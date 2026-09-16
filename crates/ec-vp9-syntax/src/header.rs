@@ -783,11 +783,7 @@ fn read_sync_code(r: &mut BitReader<'_>) -> Result<()> {
 /// `color_config` (spec 6.2).
 fn read_color_config(r: &mut BitReader<'_>, profile: u8, c: &mut ColorConfig) -> Result<()> {
     c.bit_depth = if profile >= 2 {
-        if r.read_bit()? {
-            12
-        } else {
-            10
-        }
+        if r.read_bit()? { 12 } else { 10 }
     } else {
         8
     };
@@ -935,24 +931,25 @@ fn tile_cols_log2_bounds(sb64_cols: u32) -> (u8, u8) {
 mod tests {
     use super::*;
 
-    /// Spec 6.2 worked bounds: 1920 wide is 30 superblocks; a column must stay
-    /// at least 4 superblocks wide, so up to 2^3 columns (8 bits consumed =
-    /// max - min = 3), and none are forced (up to 64 wide per column).
+    /// Spec 6.2 worked bounds, with libvpx's `max_log2 - 1`
+    /// (`vp9_tile_common.c:45-49`): 1920 wide is 30 superblocks; a column must
+    /// stay at least 4 superblocks wide, so `max_log2_tile_cols` is 2 and the
+    /// decoder consumes `max - min = 2` increment bits.
     #[test]
     fn tile_bounds_match_the_spec_formulas() {
         assert_eq!(
             tile_cols_log2_bounds(1920u32.div_ceil(8).div_ceil(8)),
-            (0, 3)
+            (0, 2)
         );
         assert_eq!(
             tile_cols_log2_bounds(3840u32.div_ceil(8).div_ceil(8)),
-            (0, 4)
+            (0, 3)
         );
         // 4096 superblocks wide forces at least 2^6 tile columns.
         assert_eq!(tile_cols_log2_bounds(4096).0, 6);
-        // A single-superblock frame still consumes one increment bit
-        // (libvpx get_max_log2(1) == 1): the terminating 0.
-        assert_eq!(tile_cols_log2_bounds(1), (0, 1));
+        // A single-superblock frame consumes NO increment bit: libvpx loops
+        // `while (max_ones-- && vpx_rb_read_bit(rb))` and `max_ones` is 0.
+        assert_eq!(tile_cols_log2_bounds(1), (0, 0));
     }
 
     #[test]
