@@ -3,7 +3,8 @@
 Status: **LANE GOAL MET (2026-09-16) — `keyframes_match_ffmpeg` PASSES; both fixture
 keyframes are byte-exact against ffmpeg on Y/U/V, pre-LF and post-LF. The path there
 is HANDOFF #2 … #8 below (read #8 first for the closing state).**
-Charter file: `lanes/vp9kf.charter.md`. Branch `lane-vp9-kf` (base 29f35b77).
+Charter file: `lanes/vp9kf.charter.md`. Branch `lane-vp9-kf` (base 29f35b77) - MERGED
+into `main` on 2026-09-16 (fast-forward `29f35b77..ce696cb8`), worktree removed.
 
 ## What works (verified by running code)
 
@@ -409,3 +410,48 @@ evidence channel.
   when off; removing them would also unbuild the scratch harnesses above.
 - `tests/scratch_*.rs` (10 files, incl. the untracked `scratch_tok.rs`) — the lane's
   diff harnesses; kept because they are how the next codec lane will re-derive this.
+
+## MERGE-SIDE FOLLOW-UPS (2026-09-16, in `main`)
+
+The lane's gates were crate-scoped (`cargo test -p ec-vp9`), so three things only
+surfaced once `main` ran the merged tree:
+
+1. **`crates/ec-vp9/src/decode.rsdecode.rs` deleted** (`b0aa9301`) - a stale 620-line
+   duplicate of `decode.rs` committed by accident in the lane's first commit
+   (`7b94a0dc`). Not in the module tree, referenced by nothing. Found by reading the
+   merge's create list; no grep/caller would have found it, only `git status` of a
+   clean tree would not either (it was tracked).
+2. **`ec-vp9-syntax`'s in-lib test was stale** - `header::tests::
+   tile_bounds_match_the_spec_formulas` still pinned the pre-lane tile-bound model
+   (`(0,3)`/`(0,4)`/`(0,1)` for 30/60/1 superblocks). libvpx's
+   `get_max_log2_tile_cols` returns `max_log2 - 1`, so the values are `(0,2)`/`(0,3)`/
+   `(0,0)` and a 1-superblock frame reads **no** increment bit
+   (`vp9_tile_common.c:45-49`, `setup_tile_info`'s `while (max_ones-- && ...)`).
+   Code was right, test was old - updated to the libvpx values with the source cited.
+   `cargo test -p ec-vp9-syntax` → 13/13 lib + 3/3 `streams`.
+3. **`scratch_synth` no longer fails** (`d38a3446`): it skips with a printed SKIP line
+   when its ad-hoc tmpfs dump is absent, so a scratch probe cannot look like a
+   regression in a normal workspace run.
+
+Local fixture note: `fixtures/` is gitignored and the worktree kept its own copy, so
+`main` needed `fixtures/vp9/{key-320,lossless-64}.ivf` copied in (from the removed
+worktree) before `dump_probe` / `keyframe_exact` could run there. The generating
+commands are the charter's ffmpeg invocations.
+
+### Verification on `main` after the merge
+
+- `cargo test -p ec-vp9` → 14 binaries green (lib 8/8, keyframe_exact 4/4, dump_probe,
+  9 scratch harnesses incl. the newly tracked `scratch_tok`, which passes).
+- `cargo test -p ec-vp9-syntax` → 13/13 + 3/3.
+- `cargo check --workspace --all-targets` → clean; `ec-vp9` warnings are the same 5 as
+  at its base commit.
+- `ec-hw` (the only consumer of `ec-vp9-syntax`) → lib 12/12 plus its GPU suite; the
+  parser changes are exercised there only through header parsing.
+
+### Next lane candidates (unchanged from the report body, now the only vp9 work left)
+
+- real **inter** decode (`inter_is_named_unsupported` is a refusal pin, not a decoder);
+- **segmentation** (rav1e-era AV1 finding, applies to vp9 too: it codes no segments);
+- **non-420 / high-bitdepth / profiles 1 and 3** (only profile 0 8-bit is ported);
+- the 12 trace hooks and 10 `scratch_*` harnesses from HANDOFF #8's "not cleaned up"
+  list, if a future lane wants a bare tree.
