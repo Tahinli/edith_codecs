@@ -514,7 +514,9 @@ Evidence that the walk is now right:
 - **The remaining real-content divergence is tile-independent**: the same source encoded
   `-tile-columns 0 -tile-rows 0` produces the identical `tile bool decoder desync` (as do
   single-tile 1080p `testsrc2` and a single-tile 960x540 gradient). The desync item below
-  stays open and is a sibling lane's to diagnose.
+  stays open and is a sibling lane's to diagnose. **CLOSED (this batch)** — see
+  `## DESYNC CLOSED` at the end of this report and the companion
+  `lanes/realdesync.report.md`.
 
 ### Next lane charter seed (in priority order)
 
@@ -556,3 +558,98 @@ guard restored the test fails ("...was not filtered"); without it, it passes. li
 9/9; keyframe_exact still 4/4; the real-content sweep numbers are unchanged (that content
 does not reach the shape).
 
+
+## DESYNC CLOSED (this batch) — real-content desync root-caused and fixed
+
+The open item above (`## OPEN DEFECT LANE`, "real content desyncs mid-frame") is closed. Full
+first-divergent-decision evidence lives in the companion lane report
+`lanes/realdesync.report.md` (copied verbatim into this checkout).
+
+### Root cause (proven by bool-trace diff against the instrumented libvpx oracle)
+
+`crates/ec-vp9/src/decode.rs` reset the left entropy + partition contexts only at the TILE's
+first superblock row (`if sb_row == row_lo { ectx[].left = [0; 32]; mi.left_seg = [0; 32]; }`).
+libvpx zeroes them at the start of EVERY superblock row:
+
+- `vp9/decoder/vp9_decodeframe.c:2256-2258` (plain `decode_tiles`, the path a 1-thread `drv`
+  takes), with the row-mt twin at `:2114-2115` and the per-tile-row twins at `:1825-1826` /
+  `:1898-1899`;
+- `MACROBLOCKD.left_context` is `ENTROPY_CONTEXT left_context[MAX_MB_PLANE][16]`
+  (`vp9/common/vp9_blockd.h:192`), so `vp9_zero` clears all 16 slots of all 3 planes;
+  `left_seg_context[8]` (`blockd.h:195`) likewise.
+
+Our plane-0 left index wraps at mi_row 16 (`ay = ((mi_row << 1) + tx_row) % 32`), so the first
+block of SB row 2 read a slot left over from SB row 0: coefficient EOB context 1 instead of 0,
+first divergence at bool #74792 (oracle prob 195 vs ours 84), hard desync from there.
+
+`above_context` / `above_seg_context` need no such change: libvpx clears them per FRAME
+(`memset` at `:2076-2080`) but each tile's `xd` points into a disjoint column range
+(`vp9_init_macroblockd`, `vp9_onyxc_int.h:381-393`), which is exactly what our per-tile fills
+at `decode.rs:269-270` do.
+
+### Second defect found by the 1080p leg of the acceptance (same family: extent gated on the wrong boundary)
+
+`crates/ec-vp9/src/loopfilter.rs`, 4:2:0 chroma passes: the row-group guard was
+`if y8 + 8 > uv_h { continue; }` (visible chroma height). libvpx's loop condition is on MI rows
+— `vp9_filter_block_plane_ss11`, `vp9/common/vp9_loopfilter.c:1400` (`r += 4` while
+`mi_row + r < mi_rows`, vertical) and `:1431` (`r += 2`, horizontal) — so a group whose FIRST MI
+row is inside the frame IS filtered even when its 8 chroma rows overhang the visible height into
+the padded buffer. `vp9_adjust_mask` keeps those mask bits for odd last-SB-row remnants
+(`rows == 7` -> `mask_uv == 0xffff`).
+
+Symptom: 1080p (mi_rows 135) had **Y byte-exact but U/V off by +/-1** in the last SB row
+(chroma rows 536-539) — the vertical edges of group 3 were never filtered. 320x240 (mi_rows 30,
+`rows == 6` -> group 3's mask is cleared) never showed it, which is why no fixture caught it.
+
+Fix: gate both chroma passes on the MI-row condition (`sbr + 4*(rg>>1) < mi_rows` vertical,
+`sbr + 2*rg < mi_rows` horizontal) and read the level through a new bounds-safe
+`LfGrids::level_at(r, c)` (0 past the frame edge: `vp9_adjust_mask` guarantees the mask bit for
+such a cell is cleared, so the value only has to be safe, not meaningful — and it also removes
+a latent OOB `level8` read for widths whose last SB column holds <= 6 mi cols).
+
+### Fixes applied (this batch, uncommitted at time of writing)
+
+- `crates/ec-vp9/src/decode.rs`: guard deleted, both resets run at every SB row (`:271-285`).
+- `crates/ec-vp9/src/loopfilter.rs`: chroma row-group guards + `level_at` (above).
+
+### Sweep evidence (before -> after; same commands, same IVF files)
+
+| # | command | before (HEAD `d068da4f`) | after |
+|---|---|---|---|
+| 1 | `SWEEP_TILE0=1 SWEEP_SRC=<real 320x240 clip>.mp4 cargo test -p ec-vp9 --test scratch_realsweep -- --nocapture` | `Y 35527/34764/35551 U 7607.. V 7656..` -> `RESULT 0 of 3 frames byte-exact` | `Y 0 U 0 V 0` x3 -> `RESULT 3 of 3 frames byte-exact` |
+| 2 | `SWEEP_IVF=/tmp/t1080-single.ivf` (real 1920x1080 clip, `-g 1 -tile-columns 0 -tile-rows 0`) | `Y 1809097/1810938/1808592 U 412982.. V 403183..` -> `RESULT 0 of 3` | `Y 0 U 0 V 0` x3 -> `RESULT 3 of 3 frames byte-exact` |
+| 3 | `SWEEP_IVF=/tmp/t1080.ivf` (same clip, 4 tile columns, `cols_log2=2`) | `DECODE REFUSED/ERR vp9: tile bool decoder desync` x3 -> `RESULT 0 of 3` | `Y 0 U 0 V 0` x3 -> `RESULT 3 of 3 frames byte-exact` |
+
+Acceptance 2 was measured with fix 1 only (`U 77/70/68 V 9/12/9`, `RESULT 0 of 3`) — that is
+where defect 2 surfaced; both fixes together give `0/0/0`.
+
+`cargo test -p ec-vp9` -> every binary green (lib 9/9, `keyframe_exact` 4/4, all scratch
+harnesses); `cargo check -p ec-vp9` -> the same 5 lib warnings, no new ones. No commit made by
+this lane (the orchestrator commits).
+
+## OPEN (found by verification, 2026-09-16) — the tile-ROW path is not decoded correctly
+
+Verification of the DESYNC CLOSED batch (above) confirmed the left-context fix and the chroma
+row-group fix, and then probed the un-exercised remainder: **`log2_tile_rows > 0` is not
+decoded correctly by the port at all**, and the batch's two fixes do not touch that class.
+Three pre-existing defects were isolated with direct probes (all in the tile-row path):
+
+1. `crates/ec-vp9/src/modes.rs:186-190` reads tx probs from the `TX_*` const defaults instead
+   of the frame-updated `FrameContext` tables. The header sets `p8x8[0][0] = 31` for the
+   probed frame; the port reads 100 -> prob mismatch at read #3203 of its tile-row frame.
+2. `crates/ec-vp9/src/modes.rs:177-185` omits libvpx's `if (!has_above) above_ctx = left_ctx`
+   fallback (oracle ctx 0 / prob 20 vs port ctx 1 / prob 8).
+3. `MiState::above_mi` and `crates/ec-vp9/src/decode.rs:701` gate above-pixel and
+   above-context availability on the tile-row start where libvpx gates on the FRAME
+   (`mi_row != 0`). With (1) and (2) fixed, pixel divergence starts exactly at row 512 — the
+   first tile-row boundary.
+
+Related, and now narrowed: `decode.rs:269-270` zeroes `ectx[].above` / `mi.above_seg` once per
+tile. That is equivalent to libvpx's frame-scoped clear (`vp9_decodeframe.c:2076-2080`) only
+for `log2_tile_rows == 0` (disjoint column ranges); with tile rows, the first SB row of tile
+row k > 0 may legitimately read above state written by tile row k - 1, which the per-tile
+fill discards. The comment in `decode.rs` states this explicitly.
+
+**Status: the tile-row class is NOT closed.** No available fixture and no sweep exercises
+`log2_tile_rows > 0`, so none of the three defects is covered by a gate; they were found with
+purpose-built probes, not by the crate's tests.

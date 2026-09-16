@@ -499,6 +499,19 @@ impl LfGrids {
         (left, above, int4)
     }
 
+    /// Filter level of the 8x8 block at MI `(r, c)`. The chroma passes can
+    /// ask for a cell whose MI row/col sits past the frame edge: libvpx reads
+    /// its (zero-filled) `lfl_y` there, and `vp9_adjust_mask` guarantees the
+    /// mask bit for such a cell is already cleared, so the value only has to
+    /// be safe, not meaningful. `0` also means "no filter", which keeps the
+    /// edge emission identical.
+    fn level_at(&self, r: usize, c: usize) -> u8 {
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return 0;
+        }
+        self.level8[r * self.mi_cols + c]
+    }
+
     /// Filter the frame's three planes in place. `y_w/h`, `uv_w/h` are
     /// the coded (aligned) plane sizes.
     pub(crate) fn filter_frame(
@@ -730,14 +743,24 @@ impl LfGrids {
                     // libvpx runs the whole vertical pass before the
                     // horizontal one; they overlap, so order matters.
                     for rg in 0..4usize {
-                        let y8 = sbr * 4 + 8 * rg;
-                        if y8 + 8 > uv_h {
+                        // vp9_filter_block_plane_ss11 iterates MI rows
+                        // `r += 4` while `mi_row + r < mi_rows`
+                        // (vp9_loopfilter.c:1400), so the row GROUP is
+                        // processed whenever its first MI row is inside the
+                        // frame — even when its 8 chroma rows overhang the
+                        // visible height into the padded buffer. Gating on
+                        // `y8 + 8 <= uv_h` instead skipped the whole group and
+                        // lost the visible bottom rows (the 1080p case:
+                        // mi_rows 135, last group = chroma rows 536..543,
+                        // 536..539 visible).
+                        if sbr + 4 * (rg >> 1) >= self.mi_rows {
                             continue;
                         }
+                        let y8 = sbr * 4 + 8 * rg;
                         for cg in 0..4usize {
                             let x8 = sbc * 4 + 8 * cg;
                             let bit = 1u16 << (rg * 4 + cg);
-                            let lvl = self.level8[(sbr + 2 * rg) * self.mi_cols + sbc + 2 * cg];
+                            let lvl = self.level_at(sbr + 2 * rg, sbc + 2 * cg);
                             if lvl == 0 {
                                 continue;
                             }
@@ -787,14 +810,18 @@ impl LfGrids {
                         }
                     }
                     for rg in 0..4usize {
-                        let y8 = sbr * 4 + 8 * rg;
-                        if y8 + 8 > uv_h {
+                        // Horizontal pass: `r += 2` while `mi_row + r <
+                        // mi_rows` (vp9_loopfilter.c:1431) — one row group per
+                        // iteration, same MI-row-gated boundary as the
+                        // vertical pass above.
+                        if sbr + 2 * rg >= self.mi_rows {
                             continue;
                         }
+                        let y8 = sbr * 4 + 8 * rg;
                         for cg in 0..4usize {
                             let x8 = sbc * 4 + 8 * cg;
                             let bit = 1u16 << (rg * 4 + cg);
-                            let lvl = self.level8[(sbr + 2 * rg) * self.mi_cols + sbc + 2 * cg];
+                            let lvl = self.level_at(sbr + 2 * rg, sbc + 2 * cg);
                             if lvl == 0 {
                                 continue;
                             }
