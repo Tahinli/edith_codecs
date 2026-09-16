@@ -209,7 +209,8 @@ impl Decoder {
         let tile_rows = 1usize << hdr.tile_info.rows_log2;
 
         // Tile data: every tile except the overall last carries a
-        // 32-bit LE size prefix (spec 6.4).
+        // 32-bit BIG-endian size prefix (spec 6.4; libvpx `get_tile_buffer`
+        // reads it with `mem_get_be32`, vp9_decodeframe.c:1688/1690).
         let mut data: &[u8] = tail;
         let mut tiles: Vec<&[u8]> = Vec::with_capacity(tile_cols * tile_rows);
         for tr in 0..tile_rows {
@@ -219,7 +220,7 @@ impl Decoder {
                     tiles.push(data);
                 } else {
                     ensure(data.len() >= 4, "truncated tile size")?;
-                    let sz = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+                    let sz = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
                     data = &data[4..];
                     ensure(data.len() >= sz, "truncated tile data")?;
                     tiles.push(&data[..sz]);
