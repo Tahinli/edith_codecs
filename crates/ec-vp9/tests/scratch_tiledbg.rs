@@ -37,11 +37,29 @@ fn tile_dbg() {
                     tail.len(),
                     &tail[..16.min(tail.len())]
                 );
+                // Tile size prefixes are BIG-endian (libvpx `mem_get_be32`,
+                // vp9_decodeframe.c:1686) -- a LE read turns a 4-column
+                // 1080p prefix into ~5e8 and starves the walk.
                 if tail.len() >= 4 {
-                    let sz = u32::from_le_bytes(tail[..4].try_into().unwrap()) as usize;
+                    let be = u32::from_be_bytes(tail[..4].try_into().unwrap()) as usize;
+                    let le = u32::from_le_bytes(tail[..4].try_into().unwrap()) as usize;
+                    println!("  first tile size prefix be={be} le={le} (tail-4 = {})", tail.len() - 4);
+                    // Walk the prefixes: each must fit, and the LAST tile is the
+                    // remainder (`get_tile_buffer` size = data_end - data).
+                    let n = 1usize << (hdr.tile_info.cols_log2 + hdr.tile_info.rows_log2);
+                    let (mut pos, mut ok) = (0usize, true);
+                    for _ in 0..n.saturating_sub(1) {
+                        if pos + 4 > tail.len() {
+                            ok = false;
+                            break;
+                        }
+                        let sz = u32::from_be_bytes(tail[pos..pos + 4].try_into().unwrap()) as usize;
+                        pos += 4 + sz;
+                        ok &= pos <= tail.len();
+                    }
                     println!(
-                        "  first tile size prefix {sz} (tail-4 = {})",
-                        tail.len() - 4
+                        "  walk: {n} tiles, prefixes consume {pos} ok={ok}, last tile {}",
+                        tail.len().saturating_sub(pos)
                     );
                 }
             }
