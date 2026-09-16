@@ -28,8 +28,6 @@ pub(crate) const ADST_DCT: usize = 1;
 pub(crate) const DCT_ADST: usize = 2;
 pub(crate) const ADST_ADST: usize = 3;
 
-pub(crate) const BLOCK_INVALID: u8 = 255;
-
 // spec 5.3 (TX_MODE)
 pub(crate) const ONLY_4X4: u8 = 0;
 pub(crate) const TX_MODE_SELECT: u8 = 4;
@@ -107,16 +105,6 @@ pub(crate) fn kf_uv_probs(mode: u8) -> [u8; 9] {
     let mut out = [0u8; 9];
     out.copy_from_slice(&KF_UV_MODE_PROB[base..base + 9]);
     out
-}
-
-/// common_data.c `uv_txsize_lookup` for 4:2:0.
-pub(crate) fn uv_txsize_lookup(bsize: usize, tx_size: usize) -> usize {
-    let uv = SS_SIZE_LOOKUP[bsize * 4 + 3];
-    if uv == BLOCK_INVALID {
-        TX_4X4
-    } else {
-        tx_size.min(MAX_TXSIZE_LOOKUP[uv as usize] as usize)
-    }
 }
 
 /// common_data.c `ss_size_lookup[bsize][1][1]`.

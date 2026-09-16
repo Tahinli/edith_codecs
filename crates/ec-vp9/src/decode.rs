@@ -232,7 +232,6 @@ impl Decoder {
         }
 
         let mut grids = LfGrids {
-            tx4: vec![0; mi_cols * 2 * mi_rows * 2],
             level8: vec![0; mi_cols * mi_rows],
             blk: vec![(0u8, 0u32, 0u32); mi_cols * mi_rows],
             otx: vec![0; mi_cols * mi_rows],
@@ -583,16 +582,6 @@ impl Decoder {
                 } else {
                     info.tx_size as u8
                 };
-            }
-        }
-        // Luma tx4 grid (block-uniform in VP9).
-        {
-            let maxw = (n4w[0] as i32 + (mb_to_right.min(0) >> 5)).max(0) as usize;
-            let maxh = (n4h[0] as i32 + (mb_to_bottom.min(0) >> 5)).max(0) as usize;
-            for rr in 0..maxh.min(n4h[0]) {
-                for cc in 0..maxw.min(n4w[0]) {
-                    grids.tx4[(row * 2 + rr) * mi.mi_cols * 2 + col * 2 + cc] = info.tx_size as u8;
-                }
             }
         }
 

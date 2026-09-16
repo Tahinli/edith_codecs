@@ -595,15 +595,28 @@ pub(crate) fn iadst16(input: &[i32], output: &mut [i32]) {
     x[13] = dcrs(s[13] + s[15]) as i64;
     x[14] = dcrs(s[12] - s[14]) as i64;
     x[15] = dcrs(s[13] - s[15]) as i64;
-    for (i, j) in [(2usize, 3usize), (6, 7), (10, 11), (14, 15)] {
-        let a = C16 * (x[i] + x[j]);
-        let b = C16 * (x[i] - x[j]);
-        x[i] = dcrs(a) as i64;
-        x[j] = dcrs(b) as i64;
-    }
+    // stage 4 (inv_txfm.c:531): pairs (2,3) and (14,15) take the
+    // NEGATED sum into the first slot; (6,7) and (10,11) take
+    // (-x_i + x_j) into the second.
+    let s2 = -C16 * (x[2] + x[3]);
+    let s3 = C16 * (x[2] - x[3]);
+    let s6 = C16 * (x[6] + x[7]);
+    let s7 = C16 * (x[7] - x[6]);
+    let s10 = C16 * (x[10] + x[11]);
+    let s11 = C16 * (x[11] - x[10]);
+    let s14 = -C16 * (x[14] + x[15]);
+    let s15 = C16 * (x[14] - x[15]);
+    x[2] = dcrs(s2) as i64;
+    x[3] = dcrs(s3) as i64;
+    x[6] = dcrs(s6) as i64;
+    x[7] = dcrs(s7) as i64;
+    x[10] = dcrs(s10) as i64;
+    x[11] = dcrs(s11) as i64;
+    x[14] = dcrs(s14) as i64;
+    x[15] = dcrs(s15) as i64;
     let o = [
         x[0], -x[8], x[12], -x[4], x[6], x[14], x[10], x[2],
-        x[3], x[11], x[15], x[7], x[5], x[13], x[9], -x[1],
+        x[3], x[11], x[15], x[7], x[5], -x[13], x[9], -x[1],
     ];
     for (i, &v) in o.iter().enumerate() {
         output[i] = v as i32;

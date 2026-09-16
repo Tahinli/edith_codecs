@@ -1,9 +1,9 @@
 # lane-vp9-kf report — first VP9 software-decode lane (`ec-vp9`)
 
-Status: **HANDOFF #2 — four entropy bugs fixed (trees, kf partition probs, 8x8 partition
-symbol + sub-8x8 geometry, syntax-crate tile-info bounds); byte-exactness still not achieved
-(pixel (0,0) ours 120 vs ffmpeg 72).**
-Charter file: `lanes/vp9kf.charter.md`. Branch `lane-vp9-kf` (base 29f35b77). NOT merged, NOT pushed.
+Status: **LANE GOAL MET (2026-09-16) — `keyframes_match_ffmpeg` PASSES; both fixture
+keyframes are byte-exact against ffmpeg on Y/U/V, pre-LF and post-LF. The path there
+is HANDOFF #2 … #8 below (read #8 first for the closing state).**
+Charter file: `lanes/vp9kf.charter.md`. Branch `lane-vp9-kf` (base 29f35b77).
 
 ## What works (verified by running code)
 
@@ -354,4 +354,58 @@ Next: port `vp9_setup_mask` UV rule for <16x16 (only the first 8x8 of
 each 16x16 calls `build_masks`; the other three are `build_y_mask`).
 Do not touch luma.
 
+## HANDOFF #8 (2026-09-16, main session) — GREEN: keyframes byte-exact vs ffmpeg
 
+`cargo test -p ec-vp9 --test keyframe_exact` → 4/4 PASS, `keyframes_match_ffmpeg` included.
+`scratch_lfdump` at FRAME=1: pre-LF Y 1310 diffs, post-LF **Y 0, U 0, V 0**; FRAME=0 the
+same (Y pre 746 → post 0). Byte dumps `/tmp/{y,u,v}_{pre,post}_ours.raw` used as the
+evidence channel.
+
+### Three root causes closed this round
+
+1. **`iadst16` stage 4 + output permutation** (`transform.rs`, ported from
+   `inv_txfm.c:520-554`). The old `for (i, j) in [(2,3),(6,7),(10,11),(14,15)]` applied
+   `C16*(x_i ± x_j)` to all four pairs; libvpx negates the SUM for pairs (2,3)/(14,15)
+   and uses `(-x_i + x_j)` for the second slot of (6,7)/(10,11), and `output[13]` is
+   `-x13`, not `x13`. Load-bearing: reverting it alone fails frame 1 at Y(120,68) 209 vs
+   210. (An ADST_ADST 16x16 tx on the keyframe path; not covered by any earlier gate.)
+2. **The loop filter must be driven by `vp9_setup_mask`'s masks, not by a per-MI tx
+   walk** — for luma AND chroma. Both planes now build the 64x64 `left`/`above`/
+   `int_4x4` masks exactly as `build_masks`/`build_y_mask` (including the <16x16
+   "only the first 8x8 touches the UV masks" rule) then run `vp9_adjust_mask`
+   (TX_32→TX_16 OR, 4-tap border promotion, `rows`/`columns` edge masks, the
+   `rows == 1` / `rows == 5` UV demotions, `mask_uv_int` for internal edges).
+   All eight tables (`left/above_prediction_mask`, `size_mask`, the 64x64 txform
+   masks, the `_uv` variants, both borders) were re-read against
+   `vp9_loopfilter.c:39-205` constant by constant.
+3. **Luma's vertical and horizontal passes must not interleave per mask bit.** The
+   chroma port already learned this; the luma emission was still doing
+   `for row { for col { V; H } }`, which put H edges inside the V pass. Split into two
+   loops (all V, then all H). This was the last 19 Y diffs after the mask port.
+
+### Dead code removed (crate-internal only)
+
+- `LfGrids.tx4` (per-4x4 luma tx grid) — written during decode, read by nothing after the
+  mask port; also drops a per-frame `mi_cols*2 × mi_rows*2` allocation.
+- `tables::uv_txsize_lookup` and `tables::BLOCK_INVALID` — the only user was the old
+  chroma tx-grid walk. Warning count is back to HEAD's 5 (`TM_PRED`, `read_partition`,
+  `partition_probs`, `x_mis`, `y_mis`).
+
+### Verification run this round
+
+- `cargo test -p ec-vp9` → lib 8/8, dump_probe 1/1, keyframe_exact 4/4, scratch_bool /
+  scratch_err / scratch_hdr / scratch_hdr2 / scratch_hdr3 / scratch_lfdump /
+  scratch_lossless / scratch_sweep all PASS.
+- `scratch_synth` FAILS: it reads `/tmp/synth-kf-frame.bin`, a tmpfs fixture that no
+  longer exists. Pre-existing (commit `2024e961`), fixture-dependent, not a code defect.
+- `cargo check -p ec-vp9` → 5 warnings, the same 5 as at HEAD.
+
+### Not cleaned up (deliberate; merge-time choice, listed so it is not silent)
+
+- 12 trace hooks still in `src/`: `EC_VP9_TRACE` (`bool.rs:123`, `decode.rs:250,732,744,
+  852`, `header.rs:201`, `intra.rs:157,178`, `modes.rs:266`, `tokens.rs:79,84,151`),
+  `LFTRACE` (`loopfilter.rs`, 4 sites) and `EC_VP9_SKIP_LF` (`decode.rs:293`, used by
+  `scratch_lfdump` to split pre/post). All are `env`-gated and cost one `var_os` call
+  when off; removing them would also unbuild the scratch harnesses above.
+- `tests/scratch_*.rs` (10 files, incl. the untracked `scratch_tok.rs`) — the lane's
+  diff harnesses; kept because they are how the next codec lane will re-derive this.

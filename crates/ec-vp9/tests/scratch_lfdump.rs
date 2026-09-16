@@ -31,16 +31,31 @@ fn dump_lf_diff_map() {
     // SAFETY: single-threaded test process; no other env readers run here.
     unsafe { std::env::set_var("EC_VP9_SKIP_LF", "1") };
     let mut dec = Decoder::new();
-    let pic_pre = dec.decode(&frames[0].data).expect("decode").expect("shown");
+    let fi: usize = std::env::var("FRAME")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for k in 0..fi {
+        dec.decode(&frames[k].data).expect("decode");
+    }
+    let pic_pre = dec.decode(&frames[fi].data).expect("decode").expect("shown");
     std::fs::write("/tmp/y_pre_ours.raw", &pic_pre.y[..ysz]).unwrap();
+    std::fs::write("/tmp/u_pre_ours.raw", &pic_pre.u).unwrap();
+    std::fs::write("/tmp/v_pre_ours.raw", &pic_pre.v).unwrap();
     unsafe { std::env::remove_var("EC_VP9_SKIP_LF") };
 
     // Post-LF run (fresh decoder).
     let mut dec = Decoder::new();
-    let pic_post = dec.decode(&frames[0].data).expect("decode").expect("shown");
+    for k in 0..fi {
+        dec.decode(&frames[k].data).expect("decode");
+    }
+    let pic_post = dec.decode(&frames[fi].data).expect("decode").expect("shown");
     std::fs::write("/tmp/y_post_ours.raw", &pic_post.y[..ysz]).unwrap();
+    std::fs::write("/tmp/u_post_ours.raw", &pic_post.u).unwrap();
+    std::fs::write("/tmp/v_post_ours.raw", &pic_post.v).unwrap();
 
-    let ff = &reference[..ysz];
+    let fsz = ysz + 2 * (w / 2) * (h / 2);
+    let ff = &reference[fi * fsz..fi * fsz + ysz];
     let pre = &pic_pre.y[..ysz];
     let post = &pic_post.y[..ysz];
 
@@ -105,27 +120,31 @@ fn dump_lf_diff_map() {
         (0..h).filter(|&r| rows[r] > 0).take(24).collect::<Vec<_>>()
     );
     let uv = (w / 2) * (h / 2);
-    let ff_u = &reference[ysz..ysz + uv];
-    let ff_v = &reference[ysz + uv..ysz + 2 * uv];
+    let ff_u = &reference[fi * fsz + ysz..fi * fsz + ysz + uv];
+    let ff_v = &reference[fi * fsz + ysz + uv..fi * fsz + ysz + 2 * uv];
     let uw = w / 2;
     let u_d: Vec<_> = (0..uv).filter(|&i| pic_post.u[i] != ff_u[i]).collect();
     let v_d: Vec<_> = (0..uv).filter(|&i| pic_post.v[i] != ff_v[i]).collect();
-    println!("U post diffs: {}", u_d.len());
-    for &i in u_d.iter().take(12) {
+    let u_pre: Vec<_> = (0..uv).filter(|&i| pic_pre.u[i] != ff_u[i]).collect();
+    let v_pre: Vec<_> = (0..uv).filter(|&i| pic_pre.v[i] != ff_v[i]).collect();
+    println!("U pre diffs: {}  post: {}", u_pre.len(), u_d.len());
+    for &i in &u_d {
         println!(
-            "  U ({}, {}) ours {} ff {}",
+            "  U ({}, {}) pre {} post {} ff {}",
             i % uw,
             i / uw,
+            pic_pre.u[i],
             pic_post.u[i],
             ff_u[i]
         );
     }
-    println!("V post diffs: {}", v_d.len());
-    for &i in v_d.iter().take(12) {
+    println!("V pre diffs: {}  post: {}", v_pre.len(), v_d.len());
+    for &i in &v_d {
         println!(
-            "  V ({}, {}) ours {} ff {}",
+            "  V ({}, {}) pre {} post {} ff {}",
             i % uw,
             i / uw,
+            pic_pre.v[i],
             pic_post.v[i],
             ff_v[i]
         );
