@@ -4,3 +4,4 @@ __pycache__/
 scripts/aac-tables/sbr-cache.json
 .cache/
 lanes/wedge_dump
+/graphify-out
