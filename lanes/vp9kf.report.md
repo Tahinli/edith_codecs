@@ -837,6 +837,7 @@ Full matrix after this fix (3-frame scratch_realsweep,
 | `/tmp/w1366.ivf` | 1366x768, 1 tile | 3 of 3 |
 | `/tmp/w1366tc.ivf` | 1366x768, **2 tile columns** | 3 of 3 (`tile cols 1 rows 0`) |
 | `/tmp/h1082trc.ivf` | 1366x1082, tile cols + tile rows requested | 3 of 3, but `tile cols 1 rows 0` (encoder declined tile rows at this height) |
+| `/tmp/odd_hw_tr.ivf` | 1913x1210 (odd width AND odd height), **2 tile rows** | 3 of 3 (`tile cols 0 rows 1`) |
 | `/tmp/tr.ivf`, `/tmp/tr2.ivf`, `/tmp/t1080.ivf`, `/tmp/t1080-single.ivf`, `/tmp/single1080.ivf` | 1080p, 2/4 tile rows, 4 tile cols | 3 of 3 |
 | `SWEEP_TILE0=1 SWEEP_SRC=/tmp/small320.mp4` | 320x240 | 3 of 3 |
 
@@ -844,11 +845,18 @@ Full matrix after this fix (3-frame scratch_realsweep,
 `cargo check -p ec-vp9` = the same 5 warnings (`TM_PRED`, `read_partition`, `partition_probs`,
 `x_mis`, `y_mis`). No commit (the orchestrator commits).
 
-Cross-product coverage: odd HEIGHT x tile rows is now exercised (`/tmp/h1082tr.ivf`,
-`rows_log2=1`). Odd WIDTH x tile columns is exercised (`/tmp/w1366tc.ivf`, `cols_log2=1`). The
-encoder declines `-tile-rows` at short heights (320x242 gives `rows_log2=0`), so the combination
-of an odd width AND an odd height AND both tile axes requested is only reachable via
-`/tmp/h1082trc.ivf`, where the encoder again declined tile rows (columns accepted) — that single
-cell (odd width × odd height × tile rows) remains unexercised and needs a taller-than-1082,
-non-multiple-of-8, odd-width source before it can be covered.
+Cross-product coverage: ALL THREE cells are now exercised and green.
+- odd HEIGHT x tile rows: `/tmp/h1082tr.ivf` (1920x1082, `tile cols 0 rows 1`) 3 of 3.
+- odd WIDTH x tile columns: `/tmp/w1366tc.ivf` (1366x768, `tile cols 1 rows 0`) 3 of 3.
+- odd WIDTH x odd HEIGHT x tile ROWS: `/tmp/odd_hw_tr.ivf` (1913x1210, `tile cols 0 rows 1`)
+  3 of 3, generated with
+  `ffmpeg -v error -y -f lavfi -i testsrc2=size=1913x1210:rate=25 -frames:v 3 -c:v libvpx-vp9 -g 1 -crf 32 -deadline good -cpu-used 4 -tile-columns 0 -tile-rows 1 -pix_fmt yuv420p -f ivf /tmp/odd_hw_tr.ivf`.
+
+Encoder note (why earlier attempts failed): libvpx-vp9 declines `-tile-rows` whenever `-tile-columns` is
+also non-zero in these commands — 1366x768, 1366x1200, 1366x1210, 1913x1210 and 1918x1200 with
+`-tile-columns 1 -tile-rows 1` all came out `cols 1 rows 0`, while 1920x1200 and 1913x1210 with
+`-tile-columns 0 -tile-rows 1` came out `rows 1`. Also, a short frame (320x242, 4 SB rows) yields
+`rows_log2=0` outright. So the odd-width-plus-tile-rows witness must use `-tile-columns 0` (one tile
+column, i.e. the tile rows alone exercise the row axis) at a resolution tall enough to accept tile rows.
+
 
