@@ -512,8 +512,11 @@ impl LfGrids {
         self.level8[r * self.mi_cols + c]
     }
 
-    /// Filter the frame's three planes in place. `y_w/h`, `uv_w/h` are
-    /// the coded (aligned) plane sizes.
+    /// Filter the frame's three planes in place. `y_w/h` are the coded
+    /// (aligned) plane sizes; `uv_h` is the chroma height. The chroma
+    /// column pass takes NO width bound (vp9_loopfilter.c:1394 iterates all
+    /// `MI_BLOCK_SIZE >> 1` column groups and `filter_selectively_vert_row2`
+    /// writes whole 8-column groups into the padded plane).
     pub(crate) fn filter_frame(
         &self,
         y: &mut [u8],
@@ -523,7 +526,6 @@ impl LfGrids {
         uv_stride: usize,
         y_w: usize,
         y_h: usize,
-        uv_w: usize,
         uv_h: usize,
         sharpness: u8,
     ) {
@@ -765,7 +767,7 @@ impl LfGrids {
                                 continue;
                             }
                             let (bl, li, th) = limits(lvl, sharpness);
-                            if x8 >= 4 && x8 + 4 <= uv_w {
+                            if x8 >= 4 {
                                 let taps = if left[TX_16X16] & bit != 0 {
                                     16
                                 } else if left[TX_8X8] & bit != 0 {
@@ -776,7 +778,7 @@ impl LfGrids {
                                     0
                                 };
                                 if taps != 0 {
-                                    let t = if taps == 16 && (x8 < 8 || x8 + 8 > uv_w) {
+                                    let t = if taps == 16 && x8 < 8 {
                                         8
                                     } else {
                                         taps
@@ -794,7 +796,7 @@ impl LfGrids {
                                     );
                                 }
                             }
-                            if int4 & bit != 0 && x8 + 8 <= uv_w {
+                            if int4 & bit != 0 {
                                 lpf_edge(
                                     data,
                                     y8 * uv_stride + x8 + 4,
@@ -826,7 +828,7 @@ impl LfGrids {
                                 continue;
                             }
                             let (bl, li, th) = limits(lvl, sharpness);
-                            if y8 >= 4 && y8 + 4 <= uv_h && x8 + 8 <= uv_w {
+                            if y8 >= 4 && y8 + 4 <= uv_h {
                                 let taps = if above[TX_16X16] & bit != 0 {
                                     16
                                 } else if above[TX_8X8] & bit != 0 {
@@ -858,7 +860,6 @@ impl LfGrids {
                             if int4 & bit != 0
                                 && sbr + 2 * rg != self.mi_rows - 1
                                 && y8 + 8 <= uv_h
-                                && x8 + 8 <= uv_w
                             {
                                 lpf_edge(
                                     data,
@@ -900,7 +901,7 @@ mod tests {
     fn run(g: &LfGrids, y: &mut [u8]) {
         let mut u = vec![128u8; 32 * 32];
         let mut v = vec![128u8; 32 * 32];
-        g.filter_frame(y, 64, &mut u, &mut v, 32, 64, 64, 32, 32, 0);
+        g.filter_frame(y, 64, &mut u, &mut v, 32, 64, 64, 32, 0);
     }
 
     /// The luma internal-4x4 horizontal edge fires on the frame's LAST MI row.

@@ -244,6 +244,30 @@ impl Decoder {
             mi_rows,
         };
         let mut ti = 0usize;
+        // `above_context` / `above_seg_context` and the mi grid are
+        // FRAME-scoped in libvpx: `cm->above_context` is memset once per
+        // frame BEFORE the tile loop (vp9_decodeframe.c:2079-2080 / :2082-2083,
+        // inside the :2077-2083 block), the
+        // shared `cm->mi_grid_visible` accumulates every tile's records, and
+        // the buffers are indexed by ABSOLUTE mi_row/mi_col
+        // (`set_skip_context`, vp9_onyxc_int.h:405-413). A tile row k > 0
+        // therefore reads above state written by tile row k - 1 — tiles are
+        // disjoint in COLUMN only. Allocating these per tile would discard
+        // that above state and mis-gate `xd->above_mi`, so they live here and
+        // are zeroed exactly once per frame.
+        // libvpx sizes `cm->above_context` by `mi_cols_aligned_to_sb` and the
+        // mi grid stride by `mi_cols`; the above arrays are written/indexed up
+        // to a whole TX_32X32 (8 4x4 units) past the last mi col, so a
+        // non-multiple-of-8 width would otherwise index out of bounds.
+        let aligned_cols = mi_cols.div_ceil(SB_MI) * SB_MI;
+        let mut ectx = [
+            PlaneContexts::new(aligned_cols * 2),
+            PlaneContexts::new(aligned_cols),
+            PlaneContexts::new(aligned_cols),
+        ];
+        ectx.iter_mut().for_each(|p| p.above.fill(0));
+        let mut mi = MiState::new(mi_cols, mi_rows);
+        mi.above_seg.fill(0);
         for tr in 0..tile_rows {
             let row_lo = ((sb64_rows * tr) >> hdr.tile_info.rows_log2) * SB_MI;
             let row_hi = (((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2) * SB_MI).min(mi_rows);
@@ -260,35 +284,19 @@ impl Decoder {
                 }
                 let mut r = crate::bool::BoolDecoder::new(tiles[ti])?;
                 ti += 1;
-                let mut ectx = [
-                    PlaneContexts::new(mi_cols * 2),
-                    PlaneContexts::new(mi_cols),
-                    PlaneContexts::new(mi_cols),
-                ];
-                let mut mi = MiState::new(mi_cols, mi_rows);
-                ectx.iter_mut().for_each(|p| p.above.fill(0));
-                mi.above_seg.fill(0);
                 for sb_row in (row_lo..row_hi).step_by(SB_MI) {
                     // libvpx zeroes the left ENTROPY and PARTITION contexts at
                     // the start of EVERY superblock row, not just the tile's
-                    // first one (vp9_decodeframe.c:2256-2258 plain
-                    // `decode_tiles`; the row-mt twin is :2114-2115 and the
-                    // per-tile-row twins :1825-1826 / :1898-1899): the left
+                    // first one (vp9_decodeframe.c:2260-2261 plain
+                    // `decode_tiles`; the row-mt twin is :2117-2118 and the
+                    // per-tile-row twins :1828-1829 / :1901-1902): the left
                     // edge of an SB row has no pixels to its left. Our luma
                     // left index wraps at mi_row 16, so a stale value from two
                     // SB rows earlier would otherwise be read here.
-                    // `above_context`/`above_seg_context` are frame-scoped in
-                    // libvpx (`memset` at :2076-2080, before the tile-row
-                    // loop) and indexed by ABSOLUTE mi_col (`set_skip_context`,
-                    // vp9_onyxc_int.h:409-412), so zeroing them once per tile
-                    // is equivalent only for `log2_tile_rows == 0`, where the
-                    // disjoint-column argument holds (each tile's xd points
-                    // into its own column range: vp9_init_macroblockd,
-                    // vp9_onyxc_int.h:381-393). With tile ROWS the first SB row
-                    // of tile row k > 0 may legitimately read above state
-                    // written by tile row k - 1, which the fills at :269-270
-                    // discard: the tile-row path is NOT equivalent and is not
-                    // handled here.
+                    // `above_context`/`above_seg_context` are frame-scoped
+                    // (memset once per frame at :2079-2083, before the tile
+                    // loop) and indexed by ABSOLUTE mi_col, so they persist
+                    // across tile rows and are NOT reset here.
                     ectx.iter_mut().for_each(|p| p.left = [0; 32]);
                     mi.left_seg = [0; 32];
                     for sb_col in (col_lo..col_hi).step_by(SB_MI) {
@@ -302,7 +310,6 @@ impl Decoder {
                             sb_row,
                             sb_col,
                             4,
-                            row_lo,
                             col_lo,
                             tx_mode,
                         )?;
@@ -326,7 +333,6 @@ impl Decoder {
                 p.uvs,
                 vw,
                 vh,
-                vw / 2,
                 vh / 2,
                 hdr.loop_filter.sharpness,
             );
@@ -366,7 +372,6 @@ impl Decoder {
         row: usize,
         col: usize,
         n4: usize,
-        tile_row_start: usize,
         tile_col_start: usize,
         tx_mode: u8,
     ) -> Result<()> {
@@ -410,7 +415,6 @@ impl Decoder {
                 subsize,
                 1,
                 1,
-                tile_row_start,
                 tile_col_start,
                 tx_mode,
             )?;
@@ -428,7 +432,6 @@ impl Decoder {
                     subsize,
                     n4,
                     n4,
-                    tile_row_start,
                     tile_col_start,
                     tx_mode,
                 )?,
@@ -445,7 +448,6 @@ impl Decoder {
                         subsize,
                         n4,
                         n8,
-                        tile_row_start,
                         tile_col_start,
                         tx_mode,
                     )?;
@@ -462,7 +464,6 @@ impl Decoder {
                             subsize,
                             n4,
                             n8,
-                            tile_row_start,
                             tile_col_start,
                             tx_mode,
                         )?;
@@ -481,7 +482,6 @@ impl Decoder {
                         subsize,
                         n8,
                         n4,
-                        tile_row_start,
                         tile_col_start,
                         tx_mode,
                     )?;
@@ -498,7 +498,6 @@ impl Decoder {
                             subsize,
                             n8,
                             n4,
-                            tile_row_start,
                             tile_col_start,
                             tx_mode,
                         )?;
@@ -521,7 +520,6 @@ impl Decoder {
                             rr,
                             cc,
                             n8,
-                            tile_row_start,
                             tile_col_start,
                             tx_mode,
                         )?;
@@ -550,7 +548,6 @@ impl Decoder {
         sb_type: usize,
         bwl: usize,
         bhl: usize,
-        tile_row_start: usize,
         tile_col_start: usize,
         tx_mode: u8,
     ) -> Result<()> {
@@ -569,10 +566,9 @@ impl Decoder {
             sb_type,
             x_mis,
             y_mis,
-            tile_row_start,
             tile_col_start,
             tx_mode,
-            &self.ctx.skip,
+            &self.ctx,
         )?;
 
         // Per-plane 4x4 counts. Sub-8x8 shapes still occupy the WHOLE 8x8
@@ -650,7 +646,6 @@ impl Decoder {
                         bh,
                         mb_to_right,
                         mb_to_bottom,
-                        tile_row_start,
                         tile_col_start,
                     )?;
                 }
@@ -687,7 +682,6 @@ impl Decoder {
         bh: usize,
         mb_to_right: i32,
         mb_to_bottom: i32,
-        tile_row_start: usize,
         tile_col_start: usize,
     ) -> Result<()> {
         let s = usize::from(plane != 0);
@@ -701,12 +695,16 @@ impl Decoder {
             info.uv_mode
         };
         let planes = self.planes.as_mut().expect("frame scratch");
-        let (pw, ph) = planes.dims(plane);
-        let stride = pw;
+        let stride = planes.dims(plane).0;
         let bs = 4 << tx_size;
         let x0 = ((mi_col * 8) >> s) + tx_col * 4;
         let y0 = ((mi_row * 8) >> s) + tx_row * 4;
-        let up = tx_row != 0 || mi_row > tile_row_start;
+        // vp9_predict_intra_block `have_top = loff || (xd->above_mi != NULL)`
+        // (vp9_reconintra.c:411); `above_mi` is FRAME-gated
+        // (`set_mi_row_col`, vp9_onyxc_int.h:430: `mi_row != 0`), NOT
+        // tile-row-gated. The above row of a tile row k > 0 is decoded by
+        // tile row k - 1 and is available.
+        let up = tx_row != 0 || mi_row > 0;
         let lft = tx_col != 0 || mi_col > tile_col_start;
         // vp9_predict_intra_block `have_right`: the tx block is not in the
         // last tx column of ITS OWN block (pd->n4_w units) — above-right
@@ -714,10 +712,32 @@ impl Decoder {
         // neighbour, so it must stage as unavailable.
         let rgt = tx_col + (1usize << tx_size) < bw * 2 >> s;
 
+        // `xd->cur_buf->y_width/y_height` (vp9_reconintra.c:288-292) are the
+        // MI-ALIGNED (8-multiple) buffer extent, not the visible coded size:
+        // confirmed by instrumenting the oracle's staging for a 320x242 frame
+        // (`fh=248`, not 242). The extend-vs-direct DECISION is `mb_to_*_edge`
+        // (`:302/326/354`, passed in as `bot_ext`/`right_ext`).
+        let vw = (hdr.mi_cols() as usize * 8) >> s;
+        let vh = (hdr.mi_rows() as usize * 8) >> s;
+
         // 1. Intra prediction (reads reconstructed neighbours).
         {
             let (data, _) = planes.plane(plane);
-            build_intra_predictors(data, stride, pw, ph, x0, y0, mode, bs, up, lft, rgt);
+            build_intra_predictors(
+                data,
+                stride,
+                vw,
+                vh,
+                x0,
+                y0,
+                mode,
+                bs,
+                up,
+                lft,
+                rgt,
+                mb_to_bottom < 0,
+                mb_to_right < 0,
+            );
         }
 
         if info.skip {

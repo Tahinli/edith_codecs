@@ -54,6 +54,13 @@ pub(crate) fn build_intra_predictors(
     up_available: bool,
     left_available: bool,
     right_available: bool,
+    // `xd->mb_to_bottom_edge < 0` — the MI-ALIGNED block extent overruns the
+    // frame bottom. This is the extend-vs-direct DECISION
+    // (`vp9_reconintra.c:302`); `frame_h` is used only for the extension
+    // LENGTH (`:288-292`).
+    bot_ext: bool,
+    // `xd->mb_to_right_edge < 0` (`vp9_reconintra.c:326/354`).
+    right_ext: bool,
 ) {
     let (need_left, need_above, need_aboveright) = needs(mode);
     let mut left_col = [0u8; 32];
@@ -62,40 +69,50 @@ pub(crate) fn build_intra_predictors(
         data[(((y0 as isize + dy) * stride as isize) + x0 as isize + dx) as usize]
     };
 
+    // NEED_LEFT (vp9_reconintra.c:300-320). `extend_bottom` is `int` in C:
+    // `y0 > frame_height` must not underflow, so it is computed in isize.
     if need_left {
         if left_available {
-            if y0 + bs <= frame_h {
+            let extend_bottom = frame_h as isize - y0 as isize;
+            if !bot_ext || extend_bottom >= bs as isize {
                 for i in 0..bs {
                     left_col[i] = at(-1, i as isize);
                 }
             } else {
-                let extend_bottom = frame_h - y0;
-                for i in 0..extend_bottom {
+                let n = extend_bottom.max(0) as usize;
+                for i in 0..n {
                     left_col[i] = at(-1, i as isize);
                 }
-                for i in extend_bottom..bs {
-                    left_col[i] = at(-1, extend_bottom as isize - 1);
-                }
+                // `ref[(extend_bottom - 1) * ref_stride - 1]` — always the last
+                // VISIBLE row (`y0 + extend_bottom - 1 == frame_h - 1`).
+                let v = at(-1, extend_bottom - 1);
+                left_col[n..bs].fill(v);
             }
         } else {
             left_col[..bs].fill(129);
         }
     }
 
+    // NEED_ABOVE (vp9_reconintra.c:322-348).
     if need_above {
         if up_available {
-            if x0 + bs <= frame_w {
+            if right_ext {
+                if x0 + bs <= frame_w {
+                    for i in 0..bs {
+                        above_data[A + i] = at(i as isize, -1);
+                    }
+                } else if x0 <= frame_w {
+                    let r = frame_w - x0;
+                    for i in 0..r {
+                        above_data[A + i] = at(i as isize, -1);
+                    }
+                    let v = above_data[A + r - 1];
+                    above_data[A + r..A + bs].fill(v);
+                }
+            } else {
                 for i in 0..bs {
                     above_data[A + i] = at(i as isize, -1);
                 }
-            } else if x0 <= frame_w {
-                let r = frame_w - x0;
-                for i in 0..r {
-                    above_data[A + i] = at(i as isize, -1);
-                }
-                let v = above_data[A + r - 1];
-                let n = x0 + bs - frame_w;
-                above_data[A + r..A + r + n].fill(v);
             }
             above_data[A - 1] = if left_available { at(-1, -1) } else { 129 };
         } else {
@@ -104,37 +121,58 @@ pub(crate) fn build_intra_predictors(
         }
     }
 
+    // NEED_ABOVERIGHT (vp9_reconintra.c:350-394).
     if need_aboveright {
         if up_available {
-            if x0 + 2 * bs <= frame_w {
-                for i in 0..2 * bs {
-                    above_data[A + i] = at(i as isize, -1);
+            let fill_bs = |d: &mut [u8; 80]| {
+                let v = d[A + bs - 1];
+                d[A + bs..A + 2 * bs].fill(v);
+            };
+            if right_ext {
+                if x0 + 2 * bs <= frame_w {
+                    if bs == 4 && right_available {
+                        for i in 0..2 * bs {
+                            above_data[A + i] = at(i as isize, -1);
+                        }
+                    } else {
+                        for i in 0..bs {
+                            above_data[A + i] = at(i as isize, -1);
+                        }
+                        fill_bs(&mut above_data);
+                    }
+                } else if x0 + bs <= frame_w {
+                    let r = frame_w - x0;
+                    if bs == 4 && right_available {
+                        for i in 0..r {
+                            above_data[A + i] = at(i as isize, -1);
+                        }
+                        let v = above_data[A + r - 1];
+                        above_data[A + r..A + 2 * bs].fill(v);
+                    } else {
+                        for i in 0..bs {
+                            above_data[A + i] = at(i as isize, -1);
+                        }
+                        fill_bs(&mut above_data);
+                    }
+                } else if x0 <= frame_w {
+                    let r = frame_w - x0;
+                    for i in 0..r {
+                        above_data[A + i] = at(i as isize, -1);
+                    }
+                    let v = above_data[A + r - 1];
+                    above_data[A + r..A + 2 * bs].fill(v);
                 }
-                if !(bs == 4 && right_available) {
-                    let v = above_data[A + bs - 1];
-                    above_data[A + bs..A + 2 * bs].fill(v);
-                }
-            } else if x0 + bs <= frame_w {
-                let r = frame_w - x0;
-                for i in 0..r {
+            } else {
+                for i in 0..bs {
                     above_data[A + i] = at(i as isize, -1);
                 }
                 if bs == 4 && right_available {
-                    let v = above_data[A + r - 1];
-                    let n = x0 + 2 * bs - frame_w;
-                    above_data[A + r..A + r + n].fill(v);
+                    for i in 0..bs {
+                        above_data[A + bs + i] = at((bs + i) as isize, -1);
+                    }
                 } else {
-                    let v = above_data[A + bs - 1];
-                    above_data[A + bs..A + 2 * bs].fill(v);
+                    fill_bs(&mut above_data);
                 }
-            } else if x0 <= frame_w {
-                let r = frame_w - x0;
-                for i in 0..r {
-                    above_data[A + i] = at(i as isize, -1);
-                }
-                let v = above_data[A + r - 1];
-                let n = x0 + 2 * bs - frame_w;
-                above_data[A + r..A + r + n].fill(v);
             }
             above_data[A - 1] = if left_available { at(-1, -1) } else { 129 };
         } else {

@@ -571,9 +571,9 @@ first-divergent-decision evidence lives in the companion lane report
 first superblock row (`if sb_row == row_lo { ectx[].left = [0; 32]; mi.left_seg = [0; 32]; }`).
 libvpx zeroes them at the start of EVERY superblock row:
 
-- `vp9/decoder/vp9_decodeframe.c:2256-2258` (plain `decode_tiles`, the path a 1-thread `drv`
-  takes), with the row-mt twin at `:2114-2115` and the per-tile-row twins at `:1825-1826` /
-  `:1898-1899`;
+- `vp9/decoder/vp9_decodeframe.c:2260-2261` (plain `decode_tiles`, the path a 1-thread `drv`
+  takes), with the row-mt twin at `:2117-2118` and the per-tile-row twins at `:1828-1829` /
+  `:1901-1902`;
 - `MACROBLOCKD.left_context` is `ENTROPY_CONTEXT left_context[MAX_MB_PLANE][16]`
   (`vp9/common/vp9_blockd.h:192`), so `vp9_zero` clears all 16 slots of all 3 planes;
   `left_seg_context[8]` (`blockd.h:195`) likewise.
@@ -653,3 +653,202 @@ fill discards. The comment in `decode.rs` states this explicitly.
 **Status: the tile-row class is NOT closed.** No available fixture and no sweep exercises
 `log2_tile_rows > 0`, so none of the three defects is covered by a gate; they were found with
 purpose-built probes, not by the crate's tests.
+
+## CLOSED (2026-09-17) — the tile-ROW path is byte-exact; fixture recipes recorded
+
+All three defects above are fixed, plus a fourth that the same probe isolated. Every fix is
+ported verbatim from libvpx with the source cited in the code.
+
+1. `modes.rs` `read_intra_frame_mode_info` now takes `fc: &FrameContext` and reads
+   `fc.tx_p8x8/tx_p16x16/tx_p32x32[ctx]` (libvpx `get_tx_probs`, `vp9_pred_common.h:173`) —
+   the FRAME-updated tables, not the `TX_*` const defaults.
+2. The tx-size context now includes libvpx's `if (!has_above) above_ctx = left_ctx;`
+   (`vp9_pred_common.h:156-170`), in the same order as the `!has_left` fallback.
+3. `MiState::above_mi` (and the pixel gate `let up = ...` in `predict_and_reconstruct`) now
+   gate above availability on the FRAME (`mi_row != 0`; `set_mi_row_col`,
+   `vp9_onyxc_int.h:430`) instead of the tile-row start. `tile_row_start` is gone from the
+   whole decode chain.
+4. The above ENTROPY/PARTITION contexts and the mi grid are now FRAME-scoped: `ectx` and `mi`
+   are allocated once per frame in `decode_keyframe_inner` (above cleared once, left cleared
+   per SB row), matching libvpx's frame-scoped `cm->above_context` / `above_seg_context`
+   (`vp9_decodeframe.c:2079-2083`). Previously a fresh per-tile `MiState` discarded the above
+   rows a tile row k > 0 legitimately reads.
+5. (Same availability family, not tile-row-specific — exposed by the tile-row fixture but also
+   reproducible with `-tile-rows 0` on the same clip) `build_intra_predictors` was passed the
+   PADDED plane height (`y` buffer is 64-aligned, so 1080 -> 1088); libvpx passes the VISIBLE
+   coded size (`xd->cur_buf->y_width/y_height`, `vp9_reconintra.c:288-292`). For the last block
+   row the port therefore skipped the bottom border extension and averaged 8 rows of
+   128-filled padding into DC_PRED instead of replicating the last valid row (found the first
+   divergence at luma (1056, 288), a 32x32 DC_PRED block that a `+8` DC shift then propagated
+   right in halving steps). Now passes `hdr.width/height` (+1>>1 for chroma).
+
+### Evidence
+
+| # | command | before | after |
+|---|---|---|---|
+| 1 | `CARGO_TARGET_DIR=... SWEEP_IVF=/tmp/tr.ivf cargo test -p ec-vp9 --test scratch_realsweep -- --nocapture` (real 1920x1080 clip, `-g 1 -tile-columns 0 -tile-rows 1`, 2 tile rows) | `frame 0: Y 2065984 U 510099 V 510291`; frames 1-2 `DECODE REFUSED/ERR vp9: tile bool decoder desync` -> `RESULT 0 of 3` | `Y 0 U 0 V 0` x3 -> `RESULT 3 of 3 frames byte-exact` |
+| 2 | `SWEEP_TILE0=1 SWEEP_SRC=/tmp/small320.mp4 ...` (real 320x240 clip) | (previous batch) | `RESULT 3 of 3 frames byte-exact` |
+| 3 | `SWEEP_IVF=/tmp/t1080.ivf ...` (real 1920x1080 clip, 4 tile columns) | (previous batch) | `RESULT 3 of 3 frames byte-exact` |
+| 4 | `SWEEP_IVF=/tmp/single1080.ivf` and `/tmp/tr2.ivf` (same 1080p clip, `-tile-rows 0`; and `-tile-rows 2`, 4 tile rows) | (same clip / 2 tile rows) `RESULT 0 of 3` | `RESULT 3 of 3 frames byte-exact` |
+
+Intermediate numbers: with fixes 1-4 only, `/tmp/tr.ivf` still showed `Y 6059 U 1658 V 247`,
+localized to the bottom 24 luma rows — fix 5 removed them. `cargo test -p ec-vp9` -> all
+binaries green; `cargo check -p ec-vp9` -> the same 5 lib warnings (`TM_PRED`,
+`read_partition`, `partition_probs`, `x_mis`, `y_mis`), no new ones.
+
+### Fixture recipes (both were previously unrecorded — the report named only the source kind)
+
+All-intra keyframe sweep (one keyframe per source frame):
+
+```
+ffmpeg -v error -y -i <a real 1920x1080 clip> -frames:v 3 -c:v libvpx-vp9 -g 1 -crf 32 \
+  -deadline good -cpu-used 4 -tile-columns 0 -tile-rows 0 -pix_fmt yuv420p -f ivf /tmp/single1080.ivf
+```
+
+Tile-ROW fixture (2 tile rows, 1 tile column): identical but `-tile-rows 1` ->
+
+```
+ffmpeg -v error -y -i <a real 1920x1080 clip> -frames:v 3 -c:v libvpx-vp9 -g 1 -crf 32 \
+  -deadline good -cpu-used 4 -tile-columns 0 -tile-rows 1 -pix_fmt yuv420p -f ivf /tmp/tr.ivf
+```
+
+Confirm the layout before trusting it:
+`TILE_SRC=/tmp/tr.ivf cargo test -p ec-vp9 --test scratch_tiledbg -- --nocapture` ->
+`tile cols 0 rows 1 mi 240x135`, `walk: 2 tiles, prefixes consume 77709 ok=true`. `-tile-rows 2`
+(4 tile rows) uses `/tmp/tr2.ivf`. The 4-tile-column fixture `/tmp/t1080.ivf` uses
+`-tile-columns 2 -tile-rows 0`. Odd-shape fixtures (`-deadline good -cpu-used 4` throughout):
+`/tmp/h242.ivf` = 320x242 (height not a multiple of 8), `/tmp/h1082.ivf` = 1920x1082,
+`/tmp/w1366.ivf` = `-vf scale=1366:768` of the 320x240 clip (width not a multiple of 8).
+
+No commit made by this lane (the orchestrator commits).
+
+## PARTIAL / STILL OPEN (2026-09-17b) — edge-shape band; the OC-OOB panic class is closed
+
+A second independent verifier confirmed fixes 1-4 above (with citations) and refuted the "use
+the visible coded size as the edge" model of fix 5 as incomplete. What is now in the tree:
+
+- **CLOSED — above-context OOB panic.** `ectx[].above` is now sized `mi_cols_aligned_to_sb`
+  (luma `×2`) and `MiState::above_seg` likewise, matching libvpx's `cm->above_context` /
+  `above_seg_context`. Before: any width not a multiple of 8 (`mi_cols*2` sized array written
+  up to `2*mi_cols + 6` by the last TX_32X32) panicked with an index-out-of-bounds at
+  `decode.rs:767` (the w1366 above-array read; `intra.rs:72` is the other site, the h242
+  subtraction overflow); 1366-wide input panicked in both the baseline and the patched tree.
+- **CLOSED — `intra.rs` subtraction overflow.** The NEED_LEFT/NEED_ABOVE/NEED_ABOVERIGHT
+  staging is now ported branch-for-branch from `vp9_reconintra.c:300-394`: the
+  extend-vs-direct DECISION is `xd->mb_to_bottom_edge < 0` / `xd->mb_to_right_edge < 0`
+  (`:302/326/354`, passed in as `bot_ext`/`right_ext`), and `extend_bottom`/`extend_bottom-1`
+  are computed in `isize` so `y0 > frame_h` cannot underflow. `/tmp/h242.ivf` no longer
+  panics (was `attempt to subtract with overflow` at `intra.rs:72`), `/tmp/h1082.ivf` is 3/3.
+- **CLOSED — the tile-row class (fixes 1-4)**: `/tmp/tr.ivf`, `/tmp/tr2.ivf`,
+  `/tmp/t1080.ivf`, `/tmp/t1080-single.ivf`, `/tmp/single1080.ivf`, and the 320x240 tile0
+  sweep are all 3/3.
+- **STILL OPEN — non-multiple-of-8 frame extents**: `/tmp/h242.ivf` -> `RESULT 1 of 3`,
+  `/tmp/w1366.ivf` -> `RESULT 0 of 3`. The divergence is confined to the RECONSTRUCTED
+  OVERHANG (rows >= 242 for h242, columns >= ~1341 for w1366); no visible pixel differs
+  except where a visible block's DC/TM prediction consumes an overhang neighbour.
+  First divergent block, h242 frame 0: luma rows 240-241, x116-143 and x268-271 (+1 each);
+  localized to the left column staged for the 8x8 at `(mi_row 30, mi_col 12)`, whose
+  `x=95` rows 242-247 are written by the `TX_32X32` at the `BLOCK_32X32 (28,8)`.
+  Oracle staged left column over rows 240-255 is `15,25,25,24,25,...,25,26` (a DIRECT read of
+  the buffer's rows, not a clamp at `frame_height=242`); the port with the visible-length model
+  clamps to `extend_bottom = 242-224 = 18` and replicates row 241, giving `15,25,26,26,...`.
+  Using the ALLOCATED extent as the length instead fixes h242 **and** h1082 but regresses
+  tr.ivf / tr2.ivf / single1080.ivf / t1080-single.ivf to 0/3, so neither "visible length" nor
+  "allocated length" is the whole model — the buffer/overhang semantics differ per extent class
+  and are not yet pinned. A dedicated lane should diff the oracle's overhang bytes
+  (`DUMPH` override was added to `/tmp/vp9loss/drv.c`) against the port's padded plane.
+
+## RULE NAMED (2026-09-17c) — the staging extent is the MI-ALIGNED buffer size
+
+Instrumented `build_intra_predictors` (`STAGEDBG=x0,y0` in `vp9_reconintra.c`) prints the
+staged `left[]`/`above[]` plus `fw`/`fh`. For the divergent block of `/tmp/h242.ivf`
+(luma `x0=64 y0=224 bs=32 mode=2 tx=TX_32X32`, block `BLOCK_32X32 (28,8)`):
+
+```
+STG plane=0 x0=64 y0=224 bs=32 mode=2 mbtb=-64 mbtr=1792 fw=320 fh=248
+STG left : 10 16 15 16 16 16 16 16 16 16 16 16 16 16 16 16 16 26 25 24 25 25 25 25 25 25 25 25 25 25 25 25
+STG above: ... cor=0
+```
+
+`fh=248`, not 242. `vp9_alloc_frame_buffer` sets `y_width/y_height` to the **8-aligned**
+extent (`aligned_width = (width + 7) & ~7`, `aligned_height = (height + 7) & ~7`;
+`vpx_scale/generic/yv12config.c:173-174,250-251`) — i.e. exactly `mi_cols*8` / `mi_rows*8`.
+With `mb_to_bottom_edge = -64` the NEED_LEFT extension path runs with
+`extend_bottom = 248 - 224 = 24`: `left[0..24]` are direct reads (rows 224..247) and
+`left[24..32]` replicate row 247 — which reproduces the observed array
+(`left[18]=25 (row 242), left[19]=24 (row 243), left[20..31]=25`). Neither the visible size
+(242 -> clamped at row 241) nor the 64-aligned plane size (256 -> `extend_bottom` 32 >= bs, i.e.
+a full direct read) reproduces it; the 8-aligned extent does.
+
+Port: `decode.rs` passes `vw = mi_cols*8 >> s`, `vh = mi_rows*8 >> s` to
+`build_intra_predictors`, which keeps the MI-aligned extend-vs-direct DECISION
+(`mb_to_bottom_edge`/`mb_to_right_edge` -> `bot_ext`/`right_ext`) and the signed `isize`
+extension arithmetic. Both earlier hacks are gone and neither is needed.
+
+Result matrix (3-frame scratch_realsweep, `CARGO_TARGET_DIR=$HOME/.cache/cargo-target-tilerow`):
+
+| fixture | shape | result |
+|---|---|---|
+| `/tmp/h242.ivf` | 320x242, 1 tile | `RESULT 3 of 3` |
+| `/tmp/h1082.ivf` | 1920x1082, 1 tile | `RESULT 3 of 3` |
+| `/tmp/w1366.ivf` | 1366x768, 1 tile | `RESULT 0 of 3` — `Y 0 0 0`, `U 4/5/6 V 37/33/16` |
+| `/tmp/w1366tc.ivf` | 1366x768, 2 tile columns | `RESULT 0 of 3` (same chroma-only residue) |
+| `/tmp/h242tr.ivf` | 320x242, `-tile-rows 1` | `RESULT 3 of 3`, but `tile cols 0 rows 0` — the encoder declined tile rows at this height, so the cross-product is still not exercised |
+| `/tmp/tr.ivf`, `/tmp/tr2.ivf`, `/tmp/t1080.ivf`, `/tmp/t1080-single.ivf`, `/tmp/single1080.ivf` | 1080p, 2/4 tile rows and 4 tile cols | `RESULT 3 of 3` |
+| `SWEEP_TILE0=1 SWEEP_SRC=/tmp/small320.mp4` | 320x240 | `RESULT 3 of 3` |
+
+`cargo test -p ec-vp9` green (lib 9/9, keyframe_exact 4/4); `cargo check -p ec-vp9` = the same
+5 warnings. No commit (the orchestrator commits).
+
+### CLOSED (2026-09-17d) — chroma COLUMN groups are not width-clamped
+
+The residue was the COLUMN analogue of the chroma row-group rule already in
+`skill://vp9-kf-loopfilter-port`. `vp9_filter_block_plane_ss11` iterates ALL
+`MI_BLOCK_SIZE >> 1` chroma column groups with no plane-width clamp
+(`vp9_loopfilter.c:1394`) and `filter_selectively_vert_row2` writes whole 8-column groups
+(`:313-399`); the horizontal pass likewise. The port clamped the groups with `uv_w`
+(`x8 + 4 <= uv_w` on the vertical edge, `x8 + 8 <= uv_w` on the internal-4x4 vertical edge and
+on both horizontal edges, plus a V16->V8 downgrade when `x8 + 8 > uv_w`).
+
+Effect at 1366 wide (`uv_w = mi_cols*4 = 684` = the ALIGNED chroma width; the visible chroma
+width is 683): the last column GROUP (chroma columns 680-687) holds visible pixels 680-682 but
+overhangs the visible plane by 4, so every clamped edge was silently dropped: luma stayed byte-exact while
+chroma was off by +/-1 at scattered rows (U 4/5/6, V 37/33/16) — the same
+"Y exact, chroma off by one" signature as the row bug. Because the chroma planes are the padded
+buffer (mi_cols*8*2/... >= the group write), the writes land in the pad and are harmless.
+
+Fix: drop every `uv_w` column clamp from the chroma pass (`x8 >= 4` alone remains, mirroring
+libvpx's leftmost-column mask clear), drop the `x8 + 8 > uv_w` clause from the V16 downgrade,
+and remove the now-unused `uv_w` parameter from `filter_frame` (the pass takes no width bound at
+all — libvpx passes only the stride). `uv_h` clamps are untouched (verified via the 1080p and
+odd-height sweeps).
+
+Rule: **chroma group iteration is MI-row-gated (rows) and MI-col-unbounded (columns) — read
+libvpx's loop condition and masks, never the plane geometry.**
+
+Full matrix after this fix (3-frame scratch_realsweep,
+`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-tilerow`):
+
+| fixture | shape | result |
+|---|---|---|
+| `/tmp/h242.ivf` | 320x242, 1 tile | 3 of 3 |
+| `/tmp/h1082.ivf` | 1920x1082, 1 tile | 3 of 3 |
+| `/tmp/h1082tr.ivf` | 1920x1082, **2 tile rows** | 3 of 3 (`tile cols 0 rows 1`) |
+| `/tmp/w1366.ivf` | 1366x768, 1 tile | 3 of 3 |
+| `/tmp/w1366tc.ivf` | 1366x768, **2 tile columns** | 3 of 3 (`tile cols 1 rows 0`) |
+| `/tmp/h1082trc.ivf` | 1366x1082, tile cols + tile rows requested | 3 of 3, but `tile cols 1 rows 0` (encoder declined tile rows at this height) |
+| `/tmp/tr.ivf`, `/tmp/tr2.ivf`, `/tmp/t1080.ivf`, `/tmp/t1080-single.ivf`, `/tmp/single1080.ivf` | 1080p, 2/4 tile rows, 4 tile cols | 3 of 3 |
+| `SWEEP_TILE0=1 SWEEP_SRC=/tmp/small320.mp4` | 320x240 | 3 of 3 |
+
+`cargo test -p ec-vp9` green (lib 9/9, keyframe_exact 4/4, the LF witness suite included);
+`cargo check -p ec-vp9` = the same 5 warnings (`TM_PRED`, `read_partition`, `partition_probs`,
+`x_mis`, `y_mis`). No commit (the orchestrator commits).
+
+Cross-product coverage: odd HEIGHT x tile rows is now exercised (`/tmp/h1082tr.ivf`,
+`rows_log2=1`). Odd WIDTH x tile columns is exercised (`/tmp/w1366tc.ivf`, `cols_log2=1`). The
+encoder declines `-tile-rows` at short heights (320x242 gives `rows_log2=0`), so the combination
+of an odd width AND an odd height AND both tile axes requested is only reachable via
+`/tmp/h1082trc.ivf`, where the encoder again declined tile rows (columns accepted) — that single
+cell (odd width × odd height × tile rows) remains unexercised and needs a taller-than-1082,
+non-multiple-of-8, odd-width source before it can be covered.
+

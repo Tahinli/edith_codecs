@@ -3,6 +3,7 @@
 //! read_intra_frame_mode_info`).
 
 use crate::bool::BoolDecoder;
+use crate::header::FrameContext;
 use crate::tables::*;
 
 /// One block's parsed prediction record (`MODE_INFO`).
@@ -18,14 +19,16 @@ pub(crate) struct MiInfo {
     pub bmi: [u8; 4],
 }
 
-/// The mode-info grid and the partition contexts of one tile pass.
+/// The mode-info grid and the partition contexts of the frame.
 pub(crate) struct MiState {
     pub mi_cols: usize,
     pub mi_rows: usize,
     /// `mi_row * mi_cols + mi_col`; every cell a block covers holds a
-    /// clone of its record (libvpx shares the pointer).
+    /// clone of its record (libvpx shares the pointer). Frame-scoped: a
+    /// tile row k > 0 reads the rows written by tile row k - 1.
     pub grid: Vec<Option<MiInfo>>,
-    /// `above_seg_context`, one byte per 8x8 column (tile-scoped).
+    /// `above_seg_context`, one byte per 8x8 column (frame-scoped, like
+    /// libvpx's `cm->above_seg_context`, memset once per frame).
     pub above_seg: Vec<u8>,
     /// `left_seg_context`, one byte per 8x8 row (reset per SB row).
     pub left_seg: [u8; 32],
@@ -37,13 +40,22 @@ impl MiState {
             mi_cols,
             mi_rows,
             grid: vec![None; mi_cols * mi_rows],
-            above_seg: vec![0; mi_cols],
+            // `above_seg_context` is `mi_cols_aligned_to_sb` long in libvpx;
+            // `update_partition_ctx` fills `[col .. col + bw)` which can
+            // overrun `mi_cols` by up to a full superblock (a 64x64 block at
+            // the last mi col).
+            above_seg: vec![0; mi_cols.div_ceil(8) * 8],
             left_seg: [0; 32],
         }
     }
 
-    fn above_mi(&self, row: usize, col: usize, tile_row_start: usize) -> Option<&MiInfo> {
-        if row > tile_row_start {
+    /// `xd->above_mi` (`set_mi_row_col`, vp9_onyxc_int.h:430): available iff
+    /// the block is not on the FRAME's first mi row. libvpx gates on
+    /// `mi_row != 0`, not on the tile row start — for a tile-row stream the
+    /// row above tile row k > 0 was decoded by tile row k - 1 into the same
+    /// frame-scoped mi grid.
+    fn above_mi(&self, row: usize, col: usize) -> Option<&MiInfo> {
+        if row > 0 {
             self.grid[(row - 1) * self.mi_cols + col].as_ref()
         } else {
             None
@@ -138,12 +150,11 @@ pub(crate) fn read_intra_frame_mode_info(
     sb_type: usize,
     x_mis: usize,
     y_mis: usize,
-    tile_row_start: usize,
     tile_col_start: usize,
     tx_mode: u8,
-    skip_probs: &[u8; 3],
+    fc: &FrameContext,
 ) -> crate::Result<MiInfo> {
-    let above_mi = st.above_mi(row, col, tile_row_start).cloned();
+    let above_mi = st.above_mi(row, col).cloned();
     let left_mi = st.left_mi(row, col, tile_col_start).cloned();
 
     // read_intra_segment_id: keyframes have no temporal prediction; a
@@ -167,26 +178,37 @@ pub(crate) fn read_intra_frame_mode_info(
     let skip = if seg_skip {
         true
     } else {
-        r.read_bool(skip_probs[skip_ctx])
+        r.read_bool(fc.skip[skip_ctx])
     };
 
     // read_tx_size
     let max_tx = MAX_TXSIZE_LOOKUP[sb_type] as usize;
     let tx_size = if tx_mode == TX_MODE_SELECT && sb_type >= 3 {
-        // read_selected_tx_size: ctx from above/left tx sizes.
+        // get_tx_size_context (vp9_pred_common.h:156): default each side to
+        // max_tx, then substitute the other side when one is missing, in
+        // this exact order — the `!has_above` fallback is load-bearing.
         let ctx = {
             let a = above_mi
                 .as_ref()
                 .map_or(max_tx, |m| if m.skip { max_tx } else { m.tx_size });
-            let l = left_mi
+            let mut l = left_mi
                 .as_ref()
-                .map_or(a, |m| if m.skip { max_tx } else { m.tx_size });
+                .map_or(max_tx, |m| if m.skip { max_tx } else { m.tx_size });
+            if left_mi.is_none() {
+                l = a;
+            }
+            let mut a = a;
+            if above_mi.is_none() {
+                a = l;
+            }
             usize::from(a + l > max_tx)
         };
+        // get_tx_probs (vp9_pred_common.h:173): the FRAME-updated tables
+        // (`cm->fc->tx_probs`), not the const defaults.
         let probs: &[u8] = match max_tx {
-            1 => &TX_P8X8_PROB[ctx..ctx + 1],
-            2 => &TX_P16X16_PROB[ctx * 2..ctx * 2 + 2],
-            _ => &TX_P32X32_PROB[ctx * 3..ctx * 3 + 3],
+            1 => &fc.tx_p8x8[ctx][..],
+            2 => &fc.tx_p16x16[ctx][..],
+            _ => &fc.tx_p32x32[ctx][..],
         };
         let mut tx = r.read_bool(probs[0]) as usize;
         if tx != TX_4X4 && max_tx >= TX_16X16 {

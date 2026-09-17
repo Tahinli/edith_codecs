@@ -31,6 +31,10 @@ fn tile_dbg() {
                     hdr.mi_cols(),
                     hdr.mi_rows()
                 );
+                println!(
+                    "  loop_filter level={} sharpness={}",
+                    hdr.loop_filter.level, hdr.loop_filter.sharpness
+                );
                 let tail = &fr.data[off..];
                 println!(
                     "  tail len {} first16 {:?}",
