@@ -50,9 +50,12 @@ const NEVER_EXERCISED: &[(&str, &str)] = &[
     // spells `--enable-intrabc=1` and decodes three such 8-bit streams whole-
     // frame pixel-exact against ffmpeg, with the block counter asserted > 0.
     // Re-verified 2026-09-17 (lane-av1-intrabc) at main f715d70c: 185 rect
-    // `use_intrabc` symbols read, 5 intrabc blocks decoded, 7 frames
-    // compared pixel-exact, 1 named refusal (rect-strip intrabc), 0
-    // mismatches -- the counts the assert above stands on.
+    // `use_intrabc` symbols read, and 5 blocks took the DV path -- 4 of them
+    // DECODED whole-frame pixel-exact across 4 arms (7 frames compared, 0
+    // mismatches). The fifth is the testsrc2 rectangle-strip arm, which reads
+    // the symbol and then refuses by name (the `intrabc_hits` bump happens on
+    // the READ), so "5 blocks decoded" would overcount: 4 decoded + 1 refused,
+    // exactly the single `refused == 1` the gate asserts.
 ];
 
 /// The `--enable-*` tools this decoder cares about, whether or not any gate
@@ -417,8 +420,16 @@ mod tests {
     /// that loops `for depth in [8usize, 10]` builds BOTH streams from one
     /// recipe, but its `yuv420p10le` arm made `is_ten_bit` classify it as
     /// 10-bit only, hiding `--enable-cfl-intra=1` from the 8-bit list.
+    /// lane-av1-intrabc r1: the shared recipe helper
+    /// `screen_intrabc_stream_at_depth` is parameterised on `depth` and sits in
+    /// the segment that opens at the PRECEDING gate's `#[test]`, so without
+    /// this marker that gate's own 8-bit-only flags read as 10-bit-only -- the
+    /// lane-defon/troykf blind spot with `depth` spelled instead of
+    /// `bit_depth`. Three gates share the helper, at both depths.
     fn covers_both_depths(body: &str) -> bool {
-        body.contains("if bit_depth == 10") || body.contains("for depth in [8usize, 10]")
+        body.contains("if bit_depth == 10")
+            || body.contains("if depth == 10")
+            || body.contains("for depth in [8usize, 10]")
     }
 
     /// Whether a gate body drives a stream at this depth.
