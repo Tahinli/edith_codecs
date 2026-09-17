@@ -177,6 +177,14 @@ pub fn leaf8_intrabc_hits() -> usize {
     crate::decode::leaf8_intrabc_hits()
 }
 
+/// Blocks reconstructed with intra block copy at ANY shape: every block whose
+/// `use_intrabc` symbol came out 1 and was predicted from the current frame.
+/// The engagement counter the intrabc gates assert on; [`leaf8_intrabc_hits`]
+/// is its 8x8-leaf subset.
+pub fn intrabc_hits() -> usize {
+    crate::decode::intrabc_hits()
+}
+
 /// lane-sb128c r8: the 128 root's INTRA (key-frame) rect arm -- (128x64
 /// blocks, 64x128 blocks, blocks per resolved intra `tx_depth` 0/1/2).
 pub fn intra_sb128_counters() -> (usize, usize, [usize; 3]) {
@@ -5968,13 +5976,32 @@ pub(crate) mod tests {
         square_only: bool,
         extra: &[&str],
     ) -> Vec<u8> {
+        screen_intrabc_stream_at_depth(src, cq, txs, tiled, square_only, 8, extra)
+    }
+
+    /// [`screen_intrabc_stream_with`] at an explicit bit depth (8 or 10): the
+    /// lavfi source is rendered straight to that depth's yuv4mpegpipe pixel
+    /// format and aomenc is told to encode at the matching
+    /// `--bit-depth`/`--input-bit-depth`, so a 10-bit arm produces a genuine
+    /// high-bit-depth stream rather than an 8-bit one in disguise.
+    fn screen_intrabc_stream_at_depth(
+        src: &str,
+        cq: &str,
+        txs: &str,
+        tiled: bool,
+        square_only: bool,
+        depth: usize,
+        extra: &[&str],
+    ) -> Vec<u8> {
+        assert!(depth == 8 || depth == 10, "unsupported bit depth {depth}");
+        let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
         let mut ff = Command::new("ffmpeg");
         ff.args(["-v", "error", "-f", "lavfi", "-i", src, "-t", "0.2"]);
         if tiled {
             ff.args(["-vf", "tile=2x2"]);
         }
         let out = ff
-            .args(["-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-"])
+            .args(["-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -5983,10 +6010,9 @@ pub(crate) mod tests {
         assert!(out.status.success(), "ffmpeg failed for {src}");
         let y4m = out.stdout;
         let mut child = Command::new(aomenc_path())
+            .args(["--codec=av1"])
+            .args([format!("--bit-depth={depth}"), format!("--input-bit-depth={depth}")])
             .args([
-                "--codec=av1",
-                "--bit-depth=8",
-                "--input-bit-depth=8",
                 "--passes=1",
                 "--end-usage=q",
                 "--cpu-used=0",
@@ -6079,6 +6105,17 @@ pub(crate) mod tests {
     /// [`crate::decode::read_intrabc_dv`] hardcoded 64. Every arm is compared
     /// to ffmpeg and the decoded-intrabc-block counter is asserted non-zero,
     /// so a stream that stopped using intrabc could not make this vacuous.
+    ///
+    /// lane-av1-intrabc (2026-09-17): the four recipes now run at 10 bits as
+    /// well, and both depths must SHOW the engagement -- `blocks_at_depth`
+    /// below hard-asserts a decoded intrabc block per depth. The 10-bit
+    /// coverage the guard records for `enable-intrabc` used to rest on a gate
+    /// that only SPELLED `--enable-intrabc=1`: measured (same round), all five
+    /// arms of `a_real_aomenc_rect_strip_palette_decodes_pixel_exact` decode
+    /// ZERO intrabc blocks at BOTH depths, so the spelling proved nothing and
+    /// the entry was one encoder-RD change away from being vacuous again
+    /// (class `tool-disabled-in-every-gate`). An arm here that stops engaging
+    /// intrabc now fails this gate instead of retiring the entry unproven.
     #[test]
     fn an_sb128_screen_stream_with_intrabc_decodes_pixel_exact() {
         const NAME: &str = "an_sb128_screen_stream_with_intrabc_decodes_pixel_exact";
@@ -6089,46 +6126,65 @@ pub(crate) mod tests {
         let (width, height) = (256usize, 192usize);
         let _guard = lock_gate_counters();
         let (mut blocks_total, mut frames_compared) = (0usize, 0u32);
-        for txs in ["0", "1"] {
-            for cq in ["30", "45"] {
-                let arm = format!("sb128 txs={txs} cq={cq}");
-                let stream = screen_intrabc_stream_with(
-                    "smptebars=size=128x96:rate=25",
-                    cq,
-                    txs,
-                    true,
-                    true,
-                    &["--sb-size=128"],
-                );
-                let (sb128, intrabc_frames) = sb128_and_intrabc_frames(&stream);
-                assert!(
-                    sb128 && intrabc_frames > 0,
-                    "{NAME}: {arm} no longer codes sb128 + allow_intrabc"
-                );
-                crate::decode::reset_intrabc_hits();
-                let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {arm}: {e}"));
-                let blocks = crate::decode::intrabc_hits();
-                blocks_total += blocks;
-                let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
-                assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
-                for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
-                    assert!(
-                        ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
-                        "{NAME}: {arm} frame {i} does not match ffmpeg"
+        let mut blocks_at_depth = [0usize; 2];
+        for depth in [8usize, 10] {
+            for txs in ["0", "1"] {
+                for cq in ["30", "45"] {
+                    let arm = format!("sb128 {depth}-bit txs={txs} cq={cq}");
+                    let stream = screen_intrabc_stream_at_depth(
+                        "smptebars=size=128x96:rate=25",
+                        cq,
+                        txs,
+                        true,
+                        true,
+                        depth,
+                        &["--sb-size=128"],
                     );
-                    frames_compared += 1;
+                    let (sb128, intrabc_frames) = sb128_and_intrabc_frames(&stream);
+                    assert!(
+                        sb128 && intrabc_frames > 0,
+                        "{NAME}: {arm} no longer codes sb128 + allow_intrabc"
+                    );
+                    crate::decode::reset_intrabc_hits();
+                    let frames =
+                        decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {arm}: {e}"));
+                    let blocks = crate::decode::intrabc_hits();
+                    blocks_total += blocks;
+                    blocks_at_depth[usize::from(depth == 10)] += blocks;
+                    let theirs = if depth == 10 {
+                        ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+                    } else {
+                        ffmpeg_decode_sequence(&stream, width, height, frames.len())
+                    };
+                    assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
+                    for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+                        assert!(
+                            ours.y == ref_frame.y
+                                && ours.u == ref_frame.u
+                                && ours.v == ref_frame.v,
+                            "{NAME}: {arm} frame {i} does not match ffmpeg"
+                        );
+                        frames_compared += 1;
+                    }
+                    eprintln!(
+                        "{NAME}: {arm} intrabc_frames={intrabc_frames} intrabc_blocks={blocks} \
+                         DECODED {} frame(s) exact",
+                        frames.len()
+                    );
                 }
-                eprintln!(
-                    "{NAME}: {arm} intrabc_frames={intrabc_frames} intrabc_blocks={blocks} \
-                     DECODED {} frame(s) exact",
-                    frames.len()
-                );
             }
         }
         assert!(frames_compared > 0, "{NAME}: no frame was compared");
         assert!(
             blocks_total > 0,
             "{NAME}: gate is vacuous -- no arm decoded a single intrabc block"
+        );
+        assert!(
+            blocks_at_depth[0] > 0 && blocks_at_depth[1] > 0,
+            "{NAME}: 8-bit={} 10-bit={} -- an arm at that depth no longer decodes an intrabc \
+             block, so `enable-intrabc` coverage there would rest on the flag spelling alone",
+            blocks_at_depth[0],
+            blocks_at_depth[1]
         );
     }
 

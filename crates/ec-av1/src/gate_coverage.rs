@@ -49,6 +49,10 @@ const NEVER_EXERCISED: &[(&str, &str)] = &[
     // `a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips`
     // spells `--enable-intrabc=1` and decodes three such 8-bit streams whole-
     // frame pixel-exact against ffmpeg, with the block counter asserted > 0.
+    // Re-verified 2026-09-17 (lane-av1-intrabc) at main f715d70c: 185 rect
+    // `use_intrabc` symbols read, 5 intrabc blocks decoded, 7 frames
+    // compared pixel-exact, 1 named refusal (rect-strip intrabc), 0
+    // mismatches -- the counts the assert above stands on.
 ];
 
 /// The `--enable-*` tools this decoder cares about, whether or not any gate
@@ -204,11 +208,17 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // flip/identity/1D transform types are proven to reach a real 10-bit stream
     // this decoder reconstructs exactly (10 of its rect coefficient TUs carry a
     // 1D tx class).
-    // `enable-intrabc` LEFT this 10-bit list on 2026-09-02 (lane-kf900 r6):
-    // `a_real_aomenc_rect_strip_palette_decodes_pixel_exact`'s new
-    // `smptebars-screen-txs-cq40/cq55` arms spell `--enable-intrabc=1` and are
-    // decoded and pixel-compared at 10 bit as well as 8, so the tool reaches a
-    // real 10-bit stream this decoder reconstructs exactly.
+    // `enable-intrabc` LEFT this 10-bit list on 2026-09-02 (lane-kf900 r6).
+    // The entry it first rested on was a flag spelling -- the palette gate's
+    // `smptebars-screen-txs-cq40/cq55` arms pass `--enable-intrabc=1` -- and
+    // lane-av1-intrabc MEASURED that those arms decode ZERO intrabc blocks at
+    // both depths, so they retired the entry without a stream carrying the
+    // tool (class `tool-disabled-in-every-gate`, the same defect this list
+    // exists for). The closing evidence is now
+    // `an_sb128_screen_stream_with_intrabc_decodes_pixel_exact`: its sb128
+    // screen recipes run at 10 bits and hard-assert a decoded intrabc block
+    // per depth (4-6 per arm), every frame pixel-compared against ffmpeg's own
+    // 10-bit decode.
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
 ];
 
