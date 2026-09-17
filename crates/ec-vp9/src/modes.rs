@@ -16,6 +16,21 @@ pub(crate) struct MiInfo {
     pub uv_mode: u8,
     /// Per-4x4 sub-block y modes, valid when `sb_type < 3` (BLOCK_8X8).
     pub bmi: [u8; 4],
+    /// `is_inter_block(mi)`: `ref_frame[0] > INTRA_FRAME`.
+    pub is_inter: bool,
+    /// `mi->ref_frame[0]`/`[1]`: `INTRA_FRAME` (0), `LAST`/`GOLDEN`/`ALTREF`
+    /// (1..3), `NO_REF_FRAME` (-1).
+    pub ref_frame: [i8; 2],
+    /// `mi->mv[..]`: the refreshed MV (predictor + codeword diff).
+    pub mv: [(i32, i32); 2],
+    /// The raw MV codeword diff of each reference frame.
+    pub mv_diff: [(i32, i32); 2],
+    /// `mi->bmi[j].as_mv`.
+    pub bmi_mv: [[(i32, i32); 2]; 4],
+    /// `mi->seg_id_predicted`.
+    pub seg_id_predicted: bool,
+    /// `mi->interp_filter`.
+    pub interp_filter: u8,
 }
 
 /// The mode-info grid and the partition contexts of one tile pass.
@@ -42,7 +57,12 @@ impl MiState {
         }
     }
 
-    fn above_mi(&self, row: usize, col: usize, tile_row_start: usize) -> Option<&MiInfo> {
+    /// The grid cell at an absolute (row, col), `None` when not decoded yet.
+    pub(crate) fn at(&self, row: usize, col: usize) -> Option<&MiInfo> {
+        self.grid.get(row * self.mi_cols + col).and_then(|c| c.as_ref())
+    }
+
+    pub(crate) fn above_mi(&self, row: usize, col: usize, tile_row_start: usize) -> Option<&MiInfo> {
         if row > tile_row_start {
             self.grid[(row - 1) * self.mi_cols + col].as_ref()
         } else {
@@ -50,7 +70,7 @@ impl MiState {
         }
     }
 
-    fn left_mi(&self, row: usize, col: usize, tile_col_start: usize) -> Option<&MiInfo> {
+    pub(crate) fn left_mi(&self, row: usize, col: usize, tile_col_start: usize) -> Option<&MiInfo> {
         if col > tile_col_start {
             self.grid[row * self.mi_cols + col - 1].as_ref()
         } else {
@@ -213,6 +233,15 @@ pub(crate) fn read_intra_frame_mode_info(
         mode: DC_PRED,
         uv_mode: DC_PRED,
         bmi: [DC_PRED; 4],
+        is_inter: false,
+        ref_frame: [0, -1],
+        mv: [(0, 0); 2],
+        mv_diff: [(0, 0); 2],
+        bmi_mv: [[(0, 0); 2]; 4],
+        seg_id_predicted: false,
+        // read_intra_block_mode_info sets this so a later
+        // get_pred_context_switchable_interp never sees a stale filter.
+        interp_filter: 3,
     };
     match sb_type {
         0 => {
