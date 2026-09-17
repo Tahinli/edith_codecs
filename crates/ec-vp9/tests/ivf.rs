@@ -49,6 +49,7 @@ pub fn parse_ivf(bytes: &[u8]) -> (&str, u16, u16, Vec<IvfFrame>) {
 }
 
 /// Root of the workspace checkout this test runs in (crates/ec-vp9/../..).
+#[allow(dead_code)] // shared by every test binary that does `mod ivf`
 pub fn fixture_dir() -> Option<std::path::PathBuf> {
     let bitstreams = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/bitstreams");

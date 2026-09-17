@@ -51,7 +51,8 @@ pub(crate) struct CoeffBlock {
 }
 
 /// `decode_coefs`, verbatim port. `dq` is `[dc, ac]`; plane 0 is luma,
-/// chroma is 1; the ref axis is fixed at 0 (intra).
+/// chroma is 1. `is_inter` selects the coefficient-probability ref axis
+/// (libvpx `get_coef_probs`: `coef_probs[tx][plane][ref]`).
 pub(crate) fn decode_coefs(
     r: &mut BoolDecoder,
     plane_type: usize,
@@ -61,6 +62,7 @@ pub(crate) fn decode_coefs(
     scan: &[i16],
     nb: &[i16],
     probs4d: &[[[[[u8; 3]; 6]; 6]; 2]; 2],
+    is_inter: bool,
     #[allow(unused_variables)] pos: (usize, usize),
     #[allow(unused_variables)] plane: usize,
 ) -> CoeffBlock {
@@ -74,7 +76,7 @@ pub(crate) fn decode_coefs(
     let dq_shift = usize::from(tx_size == TX_32X32);
     let mut dqv = dequant[0] as i32;
     let mut band = band_at(tx_size, c);
-    let mut prob: &[u8; 3] = &probs4d[plane_type][0][band][ctx];
+    let mut prob: &[u8; 3] = &probs4d[plane_type][usize::from(is_inter)][band][ctx];
     if std::env::var_os("EC_VP9_DBG").is_some() && plane_type == 0 && ctx == 0 && band == 0 {
         eprintln!("DBG coefs tx={tx_size} dq={dequant:?} ctx={ctx} band={band} prob={prob:?}");
     }
@@ -95,7 +97,7 @@ pub(crate) fn decode_coefs(
             }
             ctx = get_coef_context(nb, &token_cache, c);
             band = band_at(tx_size, c);
-            prob = &probs4d[plane_type][0][band][ctx];
+            prob = &probs4d[plane_type][usize::from(is_inter)][band][ctx];
         }
         let mut v: i32;
         if r.read_bool(prob[2]) {
@@ -142,7 +144,7 @@ pub(crate) fn decode_coefs(
         if c < max_eob {
             ctx = get_coef_context(nb, &token_cache, c);
             band = band_at(tx_size, c);
-            prob = &probs4d[plane_type][0][band][ctx];
+            prob = &probs4d[plane_type][usize::from(is_inter)][band][ctx];
         }
         dqv = dequant[1] as i32;
     }
