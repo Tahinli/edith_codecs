@@ -47,6 +47,7 @@ fn main() {
             ec_av1::stream::rect64_corner_tu_hits(1)
         );
         println!("leaf8_intrabc_hits: {}", ec_av1::stream::leaf8_intrabc_hits());
+        println!("intrabc_hits: {}", ec_av1::stream::intrabc_hits());
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
