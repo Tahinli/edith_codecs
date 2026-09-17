@@ -19,6 +19,7 @@
 pub mod bool;
 pub mod decode;
 pub mod header;
+pub(crate) mod inter;
 pub mod intra;
 pub mod loopfilter;
 pub mod modes;
@@ -45,3 +46,35 @@ pub(crate) fn trace_enabled() -> bool {
         _ => true,
     }
 }
+
+/// Cached `getenv` probe: `EC_VP9_*` gates are consulted per block, per MV
+/// component and per switchable-interp read, and `std::env::var_os` locks std's
+/// ENV lock, so each gate resolves once per process and the hot path is a
+/// single relaxed atomic load (see `trace_enabled`).
+macro_rules! cached_gate {
+    ($fn_name:ident, $env:literal) => {
+        pub(crate) fn $fn_name() -> bool {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static STATE: AtomicU8 = AtomicU8::new(0);
+            match STATE.load(Ordering::Relaxed) {
+                0 => {
+                    let on = std::env::var_os($env).is_some();
+                    STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                    on
+                }
+                1 => false,
+                _ => true,
+            }
+        }
+    };
+}
+
+// Per-block dump gate for the inter-syntax lane (scratch harnesses);
+// a candidate-list dump (`mode == NEWMV` only);
+// a search-position cell + grid-store dump; and a post-compressed-header
+// MV probability table dump. (Plain comments: a doc comment on a macro
+// invocation is an "unused doc comment" warning.)
+cached_gate!(interdump_enabled, "EC_VP9_INTERDUMP");
+cached_gate!(mvdbg_enabled, "EC_VP9_MVDGB");
+cached_gate!(mvdbg2_enabled, "EC_VP9_MVDGB2");
+cached_gate!(mvdump_enabled, "EC_VP9_MVDUMP");
