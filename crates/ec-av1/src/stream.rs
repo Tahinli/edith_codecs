@@ -177,10 +177,12 @@ pub fn leaf8_intrabc_hits() -> usize {
     crate::decode::leaf8_intrabc_hits()
 }
 
-/// Blocks reconstructed with intra block copy at ANY shape: every block whose
-/// `use_intrabc` symbol came out 1 and was predicted from the current frame.
-/// The engagement counter the intrabc gates assert on; [`leaf8_intrabc_hits`]
-/// is its 8x8-leaf subset.
+/// Blocks whose `use_intrabc` symbol came out 1 and took the DV path, at ANY
+/// shape -- the engagement counter the intrabc gates assert on. It counts
+/// "read a `use_intrabc` DV", not "reconstructed": a block the rect-strip
+/// reader REFUSES for an unported shape bumps it too (the symbol and the DV
+/// are parsed before the refusal). [`leaf8_intrabc_hits`] is its 8x8-leaf
+/// subset.
 pub fn intrabc_hits() -> usize {
     crate::decode::intrabc_hits()
 }

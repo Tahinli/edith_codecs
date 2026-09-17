@@ -3583,7 +3583,10 @@ thread_local! {
     /// [`decode_block`] off the call stack (same idiom as [`PALETTE_PRED`],
     /// which the alternative -- a tenth tuple member through every caller --
     /// already avoids). Always `.take()`n by the block that reads it.
-    /// How many blocks decoded `use_intrabc == 1` -- the gate's hit counter.
+    /// How many blocks read `use_intrabc == 1` and took the DV path -- the
+    /// gate's hit counter. Bumped on the READ, before the rect-strip refusal
+    /// returns too, so it counts reads, not reconstructions (a refused block
+    /// is never reconstructed).
     static INTRABC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
     // The `tx_type` the last plane-0 [`read_plane`] actually coded, kept so
