@@ -76,6 +76,44 @@ pub struct Decoder {
     refs: [Option<Picture>; 8],
     /// Frame scratch, live only inside `decode_keyframe`.
     planes: Option<Planes>,
+    /// The four stored frame contexts (spec 6.2 `frame_context_idx`).
+    frame_ctxs: [FrameContext; 4],
+    /// The previous frame's per-8x8 MV field and segment map
+    /// (`prev_frame->mvs` / `last_frame_seg_map`).
+    prev_mvs: Vec<crate::inter::MvRef>,
+    prev_seg: Vec<u8>,
+    last: LastFrameFacts,
+    /// Live only while an inter frame is being parsed.
+    iw: Option<InterWalk>,
+    /// Frames parsed by `decode_syntax` (the dump's frame index).
+    frames_seen: usize,
+    /// Mode-info blocks parsed in the most recent inter frame (0 otherwise).
+    syntax_blocks: usize,
+}
+
+/// What `use_prev_frame_mvs` (decodeframe.c:3023) tests about the last frame.
+#[derive(Clone, Copy, Default)]
+struct LastFrameFacts {
+    width: u32,
+    height: u32,
+    intra_only: bool,
+    show_frame: bool,
+    key: bool,
+}
+
+/// State of one inter-syntax frame walk.
+struct InterWalk {
+    ifs: crate::inter::InterFrameState,
+    sign_bias: [bool; 4],
+    use_prev: bool,
+    seg_map: Vec<u8>,
+    mvs: Vec<crate::inter::MvRef>,
+    prev_seg: Vec<u8>,
+    prev_mvs: Vec<crate::inter::MvRef>,
+    tile_col_end: usize,
+    frame_index: usize,
+    /// Mode-info blocks parsed in this frame (the harness's count gate).
+    blocks: usize,
 }
 
 impl Decoder {
@@ -86,7 +124,23 @@ impl Decoder {
             ctx: FrameContext::new(true),
             refs: [const { None }; 8],
             planes: None,
+            frame_ctxs: {
+                let d = FrameContext::new(false);
+                [d.clone(), d.clone(), d.clone(), d]
+            },
+            prev_mvs: Vec::new(),
+            prev_seg: Vec::new(),
+            last: LastFrameFacts::default(),
+            iw: None,
+            frames_seen: 0,
+            syntax_blocks: 0,
         }
+    }
+
+    /// Mode-info blocks the most recent inter frame parsed; `0` for a keyframe
+    /// or before any frame. The syntax harness pins this number.
+    pub fn last_frame_blocks(&self) -> usize {
+        self.syntax_blocks
     }
 
     /// Decode one frame (or one superframe chunk); returns the picture
@@ -131,9 +185,29 @@ impl Decoder {
                 "this lane decodes keyframes only",
             ));
         }
-        // A keyframe resets the frame context (spec 7.2) before the
-        // compressed header codes this frame's updates on top.
-        self.ctx = FrameContext::new(hdr.frame_type == FrameType::Key);
+        self.decode_key_frame(&hdr, frame)
+    }
+
+    /// Decode one key frame through to pixels and refresh every slot.
+    fn decode_key_frame(&mut self, hdr: &FrameHeader, frame: &[u8]) -> Result<Option<Picture>> {
+        let hdr = hdr.clone();
+        // setup_past_independence (spec 7.2): a key frame resets the frame
+        // context, so every STORED context goes back to the inter defaults.
+        // The keyframe's own mode info reads the const `vp9_kf_partition_probs`
+        // (libvpx `get_partition_probs`), which our `new(true)` models on the
+        // active copy only.
+        let d = FrameContext::new(false);
+        self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
+        self.ctx = FrameContext::new(true);
+        self.prev_mvs.clear();
+        self.prev_seg.clear();
+        self.last = LastFrameFacts {
+            width: hdr.width,
+            height: hdr.height,
+            intra_only: hdr.intra_only,
+            show_frame: hdr.show_frame,
+            key: true,
+        };
         // [scratch probe] EC_VP9_FORCE_UH / EC_VP9_FORCE_HSZ: override the
         // uncompressed-header size / header_size_in_bytes split for diagnosis.
         let hdr = {
@@ -147,18 +221,451 @@ impl Decoder {
             h
         };
         let hdr_start = hdr.uncompressed_header_size as usize;
-        let tx_mode = read_compressed_header(
+        let ch = read_compressed_header(
             &frame[hdr_start..hdr_start + hdr.header_size_in_bytes as usize],
             &mut self.ctx,
-            hdr.quantization.lossless(),
+            &hdr,
         )?;
 
-        let pic = self.decode_keyframe(&hdr, frame, tx_mode)?;
+        let pic = self.decode_keyframe(&hdr, frame, ch.tx_mode)?;
+        if hdr.refresh_frame_context {
+            self.ctx.reset_inter_partition();
+            self.frame_ctxs[hdr.frame_context_idx as usize] = self.ctx.clone();
+        }
         // Reference refresh (spec 8.10): a keyframe updates all slots.
         for slot in self.refs.iter_mut() {
             *slot = Some(pic.clone());
         }
         Ok(if hdr.show_frame { Some(pic) } else { None })
+    }
+
+    /// Parse one frame's syntax: keyframes decode through to pixels, inter
+    /// frames are parsed (headers, mode info, MVs) with no reconstruction and
+    /// no picture. `decode` still refuses inter frames.
+    pub fn decode_syntax(&mut self, frame: &[u8]) -> Result<()> {
+        for sub in superframe::split(frame)? {
+            let index = self.frames_seen;
+            self.frames_seen += 1;
+            let hdr = self.parser.parse_frame(sub)?;
+            if hdr.show_existing_frame {
+                continue;
+            }
+            if hdr.profile != 0 {
+                return Err(Error::unsupported(
+                    format!("vp9 profile {}", hdr.profile),
+                    "this lane decodes profile 0 only",
+                ));
+            }
+            if hdr.frame_type == FrameType::Key {
+                // Propagate: a corrupt keyframe leaves a half-updated frame
+                // context, prev-frame MV field and reference slots behind, so
+                // any inter-frame dump after it would be meaningless evidence.
+                self.decode_key_frame(&hdr, sub)?;
+            } else if hdr.intra_only {
+                return Err(Error::unsupported(
+                    "vp9 intra-only",
+                    "the inter-syntax lane covers inter frames only",
+                ));
+            } else {
+                self.decode_inter_syntax_frame(&hdr, sub, index)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Inter-frame syntax walk: compressed header, then every block's mode
+    /// info and MVs. Tokens are decoded to keep the entropy stream aligned;
+    /// nothing is predicted or reconstructed.
+    fn decode_inter_syntax_frame(&mut self, hdr: &FrameHeader, frame: &[u8], index: usize) -> Result<()> {
+        // Frame-context bookkeeping (spec 6.2 / libvpx `vp9_decode_frame`):
+        // 3 resets every stored context, 2 resets the selected one; 1 means
+        // "reset after this frame" and takes no action at frame start.
+        if hdr.reset_frame_context == 3 {
+            let d = FrameContext::new(false);
+            self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
+        } else if hdr.reset_frame_context == 2 {
+            self.frame_ctxs[hdr.frame_context_idx as usize] = FrameContext::new(false);
+        }
+        self.ctx = self.frame_ctxs[hdr.frame_context_idx as usize].clone();
+
+        let hdr_start = hdr.uncompressed_header_size as usize;
+        if crate::trace_enabled() {
+            eprintln!("CHSTART frame={index}");
+        }
+        let ch = read_compressed_header(
+            &frame[hdr_start..hdr_start + hdr.header_size_in_bytes as usize],
+            &mut self.ctx,
+            hdr,
+        )?;
+
+        if crate::interdump_enabled() {
+            let mut line = format!("PPFLAT frame={index}");
+            for row in self.ctx.partition.iter() {
+                for v in row.iter() {
+                    line.push_str(&format!(" {v}"));
+                }
+            }
+            eprintln!("{line}");
+        }
+
+        // INTRA_FRAME's sign bias is 0 by definition; the coded three land at
+        // LAST/GOLDEN/ALTREF.
+        let sign_bias = [
+            false,
+            hdr.ref_frame_sign_bias[0],
+            hdr.ref_frame_sign_bias[1],
+            hdr.ref_frame_sign_bias[2],
+        ];
+        let mut ifs = crate::inter::InterFrameState {
+            reference_mode: ch.reference_mode,
+            ..Default::default()
+        };
+        if ch.reference_mode != crate::inter::SINGLE_REFERENCE {
+            crate::inter::setup_compound_reference_mode(&mut ifs, sign_bias);
+        }
+        let use_prev = !hdr.error_resilient_mode
+            && hdr.width == self.last.width
+            && hdr.height == self.last.height
+            && !self.last.intra_only
+            && self.last.show_frame
+            && !self.last.key;
+
+        let mi_cols = hdr.mi_cols() as usize;
+        let mi_rows = hdr.mi_rows() as usize;
+        let sb64_cols = mi_cols.div_ceil(SB_MI);
+        let sb64_rows = mi_rows.div_ceil(SB_MI);
+        let tile_cols = 1usize << hdr.tile_info.cols_log2;
+        let tile_rows = 1usize << hdr.tile_info.rows_log2;
+
+        self.iw = Some(InterWalk {
+            ifs,
+            sign_bias,
+            use_prev,
+            seg_map: vec![0; mi_cols * mi_rows],
+            mvs: vec![crate::inter::MvRef::default(); mi_cols * mi_rows],
+            prev_seg: std::mem::take(&mut self.prev_seg),
+            prev_mvs: std::mem::take(&mut self.prev_mvs),
+            tile_col_end: mi_cols,
+            frame_index: index,
+            blocks: 0,
+        });
+
+        let mut data: &[u8] = &frame[hdr_start + hdr.header_size_in_bytes as usize..];
+        let mut tiles: Vec<&[u8]> = Vec::with_capacity(tile_cols * tile_rows);
+        for tr in 0..tile_rows {
+            for tc in 0..tile_cols {
+                let last = tr == tile_rows - 1 && tc == tile_cols - 1;
+                if last {
+                    tiles.push(data);
+                } else {
+                    ensure(data.len() >= 4, "truncated tile size")?;
+                    let sz = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+                    data = &data[4..];
+                    ensure(data.len() >= sz, "truncated tile data")?;
+                    tiles.push(&data[..sz]);
+                    data = &data[sz..];
+                }
+            }
+        }
+
+        // The loop-filter grids are never written on this path (no
+        // reconstruction), but the walk's signature carries them.
+        let mut grids = LfGrids {
+            level8: vec![0; mi_cols * mi_rows],
+            blk: vec![(0u8, 0u32, 0u32); mi_cols * mi_rows],
+            otx: vec![0; mi_cols * mi_rows],
+            mi_cols,
+            mi_rows,
+        };
+        let mut ti = 0usize;
+        for tr in 0..tile_rows {
+            let row_lo = ((sb64_rows * tr) >> hdr.tile_info.rows_log2) * SB_MI;
+            let row_hi = (((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2) * SB_MI).min(mi_rows);
+            for tc in 0..tile_cols {
+                let col_lo = ((sb64_cols * tc) >> hdr.tile_info.cols_log2) * SB_MI;
+                let col_hi =
+                    (((sb64_cols * (tc + 1)) >> hdr.tile_info.cols_log2) * SB_MI).min(mi_cols);
+                if let Some(w) = self.iw.as_mut() {
+                    w.tile_col_end = col_hi;
+                }
+                if crate::trace_enabled() {
+                    eprintln!("TILE {} bytes frame={index}", tiles[ti].len());
+                }
+                let mut r = crate::bool::BoolDecoder::new(tiles[ti])?;
+                ti += 1;
+                let mut ectx = [
+                    PlaneContexts::new(mi_cols * 2),
+                    PlaneContexts::new(mi_cols),
+                    PlaneContexts::new(mi_cols),
+                ];
+                let mut mi = MiState::new(mi_cols, mi_rows);
+                ectx.iter_mut().for_each(|p| p.above.fill(0));
+                mi.above_seg.fill(0);
+                for sb_row in (row_lo..row_hi).step_by(SB_MI) {
+                    ectx.iter_mut().for_each(|p| p.left = [0; 32]);
+                    mi.left_seg = [0; 32];
+                    for sb_col in (col_lo..col_hi).step_by(SB_MI) {
+                        self.decode_partition(
+                            &mut r,
+                            &mut mi,
+                            &mut ectx,
+                            &mut grids,
+                            &[[0u8; 2]; 8],
+                            hdr,
+                            sb_row,
+                            sb_col,
+                            4,
+                            col_lo,
+                            ch.tx_mode,
+                        )?;
+                    }
+                }
+                ensure(r.overreads() == 0, "tile bool decoder desync")?;
+            }
+        }
+
+        // The walk state is consumed below, so the block count the harness pins
+        // has to be captured first.
+        self.syntax_blocks = self.iw.as_ref().map_or(0, |w| w.blocks);
+        let w = self.iw.take().expect("inter walk state");
+        self.prev_mvs = w.mvs;
+        self.prev_seg = w.seg_map;
+        self.last = LastFrameFacts {
+            width: hdr.width,
+            height: hdr.height,
+            intra_only: hdr.intra_only,
+            show_frame: hdr.show_frame,
+            key: false,
+        };
+        if hdr.refresh_frame_context {
+            self.frame_ctxs[hdr.frame_context_idx as usize] = self.ctx.clone();
+        }
+        if crate::interdump_enabled() {
+            eprintln!(
+                "CHSUM frame={index} tx_mode={} ref_mode={} allow_hp={} interp={} tile_rows={} tile_cols={} pp12={:?} pp0={:?} pp13={:?}",
+                ch.tx_mode,
+                ch.reference_mode,
+                hdr.allow_high_precision_mv,
+                hdr.interpolation_filter as u8,
+                hdr.tile_info.rows_log2,
+                hdr.tile_info.cols_log2,
+                self.ctx.partition[12],
+                self.ctx.partition[0],
+                self.ctx.partition[13]
+            );
+        }
+        Ok(())
+    }
+
+    /// One inter block's syntax (`read_inter_frame_mode_info` + the MV field
+    /// `vp9_read_mode_info` stores for the next frame).
+    #[allow(clippy::too_many_arguments)]
+    fn read_inter_block_info(
+        &mut self,
+        r: &mut crate::bool::BoolDecoder,
+        mi: &MiState,
+        hdr: &FrameHeader,
+        row: usize,
+        col: usize,
+        sb_type: usize,
+        x_mis: usize,
+        y_mis: usize,
+        tile_col_start: usize,
+        tx_mode: u8,
+    ) -> Result<MiInfo> {
+        // BLOCK_4X4/4X8/8X4 are the SPLIT/VERT/HORZ partitions of an 8x8.
+        let partition = match sb_type {
+            0 => 3u8,
+            1 => 2u8,
+            2 => 1u8,
+            _ => 0u8,
+        };
+        let w = self.iw.as_mut().expect("inter walk state");
+        let prev_seg = std::mem::take(&mut w.prev_seg);
+        let prev_mvs = std::mem::take(&mut w.prev_mvs);
+        let ctx = crate::inter::InterBlockCtx {
+            seg: &hdr.segmentation,
+            ifs: w.ifs,
+            sign_bias: w.sign_bias,
+            allow_hp: hdr.allow_high_precision_mv,
+            frame_interp: hdr.interpolation_filter as u8,
+            tx_mode,
+            mi_rows: mi.mi_rows,
+            mi_cols: mi.mi_cols,
+            tile_col_start,
+            tile_col_end: w.tile_col_end,
+            last_seg: (!prev_seg.is_empty()).then_some(&prev_seg[..]),
+            prev_mvs: (w.use_prev && !prev_mvs.is_empty()).then_some(&prev_mvs[..]),
+        };
+        let info = crate::inter::read_inter_frame_mode_info(
+            r,
+            mi,
+            &ctx,
+            &self.ctx,
+            row,
+            col,
+            sb_type,
+            x_mis,
+            y_mis,
+            partition,
+            &mut w.seg_map,
+        );
+        if let Ok(info) = &info {
+            w.blocks += 1;
+            for dy in 0..y_mis {
+                for dx in 0..x_mis {
+                    let i = (row + dy) * mi.mi_cols + col + dx;
+                    w.mvs[i] = crate::inter::MvRef {
+                        ref_frame: info.ref_frame,
+                        mv: info.mv,
+                    };
+                }
+            }
+            if crate::interdump_enabled() {
+                eprintln!(
+                    "MODE {} {} {} {} {} {} {} {} {} tpos=0 ref0={} ref1={} mvrow={} mvcol={} if={}",
+                    w.frame_index,
+                    row,
+                    col,
+                    sb_type,
+                    info.tx_size,
+                    info.mode,
+                    info.uv_mode,
+                    u8::from(info.skip),
+                    info.segment,
+                    info.ref_frame[0],
+                    info.ref_frame[1],
+                    info.mv[0].0,
+                    info.mv[0].1,
+                    info.interp_filter
+                );
+            }
+        }
+        w.prev_seg = prev_seg;
+        w.prev_mvs = prev_mvs;
+        info
+    }
+
+    /// Tokens for one inter block: same entropy walk as the keyframe path,
+    /// but no prediction and no residual add. `is_inter` selects the
+    /// coefficient-probability ref axis.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_inter_block_tokens(
+        &mut self,
+        r: &mut crate::bool::BoolDecoder,
+        mi: &MiState,
+        ectx: &mut [PlaneContexts; 3],
+        hdr: &FrameHeader,
+        info: &MiInfo,
+        row: usize,
+        col: usize,
+        sb_type: usize,
+        bw: usize,
+        bh: usize,
+    ) -> Result<()> {
+        let n4w = if sb_type < 3 {
+            [2, 1, 1]
+        } else {
+            [bw * 2, bw, bw]
+        };
+        let n4h = if sb_type < 3 {
+            [2, 1, 1]
+        } else {
+            [bh * 2, bh, bh]
+        };
+        if info.skip {
+            // dec_reset_skip_context
+            for plane in 0..3usize {
+                let s = usize::from(plane != 0);
+                let offx = (col << 1) >> s;
+                let offy = (row << 1) >> s;
+                for i in 0..n4w[plane] {
+                    ectx[plane].above[offx + i] = 0;
+                }
+                let lrows = 32usize >> s;
+                for i in 0..n4h[plane].min(lrows) {
+                    ectx[plane].left[(offy + i) % lrows] = 0;
+                }
+            }
+            return Ok(());
+        }
+        let mb_to_right = ((mi.mi_cols as isize - bw as isize - col as isize) * 64) as i32;
+        let mb_to_bottom = ((mi.mi_rows as isize - bh as isize - row as isize) * 64) as i32;
+        let lossless = hdr.quantization.lossless();
+        for plane in 0..3usize {
+            let s = usize::from(plane != 0);
+            let tx_size = if plane == 0 {
+                info.tx_size
+            } else {
+                get_uv_tx_size(info.tx_size, sb_type)
+            };
+            let step = 1usize << tx_size;
+            let max_blocks_wide =
+                (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+            let max_blocks_high =
+                (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+            for brow in (0..max_blocks_high).step_by(step) {
+                for bcol in (0..max_blocks_wide).step_by(step) {
+                    let tx_type = if plane != 0 || lossless || info.is_inter {
+                        DCT_DCT
+                    } else {
+                        MODE_TO_TXTYPE_LOOKUP[info.mode as usize] as usize
+                    };
+                    let (scan, nb) = scan_for(tx_size, tx_type);
+                    let q = hdr.segment_dequant(info.segment as usize);
+                    let dequant: [i16; 2] = if plane == 0 {
+                        [q.luma_dc, q.luma_ac]
+                    } else {
+                        [q.chroma_dc, q.chroma_ac]
+                    };
+                    let ptype = usize::from(plane != 0);
+                    let ax = ((col << 1) >> s) + bcol;
+                    let lrows = 32usize >> s;
+                    let ay = (((row << 1) >> s) + brow) % lrows;
+                    let nblocks = 1usize << tx_size;
+                    let ctx_in = usize::from(ectx[plane].above[ax..ax + nblocks].iter().any(|&v| v != 0))
+                        + usize::from(ectx[plane].left[ay..ay + nblocks].iter().any(|&v| v != 0));
+                    let coef = decode_coefs(
+                        r,
+                        ptype,
+                        tx_size,
+                        &dequant,
+                        ctx_in,
+                        scan,
+                        nb,
+                        &self.ctx.coef[tx_size],
+                        info.is_inter,
+                        (0, 0),
+                        plane,
+                    );
+                    // vp9_decode_block_tokens context write-back.
+                    let n4w_s = bw * 2 >> s;
+                    let n4h_s = bh * 2 >> s;
+                    let maxw =
+                        (n4w_s as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+                    let maxh =
+                        (n4h_s as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+                    let eob_pos = u64::from(coef.eob > 0);
+                    let shift_a = if maxw > 0 && nblocks + bcol > maxw {
+                        (nblocks - (maxw - bcol)) * 8
+                    } else {
+                        0
+                    };
+                    let shift_l = if maxh > 0 && nblocks + brow > maxh {
+                        (nblocks - (maxh - brow)) * 8
+                    } else {
+                        0
+                    };
+                    let spread_a = (eob_pos * 0x0101_0101_0101_0101) >> shift_a;
+                    let spread_l = (eob_pos * 0x0101_0101_0101_0101) >> shift_l;
+                    for k in 0..nblocks {
+                        ectx[plane].above[ax + k] = (spread_a >> (8 * k)) as u8;
+                        ectx[plane].left[ay + k] = (spread_l >> (8 * k)) as u8;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn decode_keyframe(&mut self, hdr: &FrameHeader, frame: &[u8], tx_mode: u8) -> Result<Picture> {
@@ -556,20 +1063,61 @@ impl Decoder {
         let x_mis = bw.min(mi.mi_cols - col);
         let y_mis = bh.min(mi.mi_rows - row);
 
-        let info = read_intra_frame_mode_info(
-            r,
-            mi,
-            &hdr.segmentation,
-            &self.ctx.partition,
-            row,
-            col,
-            sb_type,
-            x_mis,
-            y_mis,
-            tile_col_start,
-            tx_mode,
-            &self.ctx,
-        )?;
+        let info = if hdr.frame_type == FrameType::Key {
+            read_intra_frame_mode_info(
+                r,
+                mi,
+                &hdr.segmentation,
+                &self.ctx.partition,
+                row,
+                col,
+                sb_type,
+                x_mis,
+                y_mis,
+                tile_col_start,
+                tx_mode,
+                &self.ctx,
+            )?
+        } else {
+            self.read_inter_block_info(
+                r,
+                mi,
+                hdr,
+                row,
+                col,
+                sb_type,
+                x_mis,
+                y_mis,
+                tile_col_start,
+                tx_mode,
+            )?
+        };
+        if hdr.frame_type != FrameType::Key {
+            // Inter syntax only: tokens keep the entropy stream aligned, the
+            // block lands in the mode grid, and no pixel is touched.
+            self.decode_inter_block_tokens(r, mi, ectx, hdr, &info, row, col, sb_type, bw, bh)?;
+            for dy in 0..y_mis {
+                for dx in 0..x_mis {
+                    if crate::mvdbg2_enabled()
+                        && row + dy == 7
+                        && col + dx >= 30
+                        && col + dx <= 40
+                    {
+                        eprintln!(
+                            "GWR cell=({} {}) idx={} from=({row} {col}) dy={dy} dx={dx} sb={sb_type} bw={bw} bh={bh} x_mis={x_mis} y_mis={y_mis} mv={:?} ref0={} mi_cols={}",
+                            row + dy,
+                            col + dx,
+                            (row + dy) * mi.mi_cols + col + dx,
+                            info.mv,
+                            info.ref_frame[0],
+                            mi.mi_cols
+                        );
+                    }
+                    mi.grid[(row + dy) * mi.mi_cols + col + dx] = Some(info.clone());
+                }
+            }
+            return Ok(());
+        }
 
         // Per-plane 4x4 counts. Sub-8x8 shapes still occupy the WHOLE 8x8
         // mi area (libvpx set_plane_n4 with bw=bh=1): luma walks 2x2 4x4
@@ -802,6 +1350,7 @@ impl Decoder {
             scan,
             nb,
             &self.ctx.coef[tx_size],
+            false,
             (x0, y0),
             plane,
         );

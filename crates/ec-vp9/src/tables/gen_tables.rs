@@ -1427,3 +1427,67 @@ pub(crate) const KF_UV_MODE_PROB: [u8; 90] = [
     12, 32, 145, 195, 142, 32, 38, 86, 116, 12, 64, 120, 140, 125, 49, 115, 121, 102, 19, 66, 162,
     182, 122, 35, 59, 128,
 ];
+
+// ---------------------------------------------------------------------------
+// Inter-frame tables (libvpx v1.15: common/vp9_entropymode.c,
+// common/vp9_entropymv.c, common/vp9_mvref_common.h, common/vp9_common_data.c).
+// ---------------------------------------------------------------------------
+
+/// `vp9_inter_mode_tree`; leaves are `mode - NEARESTMV` (0..3).
+pub(crate) const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
+/// `vp9_switchable_interp_tree` = `{ -EIGHTTAP, 2, -EIGHTTAP_SMOOTH,
+/// -EIGHTTAP_SHARP }`. libvpx's filter constants are #defines with
+/// `EIGHTTAP = 0`, `EIGHTTAP_SMOOTH = 1`, `EIGHTTAP_SHARP = 2`
+/// (vp9/common/vp9_filter.h:23) — NOT the spec's naming order, so the tree is
+/// `{0, 2, -1, -2}` and the leaves are the coded `interp_filter` values.
+pub(crate) const SWITCHABLE_INTERP_TREE: [i8; 4] = [0, 2, -1, -2];
+/// `vp9_mv_joint_tree`.
+pub(crate) const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+/// `vp9_mv_class_tree`.
+pub(crate) const MV_CLASS_TREE: [i8; 20] = [
+    0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
+];
+/// `vp9_mv_fp_tree`.
+pub(crate) const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+/// `default_if_y_probs`, `[BLOCK_SIZE_GROUPS][INTRA_MODES - 1]`.
+pub(crate) const DEFAULT_Y_MODE_PROBS: [u8; 36] = [
+    65, 32, 18, 144, 162, 194, 41, 51, 98, 132, 68, 18, 165, 217, 196, 45, 40, 78, 173, 80, 19, 176,
+    240, 193, 64, 35, 46, 221, 135, 38, 194, 248, 121, 96, 85, 29,
+];
+/// `default_inter_mode_probs`, `[INTER_MODE_CONTEXTS][INTER_MODES - 1]`.
+pub(crate) const DEFAULT_INTER_MODE_PROBS: [u8; 21] = [
+    2, 173, 34, 7, 145, 85, 7, 166, 63, 7, 94, 66, 8, 64, 46, 17, 81, 31, 25, 29, 30,
+];
+/// `default_intra_inter_p`.
+pub(crate) const DEFAULT_INTRA_INTER_PROBS: [u8; 4] = [9, 102, 187, 225];
+/// `default_comp_inter_p`.
+pub(crate) const DEFAULT_COMP_INTER_PROBS: [u8; 5] = [239, 183, 119, 96, 41];
+/// `default_single_ref_p`, `[REF_CONTEXTS][2]`.
+pub(crate) const DEFAULT_SINGLE_REF_PROBS: [u8; 10] =
+    [33, 16, 77, 74, 142, 142, 172, 170, 238, 247];
+/// `default_comp_ref_p`, flat `[REF_CONTEXTS]`.
+pub(crate) const DEFAULT_COMP_REF_PROBS: [u8; 5] = [50, 126, 123, 221, 226];
+/// `default_switchable_interp_prob`, `[SWITCHABLE_FILTER_CONTEXTS][2]`.
+pub(crate) const DEFAULT_SWITCHABLE_INTERP_PROBS: [u8; 8] = [235, 162, 36, 255, 34, 3, 149, 144];
+/// `default_nmv_context`: joints, then both components.
+pub(crate) const DEFAULT_NMVC_JOINTS: [u8; 3] = [32, 64, 96];
+pub(crate) const DEFAULT_NMVC_SIGN: [u8; 2] = [128, 128];
+pub(crate) const DEFAULT_NMVC_CLASSES: [u8; 20] = [
+    224, 144, 192, 168, 192, 176, 192, 198, 198, 245, 216, 128, 176, 160, 176, 176, 192, 198, 198,
+    208,
+];
+pub(crate) const DEFAULT_NMVC_CLASS0: [u8; 2] = [216, 208];
+pub(crate) const DEFAULT_NMVC_BITS: [u8; 20] = [
+    136, 140, 148, 160, 176, 192, 224, 234, 234, 240, 136, 140, 148, 160, 176, 192, 224, 234, 234,
+    240,
+];
+pub(crate) const DEFAULT_NMVC_CLASS0_FP: [u8; 12] =
+    [128, 128, 64, 96, 112, 64, 128, 128, 64, 96, 112, 64];
+pub(crate) const DEFAULT_NMVC_FP: [u8; 6] = [64, 96, 64, 64, 96, 64];
+pub(crate) const DEFAULT_NMVC_CLASS0_HP: [u8; 2] = [160, 160];
+pub(crate) const DEFAULT_NMVC_HP: [u8; 2] = [128, 128];
+/// `mode_2_counter`, indexed by `PREDICTION_MODE`.
+pub(crate) const MODE_2_COUNTER: [u8; 14] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 1];
+/// `counter_to_context`.
+pub(crate) const COUNTER_TO_CONTEXT: [u8; 19] =
+    [2, 3, 4, 1, 3, 9, 0, 9, 9, 5, 5, 9, 5, 9, 9, 9, 9, 9, 6];
