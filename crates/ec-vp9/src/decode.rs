@@ -4,14 +4,17 @@
 //! reconstruction and the loop filter (spec 6, 7, 8; libvpx
 //! `vp9_decodeframe.c`).
 //!
-//! Lane scope: profile-0 8-bit 4:2:0 keyframes. Inter frames and other
-//! profiles/subsamplings are refused by name; `show_existing_frame`
-//! returns the buffered reference picture instead of pretending to
-//! decode.
+//! Capability: profile-0 8-bit 4:2:0 keyframes and inter frames (motion
+//! compensation, residual reconstruction, the loop filter and an 8-slot
+//! reference DPB). Intra-only frames, other profiles/subsamplings, a
+//! reference whose coded size differs from the current frame, and odd frame
+//! dimensions are refused by name; `show_existing_frame` returns the
+//! buffered reference picture instead of pretending to decode.
 
 use crate::header::{FrameContext, read_compressed_header};
 use crate::intra::build_intra_predictors;
 use crate::loopfilter::LfGrids;
+use crate::mc::{RefPlane, average_split_mvs_chroma, build_inter_predictors, split_mv};
 use crate::modes::{MiInfo, MiState, read_intra_frame_mode_info};
 use crate::tables::*;
 use crate::tokens::{PlaneContexts, decode_coefs, scan_for};
@@ -51,6 +54,14 @@ struct Planes {
 }
 
 impl Planes {
+    /// Immutable plane + stride (the predictor reads references).
+    fn plane_ref(&self, plane: usize) -> (&[u8], usize) {
+        match plane {
+            0 => (&self.y, self.ys),
+            1 => (&self.u, self.uvs),
+            _ => (&self.v, self.uvs),
+        }
+    }
     fn plane(&mut self, plane: usize) -> (&mut [u8], usize) {
         match plane {
             0 => (&mut self.y, self.ys),
@@ -73,7 +84,7 @@ impl Planes {
 pub struct Decoder {
     parser: Vp9Parser,
     ctx: FrameContext,
-    refs: [Option<Picture>; 8],
+    refs: [Option<RefFrame>; 8],
     /// Frame scratch, live only inside `decode_keyframe`.
     planes: Option<Planes>,
     /// The four stored frame contexts (spec 6.2 `frame_context_idx`).
@@ -87,8 +98,36 @@ pub struct Decoder {
     iw: Option<InterWalk>,
     /// Frames parsed by `decode_syntax` (the dump's frame index).
     frames_seen: usize,
+    /// Frames decoded by `decode` (the dumps' `frame=` field for this path;
+    /// `decode_syntax` counts the same way in `frames_seen`).
+    decode_index: usize,
     /// Mode-info blocks parsed in the most recent inter frame (0 otherwise).
     syntax_blocks: usize,
+    /// `twd->extend_and_predict_buf`: the per-prediction bordered reference
+    /// window built when a block's read leaves the reference frame.
+    mc_scratch: Vec<u8>,
+    /// The `vpx_convolve8` stride-64 intermediate plus the second scratch its
+    /// averaging variant needs.
+    mc_temp: Vec<u8>,
+}
+
+/// One DPB slot: a decoded frame buffer at its ALIGNED (64-multiple) extent
+/// plus the coded size it was decoded at.
+///
+/// The aligned extent is load-bearing, not slack: libvpx writes a block at the
+/// frame edge at its FULL size (`decodeframe.c:1216`), so the rows past the
+/// coded height hold real reconstructed samples, and `dec_build_inter_predictors`
+/// reads them directly whenever a block's window is inside the frame with a
+/// whole-pixel MV (`build_mc_border` is only reached when the window leaves the
+/// frame or the coded size is not a multiple of 8). Cropping the reference to
+/// the visible size would drop exactly those samples.
+#[derive(Clone)]
+struct RefFrame {
+    planes: std::sync::Arc<Planes>,
+    /// Coded width — the predictor's `y_crop_width`.
+    width: u16,
+    /// Coded height — the predictor's `y_crop_height`.
+    height: u16,
 }
 
 /// What `use_prev_frame_mvs` (decodeframe.c:3023) tests about the last frame.
@@ -133,7 +172,10 @@ impl Decoder {
             last: LastFrameFacts::default(),
             iw: None,
             frames_seen: 0,
+            decode_index: 0,
             syntax_blocks: 0,
+            mc_scratch: Vec::new(),
+            mc_temp: vec![0; 64 * 135 + 64 * 64],
         }
     }
 
@@ -160,7 +202,7 @@ impl Decoder {
         if hdr.show_existing_frame {
             let slot = hdr.frame_to_show_map_idx as usize;
             return match self.refs.get(slot).and_then(|p| p.as_ref()) {
-                Some(p) => Ok(Some(p.clone())),
+                Some(p) => Ok(Some(crop_picture(&p.planes, p.width, p.height))),
                 None => Err(corrupt("show_existing_frame names an empty slot")),
             };
         }
@@ -179,13 +221,20 @@ impl Decoder {
                 ),
             ));
         }
-        if hdr.frame_type != FrameType::Key {
+        // One index per decoded frame (the dumps' `frame=` field), so this
+        // path and `decode_syntax` label the same frame the same way.
+        let index = self.decode_index;
+        self.decode_index += 1;
+        if hdr.frame_type == FrameType::Key {
+            return self.decode_key_frame(&hdr, frame);
+        }
+        if hdr.intra_only {
             return Err(Error::unsupported(
-                "vp9 inter",
-                "this lane decodes keyframes only",
+                "vp9 intra-only",
+                "this lane decodes inter frames and keyframes only",
             ));
         }
-        self.decode_key_frame(&hdr, frame)
+        self.decode_inter_frame(&hdr, frame, index, true)
     }
 
     /// Decode one key frame through to pixels and refresh every slot.
@@ -233,8 +282,13 @@ impl Decoder {
             self.frame_ctxs[hdr.frame_context_idx as usize] = self.ctx.clone();
         }
         // Reference refresh (spec 8.10): a keyframe updates all slots.
+        let frame = RefFrame {
+            planes: std::sync::Arc::new(self.planes.take().expect("frame scratch")),
+            width: hdr.width as u16,
+            height: hdr.height as u16,
+        };
         for slot in self.refs.iter_mut() {
-            *slot = Some(pic.clone());
+            *slot = Some(frame.clone());
         }
         Ok(if hdr.show_frame { Some(pic) } else { None })
     }
@@ -267,16 +321,26 @@ impl Decoder {
                     "the inter-syntax lane covers inter frames only",
                 ));
             } else {
-                self.decode_inter_syntax_frame(&hdr, sub, index)?;
+                self.decode_inter_frame(&hdr, sub, index, false)?;
             }
         }
         Ok(())
     }
 
-    /// Inter-frame syntax walk: compressed header, then every block's mode
-    /// info and MVs. Tokens are decoded to keep the entropy stream aligned;
-    /// nothing is predicted or reconstructed.
-    fn decode_inter_syntax_frame(&mut self, hdr: &FrameHeader, frame: &[u8], index: usize) -> Result<()> {
+    /// Inter-frame decode: compressed header, the tile walk (mode info, MVs
+    /// and tokens always; prediction, residual and the loop filter when
+    /// `pixels`), then the reference refresh.
+    ///
+    /// `pixels == false` is the syntax-only walk the instrumented harnesses
+    /// drive: tokens keep the entropy stream aligned, no pixel is touched and
+    /// the reference slots are left alone.
+    fn decode_inter_frame(
+        &mut self,
+        hdr: &FrameHeader,
+        frame: &[u8],
+        index: usize,
+        pixels: bool,
+    ) -> Result<Option<Picture>> {
         // Frame-context bookkeeping (spec 6.2 / libvpx `vp9_decode_frame`):
         // 3 resets every stored context, 2 resets the selected one; 1 means
         // "reset after this frame" and takes no action at frame start.
@@ -287,6 +351,58 @@ impl Decoder {
             self.frame_ctxs[hdr.frame_context_idx as usize] = FrameContext::new(false);
         }
         self.ctx = self.frame_ctxs[hdr.frame_context_idx as usize].clone();
+
+        // Reference slots (spec 7.2): `ref_frame_idx[i]` names the slot LAST,
+        // GOLDEN and ALTREF use. libvpx validates every named reference's
+        // format here (`vp9_decodeframe.c:1620-1627`) and SCALES a reference
+        // whose size differs; this lane refuses that by name.
+        if pixels {
+            for (i, name) in ["last", "golden", "altref"].iter().enumerate() {
+                let slot = hdr.ref_frame_idx[i] as usize;
+                if slot >= self.refs.len() || hdr.ref_frame_idx[i] >= 8 {
+                    return Err(corrupt("vp9 inter names a reference slot past the DPB"));
+                }
+                let Some(p) = self.refs[slot].as_ref() else {
+                    return Err(Error::corrupt(format!(
+                        "vp9 inter reference `{name}` names empty slot {slot}"
+                    )));
+                };
+                if p.width as u32 != hdr.width || p.height as u32 != hdr.height {
+                    return Err(Error::unsupported(
+                        "vp9 inter reference size change",
+                        format!(
+                            "reference `{name}` in slot {slot} is {}x{} but this frame is {}x{}; \
+                             reference-frame scaling is not ported",
+                            p.width, p.height, hdr.width, hdr.height
+                        ),
+                    ));
+                }
+            }
+            if hdr.width % 2 != 0 || hdr.height % 2 != 0 {
+                return Err(Error::unsupported(
+                    "vp9 inter odd frame dimensions",
+                    format!(
+                        "{}x{}: the reference chroma planes of an odd-sized frame are \
+                         stored at floor(w/2) but the predictor reads libvpx's \
+                         uv_crop_width = (w+1)/2",
+                        hdr.width, hdr.height
+                    ),
+                ));
+            }
+            let width = hdr.width as usize;
+            let height = hdr.height as usize;
+            let aw = width.div_ceil(64) * 64;
+            let ah = height.div_ceil(64) * 64;
+            self.planes = Some(Planes {
+                y: vec![128u8; aw * ah],
+                u: vec![128u8; aw / 2 * ah / 2],
+                v: vec![128u8; aw / 2 * ah / 2],
+                ys: aw,
+                uvs: aw / 2,
+                aw,
+                ah,
+            });
+        }
 
         let hdr_start = hdr.uncompressed_header_size as usize;
         if crate::trace_enabled() {
@@ -368,15 +484,33 @@ impl Decoder {
             }
         }
 
-        // The loop-filter grids are never written on this path (no
-        // reconstruction), but the walk's signature carries them.
+        // The loop-filter grids are only written when pixels are built, but
+        // the walk's signature carries them.
         let mut grids = LfGrids {
             level8: vec![0; mi_cols * mi_rows],
             blk: vec![(0u8, 0u32, 0u32); mi_cols * mi_rows],
             otx: vec![0; mi_cols * mi_rows],
+            skip_inter: vec![false; mi_cols * mi_rows],
             mi_cols,
             mi_rows,
         };
+        // `above_context` / `above_seg_context` and the mi grid are
+        // FRAME-scoped in libvpx (memset once per frame before the tile loop,
+        // `vp9_decodeframe.c:2079-2083`; indexed by absolute mi_row/mi_col by
+        // `set_skip_context`). Tile rows are disjoint in COLUMN only, so a
+        // tile row k > 0 reads above state written by tile row k - 1 — the
+        // same invariant the keyframe path documents. `above_context` is
+        // sized by `mi_cols_aligned_to_sb`: a TX_32X32 block indexes up to 8
+        // 4x4 units past the last mi col.
+        let aligned_cols = mi_cols.div_ceil(SB_MI) * SB_MI;
+        let mut ectx = [
+            PlaneContexts::new(aligned_cols * 2),
+            PlaneContexts::new(aligned_cols),
+            PlaneContexts::new(aligned_cols),
+        ];
+        ectx.iter_mut().for_each(|p| p.above.fill(0));
+        let mut mi = MiState::new(mi_cols, mi_rows);
+        mi.above_seg.fill(0);
         let mut ti = 0usize;
         for tr in 0..tile_rows {
             let row_lo = ((sb64_rows * tr) >> hdr.tile_info.rows_log2) * SB_MI;
@@ -393,15 +527,10 @@ impl Decoder {
                 }
                 let mut r = crate::bool::BoolDecoder::new(tiles[ti])?;
                 ti += 1;
-                let mut ectx = [
-                    PlaneContexts::new(mi_cols * 2),
-                    PlaneContexts::new(mi_cols),
-                    PlaneContexts::new(mi_cols),
-                ];
-                let mut mi = MiState::new(mi_cols, mi_rows);
-                ectx.iter_mut().for_each(|p| p.above.fill(0));
-                mi.above_seg.fill(0);
                 for sb_row in (row_lo..row_hi).step_by(SB_MI) {
+                    // Left entropy/partition contexts are zeroed at the start
+                    // of every superblock row (the SB row's left edge has no
+                    // neighbours); the above contexts stay frame-scoped.
                     ectx.iter_mut().for_each(|p| p.left = [0; 32]);
                     mi.left_seg = [0; 32];
                     for sb_col in (col_lo..col_hi).step_by(SB_MI) {
@@ -417,6 +546,7 @@ impl Decoder {
                             4,
                             col_lo,
                             ch.tx_mode,
+                            pixels,
                         )?;
                     }
                 }
@@ -454,7 +584,56 @@ impl Decoder {
                 self.ctx.partition[13]
             );
         }
-        Ok(())
+
+        if !pixels {
+            return Ok(None);
+        }
+
+        // Loop filter post-pass: same extents as the keyframe path, but the
+        // per-cell level comes from the block's own reference and mode class
+        // (`get_filter_level`, vp9_loopfilter.c:249).
+        if hdr.loop_filter.level > 0 && std::env::var_os("EC_VP9_SKIP_LF").is_none() {
+            let p = self.planes.as_mut().expect("frame scratch");
+            let (vw, vh) = (mi_cols * 8, mi_rows * 8);
+            grids.filter_frame(
+                &mut p.y,
+                p.ys,
+                &mut p.u,
+                &mut p.v,
+                p.uvs,
+                vw,
+                vh,
+                vh / 2,
+                hdr.loop_filter.sharpness,
+            );
+        }
+
+        let pic = self.take_picture(hdr);
+        let frame = RefFrame {
+            planes: std::sync::Arc::new(self.planes.take().expect("frame scratch")),
+            width: hdr.width as u16,
+            height: hdr.height as u16,
+        };
+
+        // Reference refresh (spec 8.10 / `swap_frame_buffers`): bit i of
+        // `refresh_frame_flags` replaces slot i with the frame just decoded —
+        // the LOOP-FILTERED frame, which is what a later frame's prediction
+        // reads.
+        for slot in 0..8 {
+            if hdr.refresh_frame_flags & (1 << slot) != 0 {
+                self.refs[slot] = Some(frame.clone());
+            }
+        }
+        Ok(if hdr.show_frame { Some(pic) } else { None })
+    }
+
+    /// Crop the frame scratch to a [`Picture`].
+    fn take_picture(&self, hdr: &FrameHeader) -> Picture {
+        crop_picture(
+            self.planes.as_ref().expect("frame scratch"),
+            hdr.width as u16,
+            hdr.height as u16,
+        )
     }
 
     /// One inter block's syntax (`read_inter_frame_mode_info` + the MV field
@@ -488,7 +667,7 @@ impl Decoder {
             ifs: w.ifs,
             sign_bias: w.sign_bias,
             allow_hp: hdr.allow_high_precision_mv,
-            frame_interp: hdr.interpolation_filter as u8,
+            frame_interp: interp_filter_of(hdr),
             tx_mode,
             mi_rows: mi.mi_rows,
             mi_cols: mi.mi_cols,
@@ -563,35 +742,15 @@ impl Decoder {
         bw: usize,
         bh: usize,
     ) -> Result<()> {
-        let n4w = if sb_type < 3 {
-            [2, 1, 1]
-        } else {
-            [bw * 2, bw, bw]
-        };
-        let n4h = if sb_type < 3 {
-            [2, 1, 1]
-        } else {
-            [bh * 2, bh, bh]
-        };
+        let n4w = plane_n4_w(sb_type, bw);
+        let n4h = plane_n4_h(sb_type, bh);
         if info.skip {
             // dec_reset_skip_context
-            for plane in 0..3usize {
-                let s = usize::from(plane != 0);
-                let offx = (col << 1) >> s;
-                let offy = (row << 1) >> s;
-                for i in 0..n4w[plane] {
-                    ectx[plane].above[offx + i] = 0;
-                }
-                let lrows = 32usize >> s;
-                for i in 0..n4h[plane].min(lrows) {
-                    ectx[plane].left[(offy + i) % lrows] = 0;
-                }
-            }
+            reset_skip_context(ectx, row, col, sb_type, n4w, n4h);
             return Ok(());
         }
         let mb_to_right = ((mi.mi_cols as isize - bw as isize - col as isize) * 64) as i32;
         let mb_to_bottom = ((mi.mi_rows as isize - bh as isize - row as isize) * 64) as i32;
-        let lossless = hdr.quantization.lossless();
         for plane in 0..3usize {
             let s = usize::from(plane != 0);
             let tx_size = if plane == 0 {
@@ -606,62 +765,223 @@ impl Decoder {
                 (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
             for brow in (0..max_blocks_high).step_by(step) {
                 for bcol in (0..max_blocks_wide).step_by(step) {
-                    let tx_type = if plane != 0 || lossless || info.is_inter {
-                        DCT_DCT
-                    } else {
-                        MODE_TO_TXTYPE_LOOKUP[info.mode as usize] as usize
-                    };
-                    let (scan, nb) = scan_for(tx_size, tx_type);
-                    let q = hdr.segment_dequant(info.segment as usize);
-                    let dequant: [i16; 2] = if plane == 0 {
-                        [q.luma_dc, q.luma_ac]
-                    } else {
-                        [q.chroma_dc, q.chroma_ac]
-                    };
-                    let ptype = usize::from(plane != 0);
-                    let ax = ((col << 1) >> s) + bcol;
-                    let lrows = 32usize >> s;
-                    let ay = (((row << 1) >> s) + brow) % lrows;
-                    let nblocks = 1usize << tx_size;
-                    let ctx_in = usize::from(ectx[plane].above[ax..ax + nblocks].iter().any(|&v| v != 0))
-                        + usize::from(ectx[plane].left[ay..ay + nblocks].iter().any(|&v| v != 0));
-                    let coef = decode_coefs(
+                    let _ = decode_inter_tx_tokens(
                         r,
-                        ptype,
-                        tx_size,
-                        &dequant,
-                        ctx_in,
-                        scan,
-                        nb,
-                        &self.ctx.coef[tx_size],
-                        info.is_inter,
-                        (0, 0),
+                        ectx,
+                        hdr,
+                        info,
+                        &self.ctx,
                         plane,
+                        row,
+                        col,
+                        brow,
+                        bcol,
+                        tx_size,
+                        sb_type,
+                        bw,
+                        bh,
+                        mb_to_right,
+                        mb_to_bottom,
                     );
-                    // vp9_decode_block_tokens context write-back.
-                    let n4w_s = bw * 2 >> s;
-                    let n4h_s = bh * 2 >> s;
-                    let maxw =
-                        (n4w_s as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
-                    let maxh =
-                        (n4h_s as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
-                    let eob_pos = u64::from(coef.eob > 0);
-                    let shift_a = if maxw > 0 && nblocks + bcol > maxw {
-                        (nblocks - (maxw - bcol)) * 8
-                    } else {
-                        0
-                    };
-                    let shift_l = if maxh > 0 && nblocks + brow > maxh {
-                        (nblocks - (maxh - brow)) * 8
-                    } else {
-                        0
-                    };
-                    let spread_a = (eob_pos * 0x0101_0101_0101_0101) >> shift_a;
-                    let spread_l = (eob_pos * 0x0101_0101_0101_0101) >> shift_l;
-                    for k in 0..nblocks {
-                        ectx[plane].above[ax + k] = (spread_a >> (8 * k)) as u8;
-                        ectx[plane].left[ay + k] = (spread_l >> (8 * k)) as u8;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `decode_block`'s inter arm with pixels (`vp9_decodeframe.c:990-1044`):
+    /// `dec_build_inter_predictors_sb` for the whole block, then
+    /// `reconstruct_inter_block` per transform block. Intra blocks inside an
+    /// inter frame take the intra path (`:964-989`).
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_inter_pixels(
+        &mut self,
+        r: &mut crate::bool::BoolDecoder,
+        ectx: &mut [PlaneContexts; 3],
+        grids: &mut LfGrids,
+        hdr: &FrameHeader,
+        info: &MiInfo,
+        row: usize,
+        col: usize,
+        sb_type: usize,
+        bw: usize,
+        bh: usize,
+        mi: &mut MiState,
+        tile_col_start: usize,
+    ) -> Result<()> {
+        let x_mis = bw.min(mi.mi_cols - col);
+        let y_mis = bh.min(mi.mi_rows - row);
+        let n4w = plane_n4_w(sb_type, bw);
+        let n4h = plane_n4_h(sb_type, bh);
+        let mb_to_right = ((mi.mi_cols as isize - bw as isize - col as isize) * 64) as i32;
+        let mb_to_bottom = ((mi.mi_rows as isize - bh as isize - row as isize) * 64) as i32;
+
+        // `get_filter_level` (vp9_loopfilter.c:249):
+        // `lvl[segment_id][mi->ref_frame[0]][mode_lf_lut[mi->mode]]`, with
+        // `lvl` built by `vp9_loop_filter_frame_init` from the frame level,
+        // the per-reference deltas and the per-mode-class deltas.
+        let levels = hdr.loop_filter_levels(info.segment as usize);
+        let ref0 = if info.is_inter {
+            info.ref_frame[0].clamp(0, 3) as usize
+        } else {
+            // An intra block inside an inter frame: `mi->ref_frame[0]` is
+            // INTRA_FRAME and its mode is an intra mode, so the mode class is
+            // 0 and the reference slot is intra's.
+            0
+        };
+        let level = levels[ref0][mode_lf_lut(info.mode)];
+        for dy in 0..y_mis {
+            for dx in 0..x_mis {
+                let cell = (row + dy) * mi.mi_cols + col + dx;
+                grids.level8[cell] = level;
+                grids.blk[cell] = (sb_type as u8, row as u32, col as u32);
+                grids.otx[cell] = if sb_type < 3 {
+                    TX_4X4 as u8
+                } else {
+                    info.tx_size as u8
+                };
+                // `build_masks`'s early return is gated on
+                // `mi->skip && is_inter_block(mi)` — a skipped inter block
+                // keeps ONLY the above/left prediction masks.
+                grids.skip_inter[cell] = info.is_inter && info.skip;
+            }
+        }
+
+        // `if (mi->skip) dec_reset_skip_context(xd);` — libvpx does this at the
+        // top of `decode_block` (decodeframe.c:960), BEFORE the intra/inter
+        // split, so skipped intra blocks inside an inter frame reset too.
+        if info.skip {
+            reset_skip_context(ectx, row, col, sb_type, n4w, n4h);
+        }
+
+        if !info.is_inter {
+            // `predict_and_reconstruct_intra_block` per transform block.
+            for plane in 0..3usize {
+                let s = usize::from(plane != 0);
+                let tx_size = if plane == 0 {
+                    info.tx_size
+                } else {
+                    get_uv_tx_size(info.tx_size, sb_type)
+                };
+                let step = 1usize << tx_size;
+                let max_blocks_wide =
+                    (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+                let max_blocks_high =
+                    (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+                for brow in (0..max_blocks_high).step_by(step) {
+                    for bcol in (0..max_blocks_wide).step_by(step) {
+                        self.predict_and_reconstruct(
+                            r,
+                            ectx,
+                            hdr,
+                            info,
+                            plane,
+                            row,
+                            col,
+                            brow,
+                            bcol,
+                            tx_size,
+                            sb_type,
+                            bw,
+                            bh,
+                            mb_to_right,
+                            mb_to_bottom,
+                            // Intra prediction's left availability is
+                            // tile-scoped (`tile->mi_col_start`), which the
+                            // inter walk passes as the tile's first mi col.
+                            tile_col_start,
+                        )?;
                     }
+                }
+            }
+            return Ok(());
+        }
+
+        // Prediction: `dec_build_inter_predictors_sb`, every reference, every
+        // plane, before any token is read.
+        {
+            let planes = self.planes.as_mut().expect("frame scratch");
+            let refs = &self.refs;
+            let scratch = &mut self.mc_scratch;
+            let temp = &mut self.mc_temp;
+            for plane in 0..3usize {
+                inter_predict_plane(
+                    planes, refs, scratch, temp, hdr, info, plane, row, col, &n4w, &n4h,
+                    mb_to_right, mb_to_bottom, sb_type,
+                )?;
+            }
+        }
+
+        if info.skip {
+            return Ok(());
+        }
+
+        // Reconstruction: `reconstruct_inter_block` per transform block.
+        let mut eobtotal = 0usize;
+        for plane in 0..3usize {
+            let s = usize::from(plane != 0);
+            let tx_size = if plane == 0 {
+                info.tx_size
+            } else {
+                get_uv_tx_size(info.tx_size, sb_type)
+            };
+            let step = 1usize << tx_size;
+            let max_blocks_wide =
+                (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+            let max_blocks_high =
+                (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+            for brow in (0..max_blocks_high).step_by(step) {
+                for bcol in (0..max_blocks_wide).step_by(step) {
+                    let coef = decode_inter_tx_tokens(
+                        r,
+                        ectx,
+                        hdr,
+                        info,
+                        &self.ctx,
+                        plane,
+                        row,
+                        col,
+                        brow,
+                        bcol,
+                        tx_size,
+                        sb_type,
+                        bw,
+                        bh,
+                        mb_to_right,
+                        mb_to_bottom,
+                    );
+                    eobtotal += coef.eob;
+                    if coef.eob == 0 {
+                        continue;
+                    }
+                    // `inverse_transform_block_inter`: inter blocks always use
+                    // the DEFAULT scan and DCT_DCT (`reconstruct_inter_block`,
+                    // decodeframe.c:413).
+                    let planes = self.planes.as_mut().expect("frame scratch");
+                    let stride = planes.dims(plane).0;
+                    let x0 = ((col * 8) >> s) + bcol * 4;
+                    let y0 = ((row * 8) >> s) + brow * 4;
+                    let dst_off = y0 * stride + x0;
+                    let (data, _) = planes.plane(plane);
+                    inverse_transform_add(
+                        tx_size,
+                        DCT_DCT,
+                        &coef.coeffs,
+                        data,
+                        dst_off,
+                        stride,
+                        hdr.quantization.lossless(),
+                    );
+                }
+            }
+        }
+
+        // `if (!less8x8 && eobtotal == 0) mi->skip = 1;  // skip loopfilter`
+        // (decodeframe.c:1043).
+        if sb_type >= 3 && eobtotal == 0 {
+            for dy in 0..y_mis {
+                for dx in 0..x_mis {
+                    grids.skip_inter[(row + dy) * mi.mi_cols + col + dx] = true;
                 }
             }
         }
@@ -695,9 +1015,7 @@ impl Decoder {
                 hdr.uncompressed_header_size as usize + hdr.header_size_in_bytes as usize
             });
         let tail: Vec<u8> = frame[tail_start..].to_vec();
-        let res = self.decode_keyframe_inner(hdr, tx_mode, &tail);
-        self.planes = None;
-        res
+        self.decode_keyframe_inner(hdr, tx_mode, &tail)
     }
 
     fn decode_keyframe_inner(
@@ -706,8 +1024,6 @@ impl Decoder {
         tx_mode: u8,
         tail: &[u8],
     ) -> Result<Picture> {
-        let width = hdr.width as usize;
-        let height = hdr.height as usize;
         let mi_cols = hdr.mi_cols() as usize;
         let mi_rows = hdr.mi_rows() as usize;
         let sb64_cols = mi_cols.div_ceil(SB_MI);
@@ -747,6 +1063,7 @@ impl Decoder {
             level8: vec![0; mi_cols * mi_rows],
             blk: vec![(0u8, 0u32, 0u32); mi_cols * mi_rows],
             otx: vec![0; mi_cols * mi_rows],
+            skip_inter: vec![false; mi_cols * mi_rows],
             mi_cols,
             mi_rows,
         };
@@ -819,6 +1136,7 @@ impl Decoder {
                             4,
                             col_lo,
                             tx_mode,
+                            true,
                         )?;
                     }
                 }
@@ -845,25 +1163,7 @@ impl Decoder {
             );
         }
 
-        let crop = |src: &[u8], stride: usize, w: usize, h: usize| -> Vec<u8> {
-            let mut out = Vec::with_capacity(w * h);
-            for row in 0..h {
-                out.extend_from_slice(&src[row * stride..row * stride + w]);
-            }
-            out
-        };
-        let planes = self.planes.as_ref().expect("frame scratch");
-        Ok(Picture {
-            y: crop(&planes.y, planes.ys, width, height),
-            u: crop(&planes.u, planes.uvs, width / 2, height / 2),
-            v: crop(&planes.v, planes.uvs, width / 2, height / 2),
-            width: width as u16,
-            height: height as u16,
-            // The crop above packs rows: `stride` describes the RETURNED
-            // buffers, not the aligned decode buffer (`aw`).
-            stride: width,
-            uv_stride: width / 2,
-        })
+        Ok(self.take_picture(hdr))
     }
 
     /// `decode_partition` (decodeframe.c:1173).
@@ -881,6 +1181,10 @@ impl Decoder {
         n4: usize,
         tile_col_start: usize,
         tx_mode: u8,
+        // Whether this walk reconstructs pixels. Consulted by the inter
+        // branch only: a keyframe always reconstructs its intra blocks, and
+        // the syntax-only inter walk parses tokens without predicting.
+        pixels: bool,
     ) -> Result<()> {
         if row >= mi.mi_rows || col >= mi.mi_cols {
             return Ok(());
@@ -924,6 +1228,7 @@ impl Decoder {
                 1,
                 tile_col_start,
                 tx_mode,
+                pixels,
             )?;
         } else {
             match partition {
@@ -941,6 +1246,7 @@ impl Decoder {
                     n4,
                     tile_col_start,
                     tx_mode,
+                    pixels,
                 )?,
                 1 => {
                     self.decode_block(
@@ -957,6 +1263,7 @@ impl Decoder {
                         n8,
                         tile_col_start,
                         tx_mode,
+                        pixels,
                     )?;
                     if has_rows {
                         self.decode_block(
@@ -973,6 +1280,7 @@ impl Decoder {
                             n8,
                             tile_col_start,
                             tx_mode,
+                            pixels,
                         )?;
                     }
                 }
@@ -991,6 +1299,7 @@ impl Decoder {
                         n4,
                         tile_col_start,
                         tx_mode,
+                        pixels,
                     )?;
                     if has_cols {
                         self.decode_block(
@@ -1007,6 +1316,7 @@ impl Decoder {
                             n4,
                             tile_col_start,
                             tx_mode,
+                            pixels,
                         )?;
                     }
                 }
@@ -1029,6 +1339,7 @@ impl Decoder {
                             n8,
                             tile_col_start,
                             tx_mode,
+                            pixels,
                         )?;
                     }
                 }
@@ -1057,6 +1368,7 @@ impl Decoder {
         bhl: usize,
         tile_col_start: usize,
         tx_mode: u8,
+        pixels: bool,
     ) -> Result<()> {
         let bw = 1 << (bwl - 1);
         let bh = 1 << (bhl - 1);
@@ -1093,9 +1405,20 @@ impl Decoder {
             )?
         };
         if hdr.frame_type != FrameType::Key {
-            // Inter syntax only: tokens keep the entropy stream aligned, the
-            // block lands in the mode grid, and no pixel is touched.
-            self.decode_inter_block_tokens(r, mi, ectx, hdr, &info, row, col, sb_type, bw, bh)?;
+            if pixels {
+                // Full inter decode: prediction, tokens, residual. The
+                // per-cell loop-filter level is the block's own reference and
+                // mode class (`get_filter_level`), so the grids are written
+                // inside the reconstruction rather than from `level_of_seg`.
+                self.reconstruct_inter_pixels(
+                    r, ectx, grids, hdr, &info, row, col, sb_type, bw, bh, mi,
+                    tile_col_start,
+                )?;
+            } else {
+                // Inter syntax only: tokens keep the entropy stream aligned,
+                // the block lands in the mode grid, and no pixel is touched.
+                self.decode_inter_block_tokens(r, mi, ectx, hdr, &info, row, col, sb_type, bw, bh)?;
+            }
             for dy in 0..y_mis {
                 for dx in 0..x_mis {
                     if crate::mvdbg2_enabled()
@@ -1462,5 +1785,313 @@ fn bsize_of_n4(n4: usize) -> usize {
         2 => 6,  // BLOCK_16X16
         1 => 3,  // BLOCK_8X8
         _ => 0,  // BLOCK_4X4 (recursion never reaches n4 == 0)
+    }
+}
+
+/// Crop an aligned plane set to a displayable [`Picture`]: rows are packed to
+/// the visible width, so `stride` describes the RETURNED buffers, not the
+/// aligned decode buffer.
+fn crop_picture(planes: &Planes, width: u16, height: u16) -> Picture {
+    let (w, h) = (width as usize, height as usize);
+    let crop = |src: &[u8], stride: usize, cw: usize, ch: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(cw * ch);
+        for row in 0..ch {
+            out.extend_from_slice(&src[row * stride..row * stride + cw]);
+        }
+        out
+    };
+    Picture {
+        y: crop(&planes.y, planes.ys, w, h),
+        u: crop(&planes.u, planes.uvs, w / 2, h / 2),
+        v: crop(&planes.v, planes.uvs, w / 2, h / 2),
+        width,
+        height,
+        stride: w,
+        uv_stride: w / 2,
+    }
+}
+
+/// `pd->n4_w` (`set_plane_n4`, decodeframe.c:809): the plane block's width in
+/// its own 4x4 units. Sub-8x8 shapes occupy a whole 8x8 mi cell
+/// (`set_plane_n4(xd, bw=1, bh=1)`) so luma walks 2x2 and chroma 1x1.
+fn plane_n4_w(sb_type: usize, bw: usize) -> [usize; 3] {
+    if sb_type < 3 {
+        [2, 1, 1]
+    } else {
+        [bw * 2, bw, bw]
+    }
+}
+
+/// `pd->n4_h`, the height twin of [`plane_n4_w`].
+fn plane_n4_h(sb_type: usize, bh: usize) -> [usize; 3] {
+    if sb_type < 3 {
+        [2, 1, 1]
+    } else {
+        [bh * 2, bh, bh]
+    }
+}
+
+/// `dec_reset_skip_context` (`vp9_decodeframe.c:800`).
+fn reset_skip_context(
+    ectx: &mut [PlaneContexts; 3],
+    row: usize,
+    col: usize,
+    sb_type: usize,
+    n4w: [usize; 3],
+    n4h: [usize; 3],
+) {
+    let _ = sb_type;
+    for plane in 0..3usize {
+        let s = usize::from(plane != 0);
+        let offx = (col << 1) >> s;
+        let offy = (row << 1) >> s;
+        for i in 0..n4w[plane] {
+            ectx[plane].above[offx + i] = 0;
+        }
+        let lrows = 32usize >> s;
+        for i in 0..n4h[plane].min(lrows) {
+            ectx[plane].left[(offy + i) % lrows] = 0;
+        }
+    }
+}
+
+/// `mode_lf_lut` (`vp9/common/vp9_loopfilter.c:223`):
+/// `{0 × INTRA_MODES, 1, 1, 0, 1}` — NEARESTMV, NEARMV and NEWMV take the
+/// inter mode delta, ZEROMV does not, and intra modes never do.
+fn mode_lf_lut(mode: u8) -> usize {
+    match mode {
+        10 | 11 | 13 => 1,
+        _ => 0,
+    }
+}
+
+/// One inter transform block's tokens plus the context write-back
+/// (`vp9_decode_block_tokens`, `decodeframe.c:414`). Inter blocks always use
+/// the DEFAULT scan and `DCT_DCT`.
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_tx_tokens(
+    r: &mut crate::bool::BoolDecoder,
+    ectx: &mut [PlaneContexts; 3],
+    hdr: &FrameHeader,
+    info: &MiInfo,
+    fc: &FrameContext,
+    plane: usize,
+    row: usize,
+    col: usize,
+    brow: usize,
+    bcol: usize,
+    tx_size: usize,
+    sb_type: usize,
+    bw: usize,
+    bh: usize,
+    mb_to_right: i32,
+    mb_to_bottom: i32,
+) -> crate::tokens::CoeffBlock {
+    let s = usize::from(plane != 0);
+    // `predict_and_reconstruct_intra_block` (decodeframe.c:320-345): the luma
+    // mode of a sub-8x8 block is the SUB-BLOCK's, and an intra block inside an
+    // inter frame picks its tx type from that mode — `reconstruct_inter_block`
+    // hard-codes DCT_DCT instead, which is why the inter guard is here.
+    let tx_type = if plane != 0 || hdr.quantization.lossless() || info.is_inter {
+        DCT_DCT
+    } else {
+        let mode = if sb_type < 3 {
+            info.bmi[(brow << 1) + bcol]
+        } else {
+            info.mode
+        };
+        MODE_TO_TXTYPE_LOOKUP[mode as usize] as usize
+    };
+    let (scan, nb) = scan_for(tx_size, tx_type);
+    let q = hdr.segment_dequant(info.segment as usize);
+    let dequant: [i16; 2] = if plane == 0 {
+        [q.luma_dc, q.luma_ac]
+    } else {
+        [q.chroma_dc, q.chroma_ac]
+    };
+    let ptype = usize::from(plane != 0);
+    let ax = ((col << 1) >> s) + bcol;
+    let lrows = 32usize >> s;
+    let ay = (((row << 1) >> s) + brow) % lrows;
+    let nblocks = 1usize << tx_size;
+    let ctx_in = usize::from(ectx[plane].above[ax..ax + nblocks].iter().any(|&v| v != 0))
+        + usize::from(ectx[plane].left[ay..ay + nblocks].iter().any(|&v| v != 0));
+    if crate::tokdbg_enabled() {
+        eprintln!(
+            "TDB row={row} col={col} plane={plane} brow={brow} bcol={bcol} tx={tx_size} sbt={sb_type} ptype={ptype} inter={} mode={} tt={tx_type} ax={ax} ay={ay} cin={ctx_in} a={:?} l={:?}",
+            u8::from(info.is_inter),
+            info.mode,
+            &ectx[plane].above[ax..ax + nblocks],
+            &ectx[plane].left[ay..ay + nblocks],
+        );
+    }
+    let coef = decode_coefs(
+        r,
+        ptype,
+        tx_size,
+        &dequant,
+        ctx_in,
+        scan,
+        nb,
+        &fc.coef[tx_size],
+        info.is_inter,
+        (0, 0),
+        plane,
+    );
+    // vp9_decode_block_tokens context write-back (v1.15 edge shifts).
+    let n4w_s = bw * 2 >> s;
+    let n4h_s = bh * 2 >> s;
+    let maxw = (n4w_s as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+    let maxh = (n4h_s as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+    let eob_pos = u64::from(coef.eob > 0);
+    let shift_a = if maxw > 0 && nblocks + bcol > maxw {
+        (nblocks - (maxw - bcol)) * 8
+    } else {
+        0
+    };
+    let shift_l = if maxh > 0 && nblocks + brow > maxh {
+        (nblocks - (maxh - brow)) * 8
+    } else {
+        0
+    };
+    let spread_a = (eob_pos * 0x0101_0101_0101_0101) >> shift_a;
+    let spread_l = (eob_pos * 0x0101_0101_0101_0101) >> shift_l;
+    for k in 0..nblocks {
+        ectx[plane].above[ax + k] = (spread_a >> (8 * k)) as u8;
+        ectx[plane].left[ay + k] = (spread_l >> (8 * k)) as u8;
+    }
+    coef
+}
+
+/// `dec_build_inter_predictors_sb` (`vp9_decodeframe.c:731`) for one plane:
+/// every reference's prediction for one block, in reference order (compound
+/// blocks average the second into the first).
+#[allow(clippy::too_many_arguments)]
+fn inter_predict_plane(
+    planes: &mut Planes,
+    refs: &[Option<RefFrame>; 8],
+    scratch: &mut Vec<u8>,
+    temp: &mut Vec<u8>,
+    hdr: &FrameHeader,
+    info: &MiInfo,
+    plane: usize,
+    row: usize,
+    col: usize,
+    n4w: &[usize; 3],
+    n4h: &[usize; 3],
+    mb_to_right: i32,
+    mb_to_bottom: i32,
+    sb_type: usize,
+) -> Result<()> {
+    let s = usize::from(plane != 0);
+    let ss_x = s;
+    let ss_y = s;
+    let pw = n4w[plane] * 4;
+    let ph = n4h[plane] * 4;
+    let mb_left = -((col as i32) * 64);
+    let mb_top = -((row as i32) * 64);
+    let is_compound = info.ref_frame[1] > crate::inter::INTRA_FRAME;
+    let refs_used = 1 + usize::from(is_compound);
+    let kernel = usize::from(info.interp_filter);
+    let dst_stride = planes.dims(plane).0;
+    for rf in 0..refs_used {
+        let ref_name = info.ref_frame[rf];
+        let slot = hdr.ref_frame_idx[(ref_name - 1) as usize] as usize;
+        let Some(ref_frame) = refs[slot].as_ref() else {
+            return Err(corrupt("vp9 inter prediction read an empty reference slot"));
+        };
+        let (ref_data, ref_stride) = ref_frame.planes.plane_ref(plane);
+        let refp = RefPlane {
+            data: ref_data,
+            stride: ref_stride,
+            width: (ref_frame.width as usize) >> s,
+            height: (ref_frame.height as usize) >> s,
+        };
+        if sb_type < 3 {
+            // libvpx builds one 4x4 prediction per sub-block, with the MV from
+            // `average_split_mvs` (luma: the sub-block's own MV; 4:2:0 chroma:
+            // the q4-rounded average of the four).
+            let n4x = n4w[plane];
+            let n4y = n4h[plane];
+            for y in 0..n4y {
+                for xx in 0..n4x {
+                    let i = y * n4x + xx;
+                    let mv = if plane == 0 {
+                        split_mv(&info.bmi_mv, i, rf)
+                    } else {
+                        average_split_mvs_chroma(&info.bmi_mv, rf)
+                    };
+                    let (data, _) = planes.plane(plane);
+                    let dst_off = (((row * 8) >> s) + y * 4) * dst_stride
+                        + ((col * 8) >> s)
+                        + xx * 4;
+                    build_inter_predictors(
+                        &mut data[dst_off..],
+                        dst_stride,
+                        &refp,
+                        col,
+                        row,
+                        xx * 4,
+                        y * 4,
+                        4,
+                        4,
+                        mv,
+                        mb_left,
+                        mb_to_right,
+                        mb_top,
+                        mb_to_bottom,
+                        ss_x,
+                        ss_y,
+                        kernel,
+                        rf == 1,
+                        scratch,
+                        temp,
+                    );
+                }
+            }
+        } else {
+            let (data, _) = planes.plane(plane);
+            let dst_off = ((row * 8) >> s) * dst_stride + ((col * 8) >> s);
+            build_inter_predictors(
+                &mut data[dst_off..],
+                dst_stride,
+                &refp,
+                col,
+                row,
+                0,
+                0,
+                pw,
+                ph,
+                info.mv[rf],
+                mb_left,
+                mb_to_right,
+                mb_top,
+                mb_to_bottom,
+                ss_x,
+                ss_y,
+                kernel,
+                rf == 1,
+                scratch,
+                temp,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `read_interp_filter` (`vp9_decodeframe.c:1482`): the header's filter is a
+/// literal index through `literal_to_filter[] = {EIGHTTAP_SMOOTH, EIGHTTAP,
+/// EIGHTTAP_SHARP, BILINEAR}` — the spec's literal order is NOT libvpx's
+/// filter numbering (`#define EIGHTTAP 0`, `EIGHTTAP_SMOOTH 1`,
+/// `EIGHTTAP_SHARP 2`, `BILINEAR 3`), and `vp9_filter_kernels` (the kernel
+/// table) is indexed by the latter. A switchable frame stores SWITCHABLE (4)
+/// and picks per block, where the tree's leaves already use libvpx numbering.
+fn interp_filter_of(hdr: &FrameHeader) -> u8 {
+    const LITERAL_TO_FILTER: [u8; 4] = [1, 0, 2, 3];
+    let v = hdr.interpolation_filter as u8;
+    if v == crate::inter::SWITCHABLE {
+        v
+    } else {
+        LITERAL_TO_FILTER[v as usize]
     }
 }

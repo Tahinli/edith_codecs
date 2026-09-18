@@ -117,30 +117,44 @@ fn lossless_64_matches_ffmpeg() {
 }
 
 #[test]
-fn inter_is_named_unsupported() {
+fn inter_stream_decodes_and_matches_ffmpeg() {
+    // The altref clip is a real 60-frame inter stream with hidden frames; it
+    // used to be the "inter is refused by name" witness. Inter frames decode
+    // now, so the witness is the pixels: every shown frame must match
+    // ffmpeg's libvpx output byte for byte.
     let Some(dir) = ivf::fixture_dir() else { return };
-    // The altref clip contains hidden (inter) frames.
     let path = dir.join("vp9-superframe-altref.ivf");
     let bytes = std::fs::read(&path).unwrap();
-    let (_, _, _, frames) = ivf::parse_ivf(&bytes);
+    let (_, w, h, frames) = ivf::parse_ivf(&bytes);
+    let (w, h) = (w as usize, h as usize);
+    let expected = ffmpeg_raw_yuv(&path);
+    let frame_bytes = w * h + 2 * (w / 2) * (h / 2);
     let mut decoder = Decoder::new();
-    let mut saw_inter = false;
-    let mut saw_named = false;
-    for frame in &frames {
-        match decoder.decode(&frame.data) {
-            Ok(_) => {}
-            Err(e) => {
-                saw_inter = true;
-                let msg = format!("{e}");
-                if msg.contains("vp9 inter") {
-                    saw_named = true;
-                }
-                break;
+    let mut shown = 0usize;
+    let mut hidden = 0usize;
+    for (i, frame) in frames.iter().enumerate() {
+        match decoder.decode(&frame.data).expect("every frame decodes") {
+            Some(pic) => {
+                let off = shown * frame_bytes;
+                let mut got = Vec::with_capacity(frame_bytes);
+                got.extend_from_slice(&pic.y);
+                got.extend_from_slice(&pic.u);
+                got.extend_from_slice(&pic.v);
+                assert_eq!(
+                    got,
+                    expected[off..off + frame_bytes],
+                    "frame {i}: pixel mismatch"
+                );
+                shown += 1;
             }
+            None => hidden += 1,
         }
     }
-    assert!(saw_inter, "the altref fixture must contain a refused frame");
-    assert!(saw_named, "the refusal must name 'vp9 inter'");
+    assert!(shown >= 2, "the stream shows frames");
+    // The chunk-level hidden altref frames are consumed by the decoder's
+    // superframe split, so every IVF chunk here yields one shown frame.
+    assert_eq!(hidden, 0, "superframe chunks show exactly one frame each");
+    assert_eq!(shown * frame_bytes, expected.len());
 }
 
 #[test]

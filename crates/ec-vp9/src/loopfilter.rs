@@ -20,6 +20,26 @@
 
 use crate::tables::*;
 
+/// `LFTRACE` gate, optionally limited to one frame by `EC_VP9_LF_FRAME`
+/// (the n-th `filter_frame` call of the process — the decode order's frame
+/// index). The oracle's own LF trace is gated the same way, which is what lets
+/// the two edge lists be diffed per frame.
+fn lftrace_on() -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if std::env::var_os("LFTRACE").is_none() {
+        return false;
+    }
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    match std::env::var("EC_VP9_LF_FRAME")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(f) => f == n,
+        None => true,
+    }
+}
+
 /// `vp9_loopfilter.c` UV mask tables (BLOCK_SIZES indexed 4X4..64X64).
 const UV_LEFT_PRED: [u16; 13] = [
     0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0011, 0x0001, 0x0011, 0x1111, 0x0011,
@@ -305,6 +325,13 @@ pub(crate) struct LfGrids {
     pub blk: Vec<(u8, u32, u32)>,
     /// Per-8x8 BLOCK-level tx size (sub-8x8 blocks record TX_4X4).
     pub otx: Vec<u8>,
+    /// Per-8x8 `mi->skip && is_inter_block(mi)` AFTER libvpx's promotion
+    /// (`decodeframe.c:1043`: `if (!less8x8 && eobtotal == 0) mi->skip = 1`).
+    /// Both mask builders return right after the prediction masks when this
+    /// is set, so a skipped inter block keeps only its block-edge (prediction)
+    /// masks. Keyframes never set it (`is_inter_block` is false); `false` is
+    /// the correct value there.
+    pub skip_inter: Vec<bool>,
     pub mi_cols: usize,
     pub mi_rows: usize,
 }
@@ -342,6 +369,9 @@ impl LfGrids {
         let sh = (c & 7) + ((r & 7) << 3);
         left[tx] |= LUMA_LEFT_PRED[b] << sh;
         above[tx] |= LUMA_ABOVE_PRED[b] << sh;
+        if self.skip_inter[cell] {
+            return;
+        }
         left[tx] |= (LUMA_SIZE_MASK[b] & LUMA_LEFT_TXF[tx]) << sh;
         above[tx] |= (LUMA_SIZE_MASK[b] & LUMA_ABOVE_TXF[tx]) << sh;
         if tx == TX_4X4 {
@@ -496,6 +526,24 @@ impl LfGrids {
                 left[i] &= 0xfefefefefefefefe;
             }
         }
+        // [scratch] EC_VP9_LFMASKSY: per-superblock luma masks after
+        // `vp9_adjust_mask`, in the oracle's `LFMASKSY` field order.
+        if crate::lfmasksy_enabled() {
+            eprintln!(
+                "LFY {} {} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x}",
+                sbr,
+                sbc,
+                left[TX_4X4],
+                left[TX_8X8],
+                left[TX_16X16],
+                left[TX_32X32],
+                above[TX_4X4],
+                above[TX_8X8],
+                above[TX_16X16],
+                above[TX_32X32],
+                int4
+            );
+        }
         (left, above, int4)
     }
 
@@ -529,6 +577,7 @@ impl LfGrids {
         uv_h: usize,
         sharpness: u8,
     ) {
+        let lftrace = lftrace_on();
         // Luma masks, ported from vp9_setup_mask/build_masks and
         // vp9_adjust_mask (bit i = MI row i>>3, MI col i&7; each bit
         // covers an 8x8 cell). Edges are emitted from the masks.
@@ -570,7 +619,7 @@ impl LfGrids {
                                 t = 8;
                             }
                             lpf_edge(y, yy * stride + xx, stride, 1, t, bl, li, th, 8);
-                            if std::env::var_os("LFTRACE").is_some() {
+                            if lftrace {
                                 let kind = match t {
                                     16 => "V16",
                                     8 => "V8",
@@ -581,7 +630,7 @@ impl LfGrids {
                         }
                         if int4 & bit != 0 && xx + 8 <= y_w && yy + 8 <= y_h {
                             lpf_edge(y, yy * stride + xx + 4, stride, 1, 4, bl, li, th, 8);
-                            if std::env::var_os("LFTRACE").is_some() {
+                            if lftrace {
                                 eprintln!("V4I {} {}", xx + 4, yy);
                             }
                         }
@@ -619,7 +668,7 @@ impl LfGrids {
                                     t = 8;
                                 }
                                 lpf_edge(y, yy * stride + xx, stride, 0, t, bl, li, th, 8);
-                                if std::env::var_os("LFTRACE").is_some() {
+                                if lftrace {
                                     let kind = match t {
                                         16 => "H16",
                                         8 => "H8",
@@ -637,7 +686,7 @@ impl LfGrids {
                         // vp9_loopfilter.c:1382) and in non420 under `ss_y`.
                         if int4 & bit != 0 && yy + 8 <= y_h && xx + 8 <= y_w {
                             lpf_edge(y, (yy + 4) * stride + xx, stride, 0, 4, bl, li, th, 8);
-                            if std::env::var_os("LFTRACE").is_some() {
+                            if lftrace {
                                 eprintln!("H4I {} {}", xx, yy + 4);
                             }
                         }
@@ -678,8 +727,11 @@ impl LfGrids {
                         let shift = (((r & 7) >> 1) << 2) + ((c & 7) >> 1);
                         let b = bsize as usize;
                         left[uv_tx] |= UV_LEFT_PRED[b] << shift;
-                        left[uv_tx] |= (UV_SIZE_MASK[b] & UV_LEFT_TX[uv_tx]) << shift;
                         above[uv_tx] |= UV_ABOVE_PRED[b] << shift;
+                        if self.skip_inter[cell] {
+                            continue;
+                        }
+                        left[uv_tx] |= (UV_SIZE_MASK[b] & UV_LEFT_TX[uv_tx]) << shift;
                         above[uv_tx] |= (UV_SIZE_MASK[b] & UV_ABOVE_TX[uv_tx]) << shift;
                         if uv_tx == TX_4X4 {
                             int4 |= UV_SIZE_MASK[b] << shift;
@@ -893,6 +945,8 @@ mod tests {
             level8: vec![level; mi_cols * mi_rows],
             blk: vec![(0u8, 0, 0); mi_cols * mi_rows], // 0 == BLOCK_4X4
             otx: vec![TX_4X4 as u8; mi_cols * mi_rows],
+            // Keyframe-shaped fixture: no inter block, so no skip promotion.
+            skip_inter: vec![false; mi_cols * mi_rows],
             mi_cols,
             mi_rows,
         }
