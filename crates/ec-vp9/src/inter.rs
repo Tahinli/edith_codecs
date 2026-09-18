@@ -670,6 +670,13 @@ fn find_mv_refs(
                     &mut count,
                     early_break,
                 );
+                // The C macro's successful second add is `goto Done`
+                // (vp9_decodemv.c:475-480), which leaves the search
+                // loop; without this break the next candidate would
+                // write `mv_ref_list[2]` past the two-entry list.
+                if done {
+                    break;
+                }
             }
         }
     }

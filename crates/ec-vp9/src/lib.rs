@@ -1,11 +1,12 @@
-//! Native VP9 (profile 0, 8-bit 4:2:0 keyframes) decoder.
+//! Native VP9 (profile 0, 8-bit 4:2:0) decoder.
 //!
 //! The crate implements the VP9 bitstream specification directly
 //! ([spec]); libvpx's output is used only as a test oracle
 //! (sample-exactness witnesses against ffmpeg's libvpx-based decoder),
 //! never as code linked at runtime. Every module documents the spec
-//! section it implements. Inter-frame prediction is refused by name;
-//! this lane is keyframes only.
+//! section it implements. Inter frames decode through motion compensation,
+//! residual reconstruction and the loop filter; intra-only frames, other
+//! profiles and other subsamplings are refused by name.
 //!
 //! [spec]: https://www.webmproject.org/docs/vp9/
 //!
@@ -22,6 +23,7 @@ pub mod header;
 pub(crate) mod inter;
 pub mod intra;
 pub mod loopfilter;
+pub(crate) mod mc;
 pub mod modes;
 pub mod stream;
 pub mod tables;
@@ -78,3 +80,6 @@ cached_gate!(interdump_enabled, "EC_VP9_INTERDUMP");
 cached_gate!(mvdbg_enabled, "EC_VP9_MVDGB");
 cached_gate!(mvdbg2_enabled, "EC_VP9_MVDGB2");
 cached_gate!(mvdump_enabled, "EC_VP9_MVDUMP");
+// [scratch] per-transform-block token state (the inter pixel lane).
+cached_gate!(tokdbg_enabled, "EC_VP9_TOKDGB");
+cached_gate!(lfmasksy_enabled, "EC_VP9_LFMASKSY");
