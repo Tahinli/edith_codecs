@@ -230,3 +230,36 @@ FLAGS (the verifier should re-derive these independently)
    checkout reports the same frame-72 desync in the syntax walk).
 6. Corpus sweeps were run on this workstation with `/tmp` fixtures; the
    1080p/2160p/altref dumps are regenerable from `sweep.sh`.
+
+## MERGE-SIDE FOLLOW-UPS (2026-09-19)
+
+- Merge: fast-forward `597b7442..7f1ff7d5` from the main checkout; the
+  create-list carried exactly the four expected files (`src/mc.rs`,
+  `tests/inter_pixels_exact.rs`, `tests/scratch_pixdump.rs`, this report) —
+  no junk-file class.
+- Independent verification before merge: reviewer re-derived all eight claim
+  families (own oracle+Rust pixel dumps, corpus sweeps 48/48, 48/48, 60/60,
+  frame-72 desync reproduced AND proven lane-independent at base 597b7442 via
+  `scratch_interdump`, non-vacuity reproduced byte-for-byte, all six bug-class
+  fixes audited against the libvpx sources). VERDICT: PASS, confidence 0.94.
+  Residual-risk note: the MV clamp is applied unconditionally where libvpx
+  gates it — benign on these streams, recorded for the next inter lane.
+- Fixtures: the lane's permanent tests self-generate their streams with
+  ffmpeg/libvpx at run time, and the worktree's `fixtures/` was a symlink to
+  the main checkout's — no gitignored fixture copy was needed.
+- Dependent-crate sweep: nothing depends on `ec-vp9` (the dependency edge is
+  `ec-vp9 -> ec-vp9-syntax`, untouched by this lane).
+- Merged-tree gates, run on main after the ff:
+  `cargo test -p ec-vp9` — 20 test binaries, 0 failed, 0 ignored;
+  `cargo check --workspace --all-targets` — clean, warning parity with the
+  declared baseline (modes.rs `partition_probs`/`x_mis`/`y_mis`,
+  `read_partition`, tables `TM_PRED`).
+- `tests/scratch_pixdump.rs` SKIPs when `INTER_IVF`/`EC_VP9_PIXDUMP` are
+  unset and panics naming the path when set-but-missing — workspace runs are
+  safe after tmpfs reaps.
+- Kept for the next lane (deliberately not deleted): the `EC_VP9_TRACE` /
+  `EC_VP9_PIXDUMP` / `EC_VP9_SKIP_LF` / `EC_VP9_LFMASKSY` hooks, the scratch
+  harnesses, and `$HOME/.cache/vp9pix/` (oracle `drv_pix`, fixtures,
+  `pixcmp.py`, `sweep.sh`).
+- Lane worktree `../edith_codecs-vp9pix` and its private target dir were
+  removed after the merge; branch `lane-vp9-pix` stays.
