@@ -6,10 +6,11 @@
 //!
 //! Capability: profile-0 8-bit 4:2:0 keyframes and inter frames (motion
 //! compensation, residual reconstruction, the loop filter and an 8-slot
-//! reference DPB). Intra-only frames, other profiles/subsamplings, a
-//! reference whose coded size differs from the current frame, and odd frame
-//! dimensions are refused by name; `show_existing_frame` returns the
-//! buffered reference picture instead of pretending to decode.
+//! reference DPB). Intra-only frames, other profiles/subsamplings and a
+//! reference whose coded size differs from the current frame are refused by
+//! name; `show_existing_frame` returns the buffered reference picture instead
+//! of pretending to decode. Odd coded extents are supported: chroma stores
+//! and crops at `(w + 1) / 2` (`uv_crop_width`), matching libvpx.
 
 use crate::header::{FrameContext, read_compressed_header};
 use crate::intra::build_intra_predictors;
@@ -39,7 +40,8 @@ pub struct Picture {
     pub height: u16,
     /// Luma row pitch of the returned planes (== `width`; the crop packs rows).
     pub stride: usize,
-    /// Chroma row pitch of the returned planes (== `width / 2`).
+    /// Chroma row pitch of the returned planes (`(width + 1) / 2`; chroma
+    /// ceils an odd coded width).
     pub uv_stride: usize,
 }
 
@@ -377,17 +379,6 @@ impl Decoder {
                         ),
                     ));
                 }
-            }
-            if hdr.width % 2 != 0 || hdr.height % 2 != 0 {
-                return Err(Error::unsupported(
-                    "vp9 inter odd frame dimensions",
-                    format!(
-                        "{}x{}: the reference chroma planes of an odd-sized frame are \
-                         stored at floor(w/2) but the predictor reads libvpx's \
-                         uv_crop_width = (w+1)/2",
-                        hdr.width, hdr.height
-                    ),
-                ));
             }
             let width = hdr.width as usize;
             let height = hdr.height as usize;
@@ -1800,14 +1791,17 @@ fn crop_picture(planes: &Planes, width: u16, height: u16) -> Picture {
         }
         out
     };
+    // Chroma CEILS: the 4:2:0 plane of an odd extent carries one extra
+    // half-sample column/row (`uv_crop_width = (w + 1) / 2`).
+    let (cw, chh) = ((w + 1) / 2, (h + 1) / 2);
     Picture {
         y: crop(&planes.y, planes.ys, w, h),
-        u: crop(&planes.u, planes.uvs, w / 2, h / 2),
-        v: crop(&planes.v, planes.uvs, w / 2, h / 2),
+        u: crop(&planes.u, planes.uvs, cw, chh),
+        v: crop(&planes.v, planes.uvs, cw, chh),
         width,
         height,
         stride: w,
-        uv_stride: w / 2,
+        uv_stride: cw,
     }
 }
 
@@ -2004,8 +1998,14 @@ fn inter_predict_plane(
         let refp = RefPlane {
             data: ref_data,
             stride: ref_stride,
-            width: (ref_frame.width as usize) >> s,
-            height: (ref_frame.height as usize) >> s,
+            // `y_crop_width` / `uv_crop_width`: luma is the coded size, chroma
+            // CEILS (`(w + 1) / 2`). libvpx stores `uv_crop_width` as
+            // `(y_crop_width + 1) >> 1` (`vpx_scale/yv12config.c`), so a
+            // plain `>> 1` is one short whenever the coded extent is odd and
+            // the predictor's border/inside test then clips the last chroma
+            // column (or row).
+            width: (ref_frame.width as usize + s) >> s,
+            height: (ref_frame.height as usize + s) >> s,
         };
         if sb_type < 3 {
             // libvpx builds one 4x4 prediction per sub-block, with the MV from
