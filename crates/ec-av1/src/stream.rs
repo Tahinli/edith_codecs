@@ -1243,6 +1243,9 @@ pub(crate) struct SeqFlags {
     pub(crate) enable_interintra_compound: bool,
     pub(crate) use_sb128: bool,
     pub(crate) bit_depth: u8,
+    /// lane-av1mono: `color_config.mono_chrome` (spec 5.5.2):
+    /// `NumPlanes == 1`, no chroma is coded or reconstructed.
+    pub(crate) mono_chrome: bool,
     pub(crate) order_hint_bits: u32,
     pub(crate) mc_identity: bool,
 }
@@ -1259,6 +1262,7 @@ impl SeqFlags {
             enable_interintra_compound: seq.is_some_and(|s| s.enable_interintra_compound),
             use_sb128: seq.is_some_and(|s| s.use_128x128_superblock),
             bit_depth: seq.map_or(8, |s| s.color_config.bit_depth),
+            mono_chrome: seq.is_some_and(|s| s.color_config.mono_chrome),
             order_hint_bits: seq.map_or(0, |s| s.order_hint_bits),
             mc_identity: seq.is_some_and(|s| s.color_config.matrix_coefficients == 0),
         }
@@ -1633,6 +1637,10 @@ fn decode_frame(
     // `a_lossless_libaom_inter_frame_decodes_sample_exact`.
     crate::decode::set_lossless(coded_lossless, fctx);
     crate::decode::set_bit_depth(bit_depth, fctx);
+    // lane-av1mono: the sequence header's `mono_chrome`, set per frame like
+    // the bit depth so a mono frame decoded on a thread that last saw a
+    // 4:2:0 one never inherits the wrong plane count.
+    crate::decode::set_mono(seq.mono_chrome, fctx);
     // spec 7.16: this frame's superres state, for the filter chain --
     // `decode.rs` upscales between CDEF and loop restoration and sizes
     // the LR unit grid in upscaled coordinates. Cleared (0, 8) on an
