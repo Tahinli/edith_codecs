@@ -4,18 +4,21 @@
 //! reconstruction and the loop filter (spec 6, 7, 8; libvpx
 //! `vp9_decodeframe.c`).
 //!
-//! Capability: profile-0 8-bit 4:2:0 keyframes and inter frames (motion
-//! compensation, residual reconstruction, the loop filter and an 8-slot
-//! reference DPB). Intra-only frames, other profiles/subsamplings and a
-//! reference whose coded size differs from the current frame are refused by
-//! name; `show_existing_frame` returns the buffered reference picture instead
-//! of pretending to decode. Odd coded extents are supported: chroma stores
-//! and crops at `(w + 1) / 2` (`uv_crop_width`), matching libvpx.
+//! Capability: profile-0 8-bit 4:2:0 keyframes, intra-only frames and inter
+//! frames (motion compensation, residual reconstruction, the loop filter and
+//! an 8-slot reference DPB). A reference whose coded size differs from the
+//! current frame is scaled during prediction; other profiles/subsamplings are
+//! refused by name; `show_existing_frame` returns the buffered reference
+//! picture instead of pretending to decode. Odd coded extents are supported:
+//! chroma stores and crops at `(w + 1) / 2` (`uv_crop_width`), matching
+//! libvpx.
 
 use crate::header::{FrameContext, read_compressed_header};
 use crate::intra::build_intra_predictors;
 use crate::loopfilter::LfGrids;
-use crate::mc::{RefPlane, average_split_mvs_chroma, build_inter_predictors, split_mv};
+use crate::mc::{
+    RefPlane, ScaleFactors, average_split_mvs_chroma, build_inter_predictors, split_mv,
+};
 use crate::modes::{MiInfo, MiState, read_intra_frame_mode_info};
 use crate::tables::*;
 use crate::tokens::{PlaneContexts, decode_coefs, scan_for};
@@ -231,10 +234,7 @@ impl Decoder {
             return self.decode_key_frame(&hdr, frame);
         }
         if hdr.intra_only {
-            return Err(Error::unsupported(
-                "vp9 intra-only",
-                "this lane decodes inter frames and keyframes only",
-            ));
+            return self.decode_intra_only_frame(&hdr, frame);
         }
         self.decode_inter_frame(&hdr, frame, index, true)
     }
@@ -295,6 +295,76 @@ impl Decoder {
         Ok(if hdr.show_frame { Some(pic) } else { None })
     }
 
+    /// Decode an intra-only frame through to pixels. `libvpx
+    /// vp9_decodeframe.c:2708-2745` makes it an INTER frame that never shows
+    /// and refreshes only the slots its `refresh_frame_flags` names, but its
+    /// body is a keyframe's: intra-only mode info, intra prediction, the intra
+    /// coefficient axis and the intra loop-filter levels. Two header decisions
+    /// differ from a keyframe (`vp9_setup_past_independence`,
+    /// `vp9/common/vp9_entropymode.c:424`):
+    ///
+    /// - the ACTIVE frame context comes from storage
+    ///   (`*cm->fc = cm->frame_contexts[frame_context_idx]`,
+    ///   `vp9_decodeframe.c:3008`) — reset to the defaults only for
+    ///   `reset_frame_context` 2 (selected) or 3 (all), or under
+    ///   error-resilient mode, never unconditionally like a keyframe (whose
+    ///   `cm->frame_type == KEY_FRAME` clause resets every stored context);
+    /// - partitions read the const `vp9_kf_partition_probs`
+    ///   (`set_partition_probs`), so the stored context's own `partition`
+    ///   field survives the frame untouched.
+    fn decode_intra_only_frame(
+        &mut self,
+        hdr: &FrameHeader,
+        frame: &[u8],
+    ) -> Result<Option<Picture>> {
+        let hdr = hdr.clone();
+        if hdr.error_resilient_mode || hdr.reset_frame_context == 3 {
+            let d = FrameContext::new(false);
+            self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
+        } else if hdr.reset_frame_context == 2 {
+            self.frame_ctxs[0] = FrameContext::new(false);
+        }
+        // The parser forces frame_context_idx to 0 for an intra frame.
+        let mut ctx = self.frame_ctxs[0].clone();
+        let stored_partition = ctx.partition;
+        ctx.use_key_partition();
+        self.ctx = ctx;
+        self.prev_seg.clear();
+        self.prev_mvs.clear();
+        self.last = LastFrameFacts {
+            width: hdr.width,
+            height: hdr.height,
+            intra_only: true,
+            show_frame: hdr.show_frame,
+            key: false,
+        };
+        let hdr_start = hdr.uncompressed_header_size as usize;
+        let ch = read_compressed_header(
+            &frame[hdr_start..hdr_start + hdr.header_size_in_bytes as usize],
+            &mut self.ctx,
+            &hdr,
+        )?;
+        let pic = self.decode_keyframe(&hdr, frame, ch.tx_mode)?;
+        if hdr.refresh_frame_context {
+            // Store back with the partition probs the context arrived with:
+            // the const key table is not a `FRAME_CONTEXT` field.
+            self.ctx.partition = stored_partition;
+            self.frame_ctxs[0] = self.ctx.clone();
+        }
+        // Reference refresh (spec 8.10): only `refresh_frame_flags` slots.
+        let frame = RefFrame {
+            planes: std::sync::Arc::new(self.planes.take().expect("frame scratch")),
+            width: hdr.width as u16,
+            height: hdr.height as u16,
+        };
+        for slot in 0..8 {
+            if hdr.refresh_frame_flags & (1 << slot) != 0 {
+                self.refs[slot] = Some(frame.clone());
+            }
+        }
+        Ok(if hdr.show_frame { Some(pic) } else { None })
+    }
+
     /// Parse one frame's syntax: keyframes decode through to pixels, inter
     /// frames are parsed (headers, mode info, MVs) with no reconstruction and
     /// no picture. `decode` still refuses inter frames.
@@ -318,10 +388,9 @@ impl Decoder {
                 // any inter-frame dump after it would be meaningless evidence.
                 self.decode_key_frame(&hdr, sub)?;
             } else if hdr.intra_only {
-                return Err(Error::unsupported(
-                    "vp9 intra-only",
-                    "the inter-syntax lane covers inter frames only",
-                ));
+                // Same body as a keyframe, but an inter frame that refreshes
+                // only the slots it names.
+                self.decode_intra_only_frame(&hdr, sub)?;
             } else {
                 self.decode_inter_frame(&hdr, sub, index, false)?;
             }
@@ -356,28 +425,19 @@ impl Decoder {
 
         // Reference slots (spec 7.2): `ref_frame_idx[i]` names the slot LAST,
         // GOLDEN and ALTREF use. libvpx validates every named reference's
-        // format here (`vp9_decodeframe.c:1620-1627`) and SCALES a reference
-        // whose size differs; this lane refuses that by name.
+        // format here (`vp9_decodeframe.c:1620-1627`); a reference whose coded
+        // size differs from this frame's is SCALED during prediction
+        // (`vp9_setup_scale_factors_for_frame` per reference), not refused.
         if pixels {
             for (i, name) in ["last", "golden", "altref"].iter().enumerate() {
                 let slot = hdr.ref_frame_idx[i] as usize;
                 if slot >= self.refs.len() || hdr.ref_frame_idx[i] >= 8 {
                     return Err(corrupt("vp9 inter names a reference slot past the DPB"));
                 }
-                let Some(p) = self.refs[slot].as_ref() else {
+                if self.refs[slot].is_none() {
                     return Err(Error::corrupt(format!(
                         "vp9 inter reference `{name}` names empty slot {slot}"
                     )));
-                };
-                if p.width as u32 != hdr.width || p.height as u32 != hdr.height {
-                    return Err(Error::unsupported(
-                        "vp9 inter reference size change",
-                        format!(
-                            "reference `{name}` in slot {slot} is {}x{} but this frame is {}x{}; \
-                             reference-frame scaling is not ported",
-                            p.width, p.height, hdr.width, hdr.height
-                        ),
-                    ));
                 }
             }
             let width = hdr.width as usize;
@@ -897,8 +957,20 @@ impl Decoder {
             let temp = &mut self.mc_temp;
             for plane in 0..3usize {
                 inter_predict_plane(
-                    planes, refs, scratch, temp, hdr, info, plane, row, col, &n4w, &n4h,
-                    mb_to_right, mb_to_bottom, sb_type,
+                    planes,
+                    refs,
+                    scratch,
+                    temp,
+                    hdr,
+                    info,
+                    plane,
+                    row,
+                    col,
+                    &n4w,
+                    &n4h,
+                    mb_to_right,
+                    mb_to_bottom,
+                    sb_type,
                 )?;
             }
         }
@@ -1366,7 +1438,10 @@ impl Decoder {
         let x_mis = bw.min(mi.mi_cols - col);
         let y_mis = bh.min(mi.mi_rows - row);
 
-        let info = if hdr.frame_type == FrameType::Key {
+        // `frame_is_intra_only` (onyxc_int.h:363): a keyframe OR an
+        // intra-only frame walks the intra mode-info path.
+        let intra_frame = hdr.frame_type == FrameType::Key || hdr.intra_only;
+        let info = if intra_frame {
             read_intra_frame_mode_info(
                 r,
                 mi,
@@ -1395,14 +1470,24 @@ impl Decoder {
                 tx_mode,
             )?
         };
-        if hdr.frame_type != FrameType::Key {
+        if !intra_frame {
             if pixels {
                 // Full inter decode: prediction, tokens, residual. The
                 // per-cell loop-filter level is the block's own reference and
                 // mode class (`get_filter_level`), so the grids are written
                 // inside the reconstruction rather than from `level_of_seg`.
                 self.reconstruct_inter_pixels(
-                    r, ectx, grids, hdr, &info, row, col, sb_type, bw, bh, mi,
+                    r,
+                    ectx,
+                    grids,
+                    hdr,
+                    &info,
+                    row,
+                    col,
+                    sb_type,
+                    bw,
+                    bh,
+                    mi,
                     tile_col_start,
                 )?;
             } else {
@@ -1412,10 +1497,7 @@ impl Decoder {
             }
             for dy in 0..y_mis {
                 for dx in 0..x_mis {
-                    if crate::mvdbg2_enabled()
-                        && row + dy == 7
-                        && col + dx >= 30
-                        && col + dx <= 40
+                    if crate::mvdbg2_enabled() && row + dy == 7 && col + dx >= 30 && col + dx <= 40
                     {
                         eprintln!(
                             "GWR cell=({} {}) idx={} from=({row} {col}) dy={dy} dx={dx} sb={sb_type} bw={bw} bh={bh} x_mis={x_mis} y_mis={y_mis} mv={:?} ref0={} mi_cols={}",
@@ -1837,7 +1919,9 @@ fn reset_skip_context(
             let offx = (col << 1) >> s;
             let offy = (row << 1) >> s;
             let lrows = 32usize >> s;
-            let a: Vec<u8> = (0..n4w[plane]).map(|i| ectx[plane].above[offx + i]).collect();
+            let a: Vec<u8> = (0..n4w[plane])
+                .map(|i| ectx[plane].above[offx + i])
+                .collect();
             let l: Vec<u8> = (0..n4h[plane].min(lrows))
                 .map(|i| ectx[plane].left[(offy + i) % lrows])
                 .collect();
@@ -2032,6 +2116,26 @@ fn inter_predict_plane(
             return Err(corrupt("vp9 inter prediction read an empty reference slot"));
         };
         let (ref_data, ref_stride) = ref_frame.planes.plane_ref(plane);
+        // `vp9_setup_scale_factors_for_frame` (`vp9_decodeframe.c:2758`): the
+        // scale from the REFERENCE's coded luma size to this frame's, shared
+        // by every plane. `vp9_is_valid_scale` is enforced where libvpx
+        // enforces it — at prediction time, for the references actually used.
+        let sf = ScaleFactors::setup(
+            ref_frame.width as usize,
+            ref_frame.height as usize,
+            hdr.width as usize,
+            hdr.height as usize,
+        );
+        if !sf.is_valid() {
+            return Err(Error::unsupported(
+                "vp9 reference scale",
+                format!(
+                    "reference `{ref_name}` in slot {slot} is {}x{} against a {}x{} frame; \
+                     `valid_ref_frame_size` rejects that ratio",
+                    ref_frame.width, ref_frame.height, hdr.width, hdr.height
+                ),
+            ));
+        }
         let refp = RefPlane {
             data: ref_data,
             stride: ref_stride,
@@ -2059,9 +2163,8 @@ fn inter_predict_plane(
                         average_split_mvs_chroma(&info.bmi_mv, rf)
                     };
                     let (data, _) = planes.plane(plane);
-                    let dst_off = (((row * 8) >> s) + y * 4) * dst_stride
-                        + ((col * 8) >> s)
-                        + xx * 4;
+                    let dst_off =
+                        (((row * 8) >> s) + y * 4) * dst_stride + ((col * 8) >> s) + xx * 4;
                     build_inter_predictors(
                         &mut data[dst_off..],
                         dst_stride,
@@ -2081,6 +2184,7 @@ fn inter_predict_plane(
                         ss_y,
                         kernel,
                         rf == 1,
+                        &sf,
                         scratch,
                         temp,
                     );
@@ -2108,6 +2212,7 @@ fn inter_predict_plane(
                 ss_y,
                 kernel,
                 rf == 1,
+                &sf,
                 scratch,
                 temp,
             );
