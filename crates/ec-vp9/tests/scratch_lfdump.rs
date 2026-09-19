@@ -39,9 +39,9 @@ fn dump_lf_diff_map() {
         dec.decode(&frames[k].data).expect("decode");
     }
     let pic_pre = dec.decode(&frames[fi].data).expect("decode").expect("shown");
-    std::fs::write("/tmp/y_pre_ours.raw", &pic_pre.y[..ysz]).unwrap();
-    std::fs::write("/tmp/u_pre_ours.raw", &pic_pre.u).unwrap();
-    std::fs::write("/tmp/v_pre_ours.raw", &pic_pre.v).unwrap();
+    std::fs::write("/tmp/y_pre_ours.raw", pic_pre.y[..ysz].iter().map(|&v| v as u8).collect::<Vec<u8>>()).unwrap();
+    std::fs::write("/tmp/u_pre_ours.raw", pic_pre.u.iter().map(|&v| v as u8).collect::<Vec<u8>>()).unwrap();
+    std::fs::write("/tmp/v_pre_ours.raw", pic_pre.v.iter().map(|&v| v as u8).collect::<Vec<u8>>()).unwrap();
     unsafe { std::env::remove_var("EC_VP9_SKIP_LF") };
 
     // Post-LF run (fresh decoder).
@@ -50,17 +50,17 @@ fn dump_lf_diff_map() {
         dec.decode(&frames[k].data).expect("decode");
     }
     let pic_post = dec.decode(&frames[fi].data).expect("decode").expect("shown");
-    std::fs::write("/tmp/y_post_ours.raw", &pic_post.y[..ysz]).unwrap();
-    std::fs::write("/tmp/u_post_ours.raw", &pic_post.u).unwrap();
-    std::fs::write("/tmp/v_post_ours.raw", &pic_post.v).unwrap();
+    std::fs::write("/tmp/y_post_ours.raw", pic_post.y[..ysz].iter().map(|&v| v as u8).collect::<Vec<u8>>()).unwrap();
+    std::fs::write("/tmp/u_post_ours.raw", pic_post.u.iter().map(|&v| v as u8).collect::<Vec<u8>>()).unwrap();
+    std::fs::write("/tmp/v_post_ours.raw", pic_post.v.iter().map(|&v| v as u8).collect::<Vec<u8>>()).unwrap();
 
     let fsz = ysz + 2 * (w / 2) * (h / 2);
     let ff = &reference[fi * fsz..fi * fsz + ysz];
     let pre = &pic_pre.y[..ysz];
     let post = &pic_post.y[..ysz];
 
-    let pre_diffs: Vec<usize> = (0..ysz).filter(|&i| pre[i] != ff[i]).collect();
-    let post_diffs: Vec<usize> = (0..ysz).filter(|&i| post[i] != ff[i]).collect();
+    let pre_diffs: Vec<usize> = (0..ysz).filter(|&i| pre[i] as u8 != ff[i]).collect();
+    let post_diffs: Vec<usize> = (0..ysz).filter(|&i| post[i] as u8 != ff[i]).collect();
     let lf_changed_ours: Vec<usize> = (0..ysz).filter(|&i| pre[i] != post[i]).collect();
     println!("pre-LF diffs vs ffmpeg : {}", pre_diffs.len());
     println!("post-LF diffs vs ffmpeg: {}", post_diffs.len());
@@ -123,10 +123,10 @@ fn dump_lf_diff_map() {
     let ff_u = &reference[fi * fsz + ysz..fi * fsz + ysz + uv];
     let ff_v = &reference[fi * fsz + ysz + uv..fi * fsz + ysz + 2 * uv];
     let uw = w / 2;
-    let u_d: Vec<_> = (0..uv).filter(|&i| pic_post.u[i] != ff_u[i]).collect();
-    let v_d: Vec<_> = (0..uv).filter(|&i| pic_post.v[i] != ff_v[i]).collect();
-    let u_pre: Vec<_> = (0..uv).filter(|&i| pic_pre.u[i] != ff_u[i]).collect();
-    let v_pre: Vec<_> = (0..uv).filter(|&i| pic_pre.v[i] != ff_v[i]).collect();
+    let u_d: Vec<_> = (0..uv).filter(|&i| pic_post.u[i] as u8 != ff_u[i]).collect();
+    let v_d: Vec<_> = (0..uv).filter(|&i| pic_post.v[i] as u8 != ff_v[i]).collect();
+    let u_pre: Vec<_> = (0..uv).filter(|&i| pic_pre.u[i] as u8 != ff_u[i]).collect();
+    let v_pre: Vec<_> = (0..uv).filter(|&i| pic_pre.v[i] as u8 != ff_v[i]).collect();
     println!("U pre diffs: {}  post: {}", u_pre.len(), u_d.len());
     for &i in &u_d {
         println!(

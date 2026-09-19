@@ -7,16 +7,18 @@
 //! corner), `above_data[16 + i]` is `above[i]` — exactly the C's
 //! 16-pixel offset into `above_data[64 + 16]`.
 
+use crate::Sample;
+
 /// `AVG3`.
 #[inline]
-fn avg3(a: u8, b: u8, c: u8) -> u8 {
-    ((a as u32 + 2 * b as u32 + c as u32 + 2) >> 2) as u8
+fn avg3(a: Sample, b: Sample, c: Sample) -> Sample {
+    ((a as u32 + 2 * b as u32 + c as u32 + 2) >> 2) as Sample
 }
 
 /// `AVG2`.
 #[inline]
-fn avg2(a: u8, b: u8) -> u8 {
-    ((a as u32 + b as u32 + 1) >> 1) as u8
+fn avg2(a: Sample, b: Sample) -> Sample {
+    ((a as u32 + b as u32 + 1) >> 1) as Sample
 }
 
 const A: usize = 16;
@@ -43,7 +45,7 @@ fn needs(mode: u8) -> (bool, bool, bool) {
 /// block's absolute sample position; `frame_w`/`frame_h` the coded
 /// (aligned) plane size.
 pub(crate) fn build_intra_predictors(
-    data: &mut [u8],
+    data: &mut [Sample],
     stride: usize,
     frame_w: usize,
     frame_h: usize,
@@ -61,11 +63,16 @@ pub(crate) fn build_intra_predictors(
     bot_ext: bool,
     // `xd->mb_to_right_edge < 0` (`vp9_reconintra.c:326/354`).
     right_ext: bool,
+    bd: u8,
 ) {
     let (need_left, need_above, need_aboveright) = needs(mode);
-    let mut left_col = [0u8; 32];
-    let mut above_data = [0u8; 64 + 16];
-    let at = |dx: isize, dy: isize| -> u8 {
+    // `int base = 128 << (bd - 8)` (`vp9_reconintra.c:132`): the 127/129
+    // border fills of an 8-bit frame become `base - 1` / `base + 1`, and
+    // missing neighbours fill with the neutral grey.
+    let base = 128u16 << (bd - 8);
+    let mut left_col = [0u16; 32];
+    let mut above_data = [0u16; 64 + 16];
+    let at = |dx: isize, dy: isize| -> Sample {
         data[(((y0 as isize + dy) * stride as isize) + x0 as isize + dx) as usize]
     };
 
@@ -89,7 +96,7 @@ pub(crate) fn build_intra_predictors(
                 left_col[n..bs].fill(v);
             }
         } else {
-            left_col[..bs].fill(129);
+            left_col[..bs].fill(base + 1);
         }
     }
 
@@ -114,17 +121,17 @@ pub(crate) fn build_intra_predictors(
                     above_data[A + i] = at(i as isize, -1);
                 }
             }
-            above_data[A - 1] = if left_available { at(-1, -1) } else { 129 };
+            above_data[A - 1] = if left_available { at(-1, -1) } else { base + 1 };
         } else {
-            above_data[A..A + bs].fill(127);
-            above_data[A - 1] = 127;
+            above_data[A..A + bs].fill(base - 1);
+            above_data[A - 1] = base - 1;
         }
     }
 
     // NEED_ABOVERIGHT (vp9_reconintra.c:350-394).
     if need_aboveright {
         if up_available {
-            let fill_bs = |d: &mut [u8; 80]| {
+            let fill_bs = |d: &mut [u16; 80]| {
                 let v = d[A + bs - 1];
                 d[A + bs..A + 2 * bs].fill(v);
             };
@@ -174,10 +181,10 @@ pub(crate) fn build_intra_predictors(
                     fill_bs(&mut above_data);
                 }
             }
-            above_data[A - 1] = if left_available { at(-1, -1) } else { 129 };
+            above_data[A - 1] = if left_available { at(-1, -1) } else { base + 1 };
         } else {
-            above_data[A..A + 2 * bs].fill(127);
-            above_data[A - 1] = 127;
+            above_data[A..A + 2 * bs].fill(base - 1);
+            above_data[A - 1] = base - 1;
         }
     }
 
@@ -201,7 +208,15 @@ pub(crate) fn build_intra_predictors(
     }
     let dst = &mut data[y0 * stride + x0..];
     dispatch(
-        mode, bs, dst, stride, &above_data, &left_col, up_available, left_available,
+        mode,
+        bs,
+        dst,
+        stride,
+        &above_data,
+        &left_col,
+        up_available,
+        left_available,
+        bd,
     );
     if crate::trace_enabled()
         && std::env::var("EC_VP9_PROBE_TU")
@@ -221,12 +236,13 @@ pub(crate) fn build_intra_predictors(
 fn dispatch(
     mode: u8,
     bs: usize,
-    dst: &mut [u8],
+    dst: &mut [Sample],
     stride: usize,
-    above: &[u8],
-    left: &[u8],
+    above: &[Sample],
+    left: &[Sample],
     up: bool,
     lft: bool,
+    bd: u8,
 ) {
     // `above` is the full above_data: [A-1] = above[-1], [A + i] = above[i].
     let cor = above[A - 1];
@@ -238,17 +254,32 @@ fn dispatch(
                 .chain(left[..bs].iter())
                 .map(|&v| v as u32)
                 .sum();
-            fill_dc(dst, stride, bs, ((sum + bs as u32) / (2 * bs as u32)) as u8);
+            fill_dc(
+                dst,
+                stride,
+                bs,
+                ((sum + bs as u32) / (2 * bs as u32)) as Sample,
+            );
         }
         0 if lft => {
             let sum: u32 = left[..bs].iter().map(|&v| v as u32).sum();
-            fill_dc(dst, stride, bs, ((sum + bs as u32 / 2) / bs as u32) as u8);
+            fill_dc(
+                dst,
+                stride,
+                bs,
+                ((sum + bs as u32 / 2) / bs as u32) as Sample,
+            );
         }
         0 if up => {
             let sum: u32 = ab[..bs].iter().map(|&v| v as u32).sum();
-            fill_dc(dst, stride, bs, ((sum + bs as u32 / 2) / bs as u32) as u8);
+            fill_dc(
+                dst,
+                stride,
+                bs,
+                ((sum + bs as u32 / 2) / bs as u32) as Sample,
+            );
         }
-        0 => fill_dc(dst, stride, bs, 128),
+        0 => fill_dc(dst, stride, bs, 128u16 << (bd - 8)),
         1 => {
             for r in 0..bs {
                 dst[r * stride..r * stride + bs].copy_from_slice(&ab[..bs]);
@@ -314,7 +345,7 @@ fn dispatch(
             let mut x = 1;
             let mut size = bs - 2;
             while x < bs {
-                let src: Vec<u8> = dst[..x + size].to_vec();
+                let src: Vec<Sample> = dst[..x + size].to_vec();
                 let off = x * stride;
                 dst[off..off + size].copy_from_slice(&src[x..x + size]);
                 dst[off + size..off + bs].fill(above_right);
@@ -324,7 +355,7 @@ fn dispatch(
         }
         4 => {
             // d135
-            let mut border = [0u8; 64];
+            let mut border = [0u16; 64];
             for i in 0..bs - 2 {
                 border[i] = avg3(left[bs - 3 - i], left[bs - 2 - i], left[bs - 1 - i]);
             }
@@ -411,9 +442,9 @@ fn dispatch(
             let mut r = 2;
             let mut size = bs - 2;
             while r < bs {
-                let src0: Vec<u8> = dst[(r >> 1)..(r >> 1) + size].to_vec();
+                let src0: Vec<Sample> = dst[(r >> 1)..(r >> 1) + size].to_vec();
                 let base1 = stride + (r >> 1);
-                let src1: Vec<u8> = dst[base1..base1 + size].to_vec();
+                let src1: Vec<Sample> = dst[base1..base1 + size].to_vec();
                 let o0 = r * stride;
                 dst[o0..o0 + size].copy_from_slice(&src0);
                 dst[o0 + size..o0 + bs].fill(ab[bs - 1]);
@@ -429,14 +460,14 @@ fn dispatch(
             for r in 0..bs {
                 for c in 0..bs {
                     dst[r * stride + c] =
-                        (left[r] as i32 + ab[c] as i32 - cor as i32).clamp(0, 255) as u8;
+                        crate::clip_pixel_bd(left[r] as i32 + ab[c] as i32 - cor as i32, bd);
                 }
             }
         }
     }
 }
 
-fn fill_dc(dst: &mut [u8], stride: usize, bs: usize, v: u8) {
+fn fill_dc(dst: &mut [Sample], stride: usize, bs: usize, v: Sample) {
     for r in 0..bs {
         dst[r * stride..r * stride + bs].fill(v);
     }

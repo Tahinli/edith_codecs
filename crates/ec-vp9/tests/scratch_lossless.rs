@@ -12,7 +12,7 @@ fn lossless_matches() {
     let mut d = Decoder::new();
     let pic = d.decode(&frames[0].data).unwrap().unwrap();
     let ylen = w as usize * h as usize;
-    let mism: Vec<usize> = (0..ylen).filter(|&i| pic.y[i] != refout[i]).collect();
+    let mism: Vec<usize> = (0..ylen).filter(|&i| pic.y[i] as u8 != refout[i]).collect();
     println!("w={w} h={h} mismatches={} first={:?} ours={:?} ref={:?}",
         mism.len(), mism.first(), mism.first().map(|&i| pic.y[i]), mism.first().map(|&i| refout[i]));
 }

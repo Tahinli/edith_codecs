@@ -110,20 +110,12 @@ pub(crate) const FILTERS: [[[i16; TAPS]; SUBPEL_SHIFTS as usize]; 4] = [
     ],
 ];
 
-/// `clip_pixel` (`vpx_dsp/vpx_dsp_common.h`).
-fn clip_pixel(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
-}
-
-/// `ROUND_POWER_OF_TWO(v, n)`.
-fn round_pow2(v: i32, n: i32) -> i32 {
-    (v + (1 << (n - 1))) >> n
-}
+use crate::{Sample, clip_pixel_bd, round_pow2};
 
 /// Read `buf[i]` for a possibly negative `i`. Every caller keeps `i` inside
 /// the buffer (the border copy guarantees the tap margins exist).
 #[inline]
-fn at(buf: &[u8], i: isize) -> u8 {
+fn at(buf: &[Sample], i: isize) -> Sample {
     buf[i as usize]
 }
 
@@ -162,9 +154,9 @@ pub(crate) fn clamp_mv_to_umv_border_sb(
 /// `[0, w)` x `[0, h)`.
 #[allow(clippy::too_many_arguments)]
 fn build_mc_border(
-    src: &[u8],
+    src: &[Sample],
     src_stride: usize,
-    dst: &mut [u8],
+    dst: &mut [Sample],
     dst_stride: usize,
     x: i32,
     mut y: i32,
@@ -225,16 +217,17 @@ fn build_mc_border(
 /// `origin + y*stride + (x_q4 >> SUBPEL_BITS) - (SUBPEL_TAPS / 2 - 1) + k`.
 #[allow(clippy::too_many_arguments)]
 fn convolve_horiz(
-    buf: &[u8],
+    buf: &[Sample],
     stride: usize,
     origin: isize,
-    dst: &mut [u8],
+    dst: &mut [Sample],
     dst_stride: usize,
     f: &[[i16; TAPS]; SUBPEL_SHIFTS as usize],
     x0_q4: i32,
     w: usize,
     rows: usize,
     avg: bool,
+    bd: u8,
 ) {
     for y in 0..rows {
         let mut x_q4 = x0_q4;
@@ -246,12 +239,12 @@ fn convolve_horiz(
             for k in 0..TAPS {
                 sum += at(buf, base + k as isize) as i32 * filt[k] as i32;
             }
-            let v = clip_pixel(round_pow2(sum, FILTER_BITS)) as i32;
+            let v = clip_pixel_bd(round_pow2(sum, FILTER_BITS), bd) as i32;
             let d = y * dst_stride + x;
             dst[d] = if avg {
-                round_pow2(dst[d] as i32 + v, 1) as u8
+                round_pow2(dst[d] as i32 + v, 1) as Sample
             } else {
-                v as u8
+                v as Sample
             };
             x_q4 += SUBPEL_SHIFTS;
         }
@@ -260,16 +253,17 @@ fn convolve_horiz(
 
 /// `convolve_vert` / `convolve_avg_vert` (`vpx_dsp/vpx_convolve.c:80`).
 fn convolve_vert(
-    buf: &[u8],
+    buf: &[Sample],
     stride: usize,
     origin: isize,
-    dst: &mut [u8],
+    dst: &mut [Sample],
     dst_stride: usize,
     f: &[[i16; TAPS]; SUBPEL_SHIFTS as usize],
     y0_q4: i32,
     w: usize,
     h: usize,
     avg: bool,
+    bd: u8,
 ) {
     for x in 0..w {
         let mut y_q4 = y0_q4;
@@ -282,12 +276,12 @@ fn convolve_vert(
             for k in 0..TAPS {
                 sum += at(buf, base + k as isize * stride as isize) as i32 * filt[k] as i32;
             }
-            let v = clip_pixel(round_pow2(sum, FILTER_BITS)) as i32;
+            let v = clip_pixel_bd(round_pow2(sum, FILTER_BITS), bd) as i32;
             let d = y * dst_stride + x;
             dst[d] = if avg {
-                round_pow2(dst[d] as i32 + v, 1) as u8
+                round_pow2(dst[d] as i32 + v, 1) as Sample
             } else {
-                v as u8
+                v as Sample
             };
             y_q4 += SUBPEL_SHIFTS;
         }
@@ -305,10 +299,10 @@ fn convolve_vert(
 /// the averaging variant).
 #[allow(clippy::too_many_arguments)]
 fn inter_predictor(
-    buf: &[u8],
+    buf: &[Sample],
     stride: usize,
     origin: isize,
-    dst: &mut [u8],
+    dst: &mut [Sample],
     dst_stride: usize,
     f: &[[i16; TAPS]; SUBPEL_SHIFTS as usize],
     subpel_x: i32,
@@ -316,7 +310,8 @@ fn inter_predictor(
     w: usize,
     h: usize,
     avg: bool,
-    temp: &mut [u8],
+    temp: &mut [Sample],
+    bd: u8,
 ) {
     if subpel_x == 0 && subpel_y == 0 {
         for y in 0..h {
@@ -324,20 +319,24 @@ fn inter_predictor(
                 let s = at(buf, origin + (y * stride + x) as isize) as i32;
                 let d = y * dst_stride + x;
                 dst[d] = if avg {
-                    round_pow2(dst[d] as i32 + s, 1) as u8
+                    round_pow2(dst[d] as i32 + s, 1) as Sample
                 } else {
-                    s as u8
+                    s as Sample
                 };
             }
         }
         return;
     }
     if subpel_y == 0 {
-        convolve_horiz(buf, stride, origin, dst, dst_stride, f, subpel_x, w, h, avg);
+        convolve_horiz(
+            buf, stride, origin, dst, dst_stride, f, subpel_x, w, h, avg, bd,
+        );
         return;
     }
     if subpel_x == 0 {
-        convolve_vert(buf, stride, origin, dst, dst_stride, f, subpel_y, w, h, avg);
+        convolve_vert(
+            buf, stride, origin, dst, dst_stride, f, subpel_y, w, h, avg, bd,
+        );
         return;
     }
     // vpx_convolve8_c: horizontal pass into a stride-64 intermediate with
@@ -359,6 +358,7 @@ fn inter_predictor(
         w,
         intermediate_height,
         false,
+        bd,
     );
     if avg {
         // vpx_convolve8_avg_c: full 2D into a second scratch, then average
@@ -366,11 +366,23 @@ fn inter_predictor(
         // `temp[..64 * 135]` is the horizontal intermediate; the region after
         // it is the 2D result.
         let (horiz, mid2) = temp.split_at_mut(64 * 135);
-        convolve_vert(horiz, 64, temp_origin, mid2, w, f, subpel_y, w, h, false);
+        convolve_vert(
+            horiz,
+            64,
+            temp_origin,
+            mid2,
+            w,
+            f,
+            subpel_y,
+            w,
+            h,
+            false,
+            bd,
+        );
         for y in 0..h {
             for x in 0..w {
                 let d = y * dst_stride + x;
-                dst[d] = round_pow2(dst[d] as i32 + mid2[y * w + x] as i32, 1) as u8;
+                dst[d] = round_pow2(dst[d] as i32 + mid2[y * w + x] as i32, 1) as Sample;
             }
         }
         return;
@@ -386,13 +398,14 @@ fn inter_predictor(
         w,
         h,
         false,
+        bd,
     );
 }
 
 /// One reference plane of a stored frame.
 pub(crate) struct RefPlane<'a> {
     /// Plane base — the frame's first visible sample.
-    pub data: &'a [u8],
+    pub data: &'a [Sample],
     /// Row pitch.
     pub stride: usize,
     /// `y_crop_width` / `uv_crop_width`: the coded extent, which is what
@@ -400,6 +413,8 @@ pub(crate) struct RefPlane<'a> {
     pub width: usize,
     /// `y_crop_height` / `uv_crop_height`.
     pub height: usize,
+    /// Bits per sample of the reference frame.
+    pub bd: u8,
 }
 
 /// `dec_build_inter_predictors` (`vp9/decoder/vp9_decodeframe.c:593`),
@@ -407,7 +422,7 @@ pub(crate) struct RefPlane<'a> {
 /// `(x, y)` inside the block at MI `(mi_row, mi_col)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_inter_predictors(
-    dst: &mut [u8],
+    dst: &mut [Sample],
     dst_stride: usize,
     refp: &RefPlane<'_>,
     mi_col: usize,
@@ -425,9 +440,10 @@ pub(crate) fn build_inter_predictors(
     ss_y: usize,
     kernel: usize,
     avg: bool,
-    scratch: &mut Vec<u8>,
-    temp: &mut Vec<u8>,
+    scratch: &mut Vec<Sample>,
+    temp: &mut Vec<Sample>,
 ) {
+    let bd = refp.bd;
     let mv_q4 = clamp_mv_to_umv_border_sb(
         mv, w as i32, h as i32, mb_left, mb_right, mb_top, mb_bottom, ss_x, ss_y,
     );
@@ -511,6 +527,7 @@ pub(crate) fn build_inter_predictors(
                 h,
                 avg,
                 temp,
+                bd,
             );
             return;
         }
@@ -532,6 +549,7 @@ pub(crate) fn build_inter_predictors(
         h,
         avg,
         temp,
+        bd,
     );
 }
 

@@ -99,22 +99,22 @@ fn real_content_sweep() {
         if i == 0 {
             std::fs::write(dir.join("ours_f0.yuv"), {
                 let mut v = Vec::with_capacity(ysz + 2 * uvs);
-                v.extend_from_slice(&pic.y[..ysz.min(pic.y.len())]);
-                v.extend_from_slice(&pic.u);
-                v.extend_from_slice(&pic.v);
+                v.extend(pic.y[..ysz.min(pic.y.len())].iter().map(|&x| x as u8));
+                v.extend(pic.u.iter().map(|&x| x as u8));
+                v.extend(pic.v.iter().map(|&x| x as u8));
                 v
             })
             .unwrap();
             std::fs::write(dir.join("ff_f0.yuv"), &raw.stdout[..ysz + 2 * uvs]).unwrap();
         }
         let yd = (0..ysz)
-            .filter(|&k| pic.y[k] != raw.stdout[base + k])
+            .filter(|&k| pic.y[k] as u8 != raw.stdout[base + k])
             .count();
         let ud = (0..uvs)
-            .filter(|&k| pic.u[k] != raw.stdout[base + ysz + k])
+            .filter(|&k| pic.u[k] as u8 != raw.stdout[base + ysz + k])
             .count();
         let vd = (0..uvs)
-            .filter(|&k| pic.v[k] != raw.stdout[base + ysz + uvs + k])
+            .filter(|&k| pic.v[k] as u8 != raw.stdout[base + ysz + uvs + k])
             .count();
         println!(
             "frame {i}: {w}x{h} stride {} uv_stride {} Y {yd} U {ud} V {vd}",
