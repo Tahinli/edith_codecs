@@ -86,6 +86,16 @@ pub(crate) struct FrameCtx {
     pub(crate) lossless_flag: std::cell::Cell<bool>,
     pub(crate) cdef_bits: std::cell::Cell<u8>,
     pub(crate) bit_depth: std::cell::Cell<u8>,
+    /// lane-av1mono: the sequence header's `color_config.mono_chrome` (spec
+    /// 5.5.2), i.e. `NumPlanes == 1`. libaom threads this as
+    /// `av1_num_planes(cm)` and every chroma read site is guarded by
+    /// `!cm->seq_params->monochrome && xd->is_chroma_ref` (`decodemv.c:933`,
+    /// `:1208`) or bounded by `plane < num_planes`; a monochrome frame codes
+    /// NO `uv_mode`/`cfl`/`angle_delta_uv`/`palette_uv` symbol and NO chroma
+    /// coefficients on any block. Set once per frame from the sequence header
+    /// (like [`FrameCtx::bit_depth`]), so a mono frame decoded on a thread
+    /// that last saw a 4:2:0 one never inherits the wrong plane count.
+    pub(crate) mono_chrome: std::cell::Cell<bool>,
     pub(crate) superres: std::cell::Cell<(u32, u32)>,
     pub(crate) cdef_transmitted: std::cell::Cell<bool>,
     pub(crate) cdef_sb_cols: std::cell::Cell<usize>,
@@ -175,6 +185,7 @@ impl FrameCtx {
             lossless_flag: std::cell::Cell::new(false),
             cdef_bits: std::cell::Cell::new(0),
             bit_depth: std::cell::Cell::new(8),
+            mono_chrome: std::cell::Cell::new(false),
             superres: std::cell::Cell::new((0, 8)),
             cdef_transmitted: std::cell::Cell::new(false),
             cdef_sb_cols: std::cell::Cell::new(0),
@@ -269,6 +280,7 @@ impl<T: ?Sized> WithRef for T {}
 pub(crate) fn filter_ctx_copy(fctx: &FrameCtx) -> FrameCtx {
     let out = FrameCtx::new();
     out.bit_depth.set(fctx.bit_depth.get());
+    out.mono_chrome.set(fctx.mono_chrome.get());
     out.interp_filter.set(fctx.interp_filter.get());
     out.grain_bit_depth.set(fctx.grain_bit_depth.get());
     out.superres.set(fctx.superres.get());
@@ -564,6 +576,19 @@ pub(crate) fn bit_depth(fctx: &crate::decode::FrameCtx) -> u8 {
 /// [`crate::stream`]'s decode loop.
 pub(crate) fn set_bit_depth(bit_depth: u8, fctx: &crate::decode::FrameCtx) {
     fctx.bit_depth.with(|c| c.set(bit_depth));
+}
+
+/// This stream's `mono_chrome` (see [`FrameCtx::mono_chrome`]): a
+/// monochrome frame has `NumPlanes == 1`, so no block codes any chroma
+/// symbol or chroma coefficient and the output picture is luma only.
+pub(crate) fn mono(fctx: &crate::decode::FrameCtx) -> bool {
+    fctx.mono_chrome.with(std::cell::Cell::get)
+}
+
+/// Sets [`mono`] for the current thread, called once per frame from
+/// [`crate::stream`]'s decode loop like [`set_bit_depth`].
+pub(crate) fn set_mono(mono_chrome: bool, fctx: &crate::decode::FrameCtx) {
+    fctx.mono_chrome.with(|c| c.set(mono_chrome));
 }
 
     /// This frame's superres state: `(upscaled_width, superres_denom)`, or
@@ -9047,6 +9072,12 @@ fn read_intra_mode_rect(
     Option<PaletteY>,
     Option<PaletteUv>,
 )> {
+    // lane-av1mono: libaom guards every chroma symbol read with
+    // `!cm->seq_params->monochrome && xd->is_chroma_ref` (`decodemv.c:933`),
+    // so a monochrome block codes no `uv_mode`/`cfl`/`angle_delta_uv`/
+    // `palette_uv` even on a chroma-reference strip. Fold the plane count
+    // into the same `has_chroma` this reader already gates on.
+    let has_chroma = has_chroma && !mono(fctx);
     let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if ec_istep {
         // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
@@ -9805,7 +9836,14 @@ fn decode_rect_split(
     let mut ll_chroma_units: Vec<((usize, usize), usize, Grid)> = Vec::new();
     let ac = m.alpha.map(|_| cfl_src_rect(px, py, bw, bh));
     let reach = block_reach;
-    let (u_grid, v_grid) = if m.skip {
+    let (u_grid, v_grid) = if mono(fctx) {
+        // lane-av1mono: a monochrome frame codes no chroma coefficients on
+        // any block (`plane < av1_num_planes == 1`), so the whole chroma
+        // section -- the skipped-strip pushes, the lossless raster and the
+        // un-split `read_coeffs_rect` below -- is bypassed.
+        let zero = Grid::Zero(chroma_w * chroma_h);
+        (zero.clone(), zero)
+    } else if m.skip {
         let zero = Grid::Zero(chroma_w * chroma_h);
         if let Some((ub, _)) = &m.palette_uv {
             set_palette_pred(ub.clone(), fctx);
@@ -10456,8 +10494,14 @@ fn decode_intra_rect_in_inter(
     // `is_cfl_allowed` (spec 5.11.5) caps CFL at 32x32, so the
     // superblock-level strip reads the no-CFL alphabet -- the same split
     // [`read_intra_mode_rect`] makes for [`decode_block_rect64`].
-    let cfl_allowed = cfl_allowed_px(bw, bh, fctx);
-    let uv_mode = if cfl_allowed {
+    //
+    // lane-av1mono: a monochrome strip codes no chroma mode/CFL symbol
+    // (libaom `decodemv.c:933`).
+    let has_chroma = !mono(fctx);
+    let cfl_allowed = has_chroma && cfl_allowed_px(bw, bh, fctx);
+    let uv_mode = if !has_chroma {
+        DC_PRED
+    } else if cfl_allowed {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
@@ -10518,8 +10562,11 @@ fn decode_intra_rect_in_inter(
         }
         // A 2:1 strip of at least 8x8 is always a chroma reference, so
         // `read_palette_mode_info`'s `xd->is_chroma_ref` guard holds here.
-        let use_palette_uv =
-            uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
+        // lane-av1mono: libaom's actual guard is `num_planes > 1 &&
+        // uv_mode == UV_DC_PRED && xd->is_chroma_ref` (decodemv.c:602).
+        let use_palette_uv = has_chroma
+            && uv_mode == DC_PRED
+            && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
         if crate::envflags::env_flag!("EC_PALSYN") {
             eprintln!("EC_PALSYN rect mi={mi_r},{mi_c} bw={bw} bh={bh} mode={mode} uv={uv_mode} ctx={palette_ctx} y={} uv={} rng={}", use_palette_y as i32, use_palette_uv as i32, dec.debug_state().0);
         }
@@ -13270,11 +13317,15 @@ fn read_intra_mode(
         0
     };
     istep!("angle_y", angle_delta_y);
-    // lane-sb128c r3 (class sweep): `is_cfl_allowed` on the luma bsize, decided
-    // here so every `decode_block` caller (64x64 and 128x128 roots included)
-    // picks the right alphabet -- see [`read_intra_mode_rect`]'s twin.
-    let cfl = cfl && cfl_allowed_px(side, side, fctx);
-    let uv_mode = if cfl {
+    // lane-av1mono: a monochrome block codes no chroma mode/CFL/palette
+    // symbol at all (libaom `decodemv.c:933`'s `!monochrome && is_chroma_ref`
+    // guard). Fold `NumPlanes == 1` into the same `has_chroma` this reader
+    // gates its chroma symbols on.
+    let has_chroma = !mono(fctx);
+    let cfl = cfl && has_chroma && cfl_allowed_px(side, side, fctx);
+    let uv_mode = if !has_chroma {
+        DC_PRED
+    } else if cfl {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
@@ -13375,8 +13426,16 @@ fn read_intra_mode(
         // scope always reconstructs chroma alongside luma (`decode_block`
         // always calls `u.reconstruct`/`v.reconstruct`), so `is_chroma_ref`
         // is always true here and does not need threading in.
+        //
+        // lane-av1mono: libaom's actual guard is `num_planes > 1 &&
+        // uv_mode == UV_DC_PRED && xd->is_chroma_ref` (decodemv.c:602), so a
+        // monochrome frame reads NO `palette_uv_mode`/`palette_uv_size`
+        // symbol even at this chroma-owning square block.
         let palette_uv_mode_ctx = usize::from(use_palette_y);
-        if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[palette_uv_mode_ctx]) != 0 {
+        if has_chroma
+            && uv_mode == DC_PRED
+            && dec.symbol(&mut cdfs.palette_uv_mode[palette_uv_mode_ctx]) != 0
+        {
             let n = 2 + dec.symbol(&mut cdfs.palette_uv_size[bsize_ctx]);
             let (u_colors, v_colors) = read_palette_colors_uv(dec, n, palette_uv_cache, fctx);
             palette_uv_pending = Some((n, u_colors, v_colors));
@@ -14038,6 +14097,14 @@ fn read_plane(
     // See [`PlaneBuf::reconstruct`]'s own doc: caller's neighbour-smooth check.
     smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<Grid> {
+    // lane-av1mono: a monochrome frame has `NumPlanes == 1`, so libaom's
+    // coefficient loop (`for (plane = 0; plane < av1_num_planes(cm); ++plane)`)
+    // never reaches a chroma plane -- no u/v coefficient symbol is coded and
+    // no chroma write is recorded. Return the all-zero grid the caller's
+    // neighbour bookkeeping reads, without consuming a bit.
+    if plane_idx > 0 && mono(fctx) {
+        return Ok(Grid::Zero(side * side));
+    }
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
@@ -15916,6 +15983,9 @@ fn read_intra_mode_sub8(
     seg_w_mi: usize,
     seg_h_mi: usize, fctx: &crate::decode::FrameCtx,
 ) -> Result<(bool, usize, i32, Option<(usize, i32, Option<(i32, i32)>)>, Option<usize>)> {
+    // lane-av1mono: a monochrome leaf codes no chroma mode (libaom
+    // `decodemv.c:933`), so fold `NumPlanes == 1` into `has_chroma`.
+    let has_chroma = has_chroma && !mono(fctx);
     let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if ec_istep {
@@ -16131,6 +16201,11 @@ fn decode_leaf_split4(
             last_uv = chroma;
         }
     }
+    // lane-av1mono: as [`decode_leaf_rect8`] -- a monochrome frame has no
+    // chroma to reconstruct and no uv_mode was read.
+    let (u_grid, v_grid): (Grid, Grid) = if mono(fctx) {
+        (Grid::Zero(16), Grid::Zero(16))
+    } else {
     let (gpx, gpy) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
     let (cpx, cpy) = (gpx / 2, gpy / 2);
     let group_reach = Reach::of(8, gpx, gpy, y.width, y.height, fctx);
@@ -16171,6 +16246,8 @@ fn decode_leaf_split4(
             alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
         )?;
         (ug, vg)
+    };
+    (u_grid, v_grid)
     };
     // Chroma neighbour bookkeeping for the whole 8x8 group -- mirrors
     // [`decode_leaf8`]'s own tx4-chroma section (`record_split_luma`'s
@@ -16518,6 +16595,12 @@ fn decode_leaf_rect8(
             last_uv = chroma;
         }
     }
+    // lane-av1mono: a monochrome frame codes no chroma at all -- no
+    // `uv_mode` was read ([`read_intra_mode_sub8`] folds the plane count in),
+    // so there is no chroma to reconstruct and no chroma coefficient to read.
+    let (u_grid, v_grid): (Grid, Grid) = if mono(fctx) {
+        (Grid::Zero(16), Grid::Zero(16))
+    } else {
     let (gpx, gpy) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
     let (cpx, cpy) = (gpx / 2, gpy / 2);
     let group_reach = Reach::of(8, gpx, gpy, y.width, y.height, fctx);
@@ -16558,6 +16641,8 @@ fn decode_leaf_rect8(
             alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
         )?;
         (ug, vg)
+    };
+    (u_grid, v_grid)
     };
     // `update_partition_context` at the 8x8 level writes
     // `partition_context_lookup[subsize]` over the whole 8x8 span: BLOCK_4X8
@@ -18498,6 +18583,11 @@ fn read_inter_plane_rect(
     inherited_luma_tx_type: Option<TxType>,
     luma_skip_ctx: Option<usize>, fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, TxType)> {
+    // lane-av1mono: as [`read_plane`] -- a monochrome frame codes no chroma
+    // coefficients (`plane < av1_num_planes == 1`).
+    if plane_idx > 0 && mono(fctx) {
+        return Ok((Grid::Zero(w * h), TxType::DctDct));
+    }
     let skip_ctx = if plane_idx == 0 {
         // `get_txb_ctx_general`: 0 only when this unit IS the whole plane
         // block; a var-tx leaf passes its own neighbour-table context.
@@ -24738,6 +24828,11 @@ fn read_inter_plane(
     // lone-transform-unit 0.
     luma_skip_ctx: Option<usize>, fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, TxType)> {
+    // lane-av1mono: as [`read_plane`] -- a monochrome frame codes no chroma
+    // coefficients (`plane < av1_num_planes == 1`).
+    if plane_idx > 0 && mono(fctx) {
+        return Ok((Grid::Zero(side * side), TxType::DctDct));
+    }
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
@@ -29748,11 +29843,16 @@ fn decode_inter_block(
         // the 14-symbol CFL one gave the same DC_PRED VALUE but narrowed the
         // arithmetic coder by the wrong interval, desyncing the tile from this
         // block on.
-        let cfl_allowed = cfl_allowed_px(write_w, write_h, fctx);
+        // lane-av1mono: a monochrome block codes no chroma mode/CFL symbol
+        // (libaom `decodemv.c:933`).
+        let has_chroma = !mono(fctx);
+        let cfl_allowed = has_chroma && cfl_allowed_px(write_w, write_h, fctx);
         if !cfl_allowed {
             hit!(NOCFL_UV_MODE_HITS);
         }
-        let uv_mode = if cfl_allowed {
+        let uv_mode = if !has_chroma {
+            DC_PRED
+        } else if cfl_allowed {
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
@@ -29823,8 +29923,9 @@ fn decode_inter_block(
             if crate::envflags::env_flag!("EC_PALSYN") {
                 eprintln!("EC_PALSYN_PRE sq mi={rmi},{cmi} bw={write_w} bh={write_h} mode={mode} uv={uv_mode} ctx={palette_ctx} y={} rng={}", palette_y_pending.map_or(0, |(n, _)| n), dec.debug_state().0);
             }
-            let use_palette_uv =
-                uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
+            let use_palette_uv = has_chroma
+                && uv_mode == DC_PRED
+                && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
             if crate::envflags::env_flag!("EC_PALSYN") {
                 eprintln!("EC_PALSYN sq mi={rmi},{cmi} bw={write_w} bh={write_h} mode={mode} uv={uv_mode} ctx={palette_ctx} y={} uv={} rng={}", use_palette_y as i32, use_palette_uv as i32, dec.debug_state().0);
             }
@@ -31178,6 +31279,9 @@ fn decode_intra_sub8_leaf(
     tx_select: bool,
     reduced_tx_set: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<usize> {
+    // lane-av1mono: a monochrome leaf codes no chroma mode (libaom
+    // `decodemv.c:933`).
+    let has_chroma = has_chroma && !mono(fctx);
     let vert = bw < bh;
     let (w_mi, h_mi) = (bw / MI, bh / MI);
     let (gr, gc) = group_mi;
@@ -33872,7 +33976,12 @@ fn decode_inter_block8(
         // row (`get_uv_mode`, identity over `V_PRED..=D67_PRED`). Every value
         // but `DC_PRED` was refused here, which is what blocked the low-cq
         // CDEF arms and the 10-bit gates.
-        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        let has_chroma = !mono(fctx);
+        let uv_mode = if !has_chroma {
+            DC_PRED
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        };
         if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
             eprintln!(
                 "EC_ISTEP8 mi_row={} mi_col={} name=modes y={mode} uv={uv_mode} fi_enabled={} rng={}",
@@ -33886,7 +33995,7 @@ fn decode_inter_block8(
             hit!(SMOOTH_UV_HITS);
             hit!(INTRA_IN_INTER8_UV_SMOOTH_HITS);
         }
-        let alpha = if uv_mode == UV_CFL_PRED {
+        let alpha = if has_chroma && uv_mode == UV_CFL_PRED {
             hit!(INTRA_IN_INTER8_UV_CFL_HITS);
             Some(read_cfl_alphas(dec, cdfs))
         } else {
@@ -33943,7 +34052,8 @@ fn decode_inter_block8(
             }
             // lane-uv8 r1: `read_palette_mode_info` reads the UV symbol only
             // when `uv_mode == UV_DC_PRED` (decodemv.c).
-            let use_palette_uv = uv_mode == DC_PRED
+            let use_palette_uv = has_chroma
+                && uv_mode == DC_PRED
                 && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
             if crate::envflags::env_flag!("EC_PALSYN") {
                 eprintln!(
