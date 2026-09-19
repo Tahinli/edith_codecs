@@ -107,3 +107,43 @@ was AFTER mode info, not in it.
 
 - `decode.rs`: the tile desync error now names the tile and overread count
   (was a bare `ensure`); behaviour otherwise unchanged.
+- `tests/scratch_pixdump10.rs`: u16-LE plane dumper for the 10-bit pixel
+  comparator. KEPT as the next lane's instrument (paired with
+  `drv_pix10`); it is not a throwaway.
+
+## MERGE-SIDE FOLLOW-UPS (2026-09-19)
+
+- **Review P3 fixed on the lane before the merge.** `lanes/vp9hbd.report.md`
+  claimed `hbd_exact.rs` "fails at the first frame on the pre-fix tree"; it
+  cannot compile there (`Picture.bit_depth` is new). Reworded to state the
+  refusal was proved with an adapted test copy (new-field reads stripped)
+  panicking with `Unsupported("vp9 profile 2")` at the profile gate. Lane
+  commit `59fdf378`.
+- **Merge**: `--ff-only` (base `79984549` == main HEAD), range
+  `79984549..59fdf378`, 20 files, +819/−295.
+- **Create-list audit**: exactly the expected three creates —
+  `crates/ec-vp9/tests/hbd_exact.rs`, `crates/ec-vp9/tests/scratch_pixdump10.rs`
+  (kept instrument, above), `lanes/vp9hbd.report.md`. No fixtures, junk or
+  target artifacts. Nothing else in the merge.
+- **Gates on the MERGED tree** (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-vp9hbdmerge`):
+  `cargo test -p ec-vp9` → `rc=0`, 0 failed across every suite;
+  `hbd_exact` **2/2** passed, 0 ignored (non-skipped); `odd_dimensions_exact`
+  3/3; `inter_pixels_exact` 3/3; `keyframe_exact` 4/4.
+  Warning parity: `cargo check -p ec-vp9 --all-targets` → exactly the 5
+  pre-existing (TM_PRED, read_partition, partition_props, x_mis, y_mis).
+  No dependent crate in-repo depends on `ec-vp9` (only ec-vp9 → ec-vp9-syntax,
+  untouched), so no cross-crate suite to run.
+- **Merged-tree corpus re-sweep** (u16 conversion touched every kernel; ours
+  regenerated from the merged build via `scratch_pixdump10` / `scratch_pixdump`
+  and `cmp`ed against the oracle `drv_pix10` / `drv_pix` dumps), all
+  byte-IDENTICAL:
+  - `vp9-1080p-23.976-10bit` 48 frames (u16), `vp9-1080p-60-10bit` 120 frames (u16),
+  - `vp9-1080p-23.976-8bit` 48, `vp9-1080p-60-8bit` 120,
+  - `vp9-superframe-altref` 60, `vp9-tiles-1280` 30,
+  - odd witness `testsrc2 321x241` 12 frames (`odd_dimensions_exact`, ffmpeg oracle) 3/3.
+- **Push**: `79984549..59fdf378 main -> main`; `git ls-remote origin refs/heads/main`
+  == `59fdf378445701defd6b0e3446336ab20b1fa3fb` == local HEAD.
+- **Cleanup**: `git worktree remove .../edith_codecs-vp9hbd` (branch
+  `lane-vp9-hbd` kept); `rm -rf $HOME/.cache/cargo-target-vp9hbd{,-merge,-verify}`
+  (lane + merge + reviewer dirs, ~977 MB). Worktree list went from 8 entries
+  to 7 (the lane gone; `vp9ref` sibling lane untouched).
