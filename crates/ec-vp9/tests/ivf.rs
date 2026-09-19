@@ -31,9 +31,8 @@ pub fn parse_ivf(bytes: &[u8]) -> (&str, u16, u16, Vec<IvfFrame>) {
     let mut pos = hdr_len;
     let mut frames = Vec::new();
     while pos + 12 <= bytes.len() {
-        let sz = u32::from_le_bytes([
-            bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
-        ]) as usize;
+        let sz = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
         let pts = u64::from_le_bytes(bytes[pos + 4..pos + 12].try_into().unwrap());
         pos += 12;
         if pos + sz > bytes.len() {
@@ -51,8 +50,8 @@ pub fn parse_ivf(bytes: &[u8]) -> (&str, u16, u16, Vec<IvfFrame>) {
 /// Root of the workspace checkout this test runs in (crates/ec-vp9/../..).
 #[allow(dead_code)] // shared by every test binary that does `mod ivf`
 pub fn fixture_dir() -> Option<std::path::PathBuf> {
-    let bitstreams = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/bitstreams");
+    let bitstreams =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/bitstreams");
     if bitstreams.is_dir() {
         Some(bitstreams)
     } else {

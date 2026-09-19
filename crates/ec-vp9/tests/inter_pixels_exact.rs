@@ -87,9 +87,9 @@ fn compare(path: &std::path::Path) -> usize {
             );
             let want = &expected[off..off + frame_bytes];
             let mut got = Vec::with_capacity(frame_bytes);
-            got.extend_from_slice(&pic.y);
-            got.extend_from_slice(&pic.u);
-            got.extend_from_slice(&pic.v);
+            got.extend(pic.y.iter().map(|&v| v as u8));
+            got.extend(pic.u.iter().map(|&v| v as u8));
+            got.extend(pic.v.iter().map(|&v| v as u8));
             assert_eq!(
                 got.len(),
                 frame_bytes,

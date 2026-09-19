@@ -46,14 +46,24 @@ const S2: i64 = 9929;
 const S3: i64 = 13377;
 const S4: i64 = 15212;
 
-/// `clip_pixel_add`.
+use crate::Sample;
+
+/// `detect_invalid_highbd_input` (`vpx_dsp/inv_txfm.c:1284`): a 1-D highbitdepth
+/// transform whose input holds a magnitude `>= 1 << 25` emits all zeros instead
+/// of reconstructing. Unreachable for valid streams; ported for fidelity.
 #[inline]
-pub(crate) fn clip_add(d: u8, v: i32) -> u8 {
-    (d as i32 + v).clamp(0, 255) as u8
+fn invalid_highbd_input(input: &[i32], bd: u8) -> bool {
+    bd != 8 && input.iter().any(|&v| v.unsigned_abs() >= (1u32 << 25))
+}
+
+/// `clip_pixel_add` / `highbd_clip_pixel_add`.
+#[inline]
+pub(crate) fn clip_add(d: Sample, v: i32, bd: u8) -> Sample {
+    crate::clip_pixel_bd(d as i32 + v, bd)
 }
 
 /// vpx_iwht4x4_16_add_c (lossless).
-pub(crate) fn iwht4x4_add(input: &[i32], dest: &mut [u8], stride: usize) {
+pub(crate) fn iwht4x4_add(input: &[i32], dest: &mut [Sample], stride: usize, bd: u8) {
     let mut output = [0i32; 16];
     for i in 0..4 {
         let ip = &input[i * 4..i * 4 + 4];
@@ -82,14 +92,18 @@ pub(crate) fn iwht4x4_add(input: &[i32], dest: &mut [u8], stride: usize) {
         let c1 = e1 - c0;
         let a1 = a2 - b1;
         let d1 = d2 + c1;
-        dest[i] = clip_add(dest[i], a1);
-        dest[stride + i] = clip_add(dest[stride + i], b1);
-        dest[stride * 2 + i] = clip_add(dest[stride * 2 + i], c1);
-        dest[stride * 3 + i] = clip_add(dest[stride * 3 + i], d1);
+        dest[i] = clip_add(dest[i], a1, bd);
+        dest[stride + i] = clip_add(dest[stride + i], b1, bd);
+        dest[stride * 2 + i] = clip_add(dest[stride * 2 + i], c1, bd);
+        dest[stride * 3 + i] = clip_add(dest[stride * 3 + i], d1, bd);
     }
 }
 
-pub(crate) fn idct4(input: &[i32], output: &mut [i32]) {
+pub(crate) fn idct4(input: &[i32], output: &mut [i32], bd: u8) {
+    if invalid_highbd_input(input, bd) {
+        output[..4].fill(0);
+        return;
+    }
     let g = |v: i32| v as i64;
     let mut step = [0i32; 4];
     let t1 = (g(input[0]) + g(input[2])) * C16;
@@ -106,7 +120,11 @@ pub(crate) fn idct4(input: &[i32], output: &mut [i32]) {
     output[3] = step[0] - step[3];
 }
 
-pub(crate) fn idct8(input: &[i32], output: &mut [i32]) {
+pub(crate) fn idct8(input: &[i32], output: &mut [i32], bd: u8) {
+    if invalid_highbd_input(input, bd) {
+        output[..8].fill(0);
+        return;
+    }
     let g = |v: i32| v as i64;
     let mut step1 = [0i32; 8];
     let mut step2 = [0i32; 8];
@@ -144,7 +162,11 @@ pub(crate) fn idct8(input: &[i32], output: &mut [i32]) {
     output[7] = step1[0] - step1[7];
 }
 
-pub(crate) fn idct16(input: &[i32], output: &mut [i32]) {
+pub(crate) fn idct16(input: &[i32], output: &mut [i32], bd: u8) {
+    if invalid_highbd_input(input, bd) {
+        output[..16].fill(0);
+        return;
+    }
     let g = |v: i32| v as i64;
     let mut step1 = [0i32; 16];
     let mut step2 = [0i32; 16];
@@ -228,12 +250,18 @@ pub(crate) fn idct16(input: &[i32], output: &mut [i32]) {
     }
 }
 
-pub(crate) fn idct32(input: &[i32], output: &mut [i32]) {
+pub(crate) fn idct32(input: &[i32], output: &mut [i32], bd: u8) {
+    if invalid_highbd_input(input, bd) {
+        output[..32].fill(0);
+        return;
+    }
     let g = |v: i32| v as i64;
     let mut step1 = [0i32; 32];
     let mut step2 = [0i32; 32];
     for i in 0..16 {
-        step1[i] = input[[0usize, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30][i]];
+        step1[i] = input[[
+            0usize, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
+        ][i]];
     }
     step1[16] = dcrs(g(input[1]) * C31 - g(input[31]) * C1);
     step1[31] = dcrs(g(input[1]) * C1 + g(input[31]) * C31);
@@ -441,8 +469,17 @@ pub(crate) fn idct32(input: &[i32], output: &mut [i32]) {
     }
 }
 
-pub(crate) fn iadst4(input: &[i32], output: &mut [i32]) {
-    let (x0, x1, x2, x3) = (input[0] as i64, input[1] as i64, input[2] as i64, input[3] as i64);
+pub(crate) fn iadst4(input: &[i32], output: &mut [i32], bd: u8) {
+    if invalid_highbd_input(input, bd) {
+        output[..4].fill(0);
+        return;
+    }
+    let (x0, x1, x2, x3) = (
+        input[0] as i64,
+        input[1] as i64,
+        input[2] as i64,
+        input[3] as i64,
+    );
     if x0 | x1 | x2 | x3 == 0 {
         output[..4].fill(0);
         return;
@@ -458,7 +495,11 @@ pub(crate) fn iadst4(input: &[i32], output: &mut [i32]) {
     output[3] = dcrs(s0 + s1 - s3);
 }
 
-pub(crate) fn iadst8(input: &[i32], output: &mut [i32]) {
+pub(crate) fn iadst8(input: &[i32], output: &mut [i32], bd: u8) {
+    if invalid_highbd_input(input, bd) {
+        output[..8].fill(0);
+        return;
+    }
     let g = |v: i32| v as i64;
     let mut x0 = g(input[7]);
     let mut x1 = g(input[0]);
@@ -519,13 +560,29 @@ pub(crate) fn iadst8(input: &[i32], output: &mut [i32]) {
     output[7] = -x1 as i32;
 }
 
-pub(crate) fn iadst16(input: &[i32], output: &mut [i32]) {
+pub(crate) fn iadst16(input: &[i32], output: &mut [i32], bd: u8) {
+    if invalid_highbd_input(input, bd) {
+        output[..16].fill(0);
+        return;
+    }
     let g = |v: i32| v as i64;
     let mut x = [
-        g(input[15]), g(input[0]), g(input[13]), g(input[2]),
-        g(input[11]), g(input[4]), g(input[9]), g(input[6]),
-        g(input[7]), g(input[8]), g(input[5]), g(input[10]),
-        g(input[3]), g(input[12]), g(input[1]), g(input[14]),
+        g(input[15]),
+        g(input[0]),
+        g(input[13]),
+        g(input[2]),
+        g(input[11]),
+        g(input[4]),
+        g(input[9]),
+        g(input[6]),
+        g(input[7]),
+        g(input[8]),
+        g(input[5]),
+        g(input[10]),
+        g(input[3]),
+        g(input[12]),
+        g(input[1]),
+        g(input[14]),
     ];
     if x.iter().all(|&v| v == 0) {
         output[..16].fill(0);
@@ -615,8 +672,8 @@ pub(crate) fn iadst16(input: &[i32], output: &mut [i32]) {
     x[14] = dcrs(s14) as i64;
     x[15] = dcrs(s15) as i64;
     let o = [
-        x[0], -x[8], x[12], -x[4], x[6], x[14], x[10], x[2],
-        x[3], x[11], x[15], x[7], x[5], -x[13], x[9], -x[1],
+        x[0], -x[8], x[12], -x[4], x[6], x[14], x[10], x[2], x[3], x[11], x[15], x[7], x[5],
+        -x[13], x[9], -x[1],
     ];
     for (i, &v) in o.iter().enumerate() {
         output[i] = v as i32;
@@ -630,19 +687,20 @@ pub(crate) fn inverse_transform_add(
     tx_size: usize,
     tx_type: usize,
     coeffs: &[i32],
-    dest: &mut [u8],
+    dest: &mut [Sample],
     off: usize,
     stride: usize,
     lossless: bool,
+    bd: u8,
 ) {
     if lossless {
-        iwht4x4_add(coeffs, &mut dest[off..], stride);
+        iwht4x4_add(coeffs, &mut dest[off..], stride, bd);
         return;
     }
     if tx_size == TX_32X32 {
         let mut out = [0i32; 1024];
         for i in 0..32 {
-            idct32(&coeffs[i * 32..], &mut out[i * 32..]);
+            idct32(&coeffs[i * 32..], &mut out[i * 32..], bd);
         }
         let mut temp_in = [0i32; 32];
         let mut temp_out = [0i32; 32];
@@ -650,10 +708,10 @@ pub(crate) fn inverse_transform_add(
             for (j, ti) in temp_in.iter_mut().enumerate() {
                 *ti = out[j * 32 + i];
             }
-            idct32(&temp_in, &mut temp_out);
+            idct32(&temp_in, &mut temp_out, bd);
             for j in 0..32 {
                 let d = &mut dest[off + j * stride + i];
-                *d = clip_add(*d, (temp_out[j] + 32) >> 6);
+                *d = clip_add(*d, (temp_out[j] + 32) >> 6, bd);
             }
         }
         return;
@@ -666,7 +724,7 @@ pub(crate) fn inverse_transform_add(
     // ADST_DCT codes ADST vertical (= cols pass); DCT_ADST horizontal.
     let adst_cols = matches!(tx_type, ADST_DCT | ADST_ADST);
     let adst_rows = matches!(tx_type, DCT_ADST | ADST_ADST);
-    let (row_fn, col_fn): (fn(&[i32], &mut [i32]), fn(&[i32], &mut [i32])) = match tx_size {
+    let (row_fn, col_fn): (fn(&[i32], &mut [i32], u8), fn(&[i32], &mut [i32], u8)) = match tx_size {
         TX_4X4 => (
             if adst_rows { iadst4 } else { idct4 },
             if adst_cols { iadst4 } else { idct4 },
@@ -682,7 +740,7 @@ pub(crate) fn inverse_transform_add(
     };
     let mut out = vec![0i32; n * n];
     for i in 0..n {
-        row_fn(&coeffs[i * n..], &mut out[i * n..]);
+        row_fn(&coeffs[i * n..], &mut out[i * n..], bd);
     }
     let mut temp_in = vec![0i32; n];
     let mut temp_out = vec![0i32; n];
@@ -690,14 +748,13 @@ pub(crate) fn inverse_transform_add(
         for j in 0..n {
             temp_in[j] = out[j * n + i];
         }
-        col_fn(&temp_in, &mut temp_out);
+        col_fn(&temp_in, &mut temp_out, bd);
         for j in 0..n {
             let d = &mut dest[off + j * stride + i];
-            *d = clip_add(*d, (temp_out[j] + (1 << (shift - 1))) >> shift);
+            *d = clip_add(*d, (temp_out[j] + (1 << (shift - 1))) >> shift, bd);
         }
     }
 }
-
 
 #[cfg(test)]
 mod scratch_probe {
@@ -707,8 +764,8 @@ mod scratch_probe {
         for (name, tt) in [("dct_dct", DCT_DCT), ("dct_adst", DCT_ADST)] {
             let mut c = [0i32; 64];
             c[0] = 38;
-            let mut d = vec![129u8; 64];
-            inverse_transform_add(TX_8X8, tt, &c, &mut d, 0, 8, false);
+            let mut d = vec![129u16; 64];
+            inverse_transform_add(TX_8X8, tt, &c, &mut d, 0, 8, false, 8);
             println!("{name}: {:?}", &d[..8]);
         }
     }

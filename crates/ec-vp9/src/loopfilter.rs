@@ -95,48 +95,60 @@ const LUMA_ABOVE_TXF: [u64; 4] = [u64::MAX, u64::MAX, 0x00ff00ff00ff00ff, 0x0000
 const LUMA_LEFT_BORDER: u64 = 0x1111111111111111;
 const LUMA_ABOVE_BORDER: u64 = 0x000000ff000000ff;
 
+use crate::Sample;
+
+/// `signed_char_clamp_high` (`vpx_dsp/loopfilter.c:23`): clamp to
+/// `[-(128 << (bd-8)), (128 << (bd-8)) - 1]`. At `bd == 8` this is libvpx's
+/// 8-bit `signed_char_clamp` (`[-128, 127]`).
 #[inline]
-fn sc(x: i32) -> i32 {
-    x.clamp(-128, 127)
+fn sc(x: i32, bd: u8) -> i32 {
+    let shift = (bd - 8) as i32;
+    x.clamp(-(128 << shift), (128 << shift) - 1)
 }
 
-/// `filter4` kernel; `idx` = [op1, op0, oq0, oq1].
+/// `filter4` / `highbd_filter4` kernel; `idx` = [op1, op0, oq0, oq1].
 /// `vpx_dsp filter4`: updates p1/p0/q0/q1 in place. `mask` gates the
-/// whole filter, `hev` the outer taps (vp9_loopfilter.c:81).
-fn filter4(s: &mut [u8], idx: [usize; 4], thresh: i32, mask: bool) {
+/// whole filter, `hev` the outer taps (vp9_loopfilter.c:81). The `^ 0x80`
+/// of the 8-bit kernel generalizes to subtracting `0x80 << (bd - 8)`.
+fn filter4(s: &mut [Sample], idx: [usize; 4], thresh: i32, mask: bool, bd: u8) {
     if !mask {
         return;
     }
+    let shift = (bd - 8) as i32;
+    let bias = 0x80 << shift;
     let (op1, op0, oq0, oq1) = (idx[0], idx[1], idx[2], idx[3]);
     let (p1, p0, q0, q1) = (s[op1], s[op0], s[oq0], s[oq1]);
-    let hev = (p1 as i32 - p0 as i32).abs() > thresh || (q1 as i32 - q0 as i32).abs() > thresh;
+    let hev_thresh = thresh << shift;
+    let hev =
+        (p1 as i32 - p0 as i32).abs() > hev_thresh || (q1 as i32 - q0 as i32).abs() > hev_thresh;
     let (ps1, ps0, qs0, qs1) = (
-        (p1 ^ 0x80) as i8 as i32,
-        (p0 ^ 0x80) as i8 as i32,
-        (q0 ^ 0x80) as i8 as i32,
-        (q1 ^ 0x80) as i8 as i32,
+        p1 as i32 - bias,
+        p0 as i32 - bias,
+        q0 as i32 - bias,
+        q1 as i32 - bias,
     );
-    let mut filter = sc(ps1 - qs1);
+    let mut filter = sc(ps1 - qs1, bd);
     if hev {
         // add outer taps if we have high edge variance (& hev mask)
     } else {
         filter = 0;
     }
     // inner taps
-    filter = sc(filter + 3 * (qs0 - ps0));
+    filter = sc(filter + 3 * (qs0 - ps0), bd);
     // round one side +4 and the other +3
-    let filter1 = sc(filter + 4) >> 3;
-    let filter2 = sc(filter + 3) >> 3;
-    s[oq0] = (sc(qs0 - filter1) ^ 0x80) as u8;
-    s[op0] = (sc(ps0 + filter2) ^ 0x80) as u8;
+    let filter1 = sc(filter + 4, bd) >> 3;
+    let filter2 = sc(filter + 3, bd) >> 3;
+    s[oq0] = (sc(qs0 - filter1, bd) + bias) as Sample;
+    s[op0] = (sc(ps0 + filter2, bd) + bias) as Sample;
     // outer tap adjustments (& ~hev)
     let f = if hev { 0 } else { (filter1 + 1) >> 1 };
-    s[oq1] = (sc(qs1 - f) ^ 0x80) as u8;
-    s[op1] = (sc(ps1 + f) ^ 0x80) as u8;
+    s[oq1] = (sc(qs1 - f, bd) + bias) as Sample;
+    s[op1] = (sc(ps1 + f, bd) + bias) as Sample;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lpf_edge(
-    data: &mut [u8],
+    data: &mut [Sample],
     off: usize,
     stride: usize,
     dir: u8,
@@ -145,7 +157,14 @@ fn lpf_edge(
     limit: i32,
     thresh: i32,
     nlines: isize,
+    bd: u8,
 ) {
+    // `highbd_filter_mask` / `highbd_flat_mask*`: the coded 8-bit thresholds
+    // scale by `1 << (bd - 8)`.
+    let shift = (bd - 8) as i32;
+    let limit = limit << shift;
+    let blimit = blimit << shift;
+    let flat_t = 1 << shift;
     // `dir` 0 = horizontal edges (rows step by stride), 1 = vertical
     // (columns step by 1). `taps` in {4, 8, 16}.
     let step: isize = if dir == 0 { stride as isize } else { 1 };
@@ -179,23 +198,23 @@ fn lpf_edge(
             (edge + step) as usize,
         ];
         if taps == 4 {
-            filter4(data, idx4, thresh, mask);
+            filter4(data, idx4, thresh, mask, bd);
             continue;
         }
         if !mask {
             continue;
         }
         // flat_mask4(1, p3..q3)
-        let flat = (rd!(-2) - rd!(-1)).abs() <= 1
-            && (rd!(1) - rd!(0)).abs() <= 1
-            && (rd!(-3) - rd!(-1)).abs() <= 1
-            && (rd!(2) - rd!(0)).abs() <= 1
-            && (rd!(-4) - rd!(-1)).abs() <= 1
-            && (rd!(3) - rd!(0)).abs() <= 1;
+        let flat = (rd!(-2) - rd!(-1)).abs() <= flat_t
+            && (rd!(1) - rd!(0)).abs() <= flat_t
+            && (rd!(-3) - rd!(-1)).abs() <= flat_t
+            && (rd!(2) - rd!(0)).abs() <= flat_t
+            && (rd!(-4) - rd!(-1)).abs() <= flat_t
+            && (rd!(3) - rd!(0)).abs() <= flat_t;
         if taps == 8 || !flat {
             if !flat {
                 // plain filter4 with the real mask and hev threshold
-                filter4(data, idx4, thresh, mask);
+                filter4(data, idx4, thresh, mask, bd);
                 continue;
             }
             // 7-tap [1,1,1,2,1,1,1] outputs (filter8).
@@ -209,25 +228,40 @@ fn lpf_edge(
                 rd!(2),
                 rd!(3),
             );
-            put!(-3, ((p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3) as u8);
-            put!(-2, ((p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3) as u8);
-            put!(-1, ((p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3) as u8);
-            put!(0, ((p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3) as u8);
-            put!(1, ((p1 + p0 + q0 + q1 * 2 + q2 + q3 + q3 + 4) >> 3) as u8);
-            put!(2, ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as u8);
+            put!(-3, ((p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3) as Sample);
+            put!(
+                -2,
+                ((p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3) as Sample
+            );
+            put!(
+                -1,
+                ((p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3) as Sample
+            );
+            put!(
+                0,
+                ((p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3) as Sample
+            );
+            put!(
+                1,
+                ((p1 + p0 + q0 + q1 * 2 + q2 + q3 + q3 + 4) >> 3) as Sample
+            );
+            put!(
+                2,
+                ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as Sample
+            );
             continue;
         }
         // flat_mask5(1, s[-8], s[-7], s[-6], s[-5], p0, q0, s[4], s[5], s[6], s[7]):
         // |p7..p4 - p0| and |q4..q7 - q0| (the C names are shifted; q4..q6
         // are the q1..q3 args of the inner flat_mask4 and compare to q0).
-        let flat2 = (rd!(-8) - rd!(-1)).abs() <= 1
-            && (rd!(-7) - rd!(-1)).abs() <= 1
-            && (rd!(-6) - rd!(-1)).abs() <= 1
-            && (rd!(-5) - rd!(-1)).abs() <= 1
-            && (rd!(4) - rd!(0)).abs() <= 1
-            && (rd!(5) - rd!(0)).abs() <= 1
-            && (rd!(6) - rd!(0)).abs() <= 1
-            && (rd!(7) - rd!(0)).abs() <= 1;
+        let flat2 = (rd!(-8) - rd!(-1)).abs() <= flat_t
+            && (rd!(-7) - rd!(-1)).abs() <= flat_t
+            && (rd!(-6) - rd!(-1)).abs() <= flat_t
+            && (rd!(-5) - rd!(-1)).abs() <= flat_t
+            && (rd!(4) - rd!(0)).abs() <= flat_t
+            && (rd!(5) - rd!(0)).abs() <= flat_t
+            && (rd!(6) - rd!(0)).abs() <= flat_t
+            && (rd!(7) - rd!(0)).abs() <= flat_t;
         if !flat2 {
             let (p3, p2, p1, p0, q0, q1, q2, q3) = (
                 rd!(-4),
@@ -239,12 +273,27 @@ fn lpf_edge(
                 rd!(2),
                 rd!(3),
             );
-            put!(-3, ((p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3) as u8);
-            put!(-2, ((p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3) as u8);
-            put!(-1, ((p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3) as u8);
-            put!(0, ((p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3) as u8);
-            put!(1, ((p1 + p0 + q0 + q1 * 2 + q2 + q3 + q3 + 4) >> 3) as u8);
-            put!(2, ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as u8);
+            put!(-3, ((p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3) as Sample);
+            put!(
+                -2,
+                ((p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3) as Sample
+            );
+            put!(
+                -1,
+                ((p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3) as Sample
+            );
+            put!(
+                0,
+                ((p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3) as Sample
+            );
+            put!(
+                1,
+                ((p1 + p0 + q0 + q1 * 2 + q2 + q3 + q3 + 4) >> 3) as Sample
+            );
+            put!(
+                2,
+                ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as Sample
+            );
             continue;
         }
         // 15-tap filter [1 x 7, 2, 1 x 7] (filter16, weights verbatim).
@@ -254,65 +303,67 @@ fn lpf_edge(
         let (q4, q5, q6, q7) = (rd!(4), rd!(5), rd!(6), rd!(7));
         put!(
             -7,
-            ((p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0 + 8) >> 4) as u8
+            ((p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0 + 8) >> 4) as Sample
         );
         put!(
             -6,
-            ((p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1 + 8) >> 4) as u8
+            ((p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1 + 8) >> 4) as Sample
         );
         put!(
             -5,
-            ((p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4) as u8
+            ((p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4) as Sample
         );
         put!(
             -4,
-            ((p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3 + 8) >> 4) as u8
+            ((p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3 + 8) >> 4)
+                as Sample
         );
         put!(
             -3,
             ((p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 + 8) >> 4)
-                as u8
+                as Sample
         );
         put!(
             -2,
             ((p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + q4 + q5 + 8) >> 4)
-                as u8
+                as Sample
         );
         put!(
             -1,
             ((p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + q5 + q6 + 8)
-                >> 4) as u8
+                >> 4) as Sample
         );
         put!(
             0,
             ((p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + q6 + q7 + 8)
-                >> 4) as u8
+                >> 4) as Sample
         );
         put!(
             1,
             ((p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + q7 * 2 + 8) >> 4)
-                as u8
+                as Sample
         );
         put!(
             2,
             ((p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 + q4 + q5 + q6 + q7 * 3 + 8) >> 4)
-                as u8
+                as Sample
         );
         put!(
             3,
-            ((p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4 + 8) >> 4) as u8
+            ((p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4 + 8) >> 4)
+                as Sample
         );
         put!(
             4,
-            ((p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5 + 8) >> 4) as u8
+            ((p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5 + 8) >> 4) as Sample
         );
         put!(
             5,
-            ((p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6 + 8) >> 4) as u8
+            ((p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6 + 8) >> 4) as Sample
         );
         put!(
             6,
-            ((p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7 + 8) >> 4) as u8
+            ((p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7 + 8) >> 4) as Sample
         );
     }
 }
@@ -567,15 +618,16 @@ impl LfGrids {
     /// writes whole 8-column groups into the padded plane).
     pub(crate) fn filter_frame(
         &self,
-        y: &mut [u8],
+        y: &mut [Sample],
         stride: usize,
-        u: &mut [u8],
-        v: &mut [u8],
+        u: &mut [Sample],
+        v: &mut [Sample],
         uv_stride: usize,
         y_w: usize,
         y_h: usize,
         uv_h: usize,
         sharpness: u8,
+        bd: u8,
     ) {
         let lftrace = lftrace_on();
         // Luma masks, ported from vp9_setup_mask/build_masks and
@@ -618,7 +670,7 @@ impl LfGrids {
                             if t == 16 && (xx < 8 || xx + 8 > y_w) {
                                 t = 8;
                             }
-                            lpf_edge(y, yy * stride + xx, stride, 1, t, bl, li, th, 8);
+                            lpf_edge(y, yy * stride + xx, stride, 1, t, bl, li, th, 8, bd);
                             if lftrace {
                                 let kind = match t {
                                     16 => "V16",
@@ -629,7 +681,7 @@ impl LfGrids {
                             }
                         }
                         if int4 & bit != 0 && xx + 8 <= y_w && yy + 8 <= y_h {
-                            lpf_edge(y, yy * stride + xx + 4, stride, 1, 4, bl, li, th, 8);
+                            lpf_edge(y, yy * stride + xx + 4, stride, 1, 4, bl, li, th, 8, bd);
                             if lftrace {
                                 eprintln!("V4I {} {}", xx + 4, yy);
                             }
@@ -667,7 +719,7 @@ impl LfGrids {
                                 if t == 16 && (yy < 8 || yy + 8 > y_h) {
                                     t = 8;
                                 }
-                                lpf_edge(y, yy * stride + xx, stride, 0, t, bl, li, th, 8);
+                                lpf_edge(y, yy * stride + xx, stride, 0, t, bl, li, th, 8, bd);
                                 if lftrace {
                                     let kind = match t {
                                         16 => "H16",
@@ -685,7 +737,7 @@ impl LfGrids {
                         // exists only in the 4:2:0-chroma path (ss11,
                         // vp9_loopfilter.c:1382) and in non420 under `ss_y`.
                         if int4 & bit != 0 && yy + 8 <= y_h && xx + 8 <= y_w {
-                            lpf_edge(y, (yy + 4) * stride + xx, stride, 0, 4, bl, li, th, 8);
+                            lpf_edge(y, (yy + 4) * stride + xx, stride, 0, 4, bl, li, th, 8, bd);
                             if lftrace {
                                 eprintln!("H4I {} {}", xx, yy + 4);
                             }
@@ -830,11 +882,7 @@ impl LfGrids {
                                     0
                                 };
                                 if taps != 0 {
-                                    let t = if taps == 16 && x8 < 8 {
-                                        8
-                                    } else {
-                                        taps
-                                    };
+                                    let t = if taps == 16 && x8 < 8 { 8 } else { taps };
                                     lpf_edge(
                                         data,
                                         y8 * uv_stride + x8,
@@ -845,6 +893,7 @@ impl LfGrids {
                                         li,
                                         th,
                                         8,
+                                        bd,
                                     );
                                 }
                             }
@@ -859,6 +908,7 @@ impl LfGrids {
                                     li,
                                     th,
                                     8,
+                                    bd,
                                 );
                             }
                         }
@@ -906,12 +956,11 @@ impl LfGrids {
                                         li,
                                         th,
                                         8,
+                                        bd,
                                     );
                                 }
                             }
-                            if int4 & bit != 0
-                                && sbr + 2 * rg != self.mi_rows - 1
-                                && y8 + 8 <= uv_h
+                            if int4 & bit != 0 && sbr + 2 * rg != self.mi_rows - 1 && y8 + 8 <= uv_h
                             {
                                 lpf_edge(
                                     data,
@@ -923,6 +972,7 @@ impl LfGrids {
                                     li,
                                     th,
                                     8,
+                                    bd,
                                 );
                             }
                         }
@@ -952,10 +1002,10 @@ mod tests {
         }
     }
 
-    fn run(g: &LfGrids, y: &mut [u8]) {
-        let mut u = vec![128u8; 32 * 32];
-        let mut v = vec![128u8; 32 * 32];
-        g.filter_frame(y, 64, &mut u, &mut v, 32, 64, 64, 32, 0);
+    fn run(g: &LfGrids, y: &mut [Sample]) {
+        let mut u = vec![128u16; 32 * 32];
+        let mut v = vec![128u16; 32 * 32];
+        g.filter_frame(y, 64, &mut u, &mut v, 32, 64, 64, 32, 0, 8);
     }
 
     /// The luma internal-4x4 horizontal edge fires on the frame's LAST MI row.
@@ -973,7 +1023,7 @@ mod tests {
         let stride = 64;
         // A gentle step (4) between rows 59 and 60: sharp steps fail the
         // filter_mask gradient test, and a flat pattern cannot move.
-        let mut y = vec![100u8; 64 * 64];
+        let mut y = vec![100u16; 64 * 64];
         for row in 60..64 {
             y[row * stride..row * stride + 64].fill(104);
         }
@@ -985,4 +1035,3 @@ mod tests {
         );
     }
 }
-

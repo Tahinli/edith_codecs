@@ -22,9 +22,13 @@ fn pixdump() {
     for (i, f) in frames.iter().enumerate() {
         match decoder.decode(&f.data) {
             Ok(Some(pic)) => {
-                dump.extend_from_slice(&pic.y);
-                dump.extend_from_slice(&pic.u);
-                dump.extend_from_slice(&pic.v);
+                for &v in pic.y.iter().chain(pic.u.iter()).chain(pic.v.iter()) {
+                    if pic.bit_depth == 8 {
+                        dump.push(v as u8);
+                    } else {
+                        dump.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
                 eprintln!(
                     "PIXFRAME input={i} shown={shown} {w}x{h} {}x{}",
                     pic.width, pic.height
@@ -51,12 +55,8 @@ fn parse_ivf(bytes: &[u8]) -> (&str, u16, u16, Vec<IvfFrame>) {
     let mut pos = hdr_len;
     let mut frames = Vec::new();
     while pos + 12 <= bytes.len() {
-        let sz = u32::from_le_bytes([
-            bytes[pos],
-            bytes[pos + 1],
-            bytes[pos + 2],
-            bytes[pos + 3],
-        ]) as usize;
+        let sz = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
         let pts = u64::from_le_bytes(bytes[pos + 4..pos + 12].try_into().unwrap());
         pos += 12;
         if pos + sz > bytes.len() {

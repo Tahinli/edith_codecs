@@ -141,9 +141,9 @@ fn check(nw: u16, nh: u16) {
             "frame {i}: ffmpeg has fewer frames than we show"
         );
         let mut got = Vec::with_capacity(frame_bytes);
-        got.extend_from_slice(&pic.y);
-        got.extend_from_slice(&pic.u);
-        got.extend_from_slice(&pic.v);
+        got.extend(pic.y.iter().map(|&v| v as u8));
+        got.extend(pic.u.iter().map(|&v| v as u8));
+        got.extend(pic.v.iter().map(|&v| v as u8));
         assert_eq!(
             got,
             expected[off..off + frame_bytes],

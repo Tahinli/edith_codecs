@@ -4,13 +4,14 @@
 //! reconstruction and the loop filter (spec 6, 7, 8; libvpx
 //! `vp9_decodeframe.c`).
 //!
-//! Capability: profile-0 8-bit 4:2:0 keyframes and inter frames (motion
-//! compensation, residual reconstruction, the loop filter and an 8-slot
-//! reference DPB). Intra-only frames, other profiles/subsamplings and a
-//! reference whose coded size differs from the current frame are refused by
-//! name; `show_existing_frame` returns the buffered reference picture instead
-//! of pretending to decode. Odd coded extents are supported: chroma stores
-//! and crops at `(w + 1) / 2` (`uv_crop_width`), matching libvpx.
+//! Capability: profile-0 8-bit and profile-2 10-bit 4:2:0 keyframes and inter
+//! frames (motion compensation, residual reconstruction, the loop filter and
+//! an 8-slot reference DPB). Intra-only frames, profiles 1/3, 12-bit, other
+//! subsamplings and a reference whose coded size differs from the current
+//! frame are refused by name; `show_existing_frame` returns the buffered
+//! reference picture instead of pretending to decode. Odd coded extents are
+//! supported: chroma stores and crops at `(w + 1) / 2` (`uv_crop_width`),
+//! matching libvpx.
 
 use crate::header::{FrameContext, read_compressed_header};
 use crate::intra::build_intra_predictors;
@@ -20,7 +21,7 @@ use crate::modes::{MiInfo, MiState, read_intra_frame_mode_info};
 use crate::tables::*;
 use crate::tokens::{PlaneContexts, decode_coefs, scan_for};
 use crate::transform::inverse_transform_add;
-use crate::{Error, Result};
+use crate::{Error, Result, Sample};
 use ec_vp9_syntax::{FrameHeader, FrameType, Vp9Parser, superframe};
 
 const SB_MI: usize = 8; // a 64x64 superblock in mi (8x8) units
@@ -28,12 +29,12 @@ const SB_MI: usize = 8; // a 64x64 superblock in mi (8x8) units
 /// A decoded, displayable frame: cropped contiguous planes.
 #[derive(Clone, Debug)]
 pub struct Picture {
-    /// Luma plane, `stride`-spaced rows of `width` pixels.
-    pub y: Vec<u8>,
+    /// Luma plane, `stride`-spaced rows of `width` samples.
+    pub y: Vec<Sample>,
     /// U (Cb) plane, half resolution.
-    pub u: Vec<u8>,
+    pub u: Vec<Sample>,
     /// V (Cr) plane, half resolution.
-    pub v: Vec<u8>,
+    pub v: Vec<Sample>,
     /// Frame width in pixels.
     pub width: u16,
     /// Frame height in pixels.
@@ -43,28 +44,51 @@ pub struct Picture {
     /// Chroma row pitch of the returned planes (`(width + 1) / 2`; chroma
     /// ceils an odd coded width).
     pub uv_stride: usize,
+    /// Bits per sample (8 for profile 0, 10 for profile 2).
+    pub bit_depth: u8,
 }
 
 struct Planes {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
+    y: Vec<Sample>,
+    u: Vec<Sample>,
+    v: Vec<Sample>,
     ys: usize,
     uvs: usize,
     aw: usize,
     ah: usize,
+    /// Bits per sample this frame was decoded at.
+    bd: u8,
 }
 
 impl Planes {
+    /// A frame scratch at the 64-multiple ALIGNED extent, filled with the
+    /// neutral grey `1 << (bd - 1)` (`128` at 8-bit, `512` at 10-bit). The
+    /// aligned the decode writes real samples into it (blocks at the frame
+    /// edge decode at FULL size), so the fill only backs the never-written
+    /// padding past the MI extent.
+    fn new(aw: usize, ah: usize, bd: u8) -> Planes {
+        let fill = 1u16 << (bd - 1);
+        Planes {
+            y: vec![fill; aw * ah],
+            u: vec![fill; aw / 2 * ah / 2],
+            v: vec![fill; aw / 2 * ah / 2],
+            ys: aw,
+            uvs: aw / 2,
+            aw,
+            ah,
+            bd,
+        }
+    }
+
     /// Immutable plane + stride (the predictor reads references).
-    fn plane_ref(&self, plane: usize) -> (&[u8], usize) {
+    fn plane_ref(&self, plane: usize) -> (&[Sample], usize) {
         match plane {
             0 => (&self.y, self.ys),
             1 => (&self.u, self.uvs),
             _ => (&self.v, self.uvs),
         }
     }
-    fn plane(&mut self, plane: usize) -> (&mut [u8], usize) {
+    fn plane(&mut self, plane: usize) -> (&mut [Sample], usize) {
         match plane {
             0 => (&mut self.y, self.ys),
             1 => (&mut self.u, self.uvs),
@@ -107,10 +131,10 @@ pub struct Decoder {
     syntax_blocks: usize,
     /// `twd->extend_and_predict_buf`: the per-prediction bordered reference
     /// window built when a block's read leaves the reference frame.
-    mc_scratch: Vec<u8>,
+    mc_scratch: Vec<Sample>,
     /// The `vpx_convolve8` stride-64 intermediate plus the second scratch its
     /// averaging variant needs.
-    mc_temp: Vec<u8>,
+    mc_temp: Vec<Sample>,
 }
 
 /// One DPB slot: a decoded frame buffer at its ALIGNED (64-multiple) extent
@@ -208,10 +232,16 @@ impl Decoder {
                 None => Err(corrupt("show_existing_frame names an empty slot")),
             };
         }
-        if hdr.profile != 0 {
+        if hdr.profile != 0 && hdr.profile != 2 {
             return Err(Error::unsupported(
                 format!("vp9 profile {}", hdr.profile),
-                "this lane decodes profile 0 only",
+                "this lane decodes profiles 0 and 2 only (profiles 1 and 3 are 4:4:4)",
+            ));
+        }
+        if hdr.bit_depth != 8 && hdr.bit_depth != 10 {
+            return Err(Error::unsupported(
+                format!("vp9 bit depth {}", hdr.bit_depth),
+                "this lane decodes 8- and 10-bit only (12-bit is not ported)",
             ));
         }
         if hdr.subsampling_x != 1 || hdr.subsampling_y != 1 {
@@ -306,10 +336,16 @@ impl Decoder {
             if hdr.show_existing_frame {
                 continue;
             }
-            if hdr.profile != 0 {
+            if hdr.profile != 0 && hdr.profile != 2 {
                 return Err(Error::unsupported(
                     format!("vp9 profile {}", hdr.profile),
-                    "this lane decodes profile 0 only",
+                    "this lane decodes profiles 0 and 2 only (profiles 1 and 3 are 4:4:4)",
+                ));
+            }
+            if hdr.bit_depth != 8 && hdr.bit_depth != 10 {
+                return Err(Error::unsupported(
+                    format!("vp9 bit depth {}", hdr.bit_depth),
+                    "this lane decodes 8- and 10-bit only (12-bit is not ported)",
                 ));
             }
             if hdr.frame_type == FrameType::Key {
@@ -384,15 +420,7 @@ impl Decoder {
             let height = hdr.height as usize;
             let aw = width.div_ceil(64) * 64;
             let ah = height.div_ceil(64) * 64;
-            self.planes = Some(Planes {
-                y: vec![128u8; aw * ah],
-                u: vec![128u8; aw / 2 * ah / 2],
-                v: vec![128u8; aw / 2 * ah / 2],
-                ys: aw,
-                uvs: aw / 2,
-                aw,
-                ah,
-            });
+            self.planes = Some(Planes::new(aw, ah, hdr.bit_depth));
         }
 
         let hdr_start = hdr.uncompressed_header_size as usize;
@@ -596,6 +624,7 @@ impl Decoder {
                 vh,
                 vh / 2,
                 hdr.loop_filter.sharpness,
+                hdr.bit_depth,
             );
         }
 
@@ -897,8 +926,20 @@ impl Decoder {
             let temp = &mut self.mc_temp;
             for plane in 0..3usize {
                 inter_predict_plane(
-                    planes, refs, scratch, temp, hdr, info, plane, row, col, &n4w, &n4h,
-                    mb_to_right, mb_to_bottom, sb_type,
+                    planes,
+                    refs,
+                    scratch,
+                    temp,
+                    hdr,
+                    info,
+                    plane,
+                    row,
+                    col,
+                    &n4w,
+                    &n4h,
+                    mb_to_right,
+                    mb_to_bottom,
+                    sb_type,
                 )?;
             }
         }
@@ -950,6 +991,7 @@ impl Decoder {
                     // decodeframe.c:413).
                     let planes = self.planes.as_mut().expect("frame scratch");
                     let stride = planes.dims(plane).0;
+                    let bd = planes.bd;
                     let x0 = ((col * 8) >> s) + bcol * 4;
                     let y0 = ((row * 8) >> s) + brow * 4;
                     let dst_off = y0 * stride + x0;
@@ -962,6 +1004,7 @@ impl Decoder {
                         dst_off,
                         stride,
                         hdr.quantization.lossless(),
+                        bd,
                     );
                 }
             }
@@ -990,15 +1033,7 @@ impl Decoder {
         // mi_row 132 writes 8 rows past a 1080-row buffer).
         let aw = width.div_ceil(64) * 64;
         let ah = height.div_ceil(64) * 64;
-        self.planes = Some(Planes {
-            y: vec![128u8; aw * ah],
-            u: vec![128u8; aw / 2 * ah / 2],
-            v: vec![128u8; aw / 2 * ah / 2],
-            ys: aw,
-            uvs: aw / 2,
-            aw,
-            ah,
-        });
+        self.planes = Some(Planes::new(aw, ah, hdr.bit_depth));
         let tail_start = std::env::var("EC_VP9_FORCE_TAIL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1131,7 +1166,12 @@ impl Decoder {
                         )?;
                     }
                 }
-                ensure(r.overreads() == 0, "tile bool decoder desync")?;
+                if r.overreads() != 0 {
+                    return Err(corrupt(format!(
+                        "tile bool decoder desync (tile tr={tr} tc={tc} overreads={})",
+                        r.overreads()
+                    )));
+                }
             }
         }
 
@@ -1151,6 +1191,7 @@ impl Decoder {
                 vh,
                 vh / 2,
                 hdr.loop_filter.sharpness,
+                hdr.bit_depth,
             );
         }
 
@@ -1402,7 +1443,17 @@ impl Decoder {
                 // mode class (`get_filter_level`), so the grids are written
                 // inside the reconstruction rather than from `level_of_seg`.
                 self.reconstruct_inter_pixels(
-                    r, ectx, grids, hdr, &info, row, col, sb_type, bw, bh, mi,
+                    r,
+                    ectx,
+                    grids,
+                    hdr,
+                    &info,
+                    row,
+                    col,
+                    sb_type,
+                    bw,
+                    bh,
+                    mi,
                     tile_col_start,
                 )?;
             } else {
@@ -1412,10 +1463,7 @@ impl Decoder {
             }
             for dy in 0..y_mis {
                 for dx in 0..x_mis {
-                    if crate::mvdbg2_enabled()
-                        && row + dy == 7
-                        && col + dx >= 30
-                        && col + dx <= 40
+                    if crate::mvdbg2_enabled() && row + dy == 7 && col + dx >= 30 && col + dx <= 40
                     {
                         eprintln!(
                             "GWR cell=({} {}) idx={} from=({row} {col}) dy={dy} dx={dx} sb={sb_type} bw={bw} bh={bh} x_mis={x_mis} y_mis={y_mis} mv={:?} ref0={} mi_cols={}",
@@ -1558,6 +1606,7 @@ impl Decoder {
         };
         let planes = self.planes.as_mut().expect("frame scratch");
         let stride = planes.dims(plane).0;
+        let bd = planes.bd;
         let bs = 4 << tx_size;
         let x0 = ((mi_col * 8) >> s) + tx_col * 4;
         let y0 = ((mi_row * 8) >> s) + tx_row * 4;
@@ -1599,6 +1648,7 @@ impl Decoder {
                 rgt,
                 mb_to_bottom < 0,
                 mb_to_right < 0,
+                bd,
             );
         }
 
@@ -1665,6 +1715,7 @@ impl Decoder {
             nb,
             &self.ctx.coef[tx_size],
             false,
+            bd,
             (x0, y0),
             plane,
         );
@@ -1710,7 +1761,7 @@ impl Decoder {
                         Some((it.next()?.parse::<usize>().ok()?, it.next()?.parse().ok()?))
                     })
                     .is_some_and(|(px, py)| x0 == px && y0 == py);
-            let t: Option<Vec<Vec<u8>>> = if probe {
+            let t: Option<Vec<Vec<Sample>>> = if probe {
                 Some(
                     (0..4usize)
                         .map(|rr| data[dst_off + rr * stride..dst_off + rr * stride + 4].to_vec())
@@ -1727,9 +1778,10 @@ impl Decoder {
                 dst_off,
                 stride,
                 lossless,
+                bd,
             );
             if let Some(before) = t {
-                let after: Vec<Vec<u8>> = (0..4usize)
+                let after: Vec<Vec<Sample>> = (0..4usize)
                     .map(|rr| data[dst_off + rr * stride..dst_off + rr * stride + 4].to_vec())
                     .collect();
                 eprintln!("RC x0={x0} y0={y0} tx={tx_size} mode={mode}");
@@ -1764,7 +1816,7 @@ fn bsize_of_n4(n4: usize) -> usize {
 /// aligned decode buffer.
 fn crop_picture(planes: &Planes, width: u16, height: u16) -> Picture {
     let (w, h) = (width as usize, height as usize);
-    let crop = |src: &[u8], stride: usize, cw: usize, ch: usize| -> Vec<u8> {
+    let crop = |src: &[Sample], stride: usize, cw: usize, ch: usize| -> Vec<Sample> {
         let mut out = Vec::with_capacity(cw * ch);
         for row in 0..ch {
             out.extend_from_slice(&src[row * stride..row * stride + cw]);
@@ -1782,6 +1834,7 @@ fn crop_picture(planes: &Planes, width: u16, height: u16) -> Picture {
         height,
         stride: w,
         uv_stride: cw,
+        bit_depth: planes.bd,
     }
 }
 
@@ -1837,7 +1890,9 @@ fn reset_skip_context(
             let offx = (col << 1) >> s;
             let offy = (row << 1) >> s;
             let lrows = 32usize >> s;
-            let a: Vec<u8> = (0..n4w[plane]).map(|i| ectx[plane].above[offx + i]).collect();
+            let a: Vec<u8> = (0..n4w[plane])
+                .map(|i| ectx[plane].above[offx + i])
+                .collect();
             let l: Vec<u8> = (0..n4h[plane].min(lrows))
                 .map(|i| ectx[plane].left[(offy + i) % lrows])
                 .collect();
@@ -1962,6 +2017,7 @@ fn decode_inter_tx_tokens(
         nb,
         &fc.coef[tx_size],
         info.is_inter,
+        hdr.bit_depth,
         (0, 0),
         plane,
     );
@@ -2001,8 +2057,8 @@ fn decode_inter_tx_tokens(
 fn inter_predict_plane(
     planes: &mut Planes,
     refs: &[Option<RefFrame>; 8],
-    scratch: &mut Vec<u8>,
-    temp: &mut Vec<u8>,
+    scratch: &mut Vec<Sample>,
+    temp: &mut Vec<Sample>,
     hdr: &FrameHeader,
     info: &MiInfo,
     plane: usize,
@@ -2043,6 +2099,7 @@ fn inter_predict_plane(
             // column (or row).
             width: (ref_frame.width as usize + s) >> s,
             height: (ref_frame.height as usize + s) >> s,
+            bd: ref_frame.planes.bd,
         };
         if sb_type < 3 {
             // libvpx builds one 4x4 prediction per sub-block, with the MV from
@@ -2059,9 +2116,8 @@ fn inter_predict_plane(
                         average_split_mvs_chroma(&info.bmi_mv, rf)
                     };
                     let (data, _) = planes.plane(plane);
-                    let dst_off = (((row * 8) >> s) + y * 4) * dst_stride
-                        + ((col * 8) >> s)
-                        + xx * 4;
+                    let dst_off =
+                        (((row * 8) >> s) + y * 4) * dst_stride + ((col * 8) >> s) + xx * 4;
                     build_inter_predictors(
                         &mut data[dst_off..],
                         dst_stride,

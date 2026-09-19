@@ -4,6 +4,14 @@
 use crate::bool::BoolDecoder;
 use crate::tables::*;
 
+/// `vp9_cat6_prob_high12 + 2` (`vp9/common/vp9_entropy.c`): the CAT6 token's
+/// 16 extra bits at bit depth 10 (and the middle 16 of the 12-bit table).
+/// The bitstream is the ONLY depth-dependent syntax element: `decode_coefs`
+/// picks `vp9_cat6_prob`/14 bits at 8-bit and this/16 bits at 10- and 12-bit.
+const CAT6_PROB_HIGH: [u8; 16] = [
+    255, 255, 254, 254, 254, 252, 249, 243, 230, 196, 177, 153, 140, 133, 130, 129,
+];
+
 /// One plane's entropy contexts: a has-coefficient flag per 4x4 column
 /// above the current superblock row and per 4x4 row to the left.
 pub(crate) struct PlaneContexts {
@@ -63,6 +71,7 @@ pub(crate) fn decode_coefs(
     nb: &[i16],
     probs4d: &[[[[[u8; 3]; 6]; 6]; 2]; 2],
     is_inter: bool,
+    bd: u8,
     #[allow(unused_variables)] pos: (usize, usize),
     #[allow(unused_variables)] plane: usize,
 ) -> CoeffBlock {
@@ -83,7 +92,10 @@ pub(crate) fn decode_coefs(
 
     while c < max_eob {
         if crate::trace_enabled() {
-            eprintln!("TOK c={c} band={band} ctx={ctx} p0={},{},{}", prob[0], prob[1], prob[2]);
+            eprintln!(
+                "TOK c={c} band={band} ctx={ctx} p0={},{},{}",
+                prob[0], prob[1], prob[2]
+            );
         }
         if !r.read_bool(prob[0]) {
             break;
@@ -108,7 +120,12 @@ pub(crate) fn decode_coefs(
                     token_cache[scan[c] as usize] = 5;
                     if r.read_bool(p[5]) {
                         if r.read_bool(p[7]) {
-                            v = 67 + read_coeff(r, &CAT6_PROB, 14);
+                            v = 67
+                                + if bd == 8 {
+                                    read_coeff(r, &CAT6_PROB, 14)
+                                } else {
+                                    read_coeff(r, &CAT6_PROB_HIGH, 16)
+                                };
                         } else {
                             v = 35 + read_coeff(r, &CAT5_PROB, 5);
                         }

@@ -18,7 +18,7 @@ fn sweep() {
         let mut d = Decoder::new();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.decode(&frames[0].data)));
         let Ok(Ok(Some(pic))) = r else { continue };
-        let m = (0..ylen).filter(|&i| pic.y[i] == refout[i]).count();
+        let m = (0..ylen).filter(|&i| pic.y[i] as u8 == refout[i]).count();
         if m > best.0 { best = (m, t); }
     }
     unsafe { std::env::remove_var("EC_VP9_FORCE_TAIL"); }

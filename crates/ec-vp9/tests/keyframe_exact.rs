@@ -71,13 +71,13 @@ fn compare(path: &std::path::Path) {
             assert_eq!(pic.u.len(), want_u.len());
             assert_eq!(pic.v.len(), want_v.len());
             for (i, (&a, &b)) in pic.y.iter().zip(want_y).enumerate() {
-                assert_eq!(a, b, "Y plane mismatch at pixel ({}, {}) frame {shown}", i % w, i / w);
+                assert_eq!(a as u8, b, "Y plane mismatch at pixel ({}, {}) frame {shown}", i % w, i / w);
             }
             for (i, (&a, &b)) in pic.u.iter().zip(want_u).enumerate() {
-                assert_eq!(a, b, "U plane mismatch at ({}, {}) frame {shown}", i % (w / 2), i / (w / 2));
+                assert_eq!(a as u8, b, "U plane mismatch at ({}, {}) frame {shown}", i % (w / 2), i / (w / 2));
             }
             for (i, (&a, &b)) in pic.v.iter().zip(want_v).enumerate() {
-                assert_eq!(a, b, "V plane mismatch at ({}, {}) frame {shown}", i % (w / 2), i / (w / 2));
+                assert_eq!(a as u8, b, "V plane mismatch at ({}, {}) frame {shown}", i % (w / 2), i / (w / 2));
             }
             shown += 1;
         }
@@ -110,9 +110,9 @@ fn lossless_64_matches_ffmpeg() {
     let want_y = &reference[..w * h];
     let want_u = &reference[w * h..w * h + uv];
     let want_v = &reference[w * h + uv..];
-    assert!(pic.y.iter().eq(want_y.iter()), "lossless Y must be byte-exact");
-    assert!(pic.u.iter().eq(want_u.iter()), "lossless U must be byte-exact");
-    assert!(pic.v.iter().eq(want_v.iter()), "lossless V must be byte-exact");
+    assert!(pic.y.iter().map(|&v| v as u8).eq(want_y.iter().copied()), "lossless Y must be byte-exact");
+    assert!(pic.u.iter().map(|&v| v as u8).eq(want_u.iter().copied()), "lossless U must be byte-exact");
+    assert!(pic.v.iter().map(|&v| v as u8).eq(want_v.iter().copied()), "lossless V must be byte-exact");
     assert_eq!((pic.width, pic.height), (w as u16, h as u16));
 }
 
@@ -137,9 +137,9 @@ fn inter_stream_decodes_and_matches_ffmpeg() {
             Some(pic) => {
                 let off = shown * frame_bytes;
                 let mut got = Vec::with_capacity(frame_bytes);
-                got.extend_from_slice(&pic.y);
-                got.extend_from_slice(&pic.u);
-                got.extend_from_slice(&pic.v);
+                got.extend(pic.y.iter().map(|&v| v as u8));
+                got.extend(pic.u.iter().map(|&v| v as u8));
+                got.extend(pic.v.iter().map(|&v| v as u8));
                 assert_eq!(
                     got,
                     expected[off..off + frame_bytes],

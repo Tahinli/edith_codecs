@@ -17,7 +17,7 @@ fn diff_stats() {
     let mut first: Option<(usize, usize)> = None;
     for y in 0..240 {
         for x in 0..320 {
-            let a = pic.y[y * pic.stride + x];
+            let a = pic.y[y * pic.stride + x] as u8;
             let b = refout[y * w + x];
             let (sy, sx) = (y / 64, x / 64);
             sb_total[sy][sx] += 1;
