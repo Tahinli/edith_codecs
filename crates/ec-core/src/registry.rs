@@ -281,7 +281,12 @@ impl Rotation {
     /// turn this decoder would then apply for real.
     pub fn from_matrix(a: i32, b: i32, c: i32, d: i32) -> Rotation {
         // A pure rotation: isotropic (a == d, b == -c) with something to turn.
-        if a == d && b == (-c) && (a != 0 || b != 0) {
+        // `c.checked_neg()` rather than `-c`: a crafted `tkhd` can carry
+        // `i32::MIN`, whose negation is not representable -- the plain form
+        // panics in a debug build and wraps onto a false quarter turn in a
+        // release one. `checked_neg` is `None` there, so the term falls through
+        // to `Other` below, which is the right reading for it anyway.
+        if a == d && c.checked_neg() == Some(b) && (a != 0 || b != 0) {
             // `(a, b)` is the turned x-axis; a quarter turn lands it on an axis.
             return match (a.signum(), b.signum()) {
                 (1, 0) => Rotation::None,
@@ -607,6 +612,27 @@ mod tests {
             (0, ONE, ONE, 0),
             (ONE, 0, ONE, ONE),
             (0, 0, 0, 0),
+        ] {
+            let got = Rotation::from_matrix(a, b, c, d);
+            assert!(
+                matches!(got, Rotation::Other { .. }),
+                "{a} {b} {c} {d} read as {got:?}"
+            );
+            assert_eq!(got.steps(), None, "Other is not a quarter count");
+        }
+    }
+
+    #[test]
+    fn a_matrix_term_at_i32_min_is_not_a_quarter_turn() {
+        // A crafted `tkhd` can carry `i32::MIN`, whose negation is not
+        // representable. `from_matrix` must not panic (debug) or wrap onto a
+        // false turn (release) deciding `b == -c`, and such a term is no
+        // quarter turn anyway. `(0, MIN, MIN, 0)` is the load-bearing case: the
+        // wrapping form would read it as `Cw270`.
+        for (a, b, c, d) in [
+            (0, i32::MIN, i32::MIN, 0),
+            (65_536, i32::MIN, i32::MIN, 65_536),
+            (i32::MIN, 0, i32::MIN, i32::MIN),
         ] {
             let got = Rotation::from_matrix(a, b, c, d);
             assert!(
