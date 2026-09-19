@@ -129,3 +129,30 @@ fn inter_gop_with_tile_columns_matches_ffmpeg() {
     ensure_fixture(&path, 1);
     assert!(compare(&path) >= 2);
 }
+
+/// Real-content regression for the last-partial-SB-row context bug: this
+/// 120-frame 1080p stream used to abort at input frame 72 with
+/// `tile bool decoder desync`, because a chroma transform block whose
+/// write-back window runs past the frame bottom edge kept the window's
+/// TAIL slot set (`write_tx_context`), and the next row of blocks read it
+/// as an entropy context. Every shown frame must match ffmpeg.
+///
+/// Media-gated: the corpus fixture is not versioned, so the witness skips
+/// when `fixtures/bitstreams/vp9-1080p-60-8bit.ivf` is absent.
+#[test]
+fn corpus_1080p_60fps_matches_ffmpeg_past_frame_72() {
+    let Some(dir) = ivf::fixture_dir() else {
+        println!("SKIP: fixtures/bitstreams absent (media-gated witness)");
+        return;
+    };
+    let path = dir.join("vp9-1080p-60-8bit.ivf");
+    if !path.exists() {
+        println!("SKIP: {} absent (media-gated witness)", path.display());
+        return;
+    }
+    let shown = compare(&path);
+    assert!(
+        shown >= 73,
+        "the witness must decode past input frame 72 (got {shown} shown frames)"
+    );
+}
