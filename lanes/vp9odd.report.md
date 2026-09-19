@@ -227,8 +227,19 @@ GATE 5 - committed to `lane-vp9-odd`, clean tree, no push: `e8152b9b`:
 
 ## MERGE-SIDE FOLLOW-UPS
 
+- Merged to `main` by fast-forward `e910d25b..1a2fb69f` (no merge commit; the
+  lane's head is main's head). Doc commit folded in first: report prose for the
+  corrupt `refusal_odd.ivf` fixture and the `scratch_pixdump` chroma layout now
+  match the shipped ceil extents.
 - Create-list: `crates/ec-vp9/src/decode.rs`,
   `crates/ec-vp9/tests/odd_dimensions_exact.rs`, this report. No other file.
+- Gates re-run on the merged main tree: `cargo test -p ec-vp9` = 21 binaries,
+  33 passed / 0 failed (odd_dimensions_exact adds the 3 odd cases); warning
+  parity = the same 5 pre-existing (`partition_probs`, `x_mis`, `y_mis`,
+  `read_partition`, `TM_PRED`).
+- Dependent sweep: no crate's `Cargo.toml` depends on `ec-vp9` (only on
+  `ec-vp9-syntax`), so zero external consumers of the changed plane layout and
+  no stale in-lib tests elsewhere.
 - The `$HOME/.cache/vp9pix` assets added here (`drv_pix2.c`/`drv_pix2`,
   `pixcmp2.py`, `patch_kf_size.py`, `sweep2.sh`, `libvpx-hdr/`) are outside the
   repo; the in-repo witness is self-contained (ffmpeg + a pure-Rust patch).
