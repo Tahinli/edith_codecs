@@ -2027,10 +2027,11 @@ pub(crate) mod tests {
     /// `-pix_fmt gray` encode of the crate's own fixture recipe does.
     ///
     /// Root cause (localised with `EC_TRACE_MODE_STEP` on the instrumented
-    /// aomdec oracle vs this decoder, both over the same OBU): the two traces
-    /// agree bit-for-bit -- identical `rng` through `skip`, `cdef`, `mode`,
-    /// `angle_y` -- and then aomdec goes straight from `angle_uv` to
-    /// `tx_depth` while ours reads a `uv_mode` symbol first. libaom's
+    /// aomdec oracle vs this decoder, both over the same OBU): on the mono
+    /// stream ours reads `angle_uv` at `rng=50996`, while aomdec reads NO
+    /// `uv_mode`/`angle_uv` at all (the guard below); the first divergence at
+    /// `(0,0)` is aomdec reading `tx_depth ctx=0 cat=1` (`rng=43616`) where
+    /// ours reads a `uv_mode` (val=13). libaom's
     /// `decodemv.c` guards that read with
     /// `if (!cm->seq_params->monochrome && xd->is_chroma_ref)`: a monochrome
     /// frame codes NO `uv_mode`/`cfl`/`angle_delta_uv`/`palette_uv` at all,
