@@ -45,6 +45,6 @@ pub use frame::{
 pub use packet::{Buf, Packet, PacketFlags, SideData};
 pub use registry::{
     AudioParameters, CodecId, CodecParameters, Decoder, Demuxer, Encoder, MediaParameters,
-    MediaType, Muxer, SeekMode, StreamInfo, VideoParameters,
+    MediaType, Muxer, Rotation, SeekMode, StreamInfo, VideoParameters,
 };
 pub use timebase::{Rounding, TimeBase, Timestamp};

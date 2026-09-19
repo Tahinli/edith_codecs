@@ -4,8 +4,8 @@ use std::io::{Read, Seek};
 
 use ec_core::{
     AudioParameters, Buf, ChannelLayout, CodecId, CodecParameters, ColorInfo, Demuxer, Error,
-    MediaParameters, MediaType, Packet, PacketFlags, Result, Rounding, SeekMode, StreamInfo,
-    TimeBase, Timestamp, VideoParameters, color, color::Tags,
+    MediaParameters, MediaType, Packet, PacketFlags, Result, Rotation, Rounding, SeekMode,
+    StreamInfo, TimeBase, Timestamp, VideoParameters, color, color::Tags,
 };
 
 use crate::boxes::{Boxes, FourCc, Src, be16, be32, be64, full};
@@ -320,6 +320,7 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         let mut mdia = None;
         let mut title = None;
         let mut display = (0u32, 0u32);
+        let mut rotation = Rotation::None;
         for child in Boxes::new(data) {
             let (kind, payload) = child?;
             match &kind {
@@ -327,8 +328,19 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
                     let (version, _, rest) = full(payload)?;
                     let at = if version == 0 { 8 } else { 16 };
                     track_id = be32(rest, at)?;
-                    // ...and the display size, 16.16, at the far end of the box.
+                    // The display matrix -- nine 16.16 fixed-point `s32` -- and
+                    // the display size, also 16.16, at the far end of the box.
+                    // The matrix is the 36 bytes just before the size; only its
+                    // leading 2x2 (`a b c d`) says which way the picture turns.
                     let end = rest.len().saturating_sub(8);
+                    let matrix = end.saturating_sub(36);
+                    let (a, b, c, d) = (
+                        be32(rest, matrix)? as i32,
+                        be32(rest, matrix + 4)? as i32,
+                        be32(rest, matrix + 12)? as i32,
+                        be32(rest, matrix + 16)? as i32,
+                    );
+                    rotation = Rotation::from_matrix(a, b, c, d);
                     display = (be32(rest, end)? >> 16, be32(rest, end + 4)? >> 16);
                 }
                 b"edts" => {
@@ -458,6 +470,9 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
                     // a trim: no sample is dropped, so none is announced as
                     // padding either.
                     initial_padding: 0,
+                    // The `tkhd` display matrix: which way the coded picture
+                    // turns to be seen as shot. Reported, not applied here.
+                    rotation,
                 });
                 Some(index)
             }

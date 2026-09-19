@@ -224,6 +224,101 @@ impl CodecParameters {
     }
 }
 
+/// The turn a container's display matrix asks a player to make so its pictures
+/// are seen the way they were shot: quarter turns **clockwise**. A phone's
+/// portrait video is the case that names it -- the pixels stay landscape and
+/// the container says which way to turn them.
+///
+/// This is metadata about the *pixels*, not a user's edit, and it is not a
+/// request to touch them here: a demuxer reports it and a consumer (the
+/// preview, the encoder) decides. A matrix that is not a quarter turn -- a
+/// mirror, a shear, a scale, or a 45-degree quirk -- is [`Rotation::Other`]
+/// rather than an approximation, so a caller refuses it by name instead of
+/// showing the picture wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rotation {
+    /// No turn: an identity display matrix, or a container that states one.
+    #[default]
+    None,
+    /// A quarter turn clockwise.
+    Cw90,
+    /// A half turn (two quarter turns clockwise).
+    Cw180,
+    /// Three quarter turns clockwise, i.e. one quarter counter-clockwise.
+    Cw270,
+    /// A display matrix that is not a quarter turn: a mirror (a negative
+    /// determinant), a shear, an anisotropic scale, or an angle that is not a
+    /// multiple of 90 degrees. The four linear terms are carried verbatim so
+    /// the reading is representable rather than silently dropped -- they are
+    /// the 16.16 fixed-point `a`, `b`, `c`, `d` of an ISO-BMFF `tkhd` matrix
+    /// (`matrix[0][0]`, `[0][1]`, `[1][0]`, `[1][1]`).
+    Other {
+        /// The matrix's `a` term, 16.16 fixed point.
+        a: i32,
+        /// The matrix's `b` term, 16.16 fixed point.
+        b: i32,
+        /// The matrix's `c` term, 16.16 fixed point.
+        c: i32,
+        /// The matrix's `d` term, 16.16 fixed point.
+        d: i32,
+    },
+}
+
+impl Rotation {
+    /// The rotation an ISO-BMFF `tkhd` display matrix states, from its linear
+    /// 2x2 part read as 16.16 fixed-point `i32`s.
+    ///
+    /// The matrix transforms a point `(x, y)` to `(a*x + c*y, b*x + d*y)`, so
+    /// the columns `(a, b)` and `(c, d)` are the turned axes: a pure rotation
+    /// has both columns the same length (isotropic) and one the other's quarter
+    /// turn (`a == d`, `b == -c`). Anything else is [`Rotation::Other`].
+    ///
+    /// The reading is exact integer arithmetic: the four quarter turns are
+    /// recognised by an axis landing on an axis (`b == 0` or `a == 0`). An
+    /// encoder writes 16.16 quarter turns exactly, so a value within a fraction
+    /// of a degree of one that is not exactly one -- a hand-edited or rescaled
+    /// matrix -- reads as [`Rotation::Other`] rather than being rounded onto a
+    /// turn this decoder would then apply for real.
+    pub fn from_matrix(a: i32, b: i32, c: i32, d: i32) -> Rotation {
+        // A pure rotation: isotropic (a == d, b == -c) with something to turn.
+        if a == d && b == (-c) && (a != 0 || b != 0) {
+            // `(a, b)` is the turned x-axis; a quarter turn lands it on an axis.
+            return match (a.signum(), b.signum()) {
+                (1, 0) => Rotation::None,
+                (-1, 0) => Rotation::Cw180,
+                (0, 1) => Rotation::Cw90,
+                (0, -1) => Rotation::Cw270,
+                _ => Rotation::Other { a, b, c, d },
+            };
+        }
+        Rotation::Other { a, b, c, d }
+    }
+
+    /// Quarter turns clockwise, where the stream is a quarter turn at all --
+    /// `None` for anything [`Rotation::Other`] carries.
+    pub fn steps(self) -> Option<u8> {
+        match self {
+            Rotation::None => Some(0),
+            Rotation::Cw90 => Some(1),
+            Rotation::Cw180 => Some(2),
+            Rotation::Cw270 => Some(3),
+            Rotation::Other { .. } => None,
+        }
+    }
+
+    /// Whether the turned picture's width and height are the coded ones
+    /// swapped.
+    pub fn swaps_axes(self) -> bool {
+        matches!(self, Rotation::Cw90 | Rotation::Cw270)
+    }
+
+    /// Whether there is nothing to do: no turn, the common case of a file that
+    /// was shot the way it is stored.
+    pub fn is_none(self) -> bool {
+        matches!(self, Rotation::None)
+    }
+}
+
 /// One stream of a container, as a demuxer reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamInfo {
@@ -258,6 +353,14 @@ pub struct StreamInfo {
     /// flagged stream at all, and its first stream of a kind is its default
     /// ([`crate::registry`] callers, `ec_probe::Reader::default_stream`).
     pub default: bool,
+    /// The turn this stream's display matrix asks for, where the container
+    /// states one. [`Rotation::None`] for a container that states none, for an
+    /// identity matrix, and for a non-video stream alike -- the common case.
+    ///
+    /// This is metadata, not an edit: nothing about [`params`](Self::params)
+    /// changes because of it, and a caller that wants the displayed picture
+    /// (the preview, the encoder) has to make the turn itself.
+    pub rotation: Rotation,
 }
 
 impl StreamInfo {
@@ -273,6 +376,7 @@ impl StreamInfo {
             language: None,
             initial_padding: 0,
             default: false,
+            rotation: Rotation::None,
         }
     }
 }
@@ -452,6 +556,65 @@ mod tests {
         assert_eq!(s.params.codec.media_type(), MediaType::Subtitle);
         assert_eq!(s.index, 2);
         assert_eq!(s.language.as_deref(), Some("tur"));
+        assert_eq!(s.rotation, Rotation::None);
+    }
+
+    #[test]
+    fn quarter_turn_matrices_read_as_typed_rotations() {
+        const ONE: i32 = 65_536; // 16.16 unity.
+        let cases = [
+            // A tkhd matrix and the turn it states, in this crate's clockwise
+            // convention. `(0, -1, 1, 0)` is what ffmpeg's
+            // `-display_rotation 90` writes: it asks the picture to be turned
+            // a quarter counter-clockwise here, which is Cw270.
+            ((ONE, 0, 0, ONE), Rotation::None),
+            ((0, -ONE, ONE, 0), Rotation::Cw270),
+            ((-ONE, 0, 0, -ONE), Rotation::Cw180),
+            ((0, ONE, -ONE, 0), Rotation::Cw90),
+            // A scaled identity is still no turn: the reading normalises by the
+            // matrix's own scale, so a differently-scaled copy reads the same.
+            ((2 * ONE, 0, 0, 2 * ONE), Rotation::None),
+        ];
+        for ((a, b, c, d), want) in cases {
+            assert_eq!(Rotation::from_matrix(a, b, c, d), want, "{a} {b} {c} {d}");
+        }
+        assert_eq!(Rotation::None.steps(), Some(0));
+        assert_eq!(Rotation::Cw90.steps(), Some(1));
+        assert_eq!(Rotation::Cw180.steps(), Some(2));
+        assert_eq!(Rotation::Cw270.steps(), Some(3));
+        assert!(Rotation::Cw90.swaps_axes() && Rotation::Cw270.swaps_axes());
+        assert!(!Rotation::None.swaps_axes() && !Rotation::Cw180.swaps_axes());
+        assert!(Rotation::None.is_none());
+    }
+
+    #[test]
+    fn a_matrix_that_is_not_a_quarter_turn_is_kept_not_rounded() {
+        const ONE: i32 = 65_536;
+        // A 45-degree turn: isotropic and pure, but no axis lands on an axis.
+        assert_eq!(
+            Rotation::from_matrix(46_340, -46_340, 46_340, 46_340),
+            Rotation::Other {
+                a: 46_340,
+                b: -46_340,
+                c: 46_340,
+                d: 46_340,
+            }
+        );
+        // A mirror (negative determinant), a mirror of a quarter turn (b != -c),
+        // a shear (a != d), and the degenerate all-zero matrix: none is a turn.
+        for (a, b, c, d) in [
+            (ONE, 0, 0, -ONE),
+            (0, ONE, ONE, 0),
+            (ONE, 0, ONE, ONE),
+            (0, 0, 0, 0),
+        ] {
+            let got = Rotation::from_matrix(a, b, c, d);
+            assert!(
+                matches!(got, Rotation::Other { .. }),
+                "{a} {b} {c} {d} read as {got:?}"
+            );
+            assert_eq!(got.steps(), None, "Other is not a quarter count");
+        }
     }
 
     #[test]
