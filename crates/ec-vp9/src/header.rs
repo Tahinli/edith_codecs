@@ -124,6 +124,18 @@ impl FrameContext {
     pub(crate) fn reset_inter_partition(&mut self) {
         self.partition = rows(&DEFAULT_PARTITION_PROBS);
     }
+
+    /// `set_partition_probs` (`vp9/onyxc_int.h:367`): a key frame OR an
+    /// intra-only frame reads partitions from the const
+    /// `vp9_kf_partition_probs`, never from the stored `FRAME_CONTEXT`. An
+    /// intra-only frame's context otherwise comes from storage, so its own
+    /// `partition` field must be left alone (this only swaps the field on the
+    /// active read copy).
+    pub(crate) fn use_key_partition(&mut self) {
+        for (i, row) in self.partition.iter_mut().enumerate() {
+            row.copy_from_slice(&KF_PARTITION_PROBS[i * 3..i * 3 + 3]);
+        }
+    }
 }
 
 /// `inv_recenter_nonneg` (vp9_dsubexp.c).
