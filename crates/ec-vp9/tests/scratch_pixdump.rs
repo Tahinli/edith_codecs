@@ -2,8 +2,9 @@
 //!
 //! `INTER_IVF=<path> EC_VP9_PIXDUMP=<out> cargo test -p ec-vp9 --test scratch_pixdump`
 //!
-//! Layout matches the oracle: per shown frame, Y (w*h), U ((w/2)*(h/2)),
-//! V ((w/2)*(h/2)), rows packed to the visible width.
+//! Layout matches the oracle: per shown frame, Y (w*h), U and V each
+//! (((w+1)/2)*((h+1)/2)) (chroma ceils, so odd extents keep the last column/
+//! row), rows packed to the visible width.
 
 use ec_vp9::decode::Decoder;
 
