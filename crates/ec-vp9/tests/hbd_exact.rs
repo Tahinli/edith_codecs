@@ -5,8 +5,7 @@
 //!
 //! Media-gated: the 10-bit corpus streams are gitignored, so the test skips
 //! by name when the fixture is absent (set the fixture tree up per the lane
-//! notes). The other two cases pin the refusals that STAY: non-4:2:0
-//! (profiles 1/3) and 12-bit.
+//! notes). The 4:4:4 and 12-bit shapes are covered by `subsampling_exact.rs`.
 
 mod ivf;
 
@@ -78,24 +77,4 @@ fn profile2_10bit_is_byte_exact() {
         off = end;
     }
     assert_eq!(off, want.len(), "frame count / plane size mismatch");
-}
-
-/// The refusals that STAY: profile 1 (4:4:4) is still refused by name.
-#[test]
-fn profile1_still_refused_by_name() {
-    let Some(p) = fixture("vp9-profile1-444.ivf") else {
-        eprintln!("SKIP profile1_still_refused_by_name: fixture absent");
-        return;
-    };
-    let bytes = std::fs::read(&p).unwrap();
-    let (_f, _w, _h, frames) = ivf::parse_ivf(&bytes);
-    let mut decoder = Decoder::new();
-    let err = decoder
-        .decode(&frames[0].data)
-        .expect_err("profile 1 must stay refused");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("profile 1"),
-        "the refusal must name the profile, got: {msg}"
-    );
 }

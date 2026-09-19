@@ -616,20 +616,22 @@ impl LfGrids {
     /// column pass takes NO width bound (vp9_loopfilter.c:1394 iterates all
     /// `MI_BLOCK_SIZE >> 1` column groups and `filter_selectively_vert_row2`
     /// writes whole 8-column groups into the padded plane).
-    pub(crate) fn filter_frame(
+    /// `vp9_filter_block_plane_ss00` (vp9_loopfilter.c:1239): filter one
+    /// full-resolution plane (luma, or a 4:4:4 chroma plane) from the luma
+    /// masks. Under 4:4:4 the chroma plane reuses the luma masks AND the luma
+    /// filter levels (`lfm->lfl_y`), so this same routine serves it with the
+    /// chroma plane's stride.
+    fn filter_ss00_plane(
         &self,
-        y: &mut [Sample],
+        data: &mut [Sample],
         stride: usize,
-        u: &mut [Sample],
-        v: &mut [Sample],
-        uv_stride: usize,
-        y_w: usize,
-        y_h: usize,
-        uv_h: usize,
+        w: usize,
+        h: usize,
         sharpness: u8,
         bd: u8,
+        trace: bool,
     ) {
-        let lftrace = lftrace_on();
+        let lftrace = trace && lftrace_on();
         // Luma masks, ported from vp9_setup_mask/build_masks and
         // vp9_adjust_mask (bit i = MI row i>>3, MI col i&7; each bit
         // covers an 8x8 cell). Edges are emitted from the masks.
@@ -642,12 +644,12 @@ impl LfGrids {
                 let (left, above, int4) = self.luma_masks(sbr, sbc);
                 for row in 0..8usize {
                     let yy = sbr * 8 + row * 8;
-                    if yy >= y_h {
+                    if yy >= h {
                         break;
                     }
                     for col in 0..8usize {
                         let xx = sbc * 8 + col * 8;
-                        if xx >= y_w {
+                        if xx >= w {
                             break;
                         }
                         let bit = 1u64 << (row * 8 + col);
@@ -666,11 +668,11 @@ impl LfGrids {
                         } else {
                             0
                         };
-                        if t != 0 && xx >= 4 && xx + 4 <= y_w {
-                            if t == 16 && (xx < 8 || xx + 8 > y_w) {
+                        if t != 0 && xx >= 4 && xx + 4 <= w {
+                            if t == 16 && (xx < 8 || xx + 8 > w) {
                                 t = 8;
                             }
-                            lpf_edge(y, yy * stride + xx, stride, 1, t, bl, li, th, 8, bd);
+                            lpf_edge(data, yy * stride + xx, stride, 1, t, bl, li, th, 8, bd);
                             if lftrace {
                                 let kind = match t {
                                     16 => "V16",
@@ -680,8 +682,8 @@ impl LfGrids {
                                 eprintln!("{kind} {} {}", xx, yy);
                             }
                         }
-                        if int4 & bit != 0 && xx + 8 <= y_w && yy + 8 <= y_h {
-                            lpf_edge(y, yy * stride + xx + 4, stride, 1, 4, bl, li, th, 8, bd);
+                        if int4 & bit != 0 && xx + 8 <= w && yy + 8 <= h {
+                            lpf_edge(data, yy * stride + xx + 4, stride, 1, 4, bl, li, th, 8, bd);
                             if lftrace {
                                 eprintln!("V4I {} {}", xx + 4, yy);
                             }
@@ -690,12 +692,12 @@ impl LfGrids {
                 }
                 for row in 0..8usize {
                     let yy = sbr * 8 + row * 8;
-                    if yy >= y_h {
+                    if yy >= h {
                         break;
                     }
                     for col in 0..8usize {
                         let xx = sbc * 8 + col * 8;
-                        if xx >= y_w {
+                        if xx >= w {
                             break;
                         }
                         let bit = 1u64 << (row * 8 + col);
@@ -715,11 +717,11 @@ impl LfGrids {
                             } else {
                                 0
                             };
-                            if t != 0 && yy >= 4 && yy + 4 <= y_h && xx + 8 <= y_w {
-                                if t == 16 && (yy < 8 || yy + 8 > y_h) {
+                            if t != 0 && yy >= 4 && yy + 4 <= h && xx + 8 <= w {
+                                if t == 16 && (yy < 8 || yy + 8 > h) {
                                     t = 8;
                                 }
-                                lpf_edge(y, yy * stride + xx, stride, 0, t, bl, li, th, 8, bd);
+                                lpf_edge(data, yy * stride + xx, stride, 0, t, bl, li, th, 8, bd);
                                 if lftrace {
                                     let kind = match t {
                                         16 => "H16",
@@ -736,8 +738,19 @@ impl LfGrids {
                         // (vp9_loopfilter.c:1286-1311). `skip_border_4x4_r`
                         // exists only in the 4:2:0-chroma path (ss11,
                         // vp9_loopfilter.c:1382) and in non420 under `ss_y`.
-                        if int4 & bit != 0 && yy + 8 <= y_h && xx + 8 <= y_w {
-                            lpf_edge(y, (yy + 4) * stride + xx, stride, 0, 4, bl, li, th, 8, bd);
+                        if int4 & bit != 0 && yy + 8 <= h && xx + 8 <= w {
+                            lpf_edge(
+                                data,
+                                (yy + 4) * stride + xx,
+                                stride,
+                                0,
+                                4,
+                                bl,
+                                li,
+                                th,
+                                8,
+                                bd,
+                            );
                             if lftrace {
                                 eprintln!("H4I {} {}", xx, yy + 4);
                             }
@@ -746,6 +759,18 @@ impl LfGrids {
                 }
             }
         }
+    }
+
+    /// `vp9_filter_block_plane_ss11` (vp9_loopfilter.c:1324): filter one
+    /// 4:2:0 chroma plane.
+    fn filter_ss11_plane(
+        &self,
+        data: &mut [Sample],
+        uv_stride: usize,
+        uv_h: usize,
+        sharpness: u8,
+        bd: u8,
+    ) {
         // Chroma 4:2:0 (vp9_filter_block_plane_ss11). MI is 4 chroma
         // pixels. The UV masks are built per 64x64 superblock exactly as
         // vp9_setup_mask/build_masks do — one build_masks per block, only
@@ -775,7 +800,7 @@ impl LfGrids {
                         if (bor as usize, boc as usize) != (r, c) || self.level8[cell] == 0 {
                             continue;
                         }
-                        let uv_tx = get_uv_tx_size(self.otx[cell] as usize, bsize as usize);
+                        let uv_tx = get_uv_tx_size(self.otx[cell] as usize, bsize as usize, 1, 1);
                         let shift = (((r & 7) >> 1) << 2) + ((c & 7) >> 1);
                         let b = bsize as usize;
                         left[uv_tx] |= UV_LEFT_PRED[b] << shift;
@@ -845,65 +870,49 @@ impl LfGrids {
                         *m &= 0xeeee;
                     }
                 }
-                for data in [&mut *u, &mut *v] {
-                    // libvpx runs the whole vertical pass before the
-                    // horizontal one; they overlap, so order matters.
-                    for rg in 0..4usize {
-                        // vp9_filter_block_plane_ss11 iterates MI rows
-                        // `r += 4` while `mi_row + r < mi_rows`
-                        // (vp9_loopfilter.c:1400), so the row GROUP is
-                        // processed whenever its first MI row is inside the
-                        // frame — even when its 8 chroma rows overhang the
-                        // visible height into the padded buffer. Gating on
-                        // `y8 + 8 <= uv_h` instead skipped the whole group and
-                        // lost the visible bottom rows (the 1080p case:
-                        // mi_rows 135, last group = chroma rows 536..543,
-                        // 536..539 visible).
-                        if sbr + 4 * (rg >> 1) >= self.mi_rows {
+                // libvpx runs the whole vertical pass before the
+                // horizontal one; they overlap, so order matters.
+                for rg in 0..4usize {
+                    // vp9_filter_block_plane_ss11 iterates MI rows
+                    // `r += 4` while `mi_row + r < mi_rows`
+                    // (vp9_loopfilter.c:1400), so the row GROUP is
+                    // processed whenever its first MI row is inside the
+                    // frame — even when its 8 chroma rows overhang the
+                    // visible height into the padded buffer. Gating on
+                    // `y8 + 8 <= uv_h` instead skipped the whole group and
+                    // lost the visible bottom rows (the 1080p case:
+                    // mi_rows 135, last group = chroma rows 536..543,
+                    // 536..539 visible).
+                    if sbr + 4 * (rg >> 1) >= self.mi_rows {
+                        continue;
+                    }
+                    let y8 = sbr * 4 + 8 * rg;
+                    for cg in 0..4usize {
+                        let x8 = sbc * 4 + 8 * cg;
+                        let bit = 1u16 << (rg * 4 + cg);
+                        let lvl = self.level_at(sbr + 2 * rg, sbc + 2 * cg);
+                        if lvl == 0 {
                             continue;
                         }
-                        let y8 = sbr * 4 + 8 * rg;
-                        for cg in 0..4usize {
-                            let x8 = sbc * 4 + 8 * cg;
-                            let bit = 1u16 << (rg * 4 + cg);
-                            let lvl = self.level_at(sbr + 2 * rg, sbc + 2 * cg);
-                            if lvl == 0 {
-                                continue;
-                            }
-                            let (bl, li, th) = limits(lvl, sharpness);
-                            if x8 >= 4 {
-                                let taps = if left[TX_16X16] & bit != 0 {
-                                    16
-                                } else if left[TX_8X8] & bit != 0 {
-                                    8
-                                } else if left[TX_4X4] & bit != 0 {
-                                    4
-                                } else {
-                                    0
-                                };
-                                if taps != 0 {
-                                    let t = if taps == 16 && x8 < 8 { 8 } else { taps };
-                                    lpf_edge(
-                                        data,
-                                        y8 * uv_stride + x8,
-                                        uv_stride,
-                                        1,
-                                        t,
-                                        bl,
-                                        li,
-                                        th,
-                                        8,
-                                        bd,
-                                    );
-                                }
-                            }
-                            if int4 & bit != 0 {
+                        let (bl, li, th) = limits(lvl, sharpness);
+                        if x8 >= 4 {
+                            let taps = if left[TX_16X16] & bit != 0 {
+                                16
+                            } else if left[TX_8X8] & bit != 0 {
+                                8
+                            } else if left[TX_4X4] & bit != 0 {
+                                4
+                            } else {
+                                0
+                            };
+                            if taps != 0 {
+                                let t = if taps == 16 && x8 < 8 { 8 } else { taps };
                                 lpf_edge(
                                     data,
-                                    y8 * uv_stride + x8 + 4,
+                                    y8 * uv_stride + x8,
                                     uv_stride,
                                     1,
-                                    4,
+                                    t,
                                     bl,
                                     li,
                                     th,
@@ -912,60 +921,294 @@ impl LfGrids {
                                 );
                             }
                         }
+                        if int4 & bit != 0 {
+                            lpf_edge(
+                                data,
+                                y8 * uv_stride + x8 + 4,
+                                uv_stride,
+                                1,
+                                4,
+                                bl,
+                                li,
+                                th,
+                                8,
+                                bd,
+                            );
+                        }
                     }
-                    for rg in 0..4usize {
-                        // Horizontal pass: `r += 2` while `mi_row + r <
-                        // mi_rows` (vp9_loopfilter.c:1431) — one row group per
-                        // iteration, same MI-row-gated boundary as the
-                        // vertical pass above.
-                        if sbr + 2 * rg >= self.mi_rows {
+                }
+                for rg in 0..4usize {
+                    // Horizontal pass: `r += 2` while `mi_row + r <
+                    // mi_rows` (vp9_loopfilter.c:1431) — one row group per
+                    // iteration, same MI-row-gated boundary as the
+                    // vertical pass above.
+                    if sbr + 2 * rg >= self.mi_rows {
+                        continue;
+                    }
+                    let y8 = sbr * 4 + 8 * rg;
+                    for cg in 0..4usize {
+                        let x8 = sbc * 4 + 8 * cg;
+                        let bit = 1u16 << (rg * 4 + cg);
+                        let lvl = self.level_at(sbr + 2 * rg, sbc + 2 * cg);
+                        if lvl == 0 {
                             continue;
                         }
-                        let y8 = sbr * 4 + 8 * rg;
-                        for cg in 0..4usize {
-                            let x8 = sbc * 4 + 8 * cg;
-                            let bit = 1u16 << (rg * 4 + cg);
-                            let lvl = self.level_at(sbr + 2 * rg, sbc + 2 * cg);
-                            if lvl == 0 {
-                                continue;
-                            }
-                            let (bl, li, th) = limits(lvl, sharpness);
-                            if y8 >= 4 && y8 + 4 <= uv_h {
-                                let taps = if above[TX_16X16] & bit != 0 {
-                                    16
-                                } else if above[TX_8X8] & bit != 0 {
+                        let (bl, li, th) = limits(lvl, sharpness);
+                        if y8 >= 4 && y8 + 4 <= uv_h {
+                            let taps = if above[TX_16X16] & bit != 0 {
+                                16
+                            } else if above[TX_8X8] & bit != 0 {
+                                8
+                            } else if above[TX_4X4] & bit != 0 {
+                                4
+                            } else {
+                                0
+                            };
+                            if taps != 0 {
+                                let t = if taps == 16 && (y8 < 8 || y8 + 8 > uv_h) {
                                     8
-                                } else if above[TX_4X4] & bit != 0 {
-                                    4
                                 } else {
-                                    0
+                                    taps
                                 };
-                                if taps != 0 {
-                                    let t = if taps == 16 && (y8 < 8 || y8 + 8 > uv_h) {
-                                        8
-                                    } else {
-                                        taps
-                                    };
-                                    lpf_edge(
-                                        data,
-                                        y8 * uv_stride + x8,
-                                        uv_stride,
-                                        0,
-                                        t,
-                                        bl,
-                                        li,
-                                        th,
-                                        8,
-                                        bd,
-                                    );
-                                }
-                            }
-                            if int4 & bit != 0 && sbr + 2 * rg != self.mi_rows - 1 && y8 + 8 <= uv_h
-                            {
                                 lpf_edge(
                                     data,
-                                    (y8 + 4) * uv_stride + x8,
+                                    y8 * uv_stride + x8,
                                     uv_stride,
+                                    0,
+                                    t,
+                                    bl,
+                                    li,
+                                    th,
+                                    8,
+                                    bd,
+                                );
+                            }
+                        }
+                        if int4 & bit != 0 && sbr + 2 * rg != self.mi_rows - 1 && y8 + 8 <= uv_h {
+                            lpf_edge(
+                                data,
+                                (y8 + 4) * uv_stride + x8,
+                                uv_stride,
+                                0,
+                                4,
+                                bl,
+                                li,
+                                th,
+                                8,
+                                bd,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `vp9_filter_block_plane_non420` (vp9_loopfilter.c:1078): the slow
+    /// path for a chroma plane subsampled in exactly ONE direction (4:2:2 /
+    /// 4:4:0), where the luma masks cannot be reused. Masks and per-MI filter
+    /// levels are built inline; the vertical pass runs one band of 8 chroma
+    /// rows per MI row step (`row_step = 1 << ss_y`).
+    #[allow(clippy::too_many_arguments)]
+    fn filter_non420_plane(
+        &self,
+        data: &mut [Sample],
+        stride: usize,
+        uv_w: usize,
+        uv_h: usize,
+        ss_x: usize,
+        ss_y: usize,
+        sharpness: u8,
+        bd: u8,
+    ) {
+        let row_step = 1usize << ss_y;
+        let col_step = 1usize << ss_x;
+        let groups = 8usize >> ss_x;
+        let sb_rows = (self.mi_rows + 7) / 8;
+        let sb_cols = (self.mi_cols + 7) / 8;
+        for sbr_i in 0..sb_rows {
+            let sbr = sbr_i * 8;
+            for sbc_i in 0..sb_cols {
+                let sbc = sbc_i * 8;
+                let band_x = (sbc * 8) >> ss_x;
+                // mask_*[r] are the horizontal-pass masks; `lfl[r][i]` the
+                // per-MI filter level at MI row offset r and column group i.
+                let mut mask_16 = [0u32; 8];
+                let mut mask_8 = [0u32; 8];
+                let mut mask_4 = [0u32; 8];
+                let mut mask_4i = [0u32; 8];
+                let mut lfl = [[0u8; 8]; 8];
+                // Vertical pass: one 8-chroma-row band per MI row step.
+                let mut r = 0usize;
+                while r < 8 && sbr + r < self.mi_rows {
+                    let mut c16 = 0u32;
+                    let mut c8 = 0u32;
+                    let mut c4 = 0u32;
+                    let mut c = 0usize;
+                    while c < 8 && sbc + c < self.mi_cols {
+                        let cell = (sbr + r) * self.mi_cols + sbc + c;
+                        let b = self.blk[cell].0 as usize;
+                        let skip_this = self.skip_inter[cell];
+                        let block_edge_left = if NUM_4X4_BLOCKS_WIDE_LOOKUP[b] > 1 {
+                            (c & (NUM_8X8_BLOCKS_WIDE_LOOKUP[b] as usize - 1)) == 0
+                        } else {
+                            true
+                        };
+                        let skip_this_c = skip_this && !block_edge_left;
+                        let block_edge_above = if NUM_4X4_BLOCKS_HIGH_LOOKUP[b] > 1 {
+                            (r & (NUM_8X8_BLOCKS_HIGH_LOOKUP[b] as usize - 1)) == 0
+                        } else {
+                            true
+                        };
+                        let skip_this_r = skip_this && !block_edge_above;
+                        let tx = get_uv_tx_size(self.otx[cell] as usize, b, ss_x, ss_y);
+                        let skip_border_c = ss_x == 1 && sbc + c == self.mi_cols - 1;
+                        let skip_border_r = ss_y == 1 && sbr + r == self.mi_rows - 1;
+                        let i = c >> ss_x;
+                        let bit = 1u32 << i;
+                        let lvl = self.level8[cell];
+                        lfl[r][i] = lvl;
+                        if lvl != 0 {
+                            if tx == TX_32X32 {
+                                if !skip_this_c && (i & 3) == 0 {
+                                    if !skip_border_c {
+                                        c16 |= bit
+                                    } else {
+                                        c8 |= bit
+                                    }
+                                }
+                                if !skip_this_r && ((r >> ss_y) & 3) == 0 {
+                                    if !skip_border_r {
+                                        mask_16[r] |= bit
+                                    } else {
+                                        mask_8[r] |= bit
+                                    }
+                                }
+                            } else if tx == TX_16X16 {
+                                if !skip_this_c && (i & 1) == 0 {
+                                    if !skip_border_c {
+                                        c16 |= bit
+                                    } else {
+                                        c8 |= bit
+                                    }
+                                }
+                                if !skip_this_r && ((r >> ss_y) & 1) == 0 {
+                                    if !skip_border_r {
+                                        mask_16[r] |= bit
+                                    } else {
+                                        mask_8[r] |= bit
+                                    }
+                                }
+                            } else {
+                                if !skip_this_c {
+                                    if tx == TX_8X8 || (i & 3) == 0 {
+                                        c8 |= bit;
+                                    } else {
+                                        c4 |= bit;
+                                    }
+                                }
+                                if !skip_this_r {
+                                    if tx == TX_8X8 || ((r >> ss_y) & 3) == 0 {
+                                        mask_8[r] |= bit;
+                                    } else {
+                                        mask_4[r] |= bit;
+                                    }
+                                }
+                                if !skip_this && tx < TX_8X8 && !skip_border_c {
+                                    mask_4i[r] |= bit;
+                                }
+                            }
+                        }
+                        c += col_step;
+                    }
+                    // Vertical edges: `filter_selectively_vert`. Leftmost
+                    // frame superblock clears the block-edge masks on the
+                    // first column group.
+                    let border = if sbc == 0 { !1u32 } else { !0u32 };
+                    let band_y = ((sbr + r) * 8) >> ss_y;
+                    let union = (c16 & border) | (c8 & border) | (c4 & border) | mask_4i[r];
+                    for gi in 0..groups {
+                        let bit = 1u32 << gi;
+                        if union & bit == 0 {
+                            continue;
+                        }
+                        let (bl, li, th) = limits(lfl[r][gi], sharpness);
+                        let x = band_x + 8 * gi;
+                        let taps = if (c16 & border) & bit != 0 {
+                            16
+                        } else if (c8 & border) & bit != 0 {
+                            8
+                        } else if (c4 & border) & bit != 0 {
+                            4
+                        } else {
+                            0
+                        };
+                        if taps != 0 {
+                            lpf_edge(
+                                data,
+                                band_y * stride + x,
+                                stride,
+                                1,
+                                taps,
+                                bl,
+                                li,
+                                th,
+                                8,
+                                bd,
+                            );
+                        }
+                        if mask_4i[r] & bit != 0 {
+                            lpf_edge(
+                                data,
+                                band_y * stride + x + 4,
+                                stride,
+                                1,
+                                4,
+                                bl,
+                                li,
+                                th,
+                                8,
+                                bd,
+                            );
+                        }
+                    }
+                    r += row_step;
+                }
+                // Horizontal pass: `filter_selectively_horiz`, one band per
+                // MI row step.
+                let mut r = 0usize;
+                while r < 8 && sbr + r < self.mi_rows {
+                    let skip_border_r = ss_y == 1 && sbr + r == self.mi_rows - 1;
+                    let int_r = if skip_border_r { 0 } else { mask_4i[r] };
+                    let (m16, m8, m4) = if sbr + r == 0 {
+                        (0, 0, 0)
+                    } else {
+                        (mask_16[r], mask_8[r], mask_4[r])
+                    };
+                    let band_y = ((sbr + r) * 8) >> ss_y;
+                    let union = m16 | m8 | m4 | int_r;
+                    for gi in 0..groups {
+                        let bit = 1u32 << gi;
+                        if union & bit == 0 {
+                            continue;
+                        }
+                        let (bl, li, th) = limits(lfl[r][gi], sharpness);
+                        let x = band_x + 8 * gi;
+                        let y = band_y;
+                        // `filter_selectively_horiz` (vpx_dsp/loopfilter.c):
+                        // a 16-tap block edge swallows the internal 4x4 edge;
+                        // the 8- and 4-tap branches emit it separately; a bit
+                        // whose only mask is the internal one takes the else
+                        // branch (the internal edge alone).
+                        if m16 & bit != 0 {
+                            lpf_edge(data, y * stride + x, stride, 0, 16, bl, li, th, 8, bd);
+                        } else if m8 & bit != 0 {
+                            lpf_edge(data, y * stride + x, stride, 0, 8, bl, li, th, 8, bd);
+                            if int_r & bit != 0 {
+                                lpf_edge(
+                                    data,
+                                    (y + 4) * stride + x,
+                                    stride,
                                     0,
                                     4,
                                     bl,
@@ -975,10 +1218,71 @@ impl LfGrids {
                                     bd,
                                 );
                             }
+                        } else if m4 & bit != 0 {
+                            lpf_edge(data, y * stride + x, stride, 0, 4, bl, li, th, 8, bd);
+                            if int_r & bit != 0 {
+                                lpf_edge(
+                                    data,
+                                    (y + 4) * stride + x,
+                                    stride,
+                                    0,
+                                    4,
+                                    bl,
+                                    li,
+                                    th,
+                                    8,
+                                    bd,
+                                );
+                            }
+                        } else {
+                            lpf_edge(data, (y + 4) * stride + x, stride, 0, 4, bl, li, th, 8, bd);
                         }
                     }
+                    r += row_step;
                 }
+                let _ = (uv_w, uv_h);
             }
+        }
+    }
+
+    /// Filter the frame's three planes in place. `y_w/h` are the coded
+    /// (aligned) luma plane sizes; `uv_w/h` the chroma plane sizes; `ss_x`/
+    /// `ss_y` the chroma subsampling. The dispatch mirrors
+    /// `vp9_loop_filter_frame` (vp9_loopfilter.c:1430): luma always takes the
+    /// ss00 path; chroma takes ss00 for 4:4:4, ss11 for 4:2:0, and the
+    /// non420 slow path otherwise (4:2:2 / 4:4:0).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn filter_frame(
+        &self,
+        y: &mut [Sample],
+        stride: usize,
+        u: &mut [Sample],
+        v: &mut [Sample],
+        uv_stride: usize,
+        y_w: usize,
+        y_h: usize,
+        uv_w: usize,
+        uv_h: usize,
+        ss_x: usize,
+        ss_y: usize,
+        sharpness: u8,
+        bd: u8,
+    ) {
+        self.filter_ss00_plane(y, stride, y_w, y_h, sharpness, bd, true);
+        if ss_x == 0 && ss_y == 0 {
+            for data in [&mut *u, &mut *v] {
+                self.filter_ss00_plane(data, uv_stride, uv_w, uv_h, sharpness, bd, false);
+            }
+            return;
+        }
+        if ss_x == 1 && ss_y == 1 {
+            for data in [&mut *u, &mut *v] {
+                self.filter_ss11_plane(data, uv_stride, uv_h, sharpness, bd);
+            }
+            return;
+        }
+        for data in [&mut *u, &mut *v] {
+            self.filter_non420_plane(data, uv_stride, uv_w, uv_h, ss_x, ss_y, sharpness, bd);
         }
     }
 }
@@ -1005,7 +1309,7 @@ mod tests {
     fn run(g: &LfGrids, y: &mut [Sample]) {
         let mut u = vec![128u16; 32 * 32];
         let mut v = vec![128u16; 32 * 32];
-        g.filter_frame(y, 64, &mut u, &mut v, 32, 64, 64, 32, 0, 8);
+        g.filter_frame(y, 64, &mut u, &mut v, 32, 64, 64, 32, 32, 1, 1, 0, 8);
     }
 
     /// The luma internal-4x4 horizontal edge fires on the frame's LAST MI row.

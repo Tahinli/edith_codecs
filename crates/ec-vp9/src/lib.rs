@@ -1,18 +1,20 @@
-//! Native VP9 (profiles 0 and 2, 8- and 10-bit 4:2:0) decoder.
+//! Native VP9 decoder: all four profiles, 8/10/12-bit, and every coded
+//! subsampling (4:2:0, 4:2:2, 4:4:0, 4:4:4).
 //!
 //! The crate implements the VP9 bitstream specification directly
 //! ([spec]); libvpx's output is used only as a test oracle
 //! (sample-exactness witnesses against ffmpeg's libvpx-based decoder),
 //! never as code linked at runtime. Every module documents the spec
 //! section it implements. Inter frames decode through motion compensation,
-//! residual reconstruction and the loop filter; intra-only frames, profiles
-//! 1/3 (4:4:4), 12-bit and other subsamplings are refused by name.
+//! residual reconstruction and the loop filter; intra-only frames and
+//! scaled references are supported too.
 //!
 //! Planes are stored as `u16` for every depth ([`Sample`]); kernels take the
 //! frame's `bd` and clamp with `clip_pixel_bd`, so one decode walk serves
-//! both depths. The only depth-dependent bitstream element is the CAT6
-//! coefficient token (14 bits/`vp9_cat6_prob` at 8-bit, 16 bits/
-//! `vp9_cat6_prob_high12 + 2` at 10- and 12-bit).
+//! every depth and subsampling. The only depth-dependent bitstream element is
+//! the CAT6 coefficient token (14 bits/`vp9_cat6_prob` at 8-bit, 16 bits/
+//! `vp9_cat6_prob_high12 + 2` at 10-bit, 18 bits/`vp9_cat6_prob_high12` at
+//! 12-bit).
 //!
 //! [spec]: https://www.webmproject.org/docs/vp9/
 //!

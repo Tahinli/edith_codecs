@@ -455,13 +455,35 @@ fn inter_predictor(
     }
     if subpel_y == 0 {
         convolve_horiz(
-            buf, stride, origin, dst, dst_stride, f, subpel_x, SUBPEL_SHIFTS, w, h, avg, bd,
+            buf,
+            stride,
+            origin,
+            dst,
+            dst_stride,
+            f,
+            subpel_x,
+            SUBPEL_SHIFTS,
+            w,
+            h,
+            avg,
+            bd,
         );
         return;
     }
     if subpel_x == 0 {
         convolve_vert(
-            buf, stride, origin, dst, dst_stride, f, subpel_y, SUBPEL_SHIFTS, w, h, avg, bd,
+            buf,
+            stride,
+            origin,
+            dst,
+            dst_stride,
+            f,
+            subpel_y,
+            SUBPEL_SHIFTS,
+            w,
+            h,
+            avg,
+            bd,
         );
         return;
     }
@@ -744,24 +766,43 @@ pub(crate) fn build_inter_predictors(
     );
 }
 
-/// `average_split_mvs` (`vp9/common/vp9_reconinter.c:113`), luma (`ss_idx 0`):
-/// the sub-block's own MV.
-pub(crate) fn split_mv(bmi: &[[(i32, i32); 2]; 4], block: usize, ref_idx: usize) -> (i32, i32) {
-    bmi[block][ref_idx]
-}
-
-/// `average_split_mvs` for 4:2:0 chroma (`ss_idx 3`): `mi_mv_pred_q4`, the
-/// q4-rounded average over the four sub-blocks.
+/// `average_split_mvs` (`vp9/common/vp9_reconinter.c:113`): the per-sub-block
+/// MV of a sub-8x8 inter block, selected by the plane's subsampling.
 ///
-/// `round_mv_comp_q4(v) = (v < 0 ? v - 2 : v + 2) / 4` — C's truncating
+/// `ss_idx` 0 (luma and 4:4:4 chroma): the sub-block's own MV; 1 (4:4:0): the
+/// q2-rounded average of the vertical pair (`block`, `block + 2`); 2 (4:2:2):
+/// the horizontal pair (`block`, `block + 1`); 3 (4:2:0): the q4-rounded
+/// average of all four.
+///
+/// `round_mv_comp_qN(v) = (v < 0 ? v - N/2 : v + N/2) / N` — C's truncating
 /// division, which Rust's `/` on integers reproduces.
-pub(crate) fn average_split_mvs_chroma(bmi: &[[(i32, i32); 2]; 4], ref_idx: usize) -> (i32, i32) {
+pub(crate) fn average_split_mvs(
+    bmi: &[[(i32, i32); 2]; 4],
+    ref_idx: usize,
+    block: usize,
+    ss_x: usize,
+    ss_y: usize,
+) -> (i32, i32) {
+    let q2 = |v: i32| if v < 0 { (v - 1) / 2 } else { (v + 1) / 2 };
     let q4 = |v: i32| if v < 0 { (v - 2) / 4 } else { (v + 2) / 4 };
-    let mut row = 0;
-    let mut col = 0;
-    for b in bmi.iter() {
-        row += b[ref_idx].0;
-        col += b[ref_idx].1;
+    match (ss_x, ss_y) {
+        (0, 0) => bmi[block][ref_idx],
+        (0, 1) => {
+            let (a, b) = (bmi[block][ref_idx], bmi[block + 2][ref_idx]);
+            (q2(a.0 + b.0), q2(a.1 + b.1))
+        }
+        (1, 0) => {
+            let (a, b) = (bmi[block][ref_idx], bmi[block + 1][ref_idx]);
+            (q2(a.0 + b.0), q2(a.1 + b.1))
+        }
+        _ => {
+            let mut row = 0;
+            let mut col = 0;
+            for b in bmi.iter() {
+                row += b[ref_idx].0;
+                col += b[ref_idx].1;
+            }
+            (q4(row), q4(col))
+        }
     }
-    (q4(row), q4(col))
 }
