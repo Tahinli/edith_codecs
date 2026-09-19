@@ -55,7 +55,14 @@ const REFUSALS: &[&str] = &[
     // `every_read_intra_mode_call_site_hands_the_reader_a_palette_cache`,
     // which keeps that invariant now the refusal is gone).
     "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
-    "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
+    // lane-av1txr: `a sub-8x8 leaf that uses intrabc (…)` is GONE -- the
+    // capability landed in this lane (4x4 / 4x8 / 8x4 intrabc leaves read the
+    // DV and reconstruct a frame copy + the INTER residual; gates
+    // `a_non_420_subsampled_sequence_header_is_refused_by_name`'s sibling
+    // witnesses and the `warped.obu`/`allintra.obu` traces). Its census gate
+    // (`a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal`)
+    // still runs: it now reports `reached = 0` with the same non-vacuous
+    // premise (allow_intrabc frames + decoded sub-8 leaves).
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
     // lane-lossless/lane-lossless2: a lossless frame (base_q_idx 0) decodes
     // sample-exact, KEY and INTER -- TX_4X4 with the Walsh-Hadamard transform
@@ -256,11 +263,15 @@ const PROVEN: &[(&str, &str)] = &[
         "a tx_type symbol outside its CDF's own set: {t}",
         "every_tx_type_symbol_of_every_cdf_width_maps_into_its_own_set",
     ),
-    // lane-t900 r24, enumeration: the reader covers spec 5.11.40's whole value
-    // domain (`0..=(1 << 20) - 2`, both ends of every prefix length), so the
-    // refusal is outside it. What it still names is a bit pattern no encoder
-    // writes -- a 20th prefix bit of 0, which the spec's `length == 20` break
-    // makes a don't-care.
+    // lane-t900 r24 + lane-av1txr RE-PIN, measured: the reader covers spec
+    // 5.11.40's whole value domain (`0..=(1 << 20) - 2`, both ends of every
+    // prefix length), so no CONFORMANT symbol stream reaches it -- but the
+    // string IS reachable as a SYMPTOM: a frame this decoder desyncs on
+    // (measured: a real libaom monochrome key frame, gate
+    // `a_real_libaom_monochrome_key_frame_is_refused_by_name` at
+    // `stream.rs`) leaves the reader mid-symbol and the next `read_golomb`
+    // reports this tail. The claim below therefore pins the reader's value
+    // coverage, NOT the string's unreachability.
     (
         "a Golomb tail longer than this decoder reads",
         "read_golomb_reads_every_value_a_conformant_stream_can_carry",
@@ -379,14 +390,10 @@ const PROVEN: &[(&str, &str)] = &[
         "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
         "no_128_root_half_reads_a_cfl_filter_intra_or_palette_symbol",
     ),
-    // lane-t900 r33, CENSUS: the `use_intrabc` symbol IS read at the sub-8
-    // reader for every sub-8x8 leaf of an `allow_intrabc` frame, and over the
-    // `--min-partition-size=4` exact-repetition screen arms every such symbol
-    // came back 0 while the frames decode pixel-exact.
-    (
-        "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
-        "a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal",
-    ),
+    // lane-av1txr: the sub-8x8 intrabc refusal this census pinned is GONE (the
+    // capability landed; see the note in `REFUSALS`). The census gate survives
+    // as the witness that its premise is still exercised -- `reached` is 0 by
+    // construction now.
     // lane-t900 r33, CENSUS: four quantisers of the recipe that reaches the
     // intrabc var-tx tree at all read it for 5 blocks in total, every one of
     // which resolved to a UNIFORM leaf size, with the frames pixel-exact.

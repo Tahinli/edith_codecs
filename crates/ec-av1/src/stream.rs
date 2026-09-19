@@ -1245,6 +1245,13 @@ pub(crate) struct SeqFlags {
     pub(crate) bit_depth: u8,
     pub(crate) order_hint_bits: u32,
     pub(crate) mc_identity: bool,
+    /// lane-av1txr: `color_config.subsampling_x/y` (spec 5.5.2). The decoder
+    /// itself hardcodes 4:2:0 everywhere, so these exist only for the
+    /// sequence-level refusal in [`decode_stream_with`] -- nothing downstream
+    /// reads them. A monochrome header parses as 1,1, so `!(1,1)` singles out
+    /// 4:4:4 (profile 1 / sRGB) and 4:2:2 (profile 2 below 12-bit).
+    pub(crate) subsampling_x: u8,
+    pub(crate) subsampling_y: u8,
 }
 
 impl SeqFlags {
@@ -1261,6 +1268,8 @@ impl SeqFlags {
             bit_depth: seq.map_or(8, |s| s.color_config.bit_depth),
             order_hint_bits: seq.map_or(0, |s| s.order_hint_bits),
             mc_identity: seq.is_some_and(|s| s.color_config.matrix_coefficients == 0),
+            subsampling_x: seq.map_or(1, |s| s.color_config.subsampling_x),
+            subsampling_y: seq.map_or(1, |s| s.color_config.subsampling_y),
         }
     }
 }
@@ -1601,6 +1610,27 @@ fn decode_frame(
             "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         ));
     }
+    // lane-av1txr: `color_config.subsampling_x/y` (spec 5.5.2) are parsed by
+    // `ec-av1-syntax` -- profile 1 forces 4:4:4, profile 2 below 12-bit forces
+    // 4:2:2, and the sRGB identity description forces full-range 4:4:4 -- but
+    // the decoder reads them NOWHERE: every chroma extent is hardcoded 4:2:0
+    // (`let (chroma_w, chroma_h) = (bw / 2, bh / 2)` at every rect site,
+    // `chroma_side = side / 2` in `decode_block`) and the probe emits 4:2:0
+    // planes only. Measured consequence: EVERY 4:4:4 stream desyncs at the
+    // first chroma transform (a444-cu6 block (0,0): aomdec reads
+    // `EC_COEFF plane=1 tx=TX_8X16` at rng 39857 where ours reads a 4-wide,
+    // 8-high 4:2:0 chroma block at the same rng) and then decodes pixels that
+    // are silently wrong. Refuse by name rather than return garbage. A
+    // `num_planes == 1` (monochrome) header keeps its parsed 1,1 and is
+    // unaffected. Gates: `a_non_420_subsampled_sequence_header_is_refused_by_
+    // name` below (hand-built profile 1/2 headers plus a real aomenc 4:4:4
+    // stream).
+    if seq.subsampling_x != 1 || seq.subsampling_y != 1 {
+        return Err(Error::unsupported(
+            "AV1 decode_stream",
+            "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
+        ));
+    }
     // lane-dpm1: a LOSSLESS frame (`qindex == 0` with zero deltas, spec 5.9.12)
     // is a different tile syntax, and this decoder has none of it: libaom
     // forces TX_4X4 with the WALSH-HADAMARD transform over every block (so no
@@ -1633,6 +1663,11 @@ fn decode_frame(
     // `a_lossless_libaom_inter_frame_decodes_sample_exact`.
     crate::decode::set_lossless(coded_lossless, fctx);
     crate::decode::set_bit_depth(bit_depth, fctx);
+    // lane-av1txr: spec 5.9.2 `disable_cdf_update` -- a frame that sets it
+    // codes every tile symbol against the CDFs it started with, so the tile
+    // readers must not adapt (libaom `decodeframe.c:2909`:
+    // `allow_update_cdf = allow_update_cdf && !cm->features.disable_cdf_update`).
+    crate::decode::set_disable_cdf_update(header.disable_cdf_update, fctx);
     // spec 7.16: this frame's superres state, for the filter chain --
     // `decode.rs` upscales between CDEF and loop restoration and sizes
     // the LR unit grid in upscaled coordinates. Cleared (0, 8) on an
@@ -2014,6 +2049,54 @@ pub(crate) mod tests {
             ),
             "expected the 12-bit refusal, got: {err}"
         );
+    }
+
+    /// lane-av1txr: a sequence header describing any chroma shape but 4:2:0 is
+    /// refused by name, because the decoder reconstructs every chroma extent
+    /// at hardcoded 4:2:0 (`bw / 2, bh / 2` at every rect site) and the probe
+    /// emits 4:2:0 planes only -- a 4:4:4 stream "decodes" into silently wrong
+    /// pixels (measured: a444-cu6's first chroma transform reads a 4x2-wide/
+    /// 8-high 4:2:0 chroma at aomdec's `TX_8X16` entry rng 39857, then
+    /// desyncs; every 4:4:4 fixture measured byte-differs from ffmpeg).
+    ///
+    /// Reachability, not a pixel claim: the header is written at the two
+    /// profiles that force a non-4:2:0 shape (spec 5.5.2 -- profile 1 forces
+    /// 4:4:4 with no coded bit; profile 2 below 12-bit forces 4:2:2) and the
+    /// tile is never reached. The 4:2:0 CONTROL below proves the refusal is
+    /// about the shape, not about this construction.
+    #[test]
+    fn a_non_420_subsampled_sequence_header_is_refused_by_name() {
+        const NAME: &str = "a_non_420_subsampled_sequence_header_is_refused_by_name";
+        const REFUSAL: &str = "a chroma format other than 4:2:0";
+        let fctx = &crate::decode::FrameCtx::new();
+        let picture = test_card(64, 64);
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
+        for (profile, label, sx, sy) in [(1u8, "4:4:4", 0u8, 0u8), (2, "4:2:2", 1, 0)] {
+            let color = ec_av1_syntax::ColorConfig {
+                num_planes: 3,
+                subsampling_x: sx,
+                subsampling_y: sy,
+                ..Default::default()
+            };
+            let (mut seq, header) =
+                crate::encode::key_frame_headers_colour(64, 64, 100, color).unwrap();
+            seq.seq_profile = profile;
+            let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+            stream.extend_from_slice(
+                &crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap(),
+            );
+            let err = decode_stream(&stream).unwrap_err().to_string();
+            assert!(
+                err.contains(REFUSAL),
+                "{NAME}: expected the non-4:2:0 refusal for the {label} header, got: {err}"
+            );
+        }
+        // CONTROL: the same construction at profile 0 (4:2:0) still decodes.
+        let (seq, header) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
+        let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+        stream.extend_from_slice(&crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap());
+        let frames = decode_stream(&stream).expect("the 4:2:0 control must decode");
+        assert_eq!(frames.len(), 1, "{NAME}: the 4:2:0 control decoded no frame");
     }
 
     /// lane-av1-decode (pilot resume, 2026-09-19): a real libaom MONOCHROME key
@@ -6667,6 +6750,64 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// lane-av1txr: a real `aomenc --cdf-update-mode=0` stream (spec 5.9.2
+    /// `disable_cdf_update`) decodes SAMPLE-EXACT. The read that was missing:
+    /// `stream.rs` never threaded the header bit, so the tile readers adapted
+    /// every symbol of a frame the encoder coded against fixed tables -- the
+    /// stream desynced at its first multi-symbol block and the pixels differed
+    /// from byte 6 (`EC_PROBE_OUT` vs `ffmpeg -pix_fmt yuv420p`, measured
+    /// 2026-09-20). The msac unit gate
+    /// (`a_reader_told_not_to_adapt_matches_a_non_adapting_writer`) pins the
+    /// mechanism; this one pins the wiring end to end.
+    #[test]
+    fn a_real_aomenc_stream_with_cdf_update_disabled_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_cdf_update_disabled_decodes_pixel_exact";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let (width, height) = (256usize, 192usize);
+        let stream = screen_intrabc_stream_with(
+            "testsrc2=size=256x192:rate=25",
+            "45",
+            "1",
+            false,
+            true,
+            &["--cdf-update-mode=0", "--limit=3"],
+        );
+        // Non-vacuity: the fixture must really code the bit on every frame.
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut headers = 0usize;
+        while pos < stream.len() {
+            let Ok(obu) = parser.parse_obu(&stream[pos..]) else {
+                break;
+            };
+            pos += obu.total_size.max(1);
+            let header = match &obu.kind {
+                ObuKind::Frame(h, _) | ObuKind::FrameHeader(h) => h,
+                _ => continue,
+            };
+            assert!(
+                header.disable_cdf_update,
+                "{NAME}: frame {headers} does not carry disable_cdf_update -- aomenc ignored \
+                 --cdf-update-mode=0"
+            );
+            headers += 1;
+        }
+        assert!(headers >= 3, "{NAME}: only {headers} frame headers in the fixture");
+        let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {e}"));
+        let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+        assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
+        for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+            assert!(
+                ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
+                "{NAME}: frame {i} does not match ffmpeg"
+            );
+        }
+        eprintln!("{NAME}: {headers} disable_cdf_update frame headers, all frames sample-exact");
     }
 
     /// lane-kf900 r4, the gate for the two lifted palette refusals ("a 1:4
