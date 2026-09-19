@@ -4,21 +4,19 @@
 //! reconstruction and the loop filter (spec 6, 7, 8; libvpx
 //! `vp9_decodeframe.c`).
 //!
-//! Capability: profile-0 8-bit and profile-2 10-bit 4:2:0 keyframes,
-//! intra-only frames and inter frames (motion compensation, residual
-//! reconstruction, the loop filter and an 8-slot reference DPB). A reference
-//! whose coded size differs from the current frame is scaled during
-//! prediction; profiles 1/3, 12-bit and other subsamplings are refused by
-//! name; `show_existing_frame` returns the buffered reference picture instead
-//! of pretending to decode. Odd coded extents are supported: chroma stores
-//! and crops at `(w + 1) / 2` (`uv_crop_width`), matching libvpx.
+//! Capability: every VP9 profile (0-3), 8/10/12-bit and every coded
+//! subsampling (4:2:0, 4:2:2, 4:4:0, 4:4:4): keyframes, intra-only frames
+//! and inter frames (motion compensation, residual reconstruction, the loop
+//! filter and an 8-slot reference DPB). A reference whose coded size differs
+//! from the current frame is scaled during prediction;
+//! `show_existing_frame` returns the buffered reference picture instead of
+//! pretending to decode. Odd coded extents are supported: chroma stores and
+//! crops at `(w + ss_x) >> ss_x` (`uv_crop_width`), matching libvpx.
 
 use crate::header::{FrameContext, read_compressed_header};
 use crate::intra::build_intra_predictors;
 use crate::loopfilter::LfGrids;
-use crate::mc::{
-    RefPlane, ScaleFactors, average_split_mvs_chroma, build_inter_predictors, split_mv,
-};
+use crate::mc::{RefPlane, ScaleFactors, average_split_mvs, build_inter_predictors};
 use crate::modes::{MiInfo, MiState, read_intra_frame_mode_info};
 use crate::tables::*;
 use crate::tokens::{PlaneContexts, decode_coefs, scan_for};
@@ -33,9 +31,10 @@ const SB_MI: usize = 8; // a 64x64 superblock in mi (8x8) units
 pub struct Picture {
     /// Luma plane, `stride`-spaced rows of `width` samples.
     pub y: Vec<Sample>,
-    /// U (Cb) plane, half resolution.
+    /// U (Cb) plane, chroma resolution (`(width + ss_x) >> ss_x` by
+    /// `(height + ss_y) >> ss_y`).
     pub u: Vec<Sample>,
-    /// V (Cr) plane, half resolution.
+    /// V (Cr) plane, chroma resolution.
     pub v: Vec<Sample>,
     /// Frame width in pixels.
     pub width: u16,
@@ -43,11 +42,17 @@ pub struct Picture {
     pub height: u16,
     /// Luma row pitch of the returned planes (== `width`; the crop packs rows).
     pub stride: usize,
-    /// Chroma row pitch of the returned planes (`(width + 1) / 2`; chroma
-    /// ceils an odd coded width).
+    /// Chroma row pitch of the returned planes (`(width + ss_x) >> ss_x`;
+    /// chroma ceils an odd coded width).
     pub uv_stride: usize,
     /// Bits per sample (8 for profile 0, 10 for profile 2).
     pub bit_depth: u8,
+    /// Chroma horizontal subsampling (`subsampling_x`): 0 for 4:4:4, 1 for
+    /// 4:2:0/4:2:2. Chroma width is `(width + subsampling_x) >> subsampling_x`.
+    pub subsampling_x: u8,
+    /// Chroma vertical subsampling (`subsampling_y`): 0 for 4:4:4/4:2:2, 1
+    /// for 4:2:0/4:4:0.
+    pub subsampling_y: u8,
 }
 
 struct Planes {
@@ -60,6 +65,12 @@ struct Planes {
     ah: usize,
     /// Bits per sample this frame was decoded at.
     bd: u8,
+    /// Chroma horizontal subsampling (`subsampling_x`): 0 for 4:4:4, 1 for
+    /// 4:2:0/4:2:2.
+    ss_x: usize,
+    /// Chroma vertical subsampling (`subsampling_y`): 0 for 4:4:4/4:2:2, 1
+    /// for 4:2:0/4:4:0.
+    ss_y: usize,
 }
 
 impl Planes {
@@ -67,18 +78,22 @@ impl Planes {
     /// neutral grey `1 << (bd - 1)` (`128` at 8-bit, `512` at 10-bit). The
     /// aligned the decode writes real samples into it (blocks at the frame
     /// edge decode at FULL size), so the fill only backs the never-written
-    /// padding past the MI extent.
-    fn new(aw: usize, ah: usize, bd: u8) -> Planes {
+    /// padding past the MI extent. Chroma planes are `aw >> ss_x` by
+    /// `ah >> ss_y`; since `aw`/`ah` are 64-multiples the shift is exact.
+    fn new(aw: usize, ah: usize, bd: u8, ss_x: usize, ss_y: usize) -> Planes {
         let fill = 1u16 << (bd - 1);
+        let (cw, ch) = (aw >> ss_x, ah >> ss_y);
         Planes {
             y: vec![fill; aw * ah],
-            u: vec![fill; aw / 2 * ah / 2],
-            v: vec![fill; aw / 2 * ah / 2],
+            u: vec![fill; cw * ch],
+            v: vec![fill; cw * ch],
             ys: aw,
-            uvs: aw / 2,
+            uvs: cw,
             aw,
             ah,
             bd,
+            ss_x,
+            ss_y,
         }
     }
 
@@ -101,7 +116,7 @@ impl Planes {
         if plane == 0 {
             (self.aw, self.ah)
         } else {
-            (self.aw / 2, self.ah / 2)
+            (self.aw >> self.ss_x, self.ah >> self.ss_y)
         }
     }
 }
@@ -234,25 +249,10 @@ impl Decoder {
                 None => Err(corrupt("show_existing_frame names an empty slot")),
             };
         }
-        if hdr.profile != 0 && hdr.profile != 2 {
-            return Err(Error::unsupported(
-                format!("vp9 profile {}", hdr.profile),
-                "this lane decodes profiles 0 and 2 only (profiles 1 and 3 are 4:4:4)",
-            ));
-        }
-        if hdr.bit_depth != 8 && hdr.bit_depth != 10 {
+        if hdr.bit_depth != 8 && hdr.bit_depth != 10 && hdr.bit_depth != 12 {
             return Err(Error::unsupported(
                 format!("vp9 bit depth {}", hdr.bit_depth),
-                "this lane decodes 8- and 10-bit only (12-bit is not ported)",
-            ));
-        }
-        if hdr.subsampling_x != 1 || hdr.subsampling_y != 1 {
-            return Err(Error::unsupported(
-                "vp9 subsampling",
-                format!(
-                    "this lane decodes 4:2:0 only (subsampling {}/{} at profile {})",
-                    hdr.subsampling_x, hdr.subsampling_y, hdr.profile
-                ),
+                "this lane decodes 8-, 10- and 12-bit only",
             ));
         }
         // One index per decoded frame (the dumps' `frame=` field), so this
@@ -405,16 +405,10 @@ impl Decoder {
             if hdr.show_existing_frame {
                 continue;
             }
-            if hdr.profile != 0 && hdr.profile != 2 {
-                return Err(Error::unsupported(
-                    format!("vp9 profile {}", hdr.profile),
-                    "this lane decodes profiles 0 and 2 only (profiles 1 and 3 are 4:4:4)",
-                ));
-            }
-            if hdr.bit_depth != 8 && hdr.bit_depth != 10 {
+            if hdr.bit_depth != 8 && hdr.bit_depth != 10 && hdr.bit_depth != 12 {
                 return Err(Error::unsupported(
                     format!("vp9 bit depth {}", hdr.bit_depth),
-                    "this lane decodes 8- and 10-bit only (12-bit is not ported)",
+                    "this lane decodes 8-, 10- and 12-bit only",
                 ));
             }
             if hdr.frame_type == FrameType::Key {
@@ -447,6 +441,8 @@ impl Decoder {
         index: usize,
         pixels: bool,
     ) -> Result<Option<Picture>> {
+        let ss_x = hdr.subsampling_x as usize;
+        let ss_y = hdr.subsampling_y as usize;
         // Frame-context bookkeeping (spec 6.2 / libvpx `vp9_decode_frame`):
         // 3 resets every stored context, 2 resets the selected one; 1 means
         // "reset after this frame" and takes no action at frame start.
@@ -479,7 +475,7 @@ impl Decoder {
             let height = hdr.height as usize;
             let aw = width.div_ceil(64) * 64;
             let ah = height.div_ceil(64) * 64;
-            self.planes = Some(Planes::new(aw, ah, hdr.bit_depth));
+            self.planes = Some(Planes::new(aw, ah, hdr.bit_depth, ss_x, ss_y));
         }
 
         let hdr_start = hdr.uncompressed_header_size as usize;
@@ -583,8 +579,8 @@ impl Decoder {
         let aligned_cols = mi_cols.div_ceil(SB_MI) * SB_MI;
         let mut ectx = [
             PlaneContexts::new(aligned_cols * 2),
-            PlaneContexts::new(aligned_cols),
-            PlaneContexts::new(aligned_cols),
+            PlaneContexts::new(aligned_cols * 2),
+            PlaneContexts::new(aligned_cols * 2),
         ];
         ectx.iter_mut().for_each(|p| p.above.fill(0));
         let mut mi = MiState::new(mi_cols, mi_rows);
@@ -681,7 +677,10 @@ impl Decoder {
                 p.uvs,
                 vw,
                 vh,
-                vh / 2,
+                vw >> ss_x,
+                vh >> ss_y,
+                ss_x,
+                ss_y,
                 hdr.loop_filter.sharpness,
                 hdr.bit_depth,
             );
@@ -821,27 +820,36 @@ impl Decoder {
         bw: usize,
         bh: usize,
     ) -> Result<()> {
-        let n4w = plane_n4_w(sb_type, bw);
-        let n4h = plane_n4_h(sb_type, bh);
+        let (ss_x, ss_y) = plane_ss(hdr, 1);
+        let n4w = [
+            plane_n4_w(bw, 0),
+            plane_n4_w(bw, ss_x),
+            plane_n4_w(bw, ss_x),
+        ];
+        let n4h = [
+            plane_n4_h(bh, 0),
+            plane_n4_h(bh, ss_y),
+            plane_n4_h(bh, ss_y),
+        ];
         if info.skip {
             // dec_reset_skip_context
-            reset_skip_context(ectx, row, col, sb_type, n4w, n4h);
+            reset_skip_context(ectx, row, col, sb_type, n4w, n4h, ss_x, ss_y);
             return Ok(());
         }
         let mb_to_right = ((mi.mi_cols as isize - bw as isize - col as isize) * 64) as i32;
         let mb_to_bottom = ((mi.mi_rows as isize - bh as isize - row as isize) * 64) as i32;
         for plane in 0..3usize {
-            let s = usize::from(plane != 0);
+            let (ss_x, ss_y) = plane_ss(hdr, plane);
             let tx_size = if plane == 0 {
                 info.tx_size
             } else {
-                get_uv_tx_size(info.tx_size, sb_type)
+                get_uv_tx_size(info.tx_size, sb_type, ss_x, ss_y)
             };
             let step = 1usize << tx_size;
             let max_blocks_wide =
-                (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+                (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + ss_x))).max(0) as usize;
             let max_blocks_high =
-                (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+                (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
             for brow in (0..max_blocks_high).step_by(step) {
                 for bcol in (0..max_blocks_wide).step_by(step) {
                     let _ = decode_inter_tx_tokens(
@@ -888,10 +896,19 @@ impl Decoder {
         mi: &mut MiState,
         tile_col_start: usize,
     ) -> Result<()> {
+        let (ss_x, ss_y) = plane_ss(hdr, 1);
         let x_mis = bw.min(mi.mi_cols - col);
         let y_mis = bh.min(mi.mi_rows - row);
-        let n4w = plane_n4_w(sb_type, bw);
-        let n4h = plane_n4_h(sb_type, bh);
+        let n4w = [
+            plane_n4_w(bw, 0),
+            plane_n4_w(bw, ss_x),
+            plane_n4_w(bw, ss_x),
+        ];
+        let n4h = [
+            plane_n4_h(bh, 0),
+            plane_n4_h(bh, ss_y),
+            plane_n4_h(bh, ss_y),
+        ];
         let mb_to_right = ((mi.mi_cols as isize - bw as isize - col as isize) * 64) as i32;
         let mb_to_bottom = ((mi.mi_rows as isize - bh as isize - row as isize) * 64) as i32;
 
@@ -930,23 +947,23 @@ impl Decoder {
         // top of `decode_block` (decodeframe.c:960), BEFORE the intra/inter
         // split, so skipped intra blocks inside an inter frame reset too.
         if info.skip {
-            reset_skip_context(ectx, row, col, sb_type, n4w, n4h);
+            reset_skip_context(ectx, row, col, sb_type, n4w, n4h, ss_x, ss_y);
         }
 
         if !info.is_inter {
             // `predict_and_reconstruct_intra_block` per transform block.
             for plane in 0..3usize {
-                let s = usize::from(plane != 0);
+                let (ss_x, ss_y) = plane_ss(hdr, plane);
                 let tx_size = if plane == 0 {
                     info.tx_size
                 } else {
-                    get_uv_tx_size(info.tx_size, sb_type)
+                    get_uv_tx_size(info.tx_size, sb_type, ss_x, ss_y)
                 };
                 let step = 1usize << tx_size;
                 let max_blocks_wide =
-                    (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+                    (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + ss_x))).max(0) as usize;
                 let max_blocks_high =
-                    (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+                    (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
                 for brow in (0..max_blocks_high).step_by(step) {
                     for bcol in (0..max_blocks_wide).step_by(step) {
                         self.predict_and_reconstruct(
@@ -1010,17 +1027,17 @@ impl Decoder {
         // Reconstruction: `reconstruct_inter_block` per transform block.
         let mut eobtotal = 0usize;
         for plane in 0..3usize {
-            let s = usize::from(plane != 0);
+            let (ss_x, ss_y) = plane_ss(hdr, plane);
             let tx_size = if plane == 0 {
                 info.tx_size
             } else {
-                get_uv_tx_size(info.tx_size, sb_type)
+                get_uv_tx_size(info.tx_size, sb_type, ss_x, ss_y)
             };
             let step = 1usize << tx_size;
             let max_blocks_wide =
-                (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+                (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + ss_x))).max(0) as usize;
             let max_blocks_high =
-                (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+                (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
             for brow in (0..max_blocks_high).step_by(step) {
                 for bcol in (0..max_blocks_wide).step_by(step) {
                     let coef = decode_inter_tx_tokens(
@@ -1051,8 +1068,8 @@ impl Decoder {
                     let planes = self.planes.as_mut().expect("frame scratch");
                     let stride = planes.dims(plane).0;
                     let bd = planes.bd;
-                    let x0 = ((col * 8) >> s) + bcol * 4;
-                    let y0 = ((row * 8) >> s) + brow * 4;
+                    let x0 = ((col * 8) >> ss_x) + bcol * 4;
+                    let y0 = ((row * 8) >> ss_y) + brow * 4;
                     let dst_off = y0 * stride + x0;
                     let (data, _) = planes.plane(plane);
                     inverse_transform_add(
@@ -1082,6 +1099,8 @@ impl Decoder {
     }
 
     fn decode_keyframe(&mut self, hdr: &FrameHeader, frame: &[u8], tx_mode: u8) -> Result<Picture> {
+        let ss_x = hdr.subsampling_x as usize;
+        let ss_y = hdr.subsampling_y as usize;
         let width = hdr.width as usize;
         let height = hdr.height as usize;
         // The decode buffer is padded to whole superblocks: libvpx decodes a
@@ -1092,7 +1111,7 @@ impl Decoder {
         // mi_row 132 writes 8 rows past a 1080-row buffer).
         let aw = width.div_ceil(64) * 64;
         let ah = height.div_ceil(64) * 64;
-        self.planes = Some(Planes::new(aw, ah, hdr.bit_depth));
+        self.planes = Some(Planes::new(aw, ah, hdr.bit_depth, ss_x, ss_y));
         let tail_start = std::env::var("EC_VP9_FORCE_TAIL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1109,6 +1128,8 @@ impl Decoder {
         tx_mode: u8,
         tail: &[u8],
     ) -> Result<Picture> {
+        let ss_x = hdr.subsampling_x as usize;
+        let ss_y = hdr.subsampling_y as usize;
         let mi_cols = hdr.mi_cols() as usize;
         let mi_rows = hdr.mi_rows() as usize;
         let sb64_cols = mi_cols.div_ceil(SB_MI);
@@ -1171,8 +1192,8 @@ impl Decoder {
         let aligned_cols = mi_cols.div_ceil(SB_MI) * SB_MI;
         let mut ectx = [
             PlaneContexts::new(aligned_cols * 2),
-            PlaneContexts::new(aligned_cols),
-            PlaneContexts::new(aligned_cols),
+            PlaneContexts::new(aligned_cols * 2),
+            PlaneContexts::new(aligned_cols * 2),
         ];
         ectx.iter_mut().for_each(|p| p.above.fill(0));
         let mut mi = MiState::new(mi_cols, mi_rows);
@@ -1248,7 +1269,10 @@ impl Decoder {
                 p.uvs,
                 vw,
                 vh,
-                vh / 2,
+                vw >> ss_x,
+                vh >> ss_y,
+                ss_x,
+                ss_y,
                 hdr.loop_filter.sharpness,
                 hdr.bit_depth,
             );
@@ -1466,6 +1490,21 @@ impl Decoder {
         let x_mis = bw.min(mi.mi_cols - col);
         let y_mis = bh.min(mi.mi_rows - row);
 
+        // `decode_block` (decodeframe.c:942): a block size that does not
+        // exist once subsampled (`BLOCK_8X4` under 4:4:0, `BLOCK_4X8` under
+        // 4:2:2) is a corrupt frame. Sub-8x8 sizes have no `ss_size_lookup`
+        // row to check and are exempt.
+        if sb_type >= 3 && (hdr.subsampling_x != 0 || hdr.subsampling_y != 0) {
+            ensure(
+                ss_size(
+                    sb_type,
+                    hdr.subsampling_x as usize,
+                    hdr.subsampling_y as usize,
+                ) != BLOCK_INVALID,
+                "invalid block size for the chroma subsampling",
+            )?;
+        }
+
         // `frame_is_intra_only` (onyxc_int.h:363): a keyframe OR an
         // intra-only frame walks the intra mode-info path.
         let intra_frame = hdr.frame_type == FrameType::Key || hdr.intra_only;
@@ -1546,16 +1585,17 @@ impl Decoder {
         // Per-plane 4x4 counts. Sub-8x8 shapes still occupy the WHOLE 8x8
         // mi area (libvpx set_plane_n4 with bw=bh=1): luma walks 2x2 4x4
         // TUs, chroma is one 4x4 (n4 >> subsampling), coded once per 8x8.
-        let n4w = if sb_type < 3 {
-            [2, 1, 1]
-        } else {
-            [bw * 2, bw, bw]
-        };
-        let n4h = if sb_type < 3 {
-            [2, 1, 1]
-        } else {
-            [bh * 2, bh, bh]
-        };
+        let (ss_x, ss_y) = plane_ss(hdr, 1);
+        let n4w = [
+            plane_n4_w(bw, 0),
+            plane_n4_w(bw, ss_x),
+            plane_n4_w(bw, ss_x),
+        ];
+        let n4h = [
+            plane_n4_h(bh, 0),
+            plane_n4_h(bh, ss_y),
+            plane_n4_h(bh, ss_y),
+        ];
         let mb_to_right = ((mi.mi_cols as isize - bw as isize - col as isize) * 64) as i32;
         let mb_to_bottom = ((mi.mi_rows as isize - bh as isize - row as isize) * 64) as i32;
 
@@ -1575,13 +1615,13 @@ impl Decoder {
 
         if info.skip {
             for plane in 0..3usize {
-                let s = usize::from(plane != 0);
-                let offx = (col << 1) >> s;
-                let offy = (row << 1) >> s;
+                let (sx, sy) = if plane == 0 { (0, 0) } else { (ss_x, ss_y) };
+                let offx = (col << 1) >> sx;
+                let offy = (row << 1) >> sy;
                 for i in 0..n4w[plane] {
                     ectx[plane].above[offx + i] = 0;
                 }
-                let lrows = 32usize >> s;
+                let lrows = 32usize >> sy;
                 for i in 0..n4h[plane].min(lrows) {
                     ectx[plane].left[(offy + i) % lrows] = 0;
                 }
@@ -1589,17 +1629,17 @@ impl Decoder {
         }
 
         for plane in 0..3usize {
-            let s = usize::from(plane != 0);
+            let (ss_x, ss_y) = plane_ss(hdr, plane);
             let tx_size = if plane == 0 {
                 info.tx_size
             } else {
-                get_uv_tx_size(info.tx_size, sb_type)
+                get_uv_tx_size(info.tx_size, sb_type, ss_x, ss_y)
             };
             let step = 1usize << tx_size;
             let max_blocks_wide =
-                (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
+                (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + ss_x))).max(0) as usize;
             let max_blocks_high =
-                (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+                (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
             for brow in (0..max_blocks_high).step_by(step) {
                 for bcol in (0..max_blocks_wide).step_by(step) {
                     self.predict_and_reconstruct(
@@ -1656,7 +1696,7 @@ impl Decoder {
         mb_to_bottom: i32,
         tile_col_start: usize,
     ) -> Result<()> {
-        let s = usize::from(plane != 0);
+        let (ss_x, ss_y) = plane_ss(hdr, plane);
         let mode = if plane == 0 {
             if sb_type < 3 {
                 info.bmi[(tx_row << 1) + tx_col]
@@ -1670,8 +1710,8 @@ impl Decoder {
         let stride = planes.dims(plane).0;
         let bd = planes.bd;
         let bs = 4 << tx_size;
-        let x0 = ((mi_col * 8) >> s) + tx_col * 4;
-        let y0 = ((mi_row * 8) >> s) + tx_row * 4;
+        let x0 = ((mi_col * 8) >> ss_x) + tx_col * 4;
+        let y0 = ((mi_row * 8) >> ss_y) + tx_row * 4;
         // vp9_predict_intra_block `have_top = loff || (xd->above_mi != NULL)`
         // (vp9_reconintra.c:411); `above_mi` is FRAME-gated
         // (`set_mi_row_col`, vp9_onyxc_int.h:430: `mi_row != 0`), NOT
@@ -1683,15 +1723,15 @@ impl Decoder {
         // last tx column of ITS OWN block (pd->n4_w units) — above-right
         // past the block's right edge belongs to a not-yet-decoded
         // neighbour, so it must stage as unavailable.
-        let rgt = tx_col + (1usize << tx_size) < bw * 2 >> s;
+        let rgt = tx_col + (1usize << tx_size) < bw * 2 >> ss_x;
 
         // `xd->cur_buf->y_width/y_height` (vp9_reconintra.c:288-292) are the
         // MI-ALIGNED (8-multiple) buffer extent, not the visible coded size:
         // confirmed by instrumenting the oracle's staging for a 320x242 frame
         // (`fh=248`, not 242). The extend-vs-direct DECISION is `mb_to_*_edge`
         // (`:302/326/354`, passed in as `bot_ext`/`right_ext`).
-        let vw = (hdr.mi_cols() as usize * 8) >> s;
-        let vh = (hdr.mi_rows() as usize * 8) >> s;
+        let vw = (hdr.mi_cols() as usize * 8) >> ss_x;
+        let vh = (hdr.mi_rows() as usize * 8) >> ss_y;
 
         // 1. Intra prediction (reads reconstructed neighbours).
         {
@@ -1733,9 +1773,9 @@ impl Decoder {
             [q.chroma_dc, q.chroma_ac]
         };
         let ptype = usize::from(plane != 0);
-        let ax = ((mi_col << 1) >> s) + tx_col;
-        let lrows = 32usize >> s;
-        let ay = (((mi_row << 1) >> s) + tx_row) % lrows;
+        let ax = ((mi_col << 1) >> ss_x) + tx_col;
+        let lrows = 32usize >> ss_y;
+        let ay = (((mi_row << 1) >> ss_y) + tx_row) % lrows;
         // libvpx reads the context as !!*(uintN_t *)a / l over the WHOLE
         // tx-block span (uint16 for 8x8, uint32 for 16x16, uint64 for
         // 32x32), not just the first entry.
@@ -1783,10 +1823,10 @@ impl Decoder {
         );
 
         // 3. Context write-back (vp9_decode_block_tokens, v1.15 shifts).
-        let n4w = bw * 2 >> s;
-        let n4h = bh * 2 >> s;
-        let maxw = (n4w as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
-        let maxh = (n4h as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+        let n4w = bw * 2 >> ss_x;
+        let n4h = bh * 2 >> ss_y;
+        let maxw = (n4w as i32 + (mb_to_right.min(0) >> (5 + ss_x))).max(0) as usize;
+        let maxh = (n4h as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
         let nblocks = 1usize << tx_size;
         let shift_a = if maxw > 0 && nblocks + tx_col > maxw {
             (nblocks - (maxw - tx_col)) * 8
@@ -1885,9 +1925,11 @@ fn crop_picture(planes: &Planes, width: u16, height: u16) -> Picture {
         }
         out
     };
-    // Chroma CEILS: the 4:2:0 plane of an odd extent carries one extra
-    // half-sample column/row (`uv_crop_width = (w + 1) / 2`).
-    let (cw, chh) = ((w + 1) / 2, (h + 1) / 2);
+    // Chroma CEILS: a subsampled plane of an odd extent carries one extra
+    // half-sample column/row (`uv_crop_width = (w + ss_x) >> ss_x`). Under
+    // 4:4:4 the chroma plane is the full luma extent.
+    let (sx, sy) = (planes.ss_x, planes.ss_y);
+    let (cw, chh) = ((w + sx) >> sx, (h + sy) >> sy);
     Picture {
         y: crop(&planes.y, planes.ys, w, h),
         u: crop(&planes.u, planes.uvs, cw, chh),
@@ -1897,30 +1939,36 @@ fn crop_picture(planes: &Planes, width: u16, height: u16) -> Picture {
         stride: w,
         uv_stride: cw,
         bit_depth: planes.bd,
+        subsampling_x: sx as u8,
+        subsampling_y: sy as u8,
+    }
+}
+
+/// `(ss_x, ss_y)` of a plane: luma is always full-resolution.
+#[inline]
+fn plane_ss(hdr: &FrameHeader, plane: usize) -> (usize, usize) {
+    if plane == 0 {
+        (0, 0)
+    } else {
+        (hdr.subsampling_x as usize, hdr.subsampling_y as usize)
     }
 }
 
 /// `pd->n4_w` (`set_plane_n4`, decodeframe.c:809): the plane block's width in
-/// its own 4x4 units. Sub-8x8 shapes occupy a whole 8x8 mi cell
-/// (`set_plane_n4(xd, bw=1, bh=1)`) so luma walks 2x2 and chroma 1x1.
-fn plane_n4_w(sb_type: usize, bw: usize) -> [usize; 3] {
-    if sb_type < 3 {
-        [2, 1, 1]
-    } else {
-        [bw * 2, bw, bw]
-    }
+/// its own 4x4 units, `(bw << 1) >> ss_x`. Sub-8x8 shapes occupy a whole 8x8
+/// mi cell (`set_plane_n4(xd, bw=1, bh=1)`), so luma walks 2x2 and chroma
+/// `(2 >> ss_x)` wide.
+fn plane_n4_w(bw: usize, ss_x: usize) -> usize {
+    (bw << 1) >> ss_x
 }
 
 /// `pd->n4_h`, the height twin of [`plane_n4_w`].
-fn plane_n4_h(sb_type: usize, bh: usize) -> [usize; 3] {
-    if sb_type < 3 {
-        [2, 1, 1]
-    } else {
-        [bh * 2, bh, bh]
-    }
+fn plane_n4_h(bh: usize, ss_y: usize) -> usize {
+    (bh << 1) >> ss_y
 }
 
 /// `dec_reset_skip_context` (`vp9_decodeframe.c:800`).
+#[allow(clippy::too_many_arguments)]
 fn reset_skip_context(
     ectx: &mut [PlaneContexts; 3],
     row: usize,
@@ -1928,16 +1976,18 @@ fn reset_skip_context(
     sb_type: usize,
     n4w: [usize; 3],
     n4h: [usize; 3],
+    ss_x: usize,
+    ss_y: usize,
 ) {
     let _ = sb_type;
     for plane in 0..3usize {
-        let s = usize::from(plane != 0);
-        let offx = (col << 1) >> s;
-        let offy = (row << 1) >> s;
+        let (sx, sy) = if plane == 0 { (0, 0) } else { (ss_x, ss_y) };
+        let offx = (col << 1) >> sx;
+        let offy = (row << 1) >> sy;
         for i in 0..n4w[plane] {
             ectx[plane].above[offx + i] = 0;
         }
-        let lrows = 32usize >> s;
+        let lrows = 32usize >> sy;
         for i in 0..n4h[plane].min(lrows) {
             ectx[plane].left[(offy + i) % lrows] = 0;
         }
@@ -1948,10 +1998,10 @@ fn reset_skip_context(
         // block), not the whole rolling buffer from base index 0.
         let mut line = format!("TDK row={row} col={col} n4w={n4w:?} n4h={n4h:?}");
         for plane in 0..3usize {
-            let s = usize::from(plane != 0);
-            let offx = (col << 1) >> s;
-            let offy = (row << 1) >> s;
-            let lrows = 32usize >> s;
+            let (sx, sy) = if plane == 0 { (0, 0) } else { (ss_x, ss_y) };
+            let offx = (col << 1) >> sx;
+            let offy = (row << 1) >> sy;
+            let lrows = 32usize >> sy;
             let a: Vec<u8> = (0..n4w[plane])
                 .map(|i| ectx[plane].above[offx + i])
                 .collect();
@@ -2031,7 +2081,7 @@ fn decode_inter_tx_tokens(
     mb_to_right: i32,
     mb_to_bottom: i32,
 ) -> crate::tokens::CoeffBlock {
-    let s = usize::from(plane != 0);
+    let (ss_x, ss_y) = plane_ss(hdr, plane);
     // `predict_and_reconstruct_intra_block` (decodeframe.c:320-345): the luma
     // mode of a sub-8x8 block is the SUB-BLOCK's, and an intra block inside an
     // inter frame picks its tx type from that mode — `reconstruct_inter_block`
@@ -2054,9 +2104,9 @@ fn decode_inter_tx_tokens(
         [q.chroma_dc, q.chroma_ac]
     };
     let ptype = usize::from(plane != 0);
-    let ax = ((col << 1) >> s) + bcol;
-    let lrows = 32usize >> s;
-    let ay = (((row << 1) >> s) + brow) % lrows;
+    let ax = ((col << 1) >> ss_x) + bcol;
+    let lrows = 32usize >> ss_y;
+    let ay = (((row << 1) >> ss_y) + brow) % lrows;
     let nblocks = 1usize << tx_size;
     let ctx_in = usize::from(ectx[plane].above[ax..ax + nblocks].iter().any(|&v| v != 0))
         + usize::from(ectx[plane].left[ay..ay + nblocks].iter().any(|&v| v != 0));
@@ -2084,10 +2134,10 @@ fn decode_inter_tx_tokens(
         plane,
     );
     // vp9_decode_block_tokens context write-back (v1.15 edge shifts).
-    let n4w_s = bw * 2 >> s;
-    let n4h_s = bh * 2 >> s;
-    let maxw = (n4w_s as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
-    let maxh = (n4h_s as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
+    let n4w_s = bw * 2 >> ss_x;
+    let n4h_s = bh * 2 >> ss_y;
+    let maxw = (n4w_s as i32 + (mb_to_right.min(0) >> (5 + ss_x))).max(0) as usize;
+    let maxh = (n4h_s as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
     let shift_a = if maxw > 0 && nblocks + bcol > maxw {
         (nblocks - (maxw - bcol)) * 8
     } else {
@@ -2132,9 +2182,7 @@ fn inter_predict_plane(
     mb_to_bottom: i32,
     sb_type: usize,
 ) -> Result<()> {
-    let s = usize::from(plane != 0);
-    let ss_x = s;
-    let ss_y = s;
+    let (ss_x, ss_y) = plane_ss(hdr, plane);
     let pw = n4w[plane] * 4;
     let ph = n4h[plane] * 4;
     let mb_left = -((col as i32) * 64);
@@ -2179,27 +2227,24 @@ fn inter_predict_plane(
             // plain `>> 1` is one short whenever the coded extent is odd and
             // the predictor's border/inside test then clips the last chroma
             // column (or row).
-            width: (ref_frame.width as usize + s) >> s,
-            height: (ref_frame.height as usize + s) >> s,
+            width: (ref_frame.width as usize + ss_x) >> ss_x,
+            height: (ref_frame.height as usize + ss_y) >> ss_y,
             bd: ref_frame.planes.bd,
         };
         if sb_type < 3 {
             // libvpx builds one 4x4 prediction per sub-block, with the MV from
-            // `average_split_mvs` (luma: the sub-block's own MV; 4:2:0 chroma:
-            // the q4-rounded average of the four).
+            // `average_split_mvs` selected by subsampling: luma and 4:4:4
+            // chroma take the sub-block's own MV, 4:4:0 averages the vertical
+            // pair, 4:2:2 the horizontal pair, 4:2:0 all four (q4).
             let n4x = n4w[plane];
             let n4y = n4h[plane];
             for y in 0..n4y {
                 for xx in 0..n4x {
                     let i = y * n4x + xx;
-                    let mv = if plane == 0 {
-                        split_mv(&info.bmi_mv, i, rf)
-                    } else {
-                        average_split_mvs_chroma(&info.bmi_mv, rf)
-                    };
+                    let mv = average_split_mvs(&info.bmi_mv, rf, i, ss_x, ss_y);
                     let (data, _) = planes.plane(plane);
                     let dst_off =
-                        (((row * 8) >> s) + y * 4) * dst_stride + ((col * 8) >> s) + xx * 4;
+                        (((row * 8) >> ss_y) + y * 4) * dst_stride + ((col * 8) >> ss_x) + xx * 4;
                     build_inter_predictors(
                         &mut data[dst_off..],
                         dst_stride,
@@ -2227,7 +2272,7 @@ fn inter_predict_plane(
             }
         } else {
             let (data, _) = planes.plane(plane);
-            let dst_off = ((row * 8) >> s) * dst_stride + ((col * 8) >> s);
+            let dst_off = ((row * 8) >> ss_y) * dst_stride + ((col * 8) >> ss_x);
             build_inter_predictors(
                 &mut data[dst_off..],
                 dst_stride,

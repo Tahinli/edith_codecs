@@ -51,11 +51,7 @@ pub(crate) const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4
 /// blockd.h `get_y_mode`.
 #[inline]
 pub(crate) fn get_y_mode(sb_type: usize, bmi: [u8; 4], mode: u8, block: usize) -> u8 {
-    if sb_type < 3 {
-        bmi[block]
-    } else {
-        mode
-    }
+    if sb_type < 3 { bmi[block] } else { mode }
 }
 
 /// vp9_blockd.c `vp9_above_block_mode` (keyframes: neighbours are intra).
@@ -107,20 +103,22 @@ pub(crate) fn kf_uv_probs(mode: u8) -> [u8; 9] {
     out
 }
 
-/// common_data.c `ss_size_lookup[bsize][1][1]`.
+/// `BLOCK_INVALID`, the `ss_size_lookup` sentinel for a subsampled block size
+/// that does not exist (`BLOCK_8X4` under 4:4:0, `BLOCK_4X8` under 4:2:2).
+pub(crate) const BLOCK_INVALID: usize = 255;
+
+/// common_data.c `ss_size_lookup[bsize][ss_x][ss_y]`: the luma block size
+/// `bsize` expressed in a plane subsampled by `ss_x`/`ss_y`.
 #[inline]
-pub(crate) fn ss_size(bsize: usize) -> usize {
-    SS_SIZE_LOOKUP[bsize * 4 + 3] as usize
+pub(crate) fn ss_size(bsize: usize, ss_x: usize, ss_y: usize) -> usize {
+    SS_SIZE_LOOKUP[bsize * 4 + ss_x * 2 + ss_y] as usize
 }
 
-/// blockd.h `get_uv_tx_size` for 4:2:0.
+/// blockd.h `get_uv_tx_size`:
+/// `uv_txsize_lookup[mi->sb_type][mi->tx_size][ss_x][ss_y]`.
 #[inline]
-pub(crate) fn get_uv_tx_size(mi_tx_size: usize, sb_type: usize) -> usize {
-    if sb_type < 3 {
-        TX_4X4
-    } else {
-        mi_tx_size.min(MAX_TXSIZE_LOOKUP[ss_size(sb_type)] as usize)
-    }
+pub(crate) fn get_uv_tx_size(mi_tx_size: usize, sb_type: usize, ss_x: usize, ss_y: usize) -> usize {
+    UV_TXSIZE_LOOKUP[((sb_type * 4 + mi_tx_size) * 2 + ss_x) * 2 + ss_y] as usize
 }
 
 pub(crate) fn corrupt(what: impl Into<String>) -> Error {
@@ -128,9 +126,5 @@ pub(crate) fn corrupt(what: impl Into<String>) -> Error {
 }
 
 pub(crate) fn ensure(cond: bool, what: &str) -> Result<()> {
-    if cond {
-        Ok(())
-    } else {
-        Err(corrupt(what))
-    }
+    if cond { Ok(()) } else { Err(corrupt(what)) }
 }
