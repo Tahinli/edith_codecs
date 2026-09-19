@@ -1675,7 +1675,6 @@ impl Decoder {
         let maxw = (n4w as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
         let maxh = (n4h as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
         let nblocks = 1usize << tx_size;
-        let eob_pos = usize::from(coef.eob > 0);
         let shift_a = if maxw > 0 && nblocks + tx_col > maxw {
             (nblocks - (maxw - tx_col)) * 8
         } else {
@@ -1686,35 +1685,16 @@ impl Decoder {
         } else {
             0
         };
-        match tx_size {
-            TX_4X4 => {
-                ectx[plane].above[ax] = eob_pos as u8;
-                ectx[plane].left[ay] = eob_pos as u8;
-            }
-            TX_8X8 => {
-                let va = ((eob_pos as u16) * 0x0101) >> shift_a;
-                ectx[plane].above[ax] = va as u8;
-                ectx[plane].above[ax + 1] = (va >> 8) as u8;
-                let vl = ((eob_pos as u16) * 0x0101) >> shift_l;
-                ectx[plane].left[ay] = vl as u8;
-                ectx[plane].left[ay + 1] = (vl >> 8) as u8;
-            }
-            TX_16X16 => {
-                for k in 0..4 {
-                    let va = ((eob_pos as u32) * 0x01010101) >> shift_a;
-                    ectx[plane].above[ax + k] = (va >> (8 * k)) as u8;
-                    let vl = ((eob_pos as u32) * 0x01010101) >> shift_l;
-                    ectx[plane].left[ay + k] = (vl >> (8 * k)) as u8;
-                }
-            }
-            _ => {
-                for k in 0..8 {
-                    let va = ((eob_pos as u64) * 0x0101010101010101) >> shift_a;
-                    ectx[plane].above[ax + k] = (va >> (8 * k)) as u8;
-                    let vl = ((eob_pos as u64) * 0x0101010101010101) >> shift_l;
-                    ectx[plane].left[ay + k] = (vl >> (8 * k)) as u8;
-                }
-            }
+        write_tx_context(ectx, plane, tx_size, ax, ay, coef.eob > 0, shift_a, shift_l);
+        if crate::tokdbg_enabled() {
+            eprintln!(
+                "TDW row={mi_row} col={mi_col} plane={plane} brow={tx_row} bcol={tx_col} tx={tx_size} eob={} sa={} sl={} aw={:?} lw={:?} intra=1",
+                coef.eob,
+                shift_a,
+                shift_l,
+                &ectx[plane].above[ax..ax + nblocks],
+                &ectx[plane].left[ay..ay + nblocks],
+            );
         }
 
         // 4. Residual add.
@@ -1847,6 +1827,59 @@ fn reset_skip_context(
             ectx[plane].left[(offy + i) % lrows] = 0;
         }
     }
+    if crate::tokdbg_enabled() {
+        // Mirror the oracle's `SKIPCTX` print: the CLEARED window, indexed from
+        // the reset offset (libvpx's `left_context` is already offset to the
+        // block), not the whole rolling buffer from base index 0.
+        let mut line = format!("TDK row={row} col={col} n4w={n4w:?} n4h={n4h:?}");
+        for plane in 0..3usize {
+            let s = usize::from(plane != 0);
+            let offx = (col << 1) >> s;
+            let offy = (row << 1) >> s;
+            let lrows = 32usize >> s;
+            let a: Vec<u8> = (0..n4w[plane]).map(|i| ectx[plane].above[offx + i]).collect();
+            let l: Vec<u8> = (0..n4h[plane].min(lrows))
+                .map(|i| ectx[plane].left[(offy + i) % lrows])
+                .collect();
+            line.push_str(&format!(" p{plane} a={a:?} l={l:?}"));
+        }
+        eprintln!("{line}");
+    }
+}
+
+/// The entropy-context write-back of one transform block
+/// (`vp9_decode_block_tokens`, `vp9_detokenize.c:273-323`): the block's
+/// `eob` spreads over its `1 << tx_size` 4x4 slots, and `shift_a`/`shift_l`
+/// (the `get_ctx_shift` frame-edge rule) zero the slots past the frame edge.
+///
+/// libvpx applies the shift to a value whose WIDTH IS THE WINDOW'S — a
+/// `(uint16_t)` for `TX_8X8`, `(uint32_t)` for `TX_16X16`, `(uint64_t)` for
+/// `TX_32X32` — so the shift zeroes the window's TAIL. Shifting a 64-bit
+/// spread instead only zeroes bytes past the window and leaves the in-window
+/// tail set: the last-SB-row chroma blocks then hand a stale 1 to the next
+/// row's context read (the frame-72 desync).
+fn write_tx_context(
+    ectx: &mut [PlaneContexts; 3],
+    plane: usize,
+    tx_size: usize,
+    ax: usize,
+    ay: usize,
+    eob: bool,
+    shift_a: usize,
+    shift_l: usize,
+) {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let nblocks = 1usize << tx_size;
+    let eob_pos = u64::from(eob);
+    // Narrow to the window first (libvpx's cast), then apply the edge shift;
+    // the clamp keeps a fully-outside window (libvpx: undefined shift) total.
+    let narrow = 64 - 8 * nblocks;
+    let spread_a = ((eob_pos * ONES) >> narrow) >> shift_a.min(8 * nblocks);
+    let spread_l = ((eob_pos * ONES) >> narrow) >> shift_l.min(8 * nblocks);
+    for k in 0..nblocks {
+        ectx[plane].above[ax + k] = (spread_a >> (8 * k)) as u8;
+        ectx[plane].left[ay + k] = (spread_l >> (8 * k)) as u8;
+    }
 }
 
 /// `mode_lf_lut` (`vp9/common/vp9_loopfilter.c:223`):
@@ -1937,7 +1970,6 @@ fn decode_inter_tx_tokens(
     let n4h_s = bh * 2 >> s;
     let maxw = (n4w_s as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
     let maxh = (n4h_s as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
-    let eob_pos = u64::from(coef.eob > 0);
     let shift_a = if maxw > 0 && nblocks + bcol > maxw {
         (nblocks - (maxw - bcol)) * 8
     } else {
@@ -1948,11 +1980,16 @@ fn decode_inter_tx_tokens(
     } else {
         0
     };
-    let spread_a = (eob_pos * 0x0101_0101_0101_0101) >> shift_a;
-    let spread_l = (eob_pos * 0x0101_0101_0101_0101) >> shift_l;
-    for k in 0..nblocks {
-        ectx[plane].above[ax + k] = (spread_a >> (8 * k)) as u8;
-        ectx[plane].left[ay + k] = (spread_l >> (8 * k)) as u8;
+    write_tx_context(ectx, plane, tx_size, ax, ay, coef.eob > 0, shift_a, shift_l);
+    if crate::tokdbg_enabled() {
+        eprintln!(
+            "TDW row={row} col={col} plane={plane} brow={brow} bcol={bcol} tx={tx_size} eob={} sa={} sl={} aw={:?} lw={:?}",
+            coef.eob,
+            shift_a,
+            shift_l,
+            &ectx[plane].above[ax..ax + nblocks],
+            &ectx[plane].left[ay..ay + nblocks],
+        );
     }
     coef
 }
