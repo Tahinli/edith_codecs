@@ -34,8 +34,11 @@ an inter frame that inherits the odd size) reproduces it:
       reference chroma planes of an odd-sized frame are stored at floor(w/2)
       but the predictor reads libvpx's uv_crop_width = (w+1)/2)
 
-That string is gone after the fix (step: rerun the same command; frame 1 now
-decodes).
+After the fix the named ODD-DIMS refusal is gone. This particular fixture does
+not then decode cleanly, because its frame 1 is genuinely corrupt: libvpx itself
+reports `Corrupt frame detected` on it (see Deferred). So the fixture witnesses
+only the removal of the refusal; the permanent odd witness generates its own
+valid odd stream instead.
 
 ## Root cause
 
