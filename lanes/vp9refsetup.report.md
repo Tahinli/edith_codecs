@@ -165,3 +165,94 @@ crate-level `drv_pix3` comparison in gate 3.
   passed.
 * corpus sweep above — 8 streams IDENTICAL.
 * base-worktree fail-pre-fix — 3 failures with the named refusals.
+
+## MERGE-SIDE FOLLOW-UPS (2026-09-19)
+
+- **Doc nit dropped on the lane before the merge** (commit `2129be51`): the
+  "`scale=...:eval=frame` exits 139 with a 0-byte file (ffmpeg 8.1.2)" sentence
+  is gone from this report and from `scaledref_exact.rs`. The reviewer cannot
+  reproduce the exit-139 shape; the builder can — environment-dependent, so it
+  is not load-bearing. Kept: ffmpeg's rawvideo output size is locked to the
+  first decoded frame, hence the two-pass dump recipe (frame 0 alone with
+  `-frames:v 1`, frames 2..N with `select=gte(n,1)`).
+- **Merge**: `33904e74` — parents `ccc5a836` (main) and `2129be51` (lane), so a
+  real merge, not a fast-forward. Between this lane's base `79984549` and the
+  merge, main absorbed `lane-vp9-hbd`, which converted every ec-vp9 plane to
+  `u16` (`ec_vp9::Sample`) and threaded `bd` through every pixel kernel. The
+  lane wrote its scaling against the u8 kernels, so the merge was resolved by
+  porting the lane's semantics onto the u16 substrate.
+- **Conflict regions and resolution** (both sides read from the index `:2:`/`:3:`;
+  the working-tree markers elide lines):
+  - `crates/ec-vp9/src/decode.rs` — one conflict, the capability doc block.
+    Combined: both the profile-2 10-bit clause and the intra-only /
+    scaled-reference clauses in one paragraph. The auto-merged remainder was
+    verified by diff: everything the lane changed (intra-only dispatch +
+    `decode_intra_only_frame`, `frame_is_intra_only` routing in `decode_block`,
+    `ScaleFactors::setup` + `valid_ref_frame_size` refusal, the removed
+    size-change refusal) is present; the only deltas vs the lane side are
+    u16/`bd`/profile-2 mechanics.
+  - `crates/ec-vp9/src/mc.rs` — four conflicts (the two 1D convolve calls in
+    `inter_predictor`, the `convolve_vert` call inside the avg branch, and the
+    `build_inter_predictors` signature + coordinate head). Resolved by
+    COMBINING: main's `Sample`/`bd` kernels stay the substrate and the lane's
+    scaling is ported onto them —
+    `convolve_horiz(.., x0_q4, x_step, w, rows, avg, bd)`,
+    `convolve_vert(.., y0_q4, y_step, w, h, avg, bd)` (both default
+    `SUBPEL_SHIFTS`), the scaled dispatch at the top of `inter_predictor`, the
+    lane's extracted `convolve_2d` ported to `Sample` + `bd`, and `sf:
+    &ScaleFactors` in `build_inter_predictors` with the lane's scaled
+    block/MV mapping. The scale arithmetic (`scale_value`,
+    `vp9_scale_mv`, step derivation) is depth-independent and kept verbatim.
+    Because both sides rewrote these functions, the file was re-composed rather
+    than marker-resolved; the result was proof-read in both directions
+    (`diff` vs each side shows only the other side's delta).
+  - `crates/ec-vp9/src/header.rs` — clean auto-merge (`use_key_partition`).
+  - `crates/ec-vp9/tests/{intraonly,scaledref}_exact.rs` — not a git conflict,
+    but the lane's u8-era comparison had to be re-expressed: the pictures are
+    `Vec<Sample>` (u16) now, so the byte comparison goes through
+    `got.extend(pic.y.iter().map(|&v| v as u8))` (the crate's convention in
+    `odd_dimensions_exact.rs` / `inter_pixels_exact.rs`).
+- **Create-list audit**: exactly the expected creates — the three TRACKED
+  fixtures under `crates/ec-vp9/tests/data/` (they are committed, not
+  gitignored, so no fixture-copy step), `intraonly_exact.rs`,
+  `scaledref_exact.rs`, this report, `lanes/vp9refsetup/gen_intraonly.py` and
+  `gen_scaledref.c`. No junk files, no target artifacts.
+- **Gates on the MERGED tree** (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-vp9refmerge`):
+  `cargo test -p ec-vp9` → **25 binaries, 40 passed / 0 failed / 0 ignored**;
+  the non-skipped named gates: `scaledref_exact` 2/2, `intraonly_exact` 1/1,
+  `odd_dimensions_exact` 3/3, `hbd_exact` 2/2, `inter_pixels_exact` 3/3,
+  `keyframe_exact` 4/4, lib 9/9. Warning parity:
+  `cargo check -p ec-vp9 --all-targets` → exactly the 5 pre-existing
+  (`TM_PRED`, `read_partition`, `partition_probs`, `x_mis`, `y_mis`). No crate
+  in the repo depends on `ec-vp9` (only on `ec-vp9-syntax`), so there is no
+  cross-crate suite to run.
+- **Merged-tree corpus re-sweep** (both lanes touched the prediction path;
+  EVERY stream regenerated from the merged build and `cmp`ed against the
+  libvpx 1.15.0 oracle) — all **BYTE-IDENTICAL**, with the frame count derived
+  arithmetically (`dump_bytes / (w*h + 2*ceil(w/2)*ceil(h/2))`, ×2 for u16):
+
+| stream | frames | oracle | bytes |
+| --- | --- | --- | --- |
+| `tests/data/scaledref.ivf` (1x 1280x720 + 9x 640x360) | 10 | `drv_pix3` | 4,492,800 |
+| `tests/data/scaledref_odd.ivf` (1x 1279x719 + 9x 640x360) | 10 | `drv_pix3` | 4,490,801 |
+| `tests/data/intraonly.ivf` (11 coded, 10 shown) | 10 | `drv_pix3` | 1,152,000 |
+| `vp9-1080p-23.976-8bit` | 48 | `drv_pix3` | 149,299,200 |
+| `vp9-1080p-60-8bit` | 120 | `drv_pix3` | 373,248,000 |
+| `vp9-superframe-altref` | 60 | `drv_pix3` | 6,912,000 |
+| `vp9-tiles-1280` | 30 | `drv_pix3` | 41,472,000 |
+| `vp9-1080p-23.976-10bit` | 48 | `drv_pix10` (u16-LE) | 298,598,400 |
+| `vp9-1080p-60-10bit` | 120 | `drv_pix10` (u16-LE) | 746,496,000 |
+| odd `testsrc2` patched 321x241 | 12 | `drv_pix2` + `pixcmp2.py` | 1,395,876 |
+
+- **Push**: `ccc5a836..33904e74 main -> main`; `git ls-remote origin
+  refs/heads/main` == `33904e747ab7881b4e97d518f68cd03d3afa6c6b` == local HEAD.
+- **Cleanup**: lane worktree `../edith_codecs-vp9ref` removed (branch
+  `lane-vp9-refsetup` kept as history); `rm -rf
+  $HOME/.cache/cargo-target-vp9ref{,merge,verify}` and the builder/verify
+  dirs. `EDITH_FINDINGS.md` (untracked, sibling session) left untouched.
+- **Instruments kept**: `tests/scratch_pixdump{,10}.rs` + the `EC_VP9_*` trace
+  hooks stay in tree — they are the next lane's comparators, not throwaways.
+- **Still open** (unchanged from the lane): the `valid_ref_frame_size` ratio
+  bound stays a named refusal (libvpx errors the same way), and profile-2
+  intra-only / scaled-reference interaction has no corpus stream — the scaled
+  path is exercised only at profile 0 (the odd fixture covers odd x scaled).
