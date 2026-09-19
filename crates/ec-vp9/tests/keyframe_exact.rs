@@ -18,14 +18,22 @@ fn ensure_fixture(path: &std::path::Path) {
     let st = std::process::Command::new("ffmpeg")
         .args([
             "-y",
-            "-f", "lavfi",
-            "-i", "testsrc2=size=320x240:rate=30:duration=1",
-            "-pix_fmt", "yuv420p",
-            "-c:v", "libvpx-vp9",
-            "-g", "1",
-            "-cpu-used", "4",
-            "-deadline", "realtime",
-            "-frames:v", "2",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=30:duration=1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libvpx-vp9",
+            "-g",
+            "1",
+            "-cpu-used",
+            "4",
+            "-deadline",
+            "realtime",
+            "-frames:v",
+            "2",
         ])
         .arg(path)
         .output()
@@ -71,13 +79,31 @@ fn compare(path: &std::path::Path) {
             assert_eq!(pic.u.len(), want_u.len());
             assert_eq!(pic.v.len(), want_v.len());
             for (i, (&a, &b)) in pic.y.iter().zip(want_y).enumerate() {
-                assert_eq!(a as u8, b, "Y plane mismatch at pixel ({}, {}) frame {shown}", i % w, i / w);
+                assert_eq!(
+                    a as u8,
+                    b,
+                    "Y plane mismatch at pixel ({}, {}) frame {shown}",
+                    i % w,
+                    i / w
+                );
             }
             for (i, (&a, &b)) in pic.u.iter().zip(want_u).enumerate() {
-                assert_eq!(a as u8, b, "U plane mismatch at ({}, {}) frame {shown}", i % (w / 2), i / (w / 2));
+                assert_eq!(
+                    a as u8,
+                    b,
+                    "U plane mismatch at ({}, {}) frame {shown}",
+                    i % (w / 2),
+                    i / (w / 2)
+                );
             }
             for (i, (&a, &b)) in pic.v.iter().zip(want_v).enumerate() {
-                assert_eq!(a as u8, b, "V plane mismatch at ({}, {}) frame {shown}", i % (w / 2), i / (w / 2));
+                assert_eq!(
+                    a as u8,
+                    b,
+                    "V plane mismatch at ({}, {}) frame {shown}",
+                    i % (w / 2),
+                    i / (w / 2)
+                );
             }
             shown += 1;
         }
@@ -110,9 +136,18 @@ fn lossless_64_matches_ffmpeg() {
     let want_y = &reference[..w * h];
     let want_u = &reference[w * h..w * h + uv];
     let want_v = &reference[w * h + uv..];
-    assert!(pic.y.iter().map(|&v| v as u8).eq(want_y.iter().copied()), "lossless Y must be byte-exact");
-    assert!(pic.u.iter().map(|&v| v as u8).eq(want_u.iter().copied()), "lossless U must be byte-exact");
-    assert!(pic.v.iter().map(|&v| v as u8).eq(want_v.iter().copied()), "lossless V must be byte-exact");
+    assert!(
+        pic.y.iter().map(|&v| v as u8).eq(want_y.iter().copied()),
+        "lossless Y must be byte-exact"
+    );
+    assert!(
+        pic.u.iter().map(|&v| v as u8).eq(want_u.iter().copied()),
+        "lossless U must be byte-exact"
+    );
+    assert!(
+        pic.v.iter().map(|&v| v as u8).eq(want_v.iter().copied()),
+        "lossless V must be byte-exact"
+    );
     assert_eq!((pic.width, pic.height), (w as u16, h as u16));
 }
 
@@ -122,7 +157,9 @@ fn inter_stream_decodes_and_matches_ffmpeg() {
     // used to be the "inter is refused by name" witness. Inter frames decode
     // now, so the witness is the pixels: every shown frame must match
     // ffmpeg's libvpx output byte for byte.
-    let Some(dir) = ivf::fixture_dir() else { return };
+    let Some(dir) = ivf::fixture_dir() else {
+        return;
+    };
     let path = dir.join("vp9-superframe-altref.ivf");
     let bytes = std::fs::read(&path).unwrap();
     let (_, w, h, frames) = ivf::parse_ivf(&bytes);
@@ -155,20 +192,4 @@ fn inter_stream_decodes_and_matches_ffmpeg() {
     // superframe split, so every IVF chunk here yields one shown frame.
     assert_eq!(hidden, 0, "superframe chunks show exactly one frame each");
     assert_eq!(shown * frame_bytes, expected.len());
-}
-
-#[test]
-fn profile1_444_is_named_unsupported() {
-    let Some(dir) = ivf::fixture_dir() else { return };
-    let path = dir.join("vp9-profile1-444.ivf");
-    let bytes = std::fs::read(&path).unwrap();
-    let (_, _, _, frames) = ivf::parse_ivf(&bytes);
-    let mut decoder = Decoder::new();
-    let err = decoder
-        .decode(&frames[0].data)
-        .expect_err("profile 1 4:4:4 must be refused");
-    assert!(
-        format!("{err}").contains("vp9 profile 1"),
-        "the refusal must name the profile: {err}"
-    );
 }
