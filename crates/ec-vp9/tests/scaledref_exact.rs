@@ -10,12 +10,14 @@
 //! The fixtures are committed under `tests/data/` because no ffmpeg
 //! invocation can produce a size change: libvpx's encoder emits one only
 //! through its rate-control resize path (ffmpeg exposes neither
-//! `rc_resize_allowed` nor SVC and crashes outright on a changing filter
-//! output), and a hand-spliced explicit-size inter frame trips libvpx's own
-//! header reparsing. The generator is recorded in
+//! `rc_resize_allowed` nor SVC; its `scale=...:eval=frame` route exits 139
+//! with a 0-byte file), and a hand-spliced explicit-size inter frame trips
+//! libvpx's own header reparsing. The generator is recorded in
 //! `lanes/vp9refsetup.report.md`: a 1280x720 one-pass CBR encode at 200 kbps,
 //! whose `vp9_resize_one_pass_cbr` downscales frame 1 to 640x360 against the
-//! keyframe.
+//! keyframe. `scaledref_odd.ivf` is that same file through
+//! `$HOME/.cache/vp9pix/patch_kf_size.py <in> <out> 1279 719` (which rewrites
+//! the IVF container size too).
 //!
 //! Oracle caveat: ffmpeg locks its rawvideo output size to the FIRST decoded
 //! frame's, so a two-size stream cannot be dumped in one pass. Frame 0 is
