@@ -25197,6 +25197,10 @@ fn ref_dims(ref_frame: i8, refpix: &RefPix<'_>) -> Result<(usize, usize)> {
                 std::backtrace::Backtrace::force_capture()
             );
         }
+        // lane-hdrlossless: libaom errors on the same stream
+        // (`decodeframe.c:5027`: `if (cm->ref_frame_map[ref] == NULL)
+        // aom_internal_error(... AOM_CODEC_CORRUPT_FRAME, "Inter frame
+        // requests nonexistent reference")`) -- a spec-conformant guard.
         unsupported(
             "a reference frame selected with no picture at this frame's own \
                  ref_frame_idx slot for it",
@@ -34802,6 +34806,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // refused every same-size reference (class av1-truesize-lane: true
     // frame size vs mi-rounded). Height must still MATCH: AV1 superres
     // never scales height, and no path here has a vertical scaling pass.
+    // lane-hdrlossless VERDICT: this is NOT a spec-conformant guard -- libaom
+    // ACCEPTS a reference of a different size and scales BOTH axes
+    // (`av1_setup_scale_factors_for_frame` + `av1_is_valid_scale`,
+    // `decodeframe.c:5089-5099`; only an out-of-range scale errors). We port
+    // only WIDTH scaling (superres), so a height mismatch is a named
+    // capability gap. No aomenc witness reaches it: superres changes width
+    // alone, and the only both-axes route (dynamic resize) stops earlier on
+    // this decoder. See `lanes/av1hdr.report.md` §4.3.
     if refpix.dims(1).is_none_or(|(_, h)| h != frame_height as usize) {
         return Err(unsupported(
             "a reference picture whose height does not match this frame's own true size",
