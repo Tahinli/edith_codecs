@@ -83,3 +83,38 @@ edith's scale normalisation.
 - Non-mp4 demuxers (matroska/ogg/riff) construct through `StreamInfo::new` and
   report `Rotation::None`; Matroska's `ProjectionPoseRoll` is not read (out of
   scope).
+
+## MERGE-SIDE FOLLOW-UPS (2026-09-19)
+
+Merged into `main` as a fast-forward: the lane was cut from `c102c27a` and
+main had not advanced, so `git merge --ff-only lane-mp4-rotation` was exact.
+
+- Merge id `b1503940` (`c102c27a..b1503940`). `git ls-remote origin main` ==
+  `b1503940525433a9c5c6ab856a288fa69dcfc0d1`.
+- **Reviewer P2, fixed on the lane before merging** (`b1503940`):
+  `Rotation::from_matrix` decided its `b == -c` test with a plain negation, so
+  a crafted `tkhd` carrying `i32::MIN` in the `c` term panicked in a debug
+  build (`attempt to negate with overflow`) and wrapped onto a false `Cw270`
+  in a release one. The fix is `c.checked_neg() == Some(b)`, so such a term
+  falls through to `Other` — exact integer arithmetic, no panic.
+  New unit test `registry::tests::a_matrix_term_at_i32_min_is_not_a_quarter_turn`
+  feeds three `i32::MIN` cases including the load-bearing `(0, MIN, MIN, 0)`;
+  **fail-pre-fix proven**: reverting the guard panics the test at
+  `registry.rs:289:28` ("attempt to negate with overflow"), restored re-green.
+- CREATE-list audit: 11 paths — `crates/ec-core/src/{lib.rs,registry.rs}`,
+  `crates/ec-mp4/src/demux.rs`, `crates/ec-mp4/tests/data/gen.sh` + 5 committed
+  `rot{0,90,180,270,45}.mp4` fixtures, `crates/ec-mp4/tests/rotation.rs`,
+  `lanes/mp4rotation.report.md`. No duplicate/junk file (`*rs.rs` class).
+- Merged-tree suite (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-mp4rotmerge`):
+  `cargo test -p ec-core -p ec-mp4` → ec-core **44 passed, 0 failed** (was 43
+  + the new guard test), ec-mp4 lib **18/0**, `tests/mp4.rs` **15/0 (1
+  ignored**, the real-library gate), `tests/rotation.rs` **3/0**.
+- `cargo check --workspace --all-targets`: clean; warning set byte-identical
+  to the pre-merge baseline — ec-vp9 5 (TM_PRED, read_partition,
+  partition_probs, x_mis, y_mis), ec-vorbis 1, **zero in ec-core/ec-mp4**
+  (forced re-emit verified).
+- Cleanup: worktree `edith_codecs-mp4rot` removed (branch `lane-mp4-rotation`
+  kept), `$HOME/.cache/cargo-target-mp4rot*` and the reviewer's scratch dirs
+  removed. No `EC_*_TRACE` hooks or scratch harnesses were added by this lane.
+- Kept for the next lane: the `gen.sh` fixture generator (regenerates the five
+  `rot*.mp4` oracle files) and the deferred muxer follow-up above.
