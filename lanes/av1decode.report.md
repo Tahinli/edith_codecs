@@ -26,8 +26,9 @@ a code un-refusal of an arm that no longer exists. This report gives:
 byte-exact at every probed offset**; at the parked tip (`3808cf8`, 2026-08-30)
 both films stopped early (Troy at a superblock-level HORZ/VERT strip with a split
 transform; Hunger Games at a superblock-level partition). The refusal inventory
-shrank from **47** (41 REFUSALS + 6 CAPABILITY_CLAIMS) to **35**
-(34 REFUSALS + 1 CAPABILITY_CLAIM).
+shrank from **47** (41 REFUSALS + 6 CAPABILITY_CLAIMS) to **37**
+(36 REFUSALS + 1 CAPABILITY_CLAIM). The refusal-scan parser reproduces the parked
+**47** exactly, so the earlier "35 (34 + 1)" figure was a miscount.
 
 ## 1. Baseline re-measurement (main 79984549)
 
@@ -142,14 +143,20 @@ recipe decodes. Four real streams stop:
 `ffmpeg -f lavfi -i testsrc2=size=320x240:rate=30:duration=2 -pix_fmt gray
 -c:v libaom-av1 -cpu-used 8 -b:v 300k -f obu` → REFUSED. The **4:2:0 twin of the
 same source+recipe decodes 60/60 frames**, so this is monochrome, not the recipe.
-This is also the io fixture `av1-monochrome.ivf`.
+(The committed io fixture `av1-monochrome.ivf` is a **different, earlier** stop:
+it refuses at `intra block copy on a HORZ/VERT/1:4 rect intra strip` — the
+intrabc-rect wall — before reaching this desync. The pinning gate in §5
+therefore generates its stream from this ffmpeg recipe, not from that fixture.)
 
 **Root cause (localised).** Run the instrumented aomdec oracle and our probe with
-`EC_TRACE_MODE_STEP=1` over the same OBU; the traces agree on every symbol and
-`rng` through `skip`, `cdef`, `dq`, `mode`, `angle_y`, `uv_mode`, `angle_uv`
-(both `rng=56072` at `(0,0)` after `angle_uv`). Then aomdec reads
-`tx_depth ctx=0 cat=1` while **ours reads a second `uv_mode` (val=13) first** and
-diverges. libaom `av1/decoder/decodemv.c:933`:
+`EC_TRACE_MODE_STEP=1` over the same OBU. On the **mono** stream **ours reads
+`angle_uv` at `rng=50996`**, while aomdec reads **no** `uv_mode`/`angle_uv` at
+all (the guard below): the monochrome frame codes neither symbol. The first
+divergence at `(0,0)` is therefore aomdec reading `tx_depth ctx=0 cat=1`
+(`rng=43616`) where **ours reads a `uv_mode` (val=13)** and desyncs. (The
+`rng=56072` "agree through `uv_mode`/`angle_uv`" agreement belongs to the 4:2:0
+twin, whose chroma symbols both decoders read; `56072` never appears in the mono
+trace.) libaom `av1/decoder/decodemv.c:933`:
 `if (!cm->seq_params->monochrome && xd->is_chroma_ref) { mbmi->uv_mode = ... }` —
 a monochrome frame codes **no** `uv_mode`/`cfl`/`angle_delta_uv`/`palette_uv`.
 This decoder's block layer has **no `num_planes`/monochrome notion at all**
@@ -201,7 +208,7 @@ debt** until the root causes above land; the PROVEN tests must then be revisited
 
 ## 4. Terrain map for the next wave
 
-Remaining refusals: **34 REFUSALS + 1 CAPABILITY_CLAIM**. Ordered by dependency
+Remaining refusals: **36 REFUSALS + 1 CAPABILITY_CLAIM** (37 total). Ordered by dependency
 (what unblocks what):
 
 **Wave 1 — the only real-stream-reachable cluster (this lane's finding):**
@@ -262,7 +269,9 @@ anything already covered by the seven witness gates above.
   → `ok. 1 passed` (`4:2:0 twin 60 frames, monochrome refused by name`).
 - `cargo check -p ec-av1 --all-targets` → rc 0, **0 warnings** (parity with
   79984549).
-- Full lib suite: **`cargo test -p ec-av1 --lib`, 652 passed / 0 failed.**
+- Full lib suite (completed on the lane by the verifier): **592 passed, 0 failed,
+  60 ignored** (6716 s). (An earlier in-lane run was cut off by a budget cap while
+  showing "652 passed"; that partial figure is not a completed suite.)
 
 ## 7. Repro commands (all re-derivable)
 
