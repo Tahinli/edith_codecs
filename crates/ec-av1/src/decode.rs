@@ -6805,6 +6805,39 @@ fn read_coeffs_rect(
     Ok((Grid::Own(grid), tx_type))
 }
 
+/// [`read_coeffs_rect`] for a CHROMA plane, carrying the monochrome gate the
+/// [`read_plane`] family already has.
+///
+/// A monochrome frame has `NumPlanes == 1`, so libaom's coefficient loop
+/// (`for (plane = 0; plane < av1_num_planes(cm); ++plane)`) never reaches a
+/// chroma plane: no u/v coefficient symbol is coded, and consuming one moves
+/// the arithmetic decoder off the stream for the rest of the tile. [`read_plane`]
+/// enforces that for every strip that reads its chroma through it, but the rect
+/// strip paths ([`decode_block_rect`], [`decode_leaf_rect`],
+/// [`decode_block_rect4`], [`decode_rect4_16_strip`], [`decode_block_rect64`])
+/// call `read_coeffs_rect` on planes 1/2 DIRECTLY, so each of those sites takes
+/// this gate instead (class `reader-gate-not-on-every-path`). One un-gated
+/// chroma read desyncs at the FIRST rect leaf of the frame and every later
+/// symbol -- and therefore every later pixel -- is decoded from the wrong
+/// place, without ever tripping a refusal (the desynced values stay inside
+/// every coded alphabet).
+fn read_chroma_coeffs_rect(
+    dec: &mut SymbolDecoder,
+    coding: &mut TxbTables,
+    scan: &[u16],
+    w: usize,
+    h: usize,
+    skip_ctx: usize,
+    sign_ctx: usize,
+    default_tx_type: TxType,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<(Grid, TxType)> {
+    if mono(fctx) {
+        return Ok((Grid::Zero(w * h), TxType::DctDct));
+    }
+    read_coeffs_rect(dec, coding, scan, w, h, skip_ctx, sign_ctx, default_tx_type)
+}
+
 /// What one coded block leaves behind for the blocks that read it as a
 /// neighbour: whether it coded anything at all, and the sign of its DC —
 /// [`crate::tile`]'s own private `Neighbour`.
@@ -11106,7 +11139,7 @@ fn decode_block_rect(
         let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
         let mut u_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
-        let (u_levels, u_tx_type) = read_coeffs_rect(
+        let (u_levels, u_tx_type) = read_chroma_coeffs_rect(
             dec,
             &mut u_coding,
             chroma_scan,
@@ -11115,6 +11148,7 @@ fn decode_block_rect(
             u_skip_ctx,
             dc_sign_ctx(around[1].2),
             u_default_tx,
+            fctx,
         )?;
         if crate::envflags::env_flag!("EC_AV1_TRACE") {
             let (rng, _) = dec.debug_state();
@@ -11149,7 +11183,7 @@ fn decode_block_rect(
         let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
         let mut v_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
-        let (v_levels, v_tx_type) = read_coeffs_rect(
+        let (v_levels, v_tx_type) = read_chroma_coeffs_rect(
             dec,
             &mut v_coding,
             chroma_scan,
@@ -11158,6 +11192,7 @@ fn decode_block_rect(
             v_skip_ctx,
             dc_sign_ctx(around[2].2),
             v_default_tx,
+            fctx,
         )?;
         if crate::envflags::env_flag!("EC_AV1_TRACE") {
             let (rng, _) = dec.debug_state();
@@ -11488,9 +11523,9 @@ fn decode_leaf_rect(
         let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
         let mut u_coding = cdfs.txb(TxbSet::ChromaRect8x4, uv_predict_mode);
-        let (u_l, u_tx_type) = read_coeffs_rect(
+        let (u_l, u_tx_type) = read_chroma_coeffs_rect(
             dec, &mut u_coding, chroma_scan, chroma_w, chroma_h, u_skip_ctx,
-            dc_sign_ctx(around[1].2), u_default_tx,
+            dc_sign_ctx(around[1].2), u_default_tx, fctx,
         )?;
         u_levels = u_l;
         let u_residual = dequant_and_inverse_typed_wh(
@@ -11507,9 +11542,9 @@ fn decode_leaf_rect(
         let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
         let mut v_coding = cdfs.txb(TxbSet::ChromaRect8x4, uv_predict_mode);
-        let (v_l, v_tx_type) = read_coeffs_rect(
+        let (v_l, v_tx_type) = read_chroma_coeffs_rect(
             dec, &mut v_coding, chroma_scan, chroma_w, chroma_h, v_skip_ctx,
-            dc_sign_ctx(around[2].2), v_default_tx,
+            dc_sign_ctx(around[2].2), v_default_tx, fctx,
         )?;
         v_levels = v_l;
         let v_residual = dequant_and_inverse_typed_wh(
@@ -11838,7 +11873,7 @@ fn decode_block_rect4(
             let default_tx = default_intra_tx_type(uv_predict_mode as u8);
             let skip_ctx = usize::from(around[plane].0) + usize::from(around[plane].1);
             let mut coding = cdfs.txb(TxbSet::Chroma8, uv_predict_mode);
-            let (levels, tx_type) = read_coeffs_rect(
+            let (levels, tx_type) = read_chroma_coeffs_rect(
                 dec,
                 &mut coding,
                 chroma_scan,
@@ -11847,6 +11882,7 @@ fn decode_block_rect4(
                 skip_ctx,
                 dc_sign_ctx(around[plane].2),
                 default_tx,
+                fctx,
             )?;
             planes.push((levels, tx_type));
         }
@@ -12488,7 +12524,7 @@ fn decode_rect4_16_strip(
                     let default_tx = default_intra_tx_type(uv_predict_mode as u8);
                     let skip_ctx = usize::from(around[plane].0) + usize::from(around[plane].1);
                     let mut coding = cdfs.txb(TxbSet::ChromaRect8x4, uv_predict_mode);
-                    let (levels, tx_type) = read_coeffs_rect(
+                    let (levels, tx_type) = read_chroma_coeffs_rect(
                         dec,
                         &mut coding,
                         chroma_scan,
@@ -12497,6 +12533,7 @@ fn decode_rect4_16_strip(
                         skip_ctx,
                         dc_sign_ctx(around[plane].2),
                         default_tx,
+                        fctx,
                     )?;
                     planes.push((levels, tx_type));
                 }
@@ -13012,7 +13049,7 @@ fn decode_block_rect64(
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=1 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
         }
-        let (u_levels, u_tx_type) = read_coeffs_rect(
+        let (u_levels, u_tx_type) = read_chroma_coeffs_rect(
             dec,
             &mut u_coding,
             chroma_scan,
@@ -13021,6 +13058,7 @@ fn decode_block_rect64(
             u_skip_ctx,
             dc_sign_ctx(around[1].2),
             TxType::DctDct,
+            fctx,
         )?;
         if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
@@ -13076,7 +13114,7 @@ fn decode_block_rect64(
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=2 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
         }
-        let (v_levels, v_tx_type) = read_coeffs_rect(
+        let (v_levels, v_tx_type) = read_chroma_coeffs_rect(
             dec,
             &mut v_coding,
             chroma_scan,
@@ -13085,6 +13123,7 @@ fn decode_block_rect64(
             v_skip_ctx,
             dc_sign_ctx(around[2].2),
             TxType::DctDct,
+            fctx,
         )?;
         if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
@@ -31604,6 +31643,26 @@ fn decode_intra_sub8_leaf(
             h.set(s);
         });
     }
+    // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
+    // needs EVERY writer): a sub-8x8 group published no palette state, so
+    // once an 8x8 leaf of the same row can BE a palette block, the group
+    // left the row's band holding that earlier block's size and the next
+    // intra block read `av1_get_palette_mode_ctx` one too high (measured:
+    // mi(30,30) of decode-order frame 1, ours ctx 1 where libaom gathers
+    // 0). No sub-8x8 piece can itself be a palette (`av1_allow_palette`
+    // needs `bsize >= BLOCK_8X8`), so the group always clears.
+    //
+    // lane-av1mono: this publish is NOT chroma work and must run BEFORE the
+    // `!has_chroma` return below. libaom's mi grid holds
+    // `palette_size[0] == 0` in every cell of such a group whatever the
+    // plane count, and on a monochrome frame EVERY sub-8 leaf passes
+    // `has_chroma == false`, so a publish placed after the return never ran
+    // at all: the band kept an earlier palette block's size, the next block
+    // read `palette_y_mode` off CDF row 1 where libaom reads row 0, decoded
+    // a palette libaom never coded, and the tile desynced one block later
+    // (measured: gray testsrc2 320x240, decode-order frame 33, mi(42,50),
+    // ours ctx 2 where libaom gathers 1).
+    record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
     if !has_chroma {
         return Ok(mode);
     }
@@ -31622,15 +31681,6 @@ fn decode_intra_sub8_leaf(
     neighbours.above_uv_mode[c] = uv_predict_mode;
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(gr, gc, 2, 2, uv_predict_mode);
-    // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
-    // needs EVERY writer): a sub-8x8 group published no palette state, so
-    // once an 8x8 leaf of the same row can BE a palette block, the group
-    // left the row's band holding that earlier block's size and the next
-    // intra block read `av1_get_palette_mode_ctx` one too high (measured:
-    // mi(30,30) of decode-order frame 1, ours ctx 1 where libaom gathers
-    // 0). No sub-8x8 piece can itself be a palette (`av1_allow_palette`
-    // needs `bsize >= BLOCK_8X8`), so the group always clears.
-    record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
 
     let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
     let (u_grid, v_grid): (Grid, Grid) = if skip {

@@ -2024,6 +2024,105 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1mono: the INVERSE of the pilot's
+    /// `a_real_libaom_monochrome_key_frame_is_refused_by_name`, which the
+    /// pilot's merge `d71084ae` landed on `main` (after this lane's base
+    /// `7f4e8301`): the very same recipe now decodes, and its luma is
+    /// byte-exact against ffmpeg's own decode of the same OBU. A merge of this
+    /// lane into `main` must therefore resolve that pinning gate by adopting
+    /// this witness in its place.
+    ///
+    /// `ffmpeg -pix_fmt gray -c:v libaom-av1` sets `color_config.mono_chrome`,
+    /// so libaom codes NO chroma symbol anywhere in the sequence -- not the
+    /// mode syntax, not a coefficient. That reaches all three classes this lane
+    /// had to close: chroma SYMBOL reads (`uv_mode`/cfl/angle/palette), chroma
+    /// COEFFICIENT reads on the rect-strip paths that call `read_coeffs_rect`
+    /// DIRECTLY instead of through `read_plane`'s own plane gate, and the
+    /// palette-mode neighbour band a mono sub-8x8 leaf must still clear before
+    /// it returns (an uncleared band made the next block read `palette_y_mode`
+    /// off the wrong CDF row and silently desynced the rest of the tile --
+    /// measured at decode-order frame 33 of this very recipe).
+    ///
+    /// The 4:2:0 twin of the same source and settings is the control: it proves
+    /// the recipe is decodable, so a failure here is about the plane count and
+    /// not about the source or the encoder settings.
+    #[test]
+    fn a_real_libaom_monochrome_key_frame_decodes_pixel_exact() {
+        const NAME: &str = "a_real_libaom_monochrome_key_frame_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let emit = |pix: &str| -> Vec<u8> {
+            let out = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=320x240:rate=30:duration=2",
+                    "-pix_fmt",
+                    pix,
+                    "-c:v",
+                    "libaom-av1",
+                    "-cpu-used",
+                    "8",
+                    "-b:v",
+                    "300k",
+                    "-f",
+                    "obu",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: ffmpeg ({pix}) failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        // CONTROL: the identical recipe at 4:2:0 still decodes.
+        let twin = decode_stream(&emit("yuv420p")).expect("the 4:2:0 twin must decode");
+        assert!(!twin.is_empty(), "{NAME}: the 4:2:0 twin decoded no frames");
+        // THE WITNESS: the monochrome stream decodes and every luma sample
+        // equals ffmpeg's own decode of the same OBU.
+        let gray = emit("gray");
+        let ours = decode_stream(&gray)
+            .unwrap_or_else(|e| panic!("{NAME}: the monochrome stream is REFUSED again: {e}"));
+        let (width, height) = (320usize, 240usize);
+        const FRAMES: usize = 60;
+        assert_eq!(ours.len(), FRAMES, "{NAME}: expected {FRAMES} mono frames");
+        let reference = ffmpeg_decode_gray_sequence(&gray, width, height, FRAMES);
+        for (i, plane) in reference.chunks_exact(width * height).enumerate() {
+            assert_eq!(ours[i].width, width, "{NAME}: frame {i} width");
+            assert_eq!(ours[i].height, height, "{NAME}: frame {i} height");
+            assert_eq!(
+                ours[i].y.len(),
+                width * height,
+                "{NAME}: frame {i} luma length"
+            );
+            for (j, (got, want)) in plane.iter().zip(ours[i].y.iter()).enumerate() {
+                assert_eq!(
+                    *want,
+                    u16::from(*got),
+                    "{NAME}: frame {i} luma sample {j} (row {}, col {}) is {want}, ffmpeg says {got}",
+                    j / width,
+                    j % width
+                );
+            }
+        }
+        eprintln!(
+            "{NAME}: 4:2:0 twin {} frames, monochrome {} frames byte-exact vs ffmpeg",
+            twin.len(),
+            ours.len()
+        );
+    }
+
     /// lane-t900 r25: the refusal "a frame OBU with no tile group" names a
     /// shape the parser cannot hand [`decode_stream`].
     ///
@@ -3294,6 +3393,49 @@ pub(crate) mod tests {
                 }
             })
             .collect()
+    }
+
+    /// As [`ffmpeg_decode_sequence`], for a MONOCHROME stream: one 8-bit luma
+    /// plane per frame, exactly what `ffmpeg -pix_fmt gray -f rawvideo` writes
+    /// (lane-av1mono). Fed down a stdin writer thread for the reason the 4:2:0
+    /// helper documents.
+    fn ffmpeg_decode_gray_sequence(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<u8> {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "gray", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg failed to start");
+        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
+        let payload = stream.to_vec();
+        let writer = std::thread::Builder::new()
+            .name("ec-av1-ffmpeg-gray-in".into())
+            .spawn(move || {
+                let _ = stdin.write_all(&payload);
+            })
+            .expect("spawning the ffmpeg stdin writer");
+        let out = child.wait_with_output().expect("ffmpeg failed to run");
+        writer.join().expect("ffmpeg stdin writer thread");
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the monochrome stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout.len(),
+            width * height * frames,
+            "expected {frames} monochrome frames, ffmpeg said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
     }
 
     /// As [`ffmpeg_decode_sequence`], but for a `yuv420p10le` stream: samples
