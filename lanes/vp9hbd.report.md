@@ -36,8 +36,13 @@ forked decode paths.
 
 Pre-fix, `Decoder::decode` on the 10-bit stream returned
 `unsupported: vp9 profile 2 — this lane decodes profile 0 only` at
-`decode.rs:211`. `hbd_exact.rs::profile2_10bit_is_byte_exact` fails at the
-first frame on the pre-fix tree for that reason.
+`decode.rs:211`. `hbd_exact.rs` cannot COMPILE on the pre-fix tree
+(`Picture.bit_depth` and the u16 plane accessors are new here), so the
+refusal was proved with an adapted copy of the test: the new-field reads
+stripped, so the body reaches `Decoder::decode` and panics with
+`Unsupported("vp9 profile 2")` on the first frame
+(`crates/ec-vp9/src/decode.rs` profile gate). The shipped test
+`hbd_exact.rs::profile2_10bit_is_byte_exact` then passes on the fixed tree.
 
 ## Oracle
 
