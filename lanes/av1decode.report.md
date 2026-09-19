@@ -296,3 +296,55 @@ EC_TRACE_MODE_STEP=1 decode_probe x.obu 2>o.step; diff a.step o.step
 ## 8. Git log
 
 - `lane-av1-decode` off `79984549`: report + `a_real_libaom_monochrome_key_frame_is_refused_by_name`.
+
+## MERGE-SIDE FOLLOW-UPS (2026-09-19)
+
+- **Doc findings fixed on the lane before the merge** (commit `5cf69cf7`, on top
+  of `fed7aaf6`): this is a report-only + one-gate lane, so all four reviewer
+  findings were prose (plus the matching root-cause paragraph in the `stream.rs`
+  gate comment):
+  1. refusal inventory is **37** (**36 REFUSALS + 1 CAPABILITY_CLAIM**), not
+     `35 (34 + 1)`. The scan parser reproduces the parked **47** exactly, so the
+     old figure was a miscount; corrected in the TL;DR and §4.
+  2. the monochrome root-cause narrative in §3.1 (and the `stream.rs` gate
+     comment) is now scoped to the **mono** stream: **ours reads `angle_uv` at
+     `rng=50996`**, aomdec reads **no** `uv_mode`/`angle_uv` (the
+     `decodemv.c:933` guard), and the first divergence at `(0,0)` is aomdec
+     `tx_depth ctx=0 cat=1` (`rng=43616`) vs ours `uv_mode val=13`. The
+     `rng=56072` agreement belongs to the 4:2:0 twin; `56072` never appears in
+     the mono trace.
+  3. `av1-monochrome.ivf` is **not** the stream this gate emits: the committed io
+     fixture stops earlier at `intra block copy on a HORZ/VERT/1:4 rect intra
+     strip` (the intrabc-rect wall). The gate keeps its own ffmpeg recipe.
+  4. §6 suite count: the **verifier's completed run** is **592 passed, 0 failed,
+     60 ignored** (6716 s) — `592 + 60 = 652`, so the earlier "652 passed" was a
+     budget-cutoff partial mislabelled as a completed suite.
+- **Merge**: `d71084ae` — parents `f0727a87` (main) and `5cf69cf7` (lane). A real
+  merge, not a fast-forward: main absorbed `lane-vp9-refsetup` after this lane's
+  base `79984549`. Both commits touch only `crates/ec-av1/`, so `ort` merged
+  cleanly with **no conflicts**.
+- **Create-list audit**: exactly the expected two paths — `crates/ec-av1/src/stream.rs`
+  (**+78**: the one pinning gate) and `lanes/av1decode.report.md` (new, **+298**).
+  **No decoder source changes**; no junk files, no target artifacts, no fixtures
+  to copy (both paths tracked).
+- **Gates on the MERGED tree** (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1pilotmerge`):
+  - `cargo test -p ec-av1 --lib a_real_libaom_monochrome_key_frame_is_refused_by_name -- --nocapture`
+    → `test result: ok. 1 passed; 0 failed` (`4:2:0 twin 60 frames, monochrome
+    refused by name (a Golomb tail longer than this decoder reads)`). The pinning
+    gate lives in the **lib** test binary (`src/stream.rs`), not a
+    `--test stream` target.
+  - `cargo check -p ec-av1 --all-targets` → rc 0, **0 warnings**.
+  - Full lib suite (verifier, completed on the lane): **592 passed / 0 failed /
+    60 ignored** (6716 s). Not re-run at merge time.
+- **Push**: `f0727a87..d71084ae main -> main`; `git ls-remote origin
+  refs/heads/main` == `d71084aec0cb2dd337abd01b68537dcd68b3639d` == local HEAD.
+- **Cleanup**: lane worktree `../edith_codecs-av1dec` removed (branch
+  `lane-av1-decode` kept as history); `rm -rf $HOME/.cache/cargo-target-av1dec`
+  and `$HOME/.cache/cargo-target-av1pilotmerge`. `EDITH_FINDINGS.md` (untracked,
+  sibling session) left untouched.
+- **Note for `lane-av1-mono` / any later `ec-av1` rewrite**: main now carries
+  `a_real_libaom_monochrome_key_frame_is_refused_by_name` in
+  `crates/ec-av1/src/stream.rs`. It is a **tripwire** (asserts the mono stream is
+  refused by name) — when monochrome decode lands it MUST be flipped to a
+  pixel-exact witness over both twins, so a mono rewrite that merges without
+  reading it will leave a stale refusal pin behind.
