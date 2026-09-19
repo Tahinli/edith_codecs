@@ -305,6 +305,14 @@ pub struct SymbolDecoder<'a> {
     /// Bits left before the decoder starts padding with zeros (spec
     /// `SymbolMaxBits`), which goes negative at the end of the string.
     max_bits: i32,
+    /// Whether [`SymbolDecoder::symbol`] adapts the CDF it reads (spec 8.3.2).
+    /// `false` for a frame whose header sets `disable_cdf_update` -- libaom's
+    /// tile entry (`decodeframe.c:2909`, `allow_update_cdf = allow_update_cdf
+    /// && !cm->features.disable_cdf_update`) skips the adaptation there, so
+    /// reading on would drift this decoder's tables away from the encoder's
+    /// and desync mid-frame. Per-READER, not global: frames of one stream can
+    /// decode on different worker threads.
+    adapt: bool,
 }
 
 impl Drop for SymbolDecoder<'_> {
@@ -326,11 +334,21 @@ impl<'a> SymbolDecoder<'a> {
             value: 0,
             range: 1 << 15,
             max_bits: 8 * data.len() as i32 - 15,
+            adapt: true,
         };
         let num_bits = usize::min(data.len() * 8, 15) as u32;
         let buf = d.f(num_bits);
         d.value = ((1 << 15) - 1) ^ (buf << (15 - num_bits));
         d
+    }
+
+    /// Spec 5.9.2's `disable_cdf_update`, the reader side: `false` (the
+    /// default) adapts every CDF [`symbol`](Self::symbol) reads; `true`
+    /// leaves each table exactly as it was read, matching libaom's
+    /// `allow_update_cdf` (decodeframe.c:2909). Set once per tile reader by
+    /// the frame's own header bit.
+    pub(crate) fn set_cdf_update(&mut self, update: bool) {
+        self.adapt = update;
     }
 
     /// `f(n)`: the next `n` bits, most significant first, zero past the end.
@@ -386,7 +404,14 @@ impl<'a> SymbolDecoder<'a> {
         // relaxed load.
         let t0 = if crate::census::armed() { self.tell_bits() } else { 0.0 };
         let s = self.symbol_fixed(cdf);
+        // lane-av1txr: spec 5.9.2's `disable_cdf_update` -- a frame that sets
+        // it codes every symbol against the tables it started with, so this
+        // reader must leave them untouched too (libaom: `allow_update_cdf =
+        // allow_update_cdf && !cm->features.disable_cdf_update`,
+        // decodeframe.c:2909). The flag is per-reader (see `Self::adapt`).
+        if self.adapt {
         update_cdf(cdf, s);
+        }
         if crate::census::armed() {
             crate::census::charge(cdf.as_ptr() as usize, self.tell_bits() - t0);
         }
@@ -812,6 +837,54 @@ pub(crate) mod tests {
             );
             assert_eq!(fast_cdfs[pick.min(14)], slow_cdfs[pick.min(14)], "cdf after item {i}");
         }
+    }
+
+    /// lane-av1txr: spec 5.9.2's `disable_cdf_update`, the reader half --
+    /// [`SymbolDecoder::set_cdf_update`]. A reader told not to adapt must
+    /// reproduce a writer that never adapted
+    /// ([`SymbolEncoder::symbol_fixed`]), and the DEFAULT reader must not: the
+    /// flag is what keeps a real `aomenc --cdf-update-mode=0` stream in sync
+    /// (its tiles desynced at the first multi-symbol block without it).
+    #[test]
+    fn a_reader_told_not_to_adapt_matches_a_non_adapting_writer() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut enc = SymbolEncoder::new();
+        let cdfs: Vec<Vec<u16>> = (2..=16).map(flat_cdf).collect();
+        let mut written = Vec::new();
+        for i in 0..600 {
+            let pick = i % cdfs.len();
+            let nsyms = pick + 2;
+            let sym = (rng(&mut state) % nsyms as u64) as usize;
+            enc.symbol_fixed(sym, &cdfs[pick]);
+            written.push((pick, sym));
+        }
+        let payload = enc.finish();
+
+        let mut fixed = SymbolDecoder::new(&payload);
+        fixed.set_cdf_update(false);
+        let mut adapting = SymbolDecoder::new(&payload);
+        let mut fixed_cdfs: Vec<Vec<u16>> = (2..=16).map(flat_cdf).collect();
+        let mut adapting_cdfs: Vec<Vec<u16>> = (2..=16).map(flat_cdf).collect();
+        let mut adapting_mismatches = 0usize;
+        for (i, &(pick, sym)) in written.iter().enumerate() {
+            assert_eq!(
+                fixed.symbol(&mut fixed_cdfs[pick]),
+                sym,
+                "non-adapting reader, item {i} (pick {pick})"
+            );
+            if adapting.symbol(&mut adapting_cdfs[pick]) != sym {
+                adapting_mismatches += 1;
+            }
+        }
+        assert_eq!(
+            fixed_cdfs,
+            (2..=16).map(flat_cdf).collect::<Vec<_>>(),
+            "the non-adapting reader still moved a table"
+        );
+        assert!(
+            adapting_mismatches > 0,
+            "the adaptation flag is inert: the default reader reproduced a non-adapting writer"
+        );
     }
 }
 

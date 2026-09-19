@@ -179,3 +179,151 @@ Oracle build: `~/.cache/aom-oracle` (cmake+ninja) instrumented with
    `decode_leaf8` dequant panic.
 3. Add the sequence-header subsampling refusal (§3) and re-pin the inventory.
 4. Run `cargo test -p ec-av1 --lib` + `cargo check -p ec-av1 --all-targets`.
+
+---
+
+## 9. Continuation (2026-09-20, second lane pass)
+
+Five defects fixed, each proven by a first-divergence move and/or a gate. **Warped
+is still NOT byte-exact** (§9.4) and `allintra`/`allintra0` still stop at NAMED
+refusals that belong to the 1:4-rect-strip lane (§9.3). Honest status first.
+
+### 9.1 Silent-garbage guard: non-4:2:0 chroma is refused by name
+
+`stream.rs`'s `decode_stream` now refuses `seq.subsampling_x != 1 ||
+seq.subsampling_y != 1` (threaded through `SeqFlags::subsampling_x/y`). A
+monochrome header parses as 1,1, so it is untouched (the mono lane's stream and
+its tripwire keep their meaning).
+
+Evidence:
+- `a_non_420_subsampled_sequence_header_is_refused_by_name` (stream.rs tests):
+  a hand-built profile-1 (4:4:4) and profile-2 (4:2:2) header each refuse with
+  the named string, and the profile-0 CONTROL still decodes — so the gate is
+  about the shape, not the construction.
+- Real encoder stream: `aomenc` auto-promotes to profile 1 for `yuv444p` input;
+  `EC_PROBE_OUT` vs `ffmpeg -pix_fmt yuv444p` on that stream **refuses by name**
+  where the same code path used to decode silently wrong pixels.
+
+### 9.2 Parsed-but-unread pixel-affecting header field sweep
+
+A census of every `SequenceHeader`/`ColorConfig`/frame-header field against the
+decoder's reads (scout report, re-derivable by grep) found exactly two
+pixel-affecting fields the decoder never consumed; both are now closed:
+
+1. `subsampling_x/y` — §9.1 (refusal).
+2. **`disable_cdf_update`** (the new find): spec 8.3.2 skips ALL per-symbol CDF
+   adaptation when set, and libaom's tile entry does exactly that
+   (`decodeframe.c:2909`, `allow_update_cdf && !disable_cdf_update`). The
+   decoder adapted unconditionally. Fixed at the one authoring point:
+   `msac::SymbolDecoder::adapt` (per READER, not global — frames decode on
+   different workers) + `FrameCtx::disable_cdf_update` + one line in
+   `decode_frame`.
+
+   Evidence, both directions:
+   - `a_real_aomenc_stream_with_cdf_update_disabled_decodes_pixel_exact`
+     (real `aomenc --cdf-update-mode=0`, 3 frames): asserts every frame header
+     carries the bit, then compares all planes against ffmpeg. Green.
+   - fail-pre-fix, measured: with `set_cdf_update` forced ON the SAME stream
+     differs from ffmpeg at **byte 6** (`OK: 3 frames` but wrong pixels).
+   - `a_reader_told_not_to_adapt_matches_a_non_adapting_writer` (msac unit):
+     a non-adapting reader reproduces a non-adapting writer symbol-for-symbol
+     and its tables stay untouched; the default reader does not (flag
+     load-bearing).
+
+Everything else never-read is dispositioned as metadata (color_primaries /
+transfer_characteristics / color_range / chroma_sample_position, timing and
+frame-id fields, `showable_frame`, `render_width/height` — deliberate per
+`encode.rs:15917-15921`), or consumed indirectly by the parser (seq gates forced
+into the frame header: superres/CDEF/restoration/warped/enable_ref_frame_mvs,
+`separate_uv_delta_q`, `seq_force_*`). `mono_chrome`/`num_planes` is the sibling
+lane-av1-mono's.
+
+### 9.3 transform.rs:1134 panic — ROOT-CAUSED AND FIXED (not a refusal)
+
+`txbset_for_inter` was a near-duplicate of `inter_txbset_for` whose `4` fell
+through to `TxbSet::Luma64`: a 4x4 intrabc/inter TU read 32x32-class tables (a
+1024-entry grid) and panicked in `inverse_transform_2d_typed_wh` the first time
+such a TU coded a non-zero coefficient (`allintra0`, cpu-used 0). libaom reads a
+4x4 grid with the 16-symbol INTER ext-tx set there (`EXT_TX_SET_ALL16` /
+`_DTT4_IDTX` reduced). Fix: delete the duplicate, route all inter-table sites
+through `inter_txbset_for` (which already had the 4 arms). Result: **no panic**;
+`allintra0` now stops at the EXISTING named refusal "an intrabc block whose
+var-tx tree resolved to mixed leaf transform sizes" (`decode.rs:14327`) — a
+lane-of-its-own gap, not a crash.
+
+### 9.4 warped: four more defects out of the way, still not byte-exact
+
+Ladder evidence (`EC_TRACE_MODE_STEP=1` on the instrumented aomdec vs ours,
+rng-ladder subsequence walk, frame 0). First divergence moved
+**(38,60) → (38,62) → (46,66)**; consuming steps matched 916 → 1119 → 1349 of
+aomdec's 2204 before the next divergence.
+
+1. **Rect intrabc leaves read no transform symbol** (the charter's named stop):
+   `block_signals_txsize` is `bsize > BLOCK_4X4` (`blockd.h:1027`), TRUE at
+   `BLOCK_4X8`/`BLOCK_8X4` — so an UNSKIPPED intrabc rect leaf reads the INTER
+   var-tx tree (`read_tx_size_vartx` over `max_txsize_rect_lookup[BLOCK_4X8] ==
+   TX_4X8`), not nothing. Fixed in `decode_leaf_rect8`'s intrabc arm
+   (`read_var_tx_size` with the rect entry + per-4x4-TU residual/reconstruction
+   when the tree splits, `RECT_INTRABC_VARTX_HITS` counter, probe line
+   `rect_intrabc_vartx`). aomdec's `EC_VARTX mi_row=37 mi_col=62 bsize=2
+   tx_size=6 ctx=19 rng=37745` is now reproduced exactly.
+2. **Sub-8x8 leaves never published the TXFM context bands**: libaom runs
+   `set_txfm_ctxs` for EVERY block; `decode_leaf_split4`/`decode_leaf_rect8` had
+   no write, so an intrabc block's `txfm_partition_context` read a stale 8 where
+   aomdec read 4 (ctx 18 vs 19). Fixed (+ unit bug caught on the way: the rect
+   helper takes PIXELS for the parent span, not mi).
+3. **`intrabc_dv` slot leak**: `read_intra_mode_sub8` armed the frame slot and
+   the sub-8x8 callers never took it, so the NEXT 8x8+ block inherited the
+   vector and read an inter var-tx symbol where libaom read an intra
+   `tx_depth`. The DV already travels in the return value; the arm is gone.
+4. (9.3's table fix also feeds this path: the split rect leaf's 4x4 TUs read
+   `Luma4Inter`/`Set1`.)
+
+**Remaining first divergence (frame 0, mi (46,66), 8x8 intra block):**
+`tx_depth ctx` ours 0 vs aomdec 1. Root cause, localised: the key-frame
+square/leaf tx-depth context is read through `tx_size_context` — the DEBLOCK
+grid approximation — while libaom's `get_tx_size_context` (`pred_common.h:342`)
+reads the **TXFM bands** with the inter-neighbour block-size override. The
+approximation only coincides while every neighbour codes one whole-block
+transform, "which is exactly what `TxMode::Select` ends" (the helper's own
+doc) — warped's key frame IS `TxMode::Select` with intrabc. The fix is the
+lane's next step and is NOT small: `publish_txfm_bands_if_in_inter` returns
+early on a key frame, so switching the read to libaom's formula requires
+publishing the bands from EVERY key-frame block (strips included) in the same
+change, or currently-byte-exact streams can regress. Left unpushed.
+
+Consequences for the rest of the corpus: `allintra` and `warped` both now stop
+at `decode.rs:9155` "intra block copy on a HORZ/VERT/1:4 rect intra strip
+(reconstruction is not ported at this shape)" — after **16 more mi rows** of
+frame 0 than before the fix (was (38,60), now (54,64)). That refusal is lane 3's
+and is left standing.
+
+### 9.5 Inventory re-pin (done)
+
+- The sub-8x8-intrabc refusal no longer exists (the capability landed), so its
+  `REFUSALS` entry is replaced by a note and its claims-table pair is retired;
+  the census gate stays as the non-vacuous premise witness (`reached = 0` now).
+- The Golomb entry is RE-PINNED with the measurement: the reader covers the
+  whole legal value domain, but the string is reachable as a DESYNC SYMPTOM
+  (real monochrome libaom stream, `stream.rs`'s mono tripwire) — the claim pins
+  value coverage, not unreachability.
+
+### 9.6 Gates
+
+- `cargo test -p ec-av1 --lib -- <the three new gates>`: 3 passed, 0 warnings.
+- Full `cargo test -p ec-av1 --lib` and `cargo check -p ec-av1 --all-targets`
+  were launched at the end of this pass; see the commit message / next session
+  for their totals (baseline 592/0/60).
+- `cargo build --release -p ec-av1 --example decode_probe`: 0 warnings.
+
+### 9.7 Next steps (ordered)
+
+1. Read the key-frame tx-depth context from the TXFM bands (libaom
+   `get_tx_size_context`) and publish the bands from every key-frame block —
+   then re-run the (46,66) ladder rung and the corpus sweep (§5's tripwires
+   included).
+2. `allintra`'s 1:4 rect-strip intrabc (lane 3) and the mixed-leaf var-tx
+   refusal (the new stop for `allintra0`).
+3. Add the 4x8/8x4 intrabc witnesses to the media-gated corpus (a real stream
+   that codes one: `warped.obu` reaches `RECT_INTRABC_VARTX_HITS == 1` and now
+   decodes past the old divergence).
