@@ -8,9 +8,11 @@
 //! The VP9 decoder does NOT extend the reference frame's borders in place: it
 //! builds a bordered copy of the block's reference window per prediction
 //! (`extend_and_predict`) whenever the window leaves the frame or the frame's
-//! dimensions are not a multiple of 8. This module ports that path, unscaled
-//! only — a reference slot whose size differs from the current frame is
-//! refused by `decode` before any predictor runs.
+//! dimensions are not a multiple of 8. A reference slot whose size differs
+//! from the current frame is SCALED: [`ScaleFactors`] carries
+//! `vp9_setup_scale_factors_for_frame`, the block/MV are mapped into the
+//! reference with `vp9_scale_mv`, and the convolve steps by `x_step_q4` /
+//! `y_step_q4` (`sf->predict`, `vpx_scaled_*`).
 //!
 //! Indexing note: libvpx's convolve helpers take a raw pointer and subtract
 //! `SUBPEL_TAPS / 2 - 1` from it, so they read taps *before* the block's first
@@ -27,6 +29,93 @@ const TAPS: usize = 8;
 const FILTER_BITS: i32 = 7;
 /// `VP9_INTERP_EXTEND` (`vpx_scale/yv12config.h:25`).
 const INTERP_EXTEND: i32 = 4;
+
+/// `REF_SCALE_SHIFT` / `REF_NO_SCALE` / `REF_INVALID_SCALE`
+/// (`vp9/common/vp9_scale.h:21-23`): the fixed-point precision of a reference
+/// frame's scale factor.
+const REF_SCALE_SHIFT: i32 = 14;
+const REF_NO_SCALE: i32 = 1 << REF_SCALE_SHIFT;
+const REF_INVALID_SCALE: i32 = -1;
+
+/// `scaled_x` / `scaled_y` (`vp9_scale.c:22`).
+fn scale_value(val: i32, scale_fp: i32) -> i32 {
+    (((val as i64) * scale_fp as i64) >> REF_SCALE_SHIFT) as i32
+}
+
+/// `struct scale_factors` (`vp9/common/vp9_scale.h:27`) set up by
+/// `vp9_setup_scale_factors_for_frame` (`vp9_scale.c:44`): the scale from a
+/// reference frame's coded size to this frame's, its derived 1/16-pel step
+/// (`x_step_q4`/`y_step_q4`; 16 means "no scaling on that axis") and
+/// `vp9_scale_mv`.
+#[derive(Clone, Copy)]
+pub(crate) struct ScaleFactors {
+    x_scale_fp: i32,
+    y_scale_fp: i32,
+    x_step_q4: i32,
+    y_step_q4: i32,
+}
+
+impl ScaleFactors {
+    /// `vp9_setup_scale_factors_for_frame(other_w, other_h, this_w, this_h)`:
+    /// `other_*` is the REFERENCE's coded size, `this_*` the frame being
+    /// decoded. An out-of-range ratio leaves `REF_INVALID_SCALE`, which
+    /// libvpx turns into `Reference frame has invalid dimensions` when the
+    /// reference is actually predicted from.
+    pub(crate) fn setup(other_w: usize, other_h: usize, this_w: usize, this_h: usize) -> Self {
+        // `valid_ref_frame_size` (`vp9_scale.h:61`): at most 2x down, 16x up.
+        let valid = 2 * this_w >= other_w
+            && 2 * this_h >= other_h
+            && this_w <= 16 * other_w
+            && this_h <= 16 * other_h;
+        if !valid {
+            return ScaleFactors {
+                x_scale_fp: REF_INVALID_SCALE,
+                y_scale_fp: REF_INVALID_SCALE,
+                x_step_q4: 0,
+                y_step_q4: 0,
+            };
+        }
+        let x_scale_fp = (((other_w as i64) << REF_SCALE_SHIFT) / this_w as i64) as i32;
+        let y_scale_fp = (((other_h as i64) << REF_SCALE_SHIFT) / this_h as i64) as i32;
+        ScaleFactors {
+            x_scale_fp,
+            y_scale_fp,
+            x_step_q4: scale_value(SUBPEL_SHIFTS, x_scale_fp),
+            y_step_q4: scale_value(SUBPEL_SHIFTS, y_scale_fp),
+        }
+    }
+
+    /// `vp9_is_valid_scale`.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.x_scale_fp != REF_INVALID_SCALE && self.y_scale_fp != REF_INVALID_SCALE
+    }
+
+    /// `vp9_is_scaled`.
+    pub(crate) fn is_scaled(&self) -> bool {
+        self.is_valid() && (self.x_scale_fp != REF_NO_SCALE || self.y_scale_fp != REF_NO_SCALE)
+    }
+
+    fn scale_x(&self, val: i32) -> i32 {
+        scale_value(val, self.x_scale_fp)
+    }
+
+    fn scale_y(&self, val: i32) -> i32 {
+        scale_value(val, self.y_scale_fp)
+    }
+
+    /// `vp9_scale_mv` (`vp9_scale.c:29`): the block MV scaled to the
+    /// reference's resolution plus the sub-pixel offset of the block's own
+    /// scaled position. Returns `(row, col)` in 1/16-pel units.
+    ///
+    /// `x`/`y` are the block's coordinates in the CURRENT frame (libvpx
+    /// passes `mi_x + x`, `mi_y + y` — luma units even for chroma planes; the
+    /// sub-8x8 chroma offsets are always 0, so the mismatch never bites).
+    pub(crate) fn scale_mv(&self, mv: (i32, i32), x: i32, y: i32) -> (i32, i32) {
+        let x_off_q4 = self.scale_x(x << SUBPEL_BITS) & SUBPEL_MASK;
+        let y_off_q4 = self.scale_y(y << SUBPEL_BITS) & SUBPEL_MASK;
+        (self.scale_y(mv.0) + y_off_q4, self.scale_x(mv.1) + x_off_q4)
+    }
+}
 
 /// `vp9_filter_kernels` (`vp9/common/vp9_filter.c:79`), in libvpx's filter
 /// numbering: 0 `EIGHTTAP`, 1 `EIGHTTAP_SMOOTH`, 2 `EIGHTTAP_SHARP`,
@@ -223,6 +312,9 @@ fn build_mc_border(
 /// `convolve_horiz` / `convolve_avg_horiz` (`vpx_dsp/vpx_convolve.c:22`).
 /// `origin` is the block's first sample in `buf`; taps are read from
 /// `origin + y*stride + (x_q4 >> SUBPEL_BITS) - (SUBPEL_TAPS / 2 - 1) + k`.
+/// `x_step` advances `x_q4` per output sample — `SUBPEL_SHIFTS` for an
+/// unscaled reference, `sf->x_step_q4` (the scaled sampler, also used by
+/// `vpx_scaled_horiz`) otherwise.
 #[allow(clippy::too_many_arguments)]
 fn convolve_horiz(
     buf: &[u8],
@@ -232,6 +324,7 @@ fn convolve_horiz(
     dst_stride: usize,
     f: &[[i16; TAPS]; SUBPEL_SHIFTS as usize],
     x0_q4: i32,
+    x_step: i32,
     w: usize,
     rows: usize,
     avg: bool,
@@ -253,12 +346,15 @@ fn convolve_horiz(
             } else {
                 v as u8
             };
-            x_q4 += SUBPEL_SHIFTS;
+            x_q4 += x_step;
         }
     }
 }
 
 /// `convolve_vert` / `convolve_avg_vert` (`vpx_dsp/vpx_convolve.c:80`).
+/// `y_step` advances `y_q4` per output sample (`SUBPEL_SHIFTS` unscaled,
+/// `sf->y_step_q4` for `vpx_scaled_vert`).
+#[allow(clippy::too_many_arguments)]
 fn convolve_vert(
     buf: &[u8],
     stride: usize,
@@ -267,6 +363,7 @@ fn convolve_vert(
     dst_stride: usize,
     f: &[[i16; TAPS]; SUBPEL_SHIFTS as usize],
     y0_q4: i32,
+    y_step: i32,
     w: usize,
     h: usize,
     avg: bool,
@@ -289,15 +386,18 @@ fn convolve_vert(
             } else {
                 v as u8
             };
-            y_q4 += SUBPEL_SHIFTS;
+            y_q4 += y_step;
         }
     }
 }
 
 /// `inter_predictor` + `sf->predict` (`vp9/common/vp9_reconinter.h:23`,
-/// `vp9/common/vp9_scale.c:79`): for the unscaled case `predict[0][0]` is
-/// copy/avg, `predict[0][1][*]` the vertical kernel, `predict[1][0][*]` the
-/// horizontal one and `predict[1][1][*]` the 2D convolve.
+/// `vp9/common/vp9_scale.c:79`): the kernel is picked by
+/// `predict[subpel_x != 0][subpel_y != 0][avg]`. Unscaled that is
+/// copy/avg, the vertical, the horizontal and the 2D convolve; with a scaled
+/// reference the table collapses to the scaled variants (`vpx_scaled_horiz` /
+/// `vpx_scaled_vert` — the same walk with `x_step_q4` / `y_step_q4` — and
+/// `vpx_scaled_2d`), reproduced here by the step-aware convolve helpers.
 ///
 /// `w` x `h` output samples written at `dst`; `buf`/`origin` locate the
 /// block's first reference sample. `temp` is the `vpx_convolve8` intermediate
@@ -313,11 +413,37 @@ fn inter_predictor(
     f: &[[i16; TAPS]; SUBPEL_SHIFTS as usize],
     subpel_x: i32,
     subpel_y: i32,
+    x_step: i32,
+    y_step: i32,
     w: usize,
     h: usize,
     avg: bool,
     temp: &mut [u8],
 ) {
+    let scaled_x = x_step != SUBPEL_SHIFTS;
+    let scaled_y = y_step != SUBPEL_SHIFTS;
+    if scaled_x || scaled_y {
+        // sf->predict with a scaled axis (vp9_scale.c:79-110): an unscaled
+        // axis keeps its 1D kernel only when the other axis has no subpel
+        // offset; anything else is the 2D scaled convolve.
+        if !scaled_x && subpel_x == 0 {
+            convolve_vert(
+                buf, stride, origin, dst, dst_stride, f, subpel_y, y_step, w, h, avg,
+            );
+            return;
+        }
+        if !scaled_y && subpel_y == 0 {
+            convolve_horiz(
+                buf, stride, origin, dst, dst_stride, f, subpel_x, x_step, w, h, avg,
+            );
+            return;
+        }
+        convolve_2d(
+            buf, stride, origin, dst, dst_stride, f, subpel_x, subpel_y, x_step, y_step, w, h, avg,
+            temp,
+        );
+        return;
+    }
     if subpel_x == 0 && subpel_y == 0 {
         for y in 0..h {
             for x in 0..w {
@@ -333,20 +459,67 @@ fn inter_predictor(
         return;
     }
     if subpel_y == 0 {
-        convolve_horiz(buf, stride, origin, dst, dst_stride, f, subpel_x, w, h, avg);
+        convolve_horiz(
+            buf,
+            stride,
+            origin,
+            dst,
+            dst_stride,
+            f,
+            subpel_x,
+            SUBPEL_SHIFTS,
+            w,
+            h,
+            avg,
+        );
         return;
     }
     if subpel_x == 0 {
-        convolve_vert(buf, stride, origin, dst, dst_stride, f, subpel_y, w, h, avg);
+        convolve_vert(
+            buf,
+            stride,
+            origin,
+            dst,
+            dst_stride,
+            f,
+            subpel_y,
+            SUBPEL_SHIFTS,
+            w,
+            h,
+            avg,
+        );
         return;
     }
-    // vpx_convolve8_c: horizontal pass into a stride-64 intermediate with
-    // `intermediate_height = (((h - 1) * y_step_q4 + y0_q4) >> SUBPEL_BITS) +
-    // SUBPEL_TAPS` — for the unscaled `y_step_q4 = 16` that is `h + SUBPEL_TAPS
-    // - 1`. The horizontal pass starts `SUBPEL_TAPS / 2 - 1` rows ABOVE the
-    // block (C passes `src - src_stride * (SUBPEL_TAPS / 2 - 1)`).
-    let intermediate_height =
-        (((h as i32 - 1) * SUBPEL_SHIFTS + subpel_y) >> SUBPEL_BITS) as usize + TAPS;
+    convolve_2d(
+        buf, stride, origin, dst, dst_stride, f, subpel_x, subpel_y, x_step, y_step, w, h, avg,
+        temp,
+    );
+}
+
+/// `vpx_convolve8_c` / `vpx_convolve8_avg_c` (`vpx_dsp/vpx_convolve.c:158`) =
+/// `vpx_scaled_2d` / `vpx_scaled_avg_2d`: horizontal pass into a stride-64
+/// intermediate with `intermediate_height = (((h - 1) * y_step_q4 + y0_q4) >>
+/// SUBPEL_BITS) + SUBPEL_TAPS`, then the vertical pass. The horizontal pass
+/// starts `SUBPEL_TAPS / 2 - 1` rows ABOVE the block (C passes
+/// `src - src_stride * (SUBPEL_TAPS / 2 - 1)`).
+#[allow(clippy::too_many_arguments)]
+fn convolve_2d(
+    buf: &[u8],
+    stride: usize,
+    origin: isize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    f: &[[i16; TAPS]; SUBPEL_SHIFTS as usize],
+    subpel_x: i32,
+    subpel_y: i32,
+    x_step: i32,
+    y_step: i32,
+    w: usize,
+    h: usize,
+    avg: bool,
+    temp: &mut [u8],
+) {
+    let intermediate_height = (((h as i32 - 1) * y_step + subpel_y) >> SUBPEL_BITS) as usize + TAPS;
     let temp_origin = (TAPS as isize / 2 - 1) * 64;
     convolve_horiz(
         buf,
@@ -356,6 +529,7 @@ fn inter_predictor(
         64,
         f,
         subpel_x,
+        x_step,
         w,
         intermediate_height,
         false,
@@ -366,7 +540,19 @@ fn inter_predictor(
         // `temp[..64 * 135]` is the horizontal intermediate; the region after
         // it is the 2D result.
         let (horiz, mid2) = temp.split_at_mut(64 * 135);
-        convolve_vert(horiz, 64, temp_origin, mid2, w, f, subpel_y, w, h, false);
+        convolve_vert(
+            horiz,
+            64,
+            temp_origin,
+            mid2,
+            w,
+            f,
+            subpel_y,
+            y_step,
+            w,
+            h,
+            false,
+        );
         for y in 0..h {
             for x in 0..w {
                 let d = y * dst_stride + x;
@@ -383,6 +569,7 @@ fn inter_predictor(
         dst_stride,
         f,
         subpel_y,
+        y_step,
         w,
         h,
         false,
@@ -402,9 +589,12 @@ pub(crate) struct RefPlane<'a> {
     pub height: usize,
 }
 
-/// `dec_build_inter_predictors` (`vp9/decoder/vp9_decodeframe.c:593`),
-/// unscaled: predict one `w` x `h` plane block whose top-left is plane pixel
-/// `(x, y)` inside the block at MI `(mi_row, mi_col)`.
+/// `dec_build_inter_predictors` (`vp9/decoder/vp9_decodeframe.c:593`):
+/// predict one `w` x `h` plane block whose top-left is plane pixel `(x, y)`
+/// inside the block at MI `(mi_row, mi_col)`. `sf` is the reference's scale
+/// factors; when they scale, the block is mapped into the reference frame
+/// (`scale_value_x/y`), the MV is scaled with it (`vp9_scale_mv`) and the
+/// convolve steps by `x_step_q4` / `y_step_q4`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_inter_predictors(
     dst: &mut [u8],
@@ -425,50 +615,81 @@ pub(crate) fn build_inter_predictors(
     ss_y: usize,
     kernel: usize,
     avg: bool,
+    sf: &ScaleFactors,
     scratch: &mut Vec<u8>,
     temp: &mut Vec<u8>,
 ) {
+    let is_scaled = sf.is_scaled();
     let mv_q4 = clamp_mv_to_umv_border_sb(
         mv, w as i32, h as i32, mb_left, mb_right, mb_top, mb_bottom, ss_x, ss_y,
     );
 
     // Co-ordinate of the containing block, pixel precision, plus the
     // block-relative offset (`x`, `y`).
-    let x0_pre = (-mb_left >> (3 + ss_x)) + x as i32;
-    let y0_pre = (-mb_top >> (3 + ss_y)) + y as i32;
-    let x0_16 = (x0_pre << SUBPEL_BITS) + mv_q4.1;
-    let y0_16 = (y0_pre << SUBPEL_BITS) + mv_q4.0;
-    let subpel_x = mv_q4.1 & SUBPEL_MASK;
-    let subpel_y = mv_q4.0 & SUBPEL_MASK;
+    let x_pre = (-mb_left >> (3 + ss_x)) + x as i32;
+    let y_pre = (-mb_top >> (3 + ss_y)) + y as i32;
+    let (x_step, y_step, scaled_mv);
+    let (x0_16, y0_16, x0_pre, y0_pre);
+    if is_scaled {
+        // The block is mapped into the reference frame at 1/16-pel (the
+        // `x0_16` used for the border extent) and at pixel precision (`x0`,
+        // which shifts by the scaled MV's integer part below).
+        let x0 = sf.scale_x(x_pre);
+        let y0 = sf.scale_y(y_pre);
+        scaled_mv = sf.scale_mv(
+            mv_q4,
+            mi_col as i32 * 8 + x as i32,
+            mi_row as i32 * 8 + y as i32,
+        );
+        x_step = sf.x_step_q4;
+        y_step = sf.y_step_q4;
+        x0_16 = sf.scale_x(x_pre << SUBPEL_BITS) + scaled_mv.1;
+        y0_16 = sf.scale_y(y_pre << SUBPEL_BITS) + scaled_mv.0;
+        x0_pre = x0;
+        y0_pre = y0;
+    } else {
+        scaled_mv = mv_q4;
+        x_step = SUBPEL_SHIFTS;
+        y_step = SUBPEL_SHIFTS;
+        x0_16 = (x_pre << SUBPEL_BITS) + scaled_mv.1;
+        y0_16 = (y_pre << SUBPEL_BITS) + scaled_mv.0;
+        x0_pre = x_pre;
+        y0_pre = y_pre;
+    }
+    let subpel_x = scaled_mv.1 & SUBPEL_MASK;
+    let subpel_y = scaled_mv.0 & SUBPEL_MASK;
 
     let frame_width = refp.width as i32;
     let frame_height = refp.height as i32;
     // `buf_ptr = ref_frame + y0 * stride + x0` is taken AFTER the MV integer
     // part but BEFORE the tap padding below, so the direct read keeps its own
     // copy of the coordinates.
-    let x0_mv = x0_pre + (mv_q4.1 >> SUBPEL_BITS);
-    let y0_mv = y0_pre + (mv_q4.0 >> SUBPEL_BITS);
+    let x0_mv = x0_pre + (scaled_mv.1 >> SUBPEL_BITS);
+    let y0_mv = y0_pre + (scaled_mv.0 >> SUBPEL_BITS);
     let mut x0 = x0_mv;
     let mut y0 = y0_mv;
 
     let f = &FILTERS[kernel];
-    let _ = mi_col;
-    let _ = mi_row;
 
     // `is_scaled || scaled_mv.col || scaled_mv.row || (frame_width & 7) ||
     // (frame_height & 7)`: the border copy is skipped only when the window is
     // provably inside the frame.
-    if mv_q4.1 != 0 || mv_q4.0 != 0 || (frame_width & 7) != 0 || (frame_height & 7) != 0 {
-        let mut x1 = ((x0_16 + (w as i32 - 1) * SUBPEL_SHIFTS) >> SUBPEL_BITS) + 1;
-        let mut y1 = ((y0_16 + (h as i32 - 1) * SUBPEL_SHIFTS) >> SUBPEL_BITS) + 1;
+    if is_scaled
+        || scaled_mv.1 != 0
+        || scaled_mv.0 != 0
+        || (frame_width & 7) != 0
+        || (frame_height & 7) != 0
+    {
+        let mut x1 = ((x0_16 + (w as i32 - 1) * x_step) >> SUBPEL_BITS) + 1;
+        let mut y1 = ((y0_16 + (h as i32 - 1) * y_step) >> SUBPEL_BITS) + 1;
         let mut x_pad = false;
         let mut y_pad = false;
-        if subpel_x != 0 {
+        if subpel_x != 0 || x_step != SUBPEL_SHIFTS {
             x0 -= INTERP_EXTEND - 1;
             x1 += INTERP_EXTEND;
             x_pad = true;
         }
-        if subpel_y != 0 {
+        if subpel_y != 0 || y_step != SUBPEL_SHIFTS {
             y0 -= INTERP_EXTEND - 1;
             y1 += INTERP_EXTEND;
             y_pad = true;
@@ -507,6 +728,8 @@ pub(crate) fn build_inter_predictors(
                 f,
                 subpel_x,
                 subpel_y,
+                x_step,
+                y_step,
                 w,
                 h,
                 avg,
@@ -528,6 +751,8 @@ pub(crate) fn build_inter_predictors(
         f,
         subpel_x,
         subpel_y,
+        x_step,
+        y_step,
         w,
         h,
         avg,
