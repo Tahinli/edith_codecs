@@ -64,6 +64,12 @@ const REFUSALS: &[&str] = &[
     // still runs: it now reports `reached = 0` with the same non-vacuous
     // premise (allow_intrabc frames + decoded sub-8 leaves).
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
+    // lane-av1txr: the silent-garbage guard. A 4:4:4/4:2:2 stream used to
+    // decode with no refusal and wrong pixels (every chroma extent is
+    // hardcoded 4:2:0, the probe emits 4:2:0 planes only); it is now refused
+    // at the sequence header. Gate:
+    // `a_non_420_subsampled_sequence_header_is_refused_by_name`.
+    "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
     // lane-lossless/lane-lossless2: a lossless frame (base_q_idx 0) decodes
     // sample-exact, KEY and INTER -- TX_4X4 with the Walsh-Hadamard transform
     // on every plane, no `tx_type` symbol, `is_cfl_allowed` narrowed to a
@@ -306,6 +312,14 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         "a_twelve_bit_sequence_header_is_refused_by_name",
+    ),
+    // lane-av1txr: the guard's own gate builds a profile-1 and a profile-2
+    // sequence header by hand and asserts each refuses by name while the
+    // profile-0 CONTROL still decodes -- the refusal is exercised, not merely
+    // present.
+    (
+        "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
+        "a_non_420_subsampled_sequence_header_is_refused_by_name",
     ),
     (
         "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
