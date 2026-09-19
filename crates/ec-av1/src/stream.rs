@@ -2016,6 +2016,84 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1-decode (pilot resume, 2026-09-19): a real libaom MONOCHROME key
+    /// frame is currently REFUSED BY NAME, and this gate pins that as today's
+    /// measured first stop for a real encoder stream.
+    ///
+    /// The parked lane's first wall (64x64 superblock-level partition arms) is
+    /// ALREADY CLOSED on this tree (both user films decode byte-exact; the
+    /// SB-level HORZ/VERT/AB/1:4 arms are witness-gated), so the re-measurement
+    /// this gate belongs to had to find where a real stream stops TODAY. A
+    /// `-pix_fmt gray` encode of the crate's own fixture recipe does.
+    ///
+    /// Root cause (localised with `EC_TRACE_MODE_STEP` on the instrumented
+    /// aomdec oracle vs this decoder, both over the same OBU): on the mono
+    /// stream ours reads `angle_uv` at `rng=50996`, while aomdec reads NO
+    /// `uv_mode`/`angle_uv` at all (the guard below); the first divergence at
+    /// `(0,0)` is aomdec reading `tx_depth ctx=0 cat=1` (`rng=43616`) where
+    /// ours reads a `uv_mode` (val=13). libaom's
+    /// `decodemv.c` guards that read with
+    /// `if (!cm->seq_params->monochrome && xd->is_chroma_ref)`: a monochrome
+    /// frame codes NO `uv_mode`/`cfl`/`angle_delta_uv`/`palette_uv` at all,
+    /// while this decoder's block layer has no `num_planes`/monochrome notion
+    /// and reads them for every block. That is the whole desync; the
+    /// "a Golomb tail longer than this decoder reads" refusal is the SYMPTOM
+    /// (the reader is left mid-symbol), not the defect -- which is why that
+    /// string's PROVEN claim ("read_golomb_reads_every_value_a_conformant_stream_can_carry")
+    /// does not contradict this gate.
+    ///
+    /// The twin 4:2:0 encode of the SAME source and recipe decodes, so this is
+    /// a monochrome defect and not a recipe defect. When monochrome decode
+    /// lands, flip this gate to a witness (decode BOTH twins pixel-exact
+    /// against ffmpeg); the refusal string is the tripwire.
+    #[test]
+    fn a_real_libaom_monochrome_key_frame_is_refused_by_name() {
+        const NAME: &str = "a_real_libaom_monochrome_key_frame_is_refused_by_name";
+        const REFUSAL: &str = "a Golomb tail longer than this decoder reads";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let emit = |pix: &str| -> Vec<u8> {
+            let out = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=320x240:rate=30:duration=2", "-pix_fmt", pix,
+                    "-c:v", "libaom-av1", "-cpu-used", "8", "-b:v", "300k", "-f", "obu", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: ffmpeg ({pix}) failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        // CONTROL: the identical recipe at 4:2:0 decodes -- so the refusal below
+        // is about monochrome, not about the source or the encoder settings.
+        let twin = decode_stream(&emit("yuv420p")).expect("the 4:2:0 twin must decode");
+        assert!(!twin.is_empty(), "{NAME}: the 4:2:0 twin decoded no frames");
+        let err = decode_stream(&emit("gray"))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| {
+                panic!("{NAME}: the monochrome stream now decodes -- flip this gate to a witness")
+            });
+        assert!(
+            err.contains(REFUSAL),
+            "{NAME}: the monochrome stream stopped without the measured refusal \
+             {REFUSAL:?} -- the desync moved; re-measure before trusting this gate. got: {err}"
+        );
+        eprintln!(
+            "{NAME}: 4:2:0 twin {} frames, monochrome refused by name ({REFUSAL})",
+            twin.len()
+        );
+    }
+
     /// lane-t900 r25: the refusal "a frame OBU with no tile group" names a
     /// shape the parser cannot hand [`decode_stream`].
     ///
