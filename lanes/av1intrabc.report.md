@@ -31,9 +31,12 @@ In-gate (flipped pin -> witness): `stream::tests::
 a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips`. Its
 `testsrc2-cq50-txs0` arm used to stop at the rect-strip refusal; it now decodes
 1 frame, **1 intrabc block on a HORZ/VERT rect strip**, pixel-exact vs ffmpeg.
-Gate totals (re-measured, reviewer-corrected): **2** intrabc blocks over **2**
-arms -- 4 arms decode ZERO intrabc blocks (out of scope), 187 rect
-`use_intrabc` reads, 8 frames compared, 0 mismatches, 0 named refusals.
+Gate totals (re-measured at r4, on the committed tree): **5** intrabc blocks
+over **5** arms -- 3 arms decode ZERO intrabc blocks (out of scope), 187 rect
+`use_intrabc` reads, 8 frames compared, 0 mismatches, 0 named refusals, 1
+intrabc block on a HORZ/VERT rect strip. The r4 gate
+`a_coded_rect_intrabc_block_reconstructs_in_both_orientations` adds 3 more
+byte-exact frames (HORZ coded, VERT coded, TX_MODE_SELECT).
 
 Standalone recipes (aomenc oracle at `~/.cache/aom-oracle/build/aomenc`, probe
 `cargo run --release -p ec-av1 --example decode_probe -- <obu>`):
@@ -240,3 +243,127 @@ ORDER/WEIGHT, not the DV syntax.
   TX_MODE_SELECT gate is still red); the batch-level suite run stays deferred.
 
 `deferred(DV-predictor candidate ordering at mi(84,104))`
+
+## 4d. Round 4 (2026-09-20) -- the DV predictor's root cause is BLOCK COVERAGE, not candidate weighting; stream B is byte-exact
+
+The remaining defect was localized to a single wrong DV at `mi(84,104)` on the
+512x384 stream, with identical coded diff and identical post-read range. The
+task named candidate ORDER/WEIGHT; the order was indeed wrong, but the cause is
+one level down: **our intrabc MV grid only contained the intrabc blocks.**
+
+### Mechanism (measured, not inferred)
+
+libaom's `setup_ref_mv_list` row/col scans walk `xd->mi[]`, which holds an
+`MB_MODE_INFO` for EVERY coded block, and step by
+`mi_size_wide/height[candidate->bsize]`. Our `MiGrid` was filled only by
+`record_intrabc_mi_rect`, so every intra non-intrabc neighbour read as
+`None` and the scan advanced that cell by ONE instead of by the neighbour's
+real width. At `mi(84,104)` (16x16, `bsize=6`) the row scan's extended offset
+`-3` therefore over-reached from libaom's last probe `(81,106)` (the 8x16
+intrabc voting `-520`) to `(81,108)` -- a 16x16 intrabc voting `-512` with a
+16-wide (`len 4 * weight 4`) contribution libaom never makes.
+
+Instrumented oracle (`~/.cache/aom-oracle`, new `EC_TRACE_STACK` /
+`EC_TRACE_STACK2` prints in `setup_ref_mv_list` + `scan_row_mbmi` /
+`scan_col_mbmi` / `scan_blk_mbmi`):
+
+```
+O  EC_STACK mi_row=84 mi_col=104 ref=0 w=4 h=4 cnt=2 near_match=1 ref_match=1 \
+     [0 w=656 mv=(-520,0)] [1 w=648 mv=(-512,0)]
+U  EC_STACK_OURS mi_row=84 mi_col=104 ... n=2 near_match=1 ref_match=1 prows=6 pcols=0
+     [0 w=648 mv=(-520,0)] [1 w=664 mv=(-512,0)]
+```
+
+libaom's `-520` votes: `4` (row `-1`) + `4` (row `-3`) + `8` (row `-5`) = `16`
+(`640 + 16 = 656`); `-512`'s: `4` (top-right `(83,108)`) + `4` (corner
+`(83,103)`) = `8` (`648`). Ours lost `-520`'s `8` (the row `-5` contribution)
+and gained `-512` `+16` from the over-reach, so the weight sort flipped:
+`nearestmv` became `-512` where libaom's is `-520`, and
+`dv = ref + diff = -512 + 8 = -504` instead of `-520 + 8 = -512`. One whole-pel
+wrong `skip == 1` copy; the 528 wrong luma samples are that copy plus the
+region that inherits its 1-px shift.
+
+### Fix
+
+`MiGrid` gained a block-COVERAGE map (`cover: Vec<[u8; 2]>`, the covering
+coded block's own `(width, height)` in mi units) with `MiGrid::cover_rect`;
+`MiGrid::get` returns the stored `MiInfo` when there is one and otherwise
+synthesizes a non-inter entry (`is_inter == false`, zero MV) from the cover, so
+a candidate that casts no vote still advances the scan by its real width --
+exactly libaom's `xd->mi[]` semantics. `single_ref_match` rejects a non-inter
+unit, so a synthetic entry can never vote.
+
+The map is published for EVERY coded block from `Neighbours::fill_lf_grid_rect`
+(the one place every block's mi span already passes through, paired 1:1 with
+`fill_skip_grid_rect`), and only when the frame has an MV grid at all
+(`intrabc_mi_grid` is `Some` exactly when `allow_intrabc`), so an inter frame
+and the tile writer's own grid are untouched: an unfilled cover reads as
+uncovered and reproduces the old `None`-per-cell behaviour exactly.
+
+### Byte-exactness after the fix
+
+| stream | before | now |
+|---|---|---|
+| B 512x384 testsrc2 cq45 `--enable-palette=1 --enable-tx-size-search=0` | 528/294912 luma | **BYTE-EXACT** (`cmp` vs ffmpeg `-pix_fmt yuv420p`) |
+| A 256x192 testsrc2 cq45 var-tx (`--enable-tx-size-search=1`) | BYTE-EXACT | **BYTE-EXACT** |
+
+Standalone arms re-run (all `cmp`-exact against ffmpeg): `cq50p0-txs0`,
+`cq45p0-txs0`, `cq45p1-txs0`, `cq50p0-txs0`, `cq50p0-1to4-off`, `minp4`
+(`--min-partition-size=4 --max-partition-size=16`), `cq50-txs1-1to4-off`. The
+`(84,104)` DV trace now reads `dv_row=-512 rng=33207`, the oracle's own value.
+
+### New reviewer-unblock gate
+
+`stream::tests::a_coded_rect_intrabc_block_reconstructs_in_both_orientations`
+-- three arms, ALL frames byte-exact against ffmpeg, each asserting the arm
+reconstructed a CODED (`skip == 0`) rect intrabc block in the orientation it
+names:
+
+- `horz-coded-256-cq45-pal0-txs0` -- 16x8 coded strip, HORZ.
+- `vert-coded-512-cq45-pal1-txs0` -- 8x16 coded strip, VERT, **and the
+  DV-predictor regression stream** (this is stream B).
+- `txmode-select-256-cq45-pal0-txs1` -- stream A's shape; the arm re-derives
+  `tx_mode == Select && allow_intrabc` out of the frame header rather than
+  trusting the encoder flags.
+
+New instrument `decode::intrabc_rect_coded_hits() -> [horz, vert]` (bumped in
+`decode_intrabc_rect` when `!skip`, indexed by `bh > bw`): the old
+`intrabc_rect_hits` counts neither the skip flag nor the orientation, so an arm
+that quietly became all-skip or single-orientation would keep it green
+(`gate-blind-to-feature`).
+
+**Non-vacuity (fail-pre-fix, measured):** with only the `MiGrid::get` cover
+fallback neutralized (the fix's load-bearing line) and nothing else touched,
+the gate fails exactly where it must --
+
+```
+horz-coded-256-cq45-pal0-txs0 ... exact, coded rect intrabc horz=1 vert=0
+vert-coded-512-cq45-pal1-txs0 frame 0 does not match ffmpeg
+test ... FAILED
+```
+
+and passes again with the line restored.
+
+### Gates run this round
+
+- `cargo check -p ec-av1 --all-targets` -> 0 warnings.
+- New gate (3 arms, 3 frames, byte-exact; fail-pre-fix proven above).
+- `a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips` -> ok
+  (187 rect reads, 5 intrabc blocks over 5 arms, 8 frames compared, 0
+  refused, 0 mismatched, 1 rect-strip block).
+- `an_intrabc_block_under_tx_mode_select_decodes_pixel_exact` -> ok
+  (cq30 16 blocks / 1 var-tx, cq45 12 blocks / 3 var-tx).
+- Refusal suite `-- refusal` -> **21 passed**. `hunger_games` -> 3 passed.
+  `monochrome` -> 1 passed. `cdf` -> 13 passed. `non_420` -> 1 passed.
+- Full `--lib` suite: FILLED IN BELOW by the round-4 batch run on the committed tree.
+
+### Deferred / open
+
+- 1:4 pair-strip intrabc -- unchanged, named in §3.
+- The cover records the mi span its `fill_lf_grid_rect` caller passes; a
+  sub-8x8 leaf publishes a 4x4 (1x1 mi) or an 8x8-square span exactly as its
+  own `fill_skip_grid`/`fill_lf_grid` call already does, so the coverage map
+  inherits that convention. No gate or arm reaches a sub-8x8 neighbour of an
+  intrabc block today; if one ever does, the leaf's true `bsize` dims are what
+  libaom's `mi_size_wide/height[candidate->bsize]` would report.
+
