@@ -541,3 +541,89 @@ if header.quantization.using_qmatrix {
 Unchanged from §9.7. This round closes the census hole; the warped key-frame
 tx-depth context (§9.4) and the 1:4-rect-strip intrabc (lane 3) are still open.
 
+## MERGE-SIDE FOLLOW-UPS (merge 10e3b8d1, 2026-09-20)
+
+**Merge commit.** `10e3b8d1`, parents `92e5ec48` + `8d8413f0` — a real
+`--no-ff` merge, not a fast-forward. Main had absorbed `lane-av1-mono`
+(7806fd0d) and `lane-av1-hdr` (e03f7173) since this lane's base `0cfb9af5`,
+both also touching `stream.rs`.
+
+**Create-list audit.** Exactly seven paths: the six `crates/ec-av1/` files the
+lane's own diffstat listed plus `lanes/av1txrouting.report.md` (new). No junk,
+no duplicate file, no fixture.
+
+**Conflicts (3 hunks) and their resolution — combined, never a side.**
+
+- `decode.rs` `read_intra_mode_sub8`: the lane's return type (its third value
+  carries the intrabc DV) **plus** mono's `has_chroma && !mono(fctx)` fold.
+  Ours' side of the hunk carried the pre-lane signature line, so a naive
+  concatenation leaves two `-> Result<...>` lines; the duplicate was deleted.
+- `stream.rs` `decode_frame`: additive — **both** per-frame setters kept
+  (mono's `set_mono`, then the lane's `set_disable_cdf_update`).
+- `stream.rs` tests: the lane's `a_non_420_...` and
+  `a_frame_using_quantisation_matrices_...` gates land ahead of mono's
+  witness; the pilot's monochrome pin stays dropped in favour of
+  `a_real_libaom_monochrome_key_frame_decodes_pixel_exact`, and the pin's doc
+  header was dropped with it. A scripted combine first placed the lane's two
+  tests **between** mono's doc header and its body (a doc block attached to
+  the wrong item with zero conflict markers); the resolved region was read as
+  a structure, not marker-grepped, and the header moved back above its body.
+
+**Two-way content proof.** Filtering hunk headers/context and comparing only
+added/removed lines: the staged tree's delta vs main equals the lane's own
+delta line-for-line (787 insertions / 64 deletions, identical per-file counts)
+and its delta vs the lane equals main's delta (651/94). Marker grep on all six
+resolved files: none.
+
+**Merged-tree gates** (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1txrmerge`,
+`TMPDIR=$HOME/.cache/tmp-av1txrmerge`):
+
+- `cargo check -p ec-av1 --all-targets` — **0 warnings** (forced re-check).
+- `cargo test -p ec-av1 --lib -- --nocapture` — literal line:
+  `test result: ok. 598 passed; 0 failed; 60 ignored; 0 measured; 0 filtered
+  out; finished in 6708.37s`. The count is `594` (main after av1hdr) + the
+  lane's **four** tests (three in `stream.rs`, `msac::tests::
+  a_reader_told_not_to_adapt_matches_a_non_adapting_writer`) = 598; the
+  charter's 596-597 estimate was low by the msac unit test. `598 + 60 = 658`
+  total. The pin `a_real_libaom_monochrome_key_frame_is_refused_by_name` is
+  absent from the run.
+- Gate evidence inside that run: monochrome *"4:2:0 twin 60 frames,
+  monochrome 60 frames byte-exact vs ffmpeg"*; qmatrix *"qm-off control 3
+  frames, qm-on refused by name"*; cdf *"3 disable_cdf_update frame headers,
+  all frames sample-exact"*; the mixed-lossless witness's 3 arms each
+  *"1 mixed frame(s), refused by name"*; the guard-arm enumeration test ok.
+
+**Behavior probes on the merged tree** (built `decode_probe` from the merged
+tree, private target dir; all six PASS): gray 60-frame key frame luma
+byte-exact (4,608,000 B); `av1-monochrome.ivf` remuxed to OBU, 60 frames luma
+byte-exact; `av1-profile1-444.ivf` refused by name (`a chroma format other than
+4:2:0`); an `aomenc --enable-qm=0` control decodes byte-exact while
+`--enable-qm=1` refuses by name (`a frame using quantisation matrices`); an
+`aomenc --cdf-update-mode=0` stream carries `disable_cdf=true` on every frame
+header and is byte-exact vs ffmpeg; `hbd-r5/hunger.obu` (3840x1608, 72 shown
+frames) `EC_PROBE_OUT16` sha256
+`d7214bb733b4a6ca2d946d0fcb4849691191b694164383db110a4d9183436784` /
+1,333,739,520 B — the pilot hash, unchanged.
+
+**Report's own suite-count audit.** §9.6/§10.3 deliberately deferred the full
+suite to the verifier and quoted scoped runs only, so there is no truncated
+total to correct. The suite ran to completion here (above).
+
+**Cleanup.** Worktree `edith_codecs-av1txr` removed (branch `lane-av1-txrouting`
+kept at `8d8413f0`); `$HOME/.cache/cargo-target-av1txrmerge*` and
+`$HOME/.cache/tmp-av1txrmerge` removed.
+
+**Kept instruments** (the next lane's tools, not deleted): `EC_TRACE_MODE_STEP`
+ladder + the per-feature counters the probe prints, `EC_PROBE_OUT8/16`,
+`EC_PROBE_HDR`, the instrumented oracle at `$HOME/.cache/aom-oracle/build/`.
+
+**Tripwires for the next lane.** Three refusal pins now sit on main and each
+must be flipped to a witness by the lane that lands the capability:
+`a_non_420_subsampled_sequence_header_is_refused_by_name` (chroma extents other
+than 4:2:0) and `a_frame_using_quantisation_matrices_is_refused_by_name` (QM
+dequantisation) — the latter's panic message already says *"flip this gate to a
+witness"* when a qm stream decodes. `a_real_aomenc_stream_with_cdf_update_disabled_decodes_pixel_exact`
+is already the witness, not a pin. Open by this report's own §9.4/§9.7: the
+key-frame tx-depth context read through the TXFM bands (warped) and the
+1:4-rect-strip intrabc (lane 3), plus the mixed-leaf var-tx refusal that
+`allintra0` now stops at.
