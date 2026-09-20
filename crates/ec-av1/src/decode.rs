@@ -3725,6 +3725,22 @@ thread_local! {
     static INTRABC_RECT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Of those, how many read the INTER var-tx tree (unskipped, TX_MODE_SELECT).
     static INTRABC_RECT_VARTX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-intrabc r4: rect INTRABC blocks whose reconstruction
+    /// [`decode_intrabc_rect`] ran with `skip == 0` (a real residual read),
+    /// split by the strip's orientation -- `bw > bh` is a HORZ strip,
+    /// `bh > bw` a VERT one. The reviewer's unblock condition needs a CODED
+    /// witness in BOTH orientations, and the existing `INTRABC_RECT_HITS`
+    /// counts neither orientation nor the skip flag, so an arm that flipped
+    /// to an all-skip stream (no residual reader at all) would stay green.
+    static INTRABC_RECT_CODED_HITS: std::cell::Cell<[usize; 2]> =
+        const { std::cell::Cell::new([0, 0]) };
+}
+
+/// lane-av1-intrabc r4: coded (`skip == 0`) rect intrabc blocks reconstructed,
+/// as `[horz, vert]` -- see [`INTRABC_RECT_CODED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_rect_coded_hits() -> [usize; 2] {
+    INTRABC_RECT_CODED_HITS.with(std::cell::Cell::get)
 }
 
 /// Current value of [`INTRABC_RECT_HITS`].
@@ -3738,6 +3754,7 @@ pub fn intrabc_rect_hits() -> usize {
 pub(crate) fn reset_intrabc_rect_hits() {
     INTRABC_RECT_HITS.with(|c| c.set(0));
     INTRABC_RECT_VARTX_HITS.with(|c| c.set(0));
+    INTRABC_RECT_CODED_HITS.with(|c| c.set([0, 0]));
 }
 
 /// Current value of [`INTRABC_RECT_VARTX_HITS`].
@@ -7652,6 +7669,22 @@ impl Neighbours {
             fill_span(&mut self.ref_grid, start, w_mi, ref_frame);
             fill_span(&mut self.delta_lf_grid, start, w_mi, snapshot);
         }
+        // lane-av1-intrabc r4: publish this coded block's own mi footprint
+        // into the intrabc MV grid's block-COVERAGE map -- every coded block,
+        // not just the intrabc ones. A later intrabc block's DV predictor is
+        // built by libaom's own row/col scans over `xd->mi[]`, which holds an
+        // `MB_MODE_INFO` for EVERY block and steps by
+        // `mi_size_wide/height[candidate->bsize]`; without this footprint a
+        // non-intrabc neighbour reads as uncovered and the scan advances it
+        // by one cell instead of its real width (see `MiGrid::cover`'s own
+        // doc comment for the measured instance). A no-op outside an
+        // `allow_intrabc` frame -- [`crate::decode::FrameCtx::intrabc_mi_grid`]
+        // is `None` exactly then.
+        fctx.intrabc_mi_grid.with(|g| {
+            if let Some((grid, _, _)) = g.borrow_mut().as_mut() {
+                grid.cover_rect(mi_r, mi_c, w_mi, h_mi);
+            }
+        });
     }
 
     /// One var-tx / split-tx LEAF's own LUMA transform dims over its mi span.
@@ -10929,6 +10962,15 @@ fn decode_intrabc_rect(
     fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
     hit!(INTRABC_RECT_HITS);
+    if !skip {
+        // [horz, vert]: see `INTRABC_RECT_CODED_HITS`.
+        let idx = usize::from(bh > bw);
+        INTRABC_RECT_CODED_HITS.with(|c| {
+            let mut seen = c.get();
+            seen[idx] += 1;
+            c.set(seen);
+        });
+    }
     let (px, py) = (mi_c * MI, mi_r * MI);
     let (cpx, cpy) = (px / 2, py / 2);
     // `av1_get_max_uv_txsize(bw x bh)`: 4:2:0 halves the footprint and the
