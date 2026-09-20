@@ -70,6 +70,14 @@ const REFUSALS: &[&str] = &[
     // at the sequence header. Gate:
     // `a_non_420_subsampled_sequence_header_is_refused_by_name`.
     "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
+    // lane-av1txr-r2: the third member of the same silent-garbage family.
+    // `using_qmatrix`/`qm_y`/`qm_u`/`qm_v` are parsed by `ec-av1-syntax` but
+    // read by NOTHING on the decode path -- dequantisation is `base_q_idx` +
+    // the plane DC/AC deltas only -- so a real `aomenc --enable-qm=1` stream
+    // decoded with no refusal and wrong pixels (measured: byte-diff vs ffmpeg
+    // while the qm-off control is byte-exact). Refused at the frame header.
+    // Gate: `a_frame_using_quantisation_matrices_is_refused_by_name`.
+    "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
     // lane-lossless/lane-lossless2: a lossless frame (base_q_idx 0) decodes
     // sample-exact, KEY and INTER -- TX_4X4 with the Walsh-Hadamard transform
     // on every plane, no `tx_type` symbol, `is_cfl_allowed` narrowed to a
@@ -320,6 +328,14 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
         "a_non_420_subsampled_sequence_header_is_refused_by_name",
+    ),
+    // lane-av1txr-r2: the gate encodes the same source twice with real aomenc
+    // (`--enable-qm=1` and `--enable-qm=0`), asserts the qm-off CONTROL decodes
+    // and the qm-on stream is refused by name -- so the refusal is exercised
+    // against the exact encoder path it names, not merely present.
+    (
+        "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
+        "a_frame_using_quantisation_matrices_is_refused_by_name",
     ),
     (
         "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",

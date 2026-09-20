@@ -1631,6 +1631,24 @@ fn decode_frame(
             "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
         ));
     }
+    // lane-av1txr-r2: `quantization_params.using_qmatrix` (spec 5.9.12) is
+    // parsed by `ec-av1-syntax` along with `qm_y`/`qm_u`/`qm_v` (frame.rs
+    // :190-196, :1418-1426), but this decoder reads NONE of them: every
+    // dequantisation below is `base_q_idx` plus the plane DC/AC deltas only
+    // (`Quantizer::new`), so a stream that applies quantisation matrices
+    // dequantises every coefficient off the wrong table. The same
+    // silent-garbage class as the non-4:2:0 guard above. Measured: a real
+    // `aomenc --enable-qm=1` key frame (`using_qmatrix = 1`, `qm_y/u/v = 5`)
+    // decodes with NO refusal and its planes byte-differ from ffmpeg, while
+    // the `--enable-qm=0` control of the same source and recipe is
+    // byte-exact. Refuse by name rather than return garbage. Gate:
+    // `a_frame_using_quantisation_matrices_is_refused_by_name` below.
+    if header.quantization.using_qmatrix {
+        return Err(Error::unsupported(
+            "AV1 decode_stream",
+            "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
+        ));
+    }
     // lane-dpm1: a LOSSLESS frame (`qindex == 0` with zero deltas, spec 5.9.12)
     // is a different tile syntax, and this decoder has none of it: libaom
     // forces TX_4X4 with the WALSH-HADAMARD transform over every block (so no
@@ -2097,6 +2115,58 @@ pub(crate) mod tests {
         stream.extend_from_slice(&crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap());
         let frames = decode_stream(&stream).expect("the 4:2:0 control must decode");
         assert_eq!(frames.len(), 1, "{NAME}: the 4:2:0 control decoded no frame");
+    }
+
+    /// lane-av1txr-r2: a frame using quantisation matrices is refused by name
+    /// -- the THIRD member of the silent-garbage family the non-4:2:0 gate
+    /// above opened (the verifier's census miss).
+    ///
+    /// `using_qmatrix`/`qm_y`/`qm_u`/`qm_v` are parsed by `ec-av1-syntax`
+    /// (frame.rs:190-196, :1418-1426) but have NO consumer anywhere on the
+    /// decode path -- every dequantisation is `base_q_idx` plus the plane
+    /// DC/AC deltas only. Measured on a real aomenc pair (same source and
+    /// recipe, only `--enable-qm` flipped): the qm-OFF control decodes
+    /// byte-exact vs ffmpeg, the qm-ON stream used to decode with NO refusal
+    /// and byte-differ from ffmpeg (silent garbage; class
+    /// `refusal-hides-a-defect` read the other way -- a silent wrong decode
+    /// is worse than a named gap).
+    ///
+    /// Both arms are real encoder output, so this is a reachability gate, not
+    /// a hand-built construction: the qm-on arm carries `using_qmatrix = 1`
+    /// (`qm_y/u/v = 5` on the measured fixture) and the refusal names the
+    /// field rather than desyncing.
+    #[test]
+    fn a_frame_using_quantisation_matrices_is_refused_by_name() {
+        const NAME: &str = "a_frame_using_quantisation_matrices_is_refused_by_name";
+        const REFUSAL: &str = "a frame using quantisation matrices";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!(
+                "SKIP {NAME}: needs ffmpeg + an aomenc oracle at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        // CONTROL: the same source and recipe with quantisation matrices OFF
+        // still decodes -- so the refusal below is about the qm bit, not about
+        // the source or the encoder settings.
+        let (_, control) = census_attempt("testsrc2", 128, 96, 3, &["--enable-qm=0"]);
+        let frames = control.unwrap_or_else(|e| {
+            panic!("{NAME}: the --enable-qm=0 control must decode, got: {e}")
+        });
+        assert!(frames >= 1, "{NAME}: the qm-off control decoded no frame");
+        // The qm-on stream is the new refusal.
+        let (_, qm) = census_attempt("testsrc2", 128, 96, 3, &["--enable-qm=1"]);
+        let err = qm.err().unwrap_or_else(|| {
+            panic!("{NAME}: the --enable-qm=1 stream now decodes -- flip this gate to a witness")
+        });
+        assert!(
+            err.contains(REFUSAL),
+            "{NAME}: the qm-on stream stopped without the named refusal {REFUSAL:?} \
+             -- re-measure before trusting this gate. got: {err}"
+        );
+        eprintln!(
+            "{NAME}: qm-off control {frames} frames, qm-on refused by name ({REFUSAL})"
+        );
     }
 
     /// lane-av1-decode (pilot resume, 2026-09-19): a real libaom MONOCHROME key
