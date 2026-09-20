@@ -92,6 +92,12 @@ fn main() {
         println!("inter16_1to4: horz4={h4} vert4={v4} chroma_pairs={pairs} sub8_pieces={sub8}");
         let leaf4 = ec_av1::stream::vartx_rect_leaf4_hits();
         println!("vartx_rect_leaf4: 8x4={} 4x8={}", leaf4[0], leaf4[1]);
+        // lane-av1txr: intrabc 4x8/8x4 leaves that read the inter var-tx tree
+        // (the symbol whose absence desynced `warped.obu`).
+        println!(
+            "rect_intrabc_vartx: {}",
+            ec_av1::decode::rect_intrabc_vartx_hits()
+        );
         let rw = ec_av1::stream::rect_wedge_hits();
         let rwi = ec_av1::stream::rect_wii_hits();
         println!(

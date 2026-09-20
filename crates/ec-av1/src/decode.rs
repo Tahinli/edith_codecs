@@ -84,6 +84,12 @@ pub(crate) struct FrameCtx {
     /// (`decodeframe.c`), `read_tx_type` (`decodetxb.c`), `is_cfl_allowed`
     /// (`blockd.h`)).
     pub(crate) lossless_flag: std::cell::Cell<bool>,
+    /// lane-av1txr: this frame header's `disable_cdf_update` (spec 5.9.2).
+    /// When set, the tile reader must not adapt any CDF it reads, or its
+    /// tables drift away from the encoder's and the frame desyncs mid-tile
+    /// (libaom: `allow_update_cdf = allow_update_cdf &&
+    /// !cm->features.disable_cdf_update`, `decodeframe.c:2909`).
+    pub(crate) disable_cdf_update: std::cell::Cell<bool>,
     pub(crate) cdef_bits: std::cell::Cell<u8>,
     pub(crate) bit_depth: std::cell::Cell<u8>,
     /// lane-av1mono: the sequence header's `color_config.mono_chrome` (spec
@@ -183,6 +189,7 @@ impl FrameCtx {
             sb128_flag: std::cell::Cell::new(false),
             interp_filter: std::cell::Cell::new(crate::mc::InterpFilterKind::Regular),
             lossless_flag: std::cell::Cell::new(false),
+            disable_cdf_update: std::cell::Cell::new(false),
             cdef_bits: std::cell::Cell::new(0),
             bit_depth: std::cell::Cell::new(8),
             mono_chrome: std::cell::Cell::new(false),
@@ -388,6 +395,18 @@ pub(crate) fn set_lossless(v: bool, fctx: &crate::decode::FrameCtx) {
 /// This frame's `CodedLossless` -- see [`FrameCtx::lossless_flag`].
 pub(crate) fn lossless(fctx: &crate::decode::FrameCtx) -> bool {
     fctx.lossless_flag.with(|c| c.get())
+}
+
+/// Sets [`FrameCtx::disable_cdf_update`] (called once per frame from
+/// `stream.rs`).
+pub(crate) fn set_disable_cdf_update(v: bool, fctx: &crate::decode::FrameCtx) {
+    fctx.disable_cdf_update.with(|c| c.set(v));
+}
+
+/// This frame's `disable_cdf_update`, for the tile readers --
+/// [`msac::SymbolDecoder::set_cdf_update`](crate::msac::SymbolDecoder::set_cdf_update).
+pub(crate) fn cdf_update_disabled(fctx: &crate::decode::FrameCtx) -> bool {
+    fctx.disable_cdf_update.with(|c| c.get())
 }
 
 /// The transform side a block of `side` pixels codes: its own (capped at the
@@ -3687,6 +3706,11 @@ thread_local! {
     /// var-tx partition tree (unskipped, `TX_MODE_SELECT`) -- the capability
     /// that replaced the refusal "an intrabc block under TxMode::Select".
     static INTRABC_VARTX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1txr: as above for a `BLOCK_4X8`/`BLOCK_8X4` intrabc leaf --
+    /// libaom's `block_signals_txsize` is `bsize > BLOCK_4X4`, so these leaves
+    /// signal a transform size where a plain `BLOCK_4X4` does not. Reading no
+    /// symbol here desynced `warped.obu` at the very next block.
+    static RECT_INTRABC_VARTX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Current value of [`INTRABC_VARTX_HITS`].
@@ -3701,11 +3725,31 @@ pub(crate) fn reset_intrabc_vartx_hits() {
     INTRABC_VARTX_HITS.with(|c| c.set(0));
 }
 
+/// Current value of [`RECT_INTRABC_VARTX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn rect_intrabc_vartx_hits() -> usize {
+    RECT_INTRABC_VARTX_HITS.with(|c| c.get())
+}
+
 /// Records one coded block into [`INTRABC_MI_GRID`]: every block contributes
 /// its size (libaom's `scan_row_mbmi` advances `processed_rows` off any
 /// candidate's `bsize`, ref-match or not), an intrabc one also its DV as an
 /// `INTRA_FRAME` candidate (libaom treats intrabc as `is_inter_block`).
 fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>, fctx: &crate::decode::FrameCtx) {
+    record_intrabc_mi_rect(mi_r, mi_c, n4, n4, dv, fctx);
+}
+
+/// [`record_intrabc_mi`] with a true rectangular footprint: `av1_find_mv_refs`
+/// takes the block's real `bsize`, so a sub-8x8 `BLOCK_4X8`/`BLOCK_8X4`
+/// intrabc leaf must publish a 1x2/2x1 mi span, not a square (lane-av1txr).
+fn record_intrabc_mi_rect(
+    mi_r: usize,
+    mi_c: usize,
+    n4_w: usize,
+    n4_h: usize,
+    dv: Option<(i32, i32)>,
+    fctx: &crate::decode::FrameCtx,
+) {
     fctx.intrabc_mi_grid.with(|g| {
         let mut g = g.borrow_mut();
         let Some((grid, _, _)) = g.as_mut() else {
@@ -3720,11 +3764,11 @@ fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>
             is_new_mv: dv.is_some(),
             is_global_mv0: false,
             is_global_mv1: false,
-            size: n4 as u8,
-            size_h: n4 as u8,
+            size: n4_w as u8,
+            size_h: n4_h as u8,
         };
-        for r in mi_r..mi_r + n4 {
-            for c in mi_c..mi_c + n4 {
+        for r in mi_r..mi_r + n4_h {
+            for c in mi_c..mi_c + n4_w {
                 grid.set(r, c, info);
             }
         }
@@ -11399,7 +11443,11 @@ fn decode_leaf_rect(
         // the range diverges silently at the first such leaf and every later
         // symbol in the tile is read from the wrong place (class
         // `wrong-alphabet-same-value`, here same alphabet / wrong row).
-        dec.symbol(&mut cdfs.tx_size_cat1[ctx])
+        let d = dec.symbol(&mut cdfs.tx_size_cat1[ctx]);
+        if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
+            eprintln!("EC_ISTEP mi_row={} mi_col={} name=tx_depth val={d} ctx={ctx} cat=1 rng={}", leaf_mi.0, leaf_mi.1, dec.debug_state().0);
+        }
+        d
     } else {
         0
     };
@@ -13318,11 +13366,14 @@ fn read_intra_mode(
     // that merely allows (but never uses) intrabc.
     if allow_intrabc {
         let use_intrabc = dec.symbol(&mut cdfs.intrabc) != 0;
+        if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
+            eprintln!("EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=intrabc val={} rng={}", u8::from(use_intrabc), dec.debug_state().0);
+        }
         if trace {
             eprintln!("TRACE use_intrabc value={}", use_intrabc as i32);
         }
         if use_intrabc {
-            let dv = read_intrabc_dv(dec, cdfs, mi_r, mi_c, side, fctx);
+            let dv = read_intrabc_dv(dec, cdfs, mi_r, mi_c, (side / MI, side / MI), fctx);
             if trace {
                 eprintln!("TRACE intrabc dv={dv:?}");
             }
@@ -14418,7 +14469,7 @@ fn decode_block(
         luma_set
     };
     let luma_set = if intrabc_dv.is_some() {
-        txbset_for_inter(logical_tx, reduced_tx_set)
+        inter_txbset_for(logical_tx, reduced_tx_set)
     } else {
         luma_set
     };
@@ -15686,7 +15737,7 @@ fn decode_leaf8(
             dec,
             cdfs,
             if intrabc_dv.is_some() {
-                txbset_for_inter(8, reduced_tx_set)
+                inter_txbset_for(8, reduced_tx_set)
             } else if reduced_tx_set {
                 TxbSet::Luma8
             } else {
@@ -15821,7 +15872,7 @@ fn decode_leaf8(
                     dec,
                     cdfs,
                     if intrabc_dv.is_some() {
-                        txbset_for_inter(4, reduced_tx_set)
+                        inter_txbset_for(4, reduced_tx_set)
                     } else if reduced_tx_set {
                         TxbSet::Luma4
                     } else {
@@ -16021,7 +16072,7 @@ fn read_intra_mode_sub8(
     // neighbour's `cdf_index`/prediction two blocks later.
     seg_w_mi: usize,
     seg_h_mi: usize, fctx: &crate::decode::FrameCtx,
-) -> Result<(bool, usize, i32, Option<(usize, i32, Option<(i32, i32)>)>, Option<usize>)> {
+) -> Result<(bool, usize, i32, Option<(usize, i32, Option<(i32, i32)>)>, Option<usize>, Option<(i32, i32)>)> {
     // lane-av1mono: a monochrome leaf codes no chroma mode (libaom
     // `decodemv.c:933`), so fold `NumPlanes == 1` into `has_chroma`.
     let has_chroma = has_chroma && !mono(fctx);
@@ -16063,10 +16114,27 @@ fn read_intra_mode_sub8(
     istep!("dq", 0);
     if allow_intrabc {
         let use_intrabc = dec.symbol(&mut cdfs.intrabc) != 0;
+        if ec_istep {
+            eprintln!("EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=intrabc val={} rng={}", u8::from(use_intrabc), dec.debug_state().0);
+        }
         if use_intrabc {
-            return Err(unsupported(
-                "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
-            ));
+            // lane-av1txr: `read_intrabc_info` (spec 5.11.13) reads the block
+            // vector right after the flag and RETURNS -- no y/uv mode, angle
+            // delta, palette, CfL or filter-intra syntax follows, and the
+            // block is reconstructed by the INTER path (libaom's
+            // `is_inter_block` counts an intrabc block), so the caller takes
+            // the frame-copy prediction + inter residual.
+            let dv = read_intrabc_dv(dec, cdfs, mi_r, mi_c, (seg_w_mi, seg_h_mi), fctx);
+            // lane-av1txr: the DV travels back in the RETURN value -- it is
+            // NOT published through `FrameCtx::intrabc_dv`. That slot is the
+            // SQUARE paths' handoff (`decode_block`/`decode_leaf8` arm it,
+            // then `take()` it in the same call), so a sub-8x8 leaf that
+            // armed it left the vector standing for the NEXT >=8x8 block:
+            // `warped.obu`'s (38,60) 8x8 intra block took it as its own
+            // intrabc and read an inter var-tx `txfm_split` where libaom read
+            // an intra `tx_depth` (class `stale-slot-handoff`).
+            hit!(INTRABC_HITS);
+            return Ok((skip, DC_PRED, 0, None, None, Some(dv)));
         }
     }
     let above_ctx = INTRA_MODE_CTX[above_mode];
@@ -16116,7 +16184,7 @@ fn read_intra_mode_sub8(
             filter_intra = Some(fi_mode);
         }
     }
-    Ok((skip, mode, angle_delta_y, chroma, filter_intra))
+    Ok((skip, mode, angle_delta_y, chroma, filter_intra, None))
 }
 
 /// Decodes a `PARTITION_SPLIT` of one 8x8 block into four `BLOCK_4X4` leaves
@@ -16167,6 +16235,10 @@ fn decode_leaf_split4(
     let mut leaf_modes = [0usize; 4];
     let mut leaf_skips = [false; 4];
     let mut last_uv: Option<(usize, i32, Option<(i32, i32)>)> = None;
+    // lane-av1txr: the chroma-reference (i==3) leaf's block vector when that
+    // leaf is an intrabc block -- its prediction/reconstruction below is a
+    // frame copy at this DV, not an intra one.
+    let mut last_intrabc: Option<(i32, i32)> = None;
     for i in 0..4usize {
         let (dr, dc) = (i / 2, i % 2);
         let lmi = (leaf_mi.0 + dr, leaf_mi.1 + dc);
@@ -16186,7 +16258,7 @@ fn decode_leaf_split4(
         };
         let has_chroma = i == 3;
         let skip_ctx = neighbours.skip_txfm_ctx(lmi.0, lmi.1);
-        let (skip, mode, angle_delta_y, chroma, filter_intra) = read_intra_mode_sub8(
+        let (skip, mode, angle_delta_y, chroma, filter_intra, intrabc) = read_intra_mode_sub8(
             dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra,
             filter_intra_size_class(4).expect("BLOCK_4X4 has its own filter_intra row"),
             skip_ctx, allow_intrabc, lmi.0, lmi.1, 1, 1, fctx,
@@ -16194,12 +16266,81 @@ fn decode_leaf_split4(
         leaf_modes[i] = mode;
         leaf_skips[i] = skip;
         neighbours.record_mode_mi(lmi.0, lmi.1, 1, 1, mode);
+        // lane-av1txr: libaom `parse_decode_block`'s `set_txfm_ctxs` for this
+        // `BLOCK_4X4` leaf -- EVERY block publishes its transform size into
+        // the TXFM context bands, and an intrabc block's later `txfm_split`
+        // context is read off them (`txfm_partition_context`). A 4x4 never
+        // signals a tx size, so it is always TX_4X4 (`set_txfm_ctxs`'s
+        // `skip && is_inter` branch writes the block's own 4 pixels -- the
+        // same value).
+        set_txfm_ctxs(neighbours, lmi, 4, 1, 1, false);
         let smooth_neighbor = is_smooth_mode(leaf_above) || is_smooth_mode(leaf_left);
         if smooth_neighbor {
             hit!(SMOOTH_LUMA_HITS);
         }
         let (px, py) = (lmi.1 * MI, lmi.0 * MI);
         let reach = Reach::of(4, px, py, y.width, y.height, fctx);
+        if let Some(dv) = intrabc {
+            // lane-av1txr: an intrabc `BLOCK_4X4` leaf -- prediction is the
+            // CURRENT frame at the block vector (`predict_inter_block`'s
+            // intrabc arm, spec 7.11.3.4), residual the INTER coefficient set
+            // (libaom reads `tx_type` off `inter_ext_tx_cdf` for
+            // `is_inter_block`, which counts intrabc). Published into
+            // `intrabc_dv` so the group's chroma arm (below, when the
+            // chroma-reference leaf is the intrabc one) and
+            // [`record_intrabc_mi`] see it.
+            flush_recon(fctx, y, u, v);
+            let mut yb = vec![0u16; 16];
+            mc::predict_with_filter(
+                &y.data, y.width, y.true_width, y.true_height,
+                mv_to_q4(px, dv.1, true), mv_to_q4(py, dv.0, true),
+                4, 4, mc::InterpFilterKind::Bilinear, &mut yb, fctx,
+            );
+            set_palette_pred(yb.clone(), fctx);
+            if skip {
+                push_intra(0, px, py, 4, DC_PRED, 0, reach, &ZERO_RESIDUAL[..16], None, None, smooth_neighbor, fctx);
+                neighbours.record_mi_luma(lmi, 4, &ZERO_RESIDUAL[..16]);
+            } else {
+                let tu_around = neighbours.around_mi(lmi, 4)[0];
+                let tu_grid = read_plane(
+                    dec,
+                    cdfs,
+                    if reduced_tx_set { TxbSet::Luma4Inter } else { TxbSet::Luma4InterSet1 },
+                    scan4,
+                    0,
+                    tu_around,
+                    DC_PRED,
+                    DC_PRED,
+                    0,
+                    reach,
+                    y,
+                    px,
+                    py,
+                    4,
+                    4,
+                    base_q_idx,
+                    None,
+                    None,
+                    None,
+                    smooth_neighbor, fctx,
+                )?;
+                neighbours.record_mi_luma(lmi, 4, &tu_grid);
+            }
+            neighbours.fill_skip_grid(lmi, 1, skip);
+            neighbours.fill_lf_grid(lmi, 1, 4, 0, fctx);
+            record_intrabc_mi(lmi.0, lmi.1, 1, Some(dv), fctx);
+            if has_chroma {
+                last_uv = Some((DC_PRED, 0, None));
+                // An intrabc block is an INTER block for `av1_get_tx_type`, so
+                // the group's chroma inherits the LUMA's coded transform type
+                // (`xd->tx_type_map` at the co-located luma position) -- the
+                // luma `read_plane` above just set [`LUMA_TX_TYPE`]. Armed for
+                // exactly this group's two chroma reads.
+                fctx.intrabc_chroma_tx.with(|c| c.set(Some(fctx.luma_tx_type.with(std::cell::Cell::get))));
+            }
+            last_intrabc = Some(dv);
+            continue;
+        }
         if skip {
             push_intra(0, px, py, 4, mode, angle_delta_y, reach, &ZERO_RESIDUAL[..16], None, filter_intra, smooth_neighbor, fctx);
             neighbours.record_mi_luma(lmi, 4, &ZERO_RESIDUAL[..16]);
@@ -16271,6 +16412,38 @@ fn decode_leaf_split4(
         push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
         push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
         (Grid::Zero(16), Grid::Zero(16))
+    } else if let Some(dv) = last_intrabc {
+        // lane-av1txr: the chroma-reference leaf was an intrabc block, so the
+        // group's one chroma unit is a frame copy at that DV too (its residual
+        // still reads the ordinary `Chroma4` coefficient tables -- libaom
+        // codes a chroma `tx_type` nowhere).
+        let mut ub = vec![0u16; 16];
+        mc::predict_with_filter(
+            &u.data, u.width, u.true_width, u.true_height,
+            mv_to_q4(cpx, dv.1, false), mv_to_q4(cpy, dv.0, false),
+            4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+        );
+        let mut vb = vec![0u16; 16];
+        mc::predict_with_filter(
+            &v.data, v.width, v.true_width, v.true_height,
+            mv_to_q4(cpx, dv.1, false), mv_to_q4(cpy, dv.0, false),
+            4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+        );
+        let chroma_around = neighbours.around_mi(leaf_mi, 8);
+        set_palette_pred(ub, fctx);
+        let ug = read_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], DC_PRED, DC_PRED,
+            0, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
+            None, None, None, smooth_neighbor_uv, fctx,
+        )?;
+        set_palette_pred(vb, fctx);
+        let vg = read_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], DC_PRED, DC_PRED,
+            0, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
+            None, None, None, smooth_neighbor_uv, fctx,
+        )?;
+        fctx.intrabc_chroma_tx.with(|c| c.set(None));
+        (ug, vg)
     } else {
         let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
@@ -16398,6 +16571,8 @@ fn decode_leaf_rect8(
     let mut leaf_modes = [0usize; 2];
     let mut leaf_skips = [false; 2];
     let mut last_uv: Option<(usize, i32, Option<(i32, i32)>)> = None;
+    // lane-av1txr: as [`decode_leaf_split4`]'s own `last_intrabc`.
+    let mut last_intrabc: Option<(i32, i32)> = None;
     for i in 0..2usize {
         let lmi = if vert {
             (leaf_mi.0, leaf_mi.1 + i)
@@ -16418,12 +16593,186 @@ fn decode_leaf_rect8(
         };
         let has_chroma = i == 1;
         let skip_ctx = neighbours.skip_txfm_ctx(lmi.0, lmi.1);
-        let (skip, mode, angle_delta_y, chroma, filter_intra) = read_intra_mode_sub8(
+        let (skip, mode, angle_delta_y, chroma, filter_intra, intrabc) = read_intra_mode_sub8(
             dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra,
             filter_intra_size_class_rect(bw, bh)
                 .expect("BLOCK_4X8/BLOCK_8X4 are inside av1_filter_intra_allowed_bsize"),
             skip_ctx, allow_intrabc, lmi.0, lmi.1, bw / 4, bh / 4, fctx,
         )?;
+        leaf_modes[i] = mode;
+        leaf_skips[i] = skip;
+        neighbours.record_mode_mi(lmi.0, lmi.1, w_mi, h_mi, mode);
+        let smooth_neighbor = is_smooth_mode(leaf_above) || is_smooth_mode(leaf_left);
+        if let Some(dv) = intrabc {
+            // lane-av1txr: an intrabc `BLOCK_4X8`/`BLOCK_8X4` leaf. The
+            // prediction is a frame copy at the DV and the residual reads the
+            // INTER `LumaRect8x4` set -- but with `TxMode::Select` the leaf
+            // reads the INTER var-tx tree, exactly like every other intrabc
+            // block: libaom's `block_signals_txsize` is `bsize > BLOCK_4X4`
+            // (`blockd.h:1027`), TRUE at `BLOCK_4X8`/`BLOCK_8X4`, so
+            // `parse_decode_block` sends an unskipped `inter_block_tx` block
+            // (intrabc counts, `is_inter_block`) of a signalling bsize into
+            // `read_tx_size_vartx` over `max_txsize_rect_lookup[BLOCK_4X8] ==
+            // TX_4X8`; only `BLOCK_4X4` reads no tx symbol at all. Measured on
+            // `warped.obu` mi (37,62): reading NO symbol here left the
+            // arithmetic decoder one symbol short and desynced the very next
+            // block's `skip` (ours 60320 vs aomdec 48630, class
+            // `symbol-consumption-gap`).
+            let (px, py) = (lmi.1 * MI, lmi.0 * MI);
+            let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height, fctx);
+            flush_recon(fctx, y, u, v);
+            let mut luma_leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
+            if tx_select && !skip {
+                // `max_block_wide`/`max_block_high`: the frame's own mi grid,
+                // so a leaf hanging over the right/bottom edge reads no split
+                // symbol for the units outside it (as in `decode_block`).
+                let mi_cols = 2 * y.true_width.div_ceil(8);
+                let mi_rows = 2 * y.true_height.div_ceil(8);
+                let max_w_mi = w_mi.min(mi_cols.saturating_sub(lmi.1));
+                let max_h_mi = h_mi.min(mi_rows.saturating_sub(lmi.0));
+                read_var_tx_size(
+                    dec,
+                    cdfs,
+                    neighbours,
+                    lmi,
+                    bw.max(bh),
+                    (max_w_mi, max_h_mi),
+                    (bw, bh),
+                    0,
+                    0,
+                    0,
+                    &mut luma_leaves,
+                );
+                hit!(RECT_INTRABC_VARTX_HITS);
+            } else {
+                luma_leaves.push((0, 0, bw, bh));
+                // The non-var-tx arm: a SKIPPED intrabc leaf (or a frame
+                // outside `TxMode::Select`) publishes its own rect transform
+                // (`set_txfm_ctxs`'s `skip && is_inter` branch writes the
+                // block's own pixels -- the same size here).
+                txfm_partition_update_rect(neighbours, lmi, (bw, bh), (bw, bh));
+            }
+            // The transform type an intrabc block's CHROMA inherits is the
+            // `tx_type_map` entry at the chroma unit's co-located luma
+            // position (`av1_get_tx_type`, `blockd.h:1278`), i.e. the FIRST
+            // luma unit the tree resolved.
+            let single = luma_leaves.len() == 1;
+            let mut chroma_tx = TxType::DctDct;
+            let mut grid = Grid::Zero(bw * bh);
+            for (li, &(tu_row, tu_col, tw, th)) in luma_leaves.iter().enumerate() {
+                let tu_mi = (lmi.0 + tu_row, lmi.1 + tu_col);
+                let (tu_px, tu_py) = (tu_mi.1 * MI, tu_mi.0 * MI);
+                let tu_reach = if single {
+                    reach
+                } else {
+                    tu_reach(
+                        bw, bh, tu_px - px, tu_py - py, tw, reach, px, py, y.width, y.height, fctx,
+                    )
+                };
+                let mut yb = vec![0u16; tw * th];
+            mc::predict_with_filter(
+                &y.data, y.width, y.true_width, y.true_height,
+                    mv_to_q4(tu_px, dv.1, true), mv_to_q4(tu_py, dv.0, true),
+                    tw, th, mc::InterpFilterKind::Bilinear, &mut yb, fctx,
+            );
+            set_palette_pred(yb, fctx);
+                let tu_grid = if skip {
+                    let zeros = Grid::Zero(tw * th);
+                    if (tw, th) == (4, 4) {
+                        push_intra(0, tu_px, tu_py, 4, DC_PRED, 0, tu_reach, &zeros, None, None, smooth_neighbor, fctx);
+                    } else {
+                        push_intra_rect(0, tu_px, tu_py, tw, th, DC_PRED, 0, tu_reach, &zeros, None, None, smooth_neighbor, fctx);
+                    }
+                zeros
+            } else {
+                    // A unit smaller than its own block (the var-tx split)
+                    // reads its `txb_skip_ctx` off the neighbours; the
+                    // whole-leaf unit's `plane_bsize == txsize_to_bsize` fixes
+                    // it at 0.
+                    let (set, tu_scan, around, skip_ctx) = if (tw, th) == (4, 4) {
+                        (
+                            inter_txbset_for(4, reduced_tx_set),
+                            scan4,
+                            neighbours.around_mi(tu_mi, 4)[0],
+                            neighbours.luma_skip_ctx(tu_mi, 1),
+                        )
+                    } else {
+                        (
+                            if reduced_tx_set {
+                    TxbSet::LumaRect8x4Inter
+                } else {
+                    TxbSet::LumaRect8x4InterSet1
+                            },
+                            scan,
+                            neighbours.around_mi_rect(tu_mi, tw, th)[0],
+                            0,
+                        )
+                };
+                let mut coding = cdfs.txb(set, DC_PRED);
+                let (levels, tx_type) = read_coeffs_rect(
+                        dec, &mut coding, tu_scan, tw, th, skip_ctx, dc_sign_ctx(around.2),
+                        TxType::DctDct,
+                )?;
+                    if li == 0 {
+                        chroma_tx = tx_type;
+                        fctx.luma_tx_type.with(|c| c.set(tx_type));
+                    }
+                let residual = dequant_and_inverse_typed_wh(
+                        &levels, tw, th, crate::decode::bit_depth(fctx), block_q_idx(fctx),
+                    plane_q_delta(0, fctx).0, plane_q_delta(0, fctx).1, tx_type,
+                );
+                    if (tw, th) == (4, 4) {
+                        push_intra(0, tu_px, tu_py, 4, DC_PRED, 0, tu_reach, &residual, None, None, smooth_neighbor, fctx);
+                    } else {
+                        push_intra_rect(0, tu_px, tu_py, tw, th, DC_PRED, 0, tu_reach, &residual, None, None, smooth_neighbor, fctx);
+                    }
+                levels
+            };
+                if single {
+                    grid = tu_grid;
+                } else {
+                    // Per-unit neighbour state, the same shape the intra rect
+                    // leaf's own split path runs (`decode_leaf8`'s depth-1
+                    // loop): a transform unit inside a block is not a block at
+                    // that position.
+                    neighbours.record_mi_luma(tu_mi, 4, &tu_grid);
+                }
+            }
+            if single {
+            let state = neighbour_state(&grid);
+            for cell in 0..h_mi {
+                if lmi.0 + cell < neighbours.mi_rows {
+                    neighbours.left[lmi.0 + cell][0] = state;
+                }
+            }
+            for cell in 0..w_mi {
+                if lmi.1 + cell < neighbours.mi_cols {
+                    neighbours.above[lmi.1 + cell][0] = state;
+                }
+            }
+            }
+            neighbours.fill_skip_grid_rect(lmi, w_mi, h_mi, skip);
+            neighbours.fill_lf_grid_rect(
+                lmi,
+                w_mi,
+                h_mi,
+                if single { bw as u8 } else { 4 },
+                if single { bh as u8 } else { 4 },
+                0,
+                fctx,
+            );
+            // `record_intrabc_mi` publishes a square `n4`x`n4` footprint; a
+            // 4x8/8x4 leaf needs its true `w_mi`x`h_mi` (lane-av1txr).
+            record_intrabc_mi_rect(lmi.0, lmi.1, w_mi, h_mi, Some(dv), fctx);
+            if has_chroma {
+                last_uv = Some((DC_PRED, 0, None));
+                last_intrabc = Some(dv);
+                // See [`decode_leaf_split4`]: an intrabc block's chroma
+                // inherits the luma transform type.
+                fctx.intrabc_chroma_tx.with(|c| c.set(Some(chroma_tx)));
+            }
+            continue;
+        }
         if filter_intra.is_some() {
             // lane-fi8 r1: `predict_filter_intra` walks its 4x2 patches over
             // a true `bw`x`bh` block, so a 4x8/8x4 leaf predicts through the
@@ -16459,10 +16808,6 @@ fn decode_leaf_rect8(
             hit!(TX_DEPTH_HITS);
             hit!(RECT8_SPLIT_TX_HITS);
         }
-        leaf_modes[i] = mode;
-        leaf_skips[i] = skip;
-        neighbours.record_mode_mi(lmi.0, lmi.1, w_mi, h_mi, mode);
-        let smooth_neighbor = is_smooth_mode(leaf_above) || is_smooth_mode(leaf_left);
         if smooth_neighbor {
             hit!(SMOOTH_LUMA_HITS);
         }
@@ -16475,6 +16820,15 @@ fn decode_leaf_rect8(
         // four. The per-TU path writes its own neighbour state, so the
         // block-level write below is skipped for it.
         let split = depth != 0 || lossless(fctx);
+        // lane-av1txr: libaom `parse_decode_block`'s `set_txfm_ctxs` for this
+        // leaf -- the size the `tx_depth` symbol resolved (depth 1 -> TX_4X4,
+        // else the leaf's own rect transform), published over the leaf's own
+        // mi span. An intrabc block's `txfm_partition_context` reads these
+        // bands, and the key-frame sub-8x8 leaves had no write at all:
+        // `warped.obu` mi (37,62) read a stale 8 where aomdec read 4 (ctx 18
+        // vs 19) and the tile desynced (class `context-band-not-published`).
+        let (ctx_tx_w, ctx_tx_h) = if split { (4, 4) } else { (bw, bh) };
+        txfm_partition_update_rect(neighbours, lmi, (ctx_tx_w, ctx_tx_h), (bw, bh));
         if split {
             let mut done = 0usize;
             for tu in 0..2usize {
@@ -16666,6 +17020,38 @@ fn decode_leaf_rect8(
         push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
         push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
         (Grid::Zero(16), Grid::Zero(16))
+    } else if let Some(dv) = last_intrabc {
+        // lane-av1txr: the chroma-reference leaf was an intrabc block, so the
+        // group's one chroma unit is a frame copy at that DV too (its residual
+        // still reads the ordinary `Chroma4` coefficient tables -- libaom
+        // codes a chroma `tx_type` nowhere).
+        let mut ub = vec![0u16; 16];
+        mc::predict_with_filter(
+            &u.data, u.width, u.true_width, u.true_height,
+            mv_to_q4(cpx, dv.1, false), mv_to_q4(cpy, dv.0, false),
+            4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+        );
+        let mut vb = vec![0u16; 16];
+        mc::predict_with_filter(
+            &v.data, v.width, v.true_width, v.true_height,
+            mv_to_q4(cpx, dv.1, false), mv_to_q4(cpy, dv.0, false),
+            4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+        );
+        let chroma_around = neighbours.around_mi(leaf_mi, 8);
+        set_palette_pred(ub, fctx);
+        let ug = read_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], DC_PRED, DC_PRED,
+            0, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
+            None, None, None, smooth_neighbor_uv, fctx,
+        )?;
+        set_palette_pred(vb, fctx);
+        let vg = read_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], DC_PRED, DC_PRED,
+            0, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
+            None, None, None, smooth_neighbor_uv, fctx,
+        )?;
+        fctx.intrabc_chroma_tx.with(|c| c.set(None));
+        (ug, vg)
     } else {
         let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
@@ -18877,6 +19263,26 @@ pub(crate) fn reduce_inherited_chroma_tx_type_flagged(t: TxType, w: usize, h: us
     if allowed.contains(&t) { t } else { DctDct }
 }
 
+/// The [`TxbSet`] a resolved luma transform side reads its coefficient tables
+/// from for a block libaom's `is_inter_block` calls inter -- which an intrabc
+/// block is (`blockd.h:373`), so its `tx_type` comes off the inter `ext_tx`
+/// sets, never the mode-indexed intra ones ([`txbset_for`]).
+///
+/// 64 is only ever the 64x64-block, depth-0, corner-scanned case
+/// ([`TxbSet::Luma64`]); every other resolved side maps to its own matching
+/// set. `get_tx_set` (spec 5.11.48) only splits on `reduced_tx_set` at
+/// `TX_8X8`/`TX_4X4`: an intra `TX_16X16` always reads `TX_SET_INTRA_2`
+/// regardless of the flag (`av1_get_ext_tx_set_type`'s
+/// `tx_size_sqr == TX_16X16` branch ignores `use_reduced_set` once it is past
+/// the `TX_32X32`/reduced-set checks), so only the 8x8 and 4x4 cases have a
+/// second table ([`TxbSet::Luma8Inter`]/[`TxbSet::Luma4Inter`]).
+///
+/// lane-av1txr: the intrabc leaf sites used to call a near-duplicate
+/// `txbset_for_inter` whose `4` fell through to `Luma64` -- 32x32-class tables
+/// (a 1024-entry grid) handed to a 4x4 dequant, which panicked at
+/// `transform.rs`'s `inverse_transform_2d_typed_wh` the first time an intrabc
+/// 4x4 TU coded a non-zero coefficient (`allintra0`/cpu-used=0). The
+/// duplicate is gone; every inter-table site goes through this one mapping.
 fn inter_txbset_for(tx_px: usize, reduced_tx_set: bool) -> TxbSet {
     match tx_px {
         // lane-sb128c r1: a 128x128 inter block's own luma unit
@@ -18915,29 +19321,6 @@ fn scan_for<'a>(
     }
 }
 
-/// The [`TxbSet`] a resolved luma transform side reads its coefficient tables
-/// from -- 64 is only ever the 64x64-block, depth-0, corner-scanned case
-/// ([`TxbSet::Luma64`]); every other resolved side maps to its own matching
-/// set. `get_tx_set` (spec 5.11.48) only splits on `reduced_tx_set` at
-/// `TX_8X8`/`TX_4X4`: an intra `TX_16X16` always reads `TX_SET_INTRA_2`
-/// regardless of the flag (`av1_get_ext_tx_set_type`'s
-/// `tx_size_sqr == TX_16X16` branch ignores `use_reduced_set` once it is past
-/// the `TX_32X32`/reduced-set checks), so only the 8x8 and 4x4 cases have a
-/// second table ([`TxbSet::Luma8Set1`]/[`TxbSet::Luma4Set1`]).
-/// [`txbset_for`], for a block libaom's `is_inter_block` calls inter -- which
-/// an intrabc block is (`blockd.h:373`), so its `tx_type` comes off the
-/// inter `ext_tx` sets, never the mode-indexed intra ones.
-fn txbset_for_inter(tx_px: usize, reduced_tx_set: bool) -> TxbSet {
-    match tx_px {
-        64 => TxbSet::Luma64,
-        32 => TxbSet::Luma32Inter,
-        16 if reduced_tx_set => TxbSet::Luma16Inter,
-        16 => TxbSet::Luma16InterSet1,
-        8 if reduced_tx_set => TxbSet::Luma8Inter,
-        8 => TxbSet::Luma8InterSet1,
-        _ => TxbSet::Luma64,
-    }
-}
 
 fn txbset_for(tx_px: usize, reduced_tx_set: bool) -> TxbSet {
     match tx_px {
@@ -22445,6 +22828,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             );
         }
         let mut dec = SymbolDecoder::new(tile_bytes);
+        // lane-av1txr: spec 5.9.2's `disable_cdf_update` -- a frame that sets
+        // it codes every symbol against the tables it started with.
+        dec.set_cdf_update(!cdf_update_disabled(fctx));
         crate::census::register_cdfs(&cdfs);
         neighbours.start_tile(mi_row0 as usize, mi_col0 as usize, mi_col1 as usize, fctx);
         y.set_tile_origin(
@@ -24717,15 +25103,17 @@ fn read_intrabc_dv(
     cdfs: &mut Cdfs,
     mi_r: usize,
     mi_c: usize,
-    side: usize, fctx: &crate::decode::FrameCtx,
+    // The block's own mi footprint (`av1_find_mv_refs` takes the real bsize,
+    // so a sub-8x8 `BLOCK_4X8`/`BLOCK_8X4` leaf scans a 1x2/2x1 neighbourhood
+    // -- lane-av1txr).
+    (n4_w, n4_h): (usize, usize), fctx: &crate::decode::FrameCtx,
 ) -> (i32, i32) {
     const INTRABC_DELAY_PIXELS: i32 = 256;
-    let n4 = side / MI;
     let stack_pred = fctx.intrabc_mi_grid.with(|g| {
         let g = g.borrow();
         g.as_ref().map(|(grid, mi_cols, mi_rows)| {
             let stack = crate::mvstack::find_mv_stack(
-                grid, mi_r, mi_c, n4, n4, 0, /* INTRA_FRAME */
+                grid, mi_r, mi_c, n4_w, n4_h, 0, /* INTRA_FRAME */
                 *mi_cols, *mi_rows,
             );
             if stack.nearest_mv == (0, 0) {
@@ -24753,7 +25141,12 @@ fn read_intrabc_dv(
     }
     // "Ref DV should not have sub-pel" (`assign_dv`): floor to full pel.
     let pred = ((pred.0 >> 3) * 8, (pred.1 >> 3) * 8);
-    read_mv(dec, &mut cdfs.dv_comp, &mut cdfs.dv_joint, pred, false, true)
+    let dv = read_mv(dec, &mut cdfs.dv_comp, &mut cdfs.dv_joint, pred, false, true);
+    if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_DV mi_row={mi_r} mi_col={mi_c} dv_col={} dv_row={} rng={rng}", dv.1, dv.0);
+    }
+    dv
 }
 
 /// A 1/8-pel motion vector component converted to the 1/16-pel offset
@@ -35165,6 +35558,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         fctx.quant_deltas.with(|c| c.set(deltas));
         fctx.current_delta_lf.with(|c| c.set([0; 4]));
         let mut dec = SymbolDecoder::new(data);
+        // lane-av1txr: spec 5.9.2's `disable_cdf_update` -- a frame that sets
+        // it codes every symbol against the tables it started with.
+        dec.set_cdf_update(!cdf_update_disabled(fctx));
         crate::census::register_cdfs(&cdfs);
         // lane-comppin r9: tile-entry range, the earliest point comparable
         // against aomdec's own `r->ec.rng` right after `aom_reader_init` -- the
