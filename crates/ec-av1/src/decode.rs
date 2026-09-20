@@ -11327,6 +11327,14 @@ fn decode_block_rect(
     } else {
         0
     };
+    // lane-av1-intrabc r3: this strip's own `set_txfm_ctxs` when the frame
+    // reads the `TXFM_CONTEXT` bands -- see [`publish_txfm_bands_if_in_inter`].
+    publish_txfm_bands_if_in_inter(
+        neighbours,
+        (mi_r, mi_c),
+        depth_to_tx_wh(bw, bh, depth, fctx),
+        (bw, bh), fctx,
+    );
     if depth != 0 || lossless(fctx) {
         hit!(TX_DEPTH_HITS);
         // lane-rectsplit r1: a split transform is predicted and reconstructed
@@ -11847,6 +11855,14 @@ fn decode_leaf_rect(
     } else {
         0
     };
+    // lane-av1-intrabc r3: this leaf's own `set_txfm_ctxs` when the frame reads
+    // the `TXFM_CONTEXT` bands -- see [`publish_txfm_bands_if_in_inter`].
+    publish_txfm_bands_if_in_inter(
+        neighbours,
+        leaf_mi,
+        depth_to_tx_wh(bw, bh, depth, fctx),
+        (bw, bh), fctx,
+    );
     if depth != 0 || lossless(fctx) {
         // The same per-transform-unit walk the bigger strips take
         // (`depth_to_tx_wh`: TX_16X8 -> TX_8X8 at depth 1, -> TX_4X4 at
@@ -15783,19 +15799,22 @@ fn decode_block_128rect(
         logical_tx as u8,
         0, fctx,
     );
-    if in_inter {
+    if in_inter || allow_intrabc_frame(fctx) {
         // `set_txfm_ctxs(tx_size, n4_w, n4_h, skip && is_inter, xd)`
         // (libaom `decodeframe.c` `decode_block`) runs for EVERY block of an
         // inter frame, intra ones included: an intra block stamps its
         // TRANSFORM size over its own footprint in both TXFM_CONTEXT bands.
-        // A key frame has no var-tx tree and its readers use the deblock grid,
-        // so this is the inter path's alone.
+        // A key frame reads those bands only when it allows intrabc
+        // ([`read_block_tx_size_rect`]'s var-tx context), and then libaom
+        // stamps here too -- lane-av1-intrabc r3.
         txfm_partition_update_rect(
             neighbours,
             (mi_r, mi_c),
             (logical_tx, logical_tx),
             (bw, bh),
         );
+    }
+    if in_inter {
         hit_do! {
             INTRA128_IN_INTER_HITS.with(|c| {
                 let mut h = c.get();
@@ -18511,13 +18530,26 @@ fn txfm_partition_update(
 /// `tx_size_cat1` row 1 instead of row 0 -- same depth VALUE, different CDF,
 /// range 39156 where the reference has 54736 (class tx-grid-published-block-side
 /// / early-return-skips-tail).
+///
+/// lane-av1-intrabc r3: an `allow_intrabc` KEY frame reads the same bands --
+/// `read_intra_frame_mode_info` returns early for an intrabc block, so
+/// [`read_block_tx_size_rect`]'s var-tx tree is the intra path's one
+/// `txfm_partition_context` reader, and it reads whatever the block ABOVE and
+/// the block LEFT published. [`decode_block`] has published on such a frame
+/// since lane-t900 r32; the RECT strips did not, so the band still held the
+/// value of an older, smaller neighbour -- measured on the 256x192 testsrc2
+/// cq45 var-tx arm: the coded 16x8 intrabc strip at mi(38,48) read ctx 14
+/// where libaom reads 13 (`left_ctx` 4 vs the 8 the 16x8 intra strip at
+/// mi(38,44) should have published), desyncing the tile there.
 fn publish_txfm_bands_if_in_inter(
     n: &mut Neighbours,
     at_mi: (usize, usize),
     (tx_w, tx_h): (usize, usize),
     (bw, bh): (usize, usize), fctx: &crate::decode::FrameCtx,
 ) {
-    if fctx.intra_in_inter_mode.with(std::cell::Cell::get).is_none() {
+    if fctx.intra_in_inter_mode.with(std::cell::Cell::get).is_none()
+        && !allow_intrabc_frame(fctx)
+    {
         return;
     }
     let (mi_r, mi_c) = at_mi;
@@ -23126,6 +23158,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // lane-av1-intrabc r2: the FRAME's own tx_mode -- an intrabc block's
     // tx-size read keys on it even inside an intra tile.
     fctx.tx_select_frame.with(|c| c.set(tx_select));
+    // lane-av1-intrabc r3: the FRAME's own `reduced_tx_set_used`, for the same
+    // reason and by the same shape as `tx_select_frame` above. `read_tx_type`
+    // keys the `tx_type` CDF on it (`av1_get_ext_tx_set_type`), and an INTRABC
+    // block is `is_inter_block`, so it reads the INTER sets off
+    // [`FrameCtx::reduced_tx_set_inter`] -- which the inter tile decoder sets
+    // and a key frame left at its `true` DEFAULT. The first rect intrabc block
+    // of a `--enable-tx-size-search=0` screen frame then read the 2-symbol
+    // `DCT_IDTX` `tx_type` row where libaom reads the 16-symbol `ALL16` one,
+    // desyncing the tile at that block's luma coefficients (measured: the
+    // 512x384 testsrc2 cq45 arm, mi(80,106)).
+    fctx.reduced_tx_set_inter.with(|c| c.set(reduced_tx_set));
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }

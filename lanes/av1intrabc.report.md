@@ -138,3 +138,105 @@ exactly the 256x192 repro above and it is still 4520 bytes off.
    witness recipes. `deferred(1:4 pair-chroma model)`
 2. **Full-suite gate** -- `deferred(batch-level run after lane-av1-txbands
    merges; same file, mid-flight run would measure a half-built tree)`
+
+## 4c. Round 3 (2026-09-20) -- two frame-level root causes found, one stream now exact
+
+Both repros were localized with a per-symbol range ladder
+(`EC_TRACE_MODE_STEP` on our decoder vs the instrumented aomdec), then the
+first untraced region with `EC_TRACE_COEFF`/`EC_ISTEP`.
+
+### Root cause 1 (stream A, and latent for every rect strip): the key-frame RECT path never published the `TXFM_CONTEXT` bands
+
+`read_intra_frame_mode_info` (libaom `decodemv.c:909`) returns EARLY for an
+intrabc block, so the block's transform size comes from
+`parse_decode_block`'s INTER var-tx branch -- `read_tx_size_vartx`, whose
+depth-0 context is `txfm_partition_context(above_txfm[mi_col],
+left_txfm[mi_row], bsize, tx_size)`. Those bands are written by libaom's
+`set_txfm_ctxs` at the end of EVERY `decode_block`/`decode_token_recon_block`,
+key frames included.
+
+Only `decode_block` (lane-t900 r32, gated on the frame's `allow_intrabc`) and
+`decode_block_rect4`/`decode_block_rect64`/`decode_rect4_16_strip`/
+`decode_leaf_rect8` (gated on `INTRA_IN_INTER_MODE`) published. The 2:1 strip
+readers reached on a key frame -- `decode_block_rect` (16x32/32x16),
+`decode_leaf_rect` (8x16/16x8 leaves of a 16x16 HORZ/VERT split) and
+`decode_block_128rect` -- published nothing.
+
+Measured (256x192 testsrc2 cq45 var-tx arm): the coded intrabc 16x8 strip at
+mi(38,48) read `txfm_split_rect ctx=14` where aomdec reads `ctx=13`; the left
+band held 4 (from the 8x8 at mi(38,42)) where libaom had 8 (published by the
+non-intrabc 16x8 intra strip at mi(38,44), `tx_depth=0` -> `TX_16X8`,
+`tx_size_high=8`), i.e. `left = 4 < 8` (true) instead of `8 < 8` (false). From
+that wrong CDF row the tile desynced at the very next symbol.
+
+Fix: `publish_txfm_bands_if_in_inter`'s guard now also fires when
+`allow_intrabc_frame(fctx)`, and the three missing readers above call it with
+`depth_to_tx_wh(bw, bh, depth, fctx)` (one call each, placed before their
+`depth != 0` split branch so both arms publish once).
+
+### Root cause 2 (stream B): a key frame never published the frame's `reduced_tx_set`
+
+`decode_key_frame_tile_with_cdfs` set `tx_select_inter=false` and the (r2)
+`tx_select_frame`, but not `reduced_tx_set_inter`, which therefore kept its
+`true` DEFAULT (or an inter frame's stale value). An intrabc block is
+`is_inter_block`, so `read_tx_type` resolves its `tx_type` through the INTER
+sets -- `av1_get_ext_tx_set_type` off `cm->features.reduced_tx_set_used`.
+
+Measured (512x384 testsrc2 cq45 `--enable-tx-size-search=0`): the first rect
+(8x16) intrabc block at mi(80,106) read `tx_type` from a 2-symbol CDF
+(`inter_tx_type_8`, `head=[4167,32768,0]`) where aomdec read the 16-symbol
+`EXT_TX_SET_ALL16` row (`inter_ext_tx_cdf[1][TX_8X8]`,
+`eset=1 set=5 sqr=1 nsym=16`, `head=[31123,30195,27990,27057]`); post-read
+range 37912 vs 62176. Every earlier intrabc block in that frame was 16x16
+(square), which never consults this cell, so the defect surfaced exactly at the
+first rect strip.
+
+Fix: `decode_key_frame_tile_with_cdfs` now publishes the header's
+`reduced_tx_set` into `fctx.reduced_tx_set_inter`, mirroring `tx_select_frame`.
+
+### State after the two fixes (no push; committed on the lane)
+
+| stream | bytes differ before | now |
+|---|---|---|
+| A 256x192 var-tx 16x8 | 4520/73728 | **BYTE-EXACT** (Y/U/V, `cmp` vs ffmpeg) |
+| B 512x384 coded 8x16 | 7900/294912 | 528 luma samples |
+
+### What is STILL open on B (precise)
+
+The mode-info ladder is now fully IN SYNC (identical symbol sequence AND
+identical post-read ranges through the end of the frame), and the residual
+reads agree. The single remaining difference is a **DV VALUE**:
+
+```
+O  EC_DV mi_row=84 mi_col=104 dv_col=0 dv_row=-512 rng=33207
+U  EC_DV mi_row=84 mi_col=104 dv_col=0 dv_row=-504 rng=33207
+```
+
+Same pre-range (33207 after the read on both sides) means the coded
+`diff` is identical; the reconstructed DV differs because the **DV predictor**
+differs. aomdec's own `EC_IBC` line for that block reads
+`bsize=6 skip=1 nstack=2 nearest=(-520,0) near=(-512,0) dv_ref=(-520,0)
+dv=(-512,0)`, i.e. `ref = nearest = -520`; our result `-504` is consistent with
+`ref = -512` (the `nearmv`), so our intrabc `INTRA_FRAME` MV-stack ORDERING at
+that block differs from libaom's (`av1_find_mv_refs` -> `setup_ref_mv_list` ->
+`av1_find_best_ref_mvs`, then `dv_ref = nearestmv != 0 ? nearestmv : nearmv`).
+
+The 528 mismatched luma samples (`rows 351..383`, `cols 416..431`) are all
+inside this one wrong copy: the block is `skip=1`, so the wrong DV is a wrong
+pixel copy, and the region below it inherits the shift.
+
+Next step for whoever takes it: instrument `read_intrabc_dv`'s candidate
+gathering (`record_intrabc_mi_rect` / the mv-stack build) with the candidate
+list for mi(84,104) and diff it against aomdec's `EC_IBC`
+`nstack/nearest/near/dv_ref` (already printed) -- the defect is candidate
+ORDER/WEIGHT, not the DV syntax.
+
+### Gates run this round
+
+- `cargo check -p ec-av1 --all-targets` -> 0 warnings.
+- Standalone: A byte-exact; B 528 luma samples (from 7900).
+- **Not run**: the in-gate `--lib` arms, the refusal suite, and the full suite.
+  The lane is NOT merge-ready (B is not byte-exact and the reviewer's
+  TX_MODE_SELECT gate is still red); the batch-level suite run stays deferred.
+
+`deferred(DV-predictor candidate ordering at mi(84,104))`
