@@ -1379,9 +1379,12 @@ mod tests {
     /// `decode_block_rect` fires only when `filter_intra.is_some()`, and that
     /// flag is `Some` only where `filter_intra_size_class_rect` says so. The
     /// strips the guard protects are `(64, 32)` / `(32, 64)`; this test
-    /// enumerates EVERY arm of that table and asserts none admits a `64`
-    /// axis, so no conformant stream (libaom `av1_filter_intra_allowed_bsize`
-    /// caps both sides at 32) can offer the symbol there.
+    /// enumerates every EXPLICIT arm of that table (asserting none admits a
+    /// `64` axis) AND drives the square-delegate guard arm's callee
+    /// `filter_intra_size_class` directly at 32/64, so a widening on either
+    /// side turns it red. No conformant stream (libaom
+    /// `av1_filter_intra_allowed_bsize` caps both sides at 32) can offer the
+    /// symbol there.
     #[test]
     fn a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol() {
         let src = include_str!("decode.rs");
@@ -1393,12 +1396,24 @@ mod tests {
             .find("fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {")
             .expect("filter_intra_size_class_rect is gone");
         let body = &src[at..at + src[at..].find("\n}\n").expect("unterminated fn")];
-        let (mut arms, mut saw_none_fallback) = (0usize, false);
+        let (mut arms, mut saw_none_fallback, mut saw_square_delegate) = (0usize, false, false);
         let mut seen: Vec<(usize, usize)> = Vec::new();
         for line in body.lines() {
             let line = line.trim();
             if line.starts_with('_') {
-                saw_none_fallback |= line == "_ => None,";
+                if line == "_ => None," {
+                    saw_none_fallback = true;
+                } else if line.starts_with("_ if ") {
+                    // The square-delegate guard arm hands a square strip to
+                    // `filter_intra_size_class`; the numeric walk below cannot
+                    // see it (it carries no `(bw, bh)` pair), so its callee is
+                    // audited by the direct call after the loop instead.
+                    assert!(
+                        line == "_ if bw == bh => filter_intra_size_class(bw),",
+                        "filter_intra_size_class_rect's guard arm changed shape: {line}"
+                    );
+                    saw_square_delegate = true;
+                }
                 continue;
             }
             let Some(rest) = line.strip_prefix('(') else { continue };
@@ -1417,6 +1432,17 @@ mod tests {
         }
         assert!(arms >= 10, "only {arms} arms parsed -- the table's shape changed");
         assert!(saw_none_fallback, "filter_intra_size_class_rect lost its `_ => None` fallback");
+        assert!(saw_square_delegate, "filter_intra_size_class_rect lost its square-delegate arm");
+        // The guard arm delegates square strips to `filter_intra_size_class`;
+        // drive the delegate directly, so a widening there turns THIS test red
+        // (the numeric walk never reaches the guard arm).
+        assert!(
+            crate::decode::filter_intra_size_class(32).is_some()
+                && crate::decode::filter_intra_size_class(64).is_none(),
+            "filter_intra_size_class now admits a 64-pixel side -- the square-delegate arm of \
+             filter_intra_size_class_rect can then offer a `use_filter_intra` symbol on a \
+             superblock-level HORZ/VERT strip and its guard is reachable"
+        );
         for strip in [(64usize, 32usize), (32, 64)] {
             assert!(
                 !seen.contains(&strip),
