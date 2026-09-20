@@ -154,7 +154,7 @@ would have disarmed the slot — which then stayed armed into the **next** block
 chroma read, changing that block's scan and inverse transform.
 
 Three routes carry the arm-then-skip shape, and the census (every `intrabc_chroma_tx` write on the
-production path: four arms, four clears, one reader) is:
+production path: four arms, six clears, one reader) is:
 
 | route | arms? | clears? |
 |---|---|---|

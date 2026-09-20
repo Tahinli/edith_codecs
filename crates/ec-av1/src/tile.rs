@@ -2874,7 +2874,7 @@ struct Neighbours {
     left_skip: Vec<bool>,
     /// The side, in pixels, of the transform last written in this 4x4
     /// mode-info column -- the deblock `tx_grid` a key frame's
-    /// `get_tx_size_context` reads (decode.rs `tx_size_context`/`tx_px_at`),
+    /// `get_tx_size_context` reads (decode.rs `tx_size_context_txfm`/`tx_px_at`),
     /// which is what picks the CDF row of a `TxMode::Select` block's
     /// `tx_depth` symbol.
     above_tx: Vec<u8>,
@@ -3274,7 +3274,7 @@ impl Neighbours {
         usize::from(has_above && above) + usize::from(has_left && left)
     }
 
-    /// `get_tx_size_context` (decode.rs [`crate::decode::tx_size_context`]):
+    /// `get_tx_size_context` (decode.rs [`crate::decode::tx_size_context_txfm`]):
     /// whether the transform above is at least as wide as this block's own
     /// largest transform, plus whether the one to the left is at least as
     /// tall. A neighbour outside the tile contributes nothing.
