@@ -187,6 +187,14 @@ pub fn intrabc_hits() -> usize {
     crate::decode::intrabc_hits()
 }
 
+/// lane-av1txbands: sub-8x8 group chroma-reference leaves that USED intrabc and
+/// were SKIPPED -- the route that armed [`crate::decode::intrabc_hits`]'s chroma
+/// transform slot and then read no chroma coefficient. A non-zero value is what
+/// makes the disarm at that route load-bearing on a real stream.
+pub fn skipped_intrabc_chroma_arm_hits() -> usize {
+    crate::decode::skipped_intrabc_chroma_arm_hits()
+}
+
 /// lane-sb128c r8: the 128 root's INTRA (key-frame) rect arm -- (128x64
 /// blocks, 64x128 blocks, blocks per resolved intra `tx_depth` 0/1/2).
 pub fn intra_sb128_counters() -> (usize, usize, [usize; 3]) {
