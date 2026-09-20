@@ -24,6 +24,15 @@
 
 #[cfg(test)]
 const CAPABILITY_CLAIMS: &[&str] = &[
+    // lane-hdrlossless ENUMERATION: this guard is a claim about THIS
+    // decoder's gate, not about the encoder -- `filter_intra_size_class_rect`
+    // admits no arm with a 64 axis (libaom `av1_filter_intra_allowed_bsize`
+    // is "both sides <= 32"), and the strips it protects are exactly
+    // `(64, 32)`/`(32, 64)`, which fall to its `_ => None` arm. So the
+    // `filter_intra.is_some()` guard in `decode_block_rect` is unreachable;
+    // the proof is `a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol`,
+    // which enumerates every arm of the table. Kept as a named pin (not
+    // deleted) per the repo convention for proven-unreachable guards.
     "filter intra on a superblock-level HORZ/VERT strip (never expected -- av1_filter_intra_allowed_bsize caps at 32x32)",
 ];
 
@@ -164,6 +173,27 @@ const REFUSALS: &[&str] = &[
 ///
 /// The count printed by [`tests::every_proven_refusal_names_a_test_that_exists`]
 /// is the honest numerator over the inventory below.
+///
+/// # lane-av1-hdr: which pins are `spec-conformant` vs a real gap
+///
+/// A negative gate proves our refusal FIRES by name on a hand-built stream; it
+/// does not prove libaom would reject the same stream. This lane read the
+/// libaom counterpart for the header/reference cluster and recorded the
+/// verdict (`lanes/av1hdr.report.md` §3). The spec-conformant pins (libaom
+/// errors identically) are, with their libaom site:
+///
+/// * `primary_ref_frame` empty slot -- `decodeframe.c:5075` `AOM_CODEC_CORRUPT_FRAME`.
+/// * `show_existing_frame` empty slot -- `decodeframe.c:4651` `AOM_CODEC_UNSUP_BITSTREAM`.
+/// * reference selected with no picture -- `decodeframe.c:5027` `AOM_CODEC_CORRUPT_FRAME`.
+/// * inter frame with no key frame before -- same site (`decodeframe.c:5008`).
+/// * no mode-info grid -- no libaom error site; a 0-sized frame cannot be coded.
+///
+/// The two that are NOT spec-conformant, and are kept as named capability gaps
+/// with an assessment (a real gap libaom accepts, no reachable witness here):
+/// a reference picture whose height differs (libaom SCALES,
+/// `decodeframe.c:5089`) and a frame mixing lossless and lossy segments
+/// (libaom decodes it per segment, `decodeframe.c:5205`; now WITNESSED by
+/// `a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name`).
 #[cfg(test)]
 const PROVEN: &[(&str, &str)] = &[
     // lane-t900 r20, census: three real streams present exactly the 18
@@ -401,6 +431,18 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
         "an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name",
+    ),
+    // lane-hdrlossless, WITNESS: the one refusal the pilot report left with
+    // NO proving test. It is a REAL aomenc output, not a defensive pin:
+    // `--end-usage=q --cq-level=0 --aq-mode=1` codes a frame whose segments
+    // disagree about lossless (`aq_variance.c` sets `SEG_LVL_ALT_Q` per
+    // segment with no clamp once `base_qindex == 0`), libaom decodes it
+    // (`xd->lossless[segment_id]`, `decodeframe.c:5205`), and THIS decoder
+    // refuses it by name. A named capability gap until the block-decoder
+    // lift lands (see the refusal's own doc in `stream.rs`).
+    (
+        "a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)",
+        "a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name",
     ),
 ];
 
@@ -1329,6 +1371,83 @@ mod tests {
         );
         for (bw, bh) in [(128usize, 64usize), (64, 128)] {
             assert!(bw > 64 || bh > 64, "{bw}x{bh} is not a 128-root half");
+        }
+    }
+
+    /// lane-hdrlossless, ENUMERATION behind the LONE capability claim
+    /// ("filter intra on a superblock-level HORZ/VERT strip"). The guard in
+    /// `decode_block_rect` fires only when `filter_intra.is_some()`, and that
+    /// flag is `Some` only where `filter_intra_size_class_rect` says so. The
+    /// strips the guard protects are `(64, 32)` / `(32, 64)`; this test
+    /// enumerates every EXPLICIT arm of that table (asserting none admits a
+    /// `64` axis) AND drives the square-delegate guard arm's callee
+    /// `filter_intra_size_class` directly at 32/64, so a widening on either
+    /// side turns it red. No conformant stream (libaom
+    /// `av1_filter_intra_allowed_bsize` caps both sides at 32) can offer the
+    /// symbol there.
+    #[test]
+    fn a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol() {
+        let src = include_str!("decode.rs");
+        assert!(
+            src.contains("\"filter intra on a superblock-level HORZ/VERT strip"),
+            "the guard this proof is about is gone -- re-derive the capability claim"
+        );
+        let at = src
+            .find("fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {")
+            .expect("filter_intra_size_class_rect is gone");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("unterminated fn")];
+        let (mut arms, mut saw_none_fallback, mut saw_square_delegate) = (0usize, false, false);
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with('_') {
+                if line == "_ => None," {
+                    saw_none_fallback = true;
+                } else if line.starts_with("_ if ") {
+                    // The square-delegate guard arm hands a square strip to
+                    // `filter_intra_size_class`; the numeric walk below cannot
+                    // see it (it carries no `(bw, bh)` pair), so its callee is
+                    // audited by the direct call after the loop instead.
+                    assert!(
+                        line == "_ if bw == bh => filter_intra_size_class(bw),",
+                        "filter_intra_size_class_rect's guard arm changed shape: {line}"
+                    );
+                    saw_square_delegate = true;
+                }
+                continue;
+            }
+            let Some(rest) = line.strip_prefix('(') else { continue };
+            let Some((pair, _)) = rest.split_once(") =>") else { continue };
+            let Some((a, b)) = pair.split_once(',') else { continue };
+            let bw: usize = a.trim().parse().expect("arm bw");
+            let bh: usize = b.trim().parse().expect("arm bh");
+            assert!(
+                bw <= 32 && bh <= 32,
+                "filter_intra_size_class_rect grew an arm with a side above 32 ({bw}x{bh}); \
+                 `av1_filter_intra_allowed_bsize` forbids the symbol there, but if the table \
+                 now admits it the SB-strip guard is reachable"
+            );
+            seen.push((bw, bh));
+            arms += 1;
+        }
+        assert!(arms >= 10, "only {arms} arms parsed -- the table's shape changed");
+        assert!(saw_none_fallback, "filter_intra_size_class_rect lost its `_ => None` fallback");
+        assert!(saw_square_delegate, "filter_intra_size_class_rect lost its square-delegate arm");
+        // The guard arm delegates square strips to `filter_intra_size_class`;
+        // drive the delegate directly, so a widening there turns THIS test red
+        // (the numeric walk never reaches the guard arm).
+        assert!(
+            crate::decode::filter_intra_size_class(32).is_some()
+                && crate::decode::filter_intra_size_class(64).is_none(),
+            "filter_intra_size_class now admits a 64-pixel side -- the square-delegate arm of \
+             filter_intra_size_class_rect can then offer a `use_filter_intra` symbol on a \
+             superblock-level HORZ/VERT strip and its guard is reachable"
+        );
+        for strip in [(64usize, 32usize), (32, 64)] {
+            assert!(
+                !seen.contains(&strip),
+                "{strip:?} has its own filter-intra arm now -- the SB-strip guard is reachable"
+            );
         }
     }
 
