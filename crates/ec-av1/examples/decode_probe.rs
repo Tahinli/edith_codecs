@@ -266,9 +266,10 @@ fn main() {
     // triage needs.
     if let Some(seq) = parser.sequence_header() {
         println!(
-            "SEQ: use_128x128_superblock={} bit_depth={} max_frame={}x{}",
+            "SEQ: use_128x128_superblock={} bit_depth={} mono_chrome={} max_frame={}x{}",
             seq.use_128x128_superblock,
             seq.color_config.bit_depth,
+            seq.color_config.mono_chrome,
             seq.max_frame_width,
             seq.max_frame_height
         );
@@ -310,6 +311,9 @@ fn main() {
     let mut shown = 0usize;
     let mut dims = (0usize, 0usize);
     let mut buf: Vec<u8> = Vec::new();
+    // lane-av1mono: a monochrome stream is luma only, so the raw dump is a
+    // single plane -- exactly what `ffmpeg -pix_fmt gray -f rawvideo` writes.
+    let mono = parser.sequence_header().is_some_and(|s| s.color_config.mono_chrome);
     let result = ec_av1::stream::decode_stream_with(&data, |f, _idx, is_shown| {
         if !is_shown {
             return Ok(());
@@ -318,8 +322,9 @@ fn main() {
         if shown == 1 {
             dims = (f.width, f.height);
         }
+        let planes: &[&Vec<u16>] = if mono { &[&f.y] } else { &[&f.y, &f.u, &f.v] };
         if let Some(w) = f16.as_mut() {
-            let n = 2 * (f.y.len() + f.u.len() + f.v.len());
+            let n = 2 * planes.iter().map(|p| p.len()).sum::<usize>();
             if null16 {
                 // Timing runs point EC_PROBE_OUT16 at /dev/null; the u16->LE
                 // conversion was ~2% of the main thread for bytes nobody reads.
@@ -328,7 +333,7 @@ fn main() {
                 buf.clear();
                 buf.resize(n, 0);
                 let mut off = 0;
-                for p in [&f.y, &f.u, &f.v] {
+                for p in planes {
                     let end = off + 2 * p.len();
                     for (d, &s) in buf[off..end].chunks_exact_mut(2).zip(p.iter()) {
                         d.copy_from_slice(&s.to_le_bytes());
@@ -341,7 +346,7 @@ fn main() {
         }
         if let Some(w) = f8.as_mut() {
             buf.clear();
-            for p in [&f.y, &f.u, &f.v] {
+            for p in planes {
                 buf.extend(p.iter().map(|&s| s as u8));
             }
             w.write_all(&buf).expect("writing raw planes");
