@@ -206,13 +206,15 @@ Evidence:
 
 ### 9.2 Parsed-but-unread pixel-affecting header field sweep
 
-A census of every `SequenceHeader`/`ColorConfig`/frame-header field against the
-decoder's reads (scout report, re-derivable by grep) found exactly two
-pixel-affecting fields the decoder never consumed; both are now closed:
+A per-field census of every `SequenceHeader` / `ColorConfig` /
+`QuantizationParams` / `FrameHeader` field against the decoder's PRODUCTION
+reads (`crates/ec-av1/src/{stream,decode}.rs`, test modules excluded; each row
+re-derivable by `grep -n "\.<field>\b"`) found **three** pixel-affecting fields
+the decoder never consumed. All three are now closed:
 
 1. `subsampling_x/y` — §9.1 (refusal).
-2. **`disable_cdf_update`** (the new find): spec 8.3.2 skips ALL per-symbol CDF
-   adaptation when set, and libaom's tile entry does exactly that
+2. **`disable_cdf_update`** (the second find): spec 8.3.2 skips ALL per-symbol
+   CDF adaptation when set, and libaom's tile entry does exactly that
    (`decodeframe.c:2909`, `allow_update_cdf && !disable_cdf_update`). The
    decoder adapted unconditionally. Fixed at the one authoring point:
    `msac::SymbolDecoder::adapt` (per READER, not global — frames decode on
@@ -230,13 +232,163 @@ pixel-affecting fields the decoder never consumed; both are now closed:
      and its tables stay untouched; the default reader does not (flag
      load-bearing).
 
-Everything else never-read is dispositioned as metadata (color_primaries /
-transfer_characteristics / color_range / chroma_sample_position, timing and
-frame-id fields, `showable_frame`, `render_width/height` — deliberate per
-`encode.rs:15917-15921`), or consumed indirectly by the parser (seq gates forced
-into the frame header: superres/CDEF/restoration/warped/enable_ref_frame_mvs,
-`separate_uv_delta_q`, `seq_force_*`). `mono_chrome`/`num_planes` is the sibling
-lane-av1-mono's.
+3. **`using_qmatrix` + `qm_y`/`qm_u`/`qm_v`** — the census MISS this section
+   previously claimed did not exist (found by the re-verifier; lane-av1txr-r2).
+   Parsed by `ec-av1-syntax` (`frame.rs:190-196`, `:1418-1426`), read by
+   NOTHING on the decode path: every dequantisation is `base_q_idx` plus the
+   plane DC/AC deltas. A real `aomenc --enable-qm=1` stream
+   (`using_qmatrix = 1`, `qm_y/u/v = 5` on the measured fixture) decoded with NO
+   refusal and byte-differed from ffmpeg, while the `--enable-qm=0` control of
+   the same source and recipe was byte-exact — the same silent-garbage class as
+   §9.1. Refused by name at the frame header (`stream.rs`, beside the non-4:2:0
+   guard); gate `a_frame_using_quantisation_matrices_is_refused_by_name`, which
+   fails pre-fix (with the guard removed it panics "the --enable-qm=1 stream now
+   decodes").
+
+The table below is the audit artifact the re-verifier asked for: every field of
+those four structs, its first production read, or its disposition when unread.
+It is the source of the "three" above, so the census is checkable rather than a
+grep claim. Dispositions: `consumed` (a decoder read exists),
+`refused` (a named guard refuses the case), `parser-forced` (a seq flag
+`ec-av1-syntax` folds into a frame-header field the decoder DOES read),
+`parser-internal` (used only while reading the header), `metadata` (no pixel
+effect), `sibling-lane` (`mono_chrome`/`num_planes`, lane-av1-mono), and
+`internal-equivalent` (`ref_order_hint`/`order_hints`, which the decoder
+rebuilds from its own saved reference state — `stream.rs:1344`).
+
+
+**SequenceHeader**
+
+| field | disposition | first prod read |
+|---|---|---|
+| `seq_profile` | parser-internal | sequence.rs parse; effect surfaced via subsampling_x/y + bit_depth guards |
+| `still_picture` | parser-internal | parse branch |
+| `reduced_still_picture_header` | parser-internal | parse branch |
+| `timing_info` | metadata | display timing |
+| `decoder_model_info` | metadata | display timing |
+| `initial_display_delay_present_flag` | metadata | display timing |
+| `operating_points` | metadata | op selection; decoder decodes all |
+| `operating_point` | metadata | op selection |
+| `operating_point_idc` | metadata | op selection |
+| `frame_width_bits` | parser-internal | frame-size read width |
+| `frame_height_bits` | parser-internal | frame-size read width |
+| `max_frame_width` | parser-internal | frame-size validation |
+| `max_frame_height` | parser-internal | frame-size validation |
+| `frame_id_numbers_present_flag` | parser-internal | display_frame_id read |
+| `delta_frame_id_length` | parser-internal | display_frame_id read |
+| `additional_frame_id_length` | parser-internal | display_frame_id read |
+| `use_128x128_superblock` | consumed | `stream.rs:1267` |
+| `enable_filter_intra` | consumed | `stream.rs:1261` |
+| `enable_intra_edge_filter` | consumed | `stream.rs:1263` |
+| `enable_interintra_compound` | consumed | `stream.rs:1266` |
+| `enable_masked_compound` | consumed | `stream.rs:1264` |
+| `enable_warped_motion` | parser-forced | syntax/frame.rs:1053 -> h.allow_warped_motion |
+| `enable_dual_filter` | consumed | `stream.rs:1262` |
+| `enable_order_hint` | parser-forced | syntax/frame.rs:919,1068 -> order_hint_bits / ref_frame_sign_bias |
+| `enable_jnt_comp` | consumed | `stream.rs:1265` |
+| `enable_ref_frame_mvs` | parser-forced | syntax/frame.rs:970 -> h.use_ref_frame_mvs |
+| `seq_force_screen_content_tools` | parser-forced | syntax/frame.rs:853 -> h.allow_screen_content_tools |
+| `seq_force_integer_mv` | parser-forced | syntax/frame.rs:859 -> h.force_integer_mv |
+| `order_hint_bits` | consumed | `stream.rs:1269` |
+| `enable_superres` | parser-forced | syntax/frame.rs:1100 -> h.use_superres |
+| `enable_cdef` | parser-forced | syntax/frame.rs:1576 -> h.cdef |
+| `enable_restoration` | parser-forced | syntax/frame.rs:1605 -> h.loop_restoration |
+| `color_config` | consumed | `stream.rs:724` |
+| `film_grain_params_present` | parser-forced | syntax/frame.rs:809,1866 -> h.film_grain |
+
+**ColorConfig**
+
+| field | disposition | first prod read |
+|---|---|---|
+| `bit_depth` | consumed | `stream.rs:678` |
+| `mono_chrome` | sibling-lane | lane-av1-mono; a mono stream is currently refused by the Golomb tripwire |
+| `num_planes` | sibling-lane | lane-av1-mono |
+| `color_primaries` | metadata | H.273 display |
+| `transfer_characteristics` | metadata | H.273 display |
+| `matrix_coefficients` | consumed | `stream.rs:727` |
+| `color_range` | metadata | output range; probe emits limited-range 4:2:0 |
+| `subsampling_x` | consumed | `stream.rs:1248` |
+| `subsampling_y` | consumed | `stream.rs:1272` |
+| `chroma_sample_position` | metadata | display |
+| `separate_uv_delta_q` | parser-internal | decides qm_v coding, syntax/frame.rs:1422 |
+
+**FrameHeader**
+
+| field | disposition | first prod read |
+|---|---|---|
+| `show_existing_frame` | consumed | `stream.rs:603` |
+| `frame_to_show_map_idx` | consumed | `stream.rs:624` |
+| `frame_presentation_time` | metadata | decoder-model bookkeeping |
+| `display_frame_id` | metadata | frame-id bookkeeping |
+| `frame_type` | consumed | `stream.rs:853` |
+| `frame_is_intra` | parser-internal | derived from frame_type; decoder reads frame_type/show_frame |
+| `show_frame` | consumed | `stream.rs:892` |
+| `showable_frame` | metadata | output eligibility; film grain parse uses it |
+| `error_resilient_mode` | parser-internal | controls header reads (refresh flags / primary_ref) |
+| `disable_cdf_update` | consumed | `stream.rs:1687` |
+| `allow_screen_content_tools` | consumed | `stream.rs:1796` |
+| `force_integer_mv` | consumed | `stream.rs:1833` |
+| `current_frame_id` | metadata | frame-id bookkeeping |
+| `frame_size_override_flag` | parser-internal | frame-size read |
+| `order_hint` | consumed | `stream.rs:989` |
+| `primary_ref_frame` | consumed | `stream.rs:1312` |
+| `buffer_removal_time` | metadata | decoder-model bookkeeping |
+| `refresh_frame_flags` | consumed | `stream.rs:644` |
+| `ref_order_hint` | internal-equivalent | decoder keeps its own ref_order_hints from saved ref state (stream.rs:1344) |
+| `frame_width` | consumed | `stream.rs:1786` |
+| `frame_height` | consumed | `stream.rs:1787` |
+| `upscaled_width` | consumed | `stream.rs:1694` |
+| `render_width` | metadata | deliberate (encode.rs:15917-15921); display crop only |
+| `render_height` | metadata | deliberate (encode.rs:15917-15921); display crop only |
+| `use_superres` | consumed | `stream.rs:1694` |
+| `superres_denom` | consumed | `stream.rs:1695` |
+| `mi_cols` | consumed | `stream.rs:1325` |
+| `mi_rows` | consumed | `stream.rs:1324` |
+| `allow_intrabc` | consumed | `stream.rs:1797` |
+| `frame_refs_short_signaling` | parser-internal | parser derives ref_frame_idx (consumed) |
+| `ref_frame_idx` | consumed | `stream.rs:876` |
+| `delta_frame_id` | metadata | frame-id bookkeeping |
+| `allow_high_precision_mv` | consumed | `stream.rs:1877` |
+| `interpolation_filter` | consumed | `stream.rs:1703` |
+| `is_motion_mode_switchable` | consumed | `stream.rs:1744` |
+| `use_ref_frame_mvs` | consumed | `stream.rs:1317` |
+| `order_hints` | internal-equivalent | derived by decoder from ref_order_hints |
+| `ref_frame_sign_bias` | consumed | `stream.rs:1879` |
+| `disable_frame_end_update_cdf` | consumed | `stream.rs:1369` |
+| `tile_info` | consumed | `stream.rs:759` |
+| `quantization` | consumed | `stream.rs:1370` |
+| `segmentation` | consumed | `stream.rs:1405` |
+| `delta` | consumed | `stream.rs:1798` |
+| `coded_lossless` | parser-internal | computed by parser; h.lossless carries it (consumed) |
+| `all_lossless` | parser-internal | computed by parser |
+| `lossless` | consumed | `stream.rs:1671` |
+| `loop_filter` | consumed | `stream.rs:1791` |
+| `cdef` | consumed | `stream.rs:1747` |
+| `loop_restoration` | consumed | `stream.rs:1748` |
+| `tx_mode` | consumed | `stream.rs:1740` |
+| `reference_select` | consumed | `stream.rs:1887` |
+| `skip_mode_present` | consumed | `stream.rs:1746` |
+| `skip_mode_frame` | consumed | `stream.rs:1892` |
+| `allow_warped_motion` | consumed | `stream.rs:1743` |
+| `reduced_tx_set` | consumed | `stream.rs:1742` |
+| `global_motion` | consumed | `stream.rs:1880` |
+| `film_grain` | consumed | `stream.rs:666` |
+| `header_bits` | parser-internal | tile-group byte alignment |
+
+**QuantizationParams**
+
+| field | disposition | first prod read |
+|---|---|---|
+| `base_q_idx` | consumed | `stream.rs:1370` |
+| `delta_q_y_dc` | consumed | `stream.rs:1780` |
+| `delta_q_u_dc` | consumed | `stream.rs:1781` |
+| `delta_q_u_ac` | consumed | `stream.rs:1782` |
+| `delta_q_v_dc` | consumed | `stream.rs:1783` |
+| `delta_q_v_ac` | consumed | `stream.rs:1784` |
+| `using_qmatrix` | refused | read at `stream.rs:1634` and refused by name |
+| `qm_y` | refused | only present under using_qmatrix=1, now refused by name |
+| `qm_u` | refused | only present under using_qmatrix=1, now refused by name |
+| `qm_v` | refused | only present under using_qmatrix=1, now refused by name |
 
 ### 9.3 transform.rs:1134 panic — ROOT-CAUSED AND FIXED (not a refusal)
 
@@ -327,3 +479,65 @@ and is left standing.
 3. Add the 4x8/8x4 intrabc witnesses to the media-gated corpus (a real stream
    that codes one: `warped.obu` reaches `RECT_INTRABC_VARTX_HITS == 1` and now
    decodes past the old divergence).
+
+## 10. Continuation r2 (2026-09-20): the refuted census + the third silent-garbage member
+
+The re-verifier REFUTED §9.2's "exactly two parsed-but-never-read
+pixel-affecting fields". A third existed, and it was the same silent-garbage
+class §9.1 had just closed for 4:4:4. This round is that finding.
+
+### 10.1 The fix: `using_qmatrix` refused by name
+
+`QuantizationParams.using_qmatrix` + `qm_y`/`qm_u`/`qm_v` are parsed
+(`ec-av1-syntax/src/frame.rs:190-196`, `:1418-1426`) and read by NOTHING on the
+decode path — dequantisation is `base_q_idx` + the plane DC/AC deltas only. A
+spec-legal `aomenc --enable-qm=1` stream therefore decoded into silently wrong
+pixels.
+
+`stream.rs`'s `decode_stream` now refuses it at the frame header, beside the
+non-4:2:0 guard:
+
+```
+if header.quantization.using_qmatrix {
+    return Err(Error::unsupported(
+        "AV1 decode_stream",
+        "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is \
+         base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored \
+         and the frame would decode silently wrong pixels",
+    ));
+}
+```
+
+### 10.2 Evidence
+
+- Measured pair (real aomenc, same source / recipe, only `--enable-qm` flipped;
+  `~/.cache/aom-oracle/build/aomenc`): the qm-OFF stream is byte-exact vs
+  ffmpeg; the qm-ON stream (`using_qmatrix = 1`, `qm_y/u/v = 5`) decoded with NO
+  refusal and its planes byte-differed from ffmpeg.
+  `EC_AV1_PIN=<qm.obu> ... scratch_isolate_pinned_mismatch --ignored` prints the
+  parsed `using_qmatrix = true` on every frame.
+- Gate `a_frame_using_quantisation_matrices_is_refused_by_name` (stream.rs):
+  encodes `--enable-qm=0` and `--enable-qm=1` with real aomenc via
+  `census_attempt`, asserts the qm-off CONTROL decodes and the qm-on stream
+  refuses by name.
+- **Fail-pre-fix**, measured: with the guard removed the gate panics
+  `the --enable-qm=1 stream now decodes -- flip this gate to a witness` (and the
+  decode_probe pair above shows those bytes are wrong).
+- Inventory: new `REFUSALS` entry + `PROVEN` pair; P3 doc fix —
+  `cdf_state.rs`'s `wide()` comment named the deleted `txbset_for_inter`, now
+  `inter_txbset_for`.
+
+### 10.3 Gates (this round)
+
+- `cargo test -p ec-av1 --lib -- refusal_inventory <the new gate>
+  a_reader_told_not_to_adapt a_non_420`: 16 passed, 0 failed.
+- fail-pre-fix run (guard removed): 1 failed, 0 passed — the gate is
+  non-vacuous.
+- `cargo check -p ec-av1 --all-targets`: 0 warnings.
+- The full 595-test suite re-run belongs to the re-verifier.
+
+### 10.4 Next steps
+
+Unchanged from §9.7. This round closes the census hole; the warped key-frame
+tx-depth context (§9.4) and the 1:4-rect-strip intrabc (lane 3) are still open.
+
