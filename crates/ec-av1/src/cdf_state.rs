@@ -322,9 +322,9 @@ impl TxbSet {
 
     /// lane-txi: this set's `reduced_tx_set == 0` counterpart -- the WIDER
     /// `tx_type` alphabet the same coefficient tables are read with when the
-    /// frame header's bit is off. Every pair here is the one
-    /// `decode::txbset_for`/`txbset_for_inter`/`inter_txbset_for` resolve off
-    /// that bit, transcribed from the DECODER's own map so writer and reader
+    /// frame header's bit is off. Every pair here is the counterpart
+    /// `decode::txbset_for`/`inter_txbset_for` resolve off that bit,
+    /// transcribed from the DECODER's own map so writer and reader
     /// cannot drift (class `table-and-reader-move-together`); a set with no
     /// counterpart -- intra 16x16 and 32x32, inter 32x32, 64x64, every
     /// chroma set -- is its own, and widening an already-wide set is the
