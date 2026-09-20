@@ -288,3 +288,63 @@ grep -oP 'mi_row=\d+ mi_col=\d+ name=intrabc val=-?\d+' a.step > a.ib   # then d
 * The deblock approximation is gone from the read path but still computed (as
   `tx_px_at`/`tx_h_px_at`) for the divergence counter and for the deblocker
   itself; deleting it wholesale means deleting that counter.
+
+## MERGE-SIDE FOLLOW-UPS (fast-forward 3ecd4a10..221a37bc, 2026-09-20)
+
+**Merge.** A fast-forward, not a merge commit. Main (`3ecd4a10`) was exactly
+this lane's base and no sibling landed on main since it was cut, so
+`git merge --ff-only 221a37bc` advanced `main` to the lane head (no `MERGE_HEAD`,
+no parents to record). The lane first took **one review-fix commit `221a37bc`**:
+two `tile.rs` doc comments still named the deleted `tx_size_context` /
+`tx_size_context_rect` fns (renamed to `tx_size_context_txfm` /
+`tx_size_context_txfm_rect` by this lane), and this report's own census
+sentence still said "four clears" where the table already showed six — the
+two added disarms (§5) post-date the sentence. Both fixes are prose only.
+
+**Create-list audit.** The fast-forward diffstat is exactly five paths — four
+modified `crates/ec-av1/` files (`src/decode.rs`, `src/stream.rs`, `src/tile.rs`,
+`examples/decode_probe.rs`) and one new `lanes/av1txbands.report.md`. No junk,
+no duplicate file, no fixture, and **no `refusal_inventory` change** (the lane
+added no new refusal; `FrameCtx` is defined inside `src/decode.rs`).
+
+**Merged-tree gates** (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1txbmerge`,
+`TMPDIR=$HOME/.cache/tmp-av1txbmerge`):
+
+- `cargo check -p ec-av1 --all-targets` — **0 warnings**.
+- `cargo test -p ec-av1 --lib` ran to completion (6710 s); literal line:
+  `test result: ok. 600 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 6710.94s`
+  (`600 + 60 = 660`). The lane's own worktree suite had ended `599 passed / 1
+  failed / 60 ignored`, the one failure being the missing-fixture environmental
+  case — with the gitignored `fixtures/` present in the main checkout it is
+  green, so main is `600 / 0 / 60`.
+
+**Suite-integrity check.** `git diff --stat` is **empty** after the suite run:
+the bytes the gates ran on are exactly the committed bytes.
+
+**Behavior probes on the merged tree** (built `decode_probe` from the merged
+tree, private target dir; **all six PASS**):
+
+| probe | result |
+|---|---|
+| `warped.obu` 24 frames byte-exact vs `ffmpeg -pix_fmt yuv420p` | CMP=EQUAL, sha256 `196fdd8be1c5c04a6e3f031892b55deb9606e7ba8c89dad196b11c27e8395162` on **both** (2,764,800 B) |
+| gray 60-frame key frame luma byte-exact vs `ffmpeg -pix_fmt gray` | EQUAL True (4,608,000 B; `EC_PROBE_OUT16` low byte) |
+| `av1-profile1-444.ivf` remuxed to OBU | REFUSED by name (`a chroma format other than 4:2:0`), 0 bytes |
+| `aomenc --enable-qm=0` control / `--enable-qm=1` | control CMP=EQUAL; qm-on REFUSED by name (`a frame using quantisation matrices`) |
+| `aomenc --cdf-update-mode=0`, 3 frames | `disable_cdf=true` on all 3 headers, CMP=EQUAL vs ffmpeg |
+| `hg_arf_witness.obu` 10-bit (37 frames, 3840x1608) | CMP=EQUAL vs `ffmpeg -pix_fmt yuv420p10le`, sha256 `e3f3ded929f0ad8f4299c059c26f808bad899bf5f0646fae08919c59fe8d97e3` on **both** |
+
+**Cleanup.** Worktree `edith_codecs-av1txb` removed (branch `lane-av1-txbands`
+kept at `221a37bc`); `$HOME/.cache/cargo-target-av1txbmerge*` and
+`$HOME/.cache/tmp-av1txbmerge*` removed; the lane's hub process `av1txb-suite`
+(already exited with its missing-fixture failure) stopped and removed.
+
+**Kept instruments** (unchanged, the next lane's tools): `EC_TRACE_MODE_STEP`,
+the per-feature counters `decode_probe` prints, `EC_PROBE_OUT8`/`EC_PROBE_OUT16`/
+`EC_PROBE_HDR`, `EC_TXCTX`, and the instrumented oracle at
+`$HOME/.cache/aom-oracle/build/`.
+
+**Tripwire for the next lane.** The band WRITE side landed here; `lane-av1-intrabc`
+(Kubra) is being reviewed in parallel and must **rebase on this lane** rather
+than re-publishing in the rect-strip bodies (§9). Its `allintra`/`allintra0`
+streams now stop at the genuine `intra block copy on a HORZ/VERT/1:4 rect intra
+strip` refusal at mi(32,68); the mixed-leaf var-tx refusal is no longer reached.
