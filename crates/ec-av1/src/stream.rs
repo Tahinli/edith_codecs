@@ -622,6 +622,10 @@ pub fn decode_stream_with_threads(
             // was emitted (wrongly, in decode order) and its real
             // `show_existing_frame` output was silently dropped.
             let slot = header.frame_to_show_map_idx as usize;
+            // lane-hdrlossless: libaom errors on the same stream
+            // (`decodeframe.c:4651`: `if (frame_to_show == NULL)
+            // aom_internal_error(... AOM_CODEC_UNSUP_BITSTREAM, "Buffer does
+            // not contain a decoded frame")`) -- a spec-conformant guard.
             let empty_slot = || {
                 Error::unsupported(
                     "AV1 decode_stream",
@@ -1398,6 +1402,20 @@ fn decode_frame(
 ) -> Result<FrameOutput> {
     crate::census::frame_start(header, tile_bufs.iter().map(|t| t.len()).sum(), decode_idx);
     if header.segmentation.enabled {
+        // lane-hdrlossless: libaom IMPLEMENTS these three -- they rewrite a
+        // block's reference / skip / mode BEFORE the symbols are read
+        // (`decodemv.c:431` SEG_LVL_SKIP, `:437` SEG_LVL_REF_FRAME /
+        // SEG_LVL_GLOBALMV, `:1071` in `read_ref_frames`, `:1350` in
+        // `read_is_inter_block`), so a conformant stream CAN carry them and
+        // this is a capability gap, not a spec-conformant guard. Reachability
+        // from `aomenc` is nil -- its AQ modes set `SEG_LVL_ALT_Q` only
+        // (`aq_variance.c:89`, `aq_complexity.c:118`, `aq_cyclicrefresh.c:630`)
+        // and the mode-overriding features come only from the library API
+        // (`av1_apply_roi_map` `encoder_utils.c:515`, `av1_apply_active_map`
+        // `encoder_utils.c:557`, the alt-ref overlap case `:401-413`); the CLI
+        // exposes no ROI/active-map flag (checked). Kept as a named gap: the
+        // lift is an INTER-block-path change (ref/skip/mode selection) outside
+        // this lane's region. See `lanes/av1hdr.report.md` §4.1.
         for segment in 0..MAX_SEGMENTS {
             for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {
                 if header.segmentation.feature_enabled[segment][feature] {
@@ -1621,9 +1639,26 @@ fn decode_frame(
     // `qindex == 0` with zero plane deltas. The tile reader then forces TX_4X4
     // with the Walsh-Hadamard transform on every plane, codes no `tx_type`
     // symbol and narrows `is_cfl_allowed` to `plane_bsize == BLOCK_4X4`
-    // (libaom `read_tx_size`/`read_tx_type`/`is_cfl_allowed`). A frame whose
-    // segments DISAGREE is still refused by name: every one of those rules is
-    // per segment there, and no gate covers a mixed frame.
+    // (libaom `read_tx_size`/`read_tx_type`/`is_cfl_allowed`).
+    //
+    // lane-hdrlossless: a frame whose segments DISAGREE is a valid stream
+    // libaom decodes -- `xd->lossless[segment_id]` is per segment
+    // (`decodeframe.c:5205`), and aomenc WRITES one: `--end-usage=q
+    // --cq-level=0 --aq-mode=1` (variance AQ over a lossless base) gives a
+    // high-variance segment a positive `SEG_LVL_ALT_Q` while a flat one stays
+    // at `qindex == 0` (witness gate
+    // `a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name`). This
+    // decoder still refuses it BY NAME, and the refusal is honest rather than
+    // spec-conformant: the lift is a BLOCK-decoder feature, not a header one.
+    // Measured while attempting it: threading the per-segment table through
+    // [`decode::lossless`] alone is not enough -- (a) `read_tx_size` and the
+    // ~8 rectangular-strip `tx_depth` readers must return TX_4X4 without
+    // reading a symbol when the block is lossless (libaom `read_tx_size`'s
+    // first line), and (b) the lossless reconstruction/coefficient path for
+    // the shapes such a frame codes is still partial. The naive lift desyncs
+    // the tile ("a Golomb tail longer than this decoder reads") or returns a
+    // picture that differs from ffmpeg from byte 32. Kept as a named gap
+    // until a block-decoder lane ports per-segment lossless as one unit.
     let coded_lossless = header.lossless.iter().all(|&l| l);
     if header.lossless.iter().any(|&l| l) && !coded_lossless {
         return Err(Error::unsupported(
@@ -1663,6 +1698,11 @@ fn decode_frame(
     // from that reference slot's saved CDF state instead of the spec 8.4
     // defaults `decode_key/inter_frame_tile_with_cdfs`'s `None` case
     // builds.
+    // lane-hdrlossless: libaom errors on the same stream (`decodeframe.c:5075`:
+    // `if (features->primary_ref_frame != PRIMARY_REF_NONE &&
+    // get_primary_ref_frame_buf(cm) == NULL) aom_internal_error(...,
+    // AOM_CODEC_CORRUPT_FRAME, "Reference frame containing this frame's
+    // initial frame context is unavailable.")`) -- a spec-conformant guard.
     let initial_cdfs = if header.primary_ref_frame == PRIMARY_REF_NONE {
         None
     } else {
@@ -1770,6 +1810,11 @@ fn decode_frame(
     } else {
         let last_slot = header.ref_frame_idx[0] as usize;
         let _ = last_slot;
+        // lane-hdrlossless: libaom errors on the same stream -- a stream may
+        // OPEN on an intra-only frame, but a reference resolving to a slot
+        // that is still NULL is `AOM_CODEC_CORRUPT_FRAME "Inter frame
+        // requests nonexistent reference"` (`decodeframe.c:5008-5031`) -- a
+        // spec-conformant guard.
         if snap.refpix.dims(1).is_none() {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
@@ -2292,6 +2337,150 @@ pub(crate) mod tests {
             Err(e) => Err(e.to_string()),
         };
         (stream.len(), result)
+    }
+
+    /// lane-hdrlossless: WITNESS for the one refusal the pilot report left
+    /// without a proving test -- "a frame mixing lossless and lossy
+    /// segments". It is a REAL encoder output, not a defensive pin:
+    /// `--end-usage=q --cq-level=0 --aq-mode=1` (variance AQ over a lossless
+    /// base) gives a high-variance segment a positive `SEG_LVL_ALT_Q` while a
+    /// flat segment stays at `qindex == 0` (`aq_variance.c` sets
+    /// `SEG_LVL_ALT_Q` per segment and only clamps when `base_qindex != 0`,
+    /// so a lossless base is exactly where the mixed case comes from), and
+    /// libaom DECODES it -- `xd->lossless[segment_id]` is per segment
+    /// (`decodeframe.c:5205`), and `read_tx_size` returns TX_4X4 before it
+    /// reads a symbol (`decodeframe.c:1170`). So the refusal names a
+    /// capability gap, not a spec-conformant guard, and it must not be
+    /// deleted until the block-decoder lift lands (see the refusal's own doc
+    /// in [`super::decode_stream`]). The gate (1) encodes the stream, (2)
+    /// asserts it REALLY carries a mixed frame (class `gate-blind-to-feature`
+    /// -- variance AQ over a lossless base is the whole point, not the flag
+    /// spelling), (3) shows ffmpeg's libaom decoder accepts it, and (4) pins
+    /// THIS decoder's refusal by exact string.
+    #[test]
+    fn a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name() {
+        const NAME: &str = "a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        const REFUSAL: &str = "a frame mixing lossless and lossy segments";
+        const FRAMES: usize = 4;
+        // (source, per-arm overrides). `--end-usage=q --cq-level=0` is the
+        // lossless base; `--aq-mode=1` is variance AQ, the only aomenc path
+        // that sets `SEG_LVL_ALT_Q` with no clamp at base 0 (`aq_variance.c`).
+        // Several arms because the segment split depends on the encoder's own
+        // variance decisions (class knob-never-reached-the-tool: require at
+        // least one arm to actually mix, and fail if none does).
+        let arms: [(&str, &[&str]); 3] = [
+            (
+                "testsrc2=size=256x192:rate=25",
+                &["--end-usage=q", "--cq-level=0", "--aq-mode=1", "--good", "--cpu-used=3", "--sb-size=64"],
+            ),
+            (
+                "testsrc2=size=256x192:rate=25",
+                &["--end-usage=q", "--cq-level=0", "--aq-mode=1", "--good", "--cpu-used=5", "--sb-size=64"],
+            ),
+            (
+                "gradients=size=256x192:rate=25",
+                &["--end-usage=q", "--cq-level=0", "--aq-mode=1", "--good", "--cpu-used=6", "--sb-size=64"],
+            ),
+        ];
+        let mut mixed_arms = 0usize;
+        for (src, extra) in &arms {
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.16", "-pix_fmt",
+                    "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(y4m.status.success(), "{NAME}: ffmpeg failed for {src}");
+            let limit = format!("--limit={FRAMES}");
+            let mut args: Vec<String> = ["--codec=av1", "--passes=1", "--threads=1", "--obu", "-o", "-", "-"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            args.insert(1, limit);
+            args.extend(extra.iter().map(|s| (*s).to_owned()));
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            // (2) the stream really carries a frame the refusal names.
+            let mut parser = Av1Parser::new();
+            let (mut pos, mut mixed) = (0usize, 0usize);
+            while pos < stream.len() {
+                let obu = parser.parse_obu(&stream[pos..]).expect("aomenc OBU parses");
+                pos += obu.total_size.max(1);
+                let header = match &obu.kind {
+                    ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) => h,
+                    _ => continue,
+                };
+                if header.lossless.iter().any(|&l| l) && !header.lossless.iter().all(|&l| l) {
+                    mixed += 1;
+                }
+            }
+            if mixed == 0 {
+                eprintln!("{NAME}: arm {extra:?} coded no mixed frame -- trying the next");
+                continue;
+            }
+            mixed_arms += 1;
+            // (3) libaom accepts it: ffmpeg's own libaom decoder produces the
+            // stream without an error.
+            let mut ff = Command::new("ffmpeg")
+                .args(["-v", "error", "-f", "obu", "-i", "-", "-f", "null", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("ffmpeg failed to start");
+            let mut stdin = ff.stdin.take().expect("ffmpeg stdin");
+            let payload = stream.clone();
+            let writer = std::thread::spawn(move || {
+                let _ = stdin.write_all(&payload);
+            });
+            let out = ff.wait_with_output().expect("ffmpeg failed to run");
+            writer.join().expect("ffmpeg stdin writer");
+            assert!(
+                out.status.success(),
+                "{NAME}: ffmpeg refused a stream with {mixed} mixed-frame(s): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // (4) ours refuses BY NAME (not by desync).
+            let err = decode_stream(&stream)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| panic!("{NAME}: a mixed-lossless frame DECODED -- the lift landed; flip this gate to a pixel-exact witness"));
+            assert!(
+                err.contains(REFUSAL),
+                "{NAME}: expected {REFUSAL:?}, got: {err}"
+            );
+            eprintln!("{NAME}: arm {extra:?}: {mixed} mixed frame(s), refused by name");
+        }
+        assert!(
+            mixed_arms > 0,
+            "{NAME}: no arm produced a mixed lossless/lossy frame -- the witness is vacuous \
+             (re-measure the aomenc recipe)"
+        );
     }
 
     /// lane-t900 r27 CENSUS behind the negative gate above: does a real
