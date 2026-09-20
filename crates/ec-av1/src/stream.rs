@@ -6251,7 +6251,13 @@ pub(crate) mod tests {
         // (arm, source, per-arm overrides AFTER the base recipe, expect_refusal,
         //  must_read_use_intrabc_on_a_rect_strip)
         let arms: [(&str, &str, &[&str], bool, bool); 8] = [
-            ("testsrc2-cq50-txs0", TS, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"], true, true),
+            // lane-av1-intrabc (2026-09-20): this arm used to REFUSE here -- the
+            // 16x8 rect strip it decodes is the first block on main that reaches
+            // `decode_intrabc_rect`, so the whole arm stopped at a named refusal.
+            // Reconstruction is ported now, so the arm decodes pixel-exact and
+            // the `rect_total` assert below keeps it from quietly falling back
+            // to an ordinary-intra decode of the same block.
+            ("testsrc2-cq50-txs0", TS, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
             ("smptebars-cq40-txs0", SB, &["--cq-level=40", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
             ("smptebars-cq45-txs0", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
             ("smptebars-cq45-txs1", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
@@ -6269,6 +6275,7 @@ pub(crate) mod tests {
         let (mut blocks_total, mut fired_arms, mut out_of_scope, mut out_of_scope_mismatch) =
             (0usize, 0u32, 0u32, 0u32);
         let mut leaf8_total = 0usize;
+        let mut rect_total = 0usize;
         for (arm, src, extra, expect_refusal, must_read) in &arms {
             let render = || {
                 let out = Command::new("ffmpeg")
@@ -6341,6 +6348,7 @@ pub(crate) mod tests {
             decode::reset_rect_intrabc_reads();
             crate::decode::reset_intrabc_hits();
             crate::decode::reset_leaf8_intrabc_hits();
+            crate::decode::reset_intrabc_rect_hits();
             let decoded = decode_stream(&stream);
             let reads = decode::rect_intrabc_reads();
             // Blocks that decoded `use_intrabc == 1` (square path), i.e. that
@@ -6355,6 +6363,7 @@ pub(crate) mod tests {
             // `gate-blind-to-feature`).
             let leaf8 = crate::decode::leaf8_intrabc_hits();
             leaf8_total += leaf8;
+            rect_total += crate::decode::intrabc_rect_hits();
             if *arm == "testsrc2-cq55-leaf8" {
                 assert!(
                     leaf8 > 0,
@@ -6431,7 +6440,9 @@ pub(crate) mod tests {
              {refused} refused by name, {frames_compared} frames compared, \
              {out_of_scope} out of scope ({out_of_scope_mismatch} mismatched)"
         );
-        eprintln!("{NAME}: {leaf8_total} intrabc block(s) at an 8x8 leaf");
+        eprintln!(
+            "{NAME}: {rect_total} intrabc block(s) on a HORZ/VERT rect strip              (decode_intrabc_rect)"
+        );
         assert!(reads_total > 0, "{NAME}: gate is vacuous -- no arm read the symbol");
         assert!(
             leaf8_total > 0,
@@ -6441,7 +6452,16 @@ pub(crate) mod tests {
             blocks_total > 0 && fired_arms > 0,
             "{NAME}: gate is vacuous -- no compared arm actually decoded an intrabc block"
         );
-        assert_eq!(refused, 1, "{NAME}: expected exactly one named intrabc refusal");
+        assert!(
+            rect_total > 0,
+            "{NAME}: no arm decoded an intrabc block on a HORZ/VERT rect strip -- \
+             `decode_intrabc_rect` is untested"
+        );
+        // lane-av1-intrabc: this used to be exactly one -- the 2:1 rect strips
+        // now reconstruct. The 1:4 pair strips (`decode_rect4_16_strip` et al.)
+        // still refuse by name, but no arm HERE reaches that shape; it stays
+        // pinned by `refusal_inventory`'s own gate.
+        assert_eq!(refused, 0, "{NAME}: an arm still refuses by name");
         assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
         assert_eq!(
             out_of_scope_mismatch, 0,
