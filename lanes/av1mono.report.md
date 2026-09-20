@@ -591,3 +591,48 @@ warnings on the same final bytes.
 - `av1-profile1-444.ivf` chroma non-exactness (pilot §3.2 4:4:4 block-routing) —
   pre-existing, unchanged by this lane.
 - The pilot's 4:4:4-fast / all-intra / warped-cpu0 recipes — untouched.
+
+## MERGE-SIDE FOLLOW-UPS
+
+Merged `lane-av1-mono` (`66a39803`) into `main` as the merge commit
+**`7806fd0d`** (parents `0cfb9af5` + `66a39803`; a real merge, not a
+fast-forward). Pushed to `origin/main`.
+
+### Conflict resolution
+
+One conflicted file: `crates/ec-av1/src/stream.rs`, three hunks, all inside
+the pilot's pinning gate vs this lane's witness.
+
+- **DROP the pilot's pinning gate**
+  `a_real_libaom_monochrome_key_frame_is_refused_by_name` (landed on `main` at
+  the pilot merge `d71084ae`, after this lane's base `7f4e8301`). It asserts the
+  exact refusal this lane removes, so it cannot survive.
+- **KEEP this lane's inverted witness**
+  `a_real_libaom_monochrome_key_frame_decodes_pixel_exact` and its helper
+  `ffmpeg_decode_gray_sequence`, in its place.
+- `crates/ec-av1/src/decode.rs` and `crates/ec-av1/examples/decode_probe.rs`
+  auto-merged; the resolved tree's `crates/ec-av1/` is **byte-identical to the
+  lane's** (`git diff 66a39803 -- crates/ec-av1` empty), i.e. `main`'s lineage
+  never carried the mono model, so there was no `main`-side decode state to
+  preserve. Marker grep clean. All `lanes/*.md` reports kept (union:
+  `av1decode`, `av1mono`, `mp4rotation`, `vp9444`).
+
+### Merged-tree gates
+
+- `cargo test -p ec-av1 --lib` to completion → **592 passed, 0 failed,
+  60 ignored** (8124 s). Same `592/0/60` as the lane and the pilot — the pin
+  swap is count-neutral (one test removed, one added).
+- `cargo check -p ec-av1 --all-targets` → **0 warnings**.
+- Merged-build spot-check with `decode_probe` (release, merge target dir):
+  - (a) gray 60 f key frame → `OK: 60 frames decoded, 320x240`, `gray60 EQUAL True`
+  - (b) gray 120 f inter → `OK: 120 frames decoded`, `gray120 EQUAL True`
+  - (c) `av1-monochrome.ivf` remuxed to OBU → `OK: 60 frames decoded`,
+    `mono.ivf EQUAL True`
+  - (d) film window `p-hgb3300` (3840x1608, 10-bit) → `OK: 279 frames decoded`;
+    probe sha256 `b17e9036cbcfa90b` == ref sha256 `b17e9036cbcfa90b` (MATCH).
+
+### Cleanup
+
+- Removed worktree `edith_codecs-av1mono`; branch `lane-av1-mono` kept.
+- Removed private target dirs `$HOME/.cache/cargo-target-av1mono`,
+  `-av1monoverify`, `-av1monomerge` and TMPDIR `$HOME/.cache/tmp-av1monomerge`.
