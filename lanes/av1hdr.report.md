@@ -265,3 +265,76 @@ CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1hdr \
 
 - `lane-av1-hdr` off `0cfb9af5`: the witness gate, the enumeration test, the
   disposition comments, this report.
+
+## 10. MERGE-SIDE FOLLOW-UPS
+
+**Merge.** `e03f7173` (`ec-av1: merge lane-av1-hdr`), parents
+`c8ac9f46 5bb35ca3` — a real merge, not a fast-forward: `main` had advanced
+past the base with the sibling `lane-av1-mono` (`7806fd0d`, follow-ups
+`c8ac9f46`). Resolution was an **auto-merge with no conflicts**; the two sides
+of `stream.rs` were disjoint (mono rewrote the `SeqFlags`/`set_mono` region and
+replaced the pilot's monochrome pin with its pixel-exact witness; this lane
+added comments and its own witness at the end of the test module). **Both
+sides were kept**: mono's pin stays dropped and its
+`a_real_libaom_monochrome_key_frame_decodes_pixel_exact` is present; this
+lane's comments and `a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name`
+are present.
+
+**Lane P3 fixes (commit `5bb35ca3`, on the lane before the merge).**
+
+- `refusal_inventory.rs`: `a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol`
+  silently skipped the square-delegate guard arm (`_ if bw == bh =>
+  filter_intra_size_class(bw),`). The parser now recognises that arm and the
+  test additionally drives `filter_intra_size_class(32)` / `filter_intra_size_class(64)`
+  directly, so a widening of the delegate turns the gate red. Doc comment
+  updated to say what it enumerates.
+- `lanes/av1hdr.report.md` §3: `compute_image_size` is AV1-spec pseudocode, not
+  a libaom v3.13.3 symbol; the mi-grid derivation is now cited as
+  `dec_set_mb_mi` (`decoder.c:57-58`; cf. `av1_get_MBs`, `alloccommon.c:32-33`).
+- **The reviewer's third finding was withdrawn** (author retraction, verified):
+  it claimed the 12-bit warp `reduce_bits_horiz` is 4, not 5. With
+  `FILTER_BITS = 7` (`aom_dsp/aom_filter.h`, the only definition),
+  `intbufrange = 12 + 7 - 3 + 2 = 18 > 16` → `round_0 = 3 + 2 = 5`, and
+  `warped_motion.c:310`'s assert gives `round_0 >= 5`. §4.2's "= 5 at bd 12"
+  stands; **no edit made**.
+
+**Create-list audit.** Exactly four paths: `decode.rs` (+12, comments only),
+`refusal_inventory.rs` (the enumeration test), `stream.rs` (comments + the
+witness), and `lanes/av1hdr.report.md` (new). No junk/duplicate file. The
+`decode.rs`/`stream.rs` edits add **no decoder behavior**.
+
+**Merged-tree gates** (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1hdrmerge`,
+worktree `fixtures/` symlink in place):
+
+- `cargo check -p ec-av1 --all-targets` — **0 warnings**.
+- `cargo test -p ec-av1 --lib refusal_inventory` — **14 passed / 0 failed /
+  0 ignored** (640 filtered out).
+- The new gates, run together: `1..3 passed / 0 failed` —
+  `refusal_inventory::tests::a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol` ok;
+  `stream::tests::a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name` ok
+  (each of the 3 arms carried **1 mixed frame, refused by name**);
+  `stream::tests::a_real_libaom_monochrome_key_frame_decodes_pixel_exact` ok
+  (4:2:0 twin and monochrome **60 frames each, byte-exact vs ffmpeg**) — mono's
+  witness, re-run on the merged tree.
+- **decode_probe 10-bit sha-parity** (`fixtures/hbd-r5/hunger.obu`, 3840x1608,
+  72 shown frames, `EC_PROBE_OUT16`): lane `5bb35ca3` and merged `e03f7173`
+  both produce `sha256
+  d7214bb733b4a6ca2d946d0fcb4849691191b694164383db110a4d9183436784`
+  (1,333,739,520 B of yuv420p10le); `cmp` reports IDENTICAL. The merge is
+  behavior-identical on the high-bit-depth path.
+
+**Full merged-tree suite NOT re-run**: the verifier already completed it on the
+lane (594 passed / 0 failed / 60 ignored, 8083 s); the merge resolution touched
+no decoder code (comments + tests only), and the 10-bit sha-parity above is the
+behavior-identity proof.
+
+**Cleanup.** Worktree `edith_codecs-av1hdr` removed (branch `lane-av1-hdr`
+kept at `5bb35ca3`); private target dirs
+`$HOME/.cache/cargo-target-av1hdrmerge*` and the `$HOME/.cache/tmp-av1hdrmerge`
+TMPDIR removed.
+
+**Tripwire for the next lane.** `a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name`
+pins today's refusal of a frame mixing lossless and lossy segments (the
+per-segment lossless / `TX_4X4` block-decoder path is not lifted here). The lane
+that lands that lift MUST flip this pin to a witness, or it merges a stale
+refusal pin. (`lane-av1-mono` already flipped its monochrome pin.)
