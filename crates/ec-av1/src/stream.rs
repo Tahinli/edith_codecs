@@ -207,6 +207,13 @@ pub fn intra128_in_inter_counters() -> [usize; 2] {
     crate::decode::intra128_in_inter_hits()
 }
 
+/// lane-lossless128: intra 128-axis blocks decoded on a LOSSLESS frame, where
+/// every plane is a TX_4X4 unit. The engagement counter for
+/// `a_lossless_sb128_rect_intra_block_decodes_sample_exact`.
+pub fn intra128_lossless_counters() -> usize {
+    crate::decode::intra128_lossless_hits()
+}
+
 /// lane-sb128c r9: the four AB shapes at the 128 root, in `PARTITION_HORZ_A`,
 /// `_HORZ_B`, `_VERT_A`, `_VERT_B` order (key and inter tile paths share the
 /// counter -- it is bumped where the root symbol resolves).
@@ -4948,6 +4955,68 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// lane-lossless128: a LOSSLESS key frame that codes a 128-axis
+    /// (`BLOCK_64X128`) intra block -- the shape libaom's `read_tx_size` forces
+    /// to `TX_4X4` on its very first line (`decodeframe.c:1183`), so every plane
+    /// of the block is a 4x4 transform unit and NO `tx_size_cat3` symbol is
+    /// coded.
+    ///
+    /// On the merged base `decode_block_128rect` had no lossless carve-out: it
+    /// read `logical_tx = 64` off `depth == 0`, handed `PlaneBuf::reconstruct`
+    /// a 64x64 geometry with the 16-sample 4x4 residual
+    /// [`TxParams::run`](crate::decode::TxParams) produced -- `index out of
+    /// bounds: the len is 16 but the index is 16` at the reconstruction call,
+    /// on EVERY conformant stream of this shape (a panic, never a refusal).
+    ///
+    /// `crates/ec-av1/fixtures/lossless_sb128_rect_kf.obu`, 3471 bytes, sha256
+    /// `013b07979c8be999c70d47f32768c2bf959be086a893f60dde1b0f5e35d4f475`:
+    /// `aomenc --codec=av1 --passes=1 --threads=1 --obu --lossless=1
+    /// --cpu-used=0` over a 320x256, 4-frame source that is flat grey except a
+    /// textured 64x128 patch in the top-right corner -- which is what makes the
+    /// 128 root take `PARTITION_VERT` and code the `BLOCK_64X128` at mi(0,64).
+    ///
+    /// The counter delta keeps the gate non-vacuous: a stream that stopped
+    /// coding the shape reads 0 and the gate fails instead of passing on a
+    /// decode that never reached the fixed body (class
+    /// `gate-blind-to-feature`).
+    #[test]
+    fn a_lossless_sb128_rect_intra_block_decodes_sample_exact() {
+        const NAME: &str = "a_lossless_sb128_rect_intra_block_decodes_sample_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let (w, h, frames) = (320usize, 256usize, 4usize);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/lossless_sb128_rect_kf.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let before = crate::decode::intra128_lossless_hits();
+        let ours = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: a lossless 128-axis key frame decodes: {e}"));
+        let hits = crate::decode::intra128_lossless_hits() - before;
+        assert!(
+            hits > 0,
+            "{NAME}: this stream coded NO lossless 128-axis intra block -- the fixed body \
+             was never reached (class gate-blind-to-feature)"
+        );
+        let refs = ffmpeg_decode_sequence(&stream, w, h, frames);
+        assert_eq!(ours.len(), frames, "{NAME}: decode-order frame count");
+        for (i, (got, want)) in ours.iter().zip(refs.iter()).enumerate() {
+            for (plane, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                .iter()
+                .enumerate()
+            {
+                let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    bad, 0,
+                    "{NAME}: frame {i} plane {plane}: {bad} samples differ from ffmpeg"
+                );
+            }
+        }
+        eprintln!("{NAME}: {frames} frames sample-exact, intra128_lossless hits {hits}");
     }
 
     /// lane-dkey: the palette-neighbour-band gate. A palette-Y block's size and
