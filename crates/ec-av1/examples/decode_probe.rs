@@ -111,6 +111,12 @@ fn main() {
         // an INTER frame -- the arm this round implemented.
         let i128 = ec_av1::stream::intra128_in_inter_counters();
         println!("intra128_in_inter: 128x64={} 64x128={}", i128[0], i128[1]);
+        // lane-lossless128: intra 128-axis blocks on a LOSSLESS frame (every
+        // plane TX_4X4) -- the shape whose reconstruction used to panic.
+        println!(
+            "intra128_lossless: {}",
+            ec_av1::stream::intra128_lossless_counters()
+        );
         let sb = ec_av1::stream::sb128_rect_counters();
         println!(
             "sb128_rect: edge_horz={} edge_vert={} inter_128x64={} inter_64x128={}",
