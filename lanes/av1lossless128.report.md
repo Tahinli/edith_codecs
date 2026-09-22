@@ -233,3 +233,80 @@ stdout/stderr on a side thread before write_all, then sweep the same spawn
 shape).` Not this lane's decoder change.
 
 `cargo check -p ec-av1 --all-targets`: 0 warnings (before the commit).
+
+## MERGE-SIDE FOLLOW-UPS (fast-forward 46f07214..6dbc73b9, 2026-09-23)
+
+**Merge.** A fast-forward, not a merge commit. Main (`46f07214`) was exactly
+this lane's base and no sibling landed on main since it was cut, so
+`git merge --ff-only lane-av1-lossless128` advanced `main` to `6dbc73b9`
+(no `MERGE_HEAD`, no parents to record). Pushed `46f07214..6dbc73b9`;
+`git ls-remote origin refs/heads/main` returned `6dbc73b9`.
+
+**Review P3 fixed on the lane before the merge** (commit `6dbc73b9`, prose
+only). Both `decode_block_128rect` comments cited `decodeframe.c:140` for
+`read_tx_mode`'s `ONLY_4X4` return. In the oracle that line is the
+`coded_lossless` parameter; the return `if (coded_lossless) return ONLY_4X4;`
+is line 141, which §2 already cited. The `:1183` cite (`read_tx_size`
+returns `TX_4X4`) was already correct and was left alone. The committed
+diff is two lines, `140` → `141`, no other hunk.
+
+**Create-list audit.** The fast-forward diffstat is exactly five paths:
+modified `crates/ec-av1/src/decode.rs`, `crates/ec-av1/src/stream.rs`,
+`crates/ec-av1/examples/decode_probe.rs`; created
+`crates/ec-av1/fixtures/lossless_sb128_rect_kf.obu` (force-added, tracked,
+3471 bytes, sha256
+`013b07979c8be999c70d47f32768c2bf959be086a893f60dde1b0f5e35d4f475`) and
+`lanes/av1lossless128.report.md`. No junk, no duplicate file.
+
+**Reviewer suite, not re-run.** The reviewer ran the full lib suite on the
+committed lane tree (`cca03792`, before the prose-only P3): literal line
+`test result: ok. 601 passed; 0 failed; 60 ignored` in 1392.62s
+(`601 + 60 = 661`). Main was the lane base, so the fast-forward makes the
+merged decoder bytes identical to that tree plus the two comment digits.
+This close did not re-run the full suite.
+
+**Merged-tree gates** (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1llmerge`,
+`TMPDIR=$HOME/.cache/tmp-av1llmerge`):
+
+- `cargo check -p ec-av1 --all-targets` — **0 warnings** (check log has no
+  `warning` line; finished in 10.04s).
+- Scoped `cargo test -p ec-av1 --lib` (the 21 decode-path refusal tests —
+  4 in `decode`, `unsupported_frames_are_refused_by_name`, the 9
+  `stream` `refused_by_name` gates, 7 in `tile` — plus the headline gate,
+  the monochrome witness, and the cdf-update witness). 4:4:4 and qmatrix
+  are inside those 9. Literal line:
+  `test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 637 filtered out; finished in 13.61s`
+  Headline: `4 frames sample-exact, intra128_lossless hits 2`.
+  Mono: `4:2:0 twin 60 frames, monochrome 60 frames byte-exact vs ffmpeg`.
+  Qmatrix: `qm-off control 3 frames, qm-on refused by name`.
+  4:4:4 header: `a_non_420_subsampled_sequence_header_is_refused_by_name` ok.
+  CDF: `3 disable_cdf_update frame headers, all frames sample-exact`.
+
+**Probes on the merged `decode_probe`** (built from this tree into the
+merge target dir):
+
+| probe | result |
+|---|---|
+| gray 60-frame key (`libaom-av1`, 320x240, `mono_chrome`) vs `ffmpeg -pix_fmt gray` | EQUAL, 4,608,000 B, `OK: 60 frames` |
+| `fixtures/bitstreams/av1-monochrome.ivf` remuxed to OBU, 60 frames | EQUAL, 4,608,000 B. The remuxed OBU is byte-identical to the regenerated gray60 above (same deterministic recipe); both probes still ran |
+| `hg_kf900.obu` 10-bit via `EC_PROBE_OUT16` vs `ffmpeg -pix_fmt yuv420p10le` | EQUAL, 18,524,160 B, sha256 `0bf2548080b14f2a4fada234e399e5803344dd23ea8254ea944da0d1aeaef5f2` on **both** |
+| lane 24-frame lossless repro (`loss240.obu`, sb128, 320x240) | `OK: 24 frames`, `intra128_lossless: 13`. **Not** ffmpeg-exact: first differing byte is 108 (frame 0 luma col 108). Same measurement the reviewer re-derived. That is the deferred 16x4/4x16 chroma-pair desync in §6, pre-existing, not a merge regression |
+
+**Cleanup.** Worktree `edith_codecs-av1ll` removed (branch
+`lane-av1-lossless128` kept at `6dbc73b9`). `$HOME/.cache/cargo-target-av1ll*`
+and `$HOME/.cache/tmp-av1ll*` removed (lane, lane-base, verifier, and this
+merge dir). Hub processes `av1ll-suite`, `av1ll-retest`, `av1llv-*`, and
+`av1llmerge-*` stopped. Not touched: `lane-av1-intrabc` / `edith_codecs-av1ibc`.
+
+**Leftovers** (not this close's glob; left in place): worktree
+`$HOME/.cache/av1ll-base` (`tmp-av1ll-base` at `46f07214`),
+`$HOME/.cache/av1ll-out`, `$HOME/.cache/av1llverify-base`.
+
+**Kept instruments** (the next lane's tools): `decode_probe` and its
+counters (`intra128_lossless` included), `EC_PROBE_OUT` / `EC_PROBE_OUT16` /
+`EC_PROBE_HDR`, and the oracle under `$HOME/.cache/aom-oracle/build/`.
+
+**Tripwire for the next lossless-shape lane.** §6 stands:
+`deferred(lossless 16x4/4x16 chroma pair — decode_rect4_16_strip needs the
+two-TX_4X4 walk)`. The 24-frame repro still diverges at byte 108 after this
+merge. That lane must not treat this fast-forward as having closed it.
