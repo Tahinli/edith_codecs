@@ -194,6 +194,42 @@ reads. Not folded into the success summary.
 
 ## 8. Suite
 
-`cargo test -p ec-av1 --release --lib -- --test-threads=1`, hub process
-`av1ll-suite`, on the committed tree. Expected **601 passed; 0 failed; 60
-ignored** (base 600 + this gate). Literal final line filled after the run.
+Hub process `av1ll-suite`, on commit `6f84f302` (`git status --short` empty
+before and after; the suite ran the committed bytes):
+
+```
+CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1ll TMPDIR=$HOME/.cache/tmp-av1ll \
+  cargo test -p ec-av1 --release --lib -- --test-threads=1
+```
+
+Literal final line:
+
+```
+test result: FAILED. 600 passed; 1 failed; 60 ignored; 0 measured; 0 filtered out; finished in 3234.42s
+```
+
+The one failure is **not** this lane's gate and **not** a decode regression.
+`a_lossless_sb128_rect_intra_block_decodes_sample_exact` printed `ok` inside
+that run. The failed test is
+`a_real_aomenc_inter_sequence_with_a_split_transform_intra_strip_decodes_pixel_exact`,
+which had already logged seeds 42..57 and then sat 25 minutes on an `aomenc`
+blocked in `anon_pipe_write` (0% CPU, one voluntary context switch) — the
+pre-existing `write_all` of the y4m into aomenc's stdin before
+`wait_with_output` drains stdout (`stream.rs:34222`). I killed that aomenc so
+the suite could finish; the test then panicked `writing y4m to aomenc: Broken
+pipe` (`stream.rs:34227`). Isolated re-run of that exact test, same binary,
+after the suite:
+
+```
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 660 filtered out; finished in 5.11s
+```
+
+(hub `av1ll-retest`, exit 0). It got past the wedged seed (58) and returned
+once it had counted the shape (attempt 21).
+
+`deferred(aomenc stdin/stdout pipe deadlock in write_all-before-wait_with_output
+spawn sites, first seen in intra_rect_in_inter_split_tx_gate; unblock: drain
+stdout/stderr on a side thread before write_all, then sweep the same spawn
+shape).` Not this lane's decoder change.
+
+`cargo check -p ec-av1 --all-targets`: 0 warnings (before the commit).
