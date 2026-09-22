@@ -15155,7 +15155,7 @@ pub(crate) fn intra_sb128_hits() -> (usize, usize, [usize; 3]) {
 /// lane-lossless128: on a LOSSLESS frame every one of those sizes collapses to
 /// TX_4X4 -- `read_tx_mode` returns `ONLY_4X4` before the frame codes a tx-size
 /// symbol and `read_tx_size` returns `TX_4X4` before it looks at anything
-/// (`decodeframe.c:140`, `:1183`) -- so the block is tiled into 4x4 luma units
+/// (`decodeframe.c:141`, `:1183`) -- so the block is tiled into 4x4 luma units
 /// and (because a lossless frame forces `TX_4X4` on CHROMA too) 4x4 chroma
 /// units, plane-major inside each 64x64 mu chunk exactly as
 /// `decode_token_recon_block` codes them. Reading the 64-point geometry there
@@ -15221,7 +15221,7 @@ fn decode_block_128rect(
     // not. `bsize_to_tx_size_cat(BLOCK_128X64)` is 3 (see this fn's doc).
     // lane-lossless128: a LOSSLESS frame codes no tx-size symbol at all --
     // libaom's `read_tx_mode` returns `ONLY_4X4` for a `coded_lossless` frame
-    // before the symbol is even considered (`decodeframe.c:140`) and
+    // before the symbol is even considered (`decodeframe.c:141`) and
     // `read_tx_size` returns `TX_4X4` before it looks at anything
     // (`decodeframe.c:1183`). So `tx_select` is off, every plane is walked as
     // TX_4X4 transform units, and no `tx_size_cat3` symbol may be consumed.
