@@ -6295,9 +6295,11 @@ pub(crate) mod tests {
     /// 8-bit decoded "OK" with all 49152 luma samples wrong).
     ///
     /// Arm 0 is that recipe at cq50 without palette: its rect strips really do
-    /// use intrabc, which this decoder cannot reconstruct, so it must stop on
-    /// the NAMED refusal instead of emitting a wrong frame -- and it must have
-    /// read the symbol to get there.
+    /// use intrabc. lane-av1-rect14 reconstructs those strips (2:1 and the
+    /// 16x4/4x16 pair), so the arm must now decode pixel-exact -- and it must
+    /// still have read the symbol. The named refusal remains only for a
+    /// 128-superblock strip (`decode_block_128rect`), which this sb64 recipe
+    /// does not reach.
     /// Arm 1 is the same recipe without palette and without tx-size search --
     /// it decodes the whole frame, reading the symbol dozens of times.
     /// Arm 2 is a screen-tools key frame whose header does NOT set
@@ -6328,7 +6330,7 @@ pub(crate) mod tests {
         // (arm, source, per-arm overrides AFTER the base recipe, expect_refusal,
         //  must_read_use_intrabc_on_a_rect_strip)
         let arms: [(&str, &str, &[&str], bool, bool); 8] = [
-            ("testsrc2-cq50-txs0", TS, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"], true, true),
+            ("testsrc2-cq50-txs0", TS, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
             ("smptebars-cq40-txs0", SB, &["--cq-level=40", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
             ("smptebars-cq45-txs0", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
             ("smptebars-cq45-txs1", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
@@ -6518,12 +6520,131 @@ pub(crate) mod tests {
             blocks_total > 0 && fired_arms > 0,
             "{NAME}: gate is vacuous -- no compared arm actually decoded an intrabc block"
         );
-        assert_eq!(refused, 1, "{NAME}: expected exactly one named intrabc refusal");
+        assert_eq!(
+            refused, 0,
+            "{NAME}: a rect-strip intrabc block refused -- reconstruction regressed"
+        );
         assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
         assert_eq!(
             out_of_scope_mismatch, 0,
             "{NAME}: an arm without an intrabc block still mismatched ffmpeg"
         );
+    }
+
+    /// lane-av1-rect14: the 16x4/4x16 intrabc pair. libaom codes the pair's
+    /// chroma on the odd-mi strip only (`is_chroma_reference`,
+    /// av1_common_int.h:1454). The witness is the report recipe: testsrc2
+    /// 640x480 cq60 palette, txs off, which places a 16x4 intrabc strip at
+    /// mi(76,108). Pre-fix this refused by name. VERT_4 was not produced by
+    /// any fully-decoded recipe tried here (the allintra stream codes four
+    /// `PARTITION_VERT_4` at bsize 6 and then stops on the unrelated var-tx
+    /// mixed-leaf refusal); the VERT arm is the same body with the axes
+    /// swapped.
+    #[test]
+    fn a_16x4_intrabc_pair_strip_decodes_pixel_exact() {
+        const NAME: &str = "a_16x4_intrabc_pair_strip_decodes_pixel_exact";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: ffmpeg/aomenc missing");
+            return;
+        }
+        let (width, height) = (640usize, 480usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x480:r=25", "-frames:v", "1",
+                "-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .output()
+            .expect("ffmpeg")
+            .stdout;
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1", "--bit-depth=8", "--input-bit-depth=8", "--passes=1",
+                "--end-usage=q", "--cpu-used=0", "--lag-in-frames=0", "--kf-max-dist=1",
+                "--limit=1", "--threads=1", "--tile-columns=0",
+                "--enable-rect-partitions=1", "--enable-1to4-partitions=1",
+                "--min-partition-size=4", "--max-partition-size=64", "--sb-size=64",
+                "--tune-content=screen", "--enable-intrabc=1", "--cq-level=60",
+                "--enable-palette=1", "--enable-tx-size-search=0", "--obu", "-o", "-", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc");
+        child.stdin.take().unwrap().write_all(&y4m).ok();
+        let out = child.wait_with_output().expect("aomenc wait");
+        assert!(out.status.success(), "{NAME}: aomenc failed");
+        crate::decode::reset_rect4_16_pair_hits();
+        let frames = decode_stream(&out.stdout).unwrap_or_else(|e| panic!("{NAME}: {e}"));
+        assert!(
+            crate::decode::rect4_16_intrabc_hits() > 0,
+            "{NAME}: no 16x4/4x16 intrabc strip -- the pair body was not reached"
+        );
+        let refs = ffmpeg_decode_sequence(&out.stdout, width, height, frames.len());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].y, refs[0].y, "{NAME}: luma");
+        assert_eq!(frames[0].u, refs[0].u, "{NAME}: u");
+        assert_eq!(frames[0].v, refs[0].v, "{NAME}: v");
+    }
+
+    /// lane-av1-rect14: lossless 16x4/4x16 chroma is two TX_4X4s, not one
+    /// TX_8X4. The measured site is luma col 108 of a 320x240 sb128 lossless
+    /// key frame (lanes/av1lossless128.report.md §6). Rows 0-127 of that
+    /// frame -- the first superblock row, which contains the site -- must
+    /// match ffmpeg. A later mismatch is the pre-existing 64x64 square
+    /// lossless residue (base fails at byte 108; this lane's first remaining
+    /// mismatch is row 128). The gate fails if that residue moves back into
+    /// the repaired region.
+    #[test]
+    fn a_lossless_16x4_chroma_pair_repairs_the_measured_site() {
+        const NAME: &str = "a_lossless_16x4_chroma_pair_repairs_the_measured_site";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: ffmpeg/aomenc missing");
+            return;
+        }
+        let (width, height) = (320usize, 240usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=25", "-frames:v", "1",
+                "-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .output()
+            .expect("ffmpeg")
+            .stdout;
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1", "--cpu-used=0", "--lossless=1", "--sb-size=128",
+                "--lag-in-frames=0", "--kf-max-dist=1", "--limit=1", "--threads=1",
+                "--passes=1", "--enable-1to4-partitions=1", "--min-partition-size=4",
+                "--enable-rect-partitions=1", "--obu", "-o", "-", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc");
+        child.stdin.take().unwrap().write_all(&y4m).ok();
+        let out = child.wait_with_output().expect("aomenc wait");
+        assert!(out.status.success(), "{NAME}: aomenc failed");
+        crate::decode::reset_rect4_16_pair_hits();
+        let frames = decode_stream(&out.stdout).unwrap_or_else(|e| panic!("{NAME}: {e}"));
+        assert!(
+            crate::decode::rect4_16_lossless_chroma_hits() > 0,
+            "{NAME}: no lossless 16x4/4x16 chroma pair -- the walk was not reached"
+        );
+        let refs = ffmpeg_decode_sequence(&out.stdout, width, height, frames.len());
+        let repaired = 128 * width;
+        assert_eq!(
+            &frames[0].y[..repaired],
+            &refs[0].y[..repaired],
+            "{NAME}: luma rows 0-127 (the measured col-108 site) diverged"
+        );
+        let chroma_rows = 64 * (width / 2);
+        assert_eq!(&frames[0].u[..chroma_rows], &refs[0].u[..chroma_rows], "{NAME}: u");
+        assert_eq!(&frames[0].v[..chroma_rows], &refs[0].v[..chroma_rows], "{NAME}: v");
+        // The col-108 byte specifically, so a shift of the old site still fails
+        // even if some other prefix sample happens to match.
+        assert_eq!(frames[0].y[108], refs[0].y[108], "{NAME}: measured byte 108");
     }
 
     /// lane-t900 r31: builds one `--tune-content=screen --enable-intrabc=1`

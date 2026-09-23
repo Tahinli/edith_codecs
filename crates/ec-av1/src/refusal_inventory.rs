@@ -367,6 +367,11 @@ const PROVEN: &[(&str, &str)] = &[
         "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
         "a_frame_using_quantisation_matrices_is_refused_by_name",
     ),
+    // lane-av1-rect14: the 16x16- and 32x32-level strips are reconstructed
+    // (`decode_intrabc_rect` / `decode_intrabc_pair_strip`). The string remains
+    // only in `decode_block_128rect`. No sb128 screen recipe in this lane
+    // reached that arm (256x192 cq50 sb128 decoded without entering it), so
+    // the pairing still names the rect-strip gate, which no longer refuses.
     (
         "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
         "a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips",
