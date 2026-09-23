@@ -38,7 +38,10 @@ fn main() {
         println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
-        println!("rect_intrabc_reads: {}", ec_av1::stream::rect_intrabc_reads());
+        println!(
+            "rect_intrabc_reads: {}",
+            ec_av1::stream::rect_intrabc_reads()
+        );
         let (pal_y, pal_uv) = ec_av1::stream::intra_in_inter_palette_hits();
         println!("intra_in_inter_palette: y={pal_y} uv={pal_uv}");
         println!(
@@ -46,7 +49,10 @@ fn main() {
             ec_av1::stream::rect64_corner_tu_hits(0),
             ec_av1::stream::rect64_corner_tu_hits(1)
         );
-        println!("leaf8_intrabc_hits: {}", ec_av1::stream::leaf8_intrabc_hits());
+        println!(
+            "leaf8_intrabc_hits: {}",
+            ec_av1::stream::leaf8_intrabc_hits()
+        );
         println!("intrabc_hits: {}", ec_av1::stream::intrabc_hits());
         println!(
             "skipped_intrabc_chroma_arm_hits: {}",
@@ -54,14 +60,26 @@ fn main() {
         );
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
-        println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
+        println!(
+            "sub8_inter_split: groups={}",
+            ec_av1::decode::sub8_inter_split_hits()
+        );
         println!(
             "skip_split_tx_override: {}",
             ec_av1::decode::skip_split_tx_override_hits()
         );
-        println!("interintra_rect: {}", ec_av1::decode::interintra_rect_hits());
-        println!("gm_nontrans_small_side: {}", ec_av1::decode::gm_nontrans_small_side_hits());
-        println!("tr_reach_longer_side: {}", ec_av1::decode::tr_reach_longer_side_hits());
+        println!(
+            "interintra_rect: {}",
+            ec_av1::decode::interintra_rect_hits()
+        );
+        println!(
+            "gm_nontrans_small_side: {}",
+            ec_av1::decode::gm_nontrans_small_side_hits()
+        );
+        println!(
+            "tr_reach_longer_side: {}",
+            ec_av1::decode::tr_reach_longer_side_hits()
+        );
         println!(
             "mv_clamp_edge_overhang: {}",
             ec_av1::mvstack::mv_clamp_edge_overhang_hits()
@@ -90,7 +108,6 @@ fn main() {
         println!(
             "inter_edge_strip: h64={} v64={} h32={} v32={} h16={} v16={}",
             es[0], es[1], es[2], es[3], es[4], es[5]
-
         );
         let (h4, v4, pairs, sub8) = ec_av1::decode::inter16_rect4_counters();
         println!("inter16_1to4: horz4={h4} vert4={v4} chroma_pairs={pairs} sub8_pieces={sub8}");
@@ -104,9 +121,7 @@ fn main() {
         );
         let rw = ec_av1::stream::rect_wedge_hits();
         let rwi = ec_av1::stream::rect_wii_hits();
-        println!(
-            "rect_wedge(8x16,16x8,16x32,32x16,8x32,32x8): compound={rw:?} interintra={rwi:?}"
-        );
+        println!("rect_wedge(8x16,16x8,16x32,32x16,8x32,32x8): compound={rw:?} interintra={rwi:?}");
         // lane-inter128intra r1: the 128 root's HORZ/VERT half coded INTRA in
         // an INTER frame -- the arm this round implemented.
         let i128 = ec_av1::stream::intra128_in_inter_counters();
@@ -164,6 +179,11 @@ fn main() {
             "intra16x4_in_inter: 16x4={} 4x16={} chroma_ref={}",
             i164.0, i164.1, i164.2
         );
+        println!(
+            "rect4_16_pair: lossless_chroma={} intrabc={}",
+            ec_av1::decode::rect4_16_lossless_chroma_hits(),
+            ec_av1::decode::rect4_16_intrabc_hits(),
+        );
         // lane-t900 r12: chroma edge-filter neighbour answered from the mi-granular
         // uv_mode grid instead of the coarse one-slot-per-column map.
         println!(
@@ -179,10 +199,7 @@ fn main() {
         );
         // lane-thread2: proof the frame-parallel path actually fired (0 at
         // the default EC_AV1_THREADS=1).
-        println!(
-            "frames_dispatched: {}",
-            ec_av1::stream::frames_dispatched()
-        );
+        println!("frames_dispatched: {}", ec_av1::stream::frames_dispatched());
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
@@ -318,7 +335,9 @@ fn main() {
             .unwrap_or_else(|e| panic!("opening {path}: {e}"))
     };
     let out16 = std::env::var("EC_PROBE_OUT16").ok();
-    let out8 = std::env::args().nth(2).or_else(|| std::env::var("EC_PROBE_OUT").ok());
+    let out8 = std::env::args()
+        .nth(2)
+        .or_else(|| std::env::var("EC_PROBE_OUT").ok());
     let null16 = out16.as_deref() == Some("/dev/null");
     let mut f16 = out16.as_deref().map(open);
     let mut f8 = out8.as_deref().map(open);
@@ -329,7 +348,9 @@ fn main() {
     let mut buf: Vec<u8> = Vec::new();
     // lane-av1mono: a monochrome stream is luma only, so the raw dump is a
     // single plane -- exactly what `ffmpeg -pix_fmt gray -f rawvideo` writes.
-    let mono = parser.sequence_header().is_some_and(|s| s.color_config.mono_chrome);
+    let mono = parser
+        .sequence_header()
+        .is_some_and(|s| s.color_config.mono_chrome);
     let result = ec_av1::stream::decode_stream_with(&data, |f, _idx, is_shown| {
         if !is_shown {
             return Ok(());

@@ -5012,6 +5012,10 @@ thread_local! {
     /// the shape that made 4 chroma samples of the Hunger Games `-ss 1200`
     /// key frame miss by 1. Zero here means a gate never exercised the fix.
     static RECT4_16_UV_PAIR_FILT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-rect14: lossless 16x4/4x16 chroma pairs walked as two TX_4X4s.
+    static RECT4_16_LOSSLESS_CHROMA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-rect14: intrabc reconstructions of a 16x4/4x16 pair strip.
+    static RECT4_16_INTRABC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// lane-kf1200 r2: sub-8x8 chroma blocks that are `skip_txfm` AND
     /// `UV_CFL_PRED` -- the arm that used to drop the CfL alpha entirely.
     static SKIP_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -5027,6 +5031,22 @@ pub fn skip_cfl_hits() -> usize {
 /// from the pair's base mi than the strip's own mi would have given.
 pub fn rect4_16_uv_pair_filt_hits() -> usize {
     RECT4_16_UV_PAIR_FILT_HITS.with(|c| c.get())
+}
+
+/// How many lossless 16x4/4x16 chroma pairs walked two TX_4X4s per plane.
+pub fn rect4_16_lossless_chroma_hits() -> usize {
+    RECT4_16_LOSSLESS_CHROMA_HITS.with(|c| c.get())
+}
+
+/// How many 16x4/4x16 strips reconstructed as intra block copy.
+pub fn rect4_16_intrabc_hits() -> usize {
+    RECT4_16_INTRABC_HITS.with(|c| c.get())
+}
+
+/// Zero the lane-av1-rect14 pair counters so a gate measures one stream.
+pub fn reset_rect4_16_pair_hits() {
+    RECT4_16_LOSSLESS_CHROMA_HITS.with(|c| c.set(0));
+    RECT4_16_INTRABC_HITS.with(|c| c.set(0));
 }
 
 // lane-troykf r1: the two chroma defects Troy's key frames exposed --
@@ -9238,6 +9258,8 @@ fn read_intra_mode_rect(
     Option<usize>,
     Option<PaletteY>,
     Option<PaletteUv>,
+    // lane-av1-rect14: Some(dv) for an intrabc 16x4/4x16 pair strip.
+    Option<(i32, i32)>,
 )> {
     // lane-av1mono: libaom guards every chroma symbol read with
     // `!cm->seq_params->monochrome && xd->is_chroma_ref` (`decodemv.c:933`),
@@ -9316,8 +9338,18 @@ fn read_intra_mode_rect(
         istep!("intrabc", use_intrabc as i32);
         if use_intrabc {
             hit!(INTRABC_HITS);
-            return Err(unsupported(
-                "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
+            // 16x4/4x16 is a chroma PAIR ([`decode_rect4_16_intrabc`]).
+            // Every other rect shape still refuses by name: its
+            // reconstruction is `decode_intrabc_rect` (lane-av1-intrabc,
+            // not on this tree). 32x8/8x32, 64x16/16x64 and 128-axis strips
+            // own their chroma and must not take the pair helper.
+            // Every rect shape returns the DV. 16x4/4x16 reconstructs in
+            // [`decode_rect4_16_intrabc`]; other shapes in
+            // [`decode_intrabc_owned_rect`]. A shape with no coefficient
+            // table still refuses there, by the same name.
+            let dv = read_intrabc_dv(dec, cdfs, mi_r, mi_c, (bw / MI, bh / MI), fctx);
+            return Ok((
+                skip, DC_PRED, 0, DC_PRED, 0, None, None, None, None, Some(dv),
             ));
         }
     }
@@ -9469,6 +9501,7 @@ fn read_intra_mode_rect(
         filter_intra,
         palette_y,
         palette_uv,
+        None,
     ))
 }
 
@@ -10926,7 +10959,7 @@ fn decode_block_rect(
     let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
     let palette_uv_cache = neighbours.palette_uv_cache(at);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv, intrabc) =
         read_intra_mode_rect(
             dec,
             cdfs,
@@ -10944,6 +10977,12 @@ fn decode_block_rect(
             r * (SUB / MI),
             c * (SUB / MI), fctx,
         )?;
+    if let Some((dv_row, dv_col)) = intrabc {
+        return decode_intrabc_owned_rect(
+            dec, cdfs, neighbours, (r * (SUB / MI), c * (SUB / MI)), (bw, bh), skip,
+            (dv_row, dv_col), y, u, v, base_q_idx, tx_select, reduced_tx_set, fctx,
+        );
+    }
     let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
     if smooth_neighbor {
         hit!(SMOOTH_LUMA_HITS);
@@ -11421,7 +11460,7 @@ fn decode_leaf_rect(
     let pal_at = leaf_mi;
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi(pal_at);
     let palette_uv_cache = neighbours.palette_uv_cache_mi(pal_at);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv, intrabc) =
         read_intra_mode_rect(
             dec,
             cdfs,
@@ -11439,6 +11478,13 @@ fn decode_leaf_rect(
             leaf_mi.0,
             leaf_mi.1, fctx,
         )?;
+    if let Some((dv_row, dv_col)) = intrabc {
+        decode_intrabc_owned_rect(
+            dec, cdfs, neighbours, leaf_mi, (bw, bh), skip, (dv_row, dv_col),
+            y, u, v, base_q_idx, tx_select, reduced_tx_set, fctx,
+        )?;
+        return Ok(DC_PRED);
+    }
     // lane-kf900 r4: palette prediction on this shape, the same colour-index
     // map -> base colours buffer [`decode_block_rect`] hands each
     // `reconstruct_rect` through [`set_palette_pred`].
@@ -11751,6 +11797,7 @@ fn decode_block_rect4(
         filter_intra,
         palette_y,
         palette_uv,
+        intrabc,
     ) = read_intra_mode_rect(
         dec,
         cdfs,
@@ -11768,6 +11815,14 @@ fn decode_block_rect4(
         mi_r,
         mi_c, fctx,
     )?;
+    if let Some((dv_row, dv_col)) = intrabc {
+        decode_intrabc_owned_rect(
+            dec, cdfs, neighbours, (mi_r, mi_c), (bw, bh), skip, (dv_row, dv_col),
+            y, u, v, base_q_idx, tx_select,
+            fctx.reduced_tx_set_inter.with(std::cell::Cell::get), fctx,
+        )?;
+        return Ok((DC_PRED, DC_PRED));
+    }
     // lane-kf900 r4: palette prediction on this shape, exactly as
     // [`decode_block_rect`] does one aspect ratio up -- the colour-index map
     // mapped through the base colours IS the prediction (it reads no edge
@@ -12239,6 +12294,520 @@ fn decode_rect4_16(
 /// key-frame caller's coarse-cell stand-in; `None` on the inter path, where
 /// every strip publishes its own mi-exact mode). Returns
 /// `(y_mode, uv_predict_mode when this strip closes the 4:2:0 chroma pair)`.
+/// Intrabc reconstruction for a rect strip that OWNS its chroma
+/// (`bw/2 x bh/2` at the strip origin). 16x4/4x16 is not this shape -- that
+/// pair goes through [`decode_rect4_16_intrabc`].
+///
+/// This is the same control flow as the unmerged lane's `decode_intrabc_rect`
+/// (predict once, then one residual per transform unit on the INTER sets,
+/// chroma inherits luma's `tx_type`), written against the helpers that exist
+/// on this tree so a 2:1 strip no longer hides the 16x4 pair witness. The
+/// merge with lane-av1-intrabc should keep one of the two bodies; the call
+/// shape is the same.
+#[allow(clippy::too_many_arguments)]
+fn decode_intrabc_owned_rect(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    (bw, bh): (usize, usize),
+    skip: bool,
+    (dv_row, dv_col): (i32, i32),
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    base_q_idx: u8,
+    tx_select: bool,
+    reduced_tx_set: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<()> {
+    let _ = base_q_idx;
+    let (px, py) = (mi_c * MI, mi_r * MI);
+    let (cw, ch) = (bw / 2, bh / 2);
+    let side = bw.max(bh);
+    let cside = cw.max(ch);
+    let saved_reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
+    let saved_tx = fctx.tx_select_inter.with(std::cell::Cell::get);
+    fctx.reduced_tx_set_inter.with(|c| c.set(reduced_tx_set));
+    // `read_block_tx_size_rect` keys on this cell. A key frame forces it
+    // false; the real bit is the caller's `tx_select`. Restored before return.
+    fctx.tx_select_inter.with(|c| c.set(tx_select));
+    let restore = ReducedTxRestore { fctx, saved_reduced, saved_tx };
+
+    flush_recon(fctx, y, u, v);
+    let pred_y = predict_intrabc_window(y, px, py, bw, bh, dv_col, dv_row, true, side, fctx);
+    let pred_u = predict_intrabc_window(u, px / 2, py / 2, cw, ch, dv_col, dv_row, false, cside, fctx);
+    let pred_v = predict_intrabc_window(v, px / 2, py / 2, cw, ch, dv_col, dv_row, false, cside, fctx);
+
+    let mi_cols = 2 * y.true_width.div_ceil(8);
+    let mi_rows = 2 * y.true_height.div_ceil(8);
+    let leaves = read_block_tx_size_rect(
+        dec, cdfs, neighbours, (mi_r, mi_c), (bw, bh), (mi_cols, mi_rows), skip, fctx,
+    )?;
+    let mut luma_tx_type = TxType::DctDct;
+    let luma_grid;
+    let u_grid;
+    let v_grid;
+    if skip {
+        // `reconstruct_mc_rect` indexes the residual at the square stride.
+        // `bw * bh` underruns on a VERT strip (8x16: stride 16, 16 rows, index 136).
+        push_mc_rect(0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..side * bh], fctx);
+        push_mc_rect(1, px / 2, py / 2, cside, cw, ch, Pred::Inline(&pred_u, cside), &ZERO_RESIDUAL[..cside * ch], fctx);
+        push_mc_rect(2, px / 2, py / 2, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cside * ch], fctx);
+        luma_grid = Grid::Zero(side * side);
+        u_grid = Grid::Zero(cside * cside);
+        v_grid = Grid::Zero(cside * cside);
+    } else if let Some(ls) = leaves.as_ref() {
+        for (idx, &(row, col, tw, th)) in ls.iter().enumerate() {
+            let tu_mi = (mi_r + row, mi_c + col);
+            let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+            let tu_pred = Pred::Inline(&pred_y, side).offset(row * MI * side + col * MI);
+            let (g, tt) = if tw == th {
+                read_inter_plane(
+                    dec, cdfs, inter_txbset_for(tw, reduced_tx_set), &default_scan(tw.min(32)),
+                    0, neighbours.around_mi(tu_mi, tw)[0], 0, y, tu_px, tu_py, tw, base_q_idx,
+                    tu_pred, None, Some(neighbours.luma_skip_ctx(tu_mi, tw / MI)), fctx,
+                )?
+            } else {
+                read_inter_plane_rect(
+                    dec, cdfs, rect_inter_luma_set(tw, th, fctx)?, (tw, th), side, 0,
+                    neighbours.around_mi_rect(tu_mi, tw, th)[0], 0, y, tu_px, tu_py, tu_pred,
+                    None, Some(neighbours.luma_skip_ctx_rect(tu_mi, tw / MI, th / MI)), fctx,
+                )?
+            };
+            if idx == 0 {
+                luma_tx_type = tt;
+            }
+            neighbours.record_mi_luma_rect(tu_mi, tw, th, &g);
+            if tw != th {
+                neighbours.fill_lf_grid_leaf_luma((tu_mi.0, tu_mi.1), tw / MI, th / MI, tw as u8, th as u8);
+            }
+        }
+        luma_grid = Grid::Zero(side * side);
+        let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+        let (ug, _) = read_inter_plane_rect(
+            dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch), cside, 1, around[1], 0,
+            u, px / 2, py / 2, Pred::Inline(&pred_u, cside), Some(luma_tx_type), None, fctx,
+        )?;
+        let (vg, _) = read_inter_plane_rect(
+            dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch), cside, 2, around[2], 0,
+            v, px / 2, py / 2, Pred::Inline(&pred_v, cside), Some(luma_tx_type), None, fctx,
+        )?;
+        u_grid = ug;
+        v_grid = vg;
+    } else {
+        let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+        let (g, tt) = read_inter_plane_rect(
+            dec, cdfs, rect_inter_luma_set(bw, bh, fctx)?, (bw, bh), side, 0, around[0], 0,
+            y, px, py, Pred::Inline(&pred_y, side), None, None, fctx,
+        )?;
+        luma_tx_type = tt;
+        luma_grid = g;
+        let (ug, _) = read_inter_plane_rect(
+            dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch), cside, 1, around[1], 0,
+            u, px / 2, py / 2, Pred::Inline(&pred_u, cside), Some(luma_tx_type), None, fctx,
+        )?;
+        let (vg, _) = read_inter_plane_rect(
+            dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch), cside, 2, around[2], 0,
+            v, px / 2, py / 2, Pred::Inline(&pred_v, cside), Some(luma_tx_type), None, fctx,
+        )?;
+        u_grid = ug;
+        v_grid = vg;
+    }
+    drop(restore);
+    if leaves.is_some() {
+        neighbours.record_split_luma_rect_mi((mi_r, mi_c), bw, bh, DC_PRED, DC_PRED, [&u_grid, &v_grid]);
+    } else {
+        neighbours.record_rect_mi((mi_r, mi_c), bw, bh, DC_PRED, DC_PRED, &[&luma_grid, &u_grid, &v_grid]);
+    }
+    neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
+    neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, bw.min(64) as u8, bh.min(64) as u8, 0, fctx);
+    record_intrabc_mi_rect(mi_r, mi_c, bw / MI, bh / MI, Some((dv_row, dv_col)), neighbours, fctx);
+    let _ = luma_tx_type;
+    Ok(())
+}
+
+fn predict_intrabc_window(
+    plane: &PlaneBuf<'_>,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+    dv_col: i32,
+    dv_row: i32,
+    luma: bool,
+    stride: usize,
+    fctx: &crate::decode::FrameCtx,
+) -> Vec<u16> {
+    let mut dense = vec![0u16; w * h];
+    mc::predict_with_filter(
+        &plane.data, plane.width, plane.true_width, plane.true_height,
+        mv_to_q4(px, dv_col, luma), mv_to_q4(py, dv_row, luma),
+        w, h, mc::InterpFilterKind::Bilinear, &mut dense, fctx,
+    );
+    let mut laid = vec![0u16; stride * stride];
+    for row in 0..h {
+        laid[row * stride..][..w].copy_from_slice(&dense[row * w..][..w]);
+    }
+    laid
+}
+
+struct ReducedTxRestore<'a> {
+    fctx: &'a crate::decode::FrameCtx,
+    saved_reduced: bool,
+    saved_tx: bool,
+}
+impl Drop for ReducedTxRestore<'_> {
+    fn drop(&mut self) {
+        self.fctx.reduced_tx_set_inter.with(|c| c.set(self.saved_reduced));
+        self.fctx.tx_select_inter.with(|c| c.set(self.saved_tx));
+    }
+}
+
+/// Reconstruction of one intrabc 16x4 / 4x16 strip (lane-av1-rect14).
+///
+/// A 1:4 strip is a PAIR. Both children share one chroma block, and only the
+/// odd-mi member codes it (`is_chroma_reference`, `av1_common_int.h:1454`:
+/// the bottom strip of a `HORZ_4`, the right strip of a `VERT_4`). The chroma
+/// plane block is `ss_size_lookup[BLOCK_16X4][1][1] == BLOCK_8X4` (and
+/// `BLOCK_4X8` for `VERT_4`) at the PAIR origin -- `setup_pred_plane`'s
+/// `mi_row -= 1` when the block is one mi tall on an odd row. Luma is this
+/// strip's own footprint, copied from this strip's DV. The block is
+/// `is_inter_block`, so the residual uses the INTER sets and chroma inherits
+/// the luma unit's coded `tx_type`.
+///
+/// Not [`decode_intrabc_rect`]: that helper (lane-av1-intrabc, not on this
+/// tree) predicts chroma at `bw/2 x bh/2` of the strip itself. At 16x4 that
+/// is an 8x2 half-pair at the odd strip -- wrong size, wrong origin, and it
+/// would code chroma on every strip.
+#[allow(clippy::too_many_arguments)]
+fn decode_rect4_16_intrabc(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    lmi: (usize, usize),
+    horz: bool,
+    has_chroma: bool,
+    skip: bool,
+    (dv_row, dv_col): (i32, i32),
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    base_q_idx: u8,
+    tx_select: bool,
+    reduced_tx_set: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<(usize, Option<usize>, (usize, usize))> {
+    let _ = base_q_idx;
+    hit!(RECT4_16_INTRABC_HITS);
+    let (bw, bh) = if horz { (16usize, 4usize) } else { (4, 16) };
+    let (mi_w, mi_h) = (bw / MI, bh / MI);
+    let (px, py) = (lmi.1 * MI, lmi.0 * MI);
+    let side = bw.max(bh);
+    // `rect_inter_luma_set` reads the frame cell. A key frame's tile decoder
+    // publishes `reduced_tx_set` into it; set it here too so a caller that
+    // passed the bit explicitly cannot disagree with the set we read.
+    let saved_reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
+    fctx.reduced_tx_set_inter.with(|c| c.set(reduced_tx_set));
+    let restored = scopeguard_reduced(fctx, saved_reduced);
+
+    flush_recon(fctx, y, u, v);
+    let mut pred_y_dense = vec![0u16; bw * bh];
+    mc::predict_with_filter(
+        &y.data, y.width, y.true_width, y.true_height,
+        mv_to_q4(px, dv_col, true), mv_to_q4(py, dv_row, true),
+        bw, bh, mc::InterpFilterKind::Bilinear, &mut pred_y_dense, fctx,
+    );
+    let mut pred_y = vec![0u16; side * side];
+    for row in 0..bh {
+        pred_y[row * side..][..bw].copy_from_slice(&pred_y_dense[row * bw..][..bw]);
+    }
+
+    let (pw, ph) = if horz { (16usize, 8usize) } else { (8, 16) };
+    let (cw, ch) = (pw / 2, ph / 2);
+    let pair_mi = if has_chroma {
+        if horz { (lmi.0 - 1, lmi.1) } else { (lmi.0, lmi.1 - 1) }
+    } else {
+        lmi
+    };
+    let (cpx, cpy) = if has_chroma {
+        (pair_mi.1 * MI / 2, pair_mi.0 * MI / 2)
+    } else {
+        (0, 0)
+    };
+    let cside = cw.max(ch);
+    let (pred_u, pred_v) = if has_chroma {
+        let mut ud = vec![0u16; cw * ch];
+        mc::predict_with_filter(
+            &u.data, u.width, u.true_width, u.true_height,
+            mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+            cw, ch, mc::InterpFilterKind::Bilinear, &mut ud, fctx,
+        );
+        let mut us = vec![0u16; cside * cside];
+        for row in 0..ch {
+            us[row * cside..][..cw].copy_from_slice(&ud[row * cw..][..cw]);
+        }
+        let mut vd = vec![0u16; cw * ch];
+        mc::predict_with_filter(
+            &v.data, v.width, v.true_width, v.true_height,
+            mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+            cw, ch, mc::InterpFilterKind::Bilinear, &mut vd, fctx,
+        );
+        let mut vs = vec![0u16; cside * cside];
+        for row in 0..ch {
+            vs[row * cside..][..cw].copy_from_slice(&vd[row * cw..][..cw]);
+        }
+        (us, vs)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    // Key-frame `tx_select` is the parameter. `tx_select_inter` is forced
+    // false for a key frame, so `read_block_tx_size_rect` would skip the
+    // symbol; read it here against the parameter the intra path already uses.
+    // A skipped intrabc block predicts the whole footprint once and codes
+    // no residual (`decode_token_recon_block`'s inter branch). Lossless
+    // still forces TX_4X4 when the block is coded.
+    let leaves = if skip || (!lossless(fctx) && !tx_select) {
+        None
+    } else if lossless(fctx) {
+        let mut leaves = Vec::new();
+        for row in 0..bh / MI {
+            for col in 0..bw / MI {
+                leaves.push((row, col, 4usize, 4usize));
+            }
+        }
+        Some(leaves)
+    } else {
+        let ctx = txfm_partition_ctx_rect(
+            neighbours.above_txfm[lmi.1],
+            neighbours.left_txfm[lmi.0],
+            side,
+            bw,
+            bh,
+        );
+        let split = dec.symbol(&mut cdfs.txfm_partition[ctx]) == 1;
+        if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
+            let (rng, _) = dec.debug_state();
+            eprintln!(
+                "EC_ISTEP mi_row={} mi_col={} name=txfm_split_rect val={} ctx={ctx} rng={rng}",
+                lmi.0, lmi.1, u8::from(split)
+            );
+        }
+        if !split {
+            None
+        } else {
+            let (sub_w, sub_h) = sub_tx_size_map(bw, bh);
+            let mi_cols = 2 * y.true_width.div_ceil(8);
+            let mi_rows = 2 * y.true_height.div_ceil(8);
+            let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(lmi.1));
+            let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(lmi.0));
+            let mut out = Vec::new();
+            for row in (0..bh / MI).step_by(sub_h / MI) {
+                for col in (0..bw / MI).step_by(sub_w / MI) {
+                    read_var_tx_size(
+                        dec, cdfs, neighbours, lmi, side, (max_w_mi, max_h_mi),
+                        (sub_w, sub_h), 1, row, col, &mut out,
+                    );
+                }
+            }
+            Some(out)
+        }
+    };
+    let (tx_w, tx_h) = leaves.as_ref().and_then(|ls| ls.first()).map_or((bw, bh), |l| (l.2, l.3));
+
+    let mut luma_tx_type = TxType::DctDct;
+    let luma_grid;
+    let mut u_grid = Grid::Zero(cw * ch);
+    let mut v_grid = Grid::Zero(cw * ch);
+    let chroma_stamped_per_unit;
+
+    if skip {
+        push_mc_rect(
+            0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..side * bh], fctx,
+        );
+        luma_grid = Grid::Zero(bw * bh);
+        if has_chroma {
+            push_mc_rect(
+                1, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_u, cside),
+                &ZERO_RESIDUAL[..cside * ch], fctx,
+            );
+            push_mc_rect(
+                2, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_v, cside),
+                &ZERO_RESIDUAL[..cside * ch], fctx,
+            );
+        }
+        chroma_stamped_per_unit = false;
+    } else if let Some(ls) = leaves.as_ref() {
+        if lossless(fctx) {
+            for &(row, col, _tw, _th) in ls {
+                let tu_mi = (lmi.0 + row, lmi.1 + col);
+                let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+                let tu_pred = Pred::Inline(&pred_y, side).offset(row * MI * side + col * MI);
+                let (g, _) = read_inter_plane(
+                    dec, cdfs,
+                    if reduced_tx_set { TxbSet::Luma4Inter } else { TxbSet::Luma4InterSet1 },
+                    &default_scan(4), 0, neighbours.around_mi(tu_mi, 4)[0], 0,
+                    y, tu_px, tu_py, 4, base_q_idx, tu_pred, None,
+                    Some(neighbours.luma_skip_ctx(tu_mi, 1)), fctx,
+                )?;
+                neighbours.record_mi_luma_rect(tu_mi, 4, 4, &g);
+            }
+        } else {
+            for (idx, &(row, col, tw, th)) in ls.iter().enumerate() {
+                let tu_mi = (lmi.0 + row, lmi.1 + col);
+                let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+                let tu_pred = Pred::Inline(&pred_y, side).offset(row * MI * side + col * MI);
+                let (g, tt) = if tw == th {
+                    read_inter_plane(
+                        dec, cdfs, inter_txbset_for(tw, reduced_tx_set),
+                        &default_scan(tw.min(32)), 0, neighbours.around_mi(tu_mi, tw)[0], 0,
+                        y, tu_px, tu_py, tw, base_q_idx, tu_pred, None,
+                        Some(neighbours.luma_skip_ctx(tu_mi, tw / MI)), fctx,
+                    )?
+                } else {
+                    read_inter_plane_rect(
+                        dec, cdfs, rect_inter_luma_set(tw, th, fctx)?, (tw, th), side, 0,
+                        neighbours.around_mi_rect(tu_mi, tw, th)[0], 0, y, tu_px, tu_py, tu_pred,
+                        None, Some(neighbours.luma_skip_ctx_rect(tu_mi, tw / MI, th / MI)), fctx,
+                    )?
+                };
+                if idx == 0 {
+                    luma_tx_type = tt;
+                }
+                neighbours.record_mi_luma_rect(tu_mi, tw, th, &g);
+            }
+        }
+        luma_grid = Grid::Zero(bw * bh);
+        chroma_stamped_per_unit = has_chroma && lossless(fctx);
+        if has_chroma && lossless(fctx) {
+            let (mut uo, mut vo) = (Vec::new(), Vec::new());
+            read_inter_chroma_lossless(
+                dec, cdfs, neighbours, u, v,
+                Pred::Inline(&pred_u, cside), Pred::Inline(&pred_v, cside),
+                pair_mi, (cpx, cpy), (0, 0), (cw, ch), (cw, ch), cside, 0, base_q_idx,
+                &mut uo, &mut vo, fctx,
+            )?;
+            u_grid = if uo.is_empty() { Grid::Zero(cw * ch) } else { Grid::Own(uo) };
+            v_grid = if vo.is_empty() { Grid::Zero(cw * ch) } else { Grid::Own(vo) };
+        } else if has_chroma {
+            let around = neighbours.around_mi_rect(pair_mi, pw, ph);
+            let (ug, _) = read_inter_plane_rect(
+                dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch), cside, 1, around[1], 0,
+                u, cpx, cpy, Pred::Inline(&pred_u, cside), Some(luma_tx_type), None, fctx,
+            )?;
+            u_grid = ug;
+            let (vg, _) = read_inter_plane_rect(
+                dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch), cside, 2, around[2], 0,
+                v, cpx, cpy, Pred::Inline(&pred_v, cside), Some(luma_tx_type), None, fctx,
+            )?;
+            v_grid = vg;
+        }
+    } else {
+        let around = neighbours.around_mi_rect(lmi, bw, bh);
+        let (g, tt) = read_inter_plane_rect(
+            dec, cdfs, rect_inter_luma_set(bw, bh, fctx)?, (bw, bh), side, 0, around[0], 0,
+            y, px, py, Pred::Inline(&pred_y, side), None, None, fctx,
+        )?;
+        luma_tx_type = tt;
+        luma_grid = g;
+        chroma_stamped_per_unit = false;
+        if has_chroma {
+            let around = neighbours.around_mi_rect(pair_mi, pw, ph);
+            let (ug, _) = read_inter_plane_rect(
+                dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch), cside, 1, around[1], 0,
+                u, cpx, cpy, Pred::Inline(&pred_u, cside), Some(luma_tx_type), None, fctx,
+            )?;
+            u_grid = ug;
+            let (vg, _) = read_inter_plane_rect(
+                dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch), cside, 2, around[2], 0,
+                v, cpx, cpy, Pred::Inline(&pred_v, cside), Some(luma_tx_type), None, fctx,
+            )?;
+            v_grid = vg;
+        }
+    }
+    drop(restored);
+
+    if leaves.is_none() {
+        neighbours.record_mi_luma_rect(lmi, bw, bh, &luma_grid);
+    }
+    neighbours.record_mode_mi(lmi.0, lmi.1, mi_w, mi_h, DC_PRED);
+    neighbours.fill_skip_grid_rect(lmi, mi_w, mi_h, skip);
+    neighbours.fill_lf_grid_rect(lmi, mi_w, mi_h, tx_w as u8, tx_h as u8, 0, fctx);
+    for cell in 0..mi_w {
+        if let Some(slot) = neighbours.above_side_mi.get_mut(lmi.1 + cell) {
+            *slot = bw as u8;
+        }
+    }
+    for cell in 0..mi_h {
+        if let Some(slot) = neighbours.left_side_mi.get_mut(lmi.0 + cell) {
+            *slot = bh as u8;
+        }
+    }
+    let mut last_uv = None;
+    if has_chroma {
+        hit!(RECT4_16_CHROMA_HITS);
+        neighbours.record_uv_mode_mi(pair_mi.0, pair_mi.1, pw / MI, ph / MI, DC_PRED);
+        if !chroma_stamped_per_unit {
+            let u_state = neighbour_state(&u_grid);
+            let v_state = neighbour_state(&v_grid);
+            let round_up_even = |n: usize| n.div_ceil(2) * 2;
+            let bound_h = round_up_even(neighbours.mi_rows);
+            let bound_w = round_up_even(neighbours.mi_cols);
+            for cell in 0..(ph / MI) {
+                if pair_mi.0 + cell < bound_h
+                    && let Some(slot) = neighbours.left.get_mut(pair_mi.0 + cell)
+                {
+                    slot[1] = u_state;
+                    slot[2] = v_state;
+                }
+            }
+            for cell in 0..(pw / MI) {
+                if pair_mi.1 + cell < bound_w
+                    && let Some(slot) = neighbours.above.get_mut(pair_mi.1 + cell)
+                {
+                    slot[1] = u_state;
+                    slot[2] = v_state;
+                }
+            }
+        }
+        last_uv = Some(DC_PRED);
+    }
+    if horz {
+        hit!(RECT4_16_HORZ_HITS);
+    } else {
+        hit!(RECT4_16_VERT_HITS);
+    }
+    record_strip_palette(neighbours, lmi, bw, bh, 0, [0u16; 8], 0, [0u16; 8]);
+    if leaves.is_none() {
+        // Skip and TX_MODE_LARGEST publish the block size (`set_txfm_ctxs`
+        // with `skip && is_inter`, or the unsplit unit). A split tree already
+        // published per leaf inside `read_var_tx_size`.
+        txfm_partition_update_rect(neighbours, lmi, (tx_w, tx_h), (bw, bh));
+    }
+    record_intrabc_mi_rect(
+        lmi.0, lmi.1, mi_w, mi_h, Some((dv_row, dv_col)), neighbours, fctx,
+    );
+    Ok((DC_PRED, last_uv, (tx_w, tx_h)))
+}
+
+/// Restores `reduced_tx_set_inter` when the intrabc pair reader returns,
+/// including through `?`.
+struct ReducedRestore<'a> {
+    fctx: &'a crate::decode::FrameCtx,
+    saved: bool,
+}
+impl Drop for ReducedRestore<'_> {
+    fn drop(&mut self) {
+        self.fctx.reduced_tx_set_inter.with(|c| c.set(self.saved));
+    }
+}
+fn scopeguard_reduced(fctx: &crate::decode::FrameCtx, saved: bool) -> ReducedRestore<'_> {
+    ReducedRestore { fctx, saved }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_rect4_16_strip(
     dec: &mut SymbolDecoder,
@@ -12292,6 +12861,7 @@ fn decode_rect4_16_strip(
             filter_intra,
             palette_y,
             palette_uv,
+            intrabc,
         ) = read_intra_mode_rect(
             dec,
             cdfs,
@@ -12309,6 +12879,12 @@ fn decode_rect4_16_strip(
             lmi.0,
             lmi.1, fctx,
         )?;
+        if let Some(dv) = intrabc {
+            return decode_rect4_16_intrabc(
+                dec, cdfs, neighbours, lmi, horz, has_chroma, skip, dv, y, u, v,
+                base_q_idx, tx_select, reduced_tx_set, fctx,
+            );
+        }
         if palette_y.is_some() || palette_uv.is_some() {
             hit!(RECT4_PALETTE_HITS);
         }
@@ -12573,7 +13149,92 @@ fn decode_rect4_16_strip(
             {
                 hit!(RECT4_16_UV_PAIR_FILT_HITS);
             }
-            let (u_levels, v_levels) = if skip {
+            // lane-av1-rect14: a lossless frame forces TX_4X4 on every plane
+            // (`av1_get_tx_size`, blockd.h:1381). The pair's chroma block is
+            // 8x4 (HORZ_4) or 4x8 (VERT_4) -- two TX_4X4s, plane-major
+            // (`decode_token_recon_block`), not one `ChromaRect8x4`. Reading
+            // the rect here consumed one symbol block too few and desynced
+            // the next strip's `skip` (measured: lossless sb128 320x240,
+            // mi(1,20) uv_mode matched, the following skip did not).
+            let lossless_pair = lossless(fctx);
+            let (u_levels, v_levels) = if lossless_pair {
+                hit!(RECT4_16_LOSSLESS_CHROMA_HITS);
+                if skip {
+                    for plane in 1..3usize {
+                        for rr in 0..ch / 4 {
+                            for cc in 0..cw / 4 {
+                                let (ox, oy) = (cc * 4, rr * 4);
+                                let cu_reach = tu_reach(
+                                    pw, ph, ox * 2, oy * 2, 8, pair_reach, ppx, ppy,
+                                    y.width, y.height, fctx,
+                                );
+                                if let Some((ub, vb)) = &palette_uv_bufs {
+                                    let buf = if plane == 1 { ub } else { vb };
+                                    set_palette_pred(palette_window(buf, cw, ox, oy, 4, 4), fctx);
+                                }
+                                push_intra(
+                                    plane, cpx + ox, cpy + oy, 4, uv_predict_mode,
+                                    angle_delta_uv, cu_reach, &ZERO_RESIDUAL[..16], None, None,
+                                    smooth_neighbor_uv, fctx,
+                                );
+                                let cu_mi = (pair_mi.0 + oy / 2, pair_mi.1 + ox / 2);
+                                neighbours.record_mi_chroma(
+                                    cu_mi, 8, 8, plane, &ZERO_RESIDUAL[..16],
+                                );
+                            }
+                        }
+                    }
+                    (Grid::Zero(cw * ch), Grid::Zero(cw * ch))
+                } else {
+                    let scan4 = default_scan(4);
+                    // `get_txb_ctx`: offset 10 (our tables store it at +3)
+                    // when the plane block is larger than the transform.
+                    let offset = Some(3usize);
+                    let mut uo = vec![0i32; cw * ch];
+                    let mut vo = vec![0i32; cw * ch];
+                    for plane in 1..3usize {
+                        for rr in 0..ch / 4 {
+                            for cc in 0..cw / 4 {
+                                let (ox, oy) = (cc * 4, rr * 4);
+                                if cpx + ox >= u.true_width || cpy + oy >= u.true_height {
+                                    continue;
+                                }
+                                let cu_mi = (pair_mi.0 + oy / 2, pair_mi.1 + ox / 2);
+                                // One luma-mi cell: the chroma entropy arrays
+                                // are subsampled, and our bands replicate that
+                                // one entry over the unit's two cells
+                                // (`read_intra_chroma_lossless`).
+                                let cu_around = neighbours.around_mi(cu_mi, MI);
+                                let cu_reach = tu_reach(
+                                    pw, ph, ox * 2, oy * 2, 8, pair_reach, ppx, ppy,
+                                    y.width, y.height, fctx,
+                                );
+                                if let Some((ub, vb)) = &palette_uv_bufs {
+                                    let buf = if plane == 1 { ub } else { vb };
+                                    set_palette_pred(palette_window(buf, cw, ox, oy, 4, 4), fctx);
+                                }
+                                let buf: &mut PlaneBuf<'static> =
+                                    if plane == 1 { &mut *u } else { &mut *v };
+                                let cu_grid = read_plane(
+                                    dec, cdfs, TxbSet::Chroma4, &scan4, plane,
+                                    cu_around[plane], mode, uv_predict_mode, angle_delta_uv,
+                                    cu_reach, buf, cpx + ox, cpy + oy, 4, 4, base_q_idx,
+                                    None, None, offset, smooth_neighbor_uv, fctx,
+                                )?;
+                                neighbours.record_mi_chroma(cu_mi, 8, 8, plane, &cu_grid);
+                                hit!(CHROMA_SPLIT_TX_HITS);
+                                let dst = if plane == 1 { &mut uo } else { &mut vo };
+                                for row in 0..4 {
+                                    let start = (oy + row) * cw + ox;
+                                    dst[start..start + 4]
+                                        .copy_from_slice(&cu_grid[row * 4..][..4]);
+                                }
+                            }
+                        }
+                    }
+                    (Grid::Own(uo), Grid::Own(vo))
+                }
+            } else if skip {
                 let zeros = Grid::Zero(cw * ch);
                 // libaom `predict_and_reconstruct_intra_block` (decodeframe.c
                 // ~1000) predicts EVERY plane and only guards the residual on
@@ -12666,6 +13327,9 @@ fn decode_rect4_16_strip(
                 (u_levels, v_levels)
             };
             neighbours.record_uv_mode_mi(pair_mi.0, pair_mi.1, pw / MI, ph / MI, uv_predict_mode);
+            // A lossless pair already stamped each TX_4X4 (`record_mi_chroma`).
+            // The single-state rewrite below is the non-lossless TX_8X4/TX_4X8.
+            if !lossless_pair {
             // The chroma planes' coefficient context, over the PAIR's mi span
             // (`decode_leaf_rect8`'s own rule: a subsampled plane's bound is
             // the luma one rounded up to its 4x4 unit).
@@ -12689,6 +13353,7 @@ fn decode_rect4_16_strip(
                     slot[1] = u_state;
                     slot[2] = v_state;
                 }
+            }
             }
             last_uv_mode = Some(uv_predict_mode);
         }
@@ -12758,7 +13423,7 @@ fn decode_block_rect64(
     let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
     let palette_uv_cache = neighbours.palette_uv_cache(at);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv, intrabc) =
         read_intra_mode_rect(
             dec,
             cdfs,
@@ -12783,6 +13448,12 @@ fn decode_block_rect64(
             r * (SUB / MI),
             c * (SUB / MI), fctx,
         )?;
+    if let Some((dv_row, dv_col)) = intrabc {
+        return decode_intrabc_owned_rect(
+            dec, cdfs, neighbours, (r * (SUB / MI), c * (SUB / MI)), (bw, bh), skip,
+            (dv_row, dv_col), y, u, v, base_q_idx, tx_select, reduced_tx_set, fctx,
+        );
+    }
     if (palette_y.is_some() || palette_uv.is_some()) && !skip {
         // lane-t900 r34: a non-skip palette block on a superblock-level strip
         // -- counted so its gate cannot go vacuous (this was a refusal until
@@ -15185,7 +15856,7 @@ fn decode_block_128rect(
     let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
     let palette_uv_cache = neighbours.palette_uv_cache(at);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv, intrabc) =
         read_intra_mode_rect(
             dec,
             cdfs,
@@ -15205,6 +15876,11 @@ fn decode_block_128rect(
             mi_r,
             mi_c, fctx,
         )?;
+    if intrabc.is_some() {
+        return Err(unsupported(
+            "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
+        ));
+    }
     if alpha.is_some() || filter_intra.is_some() || palette_y.is_some() || palette_uv.is_some() {
         return Err(unsupported(
             "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of \
@@ -22814,6 +23490,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // otherwise inherit it and read its `tx_depth` context off the inter
     // frame's stale `TXFM_CONTEXT` bands.
     fctx.tx_select_inter.with(|c| c.set(false));
+    // lane-av1-rect14: an intrabc block is `is_inter_block`, so its
+    // `tx_type` CDF is the INTER set selected by this frame's
+    // `reduced_tx_set`. Left at the cell default, the first coded
+    // 16x4 intrabc strip reads the wrong alphabet.
+    fctx.reduced_tx_set_inter.with(|c| c.set(reduced_tx_set));
     // Every block of an intra-only frame publishes its resolved transform into
     // the `TXFM_CONTEXT` bands exactly like an inter frame's does -- see
     // [`Neighbours::fill_lf_grid_rect`].
