@@ -12,17 +12,17 @@
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::LazyLock;
 
 use ec_core::{Error, Result};
 
 use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
-use crate::decode::{TXFM_CTX_INIT, txfm_partition_ctx_rect};
+use crate::decode::{txfm_partition_ctx_rect, TXFM_CTX_INIT};
 use crate::msac::SymbolEncoder;
+use crate::mvstack::{find_mv_stack, mv16, MiGrid, MiInfo, NO_REF1};
 use crate::transform::TxType;
-use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16};
 
 // ---------------------------------------------------------------------------
 // lane-av1lr: per-64x64 `cdef_idx` (spec 5.11.56, `read_cdef`). The decoder
@@ -386,9 +386,7 @@ fn write_inter_block_128(
         let scan32 = default_scan(TX32);
         let unit_of = |plane: usize, cr: usize, cc: usize| -> Vec<i32> {
             (0..32)
-                .flat_map(|row| {
-                    packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32].to_vec()
-                })
+                .flat_map(|row| packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32].to_vec())
                 .collect()
         };
         let mut chroma_units: Vec<((usize, usize), [Vec<i32>; 2])> = Vec::new();
@@ -659,9 +657,7 @@ fn write_inter_block_128_rect(
         let scan32 = default_scan(TX32);
         let unit_of = |plane: usize, cr: usize, cc: usize| -> Vec<i32> {
             (0..32)
-                .flat_map(|row| {
-                    packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32].to_vec()
-                })
+                .flat_map(|row| packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32].to_vec())
                 .collect()
         };
         let mut chroma_units: Vec<((usize, usize), [Vec<i32>; 2])> = Vec::new();
@@ -702,7 +698,8 @@ fn write_inter_block_128_rect(
                     &mut cdfs.txb(TxbSet::Chroma32, 0),
                     &grid,
                     &scan32,
-                    usize::from(around.above_coded) + usize::from(around.left_coded)
+                    usize::from(around.above_coded)
+                        + usize::from(around.left_coded)
                         + 3 * usize::from(is_half),
                     dc_sign_ctx(around.dc_vote),
                     Some(plane),
@@ -781,8 +778,7 @@ pub fn take_sb128_ab_hits() -> [usize; 4] {
 /// lane-b128r: how many of those blocks carried a REAL residual (four
 /// TX_64X64 luma units plus their per-chunk chroma pair) rather than being
 /// skipped, since the last [`take_sb128_residual_hits`].
-static SB128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static SB128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The 128x128-with-residual count since the last call, and zero it.
 pub fn take_sb128_residual_hits() -> usize {
@@ -792,8 +788,7 @@ pub fn take_sb128_residual_hits() -> usize {
 /// [`write_inter_block_128_rect`] codes) carried a REAL residual rather than
 /// being skipped, since the last [`take_sb128_rectres_hits`] -- the writer
 /// side of [`crate::encode::take_b128_rectres_hits`]'s search count.
-static SB128_RECTRES_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static SB128_RECTRES_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The rect/AB-piece-with-residual count since the last call, and zero it.
 pub fn take_sb128_rectres_hits() -> usize {
@@ -803,8 +798,7 @@ pub fn take_sb128_rectres_hits() -> usize {
 /// lane-b128r: how many of those blocks named a SECOND reference (the
 /// compound arm at the 128 root), since the last
 /// [`take_sb128_compound_hits`].
-static SB128_COMPOUND_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static SB128_COMPOUND_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The compound-128 count since the last call, and zero it.
 pub fn take_sb128_compound_hits() -> usize {
@@ -838,12 +832,7 @@ fn write_lr(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, mi_row: u32, mi_col: u32, 
                 let info = plan.units[(rcol + rrow * plan.horz_units) as usize];
                 enc.symbol(usize::from(info.is_some()), &mut cdfs.restore_wiener);
                 if let Some(info) = info {
-                    crate::restoration::write_wiener_filter(
-                        enc,
-                        false,
-                        &mut plan.reference,
-                        &info,
-                    );
+                    crate::restoration::write_wiener_filter(enc, false, &mut plan.reference, &info);
                 }
             }
         }
@@ -919,7 +908,10 @@ impl TileLayout {
         let starts = |total: u32, log2: u32| {
             let total128 = total.div_ceil(unit);
             let step = total128.div_ceil(1 << log2).max(1);
-            let mut v: Vec<u32> = (0..total128).step_by(step as usize).map(|s| s * unit).collect();
+            let mut v: Vec<u32> = (0..total128)
+                .step_by(step as usize)
+                .map(|s| s * unit)
+                .collect();
             v.push(total);
             v
         };
@@ -1067,11 +1059,9 @@ pub(crate) fn cdef_unit_owner(blocks: &[Quadrant], mi_cols: u32, mi_rows: u32) -
                 // (its two squares are one unit each); only a non-skip one
                 // codes a literal, so only it fires.
                 Quadrant::Ab128(symbol, pieces) => {
-                    for (piece, ((mi_r, mi_c), (w, h))) in
-                        pieces.iter().zip(crate::encode::ab128_pieces(
-                            usize::from(*symbol),
-                            (0, 0),
-                        ))
+                    for (piece, ((mi_r, mi_c), (w, h))) in pieces
+                        .iter()
+                        .zip(crate::encode::ab128_pieces(usize::from(*symbol), (0, 0)))
                     {
                         if piece.skip {
                             continue;
@@ -1111,7 +1101,12 @@ thread_local! {
 /// carries no literal at all).
 pub(crate) fn arm_cdef_idx(bits: u8, sb_cols: usize, grid: Vec<u8>) {
     CDEF_IDX.with(|c| {
-        *c.borrow_mut() = (bits > 0).then(|| CdefIdxPlan { bits, sb_cols, grid, last: None });
+        *c.borrow_mut() = (bits > 0).then(|| CdefIdxPlan {
+            bits,
+            sb_cols,
+            grid,
+            last: None,
+        });
     });
 }
 
@@ -1143,8 +1138,12 @@ thread_local! {
 /// lane-deltaq) when `res == 0`.
 pub(crate) fn arm_delta_q(res: i32, sb_cols: usize, grid: Vec<u8>, base: u8) {
     DELTA_Q.with(|c| {
-        *c.borrow_mut() =
-            (res > 0).then(|| DeltaQPlan { res, sb_cols, grid, cur: i32::from(base) });
+        *c.borrow_mut() = (res > 0).then(|| DeltaQPlan {
+            res,
+            sb_cols,
+            grid,
+            cur: i32::from(base),
+        });
     });
 }
 
@@ -1285,14 +1284,23 @@ fn write_filter_intra(
     filter_intra: Option<u8>,
 ) {
     if !filter_intra_armed() || mode != DC_PRED || has_palette_y {
-        debug_assert!(filter_intra.is_none(), "no `use_filter_intra` symbol exists here");
+        debug_assert!(
+            filter_intra.is_none(),
+            "no `use_filter_intra` symbol exists here"
+        );
         return;
     }
     let Some(class) = crate::decode::filter_intra_size_class(side) else {
-        debug_assert!(filter_intra.is_none(), "past av1_filter_intra_allowed_bsize");
+        debug_assert!(
+            filter_intra.is_none(),
+            "past av1_filter_intra_allowed_bsize"
+        );
         return;
     };
-    enc.symbol(usize::from(filter_intra.is_some()), &mut cdfs.filter_intra[class]);
+    enc.symbol(
+        usize::from(filter_intra.is_some()),
+        &mut cdfs.filter_intra[class],
+    );
     if let Some(fi) = filter_intra {
         enc.symbol(usize::from(fi), &mut cdfs.filter_intra_mode);
         FILTER_INTRA_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1525,7 +1533,12 @@ fn write_motion_mode(
 /// a single-reference or intra block, and `record_compound_mi`'s overwrite of
 /// the ALTREF default for a compound one (this writer only codes
 /// `comp_group_idx == 0`, `compound_idx == 1`).
-fn record_block_compound(neighbours: &mut Neighbours, at_mi: (usize, usize), side: usize, block: &BlockCoeffs) {
+fn record_block_compound(
+    neighbours: &mut Neighbours,
+    at_mi: (usize, usize),
+    side: usize,
+    block: &BlockCoeffs,
+) {
     if let Some(r1) = block.inter.and_then(|i| i.ref1) {
         neighbours.record_compound_mi(at_mi, side, r1, 0, 1);
     }
@@ -1577,14 +1590,19 @@ pub(crate) fn high_precision_mv() -> bool {
 /// `allow_high_precision_mv`, one per non-zero mv component with it), `[1]`
 /// counts the ones that came out ZERO -- an eighth-pel vector, i.e. one a
 /// frame without the flag cannot name at all.
-static HP_SYMBOLS: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static HP_SYMBOLS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Reads and clears [`HP_SYMBOLS`]: `(hp symbols coded, eighth-pel ones)`.
 #[allow(dead_code)] // read only from the `#[cfg(test)]` witness
 pub(crate) fn take_hp_symbols() -> (u64, u64) {
     let all = HP_SYMBOLS[0].swap(0, std::sync::atomic::Ordering::Relaxed);
-    (all, HP_SYMBOLS[1].swap(0, std::sync::atomic::Ordering::Relaxed))
+    (
+        all,
+        HP_SYMBOLS[1].swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// [`take_hp_symbols`] without clearing -- what the NEWMV census prints.
@@ -1611,10 +1629,10 @@ fn write_compound_ref_frames(
     (ref0, ref1): (i8, i8),
 ) -> Result<()> {
     use crate::mvstack::{
+        comp_reference_type_ctx, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx,
+        single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx, uni_comp_ref_p1_ctx,
         ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
-        LAST_FRAME, comp_reference_type_ctx, single_ref_p1_ctx, single_ref_p2_ctx,
-        single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
-        uni_comp_ref_p1_ctx,
+        LAST_FRAME,
     };
     let a = (above_ref > 0).then_some(above_ref);
     let l = (left_ref > 0).then_some(left_ref);
@@ -1810,14 +1828,20 @@ fn write_compound_block(
             let mut walk = 1usize;
             while walk < 3 && stack.entries.len() > walk + 1 {
                 let advance = walk < idx;
-                enc.symbol(usize::from(advance), &mut cdfs.drl_mode[stack.drl_ctx[walk]]);
+                enc.symbol(
+                    usize::from(advance),
+                    &mut cdfs.drl_mode[stack.drl_ctx[walk]],
+                );
                 if !advance {
                     break;
                 }
                 walk += 1;
             }
             let near = |i: usize| {
-                stack.entries.get(i).map_or(stack.near_mv, |e| (e.mv0, e.mv1))
+                stack
+                    .entries
+                    .get(i)
+                    .map_or(stack.near_mv, |e| (e.mv0, e.mv1))
             };
             if walk != idx && near(walk) != near(idx) {
                 note_drl_clamp(idx, walk, stack.entries.len());
@@ -1845,14 +1869,20 @@ fn write_compound_block(
             let mut walk = 0usize;
             while walk < 2 && stack.entries.len() > walk + 1 {
                 let advance = walk < idx;
-                enc.symbol(usize::from(advance), &mut cdfs.drl_mode[stack.drl_ctx[walk]]);
+                enc.symbol(
+                    usize::from(advance),
+                    &mut cdfs.drl_mode[stack.drl_ctx[walk]],
+                );
                 if !advance {
                     break;
                 }
                 walk += 1;
             }
             let nearest = |i: usize| {
-                stack.entries.get(i).map_or(stack.nearest_mv, |e| (e.mv0, e.mv1))
+                stack
+                    .entries
+                    .get(i)
+                    .map_or(stack.nearest_mv, |e| (e.mv0, e.mv1))
             };
             if walk != idx && nearest(walk) != nearest(idx) {
                 note_drl_clamp(idx, walk, stack.entries.len());
@@ -1993,7 +2023,11 @@ fn write_delta_q(
         // under `EC_AV1_SB128` -- decode.rs `maybe_read_delta_q` gates on
         // `sb_mi_cur`, and a writer gating on a hardcoded 64 codes three
         // symbol groups per 128 root the reader never reads.
-        let sb_mi = if sb128_armed() { SB_MI as usize * 2 } else { SB_MI as usize };
+        let sb_mi = if sb128_armed() {
+            SB_MI as usize * 2
+        } else {
+            SB_MI as usize
+        };
         if mi.0 % sb_mi != 0 || mi.1 % sb_mi != 0 {
             return;
         }
@@ -2820,9 +2854,9 @@ impl Quadrant {
             Quadrant::Whole(block) | Quadrant::Whole64(block) | Quadrant::Whole128(block) => {
                 std::slice::from_ref(block)
             }
-            Quadrant::Split(blocks)
-            | Quadrant::Rect128(_, blocks)
-            | Quadrant::Ab128(_, blocks) => blocks.as_slice(),
+            Quadrant::Split(blocks) | Quadrant::Rect128(_, blocks) | Quadrant::Ab128(_, blocks) => {
+                blocks.as_slice()
+            }
             Quadrant::Covered => &[],
         }
     }
@@ -3040,8 +3074,12 @@ impl Neighbours {
     fn start_row(&mut self) {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
-        self.left_side.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE);
-        self.left_side_mi.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE);
+        self.left_side
+            .iter_mut()
+            .for_each(|s| *s = NO_NEIGHBOUR_SIDE);
+        self.left_side_mi
+            .iter_mut()
+            .for_each(|s| *s = NO_NEIGHBOUR_SIDE);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
         self.left_ref.iter_mut().for_each(|r| *r = -1);
@@ -3052,7 +3090,9 @@ impl Neighbours {
         self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
         self.left_palette_size.iter_mut().for_each(|s| *s = 0);
         self.left_palette_uv_size.iter_mut().for_each(|s| *s = 0);
-        self.left_palette_uv_colors.iter_mut().for_each(|c| *c = [0u16; 8]);
+        self.left_palette_uv_colors
+            .iter_mut()
+            .for_each(|c| *c = [0u16; 8]);
     }
 
     /// `av1_get_palette_mode_ctx` + `av1_get_palette_cache`, mirrored from
@@ -3069,12 +3109,18 @@ impl Neighbours {
         let above_ok = r % 16 != 0;
         let above_is_palette = r > 0 && self.above_palette_size[c] > 0;
         let (above_n, above_colors) = if above_ok && self.above_palette_size[c] > 0 {
-            (usize::from(self.above_palette_size[c]), self.above_palette_colors[c])
+            (
+                usize::from(self.above_palette_size[c]),
+                self.above_palette_colors[c],
+            )
         } else {
             (0, [0u16; 8])
         };
         let (left_n, left_colors) = if c > 0 && self.left_palette_size[r] > 0 {
-            (usize::from(self.left_palette_size[r]), self.left_palette_colors[r])
+            (
+                usize::from(self.left_palette_size[r]),
+                self.left_palette_colors[r],
+            )
         } else {
             (0, [0u16; 8])
         };
@@ -3167,7 +3213,13 @@ impl Neighbours {
     /// [`Self::record_palette_y`] for the chroma bands (decode.rs
     /// `record_palette_uv_rect`) -- `size == 0` clears stale state the same
     /// way, and the span is in LUMA pixels for both planes' bands alike.
-    fn record_palette_uv(&mut self, (r, c): (usize, usize), (w, h): (usize, usize), size: u8, colors: [u16; 8]) {
+    fn record_palette_uv(
+        &mut self,
+        (r, c): (usize, usize),
+        (w, h): (usize, usize),
+        size: u8,
+        colors: [u16; 8],
+    ) {
         // lane-b128hv: the above band spans the block's WIDTH and the left
         // band its HEIGHT; identical to the one loop this replaces at w == h.
         for cell in 0..(w / MI).max(1) {
@@ -3191,7 +3243,13 @@ impl Neighbours {
     /// What a just-written block leaves in the palette bands (decode.rs
     /// `record_palette_y_rect`): its size and colours over every 4x4 unit it
     /// spans, `0` for a block that took no palette.
-    fn record_palette_y(&mut self, (r, c): (usize, usize), (w, h): (usize, usize), size: u8, colors: [u16; 8]) {
+    fn record_palette_y(
+        &mut self,
+        (r, c): (usize, usize),
+        (w, h): (usize, usize),
+        size: u8,
+        colors: [u16; 8],
+    ) {
         // lane-b128hv: the above band spans the block's WIDTH and the left
         // band its HEIGHT; identical to the one loop this replaces at w == h.
         for cell in 0..(w / MI).max(1) {
@@ -3216,7 +3274,13 @@ impl Neighbours {
     /// of an INTER frame leaves in the two `TXFM_CONTEXT` bands -- its
     /// resolved transform size over the span `(w_px, h_px)`, which for a
     /// SKIPPED inter block is its own block size instead.
-    fn record_txfm(&mut self, (mi_r, mi_c): (usize, usize), tx_px: usize, w_px: usize, h_px: usize) {
+    fn record_txfm(
+        &mut self,
+        (mi_r, mi_c): (usize, usize),
+        tx_px: usize,
+        w_px: usize,
+        h_px: usize,
+    ) {
         for i in 0..h_px / MI {
             if let Some(cell) = self.left_txfm.get_mut(mi_r + i) {
                 *cell = tx_px as u8;
@@ -3492,9 +3556,22 @@ impl Neighbours {
     /// Writes one inter-frame block's skip flag and inter/intra state into
     /// every 16x16 column and row it covers, the same span [`Self::record`]
     /// fills for the coefficient and mode state.
-    fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool, ref_frame: i8) {
+    fn record_inter(
+        &mut self,
+        at: (usize, usize),
+        side: usize,
+        skip: bool,
+        is_inter: bool,
+        ref_frame: i8,
+    ) {
         let (r, c) = at;
-        self.record_inter_mi((r * (SUB / MI), c * (SUB / MI)), side, skip, is_inter, ref_frame);
+        self.record_inter_mi(
+            (r * (SUB / MI), c * (SUB / MI)),
+            side,
+            skip,
+            is_inter,
+            ref_frame,
+        );
     }
 
     /// lane-b128hv: [`Self::record_inter_mi`] with independent above (width)
@@ -3572,7 +3649,14 @@ impl Neighbours {
 
     /// [`Self::record_inter`] taking the block's position directly in 4x4
     /// mode-info units, for a block finer than one [`SUB`] slot.
-    fn record_inter_mi(&mut self, (mi_r, mi_c): (usize, usize), side: usize, skip: bool, is_inter: bool, ref_frame: i8) {
+    fn record_inter_mi(
+        &mut self,
+        (mi_r, mi_c): (usize, usize),
+        side: usize,
+        skip: bool,
+        is_inter: bool,
+        ref_frame: i8,
+    ) {
         for cell in 0..side / MI {
             self.above_skip[mi_c + cell] = skip;
             self.left_skip[mi_r + cell] = skip;
@@ -3838,7 +3922,16 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
             neighbours.start_row();
         }
         if sb128 && sb_start {
-            write_sb128_root(&mut enc, &mut cdfs, &neighbours, sb_r, sb_c, mi_cols, mi_rows, PARTITION_SPLIT);
+            write_sb128_root(
+                &mut enc,
+                &mut cdfs,
+                &neighbours,
+                sb_r,
+                sb_c,
+                mi_cols,
+                mi_rows,
+                PARTITION_SPLIT,
+            );
         }
         {
             if !sb128 {
@@ -4316,7 +4409,12 @@ fn write_palette_colors_y(enc: &mut SymbolEncoder, colors: &[u16], cache: &[u16]
 /// below sees, so it only ever makes the encoder take FEWER chroma palettes
 /// than it should -- never a wrong stream. Upgrade path: price both forms
 /// here and write the cheaper one under its own leading bit.
-fn write_palette_colors_uv(enc: &mut SymbolEncoder, u_colors: &[u16], v_colors: &[u16], cache: &[u16]) {
+fn write_palette_colors_uv(
+    enc: &mut SymbolEncoder,
+    u_colors: &[u16],
+    v_colors: &[u16],
+    cache: &[u16],
+) {
     let n = u_colors.len();
     let mut cached: Vec<u16> = Vec::with_capacity(n);
     for &c in cache {
@@ -4441,7 +4539,14 @@ pub(crate) fn palette_uv_bits(pal: &PaletteUv, side: usize, on: (usize, usize)) 
     enc.symbol(n - 2, &mut size_cdf);
     write_palette_colors_uv(&mut enc, &pal.u_colors[..n], &pal.v_colors[..n], &[]);
     let mut idx_cdfs = cdf::PALETTE_UV_COLOR_INDEX[n - 2];
-    write_color_index_map(&mut enc, &mut idx_cdfs, &pal.map, palette_uv_side(side), n, on);
+    write_color_index_map(
+        &mut enc,
+        &mut idx_cdfs,
+        &pal.map,
+        palette_uv_side(side),
+        n,
+        on,
+    );
     enc.bits()
 }
 
@@ -4552,7 +4657,12 @@ fn write_dv_component(enc: &mut SymbolEncoder, c: &mut MvComponentCdfs, diff: i3
 
 /// One intrabc block's DV as a residual against [`intrabc_dv_pred`], off the
 /// `dv` nmv context (decode.rs `read_intrabc_dv` -> `read_mv`).
-fn write_dv(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, dv: (i32, i32), pred: (i32, i32)) -> Result<()> {
+fn write_dv(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    dv: (i32, i32),
+    pred: (i32, i32),
+) -> Result<()> {
     let diff = (dv.0 - pred.0, dv.1 - pred.1);
     let joint = match (diff.0 != 0, diff.1 != 0) {
         (false, false) => 0,
@@ -4584,7 +4694,8 @@ fn write_intrabc_block(
     mi: (usize, usize),
     side: usize,
 ) -> Result<()> {
-    let skip_ctx = usize::from(neighbours.above_skip[mi.1]) + usize::from(neighbours.left_skip[mi.0]);
+    let skip_ctx =
+        usize::from(neighbours.above_skip[mi.1]) + usize::from(neighbours.left_skip[mi.0]);
     enc.symbol(1, &mut cdfs.skip[skip_ctx]);
     write_cdef_idx(enc, mi, true);
     enc.symbol(1, &mut cdfs.intrabc);
@@ -4705,7 +4816,8 @@ fn write_intra_mode(
     // above + left. Every block this writer codes outside an `allow_intrabc`
     // frame is unskipped, so both bands stay false and this stays 0 -- the
     // literal every stream before this lane was written with.
-    let skip_ctx = usize::from(neighbours.above_skip[mi.1]) + usize::from(neighbours.left_skip[mi.0]);
+    let skip_ctx =
+        usize::from(neighbours.above_skip[mi.1]) + usize::from(neighbours.left_skip[mi.0]);
     enc.symbol(0, &mut cdfs.skip[skip_ctx]);
     write_cdef_idx(enc, mi, false);
     // `read_intrabc_info` (spec 5.11.13): the flag is read for EVERY intra
@@ -4737,7 +4849,9 @@ fn write_intra_mode(
         write_cfl_alphas(
             enc,
             cdfs,
-            block.cfl_alphas.expect("a UV_CFL_PRED block carries its alphas"),
+            block
+                .cfl_alphas
+                .expect("a UV_CFL_PRED block carries its alphas"),
         );
     }
     // `angle_delta_uv` (spec `read_intra_angle_info`) off the same CDF array
@@ -4858,7 +4972,8 @@ fn write_palette_syntax(
                 &pal.map,
                 uv_side,
                 n,
-                crate::decode::palette_onscreen_uv((side, side), on, (uv_side, uv_side)),
+                // The encoder writes 4:2:0 only (`palette_uv_side` above).
+                crate::decode::palette_onscreen_uv((side, side), on, (uv_side, uv_side), (1, 1)),
             );
             note_palette_uv(n);
         }
@@ -4890,8 +5005,7 @@ static PALETTE_HITS: [std::sync::atomic::AtomicUsize; 9] =
 /// i.e. palette blocks this writer cut at the frame's right/bottom mi edge.
 /// A gate asserts it non-zero so it cannot pass on a stream that never cuts
 /// one (class `gate-blind-to-feature`).
-static PALETTE_CUT_MAPS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static PALETTE_CUT_MAPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Current value of [`PALETTE_CUT_MAPS`] (colour-index maps).
 pub fn palette_cut_maps_written() -> usize {
@@ -4975,15 +5089,7 @@ fn write_block(
     }
     let (above_mode, left_mode) = (neighbours.above_mode[c], neighbours.left_mode[r]);
     let mode = write_intra_mode(
-        enc,
-        cdfs,
-        neighbours,
-        block,
-        above_mode,
-        left_mode,
-        cfl,
-        at_mi,
-        side,
+        enc, cdfs, neighbours, block, above_mode, left_mode, cfl, at_mi, side,
     );
     // The coefficient tables read `fimode_to_intradir[filter_intra_mode]`'s
     // row on a filter-intra block; the neighbour publication below still gets
@@ -5085,7 +5191,9 @@ fn write_leaf8(
     // true first divergence (a differently-sized alphabet under the same
     // DC_PRED decision desyncs the coder even though the decoded mode is
     // unchanged).
-    let mode = write_intra_mode(enc, cdfs, neighbours, block, above_mode, left_mode, true, leaf_mi, 8);
+    let mode = write_intra_mode(
+        enc, cdfs, neighbours, block, above_mode, left_mode, true, leaf_mi, 8,
+    );
     let planes = [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4];
     // As [`write_block`]: the coefficient row follows the filter-intra mode,
     // the mode this leaf publishes (and returns to the next leaf) does not.
@@ -5218,7 +5326,11 @@ fn write_block_planes(
 /// The single luma transform type a block carries, `DCT_DCT` for one that
 /// never searched one (lane-txset).
 fn block_tx_type(block: &BlockCoeffs) -> TxType {
-    block.luma_tx_types.first().copied().unwrap_or(TxType::DctDct)
+    block
+        .luma_tx_types
+        .first()
+        .copied()
+        .unwrap_or(TxType::DctDct)
 }
 
 /// The `(side / tx)^2` transform units of one block's luma residual, raster
@@ -5294,9 +5406,7 @@ fn write_luma_tus(
                 grid.to_vec()
             } else {
                 (0..tx)
-                    .flat_map(|row| {
-                        grid[(tu_row * tx + row) * side + tu_col * tx..][..tx].to_vec()
-                    })
+                    .flat_map(|row| grid[(tu_row * tx + row) * side + tu_col * tx..][..tx].to_vec())
                     .collect()
             };
             // spec `get_txb_ctx_general`: a lone transform unit covering its
@@ -5381,7 +5491,9 @@ fn write_luma_select(
         }
     }
     let tx = max_tx >> depth;
-    write_luma_tus(enc, cdfs, neighbours, at_mi, side, tx, grid, mode, scans, false, tx_types)?;
+    write_luma_tus(
+        enc, cdfs, neighbours, at_mi, side, tx, grid, mode, scans, false, tx_types,
+    )?;
     neighbours.record_tx(at_mi, side, tx);
     Ok(tx)
 }
@@ -5681,7 +5793,9 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
                                     .map(|tu| {
                                         let (r0, c0) = ((tu / 2) * 32, (tu % 2) * 32);
                                         let unit: Vec<i32> = (0..32)
-                                            .flat_map(|row| g[(r0 + row) * 64 + c0..][..32].to_vec())
+                                            .flat_map(|row| {
+                                                g[(r0 + row) * 64 + c0..][..32].to_vec()
+                                            })
                                             .collect();
                                         coeff_bits(&unit, TxbSet::Luma32Inter, q_ctx, 0, 0)
                                     })
@@ -5696,7 +5810,10 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
                 }
                 Quadrant::Covered => return 0.0,
             };
-            q.blocks().iter().map(|b| block_bits(b, side, q_ctx)).sum::<f64>()
+            q.blocks()
+                .iter()
+                .map(|b| block_bits(b, side, q_ctx))
+                .sum::<f64>()
         })
         .sum()
 }
@@ -5764,7 +5881,7 @@ fn scan_of(side: usize) -> &'static Vec<u16> {
 /// DECODER's own table so the two cannot drift, cached per size and class.
 fn class_scan_of(side: usize, class: crate::decode::TxClass) -> &'static [u16] {
     static SCANS: LazyLock<[[Vec<u16>; 2]; 4]> = LazyLock::new(|| {
-        use crate::decode::{TxClass, class_scan_table};
+        use crate::decode::{class_scan_table, TxClass};
         [TX4, TX8, TX16, TX32].map(|side| {
             [
                 class_scan_table(side, TxClass::Horiz),
@@ -5846,7 +5963,16 @@ pub(crate) fn coeff_bits_typed(
         }
         let scan = scan_of(coding.side);
         let mut enc = SymbolEncoder::pricer();
-        write_coeffs(&mut enc, &mut coding, grid, scan, skip_ctx, sign_ctx, None, tx_type);
+        write_coeffs(
+            &mut enc,
+            &mut coding,
+            grid,
+            scan,
+            skip_ctx,
+            sign_ctx,
+            None,
+            tx_type,
+        );
         enc.bits()
     };
     // lane-av1speed2: 60% of the transform units of an inter stream hold no
@@ -5866,12 +5992,20 @@ pub(crate) fn coeff_bits_typed(
     let all_zero = grid.iter().all(|&level| level == 0);
     PRICING_BASE.with_borrow_mut(|base| {
         if let Some(slot) = base.as_deref_mut().filter(|s| s.0.q_ctx == q_ctx) {
-            return if all_zero { zero_price(slot) } else { price(slot) };
+            return if all_zero {
+                zero_price(slot)
+            } else {
+                price(slot)
+            };
         }
         PRICING.with_borrow_mut(|slots| {
             let slot = slots[q_ctx.min(3)]
                 .get_or_insert_with(|| Box::new((Cdfs::new(q_ctx), Cdfs::new(q_ctx))));
-            if all_zero { zero_price(slot) } else { price(slot) }
+            if all_zero {
+                zero_price(slot)
+            } else {
+                price(slot)
+            }
         })
     })
 }
@@ -5951,7 +6085,11 @@ pub(crate) fn rdoq(
     // is what the writer and the pricer take (`coded_corner`).
     let coded = side.min(TX32);
     let q_ctx = crate::decode::q_ctx_of(base_q_idx);
-    let mut dense = if coded == side { Vec::new() } else { vec![0i32; coded * coded] };
+    let mut dense = if coded == side {
+        Vec::new()
+    } else {
+        vec![0i32; coded * coded]
+    };
     fn price(
         levels: &[i32],
         dense: &mut [i32],
@@ -5971,7 +6109,9 @@ pub(crate) fn rdoq(
         }
         coeff_bits_typed(dense, set, q_ctx, skip_ctx, sign_ctx, tx_type)
     }
-    let mut bits = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx, tx_type);
+    let mut bits = price(
+        levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx, tx_type,
+    );
     // The DC has its own quantiser, so its squared error per unit of level is
     // `(dc_q / ac_q)^2` of an AC coefficient's.
     let dc = f64::from(crate::quant::dc_q(8, i32::from(base_q_idx)));
@@ -6022,9 +6162,11 @@ pub(crate) fn rdoq(
             let candidate = level - level.signum();
             levels[i] = candidate;
             budget -= 1;
-            let after = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx, tx_type);
-            let distortion = weight
-                * ((s - f64::from(candidate)).powi(2) - (s - f64::from(level)).powi(2));
+            let after = price(
+                levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx, tx_type,
+            );
+            let distortion =
+                weight * ((s - f64::from(candidate)).powi(2) - (s - f64::from(level)).powi(2));
             if distortion + lambda * (after - bits) < 0.0 {
                 bits = after;
                 if census {
@@ -6049,8 +6191,14 @@ pub(crate) fn rdoq(
 /// at the end of the scan), zeroed coefficients, lowered coefficients, bits
 /// after the pass * 64, bits before the pass * 64.
 pub(crate) static RDOQ_STATS: [AtomicU64; 8] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 
 /// The pre-pass half of [`RDOQ_STATS`] (`EC_AV1_RDOQ_CENSUS`): what the
@@ -6146,11 +6294,13 @@ thread_local! {
 /// at native, still with every one of its frames armed with the defaults.
 pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>, screen: bool) {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    let mode = *MODE.get_or_init(|| match std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() {
-        Ok("0") => 0,
-        Ok("1") => 1,
-        _ => 2,
-    });
+    let mode = *MODE.get_or_init(
+        || match std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() {
+            Ok("0") => 0,
+            Ok("1") => 1,
+            _ => 2,
+        },
+    );
     let on = match mode {
         0 => false,
         1 => true,
@@ -6158,7 +6308,9 @@ pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>, screen: bool) {
     };
     PRICING_HITS[usize::from(on && base.is_some())].fetch_add(1, Ordering::Relaxed);
     PRICING_BASE.with_borrow_mut(|slot| {
-        *slot = base.filter(|_| on).map(|c| Box::new((c.clone(), c.clone())));
+        *slot = base
+            .filter(|_| on)
+            .map(|c| Box::new((c.clone(), c.clone())));
     });
 }
 
@@ -6166,8 +6318,7 @@ pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>, screen: bool) {
 /// many with the frame's REAL starting tables ([`arm_pricing_cdfs`]), so a
 /// gate can print which side of the screen gate every frame landed on. Counts
 /// arming calls, not frames: a multi-tile frame arms one worker per tile.
-pub(crate) static PRICING_HITS: [AtomicUsize; 2] =
-    [AtomicUsize::new(0), AtomicUsize::new(0)];
+pub(crate) static PRICING_HITS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 
 /// Reads and clears [`PRICING_HITS`]: (default-table armings, real-table
 /// armings).
@@ -6389,7 +6540,10 @@ fn write_coeffs(
     // lane-av1speed3: `side` is 4, 8, 16 or 32, but it is a runtime value --
     // `pos / side` compiles to a real integer division, once per coefficient,
     // in the encoder's largest self-time symbol. Same row and column.
-    debug_assert!(side.is_power_of_two(), "the scan splits a position by shifting");
+    debug_assert!(
+        side.is_power_of_two(),
+        "the scan splits a position by shifting"
+    );
     let (shift, mask) = (side.trailing_zeros(), side - 1);
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
@@ -6649,7 +6803,11 @@ fn br_ctx(
         if row == 0 && col == 0 {
             return mag;
         }
-        let near_origin = if class == TxClass::Horiz { col == 0 } else { row == 0 };
+        let near_origin = if class == TxClass::Horiz {
+            col == 0
+        } else {
+            row == 0
+        };
         return if near_origin { mag + 7 } else { mag + 14 };
     }
     let p = row * side + col;
@@ -6800,7 +6958,11 @@ pub(crate) fn intra_inter_ctx(
 /// `CLASS0_SIZE << (class + 2)` (spec 3), the magnitude an `MV_CLASS_n`
 /// component's own bits start counting from; class zero starts at zero.
 fn mv_class_base(class: usize) -> i32 {
-    if class == 0 { 0 } else { 2i32 << (class + 2) }
+    if class == 0 {
+        0
+    } else {
+        2i32 << (class + 2)
+    }
 }
 
 /// The class a pre-offset magnitude `z` (`|diff| - 1`) falls in — the inverse
@@ -6923,11 +7085,12 @@ fn write_single_ref(
     left_ref: i8,
     left_ref1: Option<i8>,
 ) {
-    REF_HITS[(ref_frame.max(1) - 1) as usize % 7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    REF_HITS[(ref_frame.max(1) - 1) as usize % 7]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     use crate::mvstack::{
-        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
         single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
-        single_ref_p5_ctx, single_ref_p6_ctx,
+        single_ref_p5_ctx, single_ref_p6_ctx, ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME,
+        GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
     };
     let above = (above_ref > 0).then_some(above_ref);
     let left = (left_ref > 0).then_some(left_ref);
@@ -7071,7 +7234,10 @@ pub(crate) fn take_drl_hits() -> [usize; 4] {
 /// pricer's own offer set is enumerated against this rule by
 /// `crate::encode::tests::every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal`.
 pub(crate) fn signalled_drl_idx(entries: usize, start: usize, target: usize) -> usize {
-    target.min(start + 2).min(entries.saturating_sub(1)).max(start)
+    target
+        .min(start + 2)
+        .min(entries.saturating_sub(1))
+        .max(start)
 }
 
 fn write_drl_idx(
@@ -7161,7 +7327,7 @@ fn write_inter_mode(
             enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not NEWMV
             enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not GLOBALMV
             enc.symbol(1, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARMV
-            // `RefMvIdx` starts at 1 for NEARMV (spec 5.11.24).
+                                                               // `RefMvIdx` starts at 1 for NEARMV (spec 5.11.24).
             let idx = idx.max(1);
             let signalled = write_drl_idx(enc, cdfs, stack, 1, idx);
             let mv = stack.entries.get(signalled).map_or(stack.near_mv, |e| e.mv);
@@ -7335,12 +7501,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     let scan4 = default_scan(TX4);
     // The same four tables again as one array, which is what the per-unit
     // luma writer indexes by transform side.
-    let all_scans = [
-        scan32.clone(),
-        scan16.clone(),
-        scan8.clone(),
-        scan4.clone(),
-    ];
+    let all_scans = [scan32.clone(), scan16.clone(), scan8.clone(), scan4.clone()];
     let zero_grids = [
         vec![0i32; TX32 * TX32],
         vec![0i32; TX16 * TX16],
@@ -7431,7 +7592,10 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 // (mi_row, mi_col) and a second one at + hbs (16 mi) along the
                 // cut axis, the second only when it is inside the frame -- the
                 // search only offers a root wholly inside, so both are.
-                let base_mi = ((sb_r & !1) as usize * SB_MI as usize, (sb_c & !1) as usize * SB_MI as usize);
+                let base_mi = (
+                    (sb_r & !1) as usize * SB_MI as usize,
+                    (sb_c & !1) as usize * SB_MI as usize,
+                );
                 let (w, h) = if horz { (128usize, 64usize) } else { (64, 128) };
                 for (i, half) in halves.iter().enumerate() {
                     let at_mi = if horz {
@@ -7467,8 +7631,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     (sb_r & !1) as usize * SB_MI as usize,
                     (sb_c & !1) as usize * SB_MI as usize,
                 );
-                for (((mi_r, mi_c), (w, h)), piece) in
-                    crate::encode::ab128_pieces(symbol, base_mi).iter().zip(pieces)
+                for (((mi_r, mi_c), (w, h)), piece) in crate::encode::ab128_pieces(symbol, base_mi)
+                    .iter()
+                    .zip(pieces)
                 {
                     write_inter_block_128_rect(
                         &mut enc,
@@ -7532,7 +7697,13 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     + usize::from(neighbours.left_skip[mi_r]);
                 enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
                 write_cdef_idx(&mut enc, (mi_r, mi_c), block.skip);
-                write_delta_q(&mut enc, &mut cdfs, (mi_r, mi_c), !sb128_armed(), block.skip);
+                write_delta_q(
+                    &mut enc,
+                    &mut cdfs,
+                    (mi_r, mi_c),
+                    !sb128_armed(),
+                    block.skip,
+                );
                 let ii_ctx = intra_inter_ctx(
                     has_above,
                     has_left,
@@ -7926,7 +8097,6 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                                 // caller (r15): the SUB-grid skip/inter arrays
                                 // are otherwise left stale for the next
                                 // 16x16 slot.
-
                             }
                         }
                         continue;
@@ -7951,111 +8121,137 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
 
                 let mode_for_tx;
                 if let Some(info) = block.inter {
-                    write_comp_mode(&mut enc, &mut cdfs, &neighbours, (mi_r, mi_c), (has_above, has_left), info.ref1.is_some());
+                    write_comp_mode(
+                        &mut enc,
+                        &mut cdfs,
+                        &neighbours,
+                        (mi_r, mi_c),
+                        (has_above, has_left),
+                        info.ref1.is_some(),
+                    );
                     let (mi_row, mi_col) = (r32 as usize * 8, c32 as usize * 8);
                     if info.ref1.is_some() {
                         let (mv, mv1, is_new_mv) = write_compound_block(
-                            &mut enc, &mut cdfs, &neighbours, &grid, (mi_row, mi_col), (8, 8),
-                            (has_above, has_left), info, (mi_cols as usize, mi_rows as usize),
+                            &mut enc,
+                            &mut cdfs,
+                            &neighbours,
+                            &grid,
+                            (mi_row, mi_col),
+                            (8, 8),
+                            (has_above, has_left),
+                            info,
+                            (mi_cols as usize, mi_rows as usize),
                         )?;
                         for dr in 0..8 {
                             for dc in 0..8 {
-                                grid.set(mi_row + dr, mi_col + dc, MiInfo {
-                                    is_inter: true,
-                                    ref_frame: info.ref_frame,
-                                    ref_frame1: info.ref1.unwrap_or(NO_REF1),
-                                    mv1: mv16(mv1),
-                                    mv: mv16(mv),
-                                    is_new_mv,
-                                    size: 8,
-                                    size_h: 8,
-                                    is_global_mv0: false,
-                                    is_global_mv1: false,
-                                });
+                                grid.set(
+                                    mi_row + dr,
+                                    mi_col + dc,
+                                    MiInfo {
+                                        is_inter: true,
+                                        ref_frame: info.ref_frame,
+                                        ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                                        mv1: mv16(mv1),
+                                        mv: mv16(mv),
+                                        is_new_mv,
+                                        size: 8,
+                                        size_h: 8,
+                                        is_global_mv0: false,
+                                        is_global_mv1: false,
+                                    },
+                                );
                             }
                         }
                         mode_for_tx = 0;
                     } else {
-                    write_single_ref(&mut enc, &mut cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.above_ref1[mi_c], neighbours.left_ref[mi_r], neighbours.left_ref1[mi_r]);
+                        write_single_ref(
+                            &mut enc,
+                            &mut cdfs,
+                            info.ref_frame,
+                            neighbours.above_ref[mi_c],
+                            neighbours.above_ref1[mi_c],
+                            neighbours.left_ref[mi_r],
+                            neighbours.left_ref1[mi_r],
+                        );
 
-                    let stack = find_mv_stack(
-                        &grid,
-                        mi_row,
-                        mi_col,
-                        8,
-                        8,
-                        info.ref_frame,
-                        mi_cols as usize,
-                        mi_rows as usize,
-                    );
+                        let stack = find_mv_stack(
+                            &grid,
+                            mi_row,
+                            mi_col,
+                            8,
+                            8,
+                            info.ref_frame,
+                            mi_cols as usize,
+                            mi_rows as usize,
+                        );
 
-                    let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
-                    if crate::msac::symtrace::dir().is_some() {
-                        crate::msac::symtrace::note(&format!(
-                            "  MODE mi=({mi_r},{mi_c}) mode={:?} idx={} mv={mv:?} info_mv={:?}",
-                            info.mode, info.ref_mv_idx, info.mv
-                        ));
-                    }
-                    grid.set(
-                        mi_row,
-                        mi_col,
-                        MiInfo {
-                            is_inter: true,
-                            ref_frame: info.ref_frame,
-                            ref_frame1: NO_REF1,
-                            mv1: (0, 0),
-                            mv: mv16(mv),
-                            is_new_mv,
-                            size: 8,
-                            size_h: 8,
-                            is_global_mv0: false,
-                            is_global_mv1: false,
-                        },
-                    );
-                    for dr in 0..8 {
-                        for dc in 0..8 {
-                            if dr == 0 && dc == 0 {
-                                continue;
-                            }
-                            grid.set(
-                                mi_row + dr,
-                                mi_col + dc,
-                                MiInfo {
-                                    is_inter: true,
-                                    ref_frame: info.ref_frame,
-                                    ref_frame1: NO_REF1,
-                                    mv1: (0, 0),
-                                    mv: mv16(mv),
-                                    is_new_mv,
-                                    size: 8,
-                                    size_h: 8,
-                                    is_global_mv0: false,
-                                    is_global_mv1: false,
-                                },
-                            );
+                        let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
+                        if crate::msac::symtrace::dir().is_some() {
+                            crate::msac::symtrace::note(&format!(
+                                "  MODE mi=({mi_r},{mi_c}) mode={:?} idx={} mv={mv:?} info_mv={:?}",
+                                info.mode, info.ref_mv_idx, info.mv
+                            ));
                         }
-                    }
-                    write_motion_mode(
-                        &mut enc,
-                        &mut cdfs,
-                        &grid,
-                        (mi_row, mi_col),
-                        (8, 8),
-                        (BLOCK, BLOCK),
-                        (mi_cols as usize, mi_rows as usize),
-                        info.ref_frame,
-                        block.motion_mode,
-                    )?;
-                    mode_for_tx = 0;
+                        grid.set(
+                            mi_row,
+                            mi_col,
+                            MiInfo {
+                                is_inter: true,
+                                ref_frame: info.ref_frame,
+                                ref_frame1: NO_REF1,
+                                mv1: (0, 0),
+                                mv: mv16(mv),
+                                is_new_mv,
+                                size: 8,
+                                size_h: 8,
+                                is_global_mv0: false,
+                                is_global_mv1: false,
+                            },
+                        );
+                        for dr in 0..8 {
+                            for dc in 0..8 {
+                                if dr == 0 && dc == 0 {
+                                    continue;
+                                }
+                                grid.set(
+                                    mi_row + dr,
+                                    mi_col + dc,
+                                    MiInfo {
+                                        is_inter: true,
+                                        ref_frame: info.ref_frame,
+                                        ref_frame1: NO_REF1,
+                                        mv1: (0, 0),
+                                        mv: mv16(mv),
+                                        is_new_mv,
+                                        size: 8,
+                                        size_h: 8,
+                                        is_global_mv0: false,
+                                        is_global_mv1: false,
+                                    },
+                                );
+                            }
+                        }
+                        write_motion_mode(
+                            &mut enc,
+                            &mut cdfs,
+                            &grid,
+                            (mi_row, mi_col),
+                            (8, 8),
+                            (BLOCK, BLOCK),
+                            (mi_cols as usize, mi_rows as usize),
+                            info.ref_frame,
+                            block.motion_mode,
+                        )?;
+                        mode_for_tx = 0;
                     }
                 } else {
                     let mode = usize::from(block.mode);
                     enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_32]);
                     if (V_PRED..=D67_PRED).contains(&mode) {
                         enc.symbol(
-            (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
-            &mut cdfs.angle_delta[mode - V_PRED],
-        );
+                            (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
+                            &mut cdfs.angle_delta[mode - V_PRED],
+                        );
                     }
                     let uv_mode = usize::from(block.uv_mode);
                     enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
@@ -8208,7 +8404,8 @@ fn write_inter_frame_leaf(
 
     let (r, c) = at;
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
-    let skip_ctx = usize::from(neighbours.above_skip[mi_c]) + usize::from(neighbours.left_skip[mi_r]);
+    let skip_ctx =
+        usize::from(neighbours.above_skip[mi_c]) + usize::from(neighbours.left_skip[mi_r]);
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
     write_cdef_idx(enc, (mi_r, mi_c), block.skip);
     write_delta_q(enc, cdfs, (mi_r, mi_c), false, block.skip);
@@ -8221,87 +8418,113 @@ fn write_inter_frame_leaf(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
-        write_comp_mode(enc, cdfs, neighbours, (mi_r, mi_c), (has_above, has_left), info.ref1.is_some());
+        write_comp_mode(
+            enc,
+            cdfs,
+            neighbours,
+            (mi_r, mi_c),
+            (has_above, has_left),
+            info.ref1.is_some(),
+        );
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         if info.ref1.is_some() {
             let n = SUB_MI as usize;
             let (mv, mv1, is_new_mv) = write_compound_block(
-                enc, cdfs, neighbours, grid, (mi_row, mi_col), (n, n),
-                (has_above, has_left), info, (mi_cols as usize, mi_rows as usize),
+                enc,
+                cdfs,
+                neighbours,
+                grid,
+                (mi_row, mi_col),
+                (n, n),
+                (has_above, has_left),
+                info,
+                (mi_cols as usize, mi_rows as usize),
             )?;
             for dr in 0..n {
                 for dc in 0..n {
-                    grid.set(mi_row + dr, mi_col + dc, MiInfo {
-                        is_inter: true,
-                        ref_frame: info.ref_frame,
-                        ref_frame1: info.ref1.unwrap_or(NO_REF1),
-                        mv1: mv16(mv1),
-                        mv: mv16(mv),
-                        is_new_mv,
-                        size: n as u8,
-                        size_h: n as u8,
-                        is_global_mv0: false,
-                        is_global_mv1: false,
-                    });
+                    grid.set(
+                        mi_row + dr,
+                        mi_col + dc,
+                        MiInfo {
+                            is_inter: true,
+                            ref_frame: info.ref_frame,
+                            ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                            mv1: mv16(mv1),
+                            mv: mv16(mv),
+                            is_new_mv,
+                            size: n as u8,
+                            size_h: n as u8,
+                            is_global_mv0: false,
+                            is_global_mv1: false,
+                        },
+                    );
                 }
             }
             mode_for_tx = 0;
         } else {
-        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.above_ref1[mi_c], neighbours.left_ref[mi_r], neighbours.left_ref1[mi_r]);
+            write_single_ref(
+                enc,
+                cdfs,
+                info.ref_frame,
+                neighbours.above_ref[mi_c],
+                neighbours.above_ref1[mi_c],
+                neighbours.left_ref[mi_r],
+                neighbours.left_ref1[mi_r],
+            );
 
-        let stack = find_mv_stack(
-            grid,
-            mi_row,
-            mi_col,
-            SUB_MI as usize,
-            SUB_MI as usize,
-            info.ref_frame,
-            mi_cols as usize,
-            mi_rows as usize,
-        );
+            let stack = find_mv_stack(
+                grid,
+                mi_row,
+                mi_col,
+                SUB_MI as usize,
+                SUB_MI as usize,
+                info.ref_frame,
+                mi_cols as usize,
+                mi_rows as usize,
+            );
 
-        let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
-        for dr in 0..SUB_MI as usize {
-            for dc in 0..SUB_MI as usize {
-                grid.set(
-                    mi_row + dr,
-                    mi_col + dc,
-                    MiInfo {
-                        is_inter: true,
-                        ref_frame: info.ref_frame,
-                        ref_frame1: NO_REF1,
-                        mv1: (0, 0),
-                        mv: mv16(mv),
-                        is_new_mv,
-                        size: SUB_MI as usize as u8,
-                        size_h: SUB_MI as usize as u8,
-                        is_global_mv0: false,
-                        is_global_mv1: false,
-                    },
-                );
+            let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
+            for dr in 0..SUB_MI as usize {
+                for dc in 0..SUB_MI as usize {
+                    grid.set(
+                        mi_row + dr,
+                        mi_col + dc,
+                        MiInfo {
+                            is_inter: true,
+                            ref_frame: info.ref_frame,
+                            ref_frame1: NO_REF1,
+                            mv1: (0, 0),
+                            mv: mv16(mv),
+                            is_new_mv,
+                            size: SUB_MI as usize as u8,
+                            size_h: SUB_MI as usize as u8,
+                            is_global_mv0: false,
+                            is_global_mv1: false,
+                        },
+                    );
+                }
             }
-        }
-        write_motion_mode(
-            enc,
-            cdfs,
-            grid,
-            (mi_row, mi_col),
-            (SUB_MI as usize, SUB_MI as usize),
-            (SUB, SUB),
-            (mi_cols as usize, mi_rows as usize),
-            info.ref_frame,
-            block.motion_mode,
-        )?;
-        mode_for_tx = 0;
+            write_motion_mode(
+                enc,
+                cdfs,
+                grid,
+                (mi_row, mi_col),
+                (SUB_MI as usize, SUB_MI as usize),
+                (SUB, SUB),
+                (mi_cols as usize, mi_rows as usize),
+                info.ref_frame,
+                block.motion_mode,
+            )?;
+            mode_for_tx = 0;
         }
     } else {
         let mode = usize::from(block.mode);
         enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_16]);
         if (V_PRED..=D67_PRED).contains(&mode) {
             enc.symbol(
-            (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
-            &mut cdfs.angle_delta[mode - V_PRED],
-        );
+                (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
+                &mut cdfs.angle_delta[mode - V_PRED],
+            );
         }
         let uv_mode = usize::from(block.uv_mode);
         enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
@@ -8380,7 +8603,16 @@ fn write_inter_frame_leaf(
         ];
         if split {
             write_luma_tus(
-                enc, cdfs, neighbours, at_mi, SUB, tx, &grids[0], mode_for_tx, all_scans, is_inter,
+                enc,
+                cdfs,
+                neighbours,
+                at_mi,
+                SUB,
+                tx,
+                &grids[0],
+                mode_for_tx,
+                all_scans,
+                is_inter,
                 &block.luma_tx_types,
             )?;
         }
@@ -8467,93 +8699,122 @@ fn write_inter_frame_leaf8(
     write_cdef_idx(enc, leaf_mi, block.skip);
     write_delta_q(enc, cdfs, leaf_mi, false, block.skip);
 
-    let (has_above, has_left) = (neighbours.has_above(leaf_mi.0), neighbours.has_left(leaf_mi.1));
+    let (has_above, has_left) = (
+        neighbours.has_above(leaf_mi.0),
+        neighbours.has_left(leaf_mi.1),
+    );
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
     let is_inter = block.inter.is_some();
     enc.symbol(usize::from(is_inter), &mut cdfs.intra_inter[ii_ctx]);
 
     let mode_for_tx;
     if let Some(info) = block.inter {
-        write_comp_mode(enc, cdfs, neighbours, leaf_mi, (has_above, has_left), info.ref1.is_some());
+        write_comp_mode(
+            enc,
+            cdfs,
+            neighbours,
+            leaf_mi,
+            (has_above, has_left),
+            info.ref1.is_some(),
+        );
         let (mi_row, mi_col) = leaf_mi;
         if info.ref1.is_some() {
             let (mv, mv1, is_new_mv) = write_compound_block(
-                enc, cdfs, neighbours, grid, (mi_row, mi_col), (2, 2),
-                (has_above, has_left), info, (mi_cols as usize, mi_rows as usize),
+                enc,
+                cdfs,
+                neighbours,
+                grid,
+                (mi_row, mi_col),
+                (2, 2),
+                (has_above, has_left),
+                info,
+                (mi_cols as usize, mi_rows as usize),
             )?;
             for dr in 0..2 {
                 for dc in 0..2 {
-                    grid.set(mi_row + dr, mi_col + dc, MiInfo {
-                        is_inter: true,
-                        ref_frame: info.ref_frame,
-                        ref_frame1: info.ref1.unwrap_or(NO_REF1),
-                        mv1: mv16(mv1),
-                        mv: mv16(mv),
-                        is_new_mv,
-                        size: 2,
-                        size_h: 2,
-                        is_global_mv0: false,
-                        is_global_mv1: false,
-                    });
+                    grid.set(
+                        mi_row + dr,
+                        mi_col + dc,
+                        MiInfo {
+                            is_inter: true,
+                            ref_frame: info.ref_frame,
+                            ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                            mv1: mv16(mv1),
+                            mv: mv16(mv),
+                            is_new_mv,
+                            size: 2,
+                            size_h: 2,
+                            is_global_mv0: false,
+                            is_global_mv1: false,
+                        },
+                    );
                 }
             }
             mode_for_tx = 0;
         } else {
-        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[leaf_mi.1], neighbours.above_ref1[leaf_mi.1], neighbours.left_ref[leaf_mi.0], neighbours.left_ref1[leaf_mi.0]);
+            write_single_ref(
+                enc,
+                cdfs,
+                info.ref_frame,
+                neighbours.above_ref[leaf_mi.1],
+                neighbours.above_ref1[leaf_mi.1],
+                neighbours.left_ref[leaf_mi.0],
+                neighbours.left_ref1[leaf_mi.0],
+            );
 
-        let stack = find_mv_stack(
-            grid,
-            mi_row,
-            mi_col,
-            2,
-            2,
-            info.ref_frame,
-            mi_cols as usize,
-            mi_rows as usize,
-        );
+            let stack = find_mv_stack(
+                grid,
+                mi_row,
+                mi_col,
+                2,
+                2,
+                info.ref_frame,
+                mi_cols as usize,
+                mi_rows as usize,
+            );
 
-        let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
-        for dr in 0..2 {
-            for dc in 0..2 {
-                grid.set(
-                    mi_row + dr,
-                    mi_col + dc,
-                    MiInfo {
-                        is_inter: true,
-                        ref_frame: info.ref_frame,
-                        ref_frame1: NO_REF1,
-                        mv1: (0, 0),
-                        mv: mv16(mv),
-                        is_new_mv,
-                        size: 2,
-                        size_h: 2,
-                        is_global_mv0: false,
-                        is_global_mv1: false,
-                    },
-                );
+            let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
+            for dr in 0..2 {
+                for dc in 0..2 {
+                    grid.set(
+                        mi_row + dr,
+                        mi_col + dc,
+                        MiInfo {
+                            is_inter: true,
+                            ref_frame: info.ref_frame,
+                            ref_frame1: NO_REF1,
+                            mv1: (0, 0),
+                            mv: mv16(mv),
+                            is_new_mv,
+                            size: 2,
+                            size_h: 2,
+                            is_global_mv0: false,
+                            is_global_mv1: false,
+                        },
+                    );
+                }
             }
-        }
-        write_motion_mode(
-            enc,
-            cdfs,
-            grid,
-            (mi_row, mi_col),
-            (2, 2),
-            (8, 8),
-            (mi_cols as usize, mi_rows as usize),
-            info.ref_frame,
-            block.motion_mode,
-        )?;
-        mode_for_tx = 0;
+            write_motion_mode(
+                enc,
+                cdfs,
+                grid,
+                (mi_row, mi_col),
+                (2, 2),
+                (8, 8),
+                (mi_cols as usize, mi_rows as usize),
+                info.ref_frame,
+                block.motion_mode,
+            )?;
+            mode_for_tx = 0;
         }
     } else {
         let mode = usize::from(block.mode);
         enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_8]);
         if (V_PRED..=D67_PRED).contains(&mode) {
             enc.symbol(
-            (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
-            &mut cdfs.angle_delta[mode - V_PRED],
-        );
+                (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
+                &mut cdfs.angle_delta[mode - V_PRED],
+            );
         }
         let uv_mode = usize::from(block.uv_mode);
         enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
@@ -8606,7 +8867,7 @@ fn write_inter_frame_leaf8(
     } else {
         [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4]
     };
-        let tx = if tx_select {
+    let tx = if tx_select {
         write_tx_syntax_inter(
             enc,
             cdfs,
@@ -8628,7 +8889,13 @@ fn write_inter_frame_leaf8(
             vec![0i32; TX4 * TX4],
         ];
         neighbours.record_mi(leaf_mi, 8, &zero_grids);
-        neighbours.record_inter_mi(leaf_mi, 8, block.skip, block.inter.is_some(), block_ref(block));
+        neighbours.record_inter_mi(
+            leaf_mi,
+            8,
+            block.skip,
+            block.inter.is_some(),
+            block_ref(block),
+        );
         record_block_compound(neighbours, leaf_mi, 8, block);
     } else {
         let grids = [
@@ -8638,7 +8905,16 @@ fn write_inter_frame_leaf8(
         ];
         if split {
             write_luma_tus(
-                enc, cdfs, neighbours, leaf_mi, 8, tx, &grids[0], mode_for_tx, all_scans, is_inter,
+                enc,
+                cdfs,
+                neighbours,
+                leaf_mi,
+                8,
+                tx,
+                &grids[0],
+                mode_for_tx,
+                all_scans,
+                is_inter,
                 &block.luma_tx_types,
             )?;
         }
@@ -8669,8 +8945,8 @@ mod tests {
     use crate::sequence::sequence_header_obu;
     use ec_av1_syntax::sequence::SequenceHeader;
     use ec_av1_syntax::{
-        FrameHeader, FrameType, LoopFilterParams, PRIMARY_REF_NONE, QuantizationParams, TileInfo,
-        TxMode,
+        FrameHeader, FrameType, LoopFilterParams, QuantizationParams, TileInfo, TxMode,
+        PRIMARY_REF_NONE,
     };
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -10327,7 +10603,11 @@ mod tests {
             .map(|&v| {
                 let m = f64::from(v).abs() + 0.5;
                 let l = if m < 1.0 { 0 } else { m.floor() as i32 };
-                if v < 0.0 { -l } else { l }
+                if v < 0.0 {
+                    -l
+                } else {
+                    l
+                }
             })
             .collect();
         let before = levels.clone();
@@ -10340,18 +10620,40 @@ mod tests {
                 .zip(&scaled)
                 .enumerate()
                 .map(|(i, (&l, &s))| {
-                    (if i == 0 { dc_weight } else { 1.0 })
-                        * (f64::from(s) - f64::from(l)).powi(2)
+                    (if i == 0 { dc_weight } else { 1.0 }) * (f64::from(s) - f64::from(l)).powi(2)
                 })
                 .sum();
             d + lambda * coeff_bits(grid, set, crate::decode::q_ctx_of(q), 0, 0)
         };
-        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda, TxType::DctDct);
-        assert_eq!(bits, coeff_bits(&levels, set, crate::decode::q_ctx_of(q), 0, 0));
-        assert!(cost(&levels) <= cost(&before), "{:?} vs {:?}", cost(&levels), cost(&before));
+        let bits = rdoq(
+            &mut levels,
+            &scaled,
+            side,
+            q,
+            set,
+            0,
+            0,
+            lambda,
+            TxType::DctDct,
+        );
+        assert_eq!(
+            bits,
+            coeff_bits(&levels, set, crate::decode::q_ctx_of(q), 0, 0)
+        );
+        assert!(
+            cost(&levels) <= cost(&before),
+            "{:?} vs {:?}",
+            cost(&levels),
+            cost(&before)
+        );
         // The tail is what it is for: the last coded position moves earlier.
         let last = |g: &[i32]| scan_of(side).iter().rposition(|&p| g[usize::from(p)] != 0);
-        assert!(last(&levels) < last(&before), "eob {:?} -> {:?}", last(&before), last(&levels));
+        assert!(
+            last(&levels) < last(&before),
+            "eob {:?} -> {:?}",
+            last(&before),
+            last(&levels)
+        );
         // A 64-point transform is priced on its top-left 32x32 corner, and
         // the pass has to hand back THAT price (the dense path).
         let (side, set) = (64usize, TxbSet::Luma64);
@@ -10364,14 +10666,31 @@ mod tests {
             .map(|&v| {
                 let m = f64::from(v).abs() + 0.5;
                 let l = if m < 1.0 { 0 } else { m.floor() as i32 };
-                if v < 0.0 { -l } else { l }
+                if v < 0.0 {
+                    -l
+                } else {
+                    l
+                }
             })
             .collect();
-        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda, TxType::DctDct);
+        let bits = rdoq(
+            &mut levels,
+            &scaled,
+            side,
+            q,
+            set,
+            0,
+            0,
+            lambda,
+            TxType::DctDct,
+        );
         let corner: Vec<i32> = (0..32)
             .flat_map(|row| levels[row * side..][..32].to_vec())
             .collect();
-        assert_eq!(bits, coeff_bits(&corner, set, crate::decode::q_ctx_of(q), 0, 0));
+        assert_eq!(
+            bits,
+            coeff_bits(&corner, set, crate::decode::q_ctx_of(q), 0, 0)
+        );
     }
 
     #[test]
@@ -10848,7 +11167,11 @@ mod tests {
             (d << 3) | (fr << 1) | 1
         };
         let mag = mv_class_base(class) + local as i32 + 1;
-        if sign == 1 { -mag } else { mag }
+        if sign == 1 {
+            -mag
+        } else {
+            mag
+        }
     }
 
     /// Decodes one superblock a [`sb_coeff_inter_frame_tile`] payload wrote,
