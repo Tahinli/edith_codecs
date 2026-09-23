@@ -5026,7 +5026,7 @@ thread_local! {
     static CHROMA_EDGE_TU_CLIP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// lane-av1-loss64: skipped lossless intrabc rect strips whose luma
     /// entropy bands were zeroed per unit (libaom `av1_reset_entropy_context`,
-    /// decodemv.c:1262) instead of leaking the previous occupant's.
+    /// decodeframe.c:1262) instead of leaking the previous occupant's.
     static SKIP_LOSSLESS_BAND_RESET_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -12385,7 +12385,7 @@ fn decode_intrabc_owned_rect(
         push_mc_rect(2, px / 2, py / 2, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cside * ch], fctx);
         if let Some(ls) = leaves.as_ref() {
             // libaom `av1_reset_entropy_context` (`if (mbmi->skip_txfm)`,
-            // decodemv.c:1262 -> blockd.c:58): a SKIPPED block zeroes its
+            // decodeframe.c:1262 -> blockd.c:58): a SKIPPED block zeroes its
             // whole entropy-band footprint. The non-skip arm below writes
             // those bands per transform unit and the tail's
             // `record_split_luma_rect_mi` writes chroma only, so without
