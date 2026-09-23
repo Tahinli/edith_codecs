@@ -38,6 +38,12 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
+    // lane-av1-444 c4's rect/1:4 chroma port added two shape guards whose
+    // strings never landed here (continuation 8's suite run caught the
+    // drift); both are decoder-side "no table for that shape yet" guards on
+    // 4:4:4 rect strips, same family as the rect luma/chroma entries below.
+    "a 64-axis strip whose chroma unit has no coefficient table",
+    "a rectangular chroma transform whose size has no coefficient table",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an OBMC neighbour whose switchable interp filter was never recorded",
