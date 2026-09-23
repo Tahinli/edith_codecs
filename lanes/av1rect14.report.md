@@ -127,15 +127,14 @@ lands first; drop `decode_intrabc_owned_rect` in that case. Do not point the
 
 ## 8. Suite
 
-Not run. The budget stop landed before the hub-supervised
-`cargo test -p ec-av1 --release --lib -- --test-threads=1` on the committed
-tree. Command, once committed:
+Run hub-supervised on the committed tree (`4b73d07f`, `git status` clean)
+after the builder's model seat died post-commit:
 
 ```
 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1r14 TMPDIR=$HOME/tmp-av1r14 \
   cargo test -p ec-av1 --release --lib -- --test-threads=1
+
+test result: ok. 603 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 1505.38s
 ```
 
-Expected shape from sibling lanes: 601 passed / 0 failed / 60 ignored, or
-600/1/60 if the known aomenc stdin `write_all` deadlock fires
-(`a_real_aomenc_inter_sequence_with_a_split_transform_intra_strip_decodes_pixel_exact`).
+No aomenc pipe deadlock fired this run.
