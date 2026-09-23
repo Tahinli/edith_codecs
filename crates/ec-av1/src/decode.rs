@@ -14212,6 +14212,11 @@ impl PlaneBuf<'_> {
             );
         }
         let residual = dense_residual(residual, bw * bh);
+        if crate::envflags::env_flag!("EC_DBG192") && y == 168 && (x == 224 || x == 232) {
+            let res0: Vec<i32> = residual[..bw.min(8)].to_vec();
+            let pred0: Vec<u16> = prediction[..bw.min(8)].to_vec();
+            eprintln!("DBG192 rect x={x} y={y} bw={bw} bh={bh} mode={mode} pred0={pred0:?} res0={res0:?}");
+        }
         for row in 0..bh {
             // Same bottom/right frame-edge clip as [`Self::reconstruct`]'s
             // (lane-sb128c r8) -- a 64x128 block at the right edge of a frame
@@ -14337,6 +14342,11 @@ impl PlaneBuf<'_> {
             );
         }
         let residual = dense_residual(residual, side * side);
+        if crate::envflags::env_flag!("EC_DBG192") && y == 168 && (x == 224 || x == 232) {
+            let res0: Vec<i32> = residual[..side.min(8)].to_vec();
+            let pred0: Vec<u16> = prediction[..side.min(8)].to_vec();
+            eprintln!("DBG192 sq x={x} y={y} side={side} mode={mode} cfl={} pred0={pred0:?} res0={res0:?}", cfl.is_some());
+        }
         for row in 0..side {
                 // lane-sb128c r8: libaom's frame buffer is superblock
                 // aligned; ours is padded to 32 (`block_grid`), so a 64x64
