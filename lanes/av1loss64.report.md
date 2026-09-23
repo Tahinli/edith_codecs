@@ -116,3 +116,112 @@ test result: ok. 605 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; f
 failed 6 tests on a missing TMPDIR directory (`writing the probe stream: No
 such file or directory`) — environmental, green on re-run with the dir
 created.
+
+## Merge-close (main, merge commit 0b12fa9f)
+
+Merged as **0b12fa9f** (`Merge lane-av1-loss64: lossless sb128 full-frame
+exact + skipped sub8 intrabc chroma`), parents 5960a805 (main with the
+intrabc merge) + 0d0ad1c2 (lane head). Git auto-merged all four touched paths
+(ort, zero textual conflicts); one SEMANTIC conflict was resolved inside the
+merge commit:
+
+* The intrabc merge rewired `decode_block_rect4`'s 1:4 intrabc strips from
+  `decode_intrabc_owned_rect` (this lane's base) to `decode_intrabc_rect`,
+  whose skip arm lacked the band reset this lane added only to
+  `decode_intrabc_owned_rect`'s. Consequence, traced with a strip-entry
+  eprintln on both trees: the lane tree visits exactly one rect intrabc
+  strip (`mi=(48,66) 8x16 skip=true`); the merged tree, running with stale
+  entropy bands, mis-parsed the NEXT partition as a phantom unskipped 8x32
+  intrabc strip at `mi=(56,66)` and died on its chroma — a lossless (4,16)
+  unit hitting `TxParams::run`'s 4x4 WHT assert (`left: (4, 16)`).
+* Resolution (inside the merge, per the principle that the fix lives in
+  whichever function serves the call sites): `decode_intrabc_rect`'s skip
+  arm gains the same lossless-scoped `record_mi_luma_rect` walk (the lossless
+  arm of `read_block_tx_size_rect` resolves leaves before the skip check, so
+  the walk only ever fires for lossless strips). `decode_intrabc_owned_rect`
+  at `decode_block_rect64` keeps its copy. Both loss64 gates then pass on
+  the merged tree with byte-identical summaries.
+* The gate binary was rebuilt and `cargo check -p ec-av1 --all-targets`
+  re-run after the fix: 0 warnings.
+
+### Merged-tree gates (private `CARGO_TARGET_DIR`/`TMPDIR` under `$HOME`)
+
+```
+a_lossless_sb128_square_frame_clips_overhanging_chroma_tus
+  2 arms full-frame exact, 192 chroma units clipped
+  test result: ok. 1 passed; 0 failed; 665 filtered out
+
+a_skipped_lossless_intrabc_rect_strip_zeroes_its_entropy_bands
+  full-frame exact, 1 band resets, 3 skipped intrabc chroma predictions
+  test result: ok. 1 passed; 0 failed; 665 filtered out
+
+a_coded_rect_intrabc_block_reconstructs_in_both_orientations
+  (EC_AV1_RECON_THREADS=1 AND =4, all four vert-skip arm lines:
+   pal0 horz=11 vert=2, pal1 horz=1 vert=2 at both thread counts)
+  test result: ok. 1 passed; 0 failed; 665 filtered out  (both runs)
+
+rect14's five gates (a_16x4_intrabc_pair_strip_decodes_pixel_exact,
+  a_lossless_16x4_chroma_pair_repairs_the_measured_site,
+  a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips,
+  every_proven_refusal_names_a_test_that_exists,
+  the_decode_path_refuses_exactly_the_listed_cases)
+  test result: ok. 5 passed; 0 failed; 661 filtered out
+  in-gate totals: 187 rect-strip use_intrabc reads, 5 intrabc blocks over
+  5 arms, 0 refused, 8 frames compared, 3 out of scope (0 mismatched)
+
+cargo test -p ec-av1 --lib -- --test-threads=1 refusal
+  test result: ok. 21 passed; 0 failed; 645 filtered out; finished in 110.59s
+```
+
+### Merged-tree probes (release `decode_probe`, all `cmp` vs fresh ffmpeg oracles)
+
+| probe | verdict |
+|---|---|
+| loss320 (320x240 lossless sb128 1to4 min4) — the headline | **FULL-FRAME EXACT 115200 B** (`rect4_16_pair: lossless_chroma=6`); pre-lane this stopped at luma row 128, first diff byte 41121 |
+| sub8 (320x242 lossless sb128 min4) | **EXACT 116160 B** (`leaf8_intrabc_hits=2`, `intrabc_rect=1`) |
+| A 256x192 cq45 pal0 txs1 (var-tx arm) | EXACT 73728 B (`intrabc_rect=1 var-tx=1`) |
+| B 512x384 cq45 pal1 txs0 (coded 8x16) | EXACT 294912 B (`intrabc_rect=2`) |
+| ibc640 (rect14 §2 recipe) | EXACT 460800 B (`rect4_16_pair: intrabc=1`) |
+| cq50 arm (256x192 cq50 pal0 txs0) | EXACT 73728 B |
+| mono 60f (`av1-monochrome.ivf` remux, OUT16 low byte) | EXACT 4608000 B vs ffmpeg gray |
+| hg_* 8 committed 10-bit fixtures (`EC_PROBE_OUT16`) | 8/8 EXACT vs yuv420p10le |
+| av1-profile1-444 | REFUSED by name (`a chroma format other than 4:2:0`), 0 bytes |
+| aomenc `--enable-qm=1` / `=0` | qm=1 REFUSED by name (`a frame using quantisation matrices (using_qmatrix=1)`), 0 bytes; qm=0 control EXACT 73728 B |
+| `--cdf-update-mode=0` 3-keyframe stream | EXACT 221184 B |
+
+### Full suite on the merged tree
+
+Hub-supervised (`suite-av1l64m`, `cargo` with `CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1l64m TMPDIR=$HOME/.cache/tmp-av1l64m EC_AV1_REQUIRE_AOMENC=1 RUST_TEST_THREADS=1`), `cargo test -p ec-av1 --lib -- --test-threads=1` on the committed amended merge commit **0b12fa9f**:
+
+```
+running 666 tests
+test result: ok. 606 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 9641.30s
+```
+
+Exit 0, no kills, no flake: 606 = 604 (main after the intrabc merge, its
+603+1 evidence recorded in lanes/av1intrabc.report.md §6) + this lane's 2 new
+gate tests. A first run over the pre-fix merge was killed after the sub8 gate
+went red (the semantic conflict above); it was superseded by this run and its
+result discarded.
+
+## Follow-ups
+
+* `accepted` — the mirrored sub-8x8 8x4 (HORZ) skipped-intrabc leaf route is
+  fixed by the same code path but is not named by any committed witness: the
+  gate's stream reaches the VERT -> 4x8 leaf (3 skipped chroma predictions).
+  The lane report documents no open 4x8-leaf chroma corner beyond this; the
+  axes-swapped witness would need an encoder recipe that codes a skipped
+  HORZ 4:8 leaf (none in the corpus does).
+* `accepted` — pre-existing lossy 128-axis luma class, first difference at
+  byte 60369 on the reviewer's stream: the reviewer verified it is
+  identical-on-base (present on 5960a805 before this merge), so it is not a
+  merge regression. Unchanged by this lane.
+* `deferred(unblock: a lossless stream that codes an unskipped 8x32-shaped
+  1:4 intrabc strip)` — a latent lossless whole-unit
+  chroma read shared by BOTH `decode_intrabc_rect` and
+  `decode_intrabc_owned_rect`: an unskipped 8x32-shaped 1:4 strip in a
+  lossless frame would read chroma as one (4,16) unit through the WHT
+  assert. Unreachable in the current corpus (the correctly parsed lossless
+  streams contain no unskipped 8x32 intrabc strip — the phantom one that
+  reached it was itself the stale-band defect's product), and identical on
+  both parents. Unblock: a lossless stream that codes one.
