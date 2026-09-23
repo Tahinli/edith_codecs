@@ -63,7 +63,12 @@ fn inverse_recenter(r: u32, v: u32) -> u32 {
 /// `aom_read_primitive_refsubexpfin` (`inv_recenter_finite_nonneg` composed
 /// with `read_primitive_subexpfin`): a value in `[0, n)` recentred around
 /// `reference`.
-fn decode_unsigned_subexp_with_ref_msac(dec: &mut SymbolDecoder, n: u32, k: u32, reference: u32) -> u32 {
+fn decode_unsigned_subexp_with_ref_msac(
+    dec: &mut SymbolDecoder,
+    n: u32,
+    k: u32,
+    reference: u32,
+) -> u32 {
     let v = decode_subexp_msac(dec, n, k);
     if (reference << 1) <= n {
         inverse_recenter(reference, v)
@@ -74,7 +79,13 @@ fn decode_unsigned_subexp_with_ref_msac(dec: &mut SymbolDecoder, n: u32, k: u32,
 
 /// Signed wrapper, matching the way `read_wiener_filter`/`read_sgrproj_filter`
 /// call `aom_read_primitive_refsubexpfin(rb, max-min+1, k, ref-min)+min`.
-fn decode_signed_subexp_with_ref_msac(dec: &mut SymbolDecoder, low: i32, high: i32, k: u32, reference: i32) -> i32 {
+fn decode_signed_subexp_with_ref_msac(
+    dec: &mut SymbolDecoder,
+    low: i32,
+    high: i32,
+    k: u32,
+    reference: i32,
+) -> i32 {
     let n = (high - low) as u32;
     let r = (reference - low).clamp(0, n as i32) as u32;
     decode_unsigned_subexp_with_ref_msac(dec, n, k, r) as i32 + low
@@ -274,7 +285,11 @@ fn read_wiener_direction(dec: &mut SymbolDecoder, chroma: bool, reference: &[i32
 
 /// `read_wiener_filter` (decodeframe.c ~1595): both directions, updating
 /// `reference` in place (the running per-plane, per-tile reference state).
-fn read_wiener_filter(dec: &mut SymbolDecoder, chroma: bool, reference: &mut WienerInfo) -> WienerInfo {
+fn read_wiener_filter(
+    dec: &mut SymbolDecoder,
+    chroma: bool,
+    reference: &mut WienerInfo,
+) -> WienerInfo {
     let vfilter = read_wiener_direction(dec, chroma, &reference.vfilter);
     let hfilter = read_wiener_direction(dec, chroma, &reference.hfilter);
     let info = WienerInfo { vfilter, hfilter };
@@ -400,6 +415,16 @@ pub(crate) struct RestorationGrid {
 
 impl RestorationGrid {
     pub(crate) fn new(lr: &LoopRestorationParams, frame_width: u32, frame_height: u32) -> Self {
+        Self::with_ss(lr, frame_width, frame_height, 1, 1)
+    }
+
+    pub(crate) fn with_ss(
+        lr: &LoopRestorationParams,
+        frame_width: u32,
+        frame_height: u32,
+        ss_x: u8,
+        ss_y: u8,
+    ) -> Self {
         let mut horz_units = [1usize; 3];
         let mut vert_units = [1usize; 3];
         let mut units: [Vec<UnitFilter>; 3] = [Vec::new(), Vec::new(), Vec::new()];
@@ -410,7 +435,10 @@ impl RestorationGrid {
             let (pw, ph) = if plane == 0 {
                 (frame_width, frame_height)
             } else {
-                ((frame_width + 1) / 2, (frame_height + 1) / 2)
+                (
+                    (frame_width + u32::from(ss_x)) >> ss_x,
+                    (frame_height + u32::from(ss_y)) >> ss_y,
+                )
             };
             let unit_size = lr.loop_restoration_size[plane];
             horz_units[plane] = count_units(pw, unit_size);
@@ -462,7 +490,8 @@ pub(crate) fn read_lr(
     reference: &mut [(WienerInfo, SgrprojInfo); 3],
     mi_row: u32,
     mi_col: u32,
-    sb_mi: u32, fctx: &crate::decode::FrameCtx,
+    sb_mi: u32,
+    fctx: &crate::decode::FrameCtx,
 ) {
     if !lr.uses_lr {
         return;
@@ -472,7 +501,11 @@ pub(crate) fn read_lr(
         if ftype == RestorationType::None {
             continue;
         }
-        let mi_size = if plane == 0 { 4u32 } else { 2u32 };
+        let mi_size = if plane == 0 {
+            4u32
+        } else {
+            4u32 >> (crate::decode::ss_x(fctx) as u32)
+        };
         let unit_size = lr.loop_restoration_size[plane];
         let horz_units = grid.horz_units[plane] as u32;
         let vert_units = grid.vert_units[plane] as u32;
@@ -636,8 +669,16 @@ fn lr_sample(
 ) -> i32 {
     let col_c = col.clamp(0, plane_w as i64 - 1) as usize;
     i32::from(
-        lr_src_row(cdef, deblocked, stride, plane_w, plane_h, stripe_v_start, stripe_v_end, row)
-            [col_c],
+        lr_src_row(
+            cdef,
+            deblocked,
+            stride,
+            plane_w,
+            plane_h,
+            stripe_v_start,
+            stripe_v_end,
+            row,
+        )[col_c],
     )
 }
 
@@ -671,7 +712,11 @@ fn lr_src_row<'a>(
             let dist = stripe_v_start as i64 - 1 - row;
             (
                 deblocked,
-                if dist == 0 { stripe_v_start - 1 } else { stripe_v_start.saturating_sub(2) },
+                if dist == 0 {
+                    stripe_v_start - 1
+                } else {
+                    stripe_v_start.saturating_sub(2)
+                },
             )
         }
     } else if stripe_v_end == plane_h {
@@ -712,7 +757,8 @@ fn apply_wiener_stripe(
     h_end: usize,
     v_start: usize,
     v_end: usize,
-    info: &WienerInfo, fctx: &crate::decode::FrameCtx,
+    info: &WienerInfo,
+    fctx: &crate::decode::FrameCtx,
 ) {
     let w = h_end - h_start;
     let h = v_end - v_start;
@@ -738,8 +784,16 @@ fn apply_wiener_stripe(
     // stripe substitution is resolved once per row by `lr_src_row`, and only
     // a unit touching the plane's left or right edge needs the clamped copy.
     let hf = &info.hfilter;
-    let t16: [i16; 8] =
-        [hf[0] as i16, hf[1] as i16, hf[2] as i16, hf[3] as i16, hf[4] as i16, hf[5] as i16, hf[6] as i16, 0];
+    let t16: [i16; 8] = [
+        hf[0] as i16,
+        hf[1] as i16,
+        hf[2] as i16,
+        hf[3] as i16,
+        hf[4] as i16,
+        hf[5] as i16,
+        hf[6] as i16,
+        0,
+    ];
     // lane-mc: the intermediate is `i16` now. Both bounds are inside that
     // range at 8- and 10-bit (12-bit is refused in stream.rs), so the
     // kernel's saturating store composes with this clamp instead of changing
@@ -748,7 +802,9 @@ fn apply_wiener_stripe(
     let mut hbuf = WIENER_ROW_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
     for r in 0..rows {
         let row = v_start as i64 - 3 + r as i64;
-        let src = lr_src_row(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row);
+        let src = lr_src_row(
+            cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row,
+        );
         let lo = h_start as i64 - 3;
         let out = &mut inter[r * w..r * w + w];
         if lo >= 0 && lo as usize + w + 7 <= plane_w {
@@ -815,31 +871,27 @@ thread_local! {
 // `~/.cache/aom-oracle/src/av1/common/restoration.c` to rule out any other
 // transcription slip.
 const SGR_X_BY_XPLUS1: [i32; 256] = [
-    1, 128, 171, 192, 205, 213, 219, 224, 228, 230, 233, 235, 236, 238, 239,
-    240, 241, 242, 243, 243, 244, 244, 245, 245, 246, 246, 247, 247, 247, 247,
-    248, 248, 248, 248, 249, 249, 249, 249, 249, 250, 250, 250, 250, 250, 250,
-    250, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 252, 252, 252, 252,
-    252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 253, 253,
-    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253,
-    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    256,
+    1, 128, 171, 192, 205, 213, 219, 224, 228, 230, 233, 235, 236, 238, 239, 240, 241, 242, 243,
+    243, 244, 244, 245, 245, 246, 246, 247, 247, 247, 247, 248, 248, 248, 248, 249, 249, 249, 249,
+    249, 250, 250, 250, 250, 250, 250, 250, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 252,
+    252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 253, 253, 253,
+    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253,
+    253, 253, 253, 253, 253, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 256,
 ];
 
 /// `av1_one_by_x` (`restoration.c`): `round(4096/n)` for `n` in `1..=25`
 /// (`MAX_NELEM`, `(2*MAX_RADIUS+1)^2`), indexed `[n-1]`.
 const SGR_ONE_BY_X: [i32; 25] = [
-    4096, 2048, 1365, 1024, 819, 683, 585, 512, 455, 410, 372, 341, 315, 293, 273, 256, 241, 228, 216, 205, 195, 186,
-    178, 171, 164,
+    4096, 2048, 1365, 1024, 819, 683, 585, 512, 455, 410, 372, 341, 315, 293, 273, 256, 241, 228,
+    216, 205, 195, 186, 178, 171, 164,
 ];
 
 const SGRPROJ_MTABLE_BITS: u32 = 20;
@@ -877,7 +929,8 @@ fn compute_ab(
     // stripe, ~70 KB each at a 64-wide unit), i.e. an allocation whose every
     // page then faulted in on first touch. Every entry is written below, so
     // the resize's fill value is never read.
-    ab: &mut Vec<(i32, i64)>, fctx: &crate::decode::FrameCtx,
+    ab: &mut Vec<(i32, i64)>,
+    fctx: &crate::decode::FrameCtx,
 ) {
     let gw = w + 2;
     let gh = h + 2;
@@ -927,8 +980,9 @@ fn compute_ab(
         let i = gi as i64 - 1;
         {
             let mut accumulate = |row: i64, add: bool| {
-                let src =
-                    lr_src_row(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row);
+                let src = lr_src_row(
+                    cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row,
+                );
                 fill_clamped_row(src, plane_w, base_col, &mut samp);
                 if add {
                     for ((c_a, c_b), &px) in col_a.iter_mut().zip(col_b.iter_mut()).zip(samp.iter())
@@ -967,7 +1021,15 @@ fn compute_ab(
             a_row[gj] = a;
             b_row[gj] = b;
         }
-        ab_row(a_row, b_row, n, s, bd_shift, one_by_x, &mut ab[gi * gw..gi * gw + gw]);
+        ab_row(
+            a_row,
+            b_row,
+            n,
+            s,
+            bd_shift,
+            one_by_x,
+            &mut ab[gi * gw..gi * gw + gw],
+        );
         let dump_gj = 6i64 - h_start as i64 + 1;
         if dump && v_start as i64 + i == 60 && r == 1 && (0..gw as i64).contains(&dump_gj) {
             let gj = dump_gj as usize;
@@ -1006,14 +1068,22 @@ fn ab_point(a: i32, b: i32, n: i32, s: i32, bd_shift: u32, one_by_x: i64) -> (i3
     let b_s = round2_u31(b, bd_shift);
     let p = (a_s * n - b_s * b_s).max(0);
     let a_val = SGR_X_BY_XPLUS1[z_index(p, s)];
-    let b_val = round2((256 - a_val) as i64 * i64::from(b) * one_by_x, SGRPROJ_RECIP_BITS);
+    let b_val = round2(
+        (256 - a_val) as i64 * i64::from(b) * one_by_x,
+        SGRPROJ_RECIP_BITS,
+    );
     (a_val, b_val)
 }
 
 /// One grid row's `(A, B)` pairs: [`ab_point`] per element, eight at a time
 /// under AVX2 (the kernel is that arithmetic lane-wise, same widths).
 fn ab_row(
-    a_row: &[i32], b_row: &[i32], n: i32, s: i32, bd_shift: u32, one_by_x: i64,
+    a_row: &[i32],
+    b_row: &[i32],
+    n: i32,
+    s: i32,
+    bd_shift: u32,
+    one_by_x: i64,
     out: &mut [(i32, i64)],
 ) {
     let mut done = 0usize;
@@ -1054,7 +1124,12 @@ mod sgr_simd {
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn ab_row_avx2(
-        a_row: &[i32], b_row: &[i32], n: i32, s: i32, bd_shift: u32, one_by_x: i32,
+        a_row: &[i32],
+        b_row: &[i32],
+        n: i32,
+        s: i32,
+        bd_shift: u32,
+        one_by_x: i32,
         out: &mut [(i32, i64)],
     ) -> usize {
         let len = out.len().min(a_row.len()).min(b_row.len());
@@ -1070,8 +1145,16 @@ mod sgr_simd {
         let sh_b = _mm_cvtsi32_si128(SGRPROJ_RECIP_BITS as i32);
         let sh_a = _mm_cvtsi32_si128(2 * bd_shift as i32);
         let sh_bd = _mm_cvtsi32_si128(bd_shift as i32);
-        let rnd_a = _mm256_set1_epi32(if bd_shift == 0 { 0 } else { 1 << (2 * bd_shift - 1) });
-        let rnd_bd = _mm256_set1_epi32(if bd_shift == 0 { 0 } else { 1 << (bd_shift - 1) });
+        let rnd_a = _mm256_set1_epi32(if bd_shift == 0 {
+            0
+        } else {
+            1 << (2 * bd_shift - 1)
+        });
+        let rnd_bd = _mm256_set1_epi32(if bd_shift == 0 {
+            0
+        } else {
+            1 << (bd_shift - 1)
+        });
         let mut av = [0i32; 8];
         let mut bv = [0i32; 8];
         let mut gj = 0usize;
@@ -1115,7 +1198,11 @@ mod sgr_simd {
 /// width narrower).
 #[inline]
 fn round2_u31(value: i32, shift: u32) -> i32 {
-    if shift == 0 { value } else { (value + (1 << (shift - 1))) >> shift }
+    if shift == 0 {
+        value
+    } else {
+        (value + (1 << (shift - 1))) >> shift
+    }
 }
 
 /// Copies one source row's `out.len()` samples starting at `base_col` into a
@@ -1150,7 +1237,8 @@ fn apply_sgrproj_stripe(
     h_end: usize,
     v_start: usize,
     v_end: usize,
-    info: &SgrprojInfo, fctx: &crate::decode::FrameCtx,
+    info: &SgrprojInfo,
+    fctx: &crate::decode::FrameCtx,
 ) {
     let w = h_end - h_start;
     let h = v_end - v_start;
@@ -1166,10 +1254,16 @@ fn apply_sgrproj_stripe(
         (std::mem::take(&mut m.0), std::mem::take(&mut m.1))
     });
     if r0 > 0 {
-        compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0, &mut buf0, fctx);
+        compute_ab(
+            cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0,
+            &mut buf0, fctx,
+        );
     }
     if r1 > 0 {
-        compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1, &mut buf1, fctx);
+        compute_ab(
+            cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1,
+            &mut buf1, fctx,
+        );
     }
     let ab0 = (r0 > 0).then_some(&buf0);
     let ab1 = (r1 > 0).then_some(&buf1);
@@ -1185,7 +1279,9 @@ fn apply_sgrproj_stripe(
         let bytes: Vec<i32> = (59..=61)
             .flat_map(|row| {
                 (5..=7).map(move |col| {
-                    lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col)
+                    lr_sample(
+                        cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col,
+                    )
                 })
             })
             .collect();
@@ -1265,7 +1361,8 @@ fn apply_sgrproj_stripe(
                 let (a_ur, b_ur) = ab[idx(i - 1, j + 1)];
                 let (a_dl, b_dl) = ab[idx(i + 1, j - 1)];
                 let (a_dr, b_dr) = ab[idx(i + 1, j + 1)];
-                let a = (a_c + a_u + a_d + a_l + a_r) as i64 * 4 + (a_ul + a_ur + a_dl + a_dr) as i64 * 3;
+                let a = (a_c + a_u + a_d + a_l + a_r) as i64 * 4
+                    + (a_ul + a_ur + a_dl + a_dr) as i64 * 3;
                 let b = (b_c + b_u + b_d + b_l + b_r) * 4 + (b_ul + b_ur + b_dl + b_dr) * 3;
                 let flt1 = round2(a * dgd + b, SGRPROJ_SGR_BITS + 5 - SGRPROJ_RST_BITS);
                 v += xq[1] as i64 * (flt1 - u);
@@ -1278,9 +1375,15 @@ fn apply_sgrproj_stripe(
                         "EC_LR_CALL_DUMP combine: c={:?} u_tap(row60)={:?} d={:?} l={:?} r={:?} \
                          ul={:?} ur={:?} dl={:?} dr={:?} dense a={a} b={b} dgd={dgd} \
                          u={u} flt1={flt1} xq={xq:?} v_before_final_round={v}",
-                        ab[idx(i, j)], ab[idx(i - 1, j)], ab[idx(i + 1, j)], ab[idx(i, j - 1)],
-                        ab[idx(i, j + 1)], ab[idx(i - 1, j - 1)], ab[idx(i - 1, j + 1)],
-                        ab[idx(i + 1, j - 1)], ab[idx(i + 1, j + 1)]
+                        ab[idx(i, j)],
+                        ab[idx(i - 1, j)],
+                        ab[idx(i + 1, j)],
+                        ab[idx(i, j - 1)],
+                        ab[idx(i, j + 1)],
+                        ab[idx(i - 1, j - 1)],
+                        ab[idx(i - 1, j + 1)],
+                        ab[idx(i + 1, j - 1)],
+                        ab[idx(i + 1, j + 1)]
                     );
                 }
             }
@@ -1311,7 +1414,8 @@ fn filter_restoration_unit(
     v_start: usize,
     v_end: usize,
     ss_y: u32,
-    filter: UnitFilter, fctx: &crate::decode::FrameCtx,
+    filter: UnitFilter,
+    fctx: &crate::decode::FrameCtx,
 ) {
     let full_stripe_height = 64usize >> ss_y;
     let runit_offset = 8usize >> ss_y;
@@ -1333,10 +1437,32 @@ fn filter_restoration_unit(
         }
         match filter {
             UnitFilter::Wiener(info) => apply_wiener_stripe(
-                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info, fctx,
+                out,
+                cdef,
+                deblocked,
+                stride,
+                plane_w,
+                plane_h,
+                h_start,
+                h_end,
+                stripe_v_start,
+                stripe_v_end,
+                &info,
+                fctx,
             ),
             UnitFilter::Sgrproj(info) => apply_sgrproj_stripe(
-                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info, fctx,
+                out,
+                cdef,
+                deblocked,
+                stride,
+                plane_w,
+                plane_h,
+                h_start,
+                h_end,
+                stripe_v_start,
+                stripe_v_end,
+                &info,
+                fctx,
             ),
             UnitFilter::None => {}
         }
@@ -1395,12 +1521,16 @@ pub(crate) fn apply_loop_restoration_plane(
             let out = unsafe { so.get() };
             for rrow in r_lo..r_hi {
                 lr_unit_row(
-                    out, cdef, deblocked, stride, plane_w, plane_h, ss_y, unit_size, grid,
-                    plane, rrow, &rows, fctx,
+                    out, cdef, deblocked, stride, plane_w, plane_h, ss_y, unit_size, grid, plane,
+                    rrow, &rows, fctx,
                 );
             }
         });
-        debug_assert_eq!(rows.len(), grid.vert_units[plane], "RU row walk must match RestorationGrid::new's count_units");
+        debug_assert_eq!(
+            rows.len(),
+            grid.vert_units[plane],
+            "RU row walk must match RestorationGrid::new's count_units"
+        );
         return;
     };
     for rrow in r_lo..r_hi.min(rows.len()) {
@@ -1435,7 +1565,11 @@ pub(crate) fn lr_unit_rows(
     let mut y0 = 0u32;
     while y0 < plane_h as u32 {
         let remaining_h = plane_h as u32 - y0;
-        let uh = if remaining_h < ext_size { remaining_h } else { unit_size };
+        let uh = if remaining_h < ext_size {
+            remaining_h
+        } else {
+            unit_size
+        };
         let v_start = (y0 as i64 - voffset as i64).max(0) as u32;
         let mut v_end = y0 + uh;
         if v_end < plane_h as u32 {
@@ -1471,7 +1605,11 @@ fn lr_unit_row(
     let mut rcol = 0usize;
     while x0 < plane_w as u32 {
         let remaining_w = plane_w as u32 - x0;
-        let uw = if remaining_w < ext_size { remaining_w } else { unit_size };
+        let uw = if remaining_w < ext_size {
+            remaining_w
+        } else {
+            unit_size
+        };
         let filter = grid.get(plane, rrow, rcol);
         if filter != UnitFilter::None {
             filter_restoration_unit(
@@ -1486,7 +1624,8 @@ fn lr_unit_row(
                 v_start as usize,
                 v_end as usize,
                 ss_y,
-                filter, fctx,
+                filter,
+                fctx,
             );
         }
         x0 += uw;
@@ -1510,7 +1649,15 @@ mod tests {
     /// `SGRPROJ_PRJ_MAX-MIN+1`.
     #[test]
     fn subexp_roundtrips_every_value() {
-        for &(num_syms, k) in &[(16u32, 1u32), (32, 2), (64, 3), (96, 4), (128, 4), (3, 1), (1, 3)] {
+        for &(num_syms, k) in &[
+            (16u32, 1u32),
+            (32, 2),
+            (64, 3),
+            (96, 4),
+            (128, 4),
+            (3, 1),
+            (1, 3),
+        ] {
             for v in 0..num_syms {
                 let mut enc = SymbolEncoder::new();
                 write_subexp(&mut enc, num_syms, k, v);
@@ -1548,10 +1695,10 @@ mod tests {
     #[test]
     fn signed_subexp_with_ref_roundtrips() {
         let cases: [(i32, i32, u32); 4] = [
-            (-5, 11, 1),   // Wiener tap0
-            (-23, 9, 2),   // Wiener tap1
-            (-17, 47, 3),  // Wiener tap2
-            (-96, 32, 4),  // SGR xqd0
+            (-5, 11, 1),  // Wiener tap0
+            (-23, 9, 2),  // Wiener tap1
+            (-17, 47, 3), // Wiener tap2
+            (-96, 32, 4), // SGR xqd0
         ];
         for (low, high, k) in cases {
             let n = (high - low) as u32;
@@ -1563,8 +1710,12 @@ mod tests {
                     write_unsigned_subexp_with_ref(&mut enc, n, k, r, coded_v);
                     let payload = enc.finish();
                     let mut dec = SymbolDecoder::new(&payload);
-                    let got = decode_signed_subexp_with_ref_msac(&mut dec, low, high, k, reference_v);
-                    assert_eq!(got, v, "low={low} high={high} k={k} reference={reference_v} v={v}");
+                    let got =
+                        decode_signed_subexp_with_ref_msac(&mut dec, low, high, k, reference_v);
+                    assert_eq!(
+                        got, v,
+                        "low={low} high={high} k={k} reference={reference_v} v={v}"
+                    );
                 }
             }
         }
@@ -1595,7 +1746,11 @@ mod tests {
             let mut dec = SymbolDecoder::new(&payload);
             let mut rref = WienerInfo::default();
             for u in &units {
-                assert_eq!(read_wiener_filter(&mut dec, chroma, &mut rref), *u, "chroma={chroma}");
+                assert_eq!(
+                    read_wiener_filter(&mut dec, chroma, &mut rref),
+                    *u,
+                    "chroma={chroma}"
+                );
             }
         }
     }
