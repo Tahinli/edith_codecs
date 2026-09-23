@@ -20825,8 +20825,14 @@ fn deblock_plane_span(
     // filter level there). r7's superres measurement is preserved: its frame
     // was already 8-aligned, so this bound equals `frame_width` there and
     // still excludes the superblock padding up to `true_width`.
+    // lane-av1-444: the chroma crop follows the sequence subsampling, not a
+    // hardcoded 4:2:0 halving -- at 4:4:4 the halved bound clipped the whole
+    // filter to the top-left quarter of each chroma plane.
     let (cw, ch) = if chroma {
-        (frame_width.div_ceil(2), frame_height.div_ceil(2))
+        (
+            frame_width.div_ceil(1 << ss_x(fctx)),
+            frame_height.div_ceil(1 << ss_y(fctx)),
+        )
     } else {
         (frame_width, frame_height)
     };
