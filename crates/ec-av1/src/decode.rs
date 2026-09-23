@@ -8083,15 +8083,24 @@ impl Neighbours {
         // One pass over the cells accumulating all three planes, not one pass
         // per plane: the three planes of a cell live in the same
         // `[Neighbour; 3]` (6 bytes), so the per-plane form loaded the same
-        // cache lines three times (lane-publish).
+        // cache lines three times (lane-publish). Clamp each edge to the true
+        // frame extent: a block at the right/bottom edge may be padded beyond
+        // `mi_cols`/`mi_rows`, and libaom's unavailable context is zero there.
+        let above_mi = side_mi.min(self.mi_cols.saturating_sub(mi_c));
+        let left_mi = side_mi.min(self.mi_rows.saturating_sub(mi_r));
         let mut out = [(false, false, 0i32); 3];
-        for cell in 0..side_mi {
+        for cell in 0..above_mi {
             let above = &self.above[mi_c + cell];
-            let left = &self.left[mi_r + cell];
             for (plane, o) in out.iter_mut().enumerate() {
                 o.0 |= above[plane].level != 0;
+                o.2 += dc_vote(above[plane].dc);
+            }
+        }
+        for cell in 0..left_mi {
+            let left = &self.left[mi_r + cell];
+            for (plane, o) in out.iter_mut().enumerate() {
                 o.1 |= left[plane].level != 0;
-                o.2 += dc_vote(above[plane].dc) + dc_vote(left[plane].dc);
+                o.2 += dc_vote(left[plane].dc);
             }
         }
         out
@@ -8108,16 +8117,18 @@ impl Neighbours {
     /// mode-info units, mirroring [`Self::around_mi`].
     fn around_mi_rect(&self, (mi_r, mi_c): (usize, usize), w: usize, h: usize) -> [(bool, bool, i32); 3] {
         let (w_mi, h_mi) = (w / MI, h / MI);
+        let above_mi = w_mi.min(self.mi_cols.saturating_sub(mi_c));
+        let left_mi = h_mi.min(self.mi_rows.saturating_sub(mi_r));
         // [`Self::around_mi`]'s single pass, with the two extents split.
         let mut out = [(false, false, 0i32); 3];
-        for cell in 0..w_mi {
+        for cell in 0..above_mi {
             let above = &self.above[mi_c + cell];
             for (plane, o) in out.iter_mut().enumerate() {
                 o.0 |= above[plane].level != 0;
                 o.2 += dc_vote(above[plane].dc);
             }
         }
-        for cell in 0..h_mi {
+        for cell in 0..left_mi {
             let left = &self.left[mi_r + cell];
             for (plane, o) in out.iter_mut().enumerate() {
                 o.1 |= left[plane].level != 0;
@@ -8127,10 +8138,10 @@ impl Neighbours {
         if crate::envflags::env_flag!("EC_DCDUMP") {
             for (plane, o) in out.iter().enumerate() {
                 let vote = o.2;
-                let ab: Vec<String> = (0..w_mi)
+                let ab: Vec<String> = (0..above_mi)
                     .map(|k| format!("{:?}/{}", self.above[mi_c + k][plane].dc, self.above[mi_c + k][plane].level))
                     .collect();
-                let lf: Vec<String> = (0..h_mi)
+                let lf: Vec<String> = (0..left_mi)
                     .map(|k| format!("{:?}/{}", self.left[mi_r + k][plane].dc, self.left[mi_r + k][plane].level))
                     .collect();
                 eprintln!("EC_DCDUMP mi=({mi_r},{mi_c}) plane={plane} wh=({w},{h}) vote={vote} above=[{}] left=[{}]", ab.join(","), lf.join(","));
@@ -8160,20 +8171,22 @@ impl Neighbours {
         h_mi: usize,
     ) -> usize {
         let side_mi = w_mi;
+        let above_mi = w_mi.min(self.mi_cols.saturating_sub(mi_c));
+        let left_mi = h_mi.min(self.mi_rows.saturating_sub(mi_r));
         let mut top = 0u8;
         let mut left = 0u8;
-        for cell in 0..w_mi {
+        for cell in 0..above_mi {
             top |= self.above[mi_c + cell][0].level;
         }
-        for cell in 0..h_mi {
+        for cell in 0..left_mi {
             left |= self.left[mi_r + cell][0].level;
         }
         let ctx = SKIP_CONTEXTS[(top as usize).min(4)][(left as usize).min(4)];
         if crate::envflags::env_flag!("EC_ECDUMP") {
             let ab: Vec<String> =
-                (0..w_mi).map(|k| self.above[mi_c + k][0].level.to_string()).collect();
+                (0..above_mi).map(|k| self.above[mi_c + k][0].level.to_string()).collect();
             let lf: Vec<String> =
-                (0..h_mi).map(|k| self.left[mi_r + k][0].level.to_string()).collect();
+                (0..left_mi).map(|k| self.left[mi_r + k][0].level.to_string()).collect();
             eprintln!(
                 "EC_ECDUMP plane=0 mi=({mi_r},{mi_c}) wh=({w_mi},{h_mi}) ctx={ctx} above=[{},] left=[{},]",
                 ab.join(","), lf.join(",")
@@ -31954,6 +31967,7 @@ fn decode_inter_sub8_split4(
         // No `skip_mode` symbol: `is_comp_ref_allowed(BLOCK_4X4)` is false.
         let skip_ctx = usize::from(neighbours.above_skip[cmi]) + usize::from(neighbours.left_skip[rmi]);
         let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+        let ec_skip_post = if std::env::var_os("EC_DBG_SUB8").is_some() { Some(dec.debug_state().0) } else { None };
         inter_segment_id(dec, cdfs, rmi, cmi, 1, 1, skip, false, fctx);
         maybe_read_cdef_idx(dec, rmi, cmi, (2, 2), skip, fctx);
         maybe_read_delta_q(dec, cdfs, rmi, cmi, false, skip, fctx);
@@ -31969,6 +31983,9 @@ fn decode_inter_sub8_split4(
             neighbours.left_inter[rmi],
         );
         let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+        if std::env::var_os("EC_DBG_SUB8").is_some() {
+            eprintln!("EC_DBG piece mi=({rmi},{cmi}) skip={skip} skipctx={skip_ctx} skip_post={:?} is_inter={is_inter} iictx={ii_ctx} post={}", ec_skip_post, dec.debug_state().0);
+        }
         if !is_inter {
             if crate::envflags::env_flag!("EC_SUB8INTRA") {
                 eprintln!(
@@ -32292,6 +32309,82 @@ fn decode_inter_sub8_split4(
             }
             neighbours.record_mi_luma_rect(lmi, B4, B4, &luma_grid);
         }
+        // lane-av1-444: `is_chroma_reference` is unconditional at ss 0/0
+        // (av1_common_int.h:1459 -- `!subsampling_x`/`!subsampling_y` force
+        // both disjuncts true), so at 4:4:4 this 4x4 sub-block codes its own
+        // 4x4 U and V units right after its luma, plane order 0,1,2 per leaf
+        // (aomdec EC_COEFF on `av1-profile1-444.ivf` frame 1). Chroma MC is
+        // the piece's own mv and filters at the piece's own pixel position
+        // (ss 0: the chroma planes share luma's grid), and each unit's
+        // tx_type is its own piece's luma type -- a TX_4X4 codes no tx_type
+        // symbol, so DctDct.
+        if chroma_444 {
+            let (pc_ref, pc_mv, pc_hf, pc_vf) = piece[i].expect("inter piece recorded above");
+            let build_c = move |_y: &mut PlaneBuf<'static>,
+                                _u: &mut PlaneBuf<'static>,
+                                _v: &mut PlaneBuf<'static>,
+                                fctx: &crate::decode::FrameCtx,
+                                out: &mut [Vec<u16>; 3]| {
+                let Some((pc_ref_y, sref_u, sref_v)) = ref_planes_deferred(pc_ref, refpix) else {
+                    return;
+                };
+                let pc_scale = mc::scale_factor(pc_ref_y.width, frame_width);
+                let mut pred_u = refill(std::mem::take(&mut out[1]), B4 * B4);
+                let mut pred_v = refill(std::mem::take(&mut out[2]), B4 * B4);
+                for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
+                    let mut buf = vec![0u16; B4 * B4];
+                    mc::predict_maybe_scaled(
+                        &plane.data,
+                        plane.width,
+                        plane.true_width,
+                        plane.true_height,
+                        mv_to_q4(px, pc_mv.1, ss_x(fctx)),
+                        mv_to_q4(py, pc_mv.0, ss_x(fctx)),
+                        pc_scale,
+                        B4,
+                        B4,
+                        pc_hf,
+                        pc_vf,
+                        &mut buf, fctx,
+                    );
+                    dst.copy_from_slice(&buf);
+                }
+                out[1] = pred_u;
+                out[2] = pred_v;
+            };
+            let (pred_cu, pred_cv): (Vec<u16>, Vec<u16>);
+            let (su, sv) = if recon_deferred(fctx) {
+                push_pred(fctx, build_c);
+                (
+                    Pred::Cur { plane: 1, stride: B4, off: 0 },
+                    Pred::Cur { plane: 2, stride: B4, off: 0 },
+                )
+            } else {
+                let mut built: [Vec<u16>; 3] = Default::default();
+                build_c(y, u, v, fctx, &mut built);
+                let [_, bu, bv] = built;
+                (pred_cu, pred_cv) = (bu, bv);
+                (Pred::Inline(&pred_cu, B4), Pred::Inline(&pred_cv, B4))
+            };
+            if skip {
+                push_mc(1, px, py, B4, su, &ZERO_RESIDUAL[..B4 * B4], fctx);
+                push_mc(2, px, py, B4, sv, &ZERO_RESIDUAL[..B4 * B4], fctx);
+                neighbours.record_mi_chroma(lmi, B4, B4, 1, &ZERO_RESIDUAL[..B4 * B4]);
+                neighbours.record_mi_chroma(lmi, B4, B4, 2, &ZERO_RESIDUAL[..B4 * B4]);
+            } else {
+                let ca = neighbours.around_mi(lmi, B4);
+                let (ug, _) = read_inter_plane(
+                    dec, cdfs, TxbSet::Chroma4, scan4, 1, ca[1], 0, u, px, py, B4, base_q_idx,
+                    su, Some(TxType::DctDct), None, fctx,
+                )?;
+                let (vg, _) = read_inter_plane(
+                    dec, cdfs, TxbSet::Chroma4, scan4, 2, ca[2], 0, v, px, py, B4, base_q_idx,
+                    sv, Some(TxType::DctDct), None, fctx,
+                )?;
+                neighbours.record_mi_chroma(lmi, B4, B4, 1, &ug);
+                neighbours.record_mi_chroma(lmi, B4, B4, 2, &vg);
+            }
+        }
         neighbours.record_mode_mi(rmi, cmi, 1, 1, DC_PRED);
         neighbours.record_inter_rect_mi(lmi, 1, 1, skip, true, ref_frame, resolved_filter, false);
         // lane-inter16ab r8 (same-shape sweep of the intra-strip band gap):
@@ -32306,7 +32399,22 @@ fn decode_inter_sub8_split4(
     }
     // lane-sub8intra: when the chroma-reference sub-block was INTRA it coded
     // and reconstructed the group's one chroma unit itself.
-    if !intra_chroma {
+    // lane-av1-444: at ss 0/0 the group unit does not exist -- every piece
+    // coded its own U/V inside the loop above. The mode-level bookkeeping
+    // below still runs for both subsamplings: an inter 4x4 piece's
+    // `mbmi->uv_mode` is the DC_PRED default and no piece can be a palette
+    // block, exactly as the 4:2:0 path already published.
+    neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+    // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
+    // needs EVERY writer): a sub-8x8 group published no palette state, so
+    // once an 8x8 leaf of the same row can BE a palette block, the group
+    // left the row's band holding that earlier block's size and the next
+    // intra block read `av1_get_palette_mode_ctx` one too high (measured:
+    // mi(30,30) of decode-order frame 1, ours ctx 1 where libaom gathers
+    // 0). No sub-8x8 piece can itself be a palette (`av1_allow_palette`
+    // needs `bsize >= BLOCK_8X8`), so the group always clears.
+    record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
+    if !chroma_444 && !intra_chroma {
         // Chroma, once for the whole group, on the last sub-block's own `skip`
         // flag -- prediction from all four sub-blocks (2x2 pieces), residual as
         // one TX_4X4 unit per plane.
@@ -32412,16 +32520,6 @@ fn decode_inter_sub8_split4(
             note_sub8_chroma_tx(sub0_tx_type, first_tx_type, coded);
             (ug, vg)
         };
-        neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
-        // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
-        // needs EVERY writer): a sub-8x8 group published no palette state, so
-        // once an 8x8 leaf of the same row can BE a palette block, the group
-        // left the row's band holding that earlier block's size and the next
-        // intra block read `av1_get_palette_mode_ctx` one too high (measured:
-        // mi(30,30) of decode-order frame 1, ours ctx 1 where libaom gathers
-        // 0). No sub-8x8 piece can itself be a palette (`av1_allow_palette`
-        // needs `bsize >= BLOCK_8X8`), so the group always clears.
-        record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let bound_h = round_up_even(neighbours.mi_rows);
         let bound_w = round_up_even(neighbours.mi_cols);
@@ -37672,7 +37770,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                     if crate::envflags::env_flag!("EC_TRACE_PART") { eprintln!("EC_PART mi_row={} mi_col={} bsize=3 ctx={} rng={}", leaf_mi.0, leaf_mi.1, leaf_ctx, dec.debug_state().0); }
+                                    let ec_dbg_pre = dec.debug_state().0;
                                     let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                    if std::env::var_os("EC_DBG_SUB8").is_some() {
+                                        let ec_dbg_post = dec.debug_state().0;
+                                        eprintln!("EC_DBG b8 mi=({},{}) ctx={leaf_ctx} val={part8} pre={ec_dbg_pre} post={ec_dbg_post}", leaf_mi.0, leaf_mi.1);
+                                    }
                                     if part8 == PARTITION_SPLIT {
                                         // lane-intersub8: four BLOCK_4X4 inter
                                         // sub-blocks, chroma once per 8x8.
