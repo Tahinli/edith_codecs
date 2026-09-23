@@ -537,3 +537,97 @@ All 39 obus in `~/.cache/tmp-av1ibcreview/repro` decode without panic
 ### Full suite
 
 `test result: ok. 599 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 9555.99s` — hub-supervised `--test-threads=1` on the committed tree (`86ba99f6`), exit 0.
+
+## 6. Merge-side follow-ups (merged into `main` as daf83f3a)
+
+Merged as **daf83f3a** (`Merge lane-av1-intrabc: rect-strip intrabc reconstruction
+(2:1 + skipped strips)`), parents ed12fe52 (main) + c07da1c0 (lane head).
+Create-list audit vs first parent: exactly ONE new path, `lanes/av1intrabc.report.md`
+(5 files changed, +1429/33). Conflict resolution followed av1rect14 §7's riders:
+at the three 2:1 call sites this lane's `decode_intrabc_rect` won with the r5
+skip-stride fix already in (rider 1 satisfied), and `decode_intrabc_owned_rect`
+keeps only the fourth site it uniquely covers (`decode_block_rect64`, rider 2).
+Fixture copy: not needed — `diff` of gitignored `fixtures/bitstreams/` between
+main and the lane worktree is empty.
+
+### Merged-tree gates (private CARGO_TARGET_DIR / TMPDIR for this close, on `$HOME`)
+
+- `cargo check -p ec-av1 --all-targets`: exit 0, **0 warnings**.
+- `a_coded_rect_intrabc_block_reconstructs_in_both_orientations` (5 arms, 2 of
+  them the r5 skipped-strip arms), `EC_AV1_RECON_THREADS=1` AND `=4`, both:
+  `1 passed; 0 failed; 663 filtered out` with all seven arm lines — horz-coded
+  `horz=1 vert=0`, vert-coded `horz=0 vert=1`, txmode-select `horz=1 vert=0`,
+  vert-skip pal0/pal1 `skipped rect intrabc horz=11 vert=2` / `horz=1 vert=2`
+  at 1 AND 4 recon threads.
+- rect14's five gates on the merged tree: `5 passed; 0 failed; 659 filtered
+  out`; the in-gate `a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips`
+  totals: 187 rect-strip use_intrabc reads, 5 intrabc blocks over 5 arms, 0
+  refused, 8 frames compared, 3 out of scope (0 mismatched), 1 rect-strip block.
+- Refusal suite `-- refusal`: `21 passed; 0 failed` (110.21s).
+
+### Merged-tree probes (release `decode_probe` from daf83f3a, private target)
+
+All `cmp` vs fresh ffmpeg oracles; scratch under `$HOME/.cache`:
+
+| probe | verdict |
+|---|---|
+| A 256x192 cq45 pal0 txs1 (var-tx arm, §4b/§4c recipe) | EXACT 73728 |
+| B 512x384 cq45 pal1 txs0 (coded 8x16, DV-regression stream) | EXACT 294912 |
+| ibc640 (av1rect14 §2 recipe) | EXACT 460800, `rect4_16_pair: intrabc=1` |
+| cq50 arm (256x192 cq50 pal0 txs0) | EXACT 73728 |
+| loss320 (lossless sb128 1to4 min4) | luma rows 0-127 EXACT, first diff byte 41121 (the §2 report's 41120, 0-indexed), `rect4_16_pair: lossless_chroma=6` |
+| mono 60f (`av1-monochrome.ivf` remux, OUT16 low byte) | EXACT vs ffmpeg gray |
+| hg_* 8 committed 10-bit fixtures | 8/8 EXACT vs yuv420p10le |
+| av1-profile1-444 | REFUSED by name (`a chroma format other than 4:2:0`), 0 bytes, 0 frames dispatched |
+| aomenc `--enable-qm=1` / `=0` | qm=1 REFUSED by name (`a frame using quantisation matrices (using_qmatrix=1)`), 0 bytes; qm=0 control EXACT |
+| `--cdf-update-mode=0` 3-keyframe stream | 3/3 headers `disable_cdf=true`, byte-exact |
+
+### Full suite on the merged tree
+
+- Attempt 1 (hub-supervised `--test-threads=1`, `EC_AV1_REQUIRE_AOMENC=1`):
+  deadlocked after 2h47m in
+  `a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact`
+  — the KNOWN pipe-drain infra deadlock (`write_all` of the y4m before
+  `wait_with_output` while aomenc's stdout pipe fills; aomenc sat 29 min in
+  `anon_pipe_write` with the test blocked in `write_all`; same class as the
+  feeder-thread fix already at one stream.rs site). Killed ONLY the stuck
+  aomenc child; the test failed on its own EPIPE and the suite drained:
+  `test result: FAILED. 603 passed; 1 failed; 60 ignored; 0 measured; 0 filtered out; finished in 11764.21s`
+  — the 1 failed is that killed-child artifact, nothing else.
+- The same test standalone on the same bytes, TWICE, both green:
+  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 663 filtered out; finished in 84.51s`
+  and `... finished in 84.46s`. The gate's own in-suite summary had already
+  printed its decode verdict before the broken pipe: 3 pixel-exact attempts
+  carrying an intra 1:4 strip, per-arm attempts 16x4/4x16/chroma-reference
+  [3, 3, 3], 0 mismatched, 0 named refusals — the decode under test was exact;
+  only the spawn helper's pipe drained (panic is the test's own
+  `expect("writing y4m to aomenc")` at stream.rs:15865).
+- Batch verdict: **604/0/60 effective** on the committed bytes — 603 in-suite +
+  the killed-child test green twice standalone; 603 + 1 + 60 = 664, matching
+  the filtered-count arithmetic (664 total = main-after-rect14's 603-test total
+  + this lane's one new gate function,
+  `a_coded_rect_intrabc_block_reconstructs_in_both_orientations`; the r5 arms
+  extended that same function).
+
+### Carried deferrals (unchanged by the merge)
+
+- **128-level rect intrabc refusal** — `decode_block_128rect`'s named refusal
+  stays; `deferred(a reaching sb128 screen stream that codes a 128-level
+  HORZ/VERT/1:4 intrabc strip)` (also carried in av1rect14 §9).
+- **D.obu dispatches 0 frames** — reviewer-corpus stream decodes nothing on
+  both sides (the reviewer's own reference dumps are 0 B too); unchanged, not
+  this lane's regression.
+- **aomenc pipe-drain test-infra deadlock** — SEEN LIVE during this close
+  (attempt 1, above); ~150 `write_all`-then-`wait_with_output` spawn sites
+  remain, one site already has the feeder-thread fix.
+  `deferred(concurrent stdin/stdout drain for aomenc spawns -- unblocked by a
+  charter that may edit the spawn helper)`.
+- **Sibling lanes in flight, merge later**: lane-av1-loss64 (in review) and
+  lane-av1-444 — not gated here; they merge on their own closes.
+
+### Cleanup (post-push, same batch)
+
+`git worktree remove ../edith_codecs-av1ibc`, `git branch -d lane-av1-intrabc`,
+sweep `$HOME/.cache/cargo-target-av1ibc*`, `$HOME/.cache/tmp-av1ibc*`,
+`$HOME/tmp-av1ibc*` (lane, r5 and this close's private dirs; peer-owned
+`av1l64*`/`av1444*` untouched).
