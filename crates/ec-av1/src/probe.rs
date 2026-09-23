@@ -22,7 +22,10 @@ pub fn dims(clip: &str) -> Option<(usize, usize)> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut f = text.trim().split(',');
-    Some((f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?))
+    Some((
+        f.next()?.trim().parse().ok()?,
+        f.next()?.trim().parse().ok()?,
+    ))
 }
 
 /// The native BD gate's window on `clip`: a whole number of 128-wide
@@ -41,7 +44,10 @@ pub fn gate_crop(clip: &str) -> (String, usize, usize) {
     let (nw, nh) = dims(clip).expect("ffprobe gave no size");
     let cw = nw.min(1920) / 128 * 128;
     let ch = nh.min(1024) / 128 * 128;
-    assert!(cw >= 128 && ch >= 128, "{nw}x{nh} is smaller than a superblock");
+    assert!(
+        cw >= 128 && ch >= 128,
+        "{nw}x{nh} is smaller than a superblock"
+    );
     let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
     (format!("crop={cw}:{ch}:{x}:{y}"), cw, ch)
 }
@@ -67,10 +73,18 @@ pub fn source(
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
         .output()
         .expect("ffmpeg failed to run");
-    assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "ffmpeg: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let (luma, chroma) = (width * height, width * height / 4);
     let frame_len = luma + 2 * chroma;
-    assert_eq!(out.stdout.len(), frame_len * frames, "expected {frames} 4:2:0 frames");
+    assert_eq!(
+        out.stdout.len(),
+        frame_len * frames,
+        "expected {frames} 4:2:0 frames"
+    );
     (0..frames)
         .map(|i| {
             let b = &out.stdout[i * frame_len..][..frame_len];
@@ -78,9 +92,54 @@ pub fn source(
                 width,
                 height,
                 y: b[..luma].iter().map(|&v| u16::from(v)).collect(),
-                u: b[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                u: b[luma..luma + chroma]
+                    .iter()
+                    .map(|&v| u16::from(v))
+                    .collect(),
                 v: b[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
             }
         })
         .collect()
+}
+
+/// Runs a test-harness child (`aomenc`, `ffmpeg`) with `input` on its stdin
+/// and all three pipes drained concurrently, returning the child's
+/// [`std::process::Output`] (status, stdout, stderr) for the caller to
+/// assert on.
+///
+/// The ONE spawn path for every test that feeds a child on stdin
+/// (lane-av1-pipedrain). Writing the input INLINE before
+/// `wait_with_output()` deadlocks as soon as the child's stdout pipe buffer
+/// (~64 KiB) fills before the last input byte is written: the child blocks
+/// in write(2), the test blocks in `write_all`, both at 0% CPU until the
+/// harness timeout -- measured at 45 minutes on a 1.1 MB fixture decoding
+/// to 150 MB of raw frames (lane-t900 r10), and four aomenc gates still sat
+/// on the inline pattern after that fix. Here a writer thread owns stdin
+/// while the parent drains stdout/stderr, so a multi-MB y4m always meets a
+/// reader, never a blocked writer.
+///
+/// A child that exits early (bad flags, refused input) breaks the writer's
+/// pipe: the EPIPE from `write_all` is swallowed on purpose, and the
+/// child's own exit status and stderr -- which the caller asserts on --
+/// carry the real diagnosis.
+///
+/// # Panics
+/// When the child cannot be spawned or reaped, or the writer thread panics.
+#[cfg(test)]
+pub(crate) fn run_with_stdin(cmd: &mut Command, input: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("encoder failed to start");
+    let mut stdin = child.stdin.take().expect("encoder stdin");
+    let payload = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&payload);
+    });
+    let out = child.wait_with_output().expect("encoder failed to run");
+    writer.join().expect("encoder stdin writer thread");
+    out
 }
