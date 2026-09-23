@@ -17,7 +17,7 @@
 
 use ec_av1_syntax::{
     Av1Parser, FrameHeader, FrameType, MAX_SEGMENTS, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE,
-    SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, Tile, TxMode,
+    SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, Tile, TxMode,
 };
 use ec_core::{Error, Result};
 
@@ -851,7 +851,9 @@ pub fn decode_stream_with_threads(
         // symbols `decode_inter_block` unconditionally reads) -- have no
         // reader on the inter path, so they still refuse by name rather than
         // desyncing. aomenc's `--aq-mode` segmentation only ever sets
-        // `SEG_LVL_ALT_Q`.
+        // `SEG_LVL_ALT_Q` (census gate
+        // `a_segmentation_census_over_real_aq_streams_finds_no_mode_overriding_feature`:
+        // 1-pass, alt-ref-lag and two-pass arms, every frame header parsed).
         let tile_bufs: Vec<&[u8]> = tiles
             .iter()
             .map(|t| {
@@ -1432,14 +1434,20 @@ fn decode_frame(
         // SEG_LVL_GLOBALMV, `:1071` in `read_ref_frames`, `:1350` in
         // `read_is_inter_block`), so a conformant stream CAN carry them and
         // this is a capability gap, not a spec-conformant guard. Reachability
-        // from `aomenc` is nil -- its AQ modes set `SEG_LVL_ALT_Q` only
-        // (`aq_variance.c:89`, `aq_complexity.c:118`, `aq_cyclicrefresh.c:630`)
-        // and the mode-overriding features come only from the library API
-        // (`av1_apply_roi_map` `encoder_utils.c:515`, `av1_apply_active_map`
-        // `encoder_utils.c:557`, the alt-ref overlap case `:401-413`); the CLI
-        // exposes no ROI/active-map flag (checked). Kept as a named gap: the
-        // lift is an INTER-block-path change (ref/skip/mode selection) outside
-        // this lane's region. See `lanes/av1hdr.report.md` §4.1.
+        // from `aomenc` is nil, for three independent reasons (lane-av1seglvl
+        // census): the AQ modules clear the table then set `SEG_LVL_ALT_Q`
+        // only (`aq_variance.c:61` clear + `:89` enable, `aq_complexity.c:74`
+        // + `:118`, `aq_cyclicrefresh.c:616` + `:630`); the one other setter,
+        // `configure_static_seg_features` (`encoder_utils.c:315`, which would
+        // set ALT_LF/REF_FRAME/SKIP around alt-ref groups), is gated on
+        // `hl_sf.static_segmentation` -- a speed feature libaom's own
+        // `speed_features.h` documents as "Always set to 0" -- AND on the
+        // second pass of a two-pass encode (`encoder_utils.c:738`); and
+        // ROI/active-map maps are control-API only (`av1_apply_roi_map`,
+        // `av1_apply_active_map`: the CLI exposes no flag for either). Kept as
+        // a named gap: the lift is an INTER-block-path change (ref/skip/mode
+        // selection) outside this lane's region. See `lanes/av1hdr.report.md`
+        // §4.1 and `lanes/av1seglvl.report.md`.
         for segment in 0..MAX_SEGMENTS {
             for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {
                 if header.segmentation.feature_enabled[segment][feature] {
@@ -2500,6 +2508,163 @@ pub(crate) mod tests {
         (stream.len(), result)
     }
 
+    /// lane-av1seglvl: encode `frames` frames of `source` with real aomenc
+    /// plus `extra` args and return the raw `.obu` bytes -- the census's
+    /// half-sibling of [`census_attempt`] that keeps the STREAM instead of
+    /// only its decode verdict, so the caller can parse the frame headers'
+    /// segmentation tables themselves.
+    fn encode_aomenc_stream(
+        source: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+        extra: &[&str],
+    ) -> Vec<u8> {
+        let duration = format!("{}", frames as f64 / 25.0);
+        let src = format!("{source}=size={width}x{height}:rate=25");
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", &src, "-t", &duration, "-pix_fmt", "yuv420p",
+                "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success(), "ffmpeg refused the {width}x{height} fixture");
+        let limit = format!("--limit={frames}");
+        let mut args: Vec<String> = [
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--threads=1",
+            "--row-mt=0",
+            "--kf-max-dist=9999",
+            "--lag-in-frames=0",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        args.push(limit);
+        args.extend(extra.iter().map(|s| (*s).to_owned()));
+        args.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(out.status.success(), "aomenc refused {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    }
+
+    /// lane-av1seglvl: encode `frames` frames with a real TWO-PASS aomenc
+    /// (pass 1 writes the stats file into the session temp dir, pass 2
+    /// consumes it) and return the `.obu` bytes. This is the only shape that
+    /// reaches libaom's `is_stat_consumption_stage_twopass` segmentation
+    /// setup (`configure_static_seg_features`), so the census is not proven
+    /// over the encoder's whole reachable surface without it.
+    fn encode_aomenc_stream_twopass(
+        source: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+        extra: &[&str],
+    ) -> Vec<u8> {
+        let duration = format!("{}", frames as f64 / 25.0);
+        let src = format!("{source}=size={width}x{height}:rate=25");
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", &src, "-t", &duration, "-pix_fmt", "yuv420p",
+                "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success(), "ffmpeg refused the {width}x{height} fixture");
+        let limit = format!("--limit={frames}");
+        let fpf = std::env::temp_dir().join(format!("ec-av1-segldapass-{}.fpf", std::process::id()));
+        let mut base: Vec<String> = [
+            "--codec=av1",
+            "--passes=2",
+            "--end-usage=q",
+            "--threads=1",
+            "--row-mt=0",
+            "--kf-max-dist=9999",
+            "--lag-in-frames=0",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        base.push(limit);
+        base.extend(extra.iter().map(|s| (*s).to_owned()));
+        let mut pass1 = base.clone();
+        pass1.extend(["--pass=1".to_owned(), format!("--fpf={}", fpf.display())]);
+        pass1.extend(["--obu".to_owned(), "-o".to_owned(), "/dev/null".to_owned(), "-".to_owned()]);
+        let out1 = run_with_stdin(Command::new(aomenc_path()).args(&pass1), &y4m.stdout);
+        assert!(out1.status.success(), "aomenc pass 1 refused {pass1:?}: {}", String::from_utf8_lossy(&out1.stderr));
+        let mut pass2 = base;
+        pass2.extend(["--pass=2".to_owned(), format!("--fpf={}", fpf.display())]);
+        pass2.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
+        let out2 = run_with_stdin(Command::new(aomenc_path()).args(&pass2), &y4m.stdout);
+        let _ = std::fs::remove_file(&fpf);
+        assert!(out2.status.success(), "aomenc pass 2 refused {pass2:?}: {}", String::from_utf8_lossy(&out2.stderr));
+        out2.stdout
+    }
+
+    /// lane-av1seglvl: walk every frame OBU of `stream` and tally which
+    /// `SEG_LVL` features the frame headers actually ENABLE, plus the shape
+    /// counters a census premise is asserted against: frames with
+    /// segmentation on, of which `update_map == 1` (the map is coded) and
+    /// `update_map == 0` (every block's id is INHERITED), and frames whose
+    /// table carries a real `SEG_LVL_ALT_Q` delta.
+    /// The last vector counts per SEGMENT-FEATURE INSTANCE (a frame with
+    /// ALT_Q on all 8 segments contributes 8), which is all the verdict
+    /// needs: only index `SEG_LVL_ALT_Q` may be non-zero.
+    /// Returns `(enabled_frames, update_map_frames, inherited_frames,
+    /// alt_q_frames, feature_instances: [usize; SEG_LVL_MAX])`.
+    #[allow(clippy::type_complexity)]
+    fn segmentation_feature_census(
+        stream: &[u8],
+    ) -> (usize, usize, usize, usize, [usize; SEG_LVL_MAX]) {
+        let mut parser = Av1Parser::new();
+        let obus = parser
+            .parse_temporal_unit(stream)
+            .unwrap_or_else(|e| panic!("the census stream does not even parse: {e}"));
+        let mut enabled = 0usize;
+        let mut update_map = 0usize;
+        let mut inherited = 0usize;
+        let mut alt_q = 0usize;
+        let mut feature_frames = [0usize; SEG_LVL_MAX];
+        for obu in &obus {
+            if let ObuKind::Frame(header, _) = &obu.kind {
+                let seg = &header.segmentation;
+                if !seg.enabled {
+                    continue;
+                }
+                enabled += 1;
+                if seg.update_map {
+                    update_map += 1;
+                } else {
+                    inherited += 1;
+                }
+                let mut any_q = false;
+                for segment in 0..MAX_SEGMENTS {
+                    for feature in 0..SEG_LVL_MAX {
+                        if seg.feature_enabled[segment][feature] {
+                            feature_frames[feature] += 1;
+                            if feature == SEG_LVL_ALT_Q {
+                                any_q = true;
+                            }
+                        }
+                    }
+                }
+                if any_q {
+                    alt_q += 1;
+                }
+            }
+        }
+        (enabled, update_map, inherited, alt_q, feature_frames)
+    }
+
     /// lane-hdrlossless: WITNESS for the one refusal the pilot report left
     /// without a proving test -- "a frame mixing lossless and lossy
     /// segments". It is a REAL encoder output, not a defensive pin:
@@ -2633,6 +2798,16 @@ pub(crate) mod tests {
     /// `--aq-mode=1/2/3` (variance, complexity and cyclic-refresh AQ) and
     /// `--deltaq-mode=1` -- with the refusal as the instrument: if one of
     /// those features appeared, the decode would stop by name.
+    ///
+    /// lane-av1seglvl re-scope: r27's arms were all `--passes=1
+    /// --lag-in-frames=0`, so they never coded an alt-ref frame or ran an
+    /// encoder second pass -- the only shapes where libaom's OTHER seg
+    /// feature setup (`configure_static_seg_features`) could ever run. The
+    /// re-scoped half below adds alt-ref-group arms and a real two-pass arm,
+    /// and upgrades the instrument from the refusal (blind to a pure-ALT_LF
+    /// stream) to a direct parse of every frame header's `feature_enabled`
+    /// table: over all of it, aomenc enables `SEG_LVL_ALT_Q` and nothing
+    /// else.
     #[test]
     fn a_segmentation_census_over_real_aq_streams_finds_no_mode_overriding_feature() {
         if !have_aomenc() {
@@ -2700,6 +2875,231 @@ pub(crate) mod tests {
             "no recipe coded a single segment_id symbol -- segmentation never arrived, so \
              this census measures nothing about the three mode-overriding features"
         );
+
+        // lane-av1seglvl re-scope: the r27 arms above are all `--passes=1
+        // --lag-in-frames=0`, which never codes an alt-ref frame -- the one
+        // frame type whose segmentation libaom sets up differently
+        // (`configure_static_seg_features`, encoder_utils.c:738, is further
+        // gated on the second pass AND on `hl_sf.static_segmentation`, which
+        // speed_features.h itself documents as "Always set to 0"). The arms
+        // below cover that whole remaining surface: alt-ref groups under
+        // `--aq-mode`, a high-cq arm (the branch's own `high_q` gate is
+        // `avg_q > 48`), and a genuine two-pass encode. The instrument is no
+        // longer the refusal -- the refusal only fires on
+        // REF_FRAME/SKIP/GLOBALMV, so an ALT_LF-only stream would decode
+        // silently past it -- but a direct parse of every frame header's
+        // `feature_enabled` table.
+        let lag_recipes: [(&str, &str, usize, usize, Vec<&str>); 4] = [
+            (
+                "aq-mode=1 lag16 mandelbrot",
+                "mandelbrot",
+                192,
+                128,
+                vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=45", "--lag-in-frames=16", "--auto-alt-ref=1"],
+            ),
+            (
+                "aq-mode=1 lag16 screen",
+                "testsrc2",
+                256,
+                192,
+                vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=45", "--lag-in-frames=16", "--auto-alt-ref=1"],
+            ),
+            (
+                "aq-mode=1 lag16 cq63 high_q",
+                "mandelbrot",
+                192,
+                128,
+                vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=63", "--lag-in-frames=16", "--auto-alt-ref=1"],
+            ),
+            (
+                "aq-mode=2 lag16",
+                "mandelbrot",
+                192,
+                128,
+                vec!["--cpu-used=4", "--aq-mode=2", "--cq-level=45", "--lag-in-frames=16", "--auto-alt-ref=1"],
+            ),
+        ];
+        let mut total_enabled = 0usize;
+        let mut total_inherited = 0usize;
+        let mut total_alt_q = 0usize;
+        let mut feature_frames = [0usize; SEG_LVL_MAX];
+        for (name, source, w, h, extra) in &lag_recipes {
+            let stream = encode_aomenc_stream(source, *w, *h, 40, extra);
+            let (enabled, umap, inherited, alt_q, frames_per_feature) =
+                segmentation_feature_census(&stream);
+            eprintln!(
+                "SEGCENSUS {name}: seg-enabled {enabled}, update_map {umap}, inherited {inherited}, ALT_Q {alt_q}, per-feature {frames_per_feature:?}"
+            );
+            total_enabled += enabled;
+            total_inherited += inherited;
+            total_alt_q += alt_q;
+            for (f, n) in frames_per_feature.iter().enumerate() {
+                feature_frames[f] += n;
+            }
+        }
+        // The two-pass arm: `configure_static_seg_features` runs ONLY at
+        // `is_stat_consumption_stage_twopass`, so this is the arm that would
+        // catch its ALT_LF/REF_FRAME/SKIP tables if the dead speed feature
+        // were ever revived.
+        {
+            let stream = encode_aomenc_stream_twopass(
+                "mandelbrot",
+                192,
+                128,
+                40,
+                &["--cpu-used=4", "--aq-mode=1", "--cq-level=45", "--lag-in-frames=16", "--auto-alt-ref=1"],
+            );
+            let (enabled, umap, inherited, alt_q, frames_per_feature) =
+                segmentation_feature_census(&stream);
+            eprintln!(
+                "SEGCENSUS twopass aq-mode=1 lag16: seg-enabled {enabled}, update_map {umap}, inherited {inherited}, ALT_Q {alt_q}, per-feature {frames_per_feature:?}"
+            );
+            total_enabled += enabled;
+            total_inherited += inherited;
+            total_alt_q += alt_q;
+            for (f, n) in frames_per_feature.iter().enumerate() {
+                feature_frames[f] += n;
+            }
+        }
+        // Premise (class gate-blind-to-feature): the arms must actually reach
+        // the shapes the census speaks about -- segmentation-carrying frames,
+        // frames whose map is INHERITED (update_map == 0), and frames with a
+        // real ALT_Q table -- or the "only ALT_Q" verdict below measures
+        // nothing.
+        assert!(
+            total_enabled > 0 && total_alt_q > 0,
+            "no lag/two-pass arm carried a segmentation-enabled frame -- the census premise \
+             never arrived"
+        );
+        assert!(
+            total_inherited > 0,
+            "no arm carried an update_map == 0 frame -- the map-inheritance path the decoder \
+             reads segment ids through is unmeasured"
+        );
+        // The census verdict, over every frame of every arm: segmentation on
+        // aomenc's CLI carries SEG_LVL_ALT_Q and NOTHING else. The three
+        // mode-overriding features and the four ALT_LF deltas have no encoder
+        // path: `configure_static_seg_features` (the only setter of ALT_LF/
+        // REF_FRAME/SKIP in the tree) is gated on `hl_sf.static_segmentation`,
+        // documented "Always set to 0" (speed_features.h), and ROI/active-map
+        // are control-API only (aomenc.c has no flag for either).
+        for (feature, frames) in feature_frames.iter().enumerate() {
+            if feature == SEG_LVL_ALT_Q {
+                continue;
+            }
+            assert_eq!(
+                *frames, 0,
+                "feature index {feature} appeared on {frames} frames of real aomenc output -- \
+                 the refusal's encoder-never-writes claim is FALSE and the mode path needs \
+                 porting before this census can stay green"
+            );
+        }
+        eprintln!(
+            "SEGCENSUS lag/twopass: {total_enabled} seg-enabled frames over 5 arms, {total_inherited} inherited-map frames, {total_alt_q} with ALT_Q, all other SEG_LVL features: 0 frames"
+        );
+    }
+
+    /// lane-av1seglvl WITNESS: the reaching stream. `--aq-mode=1` turns
+    /// segmentation on for every frame; `--lag-in-frames=16 --auto-alt-ref=1`
+    /// adds real alt-ref groups, so the stream mixes map-CODING frames
+    /// (`update_map == 1`: the key frame and each group's arf) with dozens of
+    /// map-INHERITING frames (`update_map == 0`), and an inheriting block's
+    /// id is the MIN of the previous map over its own footprint while the
+    /// saved map itself inherits that footprint VERBATIM
+    /// (`copy_segment_id`, decodemv.c:342) -- heterogeneous footprints are
+    /// exactly what a 1:4-split arf leaves behind. Stamping the minified id
+    /// (the pre-lane defect) flattened those footprints and mis-dequantized
+    /// scattered blocks frames later: 2 luma bytes of mandelbrot frame 35
+    /// differed from the oracle, everything else exact.
+    ///
+    /// Both arms decode EVERY frame in decode order -- hidden arfs included
+    /// -- byte-exact against the instrumented oracle, and every SHOWN frame
+    /// pixel-exact against ffmpeg; the census counters prove the premise
+    /// (segmentation symbols read, a wider-than-zero quantizer span from
+    /// `SEG_LVL_ALT_Q`, and an inheritance-heavy shape).
+    #[test]
+    fn a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact";
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc");
+            return;
+        }
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let extra = [
+            "--cpu-used=4",
+            "--aq-mode=1",
+            "--cq-level=45",
+            "--lag-in-frames=16",
+            "--auto-alt-ref=1",
+        ];
+        let arms: [(&str, &str, usize, usize); 2] = [
+            ("screen testsrc2", "testsrc2", 256, 192),
+            ("film mandelbrot", "mandelbrot", 192, 128),
+        ];
+        for (arm, source, width, height) in &arms {
+            let stream = encode_aomenc_stream(source, *width, *height, 40, &extra);
+            // Premise: the shape under test really arrived -- segmentation on
+            // every frame, the map both coded and inherited, and real ALT_Q
+            // tables. An aomenc drift that dropped any of these would make
+            // the decode below prove nothing (class gate-blind-to-feature).
+            let (enabled, umap, inherited, alt_q, _) = segmentation_feature_census(&stream);
+            eprintln!(
+                "{NAME} {arm}: seg-enabled {enabled}, update_map {umap}, inherited {inherited}, ALT_Q-carrying {alt_q}"
+            );
+            assert!(
+                enabled > 0 && umap > 0,
+                "{arm}: no segmentation-carrying/map-coding frame -- the premise is gone"
+            );
+            assert!(
+                inherited > 0,
+                "{arm}: no update_map == 0 frame -- the map-inheritance path under test never runs"
+            );
+            assert!(
+                alt_q > 0,
+                "{arm}: no frame carries a SEG_LVL_ALT_Q table -- the feature under test never fires"
+            );
+            // Every frame in decode order -- hidden arfs included (each one
+            // re-surfaces via show-existing in this recipe, so `hidden == 0`
+            // is possible while `frames` still covers the whole coded set) --
+            // byte-exact against the oracle.
+            let (frames, hidden) = decode_all_frames_vs_oracle(&stream, arm);
+            assert!(frames > 0, "{arm}: decoded nothing");
+            assert_eq!(
+                frames, enabled,
+                "{arm}: decode-order frame count != segmentation-enabled frame count -- the \
+                 parse and the decode disagree about the stream"
+            );
+            let _ = hidden;
+            // And every shown frame pixel-exact against ffmpeg.
+            crate::decode::reset_segment_hits();
+            let pictures = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME} {arm}: decode refused: {e}"));
+            assert!(
+                crate::decode::segment_id_hits() > 0,
+                "{arm}: zero segment_id symbols read -- the decode proved nothing about \
+                 segmentation"
+            );
+            let (lo, hi) = crate::decode::block_q_span();
+            assert!(
+                hi > lo,
+                "{arm}: every block dequantized at the same qindex ({lo}) -- SEG_LVL_ALT_Q \
+                 never changed any block's quantizer"
+            );
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, *width, *height, pictures.len());
+            for (i, (ours, theirs)) in pictures.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(ours.y, theirs.y, "{NAME} {arm}: frame {i} luma vs ffmpeg");
+                assert_eq!(ours.u, theirs.u, "{NAME} {arm}: frame {i} U vs ffmpeg");
+                assert_eq!(ours.v, theirs.v, "{NAME} {arm}: frame {i} V vs ffmpeg");
+            }
+            eprintln!(
+                "{NAME} {arm}: {frames} frames decode-order exact vs oracle ({hidden} hidden), {} shown frames exact vs ffmpeg, q span {lo}..{hi}, segment_id symbols {}",
+                pictures.len(),
+                crate::decode::segment_id_hits()
+            );
+        }
     }
 
     /// lane-t900 r27, WITNESS half of the proof for "an OBMC neighbour whose
