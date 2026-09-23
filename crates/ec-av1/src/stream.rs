@@ -6634,6 +6634,124 @@ pub(crate) mod tests {
             coded_total[1]
         );
         assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+
+        // lane-av1-intrabc r5: the SKIPPED VERT 2:1 strip -- the arm the
+        // reviewer's sweep panicked on (a skipped 8x32 strip passed a
+        // `bw * bh`-sized ZERO_RESIDUAL slice at stride `side`, and
+        // `reconstruct_mc_rect` indexed `row * side + w` past its end).
+        // Skip-heavy recipes (low cq, palette off AND on), each decoded
+        // byte-exact vs ffmpeg on BOTH the default single-threaded path
+        // (`EC_AV1_RECON_THREADS == 1`, the inline ReconPlanes arm that
+        // panicked pre-fix) AND the wavefront path. The skipped-orientation
+        // counter is asserted per arm (`gate-blind-to-feature`): a recipe
+        // that stops producing a skipped VERT strip fails instead of passing
+        // vacuously. `lock_gate_counters` because `set_recon_threads` is a
+        // process-wide knob.
+        let _par_lock = lock_gate_counters();
+        let skip_arms: [(&str, &str, usize, usize, &[&str]); 2] = [
+            ("vert-skip-512-cq30-pal0-txs0", TS512, 512, 384, &["--cq-level=30", "--enable-palette=0", "--enable-tx-size-search=0"]),
+            ("vert-skip-512-cq30-pal1-txs0", TS512, 512, 384, &["--cq-level=30", "--enable-palette=1", "--enable-tx-size-search=0"]),
+        ];
+        for (arm, src, width, height, extra) in &skip_arms {
+            let y4m = {
+                let out = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.2", "-pix_fmt",
+                        "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(out.status.success(), "{NAME}: ffmpeg failed for {arm}");
+                out.stdout
+            };
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1", "--bit-depth=8", "--input-bit-depth=8", "--passes=1",
+                    "--end-usage=q", "--cpu-used=0", "--lag-in-frames=0", "--kf-max-dist=1",
+                    "--limit=1", "--threads=1", "--tile-columns=0",
+                    "--enable-rect-partitions=1", "--enable-1to4-partitions=1",
+                    "--min-partition-size=8", "--max-partition-size=32", "--sb-size=64",
+                    "--tune-content=screen", "--enable-intrabc=1",
+                ])
+                // aomenc keeps the LAST occurrence of a repeated flag.
+                .args(*extra)
+                .args(["--obu", "-o", "-", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m)
+                .or_else(|e| match e.kind() {
+                    std::io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(e),
+                })
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused {arm}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            // Default single-threaded path first (the arm that panicked
+            // pre-fix), then the wavefront path; both must match ffmpeg.
+            let mut skipped_vert = 0usize;
+            for threads in [1usize, 4] {
+                crate::par::set_recon_threads(threads);
+                crate::decode::reset_intrabc_rect_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        crate::par::set_recon_threads(1);
+                        panic!("{NAME}: {arm} refused at {threads} recon thread(s): {e}")
+                    }
+                };
+                let skipped = crate::decode::intrabc_rect_skipped_hits();
+                assert!(
+                    !frames.is_empty(),
+                    "{NAME}: {arm} decoded no frame at {threads} recon thread(s)"
+                );
+                let theirs = ffmpeg_decode_sequence(&stream, *width, *height, frames.len());
+                assert_eq!(
+                    frames.len(),
+                    theirs.len(),
+                    "{NAME}: {arm} frame count at {threads} recon thread(s)"
+                );
+                for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+                    assert!(
+                        ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
+                        "{NAME}: {arm} frame {i} does not match ffmpeg at {threads} recon thread(s)"
+                    );
+                }
+                if threads == 1 {
+                    skipped_vert = skipped[1];
+                } else {
+                    assert_eq!(
+                        skipped[1], skipped_vert,
+                        "{NAME}: {arm} skipped VERT strip count changed across recon paths"
+                    );
+                }
+                eprintln!(
+                    "{NAME}: {arm} {} frame(s) exact at {threads} recon thread(s), skipped rect intrabc horz={} vert={}",
+                    frames.len(),
+                    skipped[0],
+                    skipped[1]
+                );
+            }
+            crate::par::set_recon_threads(1);
+            assert!(
+                skipped_vert > 0,
+                "{NAME}: {arm} reconstructed no SKIPPED VERT rect intrabc strip -- the r5 stride arm is untested"
+            );
+        }
     }
 
     /// lane-t900 r31: builds one `--tune-content=screen --enable-intrabc=1`
