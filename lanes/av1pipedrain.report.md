@@ -71,7 +71,8 @@ Grep proof (final tree): zero `stdin.take()`/child-stdin `write_all` outside
 `probe.rs`; `wait_with_output` appears only inside the helper and at the two
 file-fed spawns. Zero `stdin(Stdio::piped())` outside `probe.rs`.
 
-Diff: 5 files, +369/−2137 (net −1768 lines of duplicated boilerplate).
+Diff: 5 source files, +1065/−2492 (net −1427 lines of duplicated boilerplate
+removed); whitespace-insensitive +871/−2298.
 
 ## Verification
 
@@ -96,8 +97,11 @@ decodes_pixel_exact` × 20 sequential runs:
 ## Notes / follow-ups
 
 - The repo is NOT rustfmt-clean under default `rustfmt --edition 2024`
-  (pristine stream.rs shows a 7776-line diff), so NO fmt pass was applied —
-  the change preserves the surrounding formatting style as-is. Any future
+  (pristine stream.rs shows a 7776-line diff), so no wholesale fmt pass was
+  applied. One honest exception: tile.rs carries ~600 lines of rustfmt reflow
+  around the ffmpeg_decode helper migration (raw churn 1051 lines vs 663
+  whitespace-insensitive; 388 lines differ by whitespace alone) — format-only
+  churn, semantically inert, not a defect. Any future
   "just cargo fmt it" would churn ~40k-line files wholesale; decide that
   separately, never inside a content lane.
 - `ec-av1-syntax` and `examples/` spawn no aomenc/ffmpeg on piped stdin;
