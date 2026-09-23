@@ -17884,7 +17884,7 @@ fn decode_leaf_rect8(
     neighbours.above_uv_mode[c] = uv_predict_mode;
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
-    let (u_grid, v_grid): (Grid, Grid) = if leaf_skips[1] {
+    let (u_grid, v_grid): (Grid, Grid) = if leaf_skips[1] && last_intrabc.is_none() {
         // A skipped chroma block still gets its CfL contribution: libaom's
         // `predict_and_reconstruct_intra_block` calls `cfl_predict_block`
         // from `av1_predict_intra_block_facade` (av1/common/reconintra.c:1719)
@@ -17914,37 +17914,62 @@ fn decode_leaf_rect8(
         }
         (Grid::Zero(16), Grid::Zero(16))
     } else if let Some(dv) = last_intrabc {
-        // lane-av1txr: the chroma-reference leaf was an intrabc block, so the
-        // group's one chroma unit is a frame copy at that DV too (its residual
-        // still reads the ordinary `Chroma4` coefficient tables -- libaom
-        // codes a chroma `tx_type` nowhere).
+        // A 4:2:0 `BLOCK_4X8`/`BLOCK_8X4` leaf maps to a clamped chroma
+        // `BLOCK_4X4` (`get_plane_block_size`, blockd.h:1184; `set_plane_n4`,
+        // av1_common_int.h:1344). The chroma reference is still the whole
+        // 8x8 group's 4x4 plane block at `(cpx, cpy)`, so prediction uses the
+        // group's destination origin, not the odd-mi leaf's nominal 2x4/4x2
+        // extent. The old route treated a skipped intrabc leaf as skipped
+        // intra and predicted this block with DC, first differing at
+        // mi(46,52), U(104,92), while consuming identical symbols.
+        let chroma_mv_x = mv_to_q4(cpx, dv.1, false);
+        let chroma_mv_y = mv_to_q4(cpy, dv.0, false);
+        // `decode_reconstruct_tx` reads no chroma coefficients for a skipped
+        // intrabc block, but an unskipped one reads the ordinary Chroma4
+        // tables; chroma inherits no coded tx_type of its own.
         let mut ub = vec![0u16; 16];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
-            mv_to_q4(cpx, dv.1, false), mv_to_q4(cpy, dv.0, false),
-            4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+            chroma_mv_x, chroma_mv_y, 4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
         let mut vb = vec![0u16; 16];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
-            mv_to_q4(cpx, dv.1, false), mv_to_q4(cpy, dv.0, false),
-            4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+            chroma_mv_x, chroma_mv_y, 4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
-        let chroma_around = neighbours.around_mi(leaf_mi, 8);
-        set_palette_pred(ub, fctx);
-        let ug = read_plane(
-            dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], DC_PRED, DC_PRED,
-            0, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
-            None, None, None, smooth_neighbor_uv, fctx,
-        )?;
-        set_palette_pred(vb, fctx);
-        let vg = read_plane(
-            dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], DC_PRED, DC_PRED,
-            0, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
-            None, None, None, smooth_neighbor_uv, fctx,
-        )?;
-        fctx.intrabc_chroma_tx.with(|c| c.set(None));
-        (ug, vg)
+        if leaf_skips[1] {
+            // `skip_txfm` still reconstructs an intrabc prediction, but
+            // libaom's `decode_reconstruct_tx` reads NO chroma coefficients.
+            // The ordinary skipped-intra arm above is therefore not valid for
+            // an intrabc leaf: use the copied, clamped 4x4 prediction directly.
+            push_mc_rect(
+                1, cpx, cpy, 4, 4, 4, Pred::Inline(&ub, 4),
+                &ZERO_RESIDUAL[..16], fctx,
+            );
+            push_mc_rect(
+                2, cpx, cpy, 4, 4, 4, Pred::Inline(&vb, 4),
+                &ZERO_RESIDUAL[..16], fctx,
+            );
+            hit!(SKIPPED_INTRABC_CHROMA_ARM_HITS);
+            fctx.intrabc_chroma_tx.with(|c| c.set(None));
+            (Grid::Zero(16), Grid::Zero(16))
+        } else {
+            let chroma_around = neighbours.around_mi(leaf_mi, 8);
+            set_palette_pred(ub, fctx);
+            let ug = read_plane(
+                dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], DC_PRED, DC_PRED,
+                0, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
+                None, None, None, smooth_neighbor_uv, fctx,
+            )?;
+            set_palette_pred(vb, fctx);
+            let vg = read_plane(
+                dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], DC_PRED, DC_PRED,
+                0, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
+                None, None, None, smooth_neighbor_uv, fctx,
+            )?;
+            fctx.intrabc_chroma_tx.with(|c| c.set(None));
+            (ug, vg)
+        }
     } else {
         let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);

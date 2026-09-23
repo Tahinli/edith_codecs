@@ -5148,12 +5148,12 @@ pub(crate) mod tests {
     /// `EC_ECDUMP` against the instrumented aomdec) -- a coefficient-walk
     /// desync at byte 61712 with every mode symbol still matching.
     ///
-    /// This stream is the same source at `--min-partition-size=8`, which
-    /// keeps sub-8x8 partitions out: post-fix it is full-frame exact. The
-    /// `--min-partition-size=4` sibling still is not -- its remaining
-    /// divergence is a sub-8x8 4x8-leaf chroma reconstruction defect with the
-    /// entropy ladder fully synced (first diff U(92,104), luma byte-exact),
-    /// deferred to the sub-8x8 lane family (lanes/av1loss64.report.md).
+    /// This gate uses the same `--min-partition-size=4` arm that reaches the
+    /// sub-8x8 VERT -> 4x8 skipped-intrabc leaf. Post-fix it is full-frame
+    /// exact: the skip path uses libaom's clamped 4x4 chroma intrabc
+    /// prediction (`decodeframe.c:1011-1065`, `reconinter_template.inc:186-207`)
+    /// instead of the ordinary skipped-intra DC predictor. The old route first
+    /// differed at U(104,92) with the entropy ladder fully synced.
     ///
     /// Fail-pre-fix, measured on the ed12fe52 probe: differs at byte 41120
     /// (the chroma-clip class, fixed in the same lane). Single-mutation on
@@ -5166,15 +5166,22 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let stream = lossless_sb128_testsrc2(320, 242, &["--min-partition-size=8"]);
+        let stream = lossless_sb128_testsrc2(320, 242, &["--min-partition-size=4"]);
         crate::decode::reset_loss64_hits();
+        crate::decode::reset_skipped_intrabc_chroma_arm_hits();
         let ours = decode_stream(&stream)
             .unwrap_or_else(|e| panic!("{NAME}: decodes: {e}"));
         let resets = crate::decode::skip_lossless_band_reset_hits();
+        let intrabc_skips = crate::decode::skipped_intrabc_chroma_arm_hits();
         assert!(
             resets > 0,
             "{NAME}: this stream coded NO skipped lossless intrabc rect strip -- \
              the fixed body was never reached (class gate-blind-to-feature)"
+        );
+        assert!(
+            intrabc_skips > 0,
+            "{NAME}: this stream coded NO skipped sub-8x8 intrabc chroma leaf -- \
+             the clamped chroma prediction fix was never reached (class gate-blind-to-feature)"
         );
         let refs = ffmpeg_decode_sequence(&stream, 320, 242, 1);
         assert_eq!(ours.len(), 1, "{NAME}: frame count");
@@ -5185,7 +5192,10 @@ pub(crate) mod tests {
             let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
             assert_eq!(bad, 0, "{NAME}: plane {plane}: {bad} samples differ from ffmpeg");
         }
-        eprintln!("{NAME}: full-frame exact, {resets} band resets");
+        eprintln!(
+            "{NAME}: full-frame exact, {resets} band resets, \
+             {intrabc_skips} skipped intrabc chroma predictions"
+        );
     }
 
     /// lane-dkey: the palette-neighbour-band gate. A palette-Y block's size and
