@@ -103,3 +103,16 @@ to ffmpeg for the 320x242 min4 witness; all planes were byte exact.
 The project-wide suite, 0-warning parity sweep, and the cross-lane acceptance
 arms (mono, 10-bit `hg_*`, CDF-disabled, 4:4:4 refusal, qmatrix refusal) are
 owned by the main agent and were not run in this lane.
+
+## Suite (orchestrator-run, committed tree 5c48d7b0)
+
+`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1l64 TMPDIR=$HOME/tmp-av1l64 cargo test -p ec-av1 --release --lib -- --test-threads=1`:
+
+```
+test result: ok. 605 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 1371.22s
+```
+
+605 = 603 (main after rect14) + this lane's 2 new gate tests. First attempt
+failed 6 tests on a missing TMPDIR directory (`writing the probe stream: No
+such file or directory`) — environmental, green on re-run with the dir
+created.
