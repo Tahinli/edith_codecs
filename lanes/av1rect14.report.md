@@ -39,7 +39,7 @@ Oracle: `~/.cache/aom-oracle/build/{aomenc,aomdec}`. ffmpeg raw yuv420p.
 | cq50 arm | testsrc2 256x192 cq50 palette=0 txs=0 min8 max32 sb64 screen intrabc (the old refusal arm) | refused by name | **EXACT** 73728 bytes. `rect_intrabc_reads=80` |
 | allintra | the lane-av1-intrabc allintra stop | stopped on the 1:4/rect strip refusal | advances. `rect4_16_pair: intrabc=22`. New stop: `an intrabc block whose var-tx tree resolved to mixed leaf transform sizes` |
 | loss320 | testsrc2 320x240, `--lossless=1 --sb-size=128 --enable-1to4-partitions=1 --min-partition-size=4`, 1 frame | first luma diff **byte 108** (col 108) — the §6 measurement | luma rows 0-127 **EXACT**. First remaining luma diff byte 41120 = row 128 col 160. `rect4_16_pair: lossless_chroma=6` |
-| lnone | same source, 1:4 and rect off | first ffmpeg diff byte 10320 (pre-existing) | same first byte. lane vs base diverges at byte 10368, inside the already-wrong region |
+| lnone | same source, 1:4 and rect off | first ffmpeg diff byte 41120 (pre-existing) | same first byte 41120 on both probes. lane vs base diverges at byte 41152, inside the region both probes already misdecode (pre-existing partition-reader misclassification: aomdec censuses zero `value=8/9` blocks on this stream while both probes read fn=rect blocks). Recipe under-specified: encode with and without `--min-partition-size=4` gave identical 5678-byte streams |
 
 Repro, ibc640:
 
@@ -94,7 +94,7 @@ The single-read assumption lived only in `decode_rect4_16_strip`. The other
 six times. Base and lane read the same symbols until mi(26, 20); the split is
 the coefficient walk inside a block both sides already classify as a 16x4.
 That classification disagrees with aomdec and is pre-existing (partition
-reader untouched). First ffmpeg mismatch stays at byte 10320 on both probes.
+reader untouched). First ffmpeg mismatch stays at byte 41120 on both probes.
 
 ## 5. Gates
 
@@ -124,6 +124,16 @@ Keep `decode_rect4_16_intrabc` and the lossless pair walk. At the three 2:1
 call sites, prefer `lane-av1-intrabc`'s `decode_intrabc_rect` if that branch
 lands first; drop `decode_intrabc_owned_rect` in that case. Do not point the
 1:4 pair at `decode_intrabc_rect`.
+
+Two riders on "prefer theirs":
+
+1. The sibling's `decode_intrabc_rect` at `bfb06b9b` passes
+   `ZERO_RESIDUAL[..bw*bh]` at stride `side` in its skip arm while
+   `reconstruct_mc_rect` reads `side*bh` rows — "prefer theirs" is only safe
+   after the sibling's skip-stride fix lands.
+2. This lane wires a FOURTH `owned_rect` call site (`decode_block_rect64`,
+   the 64-level 4:1 strips) the sibling does not cover, so dropping
+   `decode_intrabc_owned_rect` wholesale requires rewiring that site.
 
 ## 8. Suite
 
