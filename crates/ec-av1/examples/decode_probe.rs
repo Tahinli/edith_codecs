@@ -184,6 +184,11 @@ fn main() {
             ec_av1::decode::rect4_16_lossless_chroma_hits(),
             ec_av1::decode::rect4_16_intrabc_hits(),
         );
+        println!(
+            "loss64: chroma_edge_tu_clip={} skip_lossless_band_reset={}",
+            ec_av1::decode::chroma_edge_tu_clip_hits(),
+            ec_av1::decode::skip_lossless_band_reset_hits(),
+        );
         // lane-t900 r12: chroma edge-filter neighbour answered from the mi-granular
         // uv_mode grid instead of the coarse one-slot-per-column map.
         println!(

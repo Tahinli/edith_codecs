@@ -5019,12 +5019,41 @@ thread_local! {
     /// lane-kf1200 r2: sub-8x8 chroma blocks that are `skip_txfm` AND
     /// `UV_CFL_PRED` -- the arm that used to drop the CfL alpha entirely.
     static SKIP_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-loss64: chroma transform units the frame-edge clip skipped
+    /// (libaom `decode_reconstruct_tx`'s `max_blocks_wide/high` test) in
+    /// [`decode_block`]'s multi-transform-unit walk -- the units a lossless
+    /// block overhanging the frame does NOT code.
+    static CHROMA_EDGE_TU_CLIP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-loss64: skipped lossless intrabc rect strips whose luma
+    /// entropy bands were zeroed per unit (libaom `av1_reset_entropy_context`,
+    /// decodemv.c:1262) instead of leaking the previous occupant's.
+    static SKIP_LOSSLESS_BAND_RESET_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
 /// that reconstructed as flat DC before lane-kf1200 r2).
 pub fn skip_cfl_hits() -> usize {
     SKIP_CFL_HITS.with(|c| c.get())
+}
+
+/// How many chroma transform units the frame-edge clip skipped in
+/// [`decode_block`]'s multi-transform-unit walk (lane-av1-loss64). Zero on a
+/// stream whose lossless blocks never overhang the frame -- a gate asserting
+/// the clip fired must see this nonzero.
+pub fn chroma_edge_tu_clip_hits() -> usize {
+    CHROMA_EDGE_TU_CLIP_HITS.with(|c| c.get())
+}
+
+/// How many skipped lossless intrabc rect strips had their luma entropy
+/// bands zeroed per unit (lane-av1-loss64).
+pub fn skip_lossless_band_reset_hits() -> usize {
+    SKIP_LOSSLESS_BAND_RESET_HITS.with(|c| c.get())
+}
+
+/// Gate-side reset for the two lane-av1-loss64 counters above.
+pub fn reset_loss64_hits() {
+    CHROMA_EDGE_TU_CLIP_HITS.with(|c| c.set(0));
+    SKIP_LOSSLESS_BAND_RESET_HITS.with(|c| c.set(0));
 }
 
 /// How many 16x4/4x16 chroma pairs took a different `intra_edge_filter_type`
@@ -12354,6 +12383,30 @@ fn decode_intrabc_owned_rect(
         push_mc_rect(0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..side * bh], fctx);
         push_mc_rect(1, px / 2, py / 2, cside, cw, ch, Pred::Inline(&pred_u, cside), &ZERO_RESIDUAL[..cside * ch], fctx);
         push_mc_rect(2, px / 2, py / 2, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cside * ch], fctx);
+        if let Some(ls) = leaves.as_ref() {
+            // libaom `av1_reset_entropy_context` (`if (mbmi->skip_txfm)`,
+            // decodemv.c:1262 -> blockd.c:58): a SKIPPED block zeroes its
+            // whole entropy-band footprint. The non-skip arm below writes
+            // those bands per transform unit and the tail's
+            // `record_split_luma_rect_mi` writes chroma only, so without
+            // this walk a skipped strip whose `leaves` resolved (every
+            // lossless frame -- `read_block_tx_size_rect`'s lossless arm
+            // returns the 4x4 grid before it looks at `skip`) leaked the
+            // PREVIOUS occupant's luma bands into the next block's
+            // `txb_skip`/coefficient contexts (lane-av1-loss64: the skipped
+            // 8x16 intrabc strip at mi(48,66) of the 320x242 lossless sb128
+            // stream left a stale 7 in left[48] and mi(48,68)'s first
+            // transform unit read `txb_skip_ctx` 3 where aomdec reads 1).
+            hit!(SKIP_LOSSLESS_BAND_RESET_HITS);
+            for &(row, col, tw, th) in ls {
+                neighbours.record_mi_luma_rect(
+                    (mi_r + row, mi_c + col),
+                    tw,
+                    th,
+                    &ZERO_RESIDUAL[..tw * th],
+                );
+            }
+        }
         luma_grid = Grid::Zero(side * side);
         u_grid = Grid::Zero(cside * cside);
         v_grid = Grid::Zero(cside * cside);
@@ -15632,6 +15685,35 @@ fn decode_block(
         let mut pass_idx = 0usize;
         for cu_row in ch_row * cpc..(ch_row + 1) * cpc {
             for cu_col in ch_col * cpc..(ch_col + 1) * cpc {
+                // libaom `decode_reconstruct_tx`'s frame-edge clip
+                // (decodeframe.c:299, `blk_row >= max_blocks_high || blk_col
+                // >= max_blocks_wide` returns before ANY symbol is read): a
+                // transform unit whose 4x4 origin sits outside the frame's mi
+                // grid is not coded at all. The luma loop above carries the
+                // same clip; its absence here read `txb_skip` (+coeffs) for
+                // chroma units libaom never wrote -- the lossless 64x64 block
+                // at mi(48,0) of a 320x240 frame overhangs the bottom edge by
+                // 4 mi, so its 32x32 chroma codes SIX rows of 4x4 units, not
+                // eight (lane-av1-loss64; 48 chroma units per plane in
+                // aomdec's EC_COEFF census vs the 64 this loop read).
+                // `max_block_wide/high` (av1_common_int.h:1565): the plane
+                // block's pixel span (4:2:0 halves the luma span, clamped to
+                // 4 by `set_plane_n4`) plus the negative overhang
+                // (`mb_to_*_edge` = `2 * overhang_mi` chroma px), in 4x4
+                // units.
+                let span_mi = side / MI;
+                let over_w_mi =
+                    (2 * y.true_width.div_ceil(8)) as i32 - mi_c as i32 - span_mi as i32;
+                let over_h_mi =
+                    (2 * y.true_height.div_ceil(8)) as i32 - mi_r as i32 - span_mi as i32;
+                let plane_px = ((span_mi * 2).max(4)) as i32;
+                let max_units_w = ((plane_px + 2 * over_w_mi.min(0)) >> 2).max(0) as usize;
+                let max_units_h = ((plane_px + 2 * over_h_mi.min(0)) >> 2).max(0) as usize;
+                let unit = chroma_tx / 4; // TU side in 4x4 chroma units
+                if cu_col * unit >= max_units_w || cu_row * unit >= max_units_h {
+                    hit!(CHROMA_EDGE_TU_CLIP_HITS);
+                    continue;
+                }
                 // The chroma context arrays are indexed in LUMA mi, so this
                 // unit's anchor is its own luma quadrant: `chroma_tx` chroma
                 // pixels span `2 * chroma_tx` luma ones.

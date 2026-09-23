@@ -5019,6 +5019,175 @@ pub(crate) mod tests {
         eprintln!("{NAME}: {frames} frames sample-exact, intra128_lossless hits {hits}");
     }
 
+    /// lane-av1-loss64: the generator for the two gates below -- a deterministic
+    /// 1-frame lossless superblock-128 aomenc stream of `testsrc2`. `extra`
+    /// flags land last (aomenc keeps the LAST occurrence of a repeated flag).
+    /// The recipe is the one lanes/av1rect14.report.md section 2 measured
+    /// (`--lossless=1 --sb-size=128 --enable-1to4-partitions=1`); the
+    /// `--min-partition-size` override is what steers the bottom superblock
+    /// row's RD into overhanging 64x64 `NONE` blocks (the shape the first fix
+    /// clips) or, at 8, keeps sub-8x8 partitions out of the second gate's
+    /// stream so the whole frame is decodable.
+    fn lossless_sb128_testsrc2(width: usize, height: usize, extra: &[&str]) -> Vec<u8> {
+        let mut ff = Command::new("ffmpeg");
+        let out = ff
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .arg(format!("testsrc2=s={width}x{height}:r=25"))
+            .args(["-frames:v", "1", "-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(out.status.success(), "ffmpeg failed for testsrc2 {width}x{height}");
+        let y4m = out.stdout;
+        let mut child = Command::new(aomenc_path())
+            .args(["--codec=av1", "--bit-depth=8", "--input-bit-depth=8"])
+            .args([
+                "--passes=1",
+                "--cpu-used=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=1",
+                "--limit=1",
+                "--threads=1",
+                "--tile-columns=0",
+                "--lossless=1",
+                "--sb-size=128",
+                "--enable-1to4-partitions=1",
+            ])
+            .args(extra)
+            .args(["--obu", "-o", "-", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m)
+            .expect("aomenc stdin write");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(out.status.success(), "aomenc failed: {}", String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    }
+
+    /// lane-av1-loss64: a lossless superblock-128 frame whose intra blocks
+    /// overhang the bottom frame edge codes NO coefficient symbols for the
+    /// chroma transform units whose 4x4 origin sits outside the frame's mi
+    /// grid -- libaom `decode_reconstruct_tx` returns before any read
+    /// (`decodeframe.c:299`, `blk_row >= max_blocks_high || blk_col >=
+    /// max_blocks_wide`, the limits from `max_block_wide/high`,
+    /// av1_common_int.h:1565). The square multi-transform-unit chroma loop in
+    /// [`crate::decode`] carried no such clip (the luma loop had one) and read
+    /// `txb_skip`+coefficients for the phantom units: on the measured stream
+    /// the first lossless 64x64 `NONE` block, at mi(48,0), overhangs the
+    /// 240-px frame by 4 mi, so its 32x32 chroma codes SIX rows of 4x4 units,
+    /// not eight -- 32 phantom unit reads per plane desynced the tile and
+    /// every later symbol (including partition reads, which is what made
+    /// aomdec's zero-`value=8/9` census look like a partition-reader defect
+    /// in the rect14 review) decoded as garbage.
+    ///
+    /// Fail-pre-fix, measured on the ed12fe52 probe: both arms differ from
+    /// ffmpeg at byte 41120 (luma row 128 col 160, the first block decoded
+    /// after the phantom reads). The counter delta pins non-vacuity (class
+    /// `gate-blind-to-feature`): 96 clipped units on each arm.
+    #[test]
+    fn a_lossless_sb128_square_frame_clips_overhanging_chroma_tus() {
+        const NAME: &str = "a_lossless_sb128_square_frame_clips_overhanging_chroma_tus";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        // Arm 0 is the rect14 report's `loss320` recipe verbatim; arm 1 is its
+        // `lnone` companion (1:4 and rect partitions off) -- both coded the
+        // overhanging 64x64 blocks and both desynced at byte 41120 pre-fix.
+        let arms: [&[&str]; 2] = [
+            &["--min-partition-size=4"],
+            &["--min-partition-size=4", "--enable-1to4-partitions=0", "--enable-rect-partitions=0"],
+        ];
+        let mut clips_total = 0usize;
+        for (arm, extra) in arms.iter().enumerate() {
+            let stream = lossless_sb128_testsrc2(320, 240, extra);
+            crate::decode::reset_loss64_hits();
+            let ours = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: arm {arm} decodes: {e}"));
+            let clips = crate::decode::chroma_edge_tu_clip_hits();
+            assert!(
+                clips > 0,
+                "{NAME}: arm {arm} clipped NO overhanging chroma transform unit -- \
+                 the fixed body was never reached (class gate-blind-to-feature)"
+            );
+            clips_total += clips;
+            let refs = ffmpeg_decode_sequence(&stream, 320, 240, 1);
+            assert_eq!(ours.len(), 1, "{NAME}: arm {arm} frame count");
+            for (plane, (g, r)) in [(&ours[0].y, &refs[0].y), (&ours[0].u, &refs[0].u), (&ours[0].v, &refs[0].v)]
+                .iter()
+                .enumerate()
+            {
+                let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(bad, 0, "{NAME}: arm {arm} plane {plane}: {bad} samples differ from ffmpeg");
+            }
+        }
+        eprintln!("{NAME}: 2 arms full-frame exact, {clips_total} chroma units clipped");
+    }
+
+    /// lane-av1-loss64: a SKIPPED intrabc rect strip on a lossless frame
+    /// zeroes its whole entropy-band footprint (libaom
+    /// `av1_reset_entropy_context`, `if (mbmi->skip_txfm)` decodemv.c:1262 ->
+    /// blockd.c:58) instead of leaving the previous occupant's luma bands
+    /// standing. The skip arm of `decode_intrabc_owned_rect` never wrote the
+    /// luma bands: the lossless `read_block_tx_size_rect` resolves the 4x4
+    /// leaf list before it looks at `skip`, so the tail took the
+    /// per-transform-unit record path (chroma only) with no per-unit luma
+    /// writes ever run. The next block then read a STALE band: on the 320x242
+    /// `--min-partition-size=4` sibling of this stream the skipped 8x16
+    /// intrabc strip at mi(48,66) left a 7 in left[48] and mi(48,68)'s first
+    /// transform unit read `txb_skip_ctx` 3 where aomdec reads 1 (measured
+    /// `EC_ECDUMP` against the instrumented aomdec) -- a coefficient-walk
+    /// desync at byte 61712 with every mode symbol still matching.
+    ///
+    /// This stream is the same source at `--min-partition-size=8`, which
+    /// keeps sub-8x8 partitions out: post-fix it is full-frame exact. The
+    /// `--min-partition-size=4` sibling still is not -- its remaining
+    /// divergence is a sub-8x8 4x8-leaf chroma reconstruction defect with the
+    /// entropy ladder fully synced (first diff U(92,104), luma byte-exact),
+    /// deferred to the sub-8x8 lane family (lanes/av1loss64.report.md).
+    ///
+    /// Fail-pre-fix, measured on the ed12fe52 probe: differs at byte 41120
+    /// (the chroma-clip class, fixed in the same lane). Single-mutation on
+    /// the lane tree with ONLY this gate's walk reverted: differs at byte
+    /// 61712, the band-leak site.
+    #[test]
+    fn a_skipped_lossless_intrabc_rect_strip_zeroes_its_entropy_bands() {
+        const NAME: &str = "a_skipped_lossless_intrabc_rect_strip_zeroes_its_entropy_bands";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let stream = lossless_sb128_testsrc2(320, 242, &["--min-partition-size=8"]);
+        crate::decode::reset_loss64_hits();
+        let ours = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: decodes: {e}"));
+        let resets = crate::decode::skip_lossless_band_reset_hits();
+        assert!(
+            resets > 0,
+            "{NAME}: this stream coded NO skipped lossless intrabc rect strip -- \
+             the fixed body was never reached (class gate-blind-to-feature)"
+        );
+        let refs = ffmpeg_decode_sequence(&stream, 320, 242, 1);
+        assert_eq!(ours.len(), 1, "{NAME}: frame count");
+        for (plane, (g, r)) in [(&ours[0].y, &refs[0].y), (&ours[0].u, &refs[0].u), (&ours[0].v, &refs[0].v)]
+            .iter()
+            .enumerate()
+        {
+            let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+            assert_eq!(bad, 0, "{NAME}: plane {plane}: {bad} samples differ from ffmpeg");
+        }
+        eprintln!("{NAME}: full-frame exact, {resets} band resets");
+    }
+
     /// lane-dkey: the palette-neighbour-band gate. A palette-Y block's size and
     /// colours used to stay standing in the mi-granular above/left bands after a
     /// sub-8x8 group was decoded next to it -- the sub-8x8 readers published
