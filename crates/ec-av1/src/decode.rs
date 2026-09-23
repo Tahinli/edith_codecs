@@ -3734,6 +3734,13 @@ thread_local! {
     /// to an all-skip stream (no residual reader at all) would stay green.
     static INTRABC_RECT_CODED_HITS: std::cell::Cell<[usize; 2]> =
         const { std::cell::Cell::new([0, 0]) };
+    /// lane-av1-intrabc r5: the `skip == 1` twin of [`INTRABC_RECT_CODED_HITS`]
+    /// -- rect INTRABC blocks reconstructed as a bare prediction copy, split
+    /// by orientation. The r5 panic (residual stride `bw * bh` underrunning
+    /// `reconstruct_mc_rect`'s `row * side + w` index on a VERT strip) was
+    /// invisible to every gate because they only counted CODED strips.
+    static INTRABC_RECT_SKIPPED_HITS: std::cell::Cell<[usize; 2]> =
+        const { std::cell::Cell::new([0, 0]) };
 }
 
 /// lane-av1-intrabc r4: coded (`skip == 0`) rect intrabc blocks reconstructed,
@@ -3741,6 +3748,13 @@ thread_local! {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub fn intrabc_rect_coded_hits() -> [usize; 2] {
     INTRABC_RECT_CODED_HITS.with(std::cell::Cell::get)
+}
+
+/// lane-av1-intrabc r5: skipped (`skip == 1`) rect intrabc blocks
+/// reconstructed, as `[horz, vert]` -- see [`INTRABC_RECT_SKIPPED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_rect_skipped_hits() -> [usize; 2] {
+    INTRABC_RECT_SKIPPED_HITS.with(std::cell::Cell::get)
 }
 
 /// Current value of [`INTRABC_RECT_HITS`].
@@ -3755,6 +3769,7 @@ pub(crate) fn reset_intrabc_rect_hits() {
     INTRABC_RECT_HITS.with(|c| c.set(0));
     INTRABC_RECT_VARTX_HITS.with(|c| c.set(0));
     INTRABC_RECT_CODED_HITS.with(|c| c.set([0, 0]));
+    INTRABC_RECT_SKIPPED_HITS.with(|c| c.set([0, 0]));
 }
 
 /// Current value of [`INTRABC_RECT_VARTX_HITS`].
@@ -10962,9 +10977,15 @@ fn decode_intrabc_rect(
     fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
     hit!(INTRABC_RECT_HITS);
-    if !skip {
-        // [horz, vert]: see `INTRABC_RECT_CODED_HITS`.
-        let idx = usize::from(bh > bw);
+    // [horz, vert]: see `INTRABC_RECT_CODED_HITS` / `INTRABC_RECT_SKIPPED_HITS`.
+    let idx = usize::from(bh > bw);
+    if skip {
+        INTRABC_RECT_SKIPPED_HITS.with(|c| {
+            let mut seen = c.get();
+            seen[idx] += 1;
+            c.set(seen);
+        });
+    } else {
         INTRABC_RECT_CODED_HITS.with(|c| {
             let mut seen = c.get();
             seen[idx] += 1;
@@ -11044,9 +11065,12 @@ fn decode_intrabc_rect(
     let (luma_grid, u_grid, v_grid);
     if skip {
         // No residual syntax at all: the prediction IS the block.
-        push_mc_rect(0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..bw * bh], fctx);
-        push_mc_rect(1, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_u, cside), &ZERO_RESIDUAL[..cw * ch], fctx);
-        push_mc_rect(2, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cw * ch], fctx);
+        // Residual stride is `side` (and `cside`), not `bw`: reconstruct_mc_rect indexes
+        // `residual[row * side .. row*side + w]` for row in 0..h, so a skipped VERT strip
+        // (bh > bw) overruns a `bw * bh` slice. Bug-for-bug with the inter skip arm.
+        push_mc_rect(0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..side * side], fctx);
+        push_mc_rect(1, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_u, cside), &ZERO_RESIDUAL[..cside * cside], fctx);
+        push_mc_rect(2, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cside * cside], fctx);
         luma_tx_type = TxType::DctDct;
         luma_grid = Grid::Zero(side * side);
         u_grid = Grid::Zero(cside * cside);
