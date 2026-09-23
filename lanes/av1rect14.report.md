@@ -148,3 +148,54 @@ test result: ok. 603 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; f
 ```
 
 No aomenc pipe deadlock fired this run.
+
+## 9. Merge-side follow-ups
+
+Merged into `main` as **cb5b66b5** (`git merge --no-ff`, parents `09c7ff39` +
+`0945098f`; ort, no conflicts — the only main-side advance past the lane base
+was the disjoint root `EDITH_FINDINGS.md`). Create-list audit: the merge adds
+exactly one new path, this report. Fixture copy: not needed —
+`diff -rq fixtures <lane>/fixtures` empty. The full suite was NOT re-run: the
+merged tree is the tested lane tree (603/0/60, 1505 s) plus one disjoint doc
+file.
+
+Merged-tree evidence (private `CARGO_TARGET_DIR`, `TMPDIR` on `$HOME`):
+
+* `cargo check -p ec-av1 --all-targets`: 0 warnings, exit 0.
+* Five gates, dev lib: `5 passed; 0 failed; 658 filtered out` —
+  `a_16x4_intrabc_pair_strip_decodes_pixel_exact`,
+  `a_lossless_16x4_chroma_pair_repairs_the_measured_site`,
+  `a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips`,
+  `every_proven_refusal_names_a_test_that_exists`,
+  `the_decode_path_refuses_exactly_the_listed_cases`.
+* Probes (release `decode_probe` built from the merged tree; reviewer's
+  encoded streams re-decoded, plus fresh ffmpeg oracles):
+  ibc640 **460800 EXACT** (`rect4_16_pair: intrabc=1`);
+  cq50 arm **73728 EXACT**;
+  loss320 luma **rows 0-127 EXACT** (first diff byte 41120,
+  `rect4_16_pair: lossless_chroma=6`). All three merged-tree dumps are
+  byte-identical to the reviewed lane dumps. The §2 repro recipe re-encodes
+  to the identical obu (sha256 d01352af...) and decodes EXACT.
+
+Deferred dispositions carried (unchanged by the merge):
+
+* **128-level rect intrabc refusal** — `deferred(a reaching sb128 screen
+  stream that codes a 128-level HORZ/VERT/1:4 intrabc strip)`.
+* **loss320 full-frame byte-exactness** — blocked on the pre-existing 64x64
+  square lossless desync (`deferred(square 64x64 lossless desync)`).
+* **VERT_4 pixels** — entropy-proven only; `deferred(a txs0 recipe that codes
+  PARTITION_VERT_4 intrabc and completes)`.
+* **Lossless-skip-arm edge guard** — unwitnessed.
+* **var-tx SPLIT arm of `decode_rect4_16_intrabc`** — unwitnessed: mixed
+  trees in pair strips are neither refused nor proven.
+
+Merge-note riders for the later `lane-av1-intrabc` merge (see §7): its
+skip-stride fix must land before "prefer theirs" at the three 2:1 call sites,
+and `decode_intrabc_owned_rect` still owns the fourth site
+(`decode_block_rect64`). Expected conflict zone: those three call sites.
+
+Cleanup: worktree `edith_codecs-av1r14` and branch `lane-av1-rect14` removed
+post-push; `$HOME/tmp-av1r14`, `$HOME/tmp-av1r14m` and
+`$HOME/.cache/cargo-target-av1r14*` swept (regenerable). The reviewer's
+`cargo-target-av1r14review*` / `tmp-av1r14review` dirs are not this lane's —
+left in place.
