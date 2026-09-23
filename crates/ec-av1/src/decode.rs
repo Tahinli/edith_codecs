@@ -14887,68 +14887,145 @@ fn decode_block(
         if intrabc_dv.is_some() {
             fctx.intrabc_chroma_tx.with(|c| c.set(Some(fctx.luma_tx_type.with(std::cell::Cell::get))));
         }
-        if let Some((ub, _)) = &palette_uv_bufs {
-            set_palette_pred(ub.clone(), fctx);
-        }
-        // lane-av1-444: a 64x64 block takes this arm (`logical_tx == side`).
-        // At 4:4:4 its chroma plane is 64x64 and libaom codes four TX_32X32
-        // units. This read is still one unit (`chroma_side` x `chroma_tx`).
-        // Luma of that block matches; chroma does not. See lanes/av1444.report.md.
-        let u_grid = read_plane(
-            dec,
-            cdfs,
-            chroma_set,
-            scans.1,
-            1,
-            around[1],
-            mode,
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            u,
-            cpx,
-            cpy,
-            chroma_side,
-            chroma_tx,
-            base_q_idx,
-            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
-            None,
-            None,
-            smooth_neighbor_uv, fctx,
-        )?;
-        if crate::envflags::env_flag!("EC_AV1_TRACE") {
-            eprintln!(
-                "TRACE u-write cpx={cpx} cpy={cpy} chroma_side={chroma_side} row0={:?}",
-                &u.data[cpy * u.width + cpx..][..chroma_side]
-            );
-        }
-        if let Some((_, vb)) = &palette_uv_bufs {
-            set_palette_pred(vb.clone(), fctx);
-        }
-        let v_grid = read_plane(
-            dec,
-            cdfs,
-            chroma_set,
-            scans.1,
-            2,
-            around[2],
-            mode,
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            v,
-            cpx,
-            cpy,
-            chroma_side,
-            chroma_tx,
-            base_q_idx,
-            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
-            None,
-            None,
-            smooth_neighbor_uv, fctx,
-        )?;
+        // lane-av1-444: this arm is one luma TU (`logical_tx == side`), including
+        // the 64x64 case whose coefficient grid is 32. At 4:4:4 the chroma plane
+        // is the same size as luma and `av1_get_max_uv_txsize` caps it at
+        // TX_32X32, so a 64x64 block codes four chroma units, plane-major
+        // (every U, then every V) — the same loop the multi-TU arm runs.
+        // At 4:2:0 `chroma_side == chroma_tx`, so it stays one read.
+        let cn = (chroma_side / chroma_tx).max(1);
+        let (u_grid, v_grid, chroma_units) = if cn == 1 {
+            if let Some((ub, _)) = &palette_uv_bufs {
+                set_palette_pred(ub.clone(), fctx);
+            }
+            let u_grid = read_plane(
+                dec,
+                cdfs,
+                chroma_set,
+                scans.1,
+                1,
+                around[1],
+                mode,
+                uv_predict_mode,
+                angle_delta_uv,
+                reach,
+                u,
+                cpx,
+                cpy,
+                chroma_side,
+                chroma_tx,
+                base_q_idx,
+                alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+                None,
+                None,
+                smooth_neighbor_uv, fctx,
+            )?;
+            if crate::envflags::env_flag!("EC_AV1_TRACE") {
+                eprintln!(
+                    "TRACE u-write cpx={cpx} cpy={cpy} chroma_side={chroma_side} row0={:?}",
+                    &u.data[cpy * u.width + cpx..][..chroma_side]
+                );
+            }
+            if let Some((_, vb)) = &palette_uv_bufs {
+                set_palette_pred(vb.clone(), fctx);
+            }
+            let v_grid = read_plane(
+                dec,
+                cdfs,
+                chroma_set,
+                scans.1,
+                2,
+                around[2],
+                mode,
+                uv_predict_mode,
+                angle_delta_uv,
+                reach,
+                v,
+                cpx,
+                cpy,
+                chroma_side,
+                chroma_tx,
+                base_q_idx,
+                alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+                None,
+                None,
+                smooth_neighbor_uv, fctx,
+            )?;
+            (u_grid, v_grid, Vec::new())
+        } else {
+            let chroma_ctx_offset = Some(3);
+            let mut u_pass: Vec<Grid> = Vec::new();
+            let mut units: Vec<((usize, usize), usize, Grid, Grid)> = Vec::new();
+            let mut last_grids = [Grid::Zero(0), Grid::Zero(0)];
+            for plane_pass in 1..=2usize {
+                let mut pass_idx = 0usize;
+                for cu_row in 0..cn {
+                    for cu_col in 0..cn {
+                        let luma_span = chroma_tx << ss_x(fctx);
+                        let cu_mi = (
+                            mi_r + cu_row * (luma_span / MI),
+                            mi_c + cu_col * (luma_span / MI),
+                        );
+                        let cu_around = neighbours.around_mi(cu_mi, luma_span);
+                        let cu_reach = tu_reach(
+                            side,
+                            side,
+                            cu_col * luma_span,
+                            cu_row * luma_span,
+                            luma_span,
+                            reach,
+                            px,
+                            py,
+                            y.width,
+                            y.height, fctx,
+                        );
+                        let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx);
+                        if let Some((ub, vb)) = &palette_uv_bufs {
+                            let pbuf = if plane_pass == 1 { ub } else { vb };
+                            set_palette_pred(
+                                palette_window(
+                                    pbuf, chroma_side, cu_col * chroma_tx, cu_row * chroma_tx,
+                                    chroma_tx, chroma_tx,
+                                ),
+                                fctx,
+                            );
+                        }
+                        let buf: &mut PlaneBuf<'static> =
+                            if plane_pass == 1 { &mut *u } else { &mut *v };
+                        let cu_grid = read_plane(
+                            dec, cdfs, chroma_set, scans.1, plane_pass, cu_around[plane_pass], mode,
+                            uv_predict_mode, angle_delta_uv, cu_reach, buf, cu_x, cu_y,
+                            chroma_tx, chroma_tx, base_q_idx,
+                            alpha.zip(ac).map(|((au, av), ac)| {
+                                (if plane_pass == 1 { au } else { av }, ac)
+                            }),
+                            None, chroma_ctx_offset, smooth_neighbor_uv, fctx,
+                        )?;
+                        hit!(CHROMA_SPLIT_TX_HITS);
+                        // Immediately, so the next unit of this block reads this
+                        // one's coefficient context. `record` below stamps one
+                        // chroma state across the whole block; the replay after
+                        // it puts the per-unit state back.
+                        neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, plane_pass, &cu_grid);
+                        if plane_pass == 1 {
+                            u_pass.push(cu_grid);
+                        } else {
+                            let u_grid = std::mem::replace(&mut u_pass[pass_idx], Grid::Zero(0));
+                            units.push((cu_mi, luma_span, u_grid.clone(), cu_grid.clone()));
+                            last_grids = [u_grid, cu_grid];
+                        }
+                        pass_idx += 1;
+                    }
+                }
+            }
+            (last_grids[0].clone(), last_grids[1].clone(), units)
+        };
         fctx.intrabc_chroma_tx.with(|c| c.set(None));
         neighbours.record(at, side, mode, uv_predict_mode, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
+        for (cu_mi, luma_span, u_unit, v_unit) in &chroma_units {
+            neighbours.record_mi_chroma(*cu_mi, *luma_span, *luma_span, 1, u_unit);
+            neighbours.record_mi_chroma(*cu_mi, *luma_span, *luma_span, 2, v_unit);
+        }
     } else {
         // Several luma transform units, raster order (spec
         // `transform_block`'s loop): the block's resolved transform is
@@ -23103,16 +23180,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             (mi_row1 as usize * 4).min(y.height),
         );
         u.set_tile_origin(
-            mi_col0 as usize * 2,
-            mi_row0 as usize * 2,
-            (mi_col1 as usize * 2).min(u.width),
-            (mi_row1 as usize * 2).min(u.height),
+            (mi_col0 as usize * 4) >> ss_x(fctx),
+            (mi_row0 as usize * 4) >> ss_y(fctx),
+            ((mi_col1 as usize * 4) >> ss_x(fctx)).min(u.width),
+            ((mi_row1 as usize * 4) >> ss_y(fctx)).min(u.height),
         );
         v.set_tile_origin(
-            mi_col0 as usize * 2,
-            mi_row0 as usize * 2,
-            (mi_col1 as usize * 2).min(v.width),
-            (mi_row1 as usize * 2).min(v.height),
+            (mi_col0 as usize * 4) >> ss_x(fctx),
+            (mi_row0 as usize * 4) >> ss_y(fctx),
+            ((mi_col1 as usize * 4) >> ss_x(fctx)).min(v.width),
+            ((mi_row1 as usize * 4) >> ss_y(fctx)).min(v.height),
         );
         hit!(TILE_HITS);
 
@@ -35871,16 +35948,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             (mi_row1 as usize * 4).min(y.height),
         );
         u.set_tile_origin(
-            mi_col0 as usize * 2,
-            mi_row0 as usize * 2,
-            (mi_col1 as usize * 2).min(u.width),
-            (mi_row1 as usize * 2).min(u.height),
+            (mi_col0 as usize * 4) >> ss_x(fctx),
+            (mi_row0 as usize * 4) >> ss_y(fctx),
+            ((mi_col1 as usize * 4) >> ss_x(fctx)).min(u.width),
+            ((mi_row1 as usize * 4) >> ss_y(fctx)).min(u.height),
         );
         v.set_tile_origin(
-            mi_col0 as usize * 2,
-            mi_row0 as usize * 2,
-            (mi_col1 as usize * 2).min(v.width),
-            (mi_row1 as usize * 2).min(v.height),
+            (mi_col0 as usize * 4) >> ss_x(fctx),
+            (mi_row0 as usize * 4) >> ss_y(fctx),
+            ((mi_col1 as usize * 4) >> ss_x(fctx)).min(v.width),
+            ((mi_row1 as usize * 4) >> ss_y(fctx)).min(v.height),
         );
         // lane-tiles r6: an MV candidate scan (mvstack.rs's grid.get) must
         // not reach across a tile boundary any more than intra prediction's
