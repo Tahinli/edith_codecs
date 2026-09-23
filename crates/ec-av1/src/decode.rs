@@ -5084,12 +5084,41 @@ thread_local! {
     /// lane-kf1200 r2: sub-8x8 chroma blocks that are `skip_txfm` AND
     /// `UV_CFL_PRED` -- the arm that used to drop the CfL alpha entirely.
     static SKIP_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-loss64: chroma transform units the frame-edge clip skipped
+    /// (libaom `decode_reconstruct_tx`'s `max_blocks_wide/high` test) in
+    /// [`decode_block`]'s multi-transform-unit walk -- the units a lossless
+    /// block overhanging the frame does NOT code.
+    static CHROMA_EDGE_TU_CLIP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-loss64: skipped lossless intrabc rect strips whose luma
+    /// entropy bands were zeroed per unit (libaom `av1_reset_entropy_context`,
+    /// decodeframe.c:1262) instead of leaking the previous occupant's.
+    static SKIP_LOSSLESS_BAND_RESET_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
 /// that reconstructed as flat DC before lane-kf1200 r2).
 pub fn skip_cfl_hits() -> usize {
     SKIP_CFL_HITS.with(|c| c.get())
+}
+
+/// How many chroma transform units the frame-edge clip skipped in
+/// [`decode_block`]'s multi-transform-unit walk (lane-av1-loss64). Zero on a
+/// stream whose lossless blocks never overhang the frame -- a gate asserting
+/// the clip fired must see this nonzero.
+pub fn chroma_edge_tu_clip_hits() -> usize {
+    CHROMA_EDGE_TU_CLIP_HITS.with(|c| c.get())
+}
+
+/// How many skipped lossless intrabc rect strips had their luma entropy
+/// bands zeroed per unit (lane-av1-loss64).
+pub fn skip_lossless_band_reset_hits() -> usize {
+    SKIP_LOSSLESS_BAND_RESET_HITS.with(|c| c.get())
+}
+
+/// Gate-side reset for the two lane-av1-loss64 counters above.
+pub fn reset_loss64_hits() {
+    CHROMA_EDGE_TU_CLIP_HITS.with(|c| c.set(0));
+    SKIP_LOSSLESS_BAND_RESET_HITS.with(|c| c.set(0));
 }
 
 /// How many 16x4/4x16 chroma pairs took a different `intra_edge_filter_type`
@@ -11147,6 +11176,29 @@ fn decode_intrabc_rect(
         push_mc_rect(0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..side * side], fctx);
         push_mc_rect(1, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_u, cside), &ZERO_RESIDUAL[..cside * cside], fctx);
         push_mc_rect(2, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cside * cside], fctx);
+        if let Some(ls) = leaves.as_ref() {
+            // lane-av1-loss64, merged: the same reset [`decode_intrabc_owned_rect`]'s
+            // skip arm performs -- libaom `av1_reset_entropy_context`
+            // (`if (mbmi->skip_txfm)`, decodeframe.c:1262 -> blockd.c:58): a
+            // SKIPPED block zeroes its whole entropy-band footprint. This
+            // helper serves `decode_block_rect4`'s 1:4 strips on this tree,
+            // so a skipped lossless strip whose `leaves` resolved (every
+            // lossless frame -- `read_block_tx_size_rect`'s lossless arm
+            // returns the 4x4 grid before it looks at `skip`) left the
+            // PREVIOUS occupant's luma bands standing and the NEXT block's
+            // partition parse diverged from libaom's: the 320x242 lossless
+            // sb128 gate read a phantom unskipped 8x32 intrabc strip at
+            // mi(56,66) right after the skipped 8x16 one at mi(48,66).
+            hit!(SKIP_LOSSLESS_BAND_RESET_HITS);
+            for &(row, col, tw, th) in ls {
+                neighbours.record_mi_luma_rect(
+                    (mi_r + row, mi_c + col),
+                    tw,
+                    th,
+                    &ZERO_RESIDUAL[..tw * th],
+                );
+            }
+        }
         luma_tx_type = TxType::DctDct;
         luma_grid = Grid::Zero(side * side);
         u_grid = Grid::Zero(cside * cside);
@@ -12810,6 +12862,30 @@ fn decode_intrabc_owned_rect(
         push_mc_rect(0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..side * bh], fctx);
         push_mc_rect(1, px / 2, py / 2, cside, cw, ch, Pred::Inline(&pred_u, cside), &ZERO_RESIDUAL[..cside * ch], fctx);
         push_mc_rect(2, px / 2, py / 2, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cside * ch], fctx);
+        if let Some(ls) = leaves.as_ref() {
+            // libaom `av1_reset_entropy_context` (`if (mbmi->skip_txfm)`,
+            // decodeframe.c:1262 -> blockd.c:58): a SKIPPED block zeroes its
+            // whole entropy-band footprint. The non-skip arm below writes
+            // those bands per transform unit and the tail's
+            // `record_split_luma_rect_mi` writes chroma only, so without
+            // this walk a skipped strip whose `leaves` resolved (every
+            // lossless frame -- `read_block_tx_size_rect`'s lossless arm
+            // returns the 4x4 grid before it looks at `skip`) leaked the
+            // PREVIOUS occupant's luma bands into the next block's
+            // `txb_skip`/coefficient contexts (lane-av1-loss64: the skipped
+            // 8x16 intrabc strip at mi(48,66) of the 320x242 lossless sb128
+            // stream left a stale 7 in left[48] and mi(48,68)'s first
+            // transform unit read `txb_skip_ctx` 3 where aomdec reads 1).
+            hit!(SKIP_LOSSLESS_BAND_RESET_HITS);
+            for &(row, col, tw, th) in ls {
+                neighbours.record_mi_luma_rect(
+                    (mi_r + row, mi_c + col),
+                    tw,
+                    th,
+                    &ZERO_RESIDUAL[..tw * th],
+                );
+            }
+        }
         luma_grid = Grid::Zero(side * side);
         u_grid = Grid::Zero(cside * cside);
         v_grid = Grid::Zero(cside * cside);
@@ -16088,6 +16164,35 @@ fn decode_block(
         let mut pass_idx = 0usize;
         for cu_row in ch_row * cpc..(ch_row + 1) * cpc {
             for cu_col in ch_col * cpc..(ch_col + 1) * cpc {
+                // libaom `decode_reconstruct_tx`'s frame-edge clip
+                // (decodeframe.c:299, `blk_row >= max_blocks_high || blk_col
+                // >= max_blocks_wide` returns before ANY symbol is read): a
+                // transform unit whose 4x4 origin sits outside the frame's mi
+                // grid is not coded at all. The luma loop above carries the
+                // same clip; its absence here read `txb_skip` (+coeffs) for
+                // chroma units libaom never wrote -- the lossless 64x64 block
+                // at mi(48,0) of a 320x240 frame overhangs the bottom edge by
+                // 4 mi, so its 32x32 chroma codes SIX rows of 4x4 units, not
+                // eight (lane-av1-loss64; 48 chroma units per plane in
+                // aomdec's EC_COEFF census vs the 64 this loop read).
+                // `max_block_wide/high` (av1_common_int.h:1565): the plane
+                // block's pixel span (4:2:0 halves the luma span, clamped to
+                // 4 by `set_plane_n4`) plus the negative overhang
+                // (`mb_to_*_edge` = `2 * overhang_mi` chroma px), in 4x4
+                // units.
+                let span_mi = side / MI;
+                let over_w_mi =
+                    (2 * y.true_width.div_ceil(8)) as i32 - mi_c as i32 - span_mi as i32;
+                let over_h_mi =
+                    (2 * y.true_height.div_ceil(8)) as i32 - mi_r as i32 - span_mi as i32;
+                let plane_px = ((span_mi * 2).max(4)) as i32;
+                let max_units_w = ((plane_px + 2 * over_w_mi.min(0)) >> 2).max(0) as usize;
+                let max_units_h = ((plane_px + 2 * over_h_mi.min(0)) >> 2).max(0) as usize;
+                let unit = chroma_tx / 4; // TU side in 4x4 chroma units
+                if cu_col * unit >= max_units_w || cu_row * unit >= max_units_h {
+                    hit!(CHROMA_EDGE_TU_CLIP_HITS);
+                    continue;
+                }
                 // The chroma context arrays are indexed in LUMA mi, so this
                 // unit's anchor is its own luma quadrant: `chroma_tx` chroma
                 // pixels span `2 * chroma_tx` luma ones.
@@ -18261,7 +18366,7 @@ fn decode_leaf_rect8(
     neighbours.above_uv_mode[c] = uv_predict_mode;
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
-    let (u_grid, v_grid): (Grid, Grid) = if leaf_skips[1] {
+    let (u_grid, v_grid): (Grid, Grid) = if leaf_skips[1] && last_intrabc.is_none() {
         // A skipped chroma block still gets its CfL contribution: libaom's
         // `predict_and_reconstruct_intra_block` calls `cfl_predict_block`
         // from `av1_predict_intra_block_facade` (av1/common/reconintra.c:1719)
@@ -18291,37 +18396,62 @@ fn decode_leaf_rect8(
         }
         (Grid::Zero(16), Grid::Zero(16))
     } else if let Some(dv) = last_intrabc {
-        // lane-av1txr: the chroma-reference leaf was an intrabc block, so the
-        // group's one chroma unit is a frame copy at that DV too (its residual
-        // still reads the ordinary `Chroma4` coefficient tables -- libaom
-        // codes a chroma `tx_type` nowhere).
+        // A 4:2:0 `BLOCK_4X8`/`BLOCK_8X4` leaf maps to a clamped chroma
+        // `BLOCK_4X4` (`get_plane_block_size`, blockd.h:1184; `set_plane_n4`,
+        // av1_common_int.h:1344). The chroma reference is still the whole
+        // 8x8 group's 4x4 plane block at `(cpx, cpy)`, so prediction uses the
+        // group's destination origin, not the odd-mi leaf's nominal 2x4/4x2
+        // extent. The old route treated a skipped intrabc leaf as skipped
+        // intra and predicted this block with DC, first differing at
+        // mi(46,52), U(104,92), while consuming identical symbols.
+        let chroma_mv_x = mv_to_q4(cpx, dv.1, false);
+        let chroma_mv_y = mv_to_q4(cpy, dv.0, false);
+        // `decode_reconstruct_tx` reads no chroma coefficients for a skipped
+        // intrabc block, but an unskipped one reads the ordinary Chroma4
+        // tables; chroma inherits no coded tx_type of its own.
         let mut ub = vec![0u16; 16];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
-            mv_to_q4(cpx, dv.1, false), mv_to_q4(cpy, dv.0, false),
-            4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+            chroma_mv_x, chroma_mv_y, 4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
         let mut vb = vec![0u16; 16];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
-            mv_to_q4(cpx, dv.1, false), mv_to_q4(cpy, dv.0, false),
-            4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+            chroma_mv_x, chroma_mv_y, 4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
-        let chroma_around = neighbours.around_mi(leaf_mi, 8);
-        set_palette_pred(ub, fctx);
-        let ug = read_plane(
-            dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], DC_PRED, DC_PRED,
-            0, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
-            None, None, None, smooth_neighbor_uv, fctx,
-        )?;
-        set_palette_pred(vb, fctx);
-        let vg = read_plane(
-            dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], DC_PRED, DC_PRED,
-            0, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
-            None, None, None, smooth_neighbor_uv, fctx,
-        )?;
-        fctx.intrabc_chroma_tx.with(|c| c.set(None));
-        (ug, vg)
+        if leaf_skips[1] {
+            // `skip_txfm` still reconstructs an intrabc prediction, but
+            // libaom's `decode_reconstruct_tx` reads NO chroma coefficients.
+            // The ordinary skipped-intra arm above is therefore not valid for
+            // an intrabc leaf: use the copied, clamped 4x4 prediction directly.
+            push_mc_rect(
+                1, cpx, cpy, 4, 4, 4, Pred::Inline(&ub, 4),
+                &ZERO_RESIDUAL[..16], fctx,
+            );
+            push_mc_rect(
+                2, cpx, cpy, 4, 4, 4, Pred::Inline(&vb, 4),
+                &ZERO_RESIDUAL[..16], fctx,
+            );
+            hit!(SKIPPED_INTRABC_CHROMA_ARM_HITS);
+            fctx.intrabc_chroma_tx.with(|c| c.set(None));
+            (Grid::Zero(16), Grid::Zero(16))
+        } else {
+            let chroma_around = neighbours.around_mi(leaf_mi, 8);
+            set_palette_pred(ub, fctx);
+            let ug = read_plane(
+                dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], DC_PRED, DC_PRED,
+                0, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
+                None, None, None, smooth_neighbor_uv, fctx,
+            )?;
+            set_palette_pred(vb, fctx);
+            let vg = read_plane(
+                dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], DC_PRED, DC_PRED,
+                0, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
+                None, None, None, smooth_neighbor_uv, fctx,
+            )?;
+            fctx.intrabc_chroma_tx.with(|c| c.set(None));
+            (ug, vg)
+        }
     } else {
         let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
