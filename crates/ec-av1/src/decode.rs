@@ -130,6 +130,11 @@ pub(crate) struct FrameCtx {
     /// decoder's inter-side publishing was wired. See
     /// [`Neighbours::fill_lf_grid_rect`]'s band publish.
     pub(crate) intra_only: std::cell::Cell<bool>,
+    /// This FRAME's own `tx_mode == TxMode::Select`, set for EVERY frame
+    /// (intra included). [`Self::tx_select_inter`] cannot stand in for it:
+    /// an intrabc block rides an INTRA frame, but libaom still reads its
+    /// var-tx `txfm_partition` tree under the frame's `TxMode::Select`.
+    pub(crate) tx_select_frame: std::cell::Cell<bool>,
     pub(crate) reduced_tx_set_inter: std::cell::Cell<bool>,
     pub(crate) enable_filter_intra_inter: std::cell::Cell<bool>,
     pub(crate) palette_pred: std::cell::RefCell<Option<Vec<u16>>>,
@@ -229,6 +234,7 @@ impl FrameCtx {
             cur_segment_id: std::cell::Cell::new(0),
             seg_tile_origin: std::cell::Cell::new((0, 0)),
             tx_select_inter: std::cell::Cell::new(false),
+            tx_select_frame: std::cell::Cell::new(false),
             intra_only: std::cell::Cell::new(false),
             reduced_tx_set_inter: std::cell::Cell::new(false),
             enable_filter_intra_inter: std::cell::Cell::new(false),
@@ -1626,6 +1632,7 @@ pub(crate) fn set_inter_tx_mode(
 ) {
     fctx.tx_select_inter.with(|c| c.set(tx_select));
     fctx.intra_only.with(|c| c.set(false));
+    fctx.tx_select_frame.with(|c| c.set(tx_select));
     fctx.reduced_tx_set_inter.with(|c| c.set(reduced_tx_set));
     fctx.enable_filter_intra_inter.with(|c| c.set(enable_filter_intra));
 }
@@ -3743,6 +3750,64 @@ thread_local! {
     /// signal a transform size where a plain `BLOCK_4X4` does not. Reading no
     /// symbol here desynced `warped.obu` at the very next block.
     static RECT_INTRABC_VARTX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-intrabc: rect INTRABC blocks whose reconstruction
+    /// [`decode_intrabc_rect`] ran -- the engagement counter the rect-strip
+    /// gates assert on (a refused block bumps [`INTRABC_HITS`] but never
+    /// this one).
+    static INTRABC_RECT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Of those, how many read the INTER var-tx tree (unskipped, TX_MODE_SELECT).
+    static INTRABC_RECT_VARTX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-intrabc r4: rect INTRABC blocks whose reconstruction
+    /// [`decode_intrabc_rect`] ran with `skip == 0` (a real residual read),
+    /// split by the strip's orientation -- `bw > bh` is a HORZ strip,
+    /// `bh > bw` a VERT one. The reviewer's unblock condition needs a CODED
+    /// witness in BOTH orientations, and the existing `INTRABC_RECT_HITS`
+    /// counts neither orientation nor the skip flag, so an arm that flipped
+    /// to an all-skip stream (no residual reader at all) would stay green.
+    static INTRABC_RECT_CODED_HITS: std::cell::Cell<[usize; 2]> =
+        const { std::cell::Cell::new([0, 0]) };
+    /// lane-av1-intrabc r5: the `skip == 1` twin of [`INTRABC_RECT_CODED_HITS`]
+    /// -- rect INTRABC blocks reconstructed as a bare prediction copy, split
+    /// by orientation. The r5 panic (residual stride `bw * bh` underrunning
+    /// `reconstruct_mc_rect`'s `row * side + w` index on a VERT strip) was
+    /// invisible to every gate because they only counted CODED strips.
+    static INTRABC_RECT_SKIPPED_HITS: std::cell::Cell<[usize; 2]> =
+        const { std::cell::Cell::new([0, 0]) };
+}
+
+/// lane-av1-intrabc r4: coded (`skip == 0`) rect intrabc blocks reconstructed,
+/// as `[horz, vert]` -- see [`INTRABC_RECT_CODED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_rect_coded_hits() -> [usize; 2] {
+    INTRABC_RECT_CODED_HITS.with(std::cell::Cell::get)
+}
+
+/// lane-av1-intrabc r5: skipped (`skip == 1`) rect intrabc blocks
+/// reconstructed, as `[horz, vert]` -- see [`INTRABC_RECT_SKIPPED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_rect_skipped_hits() -> [usize; 2] {
+    INTRABC_RECT_SKIPPED_HITS.with(std::cell::Cell::get)
+}
+
+/// Current value of [`INTRABC_RECT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_rect_hits() -> usize {
+    INTRABC_RECT_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`INTRABC_RECT_HITS`]/[`INTRABC_RECT_VARTX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_rect_hits() {
+    INTRABC_RECT_HITS.with(|c| c.set(0));
+    INTRABC_RECT_VARTX_HITS.with(|c| c.set(0));
+    INTRABC_RECT_CODED_HITS.with(|c| c.set([0, 0]));
+    INTRABC_RECT_SKIPPED_HITS.with(|c| c.set([0, 0]));
+}
+
+/// Current value of [`INTRABC_RECT_VARTX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_rect_vartx_hits() -> usize {
+    INTRABC_RECT_VARTX_HITS.with(|c| c.get())
 }
 
 /// Current value of [`INTRABC_VARTX_HITS`].
@@ -7729,6 +7794,19 @@ impl Neighbours {
                 }
             }
         }
+        // lane-av1-intrabc r4: publish this coded block's own mi footprint
+        // into the intrabc MV grid's block-COVERAGE map -- every coded block,
+        // not just the intrabc ones. A later intrabc block's DV predictor is
+        // built by libaom's own row/col scans over `xd->mi[]`, which holds an
+        // `MB_MODE_INFO` for EVERY block and steps by
+        // `mi_size_wide/height[candidate->bsize]`; without this footprint a
+        // non-intrabc neighbour reads as uncovered and the scan advances it
+        // by one cell instead of by its real width.
+        fctx.intrabc_mi_grid.with(|g| {
+            if let Some((grid, _, _)) = g.borrow_mut().as_mut() {
+                grid.cover_rect(mi_r, mi_c, w_mi, h_mi);
+            }
+        });
     }
 
     /// One var-tx / split-tx LEAF's own LUMA transform dims over its mi span.
@@ -9258,7 +9336,13 @@ fn read_intra_mode_rect(
     Option<usize>,
     Option<PaletteY>,
     Option<PaletteUv>,
-    // lane-av1-rect14: Some(dv) for an intrabc 16x4/4x16 pair strip.
+    // lane-av1-intrabc: the block vector, `Some` exactly when this block's
+    // `use_intrabc` symbol came out 1 -- libaom's `read_intrabc_info` returns
+    // straight out of `read_intra_frame_mode_info` then, so every later field
+    // of the tuple is at its default (mode/uv_mode DC, no angle, no palette,
+    // no filter intra). A caller that can reconstruct intrabc at its shape
+    // takes this and calls [`decode_intrabc_rect`]; one that cannot refuses by
+    // name with the same string it always did.
     Option<(i32, i32)>,
 )> {
     // lane-av1mono: libaom guards every chroma symbol read with
@@ -9338,18 +9422,22 @@ fn read_intra_mode_rect(
         istep!("intrabc", use_intrabc as i32);
         if use_intrabc {
             hit!(INTRABC_HITS);
-            // 16x4/4x16 is a chroma PAIR ([`decode_rect4_16_intrabc`]).
-            // Every other rect shape still refuses by name: its
-            // reconstruction is `decode_intrabc_rect` (lane-av1-intrabc,
-            // not on this tree). 32x8/8x32, 64x16/16x64 and 128-axis strips
-            // own their chroma and must not take the pair helper.
-            // Every rect shape returns the DV. 16x4/4x16 reconstructs in
-            // [`decode_rect4_16_intrabc`]; other shapes in
-            // [`decode_intrabc_owned_rect`]. A shape with no coefficient
-            // table still refuses there, by the same name.
+            // libaom `read_intrabc_info`: the DV read, then an immediate
+            // return out of the mode-info read -- no `y_mode`, no `uv_mode`,
+            // no angle deltas, no palette, no filter intra. The caller owns
+            // the reconstruction at its own shape.
             let dv = read_intrabc_dv(dec, cdfs, mi_r, mi_c, (bw / MI, bh / MI), fctx);
             return Ok((
-                skip, DC_PRED, 0, DC_PRED, 0, None, None, None, None, Some(dv),
+                skip,
+                DC_PRED,
+                0,
+                DC_PRED,
+                0,
+                None,
+                None,
+                None,
+                None,
+                Some(dv),
             ));
         }
     }
@@ -10927,6 +11015,348 @@ fn decode_intra_rect_in_inter(
     Ok(())
 }
 
+/// Reconstructs one rectangular INTRABC block, `bw`x`bh` pixels at the real
+/// mi `(mi_r, mi_c)` (lane-av1-intrabc).
+///
+/// libaom treats an intrabc block as INTER for everything except the mode-info
+/// read itself: `is_inter_block` is `is_intrabc_block(mbmi) || ref > INTRA`
+/// (`blockd.h:373`), so
+///
+///  * `parse_decode_block` reads the transform size through the INTER var-tx
+///    tree (`read_tx_size_vartx`) -- [`read_block_tx_size_rect`], whose
+///    `txfm_partition` context comes off the real `TXFM_CONTEXT` bands and
+///    whose leaves publish their own resolved size back;
+///  * `predict_inter_block` predicts the WHOLE block once, from the CURRENT
+///    frame's own pre-loop-filter reconstruction, at the coded block vector
+///    with the BILINEAR kernel `read_intrabc_info` forces (`decodemv.c:913`);
+///  * `decode_token_recon_block`'s inter branch then reads one residual per
+///    transform unit, through the INTER coefficient sets
+///    ([`read_inter_plane_rect`]/[`read_inter_plane`]) with the chroma plane
+///    inheriting the colocated luma unit's coded `tx_type`.
+///
+/// Text order is libaom's: transform tree, prediction, luma residual, chroma
+/// residual, bookkeeping. A skipped block codes no residual at all -- the
+/// prediction is the reconstruction.
+#[allow(clippy::too_many_arguments)]
+fn decode_intrabc_rect(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    (bw, bh): (usize, usize),
+    skip: bool,
+    (dv_row, dv_col): (i32, i32),
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    base_q_idx: u8,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<()> {
+    hit!(INTRABC_RECT_HITS);
+    // [horz, vert]: see `INTRABC_RECT_CODED_HITS` / `INTRABC_RECT_SKIPPED_HITS`.
+    let idx = usize::from(bh > bw);
+    if skip {
+        INTRABC_RECT_SKIPPED_HITS.with(|c| {
+            let mut seen = c.get();
+            seen[idx] += 1;
+            c.set(seen);
+        });
+    } else {
+        INTRABC_RECT_CODED_HITS.with(|c| {
+            let mut seen = c.get();
+            seen[idx] += 1;
+            c.set(seen);
+        });
+    }
+    let (px, py) = (mi_c * MI, mi_r * MI);
+    let (cpx, cpy) = (px / 2, py / 2);
+    // `av1_get_max_uv_txsize(bw x bh)`: 4:2:0 halves the footprint and the
+    // halved shape's own `max_txsize_rect_lookup` entry IS that size for every
+    // shape this helper is called at, so the uv plane block is ONE unit --
+    // the same call `decode_token_recon_block`'s own chroma loop makes.
+    let (cw, ch) = (bw / 2, bh / 2);
+    // lane-av1-intrabc r2: the square stride the proven INTER path uses
+    // (`side`). The residual grids, the prediction windows AND
+    // `TxParams::stride` are all laid out at it -- the block's own width
+    // panicked `TxParams::run` on every coded VERT strip (8x16/16x32: `h`
+    // exceeds the stride).
+    let side = bw.max(bh);
+    let cside = cw.max(ch);
+    // `av1_calc_mi_size`'s 8-px-aligned grid: a block hanging over the right
+    // or bottom frame edge reads no transform-tree symbol for the units
+    // outside it.
+    let mi_cols = 2 * y.true_width.div_ceil(8);
+    let mi_rows = 2 * y.true_height.div_ceil(8);
+    let leaves = read_block_tx_size_rect(
+        dec,
+        cdfs,
+        neighbours,
+        (mi_r, mi_c),
+        (bw, bh),
+        (mi_cols, mi_rows),
+        skip, fctx,
+    )?;
+    if leaves.is_some() {
+        hit!(INTRABC_RECT_VARTX_HITS);
+    }
+    // The whole-block prediction: `predict_inter_block` runs once, before any
+    // coefficient is read. `flush_recon` first -- the source is this frame's
+    // own reconstruction, including the writes this superblock has queued.
+    flush_recon(fctx, y, u, v);
+    // `mc::predict_with_filter` writes a DENSE window; the residual machinery
+    // reads it at the square stride, so re-lay it -- the same step the inter
+    // path takes for its own square prediction buffer.
+    let mut pred_y_dense = vec![0u16; bw * bh];
+    mc::predict_with_filter(
+        &y.data, y.width, y.true_width, y.true_height,
+        mv_to_q4(px, dv_col, true), mv_to_q4(py, dv_row, true),
+        bw, bh, mc::InterpFilterKind::Bilinear, &mut pred_y_dense, fctx,
+    );
+    let mut pred_y = vec![0u16; side * side];
+    for row in 0..bh {
+        pred_y[row * side..][..bw].copy_from_slice(&pred_y_dense[row * bw..][..bw]);
+    }
+    let mut pred_u_dense = vec![0u16; cw * ch];
+    mc::predict_with_filter(
+        &u.data, u.width, u.true_width, u.true_height,
+        mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+        cw, ch, mc::InterpFilterKind::Bilinear, &mut pred_u_dense, fctx,
+    );
+    let mut pred_u = vec![0u16; cside * cside];
+    for row in 0..ch {
+        pred_u[row * cside..][..cw].copy_from_slice(&pred_u_dense[row * cw..][..cw]);
+    }
+    let mut pred_v_dense = vec![0u16; cw * ch];
+    mc::predict_with_filter(
+        &v.data, v.width, v.true_width, v.true_height,
+        mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+        cw, ch, mc::InterpFilterKind::Bilinear, &mut pred_v_dense, fctx,
+    );
+    let mut pred_v = vec![0u16; cside * cside];
+    for row in 0..ch {
+        pred_v[row * cside..][..cw].copy_from_slice(&pred_v_dense[row * cw..][..cw]);
+    }
+    let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
+    let luma_tx_type: TxType;
+    let (luma_grid, u_grid, v_grid);
+    if skip {
+        // No residual syntax at all: the prediction IS the block.
+        // Residual stride is `side` (and `cside`), not `bw`: reconstruct_mc_rect indexes
+        // `residual[row * side .. row*side + w]` for row in 0..h, so a skipped VERT strip
+        // (bh > bw) overruns a `bw * bh` slice. Bug-for-bug with the inter skip arm.
+        push_mc_rect(0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..side * side], fctx);
+        push_mc_rect(1, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_u, cside), &ZERO_RESIDUAL[..cside * cside], fctx);
+        push_mc_rect(2, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cside * cside], fctx);
+        luma_tx_type = TxType::DctDct;
+        luma_grid = Grid::Zero(side * side);
+        u_grid = Grid::Zero(cside * cside);
+        v_grid = Grid::Zero(cside * cside);
+    } else {
+        match leaves.as_ref() {
+            None => {
+                // One whole-block rectangular transform unit.
+                let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+                let (grid, tx_type) = read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    rect_inter_luma_set(bw, bh, fctx)?,
+                    (bw, bh),
+                    side,
+                    0,
+                    around[0],
+                    0,
+                    y,
+                    px,
+                    py,
+                    Pred::Inline(&pred_y, side),
+                    None,
+                    None, fctx,
+                )?;
+                luma_tx_type = tx_type;
+                luma_grid = embed_grid_stride(&grid, bw, bh, side);
+                let (ug, _) = read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    rect_inter_chroma_set(cw, ch)?,
+                    (cw, ch),
+                    cside,
+                    1,
+                    around[1],
+                    0,
+                    u,
+                    cpx,
+                    cpy,
+                    Pred::Inline(&pred_u, cside),
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?;
+                u_grid = embed_grid_stride(&ug, cw, ch, cside);
+                let (vg, _) = read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    rect_inter_chroma_set(cw, ch)?,
+                    (cw, ch),
+                    cside,
+                    2,
+                    around[2],
+                    0,
+                    v,
+                    cpx,
+                    cpy,
+                    Pred::Inline(&pred_v, cside),
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?;
+                v_grid = embed_grid_stride(&vg, cw, ch, cside);
+            }
+            Some(leaves) => {
+                // P2 (lane-av1-intrabc r2): libaom `get_transform_size` applies
+                // the split override to LUMA only, per leaf -- the step the
+                // proven inter var-tx path applies right after its own residual
+                // loop ([`Neighbours::fill_lf_grid_leaf_luma`]). Without it the
+                // leaf's own transform edges are never filtered.
+                for &(row, col, tw, th) in leaves.iter() {
+                    neighbours.fill_lf_grid_leaf_luma(
+                        (mi_r + row, mi_c + col),
+                        tw / MI,
+                        th / MI,
+                        tw as u8,
+                        th as u8,
+                    );
+                }
+                // One residual per transform unit, in the order the tree coded
+                // them; each unit reads its own neighbour-magnitude context off
+                // the units already decoded before it, and every unit adds onto
+                // its own window of the block's single prediction.
+                let mut first_tx_type = TxType::DctDct;
+                for (idx, &(row, col, tw, th)) in leaves.iter().enumerate() {
+                    let tu_mi = (mi_r + row, mi_c + col);
+                    let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+                    let tu_pred = Pred::Inline(&pred_y, side).offset(row * MI * side + col * MI);
+                    let (tu_grid, tu_tx_type) = if tw == th {
+                        let scan = default_scan(tw.min(32));
+                        let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tw / MI);
+                        read_inter_plane(
+                            dec,
+                            cdfs,
+                            inter_txbset_for(tw, reduced),
+                            scan,
+                            0,
+                            neighbours.around_mi(tu_mi, tw)[0],
+                            0,
+                            y,
+                            tu_px,
+                            tu_py,
+                            tw,
+                            base_q_idx,
+                            tu_pred,
+                            None,
+                            Some(tu_skip_ctx), fctx,
+                        )?
+                    } else {
+                        let tu_skip_ctx = neighbours.luma_skip_ctx_rect(tu_mi, tw / MI, th / MI);
+                        read_inter_plane_rect(
+                            dec,
+                            cdfs,
+                            rect_inter_luma_set(tw, th, fctx)?,
+                            (tw, th),
+                            side,
+                            0,
+                            neighbours.around_mi_rect(tu_mi, tw, th)[0],
+                            0,
+                            y,
+                            tu_px,
+                            tu_py,
+                            tu_pred,
+                            None,
+                            Some(tu_skip_ctx), fctx,
+                        )?
+                    };
+                    if idx == 0 {
+                        first_tx_type = tu_tx_type;
+                    }
+                    neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
+                }
+                // `av1_get_tx_type`'s chroma lookup lands on the colocated
+                // LUMA unit, which for a split block is the top-left one.
+                luma_tx_type = first_tx_type;
+                let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+                let (ug, _) = read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    rect_inter_chroma_set(cw, ch)?,
+                    (cw, ch),
+                    cside,
+                    1,
+                    around[1],
+                    0,
+                    u,
+                    cpx,
+                    cpy,
+                    Pred::Inline(&pred_u, cside),
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?;
+                u_grid = embed_grid_stride(&ug, cw, ch, cside);
+                let (vg, _) = read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    rect_inter_chroma_set(cw, ch)?,
+                    (cw, ch),
+                    cside,
+                    2,
+                    around[2],
+                    0,
+                    v,
+                    cpx,
+                    cpy,
+                    Pred::Inline(&pred_v, cside),
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?;
+                v_grid = embed_grid_stride(&vg, cw, ch, cside);
+                luma_grid = Grid::Zero(side * side);
+            }
+        }
+    }
+    let _ = luma_tx_type;
+    // Bookkeeping. An intrabc block publishes mode `DC_PRED` everywhere the
+    // next block reads a neighbour mode, its own block size in both `TXFM`
+    // bands (already done by `read_block_tx_size_rect`), a zeroed palette
+    // state (a stale entry would feed the next block's colour cache), and its
+    // DV into the intrabc mi grid the next block's DV predictor reads.
+    if leaves.is_some() {
+        neighbours.record_split_luma_rect_mi(
+            (mi_r, mi_c), bw, bh, DC_PRED, DC_PRED, [&u_grid, &v_grid],
+        );
+    } else {
+        neighbours.record_rect_mi(
+            (mi_r, mi_c), bw, bh, DC_PRED, DC_PRED, &[&luma_grid, &u_grid, &v_grid],
+        );
+    }
+    neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
+    neighbours.fill_lf_grid_rect(
+        (mi_r, mi_c),
+        bw / MI,
+        bh / MI,
+        bw.min(64) as u8,
+        bh.min(64) as u8,
+        0, fctx,
+    );
+    record_intrabc_mi_rect(
+        mi_r,
+        mi_c,
+        bw / MI,
+        bh / MI,
+        Some((dv_row, dv_col)),
+        neighbours,
+        fctx,
+    );
+    Ok(())
+}
+
 /// Decodes one true `bw`x`bh` `PARTITION_HORZ`/`PARTITION_VERT` intra strip
 /// (lane-intradisp r1, spec `decode_block` restricted to a 32x32 quadrant's
 /// two rect children). Only the `skip` case is supported: `skip`/`y_mode`/
@@ -10977,10 +11407,20 @@ fn decode_block_rect(
             r * (SUB / MI),
             c * (SUB / MI), fctx,
         )?;
+
     if let Some((dv_row, dv_col)) = intrabc {
-        return decode_intrabc_owned_rect(
-            dec, cdfs, neighbours, (r * (SUB / MI), c * (SUB / MI)), (bw, bh), skip,
-            (dv_row, dv_col), y, u, v, base_q_idx, tx_select, reduced_tx_set, fctx,
+        return decode_intrabc_rect(
+            dec,
+            cdfs,
+            neighbours,
+            (r * (SUB / MI), c * (SUB / MI)),
+            (bw, bh),
+            skip,
+            (dv_row, dv_col),
+            y,
+            u,
+            v,
+            base_q_idx, fctx,
         );
     }
     let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
@@ -11033,6 +11473,14 @@ fn decode_block_rect(
     } else {
         0
     };
+    // lane-av1-intrabc r3: this strip's own `set_txfm_ctxs` when the frame
+    // reads the `TXFM_CONTEXT` bands -- see [`publish_txfm_bands_if_in_inter`].
+    publish_txfm_bands_if_in_inter(
+        neighbours,
+        (mi_r, mi_c),
+        depth_to_tx_wh(bw, bh, depth, fctx),
+        (bw, bh), fctx,
+    );
     if depth != 0 || lossless(fctx) {
         hit!(TX_DEPTH_HITS);
         // lane-rectsplit r1: a split transform is predicted and reconstructed
@@ -11478,10 +11926,11 @@ fn decode_leaf_rect(
             leaf_mi.0,
             leaf_mi.1, fctx,
         )?;
+
     if let Some((dv_row, dv_col)) = intrabc {
-        decode_intrabc_owned_rect(
+        decode_intrabc_rect(
             dec, cdfs, neighbours, leaf_mi, (bw, bh), skip, (dv_row, dv_col),
-            y, u, v, base_q_idx, tx_select, reduced_tx_set, fctx,
+            y, u, v, base_q_idx, fctx,
         )?;
         return Ok(DC_PRED);
     }
@@ -11548,6 +11997,14 @@ fn decode_leaf_rect(
     } else {
         0
     };
+    // lane-av1-intrabc r3: this leaf's own `set_txfm_ctxs` when the frame reads
+    // the `TXFM_CONTEXT` bands -- see [`publish_txfm_bands_if_in_inter`].
+    publish_txfm_bands_if_in_inter(
+        neighbours,
+        leaf_mi,
+        depth_to_tx_wh(bw, bh, depth, fctx),
+        (bw, bh), fctx,
+    );
     if depth != 0 || lossless(fctx) {
         // The same per-transform-unit walk the bigger strips take
         // (`depth_to_tx_wh`: TX_16X8 -> TX_8X8 at depth 1, -> TX_4X4 at
@@ -11816,10 +12273,9 @@ fn decode_block_rect4(
         mi_c, fctx,
     )?;
     if let Some((dv_row, dv_col)) = intrabc {
-        decode_intrabc_owned_rect(
-            dec, cdfs, neighbours, (mi_r, mi_c), (bw, bh), skip, (dv_row, dv_col),
-            y, u, v, base_q_idx, tx_select,
-            fctx.reduced_tx_set_inter.with(std::cell::Cell::get), fctx,
+        decode_intrabc_rect(
+            dec, cdfs, neighbours, strip_mi, (bw, bh), skip, (dv_row, dv_col),
+            y, u, v, base_q_idx, fctx,
         )?;
         return Ok((DC_PRED, DC_PRED));
     }
@@ -16143,19 +16599,22 @@ fn decode_block_128rect(
         logical_tx as u8,
         0, fctx,
     );
-    if in_inter {
+    if in_inter || allow_intrabc_frame(fctx) {
         // `set_txfm_ctxs(tx_size, n4_w, n4_h, skip && is_inter, xd)`
         // (libaom `decodeframe.c` `decode_block`) runs for EVERY block of an
         // inter frame, intra ones included: an intra block stamps its
         // TRANSFORM size over its own footprint in both TXFM_CONTEXT bands.
-        // A key frame has no var-tx tree and its readers use the deblock grid,
-        // so this is the inter path's alone.
+        // A key frame reads those bands only when it allows intrabc
+        // ([`read_block_tx_size_rect`]'s var-tx context), and then libaom
+        // stamps here too -- lane-av1-intrabc r3.
         txfm_partition_update_rect(
             neighbours,
             (mi_r, mi_c),
             (logical_tx, logical_tx),
             (bw, bh),
         );
+    }
+    if in_inter {
         hit_do! {
             INTRA128_IN_INTER_HITS.with(|c| {
                 let mut h = c.get();
@@ -18892,13 +19351,26 @@ fn txfm_partition_update(
 /// `tx_size_cat1` row 1 instead of row 0 -- same depth VALUE, different CDF,
 /// range 39156 where the reference has 54736 (class tx-grid-published-block-side
 /// / early-return-skips-tail).
+///
+/// lane-av1-intrabc r3: an `allow_intrabc` KEY frame reads the same bands --
+/// `read_intra_frame_mode_info` returns early for an intrabc block, so
+/// [`read_block_tx_size_rect`]'s var-tx tree is the intra path's one
+/// `txfm_partition_context` reader, and it reads whatever the block ABOVE and
+/// the block LEFT published. [`decode_block`] has published on such a frame
+/// since lane-t900 r32; the RECT strips did not, so the band still held the
+/// value of an older, smaller neighbour -- measured on the 256x192 testsrc2
+/// cq45 var-tx arm: the coded 16x8 intrabc strip at mi(38,48) read ctx 14
+/// where libaom reads 13 (`left_ctx` 4 vs the 8 the 16x8 intra strip at
+/// mi(38,44) should have published), desyncing the tile there.
 fn publish_txfm_bands_if_in_inter(
     n: &mut Neighbours,
     at_mi: (usize, usize),
     (tx_w, tx_h): (usize, usize),
     (bw, bh): (usize, usize), fctx: &crate::decode::FrameCtx,
 ) {
-    if fctx.intra_in_inter_mode.with(std::cell::Cell::get).is_none() {
+    if fctx.intra_in_inter_mode.with(std::cell::Cell::get).is_none()
+        && !allow_intrabc_frame(fctx)
+    {
         return;
     }
     let (mi_r, mi_c) = at_mi;
@@ -19676,7 +20148,7 @@ fn read_block_tx_size_rect(
             (bh / MI).min(mi_rows.saturating_sub(at_mi.0)),
         );
         let mut leaves = Vec::new();
-        if !fctx.tx_select_inter.with(std::cell::Cell::get) {
+        if !fctx.tx_select_frame.with(std::cell::Cell::get) {
             for row in (0..bh / MI).step_by(tx / MI) {
                 for col in (0..bw / MI).step_by(tx / MI) {
                     leaves.push((row, col, tx, tx));
@@ -19712,7 +20184,7 @@ fn read_block_tx_size_rect(
         return Ok(Some(leaves));
     }
     let (tx_w, tx_h) = (bw, bh);
-    if !fctx.tx_select_inter.with(std::cell::Cell::get) {
+    if !fctx.tx_select_frame.with(std::cell::Cell::get) {
         // `TX_MODE_LARGEST`: no symbol at all, the whole block is one
         // transform, and `set_txfm_ctxs` records exactly what
         // `txfm_partition_update` would for that same unit.
@@ -19911,6 +20383,16 @@ fn extend_corner(corner: Grid, cw: usize, ch: usize, w: usize, h: usize) -> Grid
         full[row * w..][..cw].copy_from_slice(&corner[row * cw..][..cw]);
     }
     Grid::Own(full)
+}
+
+/// [`embed_rect_grid`] that keeps the shared zero marker zero: an all-zero
+/// transform unit's grid IS `Grid::Zero` (whose deref is the shared
+/// `ZERO_RESIDUAL`), so re-laying it would read a zero-length slice.
+fn embed_grid_stride(grid: &Grid, w: usize, h: usize, stride: usize) -> Grid {
+    if is_zero_grid(grid) {
+        return Grid::Zero(stride * stride);
+    }
+    Grid::Own(embed_rect_grid(grid, w, h, stride))
 }
 
 /// A rect coefficient grid re-laid into the square `stride x stride` grid the
@@ -23490,6 +23972,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // otherwise inherit it and read its `tx_depth` context off the inter
     // frame's stale `TXFM_CONTEXT` bands.
     fctx.tx_select_inter.with(|c| c.set(false));
+    fctx.tx_select_frame.with(|c| c.set(tx_select));
     // lane-av1-rect14: an intrabc block is `is_inter_block`, so its
     // `tx_type` CDF is the INTER set selected by this frame's
     // `reduced_tx_set`. Left at the cell default, the first coded
