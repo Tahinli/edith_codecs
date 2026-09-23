@@ -5135,7 +5135,7 @@ pub(crate) mod tests {
 
     /// lane-av1-loss64: a SKIPPED intrabc rect strip on a lossless frame
     /// zeroes its whole entropy-band footprint (libaom
-    /// `av1_reset_entropy_context`, `if (mbmi->skip_txfm)` decodemv.c:1262 ->
+    /// `av1_reset_entropy_context`, `if (mbmi->skip_txfm)` decodeframe.c:1262 ->
     /// blockd.c:58) instead of leaving the previous occupant's luma bands
     /// standing. The skip arm of `decode_intrabc_owned_rect` never wrote the
     /// luma bands: the lossless `read_block_tx_size_rect` resolves the 4x4

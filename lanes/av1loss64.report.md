@@ -66,7 +66,7 @@ reference have identical decoded bytes (`diff 0`). Artifact hashes:
 ```
 obu:  1fe5edc300a378c486abe385dad8251f3f21452f04e5a6f60f69feb48e58c8cb
 ref8: 421ca38c91a133e78b84a9a3c9f79defbddbc7163a0b3088a176f4cd50179728
-ours: f8fc6c3248e6d8782ebccd88d46f7254aa8915fd4deaf62b7b92953599709eda
+ours: 421ca38c91a133e78b84a9a3c9f79defbddbc7163a0b3088a176f4cd50179728
 ```
 
 Before the chroma-route fix, Y was exact but U/V differed at 2,488 samples;
