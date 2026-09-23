@@ -29538,11 +29538,17 @@ fn decode_inter_block(
                     // +3, so `luma_skip_ctx: Some(3)` (lane-sb128b r3's
                     // convention, as the 128 mu path above).
                     let cu_tx = chroma_tx;
-                    let mu_chroma_units = chroma_side / cu_tx;
+                    let mu_units_n = chroma_side / cu_tx;
+                    let mut u_acc: Vec<i32> = Vec::new();
+                    let mut v_acc: Vec<i32> = Vec::new();
                     for plane_idx in 1..3 {
-                        let (src, buf) = if plane_idx == 1 { (su, &mut *u) } else { (sv, &mut *v) };
-                        for cr in 0..mu_chroma_units {
-                            for cc in 0..mu_chroma_units {
+                        let (src, buf, acc) = if plane_idx == 1 {
+                            (su, &mut *u, &mut u_acc)
+                        } else {
+                            (sv, &mut *v, &mut v_acc)
+                        };
+                        for cr in 0..mu_units_n {
+                            for cc in 0..mu_units_n {
                                 let cu_mi = (rmi + cr * (cu_tx / MI), cmi + cc * (cu_tx / MI));
                                 let cu_around = neighbours.around_mi(cu_mi, cu_tx);
                                 let cu_grid = read_inter_plane(
@@ -29569,12 +29575,28 @@ fn decode_inter_block(
                                     cu_mi, cu_tx, cu_tx, plane_idx, &cu_grid,
                                 );
                                 hit!(CHROMA_SPLIT_TX_HITS);
+                                // lane-av1-444 c8: the unit's levels must ALSO
+                                // land in the block grid -- the block-tail mu
+                                // re-stamp slices the per-unit states back out
+                                // of it. This arm used to hand it a ZERO grid,
+                                // so the re-stamp (and `record_rect_mi`'s
+                                // whole-block write under it) painted the whole
+                                // block's chroma context cells 0 AFTER the
+                                // correct per-unit stamps above: the next block
+                                // read `txb_skip_ctx` base 0 where aom gathers
+                                // 1 (f52 mi(52,16) U all_zero, ctx 0 vs 8).
+                                let dst = mu_units(acc, chroma_side * chroma_side);
+                                for rr in 0..cu_tx {
+                                    let start = (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
+                                    dst[start..start + cu_tx]
+                                        .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
+                                }
                             }
                         }
                     }
                     mu_chroma = true;
-                    u_grid = Grid::Zero(chroma_side * chroma_side);
-                    v_grid = Grid::Zero(chroma_side * chroma_side);
+                    u_grid = Grid::Own(u_acc);
+                    v_grid = Grid::Own(v_acc);
                 } else {
                 u_grid = read_inter_plane(
                     dec,
@@ -30899,11 +30921,17 @@ fn decode_inter_block(
                     // +3, so `luma_skip_ctx: Some(3)` (lane-sb128b r3's
                     // convention, as the 128 mu path above).
                     let cu_tx = chroma_tx;
-                    let mu_chroma_units = chroma_side / cu_tx;
+                    let mu_units_n = chroma_side / cu_tx;
+                    let mut u_acc: Vec<i32> = Vec::new();
+                    let mut v_acc: Vec<i32> = Vec::new();
                     for plane_idx in 1..3 {
-                        let (src, buf) = if plane_idx == 1 { (su, &mut *u) } else { (sv, &mut *v) };
-                        for cr in 0..mu_chroma_units {
-                            for cc in 0..mu_chroma_units {
+                        let (src, buf, acc) = if plane_idx == 1 {
+                            (su, &mut *u, &mut u_acc)
+                        } else {
+                            (sv, &mut *v, &mut v_acc)
+                        };
+                        for cr in 0..mu_units_n {
+                            for cc in 0..mu_units_n {
                                 let cu_mi = (rmi + cr * (cu_tx / MI), cmi + cc * (cu_tx / MI));
                                 let cu_around = neighbours.around_mi(cu_mi, cu_tx);
                                 let cu_grid = read_inter_plane(
@@ -30930,12 +30958,28 @@ fn decode_inter_block(
                                     cu_mi, cu_tx, cu_tx, plane_idx, &cu_grid,
                                 );
                                 hit!(CHROMA_SPLIT_TX_HITS);
+                                // lane-av1-444 c8: the unit's levels must ALSO
+                                // land in the block grid -- the block-tail mu
+                                // re-stamp slices the per-unit states back out
+                                // of it. This arm used to hand it a ZERO grid,
+                                // so the re-stamp (and `record_rect_mi`'s
+                                // whole-block write under it) painted the whole
+                                // block's chroma context cells 0 AFTER the
+                                // correct per-unit stamps above: the next block
+                                // read `txb_skip_ctx` base 0 where aom gathers
+                                // 1 (f52 mi(52,16) U all_zero, ctx 0 vs 8).
+                                let dst = mu_units(acc, chroma_side * chroma_side);
+                                for rr in 0..cu_tx {
+                                    let start = (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
+                                    dst[start..start + cu_tx]
+                                        .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
+                                }
                             }
                         }
                     }
                     mu_chroma = true;
-                    u_grid = Grid::Zero(chroma_side * chroma_side);
-                    v_grid = Grid::Zero(chroma_side * chroma_side);
+                    u_grid = Grid::Own(u_acc);
+                    v_grid = Grid::Own(v_acc);
                 } else {
                 u_grid = read_inter_plane(
                     dec,
@@ -31751,28 +31795,64 @@ fn decode_inter_block(
     // the partial right superblock read row 1 where libaom reads row 2). The
     // units are collected here and re-stamped after that record, in mu-chunk
     // order so a later unit still wins over an earlier one.
-    let mu_chroma_units: Vec<((usize, usize), usize, Grid)> = if mu_chroma {
+    let mu_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = if mu_chroma {
         // lane-lossless2: the unit is TX_32X32 (one per 64x64 mu chunk)
         // normally and TX_4X4 on a lossless frame, where the whole chroma
         // plane block is a raster of them.
         let cu = if lossless(fctx) { 4usize } else { 32usize };
-        let span = cu * 2;
-        let (rows, cols) = if lossless(fctx) {
-            ((write_h / 2).div_ceil(cu), (write_w / 2).div_ceil(cu))
-        } else {
-            ((write_h / 64).max(1), (write_w / 64).max(1))
-        };
         let mut units = Vec::new();
-        for cr in 0..rows {
-            for cc in 0..cols {
-                let cu_mi = (at.0 + cr * (span / MI), at.1 + cc * (span / MI));
-                for (plane, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
-                    let mut unit = Vec::with_capacity(cu * cu);
-                    for rr in 0..cu {
-                        let start = (cr * cu + rr) * chroma_side + cc * cu;
-                        unit.extend_from_slice(&grid[start..start + cu]);
+        if lossless(fctx) {
+            let (rows, cols) = ((write_h / 2).div_ceil(cu), (write_w / 2).div_ceil(cu));
+            for cr in 0..rows {
+                for cc in 0..cols {
+                    let cu_mi = (at.0 + cr * (cu * 2 / MI), at.1 + cc * (cu * 2 / MI));
+                    for (plane, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
+                        let mut unit = Vec::with_capacity(cu * cu);
+                        for rr in 0..cu {
+                            let start = (cr * cu + rr) * chroma_side + cc * cu;
+                            unit.extend_from_slice(&grid[start..start + cu]);
+                        }
+                        units.push((cu_mi, plane, Grid::Own(unit), cu * 2, cu * 2));
                     }
-                    units.push((cu_mi, plane, Grid::Own(unit)));
+                }
+            }
+        } else {
+            // lane-av1-444 c8: a 64x64 mu chunk's chroma plane block is
+            // (64 >> ss) square -- ONE TX_32X32 unit per chunk at 4:2:0 but
+            // FOUR at ss 0/0 (`av1_get_max_uv_txsize` caps the unit at 32
+            // either way). Enumerate every unit at its own mi origin, its
+            // own (32 << ss)-px entropy-cell span, and its own 32x32
+            // quadrant of the assembled plane grid; stamping one quadrant's
+            // state over the whole chunk desynced the next block's
+            // `txb_skip_ctx` (f52 mi(52,16) U read base 0, aom 1).
+            let (ur, uc) = (((64usize) >> ss_y(fctx)) / cu, ((64usize) >> ss_x(fctx)) / cu);
+            let (rows, cols) = ((write_h / 64).max(1), (write_w / 64).max(1));
+            for cr in 0..rows {
+                for cc in 0..cols {
+                    for kr in 0..ur {
+                        for kc in 0..uc {
+                            let cu_mi = (
+                                at.0 + (cr * 64 + kr * (cu << ss_y(fctx))) / MI,
+                                at.1 + (cc * 64 + kc * (cu << ss_x(fctx))) / MI,
+                            );
+                            let cy = cr * ((64usize) >> ss_y(fctx)) + kr * cu;
+                            let cx = cc * ((64usize) >> ss_x(fctx)) + kc * cu;
+                            for (plane, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
+                                let mut unit = Vec::with_capacity(cu * cu);
+                                for rr in 0..cu {
+                                    let start = (cy + rr) * chroma_side + cx;
+                                    unit.extend_from_slice(&grid[start..start + cu]);
+                                }
+                                units.push((
+                                    cu_mi,
+                                    plane,
+                                    Grid::Own(unit),
+                                    cu << ss_x(fctx),
+                                    cu << ss_y(fctx),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -31909,9 +31989,12 @@ fn decode_inter_block(
         neighbours.record_uv_mode_mi(s.pair_mi.0, s.pair_mi.1, pw / MI, ph / MI, uv_predict_mode);
         hit!(INTER16_CHROMA_PAIR_HITS);
     }
-    let mu_span = if lossless(fctx) { 8 } else { 64 };
-    for (cu_mi, plane, unit) in &mu_chroma_units {
-        neighbours.record_mi_chroma(*cu_mi, mu_span, mu_span, *plane, unit);
+    // lane-av1-444 c8: each unit stamps its OWN span (32 << ss px at
+    // TX_32X32, 8 px lossless) -- a 64x64 mu chunk at ss 0/0 holds four
+    // TX_32X32 units, so the old whole-chunk 64-px span smeared one unit's
+    // state over its three neighbours' cells too.
+    for (cu_mi, plane, unit, span_w, span_h) in &mu_chroma_units {
+        neighbours.record_mi_chroma(*cu_mi, *span_w, *span_h, *plane, unit);
     }
     neighbours.record_inter_rect_mi(
         at,
