@@ -355,7 +355,8 @@ and passes again with the line restored.
   (cq30 16 blocks / 1 var-tx, cq45 12 blocks / 3 var-tx).
 - Refusal suite `-- refusal` -> **21 passed**. `hunger_games` -> 3 passed.
   `monochrome` -> 1 passed. `cdf` -> 13 passed. `non_420` -> 1 passed.
-- Full `--lib` suite: FILLED IN BELOW by the round-4 batch run on the committed tree.
+- Full `--lib` suite, re-measured 2026-09-23 on commit `db15bb5a` (see below):
+  `test result: ok. 599 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 10087.77s`
 
 ### Deferred / open
 
@@ -367,3 +368,90 @@ and passes again with the line restored.
   intrabc block today; if one ever does, the leaf's true `bsize` dims are what
   libaom's `mi_size_wide/height[candidate->bsize]` would report.
 
+
+### Verified 2026-09-23 (r4 commit `db15bb5a` was UNVERIFIED)
+
+Re-measured on that committed tree. Probe rebuilt from it
+(`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1ibc`). 8-bit comparison is
+`decode_probe <obu> <raw>` vs `ffmpeg -pix_fmt yuv420p -f rawvideo`. `git
+status --porcelain` was empty before the suite and empty after it: the suite
+ran these bytes.
+
+| stream | verdict |
+|---|---|
+| A 256x192 testsrc2 cq45 `--enable-palette=0 --enable-tx-size-search=1` | **BYTE-EXACT** (73728 B) |
+| B 512x384 testsrc2 cq45 `--enable-palette=1 --enable-tx-size-search=0` | **BYTE-EXACT** (294912 B; was 528/294912 luma) |
+
+Previously-green arms, all `cmp`-exact: `cq50p0-txs0`, `cq45p0-txs0`,
+`cq45p1-txs0`, `minp4` (`--min-partition-size=4 --max-partition-size=16`),
+`smptebars` cq40 and cq45.
+
+Unblock gate
+`a_coded_rect_intrabc_block_reconstructs_in_both_orientations` (with the
+in-gate and the tx-mode-select witness, one `cargo test` invocation):
+
+```
+horz-coded-256-cq45-pal0-txs0 1 frame(s) exact, coded rect intrabc horz=1 vert=0
+vert-coded-512-cq45-pal1-txs0 1 frame(s) exact, coded rect intrabc horz=0 vert=1
+txmode-select-256-cq45-pal0-txs1 1 frame(s) exact, coded rect intrabc horz=1 vert=0
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 656 filtered out; finished in 3.45s
+```
+
+In-gate `a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips`: 187
+rect-strip `use_intrabc` reads, 5 intrabc blocks over 5 arms, 8 frames
+compared, 0 refused, 0 mismatched, 1 rect-strip block.
+`an_intrabc_block_under_tx_mode_select_decodes_pixel_exact`: cq=30 16 blocks /
+1 var-tx, cq=45 12 blocks / 3 var-tx.
+
+Regression filters (same tree, `--nocapture --test-threads=1`):
+
+- `-- refusal` -> **21 passed** (111.09s).
+- `monochrome` -> 1 passed: 4:2:0 twin 60 frames, monochrome 60 frames
+  byte-exact vs ffmpeg.
+- `non_420` -> 1 passed.
+- `quantisation` -> 1 passed: qm-off control 3 frames, qm-on refused by name
+  (`a frame using quantisation matrices`).
+- `cdf_update` -> 1 passed: 3 `disable_cdf_update` frame headers, all frames
+  sample-exact.
+- `hunger_games` -> 3 passed.
+- `a_10bit_film` -> 5 passed (126.80s), including
+  `hg_rect64` 33 frames, `hg_arf` 37 frames, `hg_head_mvclamp` 52 frames.
+
+Wave-1 probes (release `decode_probe`, not the debug suite):
+
+- gray 60-frame key frame (`testsrc2` 320x240 2s `-pix_fmt gray -c:v
+  libaom-av1`): `OK: 60 frames`, low byte of `EC_PROBE_OUT16` EQUAL to
+  `ffmpeg -pix_fmt gray` (4,608,000 B).
+- `fixtures/bitstreams/av1-monochrome.ivf` remuxed to OBU: `OK: 60 frames`,
+  EQUAL the same way.
+- `av1-profile1-444.ivf` remuxed to OBU: REFUSED by name (`a chroma format
+  other than 4:2:0`).
+- every `crates/ec-av1/fixtures/hg_*.obu` (8 files) EQUAL to
+  `ffmpeg -pix_fmt yuv420p10le` (`EC_PROBE_OUT16`).
+
+`cargo check -p ec-av1 --all-targets` after `touch` of `lib.rs`: 0 warnings
+(`Finished dev profile in 1.15s`, `CHECK_RC=0`, no `warning:` lines).
+
+Full suite, hub process `av1ibc-suite`, `cargo test -p ec-av1 --lib --
+--test-threads=1`, `EC_AV1_REQUIRE_AOMENC=1`, `TMPDIR` on `$HOME`. Literal
+line:
+
+```
+test result: ok. 599 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 10087.77s
+```
+
+599 = 598 (this branch's base, the txrouting merge at `3ecd4a10`, before
+txbands) + this lane's one new gate. Main's `600/0/60` includes txbands' two
+gates, which are not on this branch. Not a missing test. Hub log grep for
+`FAILED` was empty. Exit 0.
+
+The first suite attempt (default threads) did not finish. After 3h20m it was
+deadlocked in `run_8x8_leaf_motion_gate`
+(`a_real_warped_causal_8x8_leaf_stream_decodes_pixel_exact`): `write_all` of
+the y4m runs before `wait_with_output`, and that aomenc's stdout pipe had been
+shrunk to 8192 bytes (a fresh pipe on this box is 65536). Both sides sat in
+`anon_pipe_write`. Pre-existing spawn pattern, not this lane's diff. Stopped
+(exit 143) and re-run single-threaded; that run is the line above.
+`deferred(concurrent stdin/stdout drain for aomenc spawns that write_all
+before wait_with_output -- unblocked by a charter that may edit the spawn
+helper)`.
