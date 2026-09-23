@@ -32513,14 +32513,22 @@ fn decode_inter_sub8_split4(
         neighbours.fill_lf_grid_rect(lmi, 1, 1, B4 as u8, B4 as u8, ref_frame.max(LAST_FRAME), fctx);
         last_skip = skip;
     }
-    // lane-sub8intra: when the chroma-reference sub-block was INTRA it coded
+    // lane-av1-444: when the chroma-reference sub-block was INTRA it coded
     // and reconstructed the group's one chroma unit itself.
-    // lane-av1-444: at ss 0/0 the group unit does not exist -- every piece
-    // coded its own U/V inside the loop above. The mode-level bookkeeping
-    // below still runs for both subsamplings: an inter 4x4 piece's
-    // `mbmi->uv_mode` is the DC_PRED default and no piece can be a palette
-    // block, exactly as the 4:2:0 path already published.
-    neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+    // lane-av1-444 (f19): at ss 0/0 the group unit does not exist -- every
+    // piece coded its own U/V inside the loop above, and every piece also
+    // wrote its own `uv_mode` neighbour state: an inter piece through
+    // `record_inter_rect_mi`'s is_inter DC stamp (libaom leaves `uv_mode`
+    // unset on an inter mbmi, `is_smooth` reads 0), an INTRA piece through
+    // [`decode_intra_sub8_leaf`]'s chroma_444 arm (libaom's per-sub-block
+    // `mbmi->uv_mode` is real there -- frame 19 of the fixture reads
+    // uv 12/11/9/12 on the four pieces of the (42,54) group, and the next
+    // block's `get_intra_edge_filter_type` must see that SMOOTH_H left
+    // neighbour, not the DC_PRED this stamp used to paint over it). So the
+    // group-level stamp runs only where the 4:2:0 group unit is real.
+    if !chroma_444 {
+        neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+    }
     // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
     // needs EVERY writer): a sub-8x8 group published no palette state, so
     // once an 8x8 leaf of the same row can BE a palette block, the group
@@ -33786,11 +33794,16 @@ fn decode_inter_sub8_rect2(
         last_skip = skip;
     }
     // lane-av1-444: at ss 0/0 the group unit does not exist -- each piece
-    // coded its own U/V inside the loop above. The mode-level bookkeeping
-    // below still runs for both subsamplings: an inter piece's
-    // `mbmi->uv_mode` is the DC_PRED default and no piece can be a palette
-    // block, exactly as the 4:2:0 path already published.
-    neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+    // coded its own U/V inside the loop above, and each piece wrote its own
+    // uv neighbour state (inter pieces through `record_inter_rect_mi`'s
+    // is_inter DC stamp, intra pieces through their own per-piece record).
+    // The group-level DC stamp below stays 4:2:0-only: at ss 0/0 it painted
+    // over an intra piece's real `uv_mode` and the next block's
+    // `get_intra_edge_filter_type` lost the smooth neighbour (same class as
+    // [`decode_inter_sub8_split4`]'s tail, frame 19 of the fixture).
+    if !chroma_444 {
+        neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+    }
     // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
     // needs EVERY writer): a sub-8x8 group published no palette state, so
     // once an 8x8 leaf of the same row can BE a palette block, the group
