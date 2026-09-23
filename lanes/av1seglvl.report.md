@@ -162,9 +162,10 @@ at every dequant site).
 
 - Full suite (`cargo test -p ec-av1 --lib -- --test-threads=1`,
   EC_AV1_REQUIRE_AOMENC/FFMPEG=1) runs on the VPS per the batch standing
-  order, staged by Main from this commit (5a96bff9, tree clean except the
-  gitignored `assets` symlink); the literal final line is recorded in the
-  merge ticket. The batch's targeted regression arms (§4) all ran green
-  locally, as did the three lane gates and the fail-pre-fix run (§3).
+  order, staged by Main from this commit (514b19f4; tree clean — the only
+  untracked path is the shared `assets` symlink, which `git archive` of the
+  commit excludes); the literal final line is recorded in the merge ticket.
+  The batch's targeted regression arms (§4) all ran green locally, as did the
+  three lane gates and the fail-pre-fix run (§3).
 - `deferred(aomenc has no recipe; unblock = an encoder that emits seg SKIP/REF on intra-only frames — needs a per-segment skip guard on the intra-frame path, where libaom's own read has a stale-segment-id wrinkle worth a look first)`: SEG_LVL_SKIP/REF on INTRA-only frames is not applied on our intra path. aomenc never emits it (features are cleared on key frames, `configure_static_seg_features:334-344`; ROI/active-map gate `!frame_is_intra_only`/`frame_is_intra_only`), and the stream-level refusal is being lifted for none of it — GLOBALMV frames still refuse wholesale. No stream in the suite can reach the shape.
 - `deferred(no decoder-side effect found; unblock = a census arm that catches configure_static_seg_features going live — the two-pass arm + parse tally in the re-scoped census is that tripwire)`: the arf `ALT_LF(-2)` tables and overlay `REF_FRAME/SKIP` tables cannot reach a stream while `static_segmentation` stays 0. The deblocker's per-segment `ALT_LF` port (`decode.rs`, lane-seg) is in place but stays unwitnessed by a real stream for the same reason.
