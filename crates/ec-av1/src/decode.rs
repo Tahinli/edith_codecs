@@ -10081,7 +10081,6 @@ fn decode_rect_split(
         let [ug, vg] = last;
         (ug, vg)
     } else if chroma_tiled {
-        eprintln!("EC_TILE chroma={chroma_w}x{chroma_h}");
         let (uw, uh, set, scan): (usize, usize, TxbSet, &[u16]) = match (chroma_w, chroma_h) {
             (64, 32) | (32, 64) => (32, 32, TxbSet::Chroma32, default_scan(32)),
             (64, 16) => (32, 16, TxbSet::ChromaRect32x16, &SCAN_32X16),
@@ -12060,11 +12059,21 @@ fn decode_block_rect4(
     let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));
     let (chroma_w, chroma_h) = (bw >> ss_x(fctx), bh >> ss_y(fctx));
     let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height, fctx);
-    let (luma_scan, chroma_scan): (&[u16], &[u16]) = if bw > bh {
-        (&SCAN_32X8, &SCAN_16X4)
-    } else {
-        (&SCAN_8X32, &SCAN_4X16)
+    // lane-av1-444: the strip's chroma shape follows the subsampling.
+    // 4:2:0 codes 16x4/4x16 (`TxbSet::Chroma8`); 4:4:4 codes the strip
+    // itself, 32x8/8x32 (`get_txsize_entropy_ctx(TX_32X8)` =
+    // `(wide_log2 + high_log2 + 1) >> 1` = the 16x16 set,
+    // `TxbSet::Chroma16`). The caller set is closed -- this reader only
+    // ever sees 32x8 / 8x32 luma and the sequence header admits ss 0/0
+    // and 1/1 only -- so the table is exhaustive.
+    let (chroma_set, chroma_scan): (TxbSet, &[u16]) = match (chroma_w, chroma_h) {
+        (16, 4) => (TxbSet::Chroma8, &SCAN_16X4[..]),
+        (4, 16) => (TxbSet::Chroma8, &SCAN_4X16[..]),
+        (32, 8) => (TxbSet::Chroma16, &SCAN_32X8[..]),
+        (8, 32) => (TxbSet::Chroma16, &SCAN_8X32[..]),
+        _ => unreachable!("decode_block_rect4 chroma shape set is closed"),
     };
+    let luma_scan: &[u16] = if bw > bh { &SCAN_32X8 } else { &SCAN_8X32 };
     let (luma_levels, u_levels, v_levels) = if skip {
         (
             vec![0i32; bw * bh],
@@ -12086,9 +12095,18 @@ fn decode_block_rect4(
         )?;
         let mut planes = Vec::with_capacity(2);
         for plane in 1..3 {
-            let default_tx = default_intra_tx_type(uv_predict_mode as u8);
+            // `av1_get_tx_type` (`blockd.h:1278`): the mode-indexed type
+            // stands only while it is a member of this tx size's set; a
+            // 32x8/8x32 chroma transform (4:4:4) squares up to TX_32X32,
+            // whose intra set is `EXT_TX_SET_DCTONLY` -- every ADST clamps
+            // to DCT_DCT there, and ADST is undefined at widths above 16.
+            let default_tx = if chroma_w.max(chroma_h) >= 32 {
+                TxType::DctDct
+            } else {
+                default_intra_tx_type(uv_predict_mode as u8)
+            };
             let skip_ctx = usize::from(around[plane].0) + usize::from(around[plane].1);
-            let mut coding = cdfs.txb(TxbSet::Chroma8, uv_predict_mode);
+            let mut coding = cdfs.txb(chroma_set, uv_predict_mode);
             let (levels, tx_type) = read_chroma_coeffs_rect(
                 dec,
                 &mut coding,
@@ -12317,7 +12335,10 @@ fn decode_rect4_16(
         } else {
             (mi_row0, mi_col0 + i)
         };
-        let has_chroma = i % 2 == 1;
+        // lane-av1-444: at 4:4:4 every strip is its own chroma reference
+        // (no mi-parity test at ss 0/0, and the strip's own chroma block is
+        // already >= 4x4) -- there is no 4:2:0 pair to close.
+        let has_chroma = i % 2 == 1 || (ss_x(fctx) == 0 && ss_y(fctx) == 0);
         let (mode, uv, _tx) = decode_rect4_16_strip(
             dec,
             cdfs,
@@ -12382,7 +12403,6 @@ fn decode_rect4_16_strip(
     let (bw, bh) = if horz { (16usize, 4usize) } else { (4, 16) };
     let (mi_w, mi_h) = (bw / MI, bh / MI);
     let scan: &[u16] = if horz { &SCAN_16X4 } else { &SCAN_4X16 };
-    let chroma_scan: &[u16] = if horz { &SCAN_8X4 } else { &SCAN_4X8 };
     let mut last_uv_mode: Option<usize> = None;
         // `decode_block_rect4`'s own neighbour rule: the coarse 16-px cell
         // aliases all four strips onto one entry, so the mi-exact map wins and
@@ -12663,12 +12683,17 @@ fn decode_rect4_16_strip(
         }
         if has_chroma {
             hit!(RECT4_16_CHROMA_HITS);
-            let pair_mi = if horz {
-                (lmi.0 - 1, lmi.1)
+            // lane-av1-444: at 4:4:4 there is no pair -- every strip is its
+            // own chroma reference and codes its own 16x4 / 4x16 chroma
+            // block. (`set_mi_offsets`'s chroma snap is the zero offset at
+            // ss 0/0, so the neighbour reads below anchor at the strip.)
+            let (pair_mi, pw, ph) = if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
+                (lmi, bw, bh)
+            } else if horz {
+                ((lmi.0 - 1, lmi.1), 16, 8)
             } else {
-                (lmi.0, lmi.1 - 1)
+                ((lmi.0, lmi.1 - 1), 8, 16)
             };
-            let (pw, ph) = if horz { (16, 8) } else { (8, 16) };
             let (ppx, ppy) = (pair_mi.1 * MI, pair_mi.0 * MI);
             let (cpx, cpy) = (ppx >> ss_x(fctx), ppy >> ss_y(fctx));
             let (cw, ch) = (pw >> ss_x(fctx), ph >> ss_y(fctx));
@@ -12728,11 +12753,21 @@ fn decode_rect4_16_strip(
                 (zeros.clone(), zeros)
             } else {
                 let around = neighbours.around_mi_rect(pair_mi, pw, ph);
+                // lane-av1-444: the strip's own 16x4 / 4x16 chroma at ss 0/0
+                // (`TxbSet::Chroma8`, `get_txsize_entropy_ctx(TX_16X4)` =
+                // the 8x8 set); 4:2:0 keeps the pair's 8x4 / 4x8.
+                let (chroma_set, chroma_scan): (TxbSet, &[u16]) = match (cw, ch) {
+                    (8, 4) => (TxbSet::ChromaRect8x4, &SCAN_8X4[..]),
+                    (4, 8) => (TxbSet::ChromaRect8x4, &SCAN_4X8[..]),
+                    (16, 4) => (TxbSet::Chroma8, &SCAN_16X4[..]),
+                    (4, 16) => (TxbSet::Chroma8, &SCAN_4X16[..]),
+                    _ => unreachable!("decode_rect4_16_strip chroma shape set is closed"),
+                };
                 let mut planes = Vec::with_capacity(2);
                 for plane in 1..3 {
                     let default_tx = default_intra_tx_type(uv_predict_mode as u8);
                     let skip_ctx = usize::from(around[plane].0) + usize::from(around[plane].1);
-                    let mut coding = cdfs.txb(TxbSet::ChromaRect8x4, uv_predict_mode);
+                    let mut coding = cdfs.txb(chroma_set, uv_predict_mode);
                     let (levels, tx_type) = read_chroma_coeffs_rect(
                         dec,
                         &mut coding,
@@ -19019,6 +19054,10 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> Result<TxbSet> {
         // set for TX_16X4/TX_4X16 (`get_txsize_entropy_ctx` = TX_8X8,
         // `txsize_log2_minus4` = 2, 64-coefficient `eob_pt`).
         (16, 4) | (4, 16) => TxbSet::Chroma8,
+        // lane-av1-444: one 32x32 unit of a 4:4:4 64x32/32x64 chroma plane
+        // block (`av1_get_max_uv_txsize` adjusts `TX_64X32`/`TX_32X64` to
+        // `TX_32X32`); `get_txsize_entropy_ctx(TX_32X32)` is the 32x32 set.
+        (32, 32) => TxbSet::Chroma32,
         _ => {
             return Err(unsupported(
                 "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
@@ -19026,6 +19065,7 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> Result<TxbSet> {
         }
     })
 }
+
 
 /// libaom `size_group_lookup[bsize]` for the block shapes this decoder's
 /// inter path reaches, from the block's TRUE footprint rather than the
@@ -19303,6 +19343,100 @@ fn read_block_tx_size_rect(
     Ok(Some(leaves))
 }
 
+/// The chroma half of a whole-block rectangular INTER transform unit (both
+/// [`decode_inter_block`] rect readers): `av1_get_max_uv_txsize(bsize)` gives
+/// the strip's own rect chroma size at 4:2:0 (one unit for the whole block),
+/// but at 4:4:4 the chroma plane block keeps the luma block's 64-px axis,
+/// which `av1_get_adjusted_tx_size` caps at 32 (`TX_64X16` -> `TX_32X16`),
+/// so it codes TWO units plane-major (every U, then every V --
+/// `decode_token_recon_block`'s inter branch loops `for plane` outside
+/// `for blk_row/blk_col` inside the one mu chunk). No unit codes a `tx_type`
+/// symbol: each inherits the block-wide luma one (`av1_get_tx_type`'s inter
+/// UV lookup at ss 0 reads the tx_type_map at its own mi, which a single-TU
+/// luma block fills uniformly).
+#[allow(clippy::too_many_arguments)]
+fn read_inter_rect_chroma(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    around: [(bool, bool, i32); 3],
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    su: Pred<'_>,
+    sv: Pred<'_>,
+    at_mi: (usize, usize),
+    (cpx, cpy): (usize, usize),
+    (write_chroma_w, write_chroma_h): (usize, usize),
+    chroma_side: usize,
+    mode_for_tx: usize,
+    luma_tx_type: TxType,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<(Grid, Grid)> {
+    let (uw, uh) = (write_chroma_w.min(32), write_chroma_h.min(32));
+    let (nx, ny) = (write_chroma_w / uw, write_chroma_h / uh);
+    let multi = nx * ny > 1;
+    let set = rect_inter_chroma_set(uw, uh)?;
+    let mut assembled: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+    if multi {
+        hit!(CHROMA_SPLIT_TX_HITS);
+        assembled = [
+            vec![0i32; chroma_side * chroma_side],
+            vec![0i32; chroma_side * chroma_side],
+        ];
+    }
+    for plane_idx in 1..=2 {
+        let (src, buf) = if plane_idx == 1 { (su, &mut *u) } else { (sv, &mut *v) };
+        for cu_row in 0..ny {
+            for cu_col in 0..nx {
+                let (span_x, span_y) = (uw << ss_x(fctx), uh << ss_y(fctx));
+                let cu_mi = (
+                    at_mi.0 + cu_row * (span_y / MI),
+                    at_mi.1 + cu_col * (span_x / MI),
+                );
+                let cu_around = if multi {
+                    neighbours.around_mi_rect(cu_mi, span_x, span_y)
+                } else {
+                    around
+                };
+                let (cu_x, cu_y) = (cpx + cu_col * uw, cpy + cu_row * uh);
+                let cu_pred = src.offset(cu_row * uh * chroma_side + cu_col * uw);
+                let cu_grid = read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    set,
+                    (uw, uh),
+                    chroma_side,
+                    plane_idx,
+                    cu_around[plane_idx],
+                    mode_for_tx,
+                    buf,
+                    cu_x,
+                    cu_y,
+                    cu_pred,
+                    Some(luma_tx_type),
+                    multi.then_some(3), fctx,
+                )?
+                .0;
+                if multi {
+                    // Immediately, so the next unit of this block reads this
+                    // one's coefficient context (libaom updates the chroma
+                    // above/left contexts per unit).
+                    neighbours.record_mi_chroma(cu_mi, span_x, span_y, plane_idx, &cu_grid);
+                    let dst = &mut assembled[plane_idx - 1];
+                    for rr in 0..uh {
+                        let start = (cu_row * uh + rr) * chroma_side + cu_col * uw;
+                        dst[start..start + uw].copy_from_slice(&cu_grid[rr * uw..][..uw]);
+                    }
+                } else {
+                    assembled[plane_idx - 1] = embed_rect_grid(&cu_grid, uw, uh, chroma_side);
+                }
+            }
+        }
+    }
+    let [ug, vg] = assembled;
+    Ok((Grid::Own(ug), Grid::Own(vg)))
+}
+
 /// [`read_inter_plane`] for a rectangular transform unit (lane-inter4 r2):
 /// the coefficients are read with the rect coefficient machinery
 /// ([`read_coeffs_rect`], whose `TxClass` handling covers the 1D `V_*`/`H_*`
@@ -19345,7 +19479,12 @@ fn read_inter_plane_rect(
         // block; a var-tx leaf passes its own neighbour-table context.
         luma_skip_ctx.unwrap_or(0)
     } else {
-        usize::from(around.0) + usize::from(around.1)
+        // libaom `get_txb_ctx`: a chroma unit's context is
+        // `combine_entropy_contexts(above, left)` plus 7, or plus 10 when the
+        // plane block is bigger than the transform. Our chroma tables hold the
+        // offset-7 rows first, so a multi-unit caller adds 3 through
+        // `luma_skip_ctx` (same convention as [`read_plane`]).
+        usize::from(around.0) + usize::from(around.1) + luma_skip_ctx.unwrap_or(0)
     };
     let mut coding = cdfs.txb(set, tx_mode);
     // libaom `read_tx_type` (`av1/decoder/decodetxb.c`): "No need to read
@@ -27679,7 +27818,11 @@ fn decode_inter_block(
     let chroma_side = side >> ss_x(fctx);
     let (write_chroma_w, write_chroma_h) = match strip_chroma {
         Some(s) if s.has_chroma => {
-            if s.horz {
+            // 4:2:0: the PAIR's 8x4 / 4x8. 4:4:4: the strip's own 16x4 /
+            // 4x16 (lane-av1-444; no pair at ss 0/0).
+            if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
+                if s.horz { (16, 4) } else { (4, 16) }
+            } else if s.horz {
                 (8, 4)
             } else {
                 (4, 8)
@@ -29032,55 +29175,24 @@ fn decode_inter_block(
                     // assembled grid (class `override-slot-on-one-arm`).
                     mu_chroma = true;
                 } else if rect_tu {
-                    // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
-                    // 2:1 strip is the strip's own rect chroma size (16x8 /
-                    // 8x16), one unit for the whole block, and it codes no
-                    // `tx_type` symbol -- it inherits the luma unit's.
-                    let (uw, uh) = (write_chroma_w, write_chroma_h);
-                    u_grid = Grid::Own(embed_rect_grid(
-                        &read_inter_plane_rect(
-                            dec,
-                            cdfs,
-                            rect_inter_chroma_set(write_chroma_w, write_chroma_h)?,
-                            (uw, uh),
-                            chroma_side,
-                            1,
-                            around[1],
-                            mode_for_tx,
-                            u,
-                            cpx,
-                            cpy,
-                            su,
-                            Some(luma_tx_type),
-                            None, fctx,
-                        )?
-                        .0,
-                        uw,
-                        uh,
+                    // One chroma read for the whole strip at 4:2:0, two
+                    // 32-capped units at 4:4:4 -- see the helper.
+                    (u_grid, v_grid) = read_inter_rect_chroma(
+                        dec,
+                        cdfs,
+                        neighbours,
+                        around,
+                        u,
+                        v,
+                        su,
+                        sv,
+                        at_mi,
+                        (cpx, cpy),
+                        (write_chroma_w, write_chroma_h),
                         chroma_side,
-                    ));
-                    v_grid = Grid::Own(embed_rect_grid(
-                        &read_inter_plane_rect(
-                            dec,
-                            cdfs,
-                            rect_inter_chroma_set(write_chroma_w, write_chroma_h)?,
-                            (uw, uh),
-                            chroma_side,
-                            2,
-                            around[2],
-                            mode_for_tx,
-                            v,
-                            cpx,
-                            cpy,
-                            sv,
-                            Some(luma_tx_type),
-                            None, fctx,
-                        )?
-                        .0,
-                        uw,
-                        uh,
-                        chroma_side,
-                    ));
+                        mode_for_tx,
+                        luma_tx_type, fctx,
+                    )?;
                 } else {
                 u_grid = read_inter_plane(
                     dec,
@@ -30375,55 +30487,24 @@ fn decode_inter_block(
                     // assembled grid (class `override-slot-on-one-arm`).
                     mu_chroma = true;
                 } else if rect_tu {
-                    // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
-                    // 2:1 strip is the strip's own rect chroma size (16x8 /
-                    // 8x16), one unit for the whole block, and it codes no
-                    // `tx_type` symbol -- it inherits the luma unit's.
-                    let (uw, uh) = (write_chroma_w, write_chroma_h);
-                    u_grid = Grid::Own(embed_rect_grid(
-                        &read_inter_plane_rect(
-                            dec,
-                            cdfs,
-                            rect_inter_chroma_set(write_chroma_w, write_chroma_h)?,
-                            (uw, uh),
-                            chroma_side,
-                            1,
-                            around_c[1],
-                            mode_for_tx,
-                            u,
-                            cpx,
-                            cpy,
-                            su,
-                            Some(luma_tx_type),
-                            None, fctx,
-                        )?
-                        .0,
-                        uw,
-                        uh,
+                    // One chroma read for the whole strip at 4:2:0, two
+                    // 32-capped units at 4:4:4 -- see the helper.
+                    (u_grid, v_grid) = read_inter_rect_chroma(
+                        dec,
+                        cdfs,
+                        neighbours,
+                        around_c,
+                        u,
+                        v,
+                        su,
+                        sv,
+                        at_mi,
+                        (cpx, cpy),
+                        (write_chroma_w, write_chroma_h),
                         chroma_side,
-                    ));
-                    v_grid = Grid::Own(embed_rect_grid(
-                        &read_inter_plane_rect(
-                            dec,
-                            cdfs,
-                            rect_inter_chroma_set(write_chroma_w, write_chroma_h)?,
-                            (uw, uh),
-                            chroma_side,
-                            2,
-                            around_c[2],
-                            mode_for_tx,
-                            v,
-                            cpx,
-                            cpy,
-                            sv,
-                            Some(luma_tx_type),
-                            None, fctx,
-                        )?
-                        .0,
-                        uw,
-                        uh,
-                        chroma_side,
-                    ));
+                        mode_for_tx,
+                        luma_tx_type, fctx,
+                    )?;
                 } else {
                 u_grid = read_inter_plane(
                     dec,
@@ -37173,8 +37254,17 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     {
                                         break;
                                     }
-                                    let strip_has_chroma = i % 2 == 1;
-                                    let pair_mi = if !strip_has_chroma {
+                                    // lane-av1-444: at 4:4:4 every strip is
+                                    // its own chroma reference
+                                    // (`is_chroma_reference`: no mi parity
+                                    // test at ss 0/0 and the strip's 16x4 /
+                                    // 4x16 chroma block is already >= 4x4),
+                                    // so there is no pair: each strip codes
+                                    // and predicts its own chroma from its
+                                    // own motion (`prev` = None).
+                                    let strip_has_chroma =
+                                        i % 2 == 1 || (ss_x(fctx) == 0 && ss_y(fctx) == 0);
+                                    let pair_mi = if !strip_has_chroma || ss_x(fctx) == 0 {
                                         at_mi
                                     } else if horz {
                                         (at_mi.0 - 1, at_mi.1)
@@ -37186,7 +37276,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             has_chroma: strip_has_chroma,
                                             horz,
                                             pair_mi,
-                                            prev: if strip_has_chroma {
+                                            prev: if strip_has_chroma && ss_x(fctx) == 1 {
                                                 fctx.inter_last_mc.with(std::cell::Cell::get)
                                             } else {
                                                 None
