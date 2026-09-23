@@ -455,3 +455,85 @@ shrunk to 8192 bytes (a fresh pipe on this box is 65536). Both sides sat in
 `deferred(concurrent stdin/stdout drain for aomenc spawns that write_all
 before wait_with_output -- unblocked by a charter that may edit the spawn
 helper)`.
+
+## 4e. Round 5 (2026-09-23) -- the skip arm's residual slice was sized `bw * bh`, not `side * side`
+
+### Root cause (the reviewer's one P1)
+
+`decode_intrabc_rect`'s skip arm (pre-fix `decode.rs:11047-11049`) passed
+`push_mc_rect(..., stride = side = bw.max(bh), w = bw, h = bh, ...,
+&ZERO_RESIDUAL[..bw * bh])` (chroma: `cw * ch`). `PlaneBuf::reconstruct_mc_rect`
+(`decode.rs:25726-25731`) indexes `residual[row * side .. row*side + w]` for
+`row in 0..h`, needing up to `(bh-1)*side + bw` elements. For a VERT strip
+(`bh > bw`) that EXCEEDS the slice: a skipped 8x32 strip reads a 256-element
+slice at stride 32 and panics at row 8 -- `range end index 264 out of range
+for slice of length 256`. The panic is a bounds check, never silent
+corruption; a HORZ strip (`bw > bh`) never overruns (`(bh-1)*side + bw <=
+bw*bh` when `bw == side`).
+
+### Why every gate missed it
+
+Two stacked blind spots. (1) Only the default single-threaded path crashes:
+at `EC_AV1_RECON_THREADS == 1` the rect is reconstructed inline through
+`ReconPlanes` (the `dense_residual` read above); on the wavefront path the
+`Residual::done` ZERO_RESIDUAL pointer-compare maps the slice to the empty
+marker and never indexes it. (2) Every existing VERT intrabc witness was
+CODED (`skip == 0`), so no gate ever walked the skip arm on a VERT strip
+(`gate-blind-to-feature`: the counters counted neither the skip flag nor the
+orientation for skipped blocks).
+
+### Fix (bug-for-bug with the proven inter path)
+
+Three lines, `decode.rs` skip arm: `&ZERO_RESIDUAL[..side * side]` and
+`&ZERO_RESIDUAL[..cside * cside]` (x2), exactly what the inter skip arm at
+`decode.rs:28906-28916` passes. `(h-1)*side + w <= side*side` for every rect
+shape.
+
+### Repro (before) / verdict (after)
+
+Reviewer's corpus at `~/.cache/tmp-av1ibcreview/repro`. Pre-fix, stock
+release `decode_probe sweep_testsrc2_cq30_p0.obu` panics with the exact
+message above (`decode.rs:25731:32`); post-fix it decodes clean, rc=0. The
+new gate arm was also proven fail-pre-fix: with only the three fix lines
+reverted, `a_coded_rect_intrabc_block_reconstructs_in_both_orientations`
+panics at the same index (`264 out of range for slice of length 256`,
+`decode.rs:25755:32` after the counter edit shifted lines).
+
+### New gate arm (non-vacuous)
+
+`stream::tests::a_coded_rect_intrabc_block_reconstructs_in_both_orientations`
+gains two SKIPPED-strip arms, `vert-skip-512-cq30-pal0-txs0` and
+`vert-skip-512-cq30-pal1-txs0` (testsrc2 512x384, `--cq-level=30`, palette
+off AND on, txs off -- the reviewer's panic recipe family). Each arm decodes
+the stream at 1 AND 4 recon threads and asserts byte-exact vs ffmpeg on
+BOTH paths, and a new counter `decode::intrabc_rect_skipped_hits()` (bump in
+`decode_intrabc_rect`, `[horz, vert]` split, reset with the coded one)
+HARD-asserts a SKIPPED VERT 2:1 strip was actually reconstructed -- an arm
+that stops producing one fails instead of passing vacuously. Measured this
+round:
+
+```
+vert-skip-512-cq30-pal0-txs0 1 frame(s) exact at 1 recon thread(s), skipped rect intrabc horz=11 vert=2
+vert-skip-512-cq30-pal0-txs0 1 frame(s) exact at 4 recon thread(s), skipped rect intrabc horz=11 vert=2
+vert-skip-512-cq30-pal1-txs0 1 frame(s) exact at 1 recon thread(s), skipped rect intrabc horz=1 vert=2
+vert-skip-512-cq30-pal1-txs0 1 frame(s) exact at 4 recon thread(s), skipped rect intrabc horz=1 vert=2
+```
+
+### Corpus sweep (post-fix, release `decode_probe` on the committed tree)
+
+All 39 obus in `~/.cache/tmp-av1ibcreview/repro` decode without panic
+(rc=0, no `panicked` in output). Byte-exactness where the reviewer compared:
+
+| group | result |
+|---|---|
+| sweep_* 16 streams with a non-zero ffmpeg ref | all 16 `cmp`-EXACT (294912 B each) |
+| sweep_* 14 streams whose ref is 0 B (the reviewer's panicking cells) | all decode clean now, no ref to compare |
+| A.obu / B.obu / C_gradients / C_mandelbrot / C_smptebars | all `cmp`-EXACT vs `*_ref.raw` |
+| D.obu | probe dispatches 0 frames (unchanged: reviewer's own `D_ours.raw`/`D_ours2.raw` are 0 B too) |
+| gray60.obu, av1-monochrome.obu | `cmp`-EXACT vs `gray_ref.raw` / `mono_ref.raw` |
+| hg_* 10-bit (8 fixtures, `EC_PROBE_OUT16`) | all 8 `cmp`-EXACT vs `ref_hg_*.raw` |
+| av1-profile1-444.obu | still REFUSED by name (`a chroma format other than 4:2:0`) |
+
+### Full suite
+
+`test result: ok. 599 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 9555.99s` — hub-supervised `--test-threads=1` on the committed tree (`86ba99f6`), exit 0.
