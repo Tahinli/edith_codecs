@@ -2489,15 +2489,8 @@ pub(crate) mod tests {
         args.push(limit);
         args.extend(extra.iter().map(|s| (*s).to_owned()));
         args.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
-        let mut child = Command::new(aomenc_path())
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+        let out = run_with_stdin(Command::new(aomenc_path())
+            .args(&args), &y4m.stdout);
         assert!(out.status.success(), "aomenc refused {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         let stream = out.stdout;
         let result = match decode_stream(&stream) {
@@ -2578,15 +2571,8 @@ pub(crate) mod tests {
                 .collect();
             args.insert(1, limit);
             args.extend(extra.iter().map(|s| (*s).to_owned()));
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused {args:?}: {}",
@@ -2614,20 +2600,10 @@ pub(crate) mod tests {
             mixed_arms += 1;
             // (3) libaom accepts it: ffmpeg's own libaom decoder produces the
             // stream without an error.
-            let mut ff = Command::new("ffmpeg")
-                .args(["-v", "error", "-f", "obu", "-i", "-", "-f", "null", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("ffmpeg failed to start");
-            let mut stdin = ff.stdin.take().expect("ffmpeg stdin");
-            let payload = stream.clone();
-            let writer = std::thread::spawn(move || {
-                let _ = stdin.write_all(&payload);
-            });
-            let out = ff.wait_with_output().expect("ffmpeg failed to run");
-            writer.join().expect("ffmpeg stdin writer");
+            let out = run_with_stdin(
+                Command::new("ffmpeg").args(["-v", "error", "-f", "obu", "-i", "-", "-f", "null", "-"]),
+                &stream,
+            );
             assert!(
                 out.status.success(),
                 "{NAME}: ffmpeg refused a stream with {mixed} mixed-frame(s): {}",
@@ -3228,7 +3204,7 @@ pub(crate) mod tests {
         let input_depth_arg = format!("--input-bit-depth={bit_depth}");
         let cq_arg = format!("--cq-level={cq}");
         let limit_arg = format!("--limit={frames}");
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg,
                 // cpu-used >= 1 keeps libaom on 64x64 superblocks at these
@@ -3255,19 +3231,7 @@ pub(crate) mod tests {
                 "--enable-paeth-intra=0", "--enable-filter-intra=0",
                 "--enable-tx-size-search=0",
                 "--obu", "-o", "-", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("write y4m");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused: {}",
@@ -3426,20 +3390,13 @@ pub(crate) mod tests {
             .output()
             .expect("ffmpeg failed to run");
         assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
                 "--cpu-used=0", "--sb-size=128", "--min-partition-size=16",
                 "--kf-max-dist=0", "--limit=1",
                 "--threads=1", "--row-mt=0", "--obu", "-o", "-", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
         let stream = out.stdout;
 
@@ -3625,7 +3582,7 @@ pub(crate) mod tests {
         assert!(format!("{err}").contains("sink says stop"), "{err}");
     }
 
-    use std::io::Write;
+    use crate::probe::run_with_stdin;
     use std::process::{Command, Stdio};
 
     /// Firing-detection gates (single-ref envelope, temporal-MV, `comp_mode`,
@@ -3699,32 +3656,12 @@ pub(crate) mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Pic> {
-        let mut child = Command::new("ffmpeg")
-            .args([
+        let out = run_with_stdin(
+            Command::new("ffmpeg").args([
                 "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("ffmpeg failed to start");
-        // lane-t900 r10: the stream goes down stdin on ITS OWN THREAD. Writing
-        // it inline deadlocks the moment ffmpeg's stdout pipe buffer (64 KiB)
-        // fills before the last input byte is written -- which is exactly what
-        // a 1.1 MB fixture decoding to 150 MB of raw 10-bit frames does
-        // (measured: 45 min, both processes at 0% CPU). A write error here is
-        // swallowed on purpose: ffmpeg's own exit status and stderr, asserted
-        // below, are the real diagnosis.
-        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
-        let payload = stream.to_vec();
-        let writer = std::thread::Builder::new()
-            .name("ec-av1-ffmpeg-in".into())
-            .spawn(move || {
-                let _ = stdin.write_all(&payload);
-            })
-            .expect("spawning the ffmpeg stdin writer");
-        let out = child.wait_with_output().expect("ffmpeg failed to run");
-        writer.join().expect("ffmpeg stdin writer thread");
+            ]),
+            stream,
+        );
         assert!(
             out.status.success(),
             "ffmpeg refused the stream: {}",
@@ -3754,33 +3691,20 @@ pub(crate) mod tests {
 
     /// As [`ffmpeg_decode_sequence`], for a MONOCHROME stream: one 8-bit luma
     /// plane per frame, exactly what `ffmpeg -pix_fmt gray -f rawvideo` writes
-    /// (lane-av1mono). Fed down a stdin writer thread for the reason the 4:2:0
-    /// helper documents.
+    /// (lane-av1mono). Fed through [`run_with_stdin`] for the reason its doc
+    /// records.
     fn ffmpeg_decode_gray_sequence(
         stream: &[u8],
         width: usize,
         height: usize,
         frames: usize,
     ) -> Vec<u8> {
-        let mut child = Command::new("ffmpeg")
-            .args([
+        let out = run_with_stdin(
+            Command::new("ffmpeg").args([
                 "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "gray", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("ffmpeg failed to start");
-        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
-        let payload = stream.to_vec();
-        let writer = std::thread::Builder::new()
-            .name("ec-av1-ffmpeg-gray-in".into())
-            .spawn(move || {
-                let _ = stdin.write_all(&payload);
-            })
-            .expect("spawning the ffmpeg stdin writer");
-        let out = child.wait_with_output().expect("ffmpeg failed to run");
-        writer.join().expect("ffmpeg stdin writer thread");
+            ]),
+            stream,
+        );
         assert!(
             out.status.success(),
             "ffmpeg refused the monochrome stream: {}",
@@ -3806,33 +3730,13 @@ pub(crate) mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Pic> {
-        let mut child = Command::new("ffmpeg")
-            .args([
+        let out = run_with_stdin(
+            Command::new("ffmpeg").args([
                 "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt",
                 "yuv420p10le", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("ffmpeg failed to start");
-        // lane-t900 r10: the stream goes down stdin on ITS OWN THREAD. Writing
-        // it inline deadlocks the moment ffmpeg's stdout pipe buffer (64 KiB)
-        // fills before the last input byte is written -- which is exactly what
-        // a 1.1 MB fixture decoding to 150 MB of raw 10-bit frames does
-        // (measured: 45 min, both processes at 0% CPU). A write error here is
-        // swallowed on purpose: ffmpeg's own exit status and stderr, asserted
-        // below, are the real diagnosis.
-        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
-        let payload = stream.to_vec();
-        let writer = std::thread::Builder::new()
-            .name("ec-av1-ffmpeg-in".into())
-            .spawn(move || {
-                let _ = stdin.write_all(&payload);
-            })
-            .expect("spawning the ffmpeg stdin writer");
-        let out = child.wait_with_output().expect("ffmpeg failed to run");
-        writer.join().expect("ffmpeg stdin writer thread");
+            ]),
+            stream,
+        );
         assert!(
             out.status.success(),
             "ffmpeg refused the stream: {}",
@@ -5041,7 +4945,7 @@ pub(crate) mod tests {
             .expect("ffmpeg failed to run");
         assert!(out.status.success(), "ffmpeg failed for testsrc2 {width}x{height}");
         let y4m = out.stdout;
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args(["--codec=av1", "--bit-depth=8", "--input-bit-depth=8"])
             .args([
                 "--passes=1",
@@ -5056,19 +4960,7 @@ pub(crate) mod tests {
                 "--enable-1to4-partitions=1",
             ])
             .args(extra)
-            .args(["--obu", "-o", "-", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m)
-            .expect("aomenc stdin write");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            .args(["--obu", "-o", "-", "-"]), &y4m);
         assert!(out.status.success(), "aomenc failed: {}", String::from_utf8_lossy(&out.stderr));
         out.stdout
     }
@@ -5616,20 +5508,8 @@ pub(crate) mod tests {
         }
         let mut arm: Vec<&str> = vec!["--arnr-maxframes=0"];
         arm.extend_from_slice(args);
-        let mut child = Command::new(aomenc_path())
-            .args(&arm)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(y4m)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+        let out = run_with_stdin(Command::new(aomenc_path())
+            .args(&arm), &y4m);
         assert!(
             out.status.success(),
             "{name} HIDDEN-ARM: aomenc refused its own recipe plus --arnr-maxframes=0: {}",
@@ -5700,7 +5580,7 @@ pub(crate) mod tests {
             );
             let depth_arg = format!("--bit-depth={bit_depth}");
             let input_depth_arg = format!("--input-bit-depth={bit_depth}");
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     // lane-defon r1: the repo's only gate that decodes hidden
                     // frames is also the only place a FORWARD KEYFRAME can be
@@ -5760,19 +5640,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the {bit_depth}-bit fixture: {}",
@@ -5867,7 +5735,7 @@ pub(crate) mod tests {
             "ffmpeg refused to generate the y4m fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1",
                 "--passes=1",
@@ -5897,19 +5765,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing the y4m fixture to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -6021,7 +5877,7 @@ pub(crate) mod tests {
             "smptebars must render byte-identical across two runs"
         );
         let y4m = y4m_a;
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1",
                 "--passes=1",
@@ -6053,19 +5909,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -6156,7 +6000,7 @@ pub(crate) mod tests {
             let y4m = y4m_a;
             let depth_arg = format!("--bit-depth={depth}");
             let input_depth_arg = format!("--input-bit-depth={depth}");
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -6189,19 +6033,7 @@ pub(crate) mod tests {
                 // Per-arm overrides go AFTER the base recipe: aomenc keeps the
                 // LAST occurrence of a repeated flag.
                 .args([&depth_arg, &input_depth_arg])
-                .args(["--obu", "-o", "-", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                .args(["--obu", "-o", "-", "-"]), &y4m);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the {depth}-bit fixture: {}",
@@ -6302,7 +6134,7 @@ pub(crate) mod tests {
                             let cq_arg = format!("--cq-level={cq}");
                             let txs_arg = format!("--enable-tx-size-search={txs}");
                             let tiles_arg = format!("--tile-columns={tiles}");
-                            let mut child = Command::new(aomenc_path())
+                            let out = run_with_stdin(Command::new(aomenc_path())
                                 .args([
                                     "--codec=av1",
                                     "--passes=1",
@@ -6324,23 +6156,7 @@ pub(crate) mod tests {
                                 // aomenc keeps the LAST occurrence of a repeated flag,
                                 // so per-arm overrides go after the base recipe.
                                 .args([&depth_arg, &input_depth_arg, &cq_arg, &txs_arg, &tiles_arg])
-                                .args(["--obu", "-o", "-", "-"])
-                                .stdin(Stdio::piped())
-                                .stdout(Stdio::piped())
-                                .stderr(Stdio::piped())
-                                .spawn()
-                                .expect("aomenc failed to start");
-                            child
-                                .stdin
-                                .take()
-                                .expect("aomenc stdin")
-                                .write_all(&y4m)
-                                .or_else(|e| match e.kind() {
-                                    std::io::ErrorKind::BrokenPipe => Ok(()),
-                                    _ => Err(e),
-                                })
-                                .expect("writing y4m to aomenc");
-                            let out = child.wait_with_output().expect("aomenc failed to run");
+                                .args(["--obu", "-o", "-", "-"]), &y4m);
                             assert!(
                                 out.status.success(),
                                 "{NAME}: aomenc refused {arm}: {}",
@@ -6553,7 +6369,7 @@ pub(crate) mod tests {
             let y4m_b = render();
             assert_eq!(y4m_a, y4m_b, "{NAME}: {arm} must render byte-identical across two runs");
             let y4m = y4m_a;
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--bit-depth=8",
@@ -6580,23 +6396,7 @@ pub(crate) mod tests {
                 ])
                 // aomenc keeps the LAST occurrence of a repeated flag.
                 .args(*extra)
-                .args(["--obu", "-o", "-", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m)
-                .or_else(|e| match e.kind() {
-                    std::io::ErrorKind::BrokenPipe => Ok(()),
-                    _ => Err(e),
-                })
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                .args(["--obu", "-o", "-", "-"]), &y4m);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused {arm}: {}",
@@ -6752,7 +6552,7 @@ pub(crate) mod tests {
             .output()
             .expect("ffmpeg")
             .stdout;
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1", "--bit-depth=8", "--input-bit-depth=8", "--passes=1",
                 "--end-usage=q", "--cpu-used=0", "--lag-in-frames=0", "--kf-max-dist=1",
@@ -6761,14 +6561,7 @@ pub(crate) mod tests {
                 "--min-partition-size=4", "--max-partition-size=64", "--sb-size=64",
                 "--tune-content=screen", "--enable-intrabc=1", "--cq-level=60",
                 "--enable-palette=1", "--enable-tx-size-search=0", "--obu", "-o", "-", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc");
-        child.stdin.take().unwrap().write_all(&y4m).ok();
-        let out = child.wait_with_output().expect("aomenc wait");
+            ]), &y4m);
         assert!(out.status.success(), "{NAME}: aomenc failed");
         crate::decode::reset_rect4_16_pair_hits();
         let frames = decode_stream(&out.stdout).unwrap_or_else(|e| panic!("{NAME}: {e}"));
@@ -6807,20 +6600,13 @@ pub(crate) mod tests {
             .output()
             .expect("ffmpeg")
             .stdout;
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1", "--cpu-used=0", "--lossless=1", "--sb-size=128",
                 "--lag-in-frames=0", "--kf-max-dist=1", "--limit=1", "--threads=1",
                 "--passes=1", "--enable-1to4-partitions=1", "--min-partition-size=4",
                 "--enable-rect-partitions=1", "--obu", "-o", "-", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc");
-        child.stdin.take().unwrap().write_all(&y4m).ok();
-        let out = child.wait_with_output().expect("aomenc wait");
+            ]), &y4m);
         assert!(out.status.success(), "{NAME}: aomenc failed");
         crate::decode::reset_rect4_16_pair_hits();
         let frames = decode_stream(&out.stdout).unwrap_or_else(|e| panic!("{NAME}: {e}"));
@@ -6916,7 +6702,7 @@ pub(crate) mod tests {
                 out.stdout
             };
             let y4m = render();
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--bit-depth=8",
@@ -6939,23 +6725,7 @@ pub(crate) mod tests {
                 ])
                 // aomenc keeps the LAST occurrence of a repeated flag.
                 .args(*extra)
-                .args(["--obu", "-o", "-", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m)
-                .or_else(|e| match e.kind() {
-                    std::io::ErrorKind::BrokenPipe => Ok(()),
-                    _ => Err(e),
-                })
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                .args(["--obu", "-o", "-", "-"]), &y4m);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused {arm}: {}",
@@ -7040,7 +6810,7 @@ pub(crate) mod tests {
                 assert!(out.status.success(), "{NAME}: ffmpeg failed for {arm}");
                 out.stdout
             };
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1", "--bit-depth=8", "--input-bit-depth=8", "--passes=1",
                     "--end-usage=q", "--cpu-used=0", "--lag-in-frames=0", "--kf-max-dist=1",
@@ -7051,23 +6821,7 @@ pub(crate) mod tests {
                 ])
                 // aomenc keeps the LAST occurrence of a repeated flag.
                 .args(*extra)
-                .args(["--obu", "-o", "-", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m)
-                .or_else(|e| match e.kind() {
-                    std::io::ErrorKind::BrokenPipe => Ok(()),
-                    _ => Err(e),
-                })
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                .args(["--obu", "-o", "-", "-"]), &y4m);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused {arm}: {}",
@@ -7181,7 +6935,7 @@ pub(crate) mod tests {
             .expect("ffmpeg failed to run");
         assert!(out.status.success(), "ffmpeg failed for {src}");
         let y4m = out.stdout;
-        let mut child = Command::new(aomenc_path())
+        let enc = run_with_stdin(Command::new(aomenc_path())
             .args(["--codec=av1"])
             .args([format!("--bit-depth={depth}"), format!("--input-bit-depth={depth}")])
             .args([
@@ -7208,23 +6962,7 @@ pub(crate) mod tests {
                 &[][..]
             })
             .args(extra)
-            .args(["--obu", "-o", "-", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m)
-            .or_else(|e| match e.kind() {
-                std::io::ErrorKind::BrokenPipe => Ok(()),
-                _ => Err(e),
-            })
-            .expect("writing y4m to aomenc");
-        let enc = child.wait_with_output().expect("aomenc failed to run");
+            .args(["--obu", "-o", "-", "-"]), &y4m);
         assert!(
             enc.status.success(),
             "aomenc refused {src} cq={cq}: {}",
@@ -7911,7 +7649,7 @@ pub(crate) mod tests {
                 let y4m = y4m_a;
                 let depth_arg = format!("--bit-depth={depth}");
                 let in_depth_arg = format!("--input-bit-depth={depth}");
-                let mut child = Command::new(aomenc_path())
+                let out = run_with_stdin(Command::new(aomenc_path())
                     .args(["--codec=av1"])
                     .args([&depth_arg, &in_depth_arg])
                     .args([
@@ -7939,25 +7677,7 @@ pub(crate) mod tests {
                     // shape this gate is about; the 10-bit arms are the
                     // untouched pinned recipe.
                     .args(if depth == 8 { &["--sb-size=64"][..] } else { &[][..] })
-                    .args(["--obu", "-o", "-", "-"])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m)
-                    .or_else(|e| match e.kind() {
-                        // aomenc rejecting the input closes the pipe before we
-                        // finish writing; its own stderr below is the report.
-                        std::io::ErrorKind::BrokenPipe => Ok(()),
-                        _ => Err(e),
-                    })
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                    .args(["--obu", "-o", "-", "-"]), &y4m);
                 assert!(
                     out.status.success(),
                     "{NAME}: aomenc refused {arm} at {depth}-bit: {}",
@@ -8092,7 +7812,7 @@ pub(crate) mod tests {
             "ffmpeg failed to render the 10-bit fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1",
                 "--passes=1",
@@ -8109,19 +7829,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the 10-bit fixture: {}",
@@ -8200,7 +7908,7 @@ pub(crate) mod tests {
             "ffmpeg failed to render the 10-bit fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                 // occurrence, so overrides go before the base list).
@@ -8243,19 +7951,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the 10-bit fixture: {}",
@@ -9520,20 +9216,8 @@ pub(crate) mod tests {
         ]);
         args.extend_from_slice(extra);
         args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-        let mut child = Command::new(aomenc_path())
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+        let out = run_with_stdin(Command::new(aomenc_path())
+            .args(&args), &y4m.stdout);
         assert!(
             out.status.success(),
             "{name}: aomenc refused the 10-bit fixture: {}",
@@ -9596,7 +9280,7 @@ pub(crate) mod tests {
             "testsrc2 must render byte-identical across two runs"
         );
         let y4m = y4m_a;
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1",
                 "--passes=1",
@@ -9623,19 +9307,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -9716,7 +9388,7 @@ pub(crate) mod tests {
                         String::from_utf8_lossy(&y4m.stderr)
                     );
                     let cq_arg = format!("--cq-level={cq}");
-                    let mut child = Command::new(aomenc_path())
+                    let out = run_with_stdin(Command::new(aomenc_path())
                         .args([
                             "--codec=av1",
                             "--passes=1",
@@ -9733,19 +9405,7 @@ pub(crate) mod tests {
                             "-o",
                             "-",
                             "-",
-                        ])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .expect("aomenc failed to start");
-                    child
-                        .stdin
-                        .take()
-                        .expect("aomenc stdin")
-                        .write_all(&y4m.stdout)
-                        .expect("writing y4m to aomenc");
-                    let out = child.wait_with_output().expect("aomenc failed to run");
+                        ]), &y4m.stdout);
                     assert!(
                         out.status.success(),
                         "aomenc refused the fixture ({source} cq={cq}): {}",
@@ -9884,7 +9544,7 @@ pub(crate) mod tests {
                         String::from_utf8_lossy(&y4m.stderr)
                     );
                     let cq_arg = format!("--cq-level={cq}");
-                    let mut child = Command::new(aomenc_path())
+                    let out = run_with_stdin(Command::new(aomenc_path())
                         .args([
                             "--codec=av1",
                             "--passes=1",
@@ -9901,19 +9561,7 @@ pub(crate) mod tests {
                             "-o",
                             "-",
                             "-",
-                        ])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .expect("aomenc failed to start");
-                    child
-                        .stdin
-                        .take()
-                        .expect("aomenc stdin")
-                        .write_all(&y4m.stdout)
-                        .expect("writing y4m to aomenc");
-                    let out = child.wait_with_output().expect("aomenc failed to run");
+                        ]), &y4m.stdout);
                     assert!(
                         out.status.success(),
                         "aomenc refused the fixture ({source} cq={cq}): {}",
@@ -10041,7 +9689,7 @@ pub(crate) mod tests {
             "ffmpeg fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                 // occurrence, so overrides go before the base list).
@@ -10073,19 +9721,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -10192,7 +9828,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -10232,19 +9868,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -10432,7 +10056,7 @@ pub(crate) mod tests {
             // walks it too, so "no rect strip fired" cannot be an artefact of
             // one cq.
             let cq = format!("--cq-level={}", [30u32, 20, 12][(attempt / 5) as usize % 3]);
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args(depth_args)
                 .arg(&cpu)
                 .arg(&cq)
@@ -10502,19 +10126,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -10720,7 +10332,7 @@ pub(crate) mod tests {
             } else {
                 &[]
             };
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args(depth_args)
                 .args([
                     // lane-defon r1: explicit on-value (aomenc keeps the FIRST
@@ -10771,19 +10383,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -10979,7 +10579,7 @@ pub(crate) mod tests {
             } else {
                 &[]
             };
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args(depth_args)
                 .args([
                     "--codec=av1",
@@ -11035,19 +10635,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -11236,7 +10824,7 @@ pub(crate) mod tests {
             } else {
                 &[]
             };
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args(depth_args)
                 .args([
                     "--codec=av1",
@@ -11292,19 +10880,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -11499,7 +11075,7 @@ pub(crate) mod tests {
             } else {
                 &[]
             };
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args(depth_args)
                 .args([
                     "--codec=av1",
@@ -11555,19 +11131,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -12280,7 +11844,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -12310,19 +11874,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -12427,7 +11979,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -12455,19 +12007,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -12584,7 +12124,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                     // occurrence, so overrides go before the base list).
@@ -12627,19 +12167,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -12823,20 +12351,8 @@ pub(crate) mod tests {
             args.insert(1, "--input-bit-depth=10".to_string());
             args.insert(1, "--bit-depth=10".to_string());
         }
-        let mut child = Command::new(aomenc_path())
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+        let out = run_with_stdin(Command::new(aomenc_path())
+            .args(&args), &y4m.stdout);
         assert!(
             out.status.success(),
             "{name}: aomenc refused the fixture: {}",
@@ -13160,20 +12676,8 @@ pub(crate) mod tests {
                 args.insert(1, "--input-bit-depth=10".to_string());
                 args.insert(1, "--bit-depth=10".to_string());
             }
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{name}: aomenc refused the fixture: {}",
@@ -13346,20 +12850,8 @@ pub(crate) mod tests {
                     "--max-partition-size=64",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -13606,28 +13098,7 @@ pub(crate) mod tests {
                     min_part, "--max-partition-size=64",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                // lane-gaterecipe r1: feed stdin from a THREAD. A
-                // single-threaded `write_all` then `wait_with_output` deadlocks
-                // the moment aomenc's stdout pipe fills before it has consumed
-                // the whole y4m -- exactly what the fine-quantiser firing arm
-                // does (one 384x256 cq-10 encode hung for 40 minutes).
-                let mut aom_stdin = child.stdin.take().expect("aomenc stdin");
-                let y4m_bytes = y4m.stdout;
-                let feeder = std::thread::Builder::new()
-                    .name("ec-av1-aomenc-in".into())
-                    .spawn(move || {
-                        aom_stdin.write_all(&y4m_bytes).expect("writing y4m to aomenc");
-                    })
-                    .expect("spawning the aomenc stdin feeder");
-                let out = child.wait_with_output().expect("aomenc failed to run");
-                feeder.join().expect("y4m feeder thread");
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -13850,20 +13321,8 @@ pub(crate) mod tests {
                     "--min-partition-size=8", "--max-partition-size=32",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -14064,20 +13523,8 @@ pub(crate) mod tests {
                     "--max-partition-size=64",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -14227,20 +13674,8 @@ pub(crate) mod tests {
                     "--enable-intrabc=0", "--enable-cfl-intra=0", "--enable-ref-frame-mvs=0",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -14432,20 +13867,8 @@ pub(crate) mod tests {
                     "--max-partition-size=32",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -14572,20 +13995,8 @@ pub(crate) mod tests {
                     "--lag-in-frames=16", "--auto-alt-ref=1", "--arnr-maxframes=0",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -14731,20 +14142,8 @@ pub(crate) mod tests {
                     "--max-partition-size=32",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -14941,20 +14340,8 @@ pub(crate) mod tests {
                     &rect_arg,
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "{NAME}: aomenc refused the fixture: {}",
@@ -15184,20 +14571,8 @@ pub(crate) mod tests {
                     obmc_arg,
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -15444,20 +14819,8 @@ pub(crate) mod tests {
                     "--max-partition-size=16",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -15684,20 +15047,8 @@ pub(crate) mod tests {
                     "--max-partition-size=16",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -16029,20 +15380,8 @@ pub(crate) mod tests {
                     &min_part_arg, "--max-partition-size=16",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -16297,20 +15636,8 @@ pub(crate) mod tests {
                     "--max-partition-size=64",
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -16443,7 +15770,7 @@ pub(crate) mod tests {
             "ffmpeg fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                 // occurrence, so overrides go before the base list).
@@ -16496,19 +15823,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -16630,7 +15945,7 @@ pub(crate) mod tests {
                 "y4m fixture length mismatch (seed {seed})"
             );
             let y4m_hash = fnv1a64(&y4m.stdout);
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -16694,19 +16009,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -16969,7 +16272,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -17047,19 +16350,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -17243,20 +16534,8 @@ pub(crate) mod tests {
             let tail = args.split_off(args.len() - 3);
             args.extend_from_slice(extra_args);
             args.extend_from_slice(&tail);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -17448,20 +16727,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -17690,20 +16957,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -17892,20 +17147,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -18107,20 +17350,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -18305,20 +17536,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -18474,20 +17693,8 @@ pub(crate) mod tests {
             "-",
             "-",
         ];
-        let mut child = Command::new(aomenc_path())
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+        let out = run_with_stdin(Command::new(aomenc_path())
+            .args(&args), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -18620,20 +17827,8 @@ pub(crate) mod tests {
             "-",
             "-",
         ];
-        let mut child = Command::new(aomenc_path())
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+        let out = run_with_stdin(Command::new(aomenc_path())
+            .args(&args), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -18759,20 +17954,8 @@ pub(crate) mod tests {
             args.push(arm.cq);
             args.extend_from_slice(&arm.extra);
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME} {}: aomenc refused the recipe: {}",
@@ -18918,20 +18101,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19010,20 +18181,8 @@ pub(crate) mod tests {
                     "--min-partition-size=8",
                     "--max-partition-size=64",
                 ]);
-                let mut child = Command::new(aomenc_path())
-                    .args(&rect_args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&rect_args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "{NAME} RECT-ARM: aomenc refused its own recipe plus the rect overrides: {}",
@@ -19217,20 +18376,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19565,20 +18712,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19792,20 +18927,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(affine_aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("affine aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(affine_aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19953,20 +19075,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -20110,7 +19220,7 @@ pub(crate) mod tests {
             "ffmpeg fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--threads=1",
                 "--row-mt=0",
@@ -20123,19 +19233,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -20232,7 +19330,7 @@ pub(crate) mod tests {
             .expect("ffmpeg failed to run");
         assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
         let encode = || {
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -20259,19 +19357,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -20349,7 +19435,7 @@ pub(crate) mod tests {
         let mut total_overrides = 0usize;
         for (rtx, filter_intra) in [("1", "0"), ("0", "1")] {
             let encode = || {
-                let mut child = Command::new(aomenc_path())
+                let out = run_with_stdin(Command::new(aomenc_path())
                     .args([
                         "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
                         "--cpu-used=4", "--threads=1", "--row-mt=0", "--sb-size=64",
@@ -20361,19 +19447,7 @@ pub(crate) mod tests {
                         &format!("--reduced-tx-type-set={rtx}"),
                         "--min-partition-size=8", "--max-partition-size=32",
                         "--obu", "-o", "-", "-",
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                    ]), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -20475,7 +19549,7 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let encode = || {
-                let mut child = Command::new(aomenc_path())
+                let out = run_with_stdin(Command::new(aomenc_path())
                     .args([
                         "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=16",
                         "--cpu-used=4", "--threads=1", "--row-mt=0", "--sb-size=64",
@@ -20487,19 +19561,7 @@ pub(crate) mod tests {
                         &format!("--input-bit-depth={depth}"),
                         &format!("--bit-depth={depth}"),
                         "--obu", "-o", "-", "-",
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                    ]), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture (depth={depth}): {}",
@@ -20646,7 +19708,7 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let encode = || {
-                let mut child = Command::new(aomenc_path())
+                let out = run_with_stdin(Command::new(aomenc_path())
                     .args([
                         "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=52",
                         "--cpu-used=0", "--threads=1", "--row-mt=0", "--sb-size=128",
@@ -20659,19 +19721,7 @@ pub(crate) mod tests {
                         &format!("--input-bit-depth={depth}"),
                         &format!("--bit-depth={depth}"),
                         "--obu", "-o", "-", "-",
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                    ]), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture (depth={depth}): {}",
@@ -20869,15 +19919,8 @@ pub(crate) mod tests {
                     args.push("--bit-depth=10".into());
                 }
                 args.extend(["--obu".into(), "-o".into(), "-".into(), "-".into()]);
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(out.status.success(), "aomenc refused {desc}: {}", String::from_utf8_lossy(&out.stderr));
                 out.stdout
             };
@@ -20993,7 +20036,7 @@ pub(crate) mod tests {
             let (width, height) = if start_x.contains("128x128") { (128usize, 128usize) } else { (64usize, 64usize) };
             for cq in [16u32, 20, 24, 28, 32, 40, 50] {
                 for rtx in ["0", "1"] {
-                    let mut child = Command::new(aomenc_path())
+                    let out = run_with_stdin(Command::new(aomenc_path())
                         .args([
                             "--codec=av1", "--passes=1", "--end-usage=q",
                             &format!("--cq-level={cq}"), "--cpu-used=4", "--threads=1",
@@ -21004,11 +20047,7 @@ pub(crate) mod tests {
                             &format!("--reduced-tx-type-set={rtx}"),
                             "--min-partition-size=8", "--max-partition-size=32",
                             "--obu", "-o", "-", "-",
-                        ])
-                        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-                        .spawn().expect("aomenc");
-                    child.stdin.take().unwrap().write_all(&y4m.stdout).unwrap();
-                    let out = child.wait_with_output().unwrap();
+                        ]), &y4m.stdout);
                     assert!(out.status.success());
                     let stream = out.stdout;
                     let before = crate::decode::rect_leaf_coeff_hits();
@@ -21171,20 +20210,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -21389,20 +20416,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -21592,20 +20607,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture (seed {seed}): {}",
@@ -21849,20 +20852,8 @@ pub(crate) mod tests {
                     args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -22044,20 +21035,8 @@ pub(crate) mod tests {
                     args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -22289,20 +21268,8 @@ pub(crate) mod tests {
                     args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -22509,20 +21476,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -22735,20 +21690,8 @@ pub(crate) mod tests {
                         "--min-partition-size=16", "--max-partition-size=32",
                         "--obu", "-o", "-", "-",
                     ];
-                    let mut child = Command::new(aomenc_path())
-                        .args(&args)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .expect("aomenc failed to start");
-                    child
-                        .stdin
-                        .take()
-                        .expect("aomenc stdin")
-                        .write_all(&y4m.stdout)
-                        .expect("writing y4m to aomenc");
-                    let out = child.wait_with_output().expect("aomenc failed to run");
+                    let out = run_with_stdin(Command::new(aomenc_path())
+                        .args(&args), &y4m.stdout);
                     assert!(
                         out.status.success(),
                         "aomenc refused the fixture: {}",
@@ -22903,7 +21846,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -22946,19 +21889,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -23212,20 +22143,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -23386,7 +22305,7 @@ pub(crate) mod tests {
                         let depth_arg = format!("--bit-depth={bit_depth}");
                         let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                         let cq_arg = format!("--cq-level={cq}");
-                        let mut child = Command::new(aomenc_path())
+                        let out = run_with_stdin(Command::new(aomenc_path())
                             .args([
                                 "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg,
                                 // cpu-used >= 1 keeps libaom on 64x64
@@ -23424,19 +22343,7 @@ pub(crate) mod tests {
                                 "--enable-paeth-intra=0", "--enable-filter-intra=0",
                                 "--enable-tx-size-search=0",
                                 "--obu", "-o", "-", "-",
-                            ])
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .expect("aomenc failed to start");
-                        child
-                            .stdin
-                            .take()
-                            .expect("aomenc stdin")
-                            .write_all(&y4m.stdout)
-                            .expect("write y4m");
-                        let out = child.wait_with_output().expect("aomenc failed to run");
+                            ]), &y4m.stdout);
                         assert!(
                             out.status.success(),
                             "aomenc refused: {}",
@@ -23626,15 +22533,8 @@ pub(crate) mod tests {
                     &max_part_arg, &min_part_arg,
                     "--obu", "-o", "-", "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
                 let stream = out.stdout;
                 let frames = match decode_stream(&stream) {
@@ -23755,15 +22655,8 @@ pub(crate) mod tests {
             "--enable-filter-intra=0",
             "--obu", "-o", "-", "-",
         ];
-        let mut child = Command::new(aomenc_path())
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child.stdin.take().unwrap().write_all(&y4m.stdout).unwrap();
-        let out = child.wait_with_output().unwrap();
+        let out = run_with_stdin(Command::new(aomenc_path())
+            .args(&args), &y4m.stdout);
         assert!(out.status.success());
         let stream = out.stdout;
         let frames = decode_stream(&stream).expect("decode");
@@ -24092,20 +22985,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -24269,8 +23150,8 @@ pub(crate) mod tests {
             let tiles = format!("--tile-columns={tile_columns}");
             // class [[aomenc-last-flag-wins]]: every flag appears exactly
             // once below, so there is no override to order.
-            let out = {
-                let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(
+                Command::new(aomenc_path())
                     .args(depth_args)
                     .arg(&cq)
                     .arg(&sb)
@@ -24320,20 +23201,9 @@ pub(crate) mod tests {
                         "-o",
                         "-",
                         "-",
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                child.wait_with_output().expect("aomenc failed to run")
-            };
+                    ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -24634,7 +23504,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -24666,19 +23536,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             if !out.status.success() {
                 refusals.push(format!(
                     "cq={cq} period={period}: aomenc itself refused the fixture"
@@ -24789,7 +23647,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -24823,19 +23681,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture (depth={depth} cq={cq})"
@@ -24965,7 +23811,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -24999,19 +23845,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture (depth={depth} cq={cq})"
@@ -25170,7 +24004,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -25206,19 +24040,7 @@ pub(crate) mod tests {
                     "-",
                     "-",
                 ])
-                .args(tile_args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                .args(tile_args), &y4m.stdout);
             if !out.status.success() {
                 refusals.push(format!(
                     "seed={seed} cq={cq}: aomenc itself refused the fixture"
@@ -25366,7 +24188,7 @@ pub(crate) mod tests {
                     "ffmpeg fixture: {}",
                     String::from_utf8_lossy(&y4m.stderr)
                 );
-                let mut child = Command::new(aomenc_path())
+                let out = run_with_stdin(Command::new(aomenc_path())
                     .args([
                         "--codec=av1",
                         "--passes=1",
@@ -25406,19 +24228,7 @@ pub(crate) mod tests {
                     } else {
                         &[][..]
                     })
-                    .args(tile_args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                    .args(tile_args), &y4m.stdout);
                 if !out.status.success() {
                     refusals.push(format!(
                         "seed={seed} cq={cq}: aomenc itself refused the fixture"
@@ -25559,7 +24369,7 @@ pub(crate) mod tests {
                     "ffmpeg fixture: {}",
                     String::from_utf8_lossy(&y4m.stderr)
                 );
-                let mut child = Command::new(aomenc_path())
+                let out = run_with_stdin(Command::new(aomenc_path())
                     .args([
                         "--codec=av1",
                         "--passes=1",
@@ -25594,19 +24404,7 @@ pub(crate) mod tests {
                         &["--input-bit-depth=10", "--bit-depth=10"][..]
                     } else {
                         &[][..]
-                    })
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                    }), &y4m.stdout);
                 if !out.status.success() {
                     refusals.push(format!("seed={seed} cq={cq}: aomenc itself refused"));
                     continue;
@@ -25782,7 +24580,7 @@ pub(crate) mod tests {
                     "ffmpeg fixture: {}",
                     String::from_utf8_lossy(&y4m.stderr)
                 );
-                let mut child = Command::new(aomenc_path())
+                let out = run_with_stdin(Command::new(aomenc_path())
                     .args([
                         "--codec=av1",
                         "--passes=1",
@@ -25827,19 +24625,7 @@ pub(crate) mod tests {
                         &["--input-bit-depth=10", "--bit-depth=10"][..]
                     } else {
                         &[][..]
-                    })
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                    }), &y4m.stdout);
                 if !out.status.success() {
                     refusals.push(format!(
                         "seed={seed} cq={cq}: aomenc itself refused the fixture"
@@ -26165,7 +24951,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -26213,19 +24999,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -26410,7 +25184,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -26448,19 +25222,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -26603,7 +25365,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -26637,19 +25399,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -26737,7 +25487,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -26771,19 +25521,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -26939,7 +25677,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -26973,19 +25711,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -27098,7 +25824,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -27133,19 +25859,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -27315,20 +26029,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -27523,20 +26225,8 @@ pub(crate) mod tests {
             args.extend(rate_args.iter().copied());
             args.extend(depth_args.iter().map(String::as_str));
             args.extend(["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -27739,7 +26429,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -27788,19 +26478,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -27920,7 +26598,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -27956,19 +26634,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28090,7 +26756,7 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -28125,19 +26791,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28271,20 +26925,8 @@ pub(crate) mod tests {
             let mut args = base.clone();
             args.extend_from_slice(extra);
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(y4m)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28490,20 +27132,8 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28659,20 +27289,8 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -28854,20 +27472,8 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -29015,20 +27621,8 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -29129,7 +27723,7 @@ pub(crate) mod tests {
             .stdout(Stdio::piped())
             .output()
             .expect("ffmpeg");
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=40",
                 "--cpu-used=2", "--threads=1", "--row-mt=0", "--sb-size=64",
@@ -29138,14 +27732,7 @@ pub(crate) mod tests {
                 "--enable-1to4-partitions=0", "--enable-palette=0",
                 "--enable-intrabc=0", "--enable-tx-size-search=0",
                 "--deltaq-mode=0", "--limit=8", "--obu", "-o", "-", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc");
-        child.stdin.take().unwrap().write_all(&y4m.stdout).unwrap();
-        let out = child.wait_with_output().expect("aomenc run");
+            ]), &y4m.stdout);
         assert!(out.status.success());
         let (frames, hidden) = decode_all_frames_vs_oracle(&out.stdout, "sb128-control-64");
         eprintln!("control sb64: {frames} frames exact ({hidden} hidden)");
@@ -29243,20 +27830,8 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -29416,20 +27991,8 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -29579,20 +28142,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -29907,20 +28458,8 @@ pub(crate) mod tests {
                     args.push(&tile_arg);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "{name}: aomenc refused the fixture: {}",
@@ -30126,20 +28665,8 @@ pub(crate) mod tests {
             let mut args = base_args.clone();
             args.extend_from_slice(extra);
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(y4m)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -30357,20 +28884,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -30579,20 +29094,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -30846,20 +29349,8 @@ pub(crate) mod tests {
                     other => panic!("unknown EC_RECTSPLIT_OFF entry {other}"),
                 });
             }
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -31200,20 +29691,8 @@ pub(crate) mod tests {
                     other => panic!("unknown EC_FISTRIP_OFF entry {other}"),
                 });
             }
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -31386,20 +29865,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -31564,20 +30031,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -31791,20 +30246,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -32028,20 +30471,8 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -32291,20 +30722,8 @@ pub(crate) mod tests {
                     "-",
                     "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -32547,20 +30966,8 @@ pub(crate) mod tests {
                     "-",
                     "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -32823,20 +31230,8 @@ pub(crate) mod tests {
                     "-",
                     "-",
                 ];
-                let mut child = Command::new(aomenc_path())
-                    .args(&args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                let out = run_with_stdin(Command::new(aomenc_path())
+                    .args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -33070,20 +31465,8 @@ pub(crate) mod tests {
             args.extend(extra.iter().copied());
             args.extend(depth_args.iter().map(String::as_str));
             args.extend(["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -33661,7 +32044,7 @@ pub(crate) mod tests {
         let cq_arg = format!("--cq-level={cq}");
         let depth_arg = format!("--bit-depth={bit_depth}");
         let input_depth_arg = format!("--input-bit-depth={bit_depth}");
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1",
                 "--passes=1",
@@ -33700,19 +32083,7 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            ]), &y4m.stdout);
         assert!(
             out.status.success(),
             "{NAME}: aomenc refused the fixture: {}",
@@ -33828,7 +32199,7 @@ pub(crate) mod tests {
                 );
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
-                let mut child = Command::new(aomenc_path())
+                let out = run_with_stdin(Command::new(aomenc_path())
                     .args([
                         "--codec=av1",
                         "--passes=1",
@@ -33858,19 +32229,7 @@ pub(crate) mod tests {
                         "-o",
                         "-",
                         "-",
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
+                    ]), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "{NAME}: aomenc refused the fixture: {}",
@@ -34030,7 +32389,7 @@ pub(crate) mod tests {
                     String::from_utf8_lossy(&y4m.stderr)
                 );
                 let encode = || {
-                    let mut child = Command::new(aomenc_path())
+                    let out = run_with_stdin(Command::new(aomenc_path())
                         .args([
                             "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
                             "--cpu-used=3", "--threads=1", "--row-mt=0", "--sb-size=64",
@@ -34042,19 +32401,7 @@ pub(crate) mod tests {
                             &format!("--input-bit-depth={depth}"),
                             &format!("--bit-depth={depth}"),
                             "--obu", "-o", "-", "-",
-                        ])
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .expect("aomenc failed to start");
-                    child
-                        .stdin
-                        .take()
-                        .expect("aomenc stdin")
-                        .write_all(&y4m.stdout)
-                        .expect("writing y4m to aomenc");
-                    let out = child.wait_with_output().expect("aomenc failed to run");
+                        ]), &y4m.stdout);
                     assert!(
                         out.status.success(),
                         "aomenc refused the fixture ({width}x{height}, depth={depth}): {}",
@@ -34212,7 +32559,7 @@ pub(crate) mod tests {
                 );
                 for cq in [20usize, 32, 45] {
                     let encode = || {
-                        let mut child = Command::new(aomenc_path())
+                        let out = run_with_stdin(Command::new(aomenc_path())
                             .args([
                                 "--codec=av1", "--passes=1", "--end-usage=q",
                                 &format!("--cq-level={cq}"),
@@ -34236,19 +32583,7 @@ pub(crate) mod tests {
                                 "--enable-smooth-intra=0", "--enable-paeth-intra=0",
                                 "--enable-filter-intra=0", "--enable-tx-size-search=0",
                                 "--obu", "-o", "-", "-",
-                            ])
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                            .expect("aomenc failed to start");
-                        child
-                            .stdin
-                            .take()
-                            .expect("aomenc stdin")
-                            .write_all(&y4m.stdout)
-                            .expect("writing y4m to aomenc");
-                        let out = child.wait_with_output().expect("aomenc failed to run");
+                            ]), &y4m.stdout);
                         assert!(
                             out.status.success(),
                             "aomenc refused the fixture ({width}x{height}, depth={depth}, \
@@ -34470,7 +32805,7 @@ pub(crate) mod tests {
             // The higher the quantiser the more 1:4 intra strips inside inter
             // frames, so the sweep walks cq 63 first.
             let cq = format!("--cq-level={}", [63u32, 55, 45, 35][(attempt / 4) as usize % 4]);
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args(depth_args)
                 .arg(&cpu)
                 .arg(&cq)
@@ -34536,19 +32871,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -34765,7 +33088,7 @@ pub(crate) mod tests {
             };
             let cq_arg = format!("--cq-level={cq}");
             let cpu_arg = format!("--cpu-used={cpu}");
-            let mut child = Command::new(aomenc_path())
+            let out = run_with_stdin(Command::new(aomenc_path())
                 .args(depth_args)
                 .args([
                     "--codec=av1",
@@ -34814,19 +33137,7 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+                ]), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -34987,7 +33298,7 @@ pub(crate) mod tests {
         // refusal, and the arm's point is the coded syntax, not the input.
         let depth_arg = format!("--bit-depth={bit_depth}");
         let cq_arg = format!("--cq-level={}", if bit_depth == 10 { 45 } else { 40 });
-        let mut child = Command::new(aomenc_path())
+        let out = run_with_stdin(Command::new(aomenc_path())
             .args([
                 "--codec=av1",
                 "--passes=1",
@@ -35012,23 +33323,7 @@ pub(crate) mod tests {
                 "--enable-intrabc=0",
             ])
             .args([&depth_arg, &cq_arg])
-            .args(["--obu", "-o", "-", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("aomenc failed to start");
-        child
-            .stdin
-            .take()
-            .expect("aomenc stdin")
-            .write_all(&y4m.stdout)
-            .or_else(|e| match e.kind() {
-                std::io::ErrorKind::BrokenPipe => Ok(()),
-                _ => Err(e),
-            })
-            .expect("writing y4m to aomenc");
-        let out = child.wait_with_output().expect("aomenc failed to run");
+            .args(["--obu", "-o", "-", "-"]), &y4m.stdout);
         assert!(
             out.status.success(),
             "{name}: aomenc refused the fixture: {}",
@@ -36407,20 +34702,8 @@ pub(crate) mod tests {
             // AOMENC FLAG PRECEDENCE (COMMON): the per-arm override goes last.
             args.push(if tiles { "--tile-columns=1" } else { "--tile-columns=0" });
             args.extend(["--obu", "-o", "-", "-"]);
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
+            let out = run_with_stdin(Command::new(aomenc_path())
+                .args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture (depth={depth} cq={cq} {width}x{height}): {}",

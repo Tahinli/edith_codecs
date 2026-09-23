@@ -15101,7 +15101,7 @@ mod tests {
     }
     use super::*;
     use crate::intra::{D45_PRED, D135_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
-    use std::io::Write;
+    use crate::probe::run_with_stdin;
     use std::process::{Command, Stdio};
 
     /// Every rectangular shape this decoder codes, at every position a block
@@ -15260,29 +15260,12 @@ mod tests {
 
     /// Decodes an AV1 OBU stream with ffmpeg and hands back the three planes.
     fn ffmpeg_decode(stream: &[u8], width: usize, height: usize) -> Picture {
-        let mut child = Command::new("ffmpeg")
-            .args([
+        let out = run_with_stdin(
+            Command::new("ffmpeg").args([
                 "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("ffmpeg failed to start");
-        // lane-t900 r10: the stream goes down stdin on ITS OWN THREAD. Writing
-        // it inline deadlocks the moment ffmpeg's stdout pipe buffer (64 KiB)
-        // fills before the last input byte is written -- which is exactly what
-        // a 1.1 MB fixture decoding to 150 MB of raw 10-bit frames does
-        // (measured: 45 min, both processes at 0% CPU). A write error here is
-        // swallowed on purpose: ffmpeg's own exit status and stderr, asserted
-        // below, are the real diagnosis.
-        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
-        let payload = stream.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&payload);
-        });
-        let out = child.wait_with_output().expect("ffmpeg failed to run");
-        writer.join().expect("ffmpeg stdin writer thread");
+            ]),
+            stream,
+        );
         assert!(
             out.status.success(),
             "ffmpeg refused the stream: {}",
@@ -17231,29 +17214,12 @@ mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Picture> {
-        let mut child = Command::new("ffmpeg")
-            .args([
+        let out = run_with_stdin(
+            Command::new("ffmpeg").args([
                 "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("ffmpeg failed to start");
-        // lane-t900 r10: the stream goes down stdin on ITS OWN THREAD. Writing
-        // it inline deadlocks the moment ffmpeg's stdout pipe buffer (64 KiB)
-        // fills before the last input byte is written -- which is exactly what
-        // a 1.1 MB fixture decoding to 150 MB of raw 10-bit frames does
-        // (measured: 45 min, both processes at 0% CPU). A write error here is
-        // swallowed on purpose: ffmpeg's own exit status and stderr, asserted
-        // below, are the real diagnosis.
-        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
-        let payload = stream.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&payload);
-        });
-        let out = child.wait_with_output().expect("ffmpeg failed to run");
-        writer.join().expect("ffmpeg stdin writer thread");
+            ]),
+            stream,
+        );
         assert!(
             out.status.success(),
             "ffmpeg refused the stream: {}",
