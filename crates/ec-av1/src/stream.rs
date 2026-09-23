@@ -28055,6 +28055,141 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1-444-128: a real `aomenc` stream whose inter frames are ONE
+    /// 128x128 PARTITION_NONE block each, non-skip, must walk that block's
+    /// chroma through the mu-chunk loop -- one TX_32X32 unit per 64x64 mu
+    /// chunk per plane at 4:2:0 (`decode_token_recon_block`'s mu walk with
+    /// `av1_get_max_uv_txsize(BLOCK_128X128)` = `TX_32X32`), each unit read
+    /// at its own origin against its own entropy-cell span and stamped
+    /// immediately (`av1_set_entropy_contexts`). The census asserts the walk
+    /// actually ran (two units per plane per coded 128-none block); the key
+    /// frame splits to 64x64 (detailed testsrc2 content), so the whole
+    /// stream stays inside the 4:2:0 paths this tree decodes. The 4:4:4 twin
+    /// of this shape (FOUR TX_32X32 units per chunk per plane) is witnessed
+    /// in `lanes/av1444128.report.md` against the merged 444 tree -- this
+    /// tree still refuses non-4:2:0 sequences by name.
+    #[test]
+    fn a_real_aomenc_128x128_none_inter_blocks_coded_chroma_per_mu_chunk_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_128x128_none_inter_blocks_coded_chroma_per_mu_chunk_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc/aomdec");
+            return;
+        }
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=128x128:rate=30",
+                "-frames:v",
+                "12",
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{NAME}: ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=8",
+            "--cpu-used=2",
+            "--threads=1",
+            "--row-mt=0",
+            "--lag-in-frames=0",
+            "--kf-max-dist=100",
+            "--enable-fwd-kf=0",
+            "--sb-size=128",
+            "--max-partition-size=128",
+            "--min-partition-size=64",
+            "--enable-palette=0",
+            "--enable-intrabc=0",
+            "--enable-cdef=0",
+            "--enable-restoration=0",
+            "--loopfilter-control=0",
+            "--enable-obmc=0",
+            "--enable-warped-motion=0",
+            "--enable-interintra-comp=0",
+            "--enable-interintra-wedge=0",
+            "--enable-smooth-interintra=0",
+            "--enable-ref-frame-mvs=0",
+            "--deltaq-mode=0",
+            "--tile-columns=0",
+            "--limit=12",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "{NAME}: aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let header = {
+            let mut parser = ec_av1_syntax::Av1Parser::new();
+            let mut pos = 0usize;
+            while let Ok(obu) = parser.parse_obu(&stream[pos..]) {
+                pos += obu.total_size;
+                if pos >= stream.len() {
+                    break;
+                }
+            }
+            parser
+                .sequence_header()
+                .map(|q| (q.use_128x128_superblock, q.color_config.bit_depth))
+        };
+        assert_eq!(
+            header,
+            Some((true, 8)),
+            "{NAME}: the encoder did not write a 128x128-superblock 8-bit sequence header -- \
+             the flags never arrived"
+        );
+        let before = (crate::decode::inter_sb128_none_hits(), crate::decode::chroma_split_tx_hits());
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, "av1444128-128none-mu-chroma");
+        let (none128, chroma_units) = (
+            crate::decode::inter_sb128_none_hits() - before.0,
+            crate::decode::chroma_split_tx_hits() - before.1,
+        );
+        assert!(
+            frames >= 11,
+            "{NAME}: only {frames} decode-order frames"
+        );
+        assert!(
+            none128 >= 8,
+            "{NAME}: only {none128} inter 128x128 PARTITION_NONE roots -- the recipe stopped \
+             exercising the shape this gate names"
+        );
+        assert!(
+            chroma_units >= 8 * 8,
+            "{NAME}: only {chroma_units} mu-chunk chroma units read -- the per-unit walk this \
+             gate names never fired (two units per plane per coded 128-none inter block)"
+        );
+        eprintln!(
+            "{NAME}: {frames} decode-order frames pixel-exact ({hidden} hidden), \
+             inter_sb128_none_hits={none128} chroma_units={chroma_units}"
+        );
+    }
+
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level
     /// partition decision is genuinely HORZ/VERT (not NONE/SPLIT) must
     /// decode pixel-exact through [`crate::decode::decode_block_rect64`] --

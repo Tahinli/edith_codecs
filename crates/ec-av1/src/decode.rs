@@ -29844,11 +29844,18 @@ fn decode_inter_block(
                     neighbours.around_mi(at, side)
                 };
                 let luma_tx_type;
-                // lane-sb128c r1: a 128x128 inter block's four chroma units
-                // are read INSIDE the luma leaf loop (one per 64x64 mu chunk);
-                // these collect them for the block-level neighbour write-back.
+                // lane-sb128c r1: a 128x128 inter block's chroma is read
+                // INSIDE the luma leaf loop (each 64x64 mu chunk's own units:
+                // one per chunk at 4:2:0, FOUR TX_32X32 at ss 0/0); these
+                // collect them for the block-level neighbour write-back.
                 let mut u_units: Vec<i32> = Vec::new();
                 let mut v_units: Vec<i32> = Vec::new();
+                // lane-av1-444-128: every luma leaf's coded tx_type, so the
+                // chunk tail's chroma units can each inherit the type of the
+                // leaf covering their own quadrant (`av1_get_tx_type`,
+                // blockd.h:1291, scales the CHROMA 4x4 position back to luma).
+                let mut leaf_tx_types: Vec<(usize, usize, usize, usize, TxType)> =
+                    Vec::new();
                 if let Some(leaves) = vartx_leaves.as_ref() {
                     // spec 5.11.17's transform tree, leaf by leaf in the order
                     // `read_var_tx_size` coded it: each unit reads its own
@@ -29914,6 +29921,12 @@ fn decode_inter_block(
                         if idx == 0 {
                             first_tx_type = tu_tx_type;
                         }
+                        // lane-av1-444-128: the per-unit chroma inheritance in
+                        // the chunk tail resolves each unit's own tx_type from
+                        // the luma leaf covering its quadrant.
+                        if side > 64 {
+                            leaf_tx_types.push((row, col, tw, th, tu_tx_type));
+                        }
                         neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
                         // lane-sb128c r1: libaom's `decode_token_recon_block`
                         // walks 64x64 "mu" chunks (`mu_blocks_wide/high =
@@ -29931,21 +29944,37 @@ fn decode_inter_block(
                                 let (cr, cc) = chunk;
                                 // `av1_get_max_uv_txsize(BLOCK_128X128)` =
                                 // `av1_get_adjusted_tx_size(TX_64X64)` =
-                                // TX_32X32: one 32x32 chroma unit per chunk.
+                                // TX_32X32. The mu walk
+                                // (`decode_token_recon_block`, decodeframe.c)
+                                // then enumerates, per plane, EVERY TX_32X32
+                                // unit of the chunk's chroma in raster order:
+                                // at ss 0/0 the chunk's chroma is 64x64 and
+                                // that is FOUR units; at 4:2:0 it is 32x32
+                                // and the loop degenerates to the one unit
+                                // this arm has always coded. `chroma_side`
+                                // already carries the subsampling.
                                 let cu_tx = 32usize;
-                                let luma_span = cu_tx * 2;
-                                let cu_mi = (at_mi.0 + cr * 16, at_mi.1 + cc * 16);
-                                let cu_around = neighbours.around_mi(cu_mi, luma_span);
-                                let (cu_x, cu_y) = (cpx + cc * cu_tx, cpy + cr * cu_tx);
+                                let chunk_chroma = chroma_side * 64 / side;
+                                let units = chunk_chroma / cu_tx;
+                                // The unit's own footprint on the LUMA mi
+                                // grid: 64 px (16 mi) at 4:2:0, 32 px (8 mi)
+                                // at ss 0/0. `around_mi` reads and
+                                // `record_mi_chroma` stamps span exactly the
+                                // unit's own cells -- `get_txb_ctx` reads the
+                                // 8 context cells of the TX_32X32 itself, and
+                                // `av1_set_entropy_contexts` memsets the same
+                                // 8, so the unit over never sees this unit's
+                                // state and the unit below always does.
+                                let unit_luma = cu_tx * (side / chroma_side);
                                 let cu_scan = default_scan(cu_tx);
                                 if lossless(fctx) {
-                                    // lane-lossless2: this chunk's chroma is
-                                    // 8x8 TX_4X4 units per plane, not one
-                                    // TX_32X32 unit.
+                                    // lane-lossless2: TX_4X4 units over this
+                                    // chunk's chroma, not one TX_32X32 unit.
                                     read_inter_chroma_lossless(
                                         dec, cdfs, neighbours, u, v, su, sv,
                                         at_mi, (cpx, cpy),
-                                        (cc * cu_tx, cr * cu_tx), (cu_tx, cu_tx),
+                                        (cc * chunk_chroma, cr * chunk_chroma),
+                                        (chunk_chroma, chunk_chroma),
                                         (write_chroma_w, write_chroma_h),
                                         chroma_side, mode_for_tx, base_q_idx,
                                         &mut u_units, &mut v_units, fctx,
@@ -29959,50 +29988,131 @@ fn decode_inter_block(
                                     } else {
                                         (sv, &mut *v)
                                     };
-                                    let cu_pred =
-                                        src.offset(cr * cu_tx * chroma_side + cc * cu_tx);
-                                    let cu_grid = read_inter_plane(
-                                        dec,
-                                        cdfs,
-                                        chroma_set,
-                                        &cu_scan,
-                                        plane_idx,
-                                        cu_around[plane_idx],
-                                        mode_for_tx,
-                                        buf,
-                                        cu_x,
-                                        cu_y,
-                                        cu_tx,
-                                        base_q_idx,
-                                        cu_pred,
-                                        Some(first_tx_type),
-                                        Some(3), fctx,
-                                    )?
-                                    .0;
-                                    // Immediately, so the NEXT chunk's unit
-                                    // reads this one's coefficient context.
-                                    neighbours.record_mi_chroma(
-                                        cu_mi, luma_span, luma_span, plane_idx, &cu_grid,
-                                    );
-                                    hit!(CHROMA_SPLIT_TX_HITS);
-                                    mu_chroma = true;
-                                    let dst = mu_units(
-                                        if plane_idx == 1 { &mut u_units } else { &mut v_units },
-                                        chroma_side * chroma_side,
-                                    );
-                                    for rr in 0..cu_tx {
-                                        let start =
-                                            (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
-                                        dst[start..start + cu_tx]
-                                            .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
+                                    // Plane-major per chunk (libaom's plane
+                                    // loop is outermost inside the mu walk);
+                                    // within a plane the units walk raster.
+                                    for ur in 0..units {
+                                        for uc in 0..units {
+                                            let unit_mi = (
+                                                at_mi.0 + cr * 16
+                                                    + ur * (unit_luma / MI),
+                                                at_mi.1 + cc * 16
+                                                    + uc * (unit_luma / MI),
+                                            );
+                                            // Per unit, AFTER the earlier
+                                            // units' stamps: this unit's
+                                            // coefficient context must see
+                                            // them.
+                                            let cu_around = neighbours
+                                                .around_mi(unit_mi, unit_luma);
+                                            let (cu_x, cu_y) = (
+                                                cpx + cc * chunk_chroma
+                                                    + uc * cu_tx,
+                                                cpy + cr * chunk_chroma
+                                                    + ur * cu_tx,
+                                            );
+                                            // `av1_get_tx_type` (blockd.h:
+                                            // 1291): an inter block's chroma
+                                            // unit never codes a tx_type; it
+                                            // inherits the coded type of the
+                                            // luma leaf covering its own
+                                            // quadrant (all of this chunk's
+                                            // leaves are read by now).
+                                            let unit_rel_mi = (
+                                                unit_mi.0 - at_mi.0,
+                                                unit_mi.1 - at_mi.1,
+                                            );
+                                            let covering = leaf_tx_types
+                                                .iter()
+                                                .copied()
+                                                // leaf (row, col) are mi but
+                                                // (tw, th) are px (the rect
+                                                // leaf path divides by MI too)
+                                                .find(
+                                                    |&(lr, lc, lw, lh, _)| {
+                                                        lr <= unit_rel_mi.0
+                                                            && unit_rel_mi.0
+                                                                < lr + lh / MI
+                                                            && lc <= unit_rel_mi.1
+                                                            && unit_rel_mi.1
+                                                                < lc + lw / MI
+                                                    },
+                                                )
+                                                .map(|(_, _, _, _, t)| t);
+                                            let cu_pred = src.offset(
+                                                (cr * chunk_chroma
+                                                    + ur * cu_tx)
+                                                    * chroma_side
+                                                    + cc * chunk_chroma
+                                                    + uc * cu_tx,
+                                            );
+                                            let cu_grid = read_inter_plane(
+                                                dec,
+                                                cdfs,
+                                                chroma_set,
+                                                &cu_scan,
+                                                plane_idx,
+                                                cu_around[plane_idx],
+                                                mode_for_tx,
+                                                buf,
+                                                cu_x,
+                                                cu_y,
+                                                cu_tx,
+                                                base_q_idx,
+                                                cu_pred,
+                                                Some(
+                                                    covering.unwrap_or(
+                                                        TxType::DctDct
+                                                    ),
+                                                ),
+                                                Some(3), fctx,
+                                            )?
+                                            .0;
+                                            // Immediately, so the NEXT unit
+                                            // reads this one's coefficient
+                                            // context.
+                                            neighbours.record_mi_chroma(
+                                                unit_mi,
+                                                unit_luma,
+                                                unit_luma,
+                                                plane_idx,
+                                                &cu_grid,
+                                            );
+                                            hit!(CHROMA_SPLIT_TX_HITS);
+                                            mu_chroma = true;
+                                            let dst = mu_units(
+                                                if plane_idx == 1 {
+                                                    &mut u_units
+                                                } else {
+                                                    &mut v_units
+                                                },
+                                                chroma_side * chroma_side,
+                                            );
+                                            for rr in 0..cu_tx {
+                                                let start = (cr * chunk_chroma
+                                                    + ur * cu_tx
+                                                    + rr)
+                                                    * chroma_side
+                                                    + cc * chunk_chroma
+                                                    + uc * cu_tx;
+                                                dst[start..start + cu_tx]
+                                                    .copy_from_slice(
+                                                        &cu_grid
+                                                            [rr * cu_tx..]
+                                                            [..cu_tx],
+                                                    );
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    // `av1_get_tx_type`'s chroma lookup scales the chroma
-                    // position back to luma, so an inter block's chroma
-                    // inherits the *first* (top-left) luma unit's coded type.
+                    // The block-level `luma_tx_type` stays the first
+                    // (top-left) luma unit's coded type; the PER-UNIT chroma
+                    // inheritance in the chunk tail above resolves each unit's
+                    // own covering leaf instead (`av1_get_tx_type`,
+                    // blockd.h:1291).
                     luma_tx_type = first_tx_type;
                     luma_grid = Grid::Zero(side * side);
                 } else if rect_tu {
@@ -31178,11 +31288,18 @@ fn decode_inter_block(
                     _ => around,
                 };
                 let luma_tx_type;
-                // lane-sb128c r1: a 128x128 inter block's four chroma units
-                // are read INSIDE the luma leaf loop (one per 64x64 mu chunk);
-                // these collect them for the block-level neighbour write-back.
+                // lane-sb128c r1: a 128x128 inter block's chroma is read
+                // INSIDE the luma leaf loop (each 64x64 mu chunk's own units:
+                // one per chunk at 4:2:0, FOUR TX_32X32 at ss 0/0); these
+                // collect them for the block-level neighbour write-back.
                 let mut u_units: Vec<i32> = Vec::new();
                 let mut v_units: Vec<i32> = Vec::new();
+                // lane-av1-444-128: every luma leaf's coded tx_type, so the
+                // chunk tail's chroma units can each inherit the type of the
+                // leaf covering their own quadrant (`av1_get_tx_type`,
+                // blockd.h:1291, scales the CHROMA 4x4 position back to luma).
+                let mut leaf_tx_types: Vec<(usize, usize, usize, usize, TxType)> =
+                    Vec::new();
                 if let Some(leaves) = vartx_leaves.as_ref() {
                     // spec 5.11.17's transform tree, leaf by leaf in the order
                     // `read_var_tx_size` coded it: each unit reads its own
@@ -31248,6 +31365,12 @@ fn decode_inter_block(
                         if idx == 0 {
                             first_tx_type = tu_tx_type;
                         }
+                        // lane-av1-444-128: the per-unit chroma inheritance in
+                        // the chunk tail resolves each unit's own tx_type from
+                        // the luma leaf covering its quadrant.
+                        if side > 64 {
+                            leaf_tx_types.push((row, col, tw, th, tu_tx_type));
+                        }
                         neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
                         // lane-sb128c r1: libaom's `decode_token_recon_block`
                         // walks 64x64 "mu" chunks (`mu_blocks_wide/high =
@@ -31265,21 +31388,37 @@ fn decode_inter_block(
                                 let (cr, cc) = chunk;
                                 // `av1_get_max_uv_txsize(BLOCK_128X128)` =
                                 // `av1_get_adjusted_tx_size(TX_64X64)` =
-                                // TX_32X32: one 32x32 chroma unit per chunk.
+                                // TX_32X32. The mu walk
+                                // (`decode_token_recon_block`, decodeframe.c)
+                                // then enumerates, per plane, EVERY TX_32X32
+                                // unit of the chunk's chroma in raster order:
+                                // at ss 0/0 the chunk's chroma is 64x64 and
+                                // that is FOUR units; at 4:2:0 it is 32x32
+                                // and the loop degenerates to the one unit
+                                // this arm has always coded. `chroma_side`
+                                // already carries the subsampling.
                                 let cu_tx = 32usize;
-                                let luma_span = cu_tx * 2;
-                                let cu_mi = (at_mi.0 + cr * 16, at_mi.1 + cc * 16);
-                                let cu_around = neighbours.around_mi(cu_mi, luma_span);
-                                let (cu_x, cu_y) = (cpx + cc * cu_tx, cpy + cr * cu_tx);
+                                let chunk_chroma = chroma_side * 64 / side;
+                                let units = chunk_chroma / cu_tx;
+                                // The unit's own footprint on the LUMA mi
+                                // grid: 64 px (16 mi) at 4:2:0, 32 px (8 mi)
+                                // at ss 0/0. `around_mi` reads and
+                                // `record_mi_chroma` stamps span exactly the
+                                // unit's own cells -- `get_txb_ctx` reads the
+                                // 8 context cells of the TX_32X32 itself, and
+                                // `av1_set_entropy_contexts` memsets the same
+                                // 8, so the unit over never sees this unit's
+                                // state and the unit below always does.
+                                let unit_luma = cu_tx * (side / chroma_side);
                                 let cu_scan = default_scan(cu_tx);
                                 if lossless(fctx) {
-                                    // lane-lossless2: this chunk's chroma is
-                                    // 8x8 TX_4X4 units per plane, not one
-                                    // TX_32X32 unit.
+                                    // lane-lossless2: TX_4X4 units over this
+                                    // chunk's chroma, not one TX_32X32 unit.
                                     read_inter_chroma_lossless(
                                         dec, cdfs, neighbours, u, v, su, sv,
                                         at_mi, (cpx, cpy),
-                                        (cc * cu_tx, cr * cu_tx), (cu_tx, cu_tx),
+                                        (cc * chunk_chroma, cr * chunk_chroma),
+                                        (chunk_chroma, chunk_chroma),
                                         (write_chroma_w, write_chroma_h),
                                         chroma_side, mode_for_tx, base_q_idx,
                                         &mut u_units, &mut v_units, fctx,
@@ -31293,50 +31432,131 @@ fn decode_inter_block(
                                     } else {
                                         (sv, &mut *v)
                                     };
-                                    let cu_pred =
-                                        src.offset(cr * cu_tx * chroma_side + cc * cu_tx);
-                                    let cu_grid = read_inter_plane(
-                                        dec,
-                                        cdfs,
-                                        chroma_set,
-                                        &cu_scan,
-                                        plane_idx,
-                                        cu_around[plane_idx],
-                                        mode_for_tx,
-                                        buf,
-                                        cu_x,
-                                        cu_y,
-                                        cu_tx,
-                                        base_q_idx,
-                                        cu_pred,
-                                        Some(first_tx_type),
-                                        Some(3), fctx,
-                                    )?
-                                    .0;
-                                    // Immediately, so the NEXT chunk's unit
-                                    // reads this one's coefficient context.
-                                    neighbours.record_mi_chroma(
-                                        cu_mi, luma_span, luma_span, plane_idx, &cu_grid,
-                                    );
-                                    hit!(CHROMA_SPLIT_TX_HITS);
-                                    mu_chroma = true;
-                                    let dst = mu_units(
-                                        if plane_idx == 1 { &mut u_units } else { &mut v_units },
-                                        chroma_side * chroma_side,
-                                    );
-                                    for rr in 0..cu_tx {
-                                        let start =
-                                            (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
-                                        dst[start..start + cu_tx]
-                                            .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
+                                    // Plane-major per chunk (libaom's plane
+                                    // loop is outermost inside the mu walk);
+                                    // within a plane the units walk raster.
+                                    for ur in 0..units {
+                                        for uc in 0..units {
+                                            let unit_mi = (
+                                                at_mi.0 + cr * 16
+                                                    + ur * (unit_luma / MI),
+                                                at_mi.1 + cc * 16
+                                                    + uc * (unit_luma / MI),
+                                            );
+                                            // Per unit, AFTER the earlier
+                                            // units' stamps: this unit's
+                                            // coefficient context must see
+                                            // them.
+                                            let cu_around = neighbours
+                                                .around_mi(unit_mi, unit_luma);
+                                            let (cu_x, cu_y) = (
+                                                cpx + cc * chunk_chroma
+                                                    + uc * cu_tx,
+                                                cpy + cr * chunk_chroma
+                                                    + ur * cu_tx,
+                                            );
+                                            // `av1_get_tx_type` (blockd.h:
+                                            // 1291): an inter block's chroma
+                                            // unit never codes a tx_type; it
+                                            // inherits the coded type of the
+                                            // luma leaf covering its own
+                                            // quadrant (all of this chunk's
+                                            // leaves are read by now).
+                                            let unit_rel_mi = (
+                                                unit_mi.0 - at_mi.0,
+                                                unit_mi.1 - at_mi.1,
+                                            );
+                                            let covering = leaf_tx_types
+                                                .iter()
+                                                .copied()
+                                                // leaf (row, col) are mi but
+                                                // (tw, th) are px (the rect
+                                                // leaf path divides by MI too)
+                                                .find(
+                                                    |&(lr, lc, lw, lh, _)| {
+                                                        lr <= unit_rel_mi.0
+                                                            && unit_rel_mi.0
+                                                                < lr + lh / MI
+                                                            && lc <= unit_rel_mi.1
+                                                            && unit_rel_mi.1
+                                                                < lc + lw / MI
+                                                    },
+                                                )
+                                                .map(|(_, _, _, _, t)| t);
+                                            let cu_pred = src.offset(
+                                                (cr * chunk_chroma
+                                                    + ur * cu_tx)
+                                                    * chroma_side
+                                                    + cc * chunk_chroma
+                                                    + uc * cu_tx,
+                                            );
+                                            let cu_grid = read_inter_plane(
+                                                dec,
+                                                cdfs,
+                                                chroma_set,
+                                                &cu_scan,
+                                                plane_idx,
+                                                cu_around[plane_idx],
+                                                mode_for_tx,
+                                                buf,
+                                                cu_x,
+                                                cu_y,
+                                                cu_tx,
+                                                base_q_idx,
+                                                cu_pred,
+                                                Some(
+                                                    covering.unwrap_or(
+                                                        TxType::DctDct
+                                                    ),
+                                                ),
+                                                Some(3), fctx,
+                                            )?
+                                            .0;
+                                            // Immediately, so the NEXT unit
+                                            // reads this one's coefficient
+                                            // context.
+                                            neighbours.record_mi_chroma(
+                                                unit_mi,
+                                                unit_luma,
+                                                unit_luma,
+                                                plane_idx,
+                                                &cu_grid,
+                                            );
+                                            hit!(CHROMA_SPLIT_TX_HITS);
+                                            mu_chroma = true;
+                                            let dst = mu_units(
+                                                if plane_idx == 1 {
+                                                    &mut u_units
+                                                } else {
+                                                    &mut v_units
+                                                },
+                                                chroma_side * chroma_side,
+                                            );
+                                            for rr in 0..cu_tx {
+                                                let start = (cr * chunk_chroma
+                                                    + ur * cu_tx
+                                                    + rr)
+                                                    * chroma_side
+                                                    + cc * chunk_chroma
+                                                    + uc * cu_tx;
+                                                dst[start..start + cu_tx]
+                                                    .copy_from_slice(
+                                                        &cu_grid
+                                                            [rr * cu_tx..]
+                                                            [..cu_tx],
+                                                    );
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    // `av1_get_tx_type`'s chroma lookup scales the chroma
-                    // position back to luma, so an inter block's chroma
-                    // inherits the *first* (top-left) luma unit's coded type.
+                    // The block-level `luma_tx_type` stays the first
+                    // (top-left) luma unit's coded type; the PER-UNIT chroma
+                    // inheritance in the chunk tail above resolves each unit's
+                    // own covering leaf instead (`av1_get_tx_type`,
+                    // blockd.h:1291).
                     luma_tx_type = first_tx_type;
                     luma_grid = Grid::Zero(side * side);
                 } else if rect_tu {
