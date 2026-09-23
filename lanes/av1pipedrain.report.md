@@ -110,3 +110,46 @@ decodes_pixel_exact` × 20 sequential runs:
 - The helper names the generic spawn/reap failures ("encoder failed to
   start/run"); per-gate diagnosis stays in each gate's own
   `assert!(status.success(), …)` on stderr, unchanged.
+
+## MERGE-SIDE FOLLOW-UPS (close, 2026-09-24)
+
+- **Merge** `2cf16389` — `git merge --no-ff lane-av1-pipedrain` from main
+  `5f5aef9a`, `ort` strategy, **zero conflicts**; create list audited: exactly
+  one new path, `lanes/av1pipedrain.report.md` (no source surprises). Second
+  parent `fccb3c72` = the pre-merge P3-fix commit on the lane (markdown only):
+  the diff stat restated to the reviewer's numbers (+1065/−2492, net −1427;
+  whitespace-insensitive +871/−2298 — self-verified via `git diff --stat` /
+  `--stat -w`), and the tile.rs ~600-line rustfmt reflow disclosed as
+  format-only churn (raw churn 1051 vs 663 whitespace-insensitive; 388 lines
+  differ by whitespace alone), semantically inert — see the note above.
+- **Merged-tree gates** (private `CARGO_TARGET_DIR=$HOME/.cache/
+  cargo-target-av1pipem`, `TMPDIR=$HOME/.cache/tmp-av1pipem`):
+  `cargo check -p ec-av1 --all-targets` rc=0, **0 warnings**. Scoped battery:
+  rect14's five + loss64's two → `test result: ok. 7 passed; 0 failed; 659
+  filtered out; finished in 5.38s`; the intrabc unblock witness
+  `a_coded_rect_intrabc_block_reconstructs_in_both_orientations` at
+  `EC_AV1_RECON_THREADS=1` and `=4` → `1 passed; 665 filtered out` both runs;
+  six real_aomenc gates through migrated pipes, led by the previously-flaked
+  `a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_
+  decodes_pixel_exact` → `test result: ok. 6 passed; 0 failed; 660 filtered
+  out; finished in 161.65s`.
+- **Full suite on the committed merge commit `2cf16389`**, hub-supervised
+  (`suite-av1pipem`, `--test-threads=1`, `EC_AV1_REQUIRE_AOMENC=1
+  EC_AV1_REQUIRE_FFMPEG=1`):
+
+  ```
+  test result: ok. 606 passed; 0 failed; 60 ignored; 0 measured; 0 filtered out; finished in 12140.12s
+  ```
+
+  Exit 0; 606 + 60 = 666 total. **The aomenc-pipe EPIPE/deadlock class this
+  lane exists to fix: zero occurrences across the whole run** — a log sweep
+  for `EPIPE|writing y4m|FAILED|panicked` over all 67k lines came back empty,
+  no kills, no standalone re-runs needed (contrast the av1intrabc close's
+  603+1 effective evidence). Slowest single gate was the encoder rate-search
+  test (~1 h, single-threaded compute, no children) — not the pipe class.
+- **Cleanup**: lane worktree `edith_codecs-av1pipe` removed, branch
+  `lane-av1-pipedrain` deleted, cache dirs matched by `cargo-target-av1pipe*`
+  + `tmp-av1pipe*` (lane, merged-tree, and verifier dirs) removed; the
+  in-flight lane-av1-444 worktree and its caches untouched. No scratch
+  harnesses or trace hooks were added by this lane; existing instruments
+  untouched.
