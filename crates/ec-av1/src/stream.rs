@@ -6330,6 +6330,12 @@ pub(crate) mod tests {
         // (arm, source, per-arm overrides AFTER the base recipe, expect_refusal,
         //  must_read_use_intrabc_on_a_rect_strip)
         let arms: [(&str, &str, &[&str], bool, bool); 8] = [
+            // lane-av1-intrabc (2026-09-20): this arm used to REFUSE here -- the
+            // 16x8 rect strip it decodes is the first block on main that reaches
+            // `decode_intrabc_rect`, so the whole arm stopped at a named refusal.
+            // Reconstruction is ported now, so the arm decodes pixel-exact and
+            // the `rect_total` assert below keeps it from quietly falling back
+            // to an ordinary-intra decode of the same block.
             ("testsrc2-cq50-txs0", TS, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
             ("smptebars-cq40-txs0", SB, &["--cq-level=40", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
             ("smptebars-cq45-txs0", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
@@ -6348,6 +6354,7 @@ pub(crate) mod tests {
         let (mut blocks_total, mut fired_arms, mut out_of_scope, mut out_of_scope_mismatch) =
             (0usize, 0u32, 0u32, 0u32);
         let mut leaf8_total = 0usize;
+        let mut rect_total = 0usize;
         for (arm, src, extra, expect_refusal, must_read) in &arms {
             let render = || {
                 let out = Command::new("ffmpeg")
@@ -6420,6 +6427,7 @@ pub(crate) mod tests {
             decode::reset_rect_intrabc_reads();
             crate::decode::reset_intrabc_hits();
             crate::decode::reset_leaf8_intrabc_hits();
+            crate::decode::reset_intrabc_rect_hits();
             let decoded = decode_stream(&stream);
             let reads = decode::rect_intrabc_reads();
             // Blocks that decoded `use_intrabc == 1` (square path), i.e. that
@@ -6434,6 +6442,7 @@ pub(crate) mod tests {
             // `gate-blind-to-feature`).
             let leaf8 = crate::decode::leaf8_intrabc_hits();
             leaf8_total += leaf8;
+            rect_total += crate::decode::intrabc_rect_hits();
             if *arm == "testsrc2-cq55-leaf8" {
                 assert!(
                     leaf8 > 0,
@@ -6510,7 +6519,9 @@ pub(crate) mod tests {
              {refused} refused by name, {frames_compared} frames compared, \
              {out_of_scope} out of scope ({out_of_scope_mismatch} mismatched)"
         );
-        eprintln!("{NAME}: {leaf8_total} intrabc block(s) at an 8x8 leaf");
+        eprintln!(
+            "{NAME}: {rect_total} intrabc block(s) on a HORZ/VERT rect strip              (decode_intrabc_rect)"
+        );
         assert!(reads_total > 0, "{NAME}: gate is vacuous -- no arm read the symbol");
         assert!(
             leaf8_total > 0,
@@ -6520,10 +6531,16 @@ pub(crate) mod tests {
             blocks_total > 0 && fired_arms > 0,
             "{NAME}: gate is vacuous -- no compared arm actually decoded an intrabc block"
         );
-        assert_eq!(
-            refused, 0,
-            "{NAME}: a rect-strip intrabc block refused -- reconstruction regressed"
+        assert!(
+            rect_total > 0,
+            "{NAME}: no arm decoded an intrabc block on a HORZ/VERT rect strip -- \
+             `decode_intrabc_rect` is untested"
         );
+        // lane-av1-intrabc: this used to be exactly one -- the 2:1 rect strips
+        // now reconstruct. The 1:4 pair strips (`decode_rect4_16_strip` et al.)
+        // still refuse by name, but no arm HERE reaches that shape; it stays
+        // pinned by `refusal_inventory`'s own gate.
+        assert_eq!(refused, 0, "{NAME}: an arm still refuses by name");
         assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
         assert_eq!(
             out_of_scope_mismatch, 0,
@@ -6645,6 +6662,290 @@ pub(crate) mod tests {
         // The col-108 byte specifically, so a shift of the old site still fails
         // even if some other prefix sample happens to match.
         assert_eq!(frames[0].y[108], refs[0].y[108], "{NAME}: measured byte 108");
+    }
+    /// lane-av1-intrabc r4: the reviewer's unblock witness for the rect-strip
+    /// reconstruction -- a CODED `use_intrabc` block (so its residual reader
+    /// runs, not just the prediction copy) on a 2:1 strip in BOTH
+    /// orientations, plus the `TX_MODE_SELECT` (var-tx) shape, every arm
+    /// byte-exact against ffmpeg.
+    ///
+    /// The orientation counters (`intrabc_rect_coded_hits`) are the
+    /// non-vacuity instrument: [`intrabc_rect_hits`] counts neither the skip
+    /// flag nor the orientation, so an arm that silently became an all-skip
+    /// stream (or a stream with only one orientation) would keep the old gate
+    /// green while the coded residual path went untested
+    /// (class `gate-blind-to-feature`).
+    ///
+    /// # The VERT arm is also the DV-PREDICTOR regression witness
+    ///
+    /// The 512x384 arm is the stream that exposed r4's defect: 528 of 294912
+    /// luma samples were wrong, all inside one `skip == 1` intrabc copy at
+    /// `mi(84,104)`. Its coded diff was identical to aomdec's and the post-read
+    /// range matched exactly (`rng=33207` both), so nothing was misread -- the
+    /// DV PREDICTOR differed. libaom picks `nearestmv` (`-520`) from the
+    /// `INTRA_FRAME` MV stack; this decoder picked `-512`, one stack entry
+    /// lower, because the scan that builds that stack walked further than
+    /// libaom's. The scans step by the candidate BLOCK's own width
+    /// (`mi_size_wide[bsize]`) over `xd->mi[]`, which holds an entry for every
+    /// coded block; this decoder's MV grid held only the intrabc blocks, so a
+    /// non-intrabc neighbour read as uncovered and the scan advanced that cell
+    /// by one instead of by its real width. See `MiGrid::cover` for the
+    /// measured walk. A stream that decodes the DV predictor from the wrong
+    /// stack entry cannot pass this arm's pixel comparison.
+    #[test]
+    fn a_coded_rect_intrabc_block_reconstructs_in_both_orientations() {
+        const NAME: &str = "a_coded_rect_intrabc_block_reconstructs_in_both_orientations";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        const TS256: &str = "testsrc2=s=256x192:r=25";
+        const TS512: &str = "testsrc2=s=512x384:r=25";
+        // (arm, source, width, height, per-arm overrides, the coded orientation
+        //  this arm must exercise, and whether the frame must code
+        //  `TX_MODE_SELECT` with `allow_intrabc` still set)
+        let arms: [(&str, &str, usize, usize, &[&str], u8, bool); 3] = [
+            // HORZ (16x8) coded strip -- the shape the in-gate witness above
+            // already reconstructs, pinned here with its own orientation counter.
+            ("horz-coded-256-cq45-pal0-txs0", TS256, 256, 192, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"], 0, false),
+            // VERT (8x16) coded strip AND the DV-predictor regression stream.
+            ("vert-coded-512-cq45-pal1-txs0", TS512, 512, 384, &["--cq-level=45", "--enable-palette=1", "--enable-tx-size-search=0"], 1, false),
+            // The `TX_MODE_SELECT` (stream A) shape: `--enable-tx-size-search=1`
+            // makes the frame code `tx_mode == Select`, so the intrabc block's
+            // transform size comes off the INTER var-tx tree.
+            ("txmode-select-256-cq45-pal0-txs1", TS256, 256, 192, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=1"], 0, true),
+        ];
+        let mut coded_total = [0usize; 2];
+        let mut frames_compared = 0usize;
+        for (arm, src, width, height, extra, want_orient, want_select) in &arms {
+            let render = || {
+                let out = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.2", "-pix_fmt",
+                        "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(out.status.success(), "{NAME}: ffmpeg failed for {arm}");
+                out.stdout
+            };
+            let y4m = render();
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--bit-depth=8",
+                    "--input-bit-depth=8",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=1",
+                    "--limit=1",
+                    "--threads=1",
+                    "--tile-columns=0",
+                    "--enable-rect-partitions=1",
+                    "--enable-1to4-partitions=1",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--sb-size=64",
+                    "--tune-content=screen",
+                    "--enable-intrabc=1",
+                ])
+                // aomenc keeps the LAST occurrence of a repeated flag.
+                .args(*extra)
+                .args(["--obu", "-o", "-", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m)
+                .or_else(|e| match e.kind() {
+                    std::io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(e),
+                })
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused {arm}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            if *want_select {
+                let (select, premise) = tx_select_and_intrabc_frames(&stream);
+                assert!(
+                    select > 0 && premise > 0,
+                    "{NAME}: {arm} no longer codes a frame with both tx_mode == Select and \
+                     allow_intrabc (select={select} premise={premise}), so the TX_MODE_SELECT \
+                     shape is untested here"
+                );
+            }
+            crate::decode::reset_intrabc_rect_hits();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: {arm} refused: {e}"));
+            assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
+            let coded = crate::decode::intrabc_rect_coded_hits();
+            coded_total[0] += coded[0];
+            coded_total[1] += coded[1];
+            assert!(
+                coded[*want_orient as usize] > 0,
+                "{NAME}: {arm} reconstructed no CODED ({}) rect intrabc block -- the residual \
+                 reader for this orientation is untested (coded horz/vert = {coded:?})",
+                if *want_orient == 0 { "HORZ" } else { "VERT" }
+            );
+            let theirs = ffmpeg_decode_sequence(&stream, *width, *height, frames.len());
+            assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
+            for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+                assert!(
+                    ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
+                    "{NAME}: {arm} frame {i} does not match ffmpeg"
+                );
+                frames_compared += 1;
+            }
+            eprintln!(
+                "{NAME}: {arm} {} frame(s) exact, coded rect intrabc horz={} vert={}",
+                frames.len(),
+                coded[0],
+                coded[1]
+            );
+        }
+        assert!(
+            coded_total[0] > 0 && coded_total[1] > 0,
+            "{NAME}: gate is vacuous -- coded rect intrabc blocks seen: horz={} vert={}",
+            coded_total[0],
+            coded_total[1]
+        );
+        assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+
+        // lane-av1-intrabc r5: the SKIPPED VERT 2:1 strip -- the arm the
+        // reviewer's sweep panicked on (a skipped 8x32 strip passed a
+        // `bw * bh`-sized ZERO_RESIDUAL slice at stride `side`, and
+        // `reconstruct_mc_rect` indexed `row * side + w` past its end).
+        // Skip-heavy recipes (low cq, palette off AND on), each decoded
+        // byte-exact vs ffmpeg on BOTH the default single-threaded path
+        // (`EC_AV1_RECON_THREADS == 1`, the inline ReconPlanes arm that
+        // panicked pre-fix) AND the wavefront path. The skipped-orientation
+        // counter is asserted per arm (`gate-blind-to-feature`): a recipe
+        // that stops producing a skipped VERT strip fails instead of passing
+        // vacuously. `lock_gate_counters` because `set_recon_threads` is a
+        // process-wide knob.
+        let _par_lock = lock_gate_counters();
+        let skip_arms: [(&str, &str, usize, usize, &[&str]); 2] = [
+            ("vert-skip-512-cq30-pal0-txs0", TS512, 512, 384, &["--cq-level=30", "--enable-palette=0", "--enable-tx-size-search=0"]),
+            ("vert-skip-512-cq30-pal1-txs0", TS512, 512, 384, &["--cq-level=30", "--enable-palette=1", "--enable-tx-size-search=0"]),
+        ];
+        for (arm, src, width, height, extra) in &skip_arms {
+            let y4m = {
+                let out = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.2", "-pix_fmt",
+                        "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(out.status.success(), "{NAME}: ffmpeg failed for {arm}");
+                out.stdout
+            };
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1", "--bit-depth=8", "--input-bit-depth=8", "--passes=1",
+                    "--end-usage=q", "--cpu-used=0", "--lag-in-frames=0", "--kf-max-dist=1",
+                    "--limit=1", "--threads=1", "--tile-columns=0",
+                    "--enable-rect-partitions=1", "--enable-1to4-partitions=1",
+                    "--min-partition-size=8", "--max-partition-size=32", "--sb-size=64",
+                    "--tune-content=screen", "--enable-intrabc=1",
+                ])
+                // aomenc keeps the LAST occurrence of a repeated flag.
+                .args(*extra)
+                .args(["--obu", "-o", "-", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m)
+                .or_else(|e| match e.kind() {
+                    std::io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(e),
+                })
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused {arm}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            // Default single-threaded path first (the arm that panicked
+            // pre-fix), then the wavefront path; both must match ffmpeg.
+            let mut skipped_vert = 0usize;
+            for threads in [1usize, 4] {
+                crate::par::set_recon_threads(threads);
+                crate::decode::reset_intrabc_rect_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        crate::par::set_recon_threads(1);
+                        panic!("{NAME}: {arm} refused at {threads} recon thread(s): {e}")
+                    }
+                };
+                let skipped = crate::decode::intrabc_rect_skipped_hits();
+                assert!(
+                    !frames.is_empty(),
+                    "{NAME}: {arm} decoded no frame at {threads} recon thread(s)"
+                );
+                let theirs = ffmpeg_decode_sequence(&stream, *width, *height, frames.len());
+                assert_eq!(
+                    frames.len(),
+                    theirs.len(),
+                    "{NAME}: {arm} frame count at {threads} recon thread(s)"
+                );
+                for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+                    assert!(
+                        ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
+                        "{NAME}: {arm} frame {i} does not match ffmpeg at {threads} recon thread(s)"
+                    );
+                }
+                if threads == 1 {
+                    skipped_vert = skipped[1];
+                } else {
+                    assert_eq!(
+                        skipped[1], skipped_vert,
+                        "{NAME}: {arm} skipped VERT strip count changed across recon paths"
+                    );
+                }
+                eprintln!(
+                    "{NAME}: {arm} {} frame(s) exact at {threads} recon thread(s), skipped rect intrabc horz={} vert={}",
+                    frames.len(),
+                    skipped[0],
+                    skipped[1]
+                );
+            }
+            crate::par::set_recon_threads(1);
+            assert!(
+                skipped_vert > 0,
+                "{NAME}: {arm} reconstructed no SKIPPED VERT rect intrabc strip -- the r5 stride arm is untested"
+            );
+        }
     }
 
     /// lane-t900 r31: builds one `--tune-content=screen --enable-intrabc=1`

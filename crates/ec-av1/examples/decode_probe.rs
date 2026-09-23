@@ -58,6 +58,11 @@ fn main() {
             "skipped_intrabc_chroma_arm_hits: {}",
             ec_av1::stream::skipped_intrabc_chroma_arm_hits()
         );
+        println!(
+            "intrabc_rect: {} (var-tx tree: {})",
+            ec_av1::decode::intrabc_rect_hits(),
+            ec_av1::decode::intrabc_rect_vartx_hits()
+        );
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         println!(

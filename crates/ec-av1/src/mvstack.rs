@@ -251,6 +251,30 @@ pub struct MiGrid {
     cols: usize,
     rows: usize,
     cells: Vec<Option<MiInfo>>,
+    /// lane-av1-intrabc r4: the CODED BLOCK's own `(width, height)` in mi
+    /// units for every cell of the frame, whatever the block is -- the
+    /// block-COVERAGE map a scan's run-length stepping needs.
+    ///
+    /// libaom's candidate scans walk `xd->mi[]`, which holds an
+    /// `MB_MODE_INFO` for EVERY coded block, and step by
+    /// `mi_size_wide/height[candidate->bsize]`. A decoder grid that only
+    /// holds the blocks with an MV (the intrabc blocks here) makes every
+    /// intra neighbour read as *uncovered*: the scan then advances that cell
+    /// by one instead of by the neighbour's real width, which walks it
+    /// straight into a cell libaom never probes -- and can even vote.
+    /// Measured on the 512x384 `testsrc2` cq45 `--enable-tx-size-search=0`
+    /// arm: at `mi(84,104)` the row scan's extended offset `-3` over-reached
+    /// from `(81,106)` (libaom's last probe, an 8x16 intrabc voting
+    /// `-520`) to `(81,108)` (a 16x16 intrabc voting `-512` with a 16-wide
+    /// weight), flipping the sorted stack so `nearestmv` became `-512` where
+    /// libaom's is `-520` -- one whole-pel-wrong DV predictor, identical
+    /// coded diff, 528 wrong luma samples.
+    ///
+    /// `[0, 0]` means "no block recorded here" and reads as uncovered, so
+    /// every grid that never fills this map (the tile writer's own, and
+    /// every synthetic test grid) keeps exactly its old `None`-per-cell
+    /// behaviour.
+    cover: Vec<[u8; 2]>,
     /// One `skip` flag per cell, beside `cells` rather than inside `MiInfo`
     /// -- the mv-stack scan walks `cells` for every inter block, so the CELL
     /// must stay 16 bytes (`mi_info_cell_stays_compact`), and nothing on the
@@ -287,6 +311,7 @@ impl MiGrid {
             cols,
             rows,
             cells: vec![None; cols * rows],
+            cover: vec![[0, 0]; cols * rows],
             skips: vec![false; cols * rows],
             tile_row0: 0,
             tile_col0: 0,
@@ -415,8 +440,33 @@ impl MiGrid {
         }
     }
 
+    /// Records the `w_mi` x `h_mi` footprint of the coded block at
+    /// `(row, col)` in this grid's block-coverage map (see `cover`) -- called
+    /// for EVERY coded block, not just the ones that carry an MV. Out-of-range
+    /// coordinates are a no-op, and an overhanging width is clipped to the
+    /// grid (the recorded width still names the block's real one, exactly as
+    /// `mi_size_wide[bsize]` does).
+    pub fn cover_rect(&mut self, row: usize, col: usize, w_mi: usize, h_mi: usize) {
+        if row >= self.rows || col >= self.cols || w_mi == 0 || h_mi == 0 {
+            return;
+        }
+        let w = w_mi.min(self.cols - col);
+        let cell = [w_mi as u8, h_mi as u8];
+        for r in row..(row + h_mi).min(self.rows) {
+            let base = r * self.cols + col;
+            self.cover[base..base + w].fill(cell);
+        }
+    }
+
     /// The unit at `(row, col)`, or `None` when it is outside the grid, hasn't
     /// been coded, or sits outside the current tile's own bounds ([`Self::set_tile_bounds`]).
+    ///
+    /// A cell that holds no MV but IS covered by a recorded block
+    /// ([`Self::cover_rect`]) reads as that block's own footprint with
+    /// `is_inter == false` -- libaom's `xd->mi[]` always holds an
+    /// `MB_MODE_INFO`, and a candidate that casts no vote still advances the
+    /// scan by its own width. Such an entry can never match
+    /// (`single_ref_match` rejects a non-inter unit) and carries a zero MV.
     pub fn get(&self, row: usize, col: usize) -> Option<MiInfo> {
         if row < self.rows
             && col < self.cols
@@ -425,10 +475,28 @@ impl MiGrid {
             && col >= self.tile_col0
             && col < self.tile_col1
         {
-            self.cells[row * self.cols + col]
-        } else {
-            None
+            let idx = row * self.cols + col;
+            if let Some(info) = self.cells[idx] {
+                return Some(info);
+            }
+            let [w, h] = self.cover[idx];
+            if w == 0 {
+                return None;
+            }
+            return Some(MiInfo {
+                is_inter: false,
+                ref_frame: 0,
+                ref_frame1: NO_REF1,
+                mv: (0, 0),
+                mv1: (0, 0),
+                is_new_mv: false,
+                is_global_mv0: false,
+                is_global_mv1: false,
+                size: w,
+                size_h: h,
+            });
         }
+        None
     }
 
     /// The unit at `(row, col)` ignoring the tile window -- the frame-level
