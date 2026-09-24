@@ -55,6 +55,14 @@ fn main() {
         );
         println!("intrabc_hits: {}", ec_av1::stream::intrabc_hits());
         println!(
+            "intrabc_vartx_trees: {}",
+            ec_av1::decode::intrabc_vartx_hits()
+        );
+        println!(
+            "intrabc_vartx_mixed_leaves: {}",
+            ec_av1::decode::intrabc_vartx_mixed_leaves_hits()
+        );
+        println!(
             "skipped_intrabc_chroma_arm_hits: {}",
             ec_av1::stream::skipped_intrabc_chroma_arm_hits()
         );
