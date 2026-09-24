@@ -1,4 +1,4 @@
-# lane-av1-intrapred — stop-report: first divergence is a chroma txb_skip CDF-content divergence at mi (36,66) plane 2, not intra prediction
+# lane-av1-intrapred — r2: the chroma txb_skip CDF fork (intrabc TX4 chroma tx inheritance) and the intrabc chroma frame-copy prediction fork are FIXED; R5/W2 byte-exact
 
 Base 7f863c5f (lane-av1-ibcvtx), worktree edith_codecs-av1intra, branch lane-av1-intrapred.
 Tree left CLEAN (all temporary probes reverted; decode.rs/tile.rs byte-identical to base). No push.
@@ -71,7 +71,7 @@ which I could not complete within this run's budget.
 
 ---
 
-# lane-av1-intrapred r2 — the reported CDF fork is FIXED; next fork is intrabc chroma prediction
+# lane-av1-intrapred r2 — the reported CDF fork is FIXED; the follow-up intrabc chroma prediction fork is also FIXED
 
 Base 3f6748d5, same worktree/branch. The reported "chroma txb_skip CDF-content" fork was
 neither the Chroma4 defaults (all four q tables match aom `token_cdfs.h` exactly) nor the
@@ -117,24 +117,28 @@ adaptation — it was the missing `INTRABC_CHROMA_TX` arming in `decode_leaf8`'s
 * Pre-fix non-vacuity: scratch worktree at 3f6748d5 rebuild reproduces the byte-352 fork
   on W2 and byte-82216 on R5.
 
-## Next fork (new class — NOT entropy, NOT the ticket's CDF fork)
+## Next fork — FIXED in the same pass (r2b): intrabc chroma frame-copy prediction
 
 `R5` first differing byte 231864 = chroma U pixel **(184,4)**; 3305 differing bytes, all
 chroma (U 1730 / V 1575), origin unit = the chroma 4x4 at cpx (184,4), i.e. the 8x8
-**intrabc** leaf at luma (368,8), mi **(2,92)**, var-tx TX4 split, luma TU (1,0) coded
-`H_ADST`, TU (0,0) `DCT_DCT`, chroma inherits `DCT_DCT` on BOTH sides (ours: probe slot
-`Some(DctDct)`; aom: `EC_TXTYPE mi=2,92 plane=1 tx_type=0`). The full symbol stream is
-aligned (3321/3321 `all_zero` reads, rng-identical), luma is byte-exact, so this is a
-**prediction-stage** divergence: the intrabc chroma frame-copy (bilinear at the chroma
-half-pel phase of the block DV) produces different samples than aomdec for this unit and
-everything predicted off it. Trace line:
+**intrabc** leaf at luma (368,8), mi **(2,92)**, var-tx TX4 split. Entropy was fully
+aligned (3321/3321 `all_zero` reads rng-identical, luma byte-exact), the DV matched
+exactly (`EC_DV mi_row=2 mi_col=92 dv_col=-2560 dv_row=0`, same as aom's `mv0=(0,-2560)`,
+source = integer-phase copy of U(24,4)), so the divergence was prediction-stage: the TX4
+arm's chroma reads override the intra prediction through `palette_uv_bufs`, but only
+`decode_block` wrapped that pair with the leaf's `intrabc_bufs` frame-copy buffers
+(decode.rs:15833) — `decode_leaf8` wrapped only `palette_y_buf` (lane-t900 r32), so an
+intrabc TX4 leaf's chroma predicted INTRA from the UV mode (intrabc's is DC) instead of
+copying the frame at the DV.
 
-```
-R5: ours U(184,4)=[103,97,107,101] aom=[86,116,55,110]; entropy identical
-    (read 2428 U / 2429 V of block mi (2,92) match through their coefficients);
-    suspect the chroma DV rounding/clamp in the leaf8 intrabc_bufs path
-    (mv_to_q4(cpx, dv_col, false) — odd-DV chroma phase) vs libaom's
-    av1_predict_intra_block intrabc clamp.
-```
+**Fix (r2b, third hunk):** `decode_leaf8` wraps `palette_uv_bufs` with `intrabc_bufs`'s
+`ub`/`vb` right after the `palette_y_buf` wrap — the chroma twin of decode.rs:15833.
 
-W2 shows the same signature (first diff U(168,4), byte 231848).
+**Gates after r2b (all machine-captured):**
+
+* R5: **byte-exact vs aomdec AND ffmpeg** (the stop report's primary gate).
+* W2 (cq8 re-encode): **byte-exact vs aomdec**.
+* R9: byte-exact vs ffmpeg (regression clean).
+* Cached-fixture sweep A1/A2/A3/D1/D2/D3: byte-exact vs their ffmpeg raws.
+* Targeted tests (intrabc/lossless/screen filters): 14 passed, 0 failed. Full suite on
+  the r2 fix alone: 607 passed / 0 failed (exit 0).
