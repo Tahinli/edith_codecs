@@ -7098,6 +7098,129 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1intrapred r2, REGRESSION GATE for the two intrabc TX4-split
+    /// chroma defects this lane fixed.
+    ///
+    /// An intrabc 8x8 leaf whose var-tx tree split to TX_4X4 must (a) arm
+    /// `INTRABC_CHROMA_TX` from the co-located luma TU's coded type -- the
+    /// chroma units then take that type's class-1 eob row, HORIZ scan and nz
+    /// contexts (libaom `av1_get_tx_type`'s is_inter branch; intrabc is
+    /// inter-classified) -- and (b) predict the chroma units from the FRAME
+    /// COPY at the DV, not intra-from-UV-mode (intrabc's UV mode is DC, so a
+    /// leaf that loses the override predicts flat DC where libaom copies a
+    /// busy region).
+    ///
+    /// Pre-r2, decode_leaf8's TX4 arm did neither: R5's chroma U txb at
+    /// mi (36,66) decoded `eob=11` off the 2D row where aomdec decoded
+    /// `eob=13` off the class-1 row, and the first surviving pixel fork was
+    /// U(184,4) of mi (2,92) (class `intrabc-chroma-tx-not-armed`, then
+    /// `intrabc-chroma-predicts-intra`).
+    ///
+    /// The fixture is the report's R5 stream pinned into `fixtures/`
+    /// (aomenc oracle, testsrc2 320x180 tiled 2x2 -> 640x360, sb64 maxp64
+    /// square-only screen intrabc, cq20, 1 frame; 7173 bytes,
+    /// sha256 bc699af4a6e7c1c5657f041e8cbdf2d3d899ddb80ec2a549a950b7cebb5b41bd).
+    /// The gate needs no oracle at run time and cannot be skipped: a missing
+    /// fixture, a decode error, a zero counter, a moved pixel patch or a
+    /// changed full-frame fingerprint each fail by name. The fingerprint is
+    /// FNV-1a (dependency-free, same rationale as the cdf-forwarding gate's).
+    #[test]
+    fn an_intrabc_tx4_leaf_chroma_inherits_the_luma_type_and_predicts_from_the_frame_copy() {
+        const NAME: &str =
+            "an_intrabc_tx4_leaf_chroma_inherits_the_luma_type_and_predicts_from_the_frame_copy";
+        const FIXTURE_LEN: usize = 7173;
+        const FIXTURE_FNV: u64 = 0x3a57_d075_5e4c_fe5b;
+        const RAW_LEN: usize = 640 * 360 * 3 / 2;
+        const RAW_FNV: u64 = 0xf271_df27_ce4d_ba66;
+        // The 4x4 chroma patches at (184,4) -- the first surviving pixel fork
+        // -- as the oracles (aomdec and ffmpeg agree) reconstruct them.
+        const U_PATCH: [u16; 16] = [
+            86, 116, 55, 110, 114, 114, 51, 83, 99, 121, 48, 114, 103, 117, 102, 67,
+        ];
+        const V_PATCH: [u16; 16] = [
+            179, 158, 199, 105, 155, 158, 195, 147, 163, 153, 194, 108, 170, 148, 168, 172,
+        ];
+
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/intrabc_tx4_chroma_kf.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_leaf8_intrabc_hits();
+        crate::decode::reset_intrabc_tx4_chroma_copy_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
+        });
+        assert_eq!(frames.len(), 1, "{NAME}: frame count");
+        let frame = &frames[0];
+        assert_eq!((frame.width, frame.height), (640, 360), "{NAME}: dimensions");
+
+        // Non-vacuity, both halves: the leaf shape must be reached at all,
+        // and its chroma route must have consulted the ARMED slot (pre-r2
+        // this counter is 0 -- the arm never armed the slot).
+        assert!(
+            crate::decode::leaf8_intrabc_hits() > 0,
+            "{NAME}: gate is vacuous -- no intrabc 8x8 leaf was decoded"
+        );
+        assert!(
+            crate::decode::intrabc_tx4_chroma_copy_hits() > 0,
+            "{NAME}: gate is vacuous -- no intrabc TX4-split leaf's chroma read consulted \
+             the armed slot (class intrabc-chroma-tx-not-armed)"
+        );
+
+        // The first surviving pixel fork: chroma 4x4 at (184,4). The wrong
+        // wirings put flat intra-DC predictions or the wrong eob class here.
+        let cw = frame.width / 2;
+        let u_patch: Vec<u16> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| frame.u[(4 + dy) * cw + 184 + dx]))
+            .collect();
+        let v_patch: Vec<u16> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| frame.v[(4 + dy) * cw + 184 + dx]))
+            .collect();
+        assert_eq!(u_patch, U_PATCH, "{NAME}: U(184,4) patch moved");
+        assert_eq!(v_patch, V_PATCH, "{NAME}: V(184,4) patch moved");
+        // The unit the FRAME-COPY override specifically pins: chroma 4x4 at
+        // (168,0) is an intrabc TX4-split leaf's chroma whose copy source is
+        // a busy ramp region; without the `palette_uv_bufs` intrabc wrap the
+        // read predicts flat intra-DC here (78k chroma bytes drift from this
+        // unit alone), with it the copy reproduces the oracle exactly.
+        const U_COPY_PATCH: [u16; 16] = [
+            91, 91, 91, 91, 120, 120, 120, 120, 120, 120, 120, 120, 73, 102, 116, 116,
+        ];
+        const V_COPY_PATCH: [u16; 16] = [
+            241, 241, 241, 241, 156, 156, 156, 156, 158, 158, 158, 158, 181, 163, 154, 154,
+        ];
+        let u_copy: Vec<u16> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| frame.u[dy * cw + 168 + dx]))
+            .collect();
+        let v_copy: Vec<u16> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| frame.v[dy * cw + 168 + dx]))
+            .collect();
+        assert_eq!(
+            u_copy, U_COPY_PATCH,
+            "{NAME}: U(168,0) patch moved -- the intrabc TX4 chroma read no longer \
+             predicts from the frame copy (class intrabc-chroma-predicts-intra)"
+        );
+        assert_eq!(v_copy, V_COPY_PATCH, "{NAME}: V(168,0) patch moved");
+
+        // The whole frame, packed as the rawvideo byte stream the oracles
+        // produce: any remaining byte anywhere in Y/U/V fails the gate.
+        let mut raw = Vec::with_capacity(RAW_LEN);
+        for plane in [&frame.y, &frame.u, &frame.v] {
+            raw.extend(plane.iter().map(|&s| s as u8));
+        }
+        assert_eq!(raw.len(), RAW_LEN, "{NAME}: raw size");
+        assert_eq!(fnv1a64(&raw), RAW_FNV, "{NAME}: full-frame fingerprint moved");
+    }
+
     /// lane-t900 r33, CENSUS for "a sub-8x8 leaf that uses intrabc".
     ///
     /// The `use_intrabc` symbol IS read at that reader for every sub-8x8 leaf

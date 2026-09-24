@@ -142,3 +142,21 @@ copying the frame at the DV.
 * Cached-fixture sweep A1/A2/A3/D1/D2/D3: byte-exact vs their ffmpeg raws.
 * Targeted tests (intrabc/lossless/screen filters): 14 passed, 0 failed. Full suite on
   the r2 fix alone: 607 passed / 0 failed (exit 0).
+
+## Regression gate (r2c)
+
+`stream::tests::an_intrabc_tx4_leaf_chroma_inherits_the_luma_type_and_predicts_from_the_frame_copy`
++ pinned fixture `crates/ec-av1/fixtures/intrabc_tx4_chroma_kf.obu` (the R5 stream,
+  7173 bytes, sha256 `bc699af4…b41bd`, FNV-1a `0x3a57d0755e4cfe5b`; aomenc oracle,
+  testsrc2 320x180 tiled 2x2 → 640x360, sb64 maxp64 square-only screen intrabc, cq20,
+  1 frame). The gate runs unconditionally (no oracle binary needed, no skip path): a
+  missing fixture, a decode error, a zero `INTRABC_TX4_CHROMA_COPY_HITS` counter (new
+  non-vacuity counter bumped when the TX4 arm's chroma reads consult the armed slot),
+  a moved U(184,4)/U(168,0)/V(168,0) pixel patch, or a changed full-frame FNV-1a
+  fingerprint each fail with the class name.
+
+* Fixed tree: passes.
+* Unwrap regression (decode_block's `palette_uv_bufs` intrabc wrap removed — the exact
+  "chroma predicts from the unwrapped palette buffer" state): **fails at the U(168,0)
+  patch assert** (`intrabc-chroma-predicts-intra`), 78182 chroma bytes wrong.
+* Pre-r2 parent (3f6748d5): fails at decode (tile desync, byte 82216/352 forks).

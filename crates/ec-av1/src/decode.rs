@@ -3694,6 +3694,27 @@ thread_local! {
     static LEAF8_INTRABC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Chroma reads of an intrabc TX4-split leaf that consulted an ARMED
+    /// [`INTRABC_CHROMA_TX`] slot -- proof that the arm's frame-copy +
+    /// inherited-type route actually ran (lane-av1intrapred r2's non-vacuity
+    /// counter: zero means the gate's fixture no longer reaches the route).
+    static INTRABC_TX4_CHROMA_COPY_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRABC_TX4_CHROMA_COPY_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn intrabc_tx4_chroma_copy_hits() -> usize {
+    INTRABC_TX4_CHROMA_COPY_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`INTRABC_TX4_CHROMA_COPY_HITS`] (gate tests call this before a decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_tx4_chroma_copy_hits() {
+    INTRABC_TX4_CHROMA_COPY_HITS.with(|c| c.set(0));
+}
+
 /// Current value of [`LEAF8_INTRABC_HITS`].
 pub(crate) fn leaf8_intrabc_hits() -> usize {
     LEAF8_INTRABC_HITS.with(|c| c.get())
@@ -17365,6 +17386,12 @@ fn decode_leaf8(
         }
         let ac = alpha.map(|_| cfl_src(px, py, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
+        // lane-av1intrapred: the non-vacuity counter -- armed slot consulted
+        // by this arm's chroma reads means the frame-copy + inherited-type
+        // route ran; zero at gate time means the fixture stopped reaching it.
+        if fctx.intrabc_chroma_tx.with(std::cell::Cell::get).is_some() {
+            hit!(INTRABC_TX4_CHROMA_COPY_HITS);
+        }
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
