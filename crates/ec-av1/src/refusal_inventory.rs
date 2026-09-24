@@ -72,13 +72,15 @@ const REFUSALS: &[&str] = &[
     // (`a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal`)
     // still runs: it now reports `reached = 0` with the same non-vacuous
     // premise (allow_intrabc frames + decoded sub-8 leaves).
-    // lane-av112bit: the blanket 12-bit refusal is REPLACED by the four
-    // named refusals below -- the witnessed paths (intra stack, dequant/
+    // lane-av112bit: the blanket 12-bit refusal is REPLACED by the named
+    // refusals below -- the witnessed paths (intra stack, dequant/
     // transforms at the 12-bit tables, deblock, CDEF, Wiener+SGR
     // restoration, translational subpel MC through the parameterised
     // round_0/round_1) are lifted by the lane's byte-exact ffmpeg gates.
+    // lane-av112bitc: compound joined the witnessed set (six-frame 12-bit
+    // compound stream byte-exact vs ffmpeg; the combines already absorbed
+    // the CONV_BUF gain drop through `INTER_POST_ROUND - delta`).
     "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
-    "a compound inter block at 12 bits (no 12-bit compound witness exists: the 12-bit inter gate is a single-reference stream)",
     "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
     "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
     // lane-av1txr: the silent-garbage guard. A 4:4:4/4:2:2 stream used to
@@ -355,16 +357,15 @@ const PROVEN: &[(&str, &str)] = &[
         "a motion_mode symbol for a block shape with no CDF row here",
         "every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row",
     ),
-    // lane-av112bit: four real-aomenc 12-bit streams, each refused by name
+    // lane-av112bit: real-aomenc 12-bit streams, each refused by name
     // (the gates encode with aomenc --bit-depth=12 and assert the exact
-    // string; the two pixel witnesses are the same battery's Ok arms).
+    // string; the pixel witnesses are the same battery's Ok arms).
+    // lane-av112bitc: the compound pair left with its refusal -- the
+    // six-frame compound stream now DECODES byte-exact
+    // (`a_real_aomenc_12bit_compound_inter_sequence_decodes_pixel_exact`).
     (
         "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
         "a_12bit_warped_motion_stream_is_refused_by_name",
-    ),
-    (
-        "a compound inter block at 12 bits (no 12-bit compound witness exists: the 12-bit inter gate is a single-reference stream)",
-        "a_12bit_compound_inter_stream_is_refused_by_name",
     ),
     (
         "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",

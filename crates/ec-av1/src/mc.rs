@@ -1560,6 +1560,7 @@ pub fn inter_pred_hits() -> usize {
 }
 
 /// Current value of [`MC_SUBPEL_HITS`].
+#[allow(dead_code)] // reader is test-only (the 12-bit inter witness); dead in non-test builds
 pub(crate) fn mc_subpel_hits() -> usize {
     MC_SUBPEL_HITS.with(|c| c.get())
 }
@@ -2068,7 +2069,9 @@ pub(crate) fn predict_compound_intermediate_kern(
 /// simple-average split `(8, 8)` or [`crate::compound::dist_wtd_comp_weight_assign`]'s
 /// output; both always sum to `1 << DIST_PRECISION_BITS`). Masked compound
 /// (`comp_group_idx == 1`, wedge/diffwtd) is a different combine this
-/// function does not cover -- decode.rs still refuses those by name.
+/// function does not cover -- see [`blend_masked_compound`]/[`diffwtd_mask`];
+/// every kind absorbs the same CONV_BUF gain drop at 12 bits
+/// ([`round_delta`]), witnessed by the 12-bit compound stream gate.
 pub(crate) fn combine_compound(
     pred0: &[i32],
     pred1: &[i32],
