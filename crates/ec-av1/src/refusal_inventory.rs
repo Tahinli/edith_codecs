@@ -212,7 +212,18 @@ const REFUSALS: &[&str] = &[
     // reconstructed at the wrong stride. Neither arm of
     // `an_intrabc_block_under_tx_mode_select_decodes_pixel_exact` reaches it
     // (both resolve uniform), so it is unwitnessed and stays live.
-    "an intrabc block whose var-tx tree resolved to mixed leaf transform sizes",
+    // lane-av1-ibcvtx: LIFTED. The t900 census's own maxp32 recipe class,
+    // retargeted at testsrc2 content with `--max-partition-size=64`, reaches
+    // mixed trees on the first encode (12-recipe hunt, 5/12 recipes hit).
+    // The luma reconstruct now walks the tree's own leaf list per leaf, and
+    // the block's chroma inherits the co-located luma unit's coded tx type
+    // (`av1_get_tx_type`, blockd.h:1278 -- that inheritance was missing on
+    // the uniform multi-TU intrabc path too). Gate:
+    // `a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal`.
+    // Its census gate
+    // (`an_intrabc_vartx_census_measures_the_mixed_leaf_refusal`) survives as
+    // the witness that the premise is still exercised -- `reached` is 0 by
+    // construction now.
     "a motion_mode symbol for a block shape with no CDF row here",
 ];
 
@@ -518,10 +529,13 @@ const PROVEN: &[(&str, &str)] = &[
     // lane-t900 r33, CENSUS: four quantisers of the recipe that reaches the
     // intrabc var-tx tree at all read it for 5 blocks in total, every one of
     // which resolved to a UNIFORM leaf size, with the frames pixel-exact.
-    (
-        "an intrabc block whose var-tx tree resolved to mixed leaf transform sizes",
-        "an_intrabc_vartx_census_measures_the_mixed_leaf_refusal",
-    ),
+    // lane-av1-ibcvtx: the mixed-leaf refusal is LIFTED (see the note in
+    // `REFUSALS`); the pair above moved out with the string. The capability
+    // gate is
+    // `a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal`,
+    // which pins the frame's residual sample mismatch against ffmpeg to the
+    // named second defect (a non-intrabc uniform-tree block elsewhere in the
+    // stream) so the pin tightens automatically when that defect is fixed.
     (
         "a reference picture whose height does not match this frame's own true size",
         "an_inter_frame_shorter_than_its_reference_is_refused_by_name",
