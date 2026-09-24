@@ -7810,6 +7810,7 @@ pub(crate) mod tests {
             "{NAME}: the VERT (64x128) orientation was never engaged -- only 128x64 HORZ strips \
              proved the lift"
         );
+    }
     /// lane-av1intrapred r2, REGRESSION GATE for the two intrabc TX4-split
     /// chroma defects this lane fixed.
     ///
