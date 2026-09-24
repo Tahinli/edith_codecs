@@ -28,6 +28,16 @@ use ec_av1_syntax::{
 };
 use ec_core::{Error, Result};
 
+// lane-av112bit: the 12-bit warp refusals below are inline literals
+// (refusal_inventory.rs extracts them from the decode source); each names the
+// witness gap that keeps the path refused -- warp's reduce bits inherit the
+// 12-bit `conv_params->round_0` (warped_motion.c:295, convolve.h:81..86).
+// lane-av112bitc lifted the compound pair of the same family: the compound
+// combines absorb the CONV_BUF gain drop (`INTER_POST_ROUND - delta`, see
+// `mc::combine_compound`) and the six-frame 12-bit compound witness is
+// byte-exact vs ffmpeg. All sites are PARSE-time: a refused stream never
+// builds a warp predictor.
+
 /// Per-frame decode state, one instance per decoded stream (lane-thread1).
 ///
 /// Every field here used to be a `thread_local!` static, which made a decode a
@@ -5324,7 +5334,7 @@ thread_local! {
 }
 
 /// Current value of [`COMPOUND_MODE_HITS`].
-#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
+#[allow(dead_code)] // reader is test-only (the 12-bit compound witness); dead in non-test builds
 pub(crate) fn compound_mode_hits() -> usize {
     COMPOUND_MODE_HITS.with(|c| c.get())
 }
@@ -29114,6 +29124,13 @@ fn decode_inter_block(
             let warp1 = compound_warp(ref1, is_global_mv1).filter(|_| ref_unscaled(ref1));
             if warp0.is_some() || warp1.is_some() {
                 hit!(COMPOUND_WARP_HITS);
+                // lane-av112bit: refused by name -- see `WARP_12BIT_REFUSAL`.
+                if bit_depth(fctx) == 12 {
+                    return Err(Error::unsupported(
+                    "AV1 tile decode",
+                    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
+                ));
+                }
             }
             // spec `get_ref_filter_type`: matches when EITHER of the
             // neighbour's two references equals this block's own ref0 --
@@ -29576,8 +29593,7 @@ fn decode_inter_block(
                 write_h,
                 h_filter,
                 v_filter,
-                &mut inter0_y,
-            );
+                &mut inter0_y, fctx,);
             // lane-cwarp r1: this reference's own GLOBAL warp replaces the
             // translational tap (libaom `av1_warp_plane` with
             // `conv_params->is_compound`); the blend below is unchanged.
@@ -29603,8 +29619,7 @@ fn decode_inter_block(
                 write_h,
                 h_filter,
                 v_filter,
-                &mut inter1_y,
-            );
+                &mut inter1_y, fctx,);
             // lane-cwarp r1: this reference's own GLOBAL warp replaces the
             // translational tap (libaom `av1_warp_plane` with
             // `conv_params->is_compound`); the blend below is unchanged.
@@ -29652,8 +29667,7 @@ fn decode_inter_block(
                 write_chroma_h,
                 h_filter,
                 v_filter,
-                &mut inter0_u,
-            );
+                &mut inter0_u, fctx,);
             // `av1_init_warp_params` bails when the PLANE's block is
             // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
             // block of an 8x8 luma block stays translational.
@@ -29681,8 +29695,7 @@ fn decode_inter_block(
                 write_chroma_h,
                 h_filter,
                 v_filter,
-                &mut inter1_u,
-            );
+                &mut inter1_u, fctx,);
             // `av1_init_warp_params` bails when the PLANE's block is
             // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
             // block of an 8x8 luma block stays translational.
@@ -29726,8 +29739,7 @@ fn decode_inter_block(
                 write_chroma_h,
                 h_filter,
                 v_filter,
-                &mut inter0_v,
-            );
+                &mut inter0_v, fctx,);
             // `av1_init_warp_params` bails when the PLANE's block is
             // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
             // block of an 8x8 luma block stays translational.
@@ -29755,8 +29767,7 @@ fn decode_inter_block(
                 write_chroma_h,
                 h_filter,
                 v_filter,
-                &mut inter1_v,
-            );
+                &mut inter1_v, fctx,);
             // `av1_init_warp_params` bails when the PLANE's block is
             // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
             // block of an 8x8 luma block stays translational.
@@ -30805,6 +30816,15 @@ fn decode_inter_block(
                 if warp_params.is_some() && gm_ref.model == ec_av1_syntax::WarpModel::Affine {
                     hit!(AFFINE_GM_HITS);
                 }
+            }
+            // lane-av112bit: a local `WARPED_CAUSAL` projection (set above) or
+            // a global warp model both land here with `warp_params` set --
+            // refused by name at 12 bits (see `WARP_12BIT_REFUSAL`).
+            if bit_depth(fctx) == 12 && warp_params.is_some() {
+                return Err(Error::unsupported(
+                    "AV1 tile decode",
+                    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
+                ));
             }
             if crate::envflags::env_flag!("EC_AV1_TELL") {
                 eprintln!(
@@ -35086,8 +35106,7 @@ fn decode_inter_block8(
                     SIDE,
                     h_filter,
                     v_filter,
-                    &mut inter0_y,
-                );
+                    &mut inter0_y, fctx,);
                 if let Some(wp) = &warp0_c {
                     crate::warp::warp_affine_compound(
                         wp, &py0.data, py0.true_width as i32, py0.true_height as i32,
@@ -35108,8 +35127,7 @@ fn decode_inter_block8(
                     SIDE,
                     h_filter,
                     v_filter,
-                    &mut inter1_y,
-                );
+                    &mut inter1_y, fctx,);
                 if let Some(wp) = &warp1_c {
                     crate::warp::warp_affine_compound(
                         wp, &py1.data, py1.true_width as i32, py1.true_height as i32,
@@ -35148,8 +35166,7 @@ fn decode_inter_block8(
                     CHROMA_SIDE,
                     h_filter,
                     v_filter,
-                    &mut inter0_u,
-                );
+                    &mut inter0_u, fctx,);
                 let mut inter1_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 mc::predict_compound_intermediate(
                     &pu1.data,
@@ -35163,8 +35180,7 @@ fn decode_inter_block8(
                     CHROMA_SIDE,
                     h_filter,
                     v_filter,
-                    &mut inter1_u,
-                );
+                    &mut inter1_u, fctx,);
                 let mut pred_u = refill(std::mem::take(&mut out[1]), CHROMA_SIDE * CHROMA_SIDE);
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
@@ -35194,8 +35210,7 @@ fn decode_inter_block8(
                     CHROMA_SIDE,
                     h_filter,
                     v_filter,
-                    &mut inter0_v,
-                );
+                    &mut inter0_v, fctx,);
                 let mut inter1_v = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 mc::predict_compound_intermediate(
                     &pv1.data,
@@ -35209,8 +35224,7 @@ fn decode_inter_block8(
                     CHROMA_SIDE,
                     h_filter,
                     v_filter,
-                    &mut inter1_v,
-                );
+                    &mut inter1_v, fctx,);
                 let mut pred_v = refill(std::mem::take(&mut out[2]), CHROMA_SIDE * CHROMA_SIDE);
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
@@ -35763,6 +35777,15 @@ fn decode_inter_block8(
             if warp_params.is_some() && gm_ref.model == ec_av1_syntax::WarpModel::Affine {
                 hit!(AFFINE_GM_HITS);
             }
+        }
+        // lane-av112bit: same 12-bit refusal as the 16x16+ leaf -- a local
+        // `WARPED_CAUSAL` projection or a global model both leave
+        // `warp_params` set here (see `WARP_12BIT_REFUSAL`).
+        if bit_depth(fctx) == 12 && warp_params.is_some() {
+            return Err(Error::unsupported(
+                    "AV1 tile decode",
+                    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
+                ));
         }
         if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(

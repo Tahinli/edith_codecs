@@ -72,7 +72,17 @@ const REFUSALS: &[&str] = &[
     // (`a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal`)
     // still runs: it now reports `reached = 0` with the same non-vacuous
     // premise (allow_intrabc frames + decoded sub-8 leaves).
-    "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
+    // lane-av112bit: the blanket 12-bit refusal is REPLACED by the named
+    // refusals below -- the witnessed paths (intra stack, dequant/
+    // transforms at the 12-bit tables, deblock, CDEF, Wiener+SGR
+    // restoration, translational subpel MC through the parameterised
+    // round_0/round_1) are lifted by the lane's byte-exact ffmpeg gates.
+    // lane-av112bitc: compound joined the witnessed set (six-frame 12-bit
+    // compound stream byte-exact vs ffmpeg; the combines already absorbed
+    // the CONV_BUF gain drop through `INTER_POST_ROUND - delta`).
+    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
+    "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
+    "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
     // lane-av1txr: the silent-garbage guard. A 4:4:4/4:2:2 stream used to
     // decode with no refusal and wrong pixels (every chroma extent is
     // hardcoded 4:2:0, the probe emits 4:2:0 planes only); it is now refused
@@ -347,9 +357,23 @@ const PROVEN: &[(&str, &str)] = &[
         "a motion_mode symbol for a block shape with no CDF row here",
         "every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row",
     ),
+    // lane-av112bit: real-aomenc 12-bit streams, each refused by name
+    // (the gates encode with aomenc --bit-depth=12 and assert the exact
+    // string; the pixel witnesses are the same battery's Ok arms).
+    // lane-av112bitc: the compound pair left with its refusal -- the
+    // six-frame compound stream now DECODES byte-exact
+    // (`a_real_aomenc_12bit_compound_inter_sequence_decodes_pixel_exact`).
     (
-        "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
-        "a_twelve_bit_sequence_header_is_refused_by_name",
+        "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
+        "a_12bit_warped_motion_stream_is_refused_by_name",
+    ),
+    (
+        "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
+        "a_12bit_film_grain_stream_is_refused_by_name",
+    ),
+    (
+        "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
+        "a_12bit_screen_content_stream_is_refused_by_name",
     ),
     // lane-av1txr: the guard's own gate builds a profile-1 and a profile-2
     // sequence header by hand and asserts each refuses by name while the
