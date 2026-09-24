@@ -11695,7 +11695,7 @@ fn decode_intrabc_128rect(
     let mut pred_y_dense = vec![0u16; bw * bh];
     mc::predict_with_filter(
         &y.data, y.width, y.true_width, y.true_height,
-        mv_to_q4(px, dv_col, true), mv_to_q4(py, dv_row, true),
+        mv_to_q4(px, dv_col, 0), mv_to_q4(py, dv_row, 0),
         bw, bh, mc::InterpFilterKind::Bilinear, &mut pred_y_dense, fctx,
     );
     let mut pred_y = vec![0u16; side * side];
@@ -11705,7 +11705,7 @@ fn decode_intrabc_128rect(
     let mut pred_u_dense = vec![0u16; cw * ch];
     mc::predict_with_filter(
         &u.data, u.width, u.true_width, u.true_height,
-        mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+        mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
         cw, ch, mc::InterpFilterKind::Bilinear, &mut pred_u_dense, fctx,
     );
     let mut pred_u = vec![0u16; cside * cside];
@@ -11715,7 +11715,7 @@ fn decode_intrabc_128rect(
     let mut pred_v_dense = vec![0u16; cw * ch];
     mc::predict_with_filter(
         &v.data, v.width, v.true_width, v.true_height,
-        mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+        mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
         cw, ch, mc::InterpFilterKind::Bilinear, &mut pred_v_dense, fctx,
     );
     let mut pred_v = vec![0u16; cside * cside];
