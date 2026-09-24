@@ -7994,7 +7994,8 @@ pub(crate) mod tests {
     /// `round_0`/`round_1` -- 5/9 at 12 bits, the whole point of the mc.rs
     /// parameterisation -- really executed, and asserts
     /// `compound_mode_hits` UNCHANGED (this recipe offers no divergent
-    /// second reference, which is exactly why compound stays refused).
+    /// second reference, so no compound mode symbol is read -- the lane's
+    /// compound witness is the six-frame gate below).
     #[test]
     fn a_real_aomenc_12bit_inter_sequence_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_12bit_inter_sequence_decodes_pixel_exact";
@@ -8063,30 +8064,63 @@ pub(crate) mod tests {
         );
     }
 
-    /// The 12-bit compound refusal, exercised on a REAL stream: six frames
-    /// with `--lag-in-frames=0` still diverge LAST from GOLDEN from frame 2
-    /// on (measured: aomenc codes compound blocks and the decode refuses at
-    /// the compound mode read).
+    /// The 12-bit COMPOUND witness (lane-av112bitc): the parent's source
+    /// and recipe with warp pinned OFF -- with six frames LAST diverges
+    /// from GOLDEN from frame 2 on and aomenc codes compound inter blocks
+    /// (pre-lift measurement: the decode refused at the compound mode
+    /// read). Two arms: the default recipe (dist-weighted average
+    /// combines live) and `--enable-dist-wtd-comp=0` (pushes compound AND
+    /// the masked choice harder: 6 diffwtd blends). Both byte-exact
+    /// against ffmpeg; each hard-asserts compound mode symbols and
+    /// masked-diffwtd blends really ran, so the parameterised combine
+    /// rounds (`INTER_POST_ROUND - delta`, diffwtd `+ (bd-8) - delta` at
+    /// 12 bits) and the ffmpeg-pinned pixel path genuinely executed.
     #[test]
-    fn a_12bit_compound_inter_stream_is_refused_by_name() {
-        const NAME: &str = "a_12bit_compound_inter_stream_is_refused_by_name";
+    fn a_real_aomenc_12bit_compound_inter_sequence_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_12bit_compound_inter_sequence_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
         if !have_aomenc() {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
         let y4m = y4m_12bit_subpel_source(6);
-        // Warp pinned OFF so the COMPOUND refusal is the one that can fire:
-        // with six frames, LAST diverges from GOLDEN from frame 2 on and
-        // aomenc codes compound blocks (measured).
-        let stream = encode_12bit(&y4m, 6, &["--enable-warped-motion=0"]);
-        let err = decode_stream(&stream).unwrap_err().to_string();
-        assert!(
-            err.contains(
-                "a compound inter block at 12 bits (no 12-bit compound witness exists: the 12-bit inter gate is a single-reference stream)"
-            ),
-            "{NAME}: expected the 12-bit compound refusal, got: {err}"
-        );
+        for (arm, extra) in [
+            ("dist-wtd", &["--enable-warped-motion=0"][..]),
+            ("plain-masked", &["--enable-warped-motion=0", "--enable-dist-wtd-comp=0"][..]),
+        ] {
+            let stream = encode_12bit(&y4m, 6, &extra);
+            assert_12bit_sequence_header(&stream, NAME);
+            let before_compound = decode::compound_mode_hits();
+            let before_masked = decode::masked_compound_hits();
+            let before_diffwtd = decode::diffwtd_hits();
+            let before_wedge = decode::wedge_hits();
+            let frames = decode_stream(&stream).unwrap_or_else(|e| {
+                panic!("{NAME} [{arm}]: decode_stream refused a real 12-bit compound stream: {e}")
+            });
+            assert_eq!(frames.len(), 6, "{NAME} [{arm}]: frame count");
+            let (comp, masked, diffwtd, wedge) = (
+                decode::compound_mode_hits() - before_compound,
+                decode::masked_compound_hits() - before_masked,
+                decode::diffwtd_hits() - before_diffwtd,
+                decode::wedge_hits() - before_wedge,
+            );
+            eprintln!(
+                "{NAME} [{arm}]: compound blocks={comp} masked={masked} diffwtd={diffwtd} wedge={wedge}"
+            );
+            assert!(comp > 0, "{NAME} [{arm}]: no compound mode symbol was read -- the compound path is unexercised");
+            assert!(masked > 0, "{NAME} [{arm}]: no masked compound block ran -- the masked combine is unexercised");
+            assert!(diffwtd > 0, "{NAME} [{arm}]: no diffwtd blend ran -- the diffwtd combine is unexercised");
+            let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 6);
+            for (i, (ours, reference)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(ours.y, reference.y, "{NAME} [{arm}] frame {i} luma vs ffmpeg");
+                assert_eq!(ours.u, reference.u, "{NAME} [{arm}] frame {i} U vs ffmpeg");
+                assert_eq!(ours.v, reference.v, "{NAME} [{arm}] frame {i} V vs ffmpeg");
+            }
+        }
     }
 
     /// The 12-bit film grain refusal: a real `--film-grain-test=1` stream

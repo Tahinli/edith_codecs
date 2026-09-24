@@ -28,13 +28,15 @@ use ec_av1_syntax::{
 };
 use ec_core::{Error, Result};
 
-// lane-av112bit: the 12-bit warp/compound refusals below are inline literals
+// lane-av112bit: the 12-bit warp refusals below are inline literals
 // (refusal_inventory.rs extracts them from the decode source); each names the
 // witness gap that keeps the path refused -- warp's reduce bits inherit the
-// 12-bit `conv_params->round_0` (warped_motion.c:295, convolve.h:81..86), and
-// the inter witness is a single-reference stream, so compound of every kind
-// is unwitnessed. All sites are PARSE-time: a refused stream never builds a
-// warp predictor or blends a compound pair.
+// 12-bit `conv_params->round_0` (warped_motion.c:295, convolve.h:81..86).
+// lane-av112bitc lifted the compound pair of the same family: the compound
+// combines absorb the CONV_BUF gain drop (`INTER_POST_ROUND - delta`, see
+// `mc::combine_compound`) and the six-frame 12-bit compound witness is
+// byte-exact vs ffmpeg. All sites are PARSE-time: a refused stream never
+// builds a warp predictor.
 
 /// Per-frame decode state, one instance per decoded stream (lane-thread1).
 ///
@@ -5301,7 +5303,7 @@ thread_local! {
 }
 
 /// Current value of [`COMPOUND_MODE_HITS`].
-#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
+#[allow(dead_code)] // reader is test-only (the 12-bit compound witness); dead in non-test builds
 pub(crate) fn compound_mode_hits() -> usize {
     COMPOUND_MODE_HITS.with(|c| c.get())
 }
@@ -29002,13 +29004,6 @@ fn decode_inter_block(
             } else {
                 read_inter_compound_mode(dec, cdfs, comp_stack.new_mv_ctx, comp_stack.ref_mv_ctx)
             };
-            // lane-av112bit: refused by name -- see `COMPOUND_12BIT_REFUSAL`.
-            if bit_depth(fctx) == 12 {
-                return Err(Error::unsupported(
-                    "AV1 tile decode",
-                    "a compound inter block at 12 bits (no 12-bit compound witness exists: the 12-bit inter gate is a single-reference stream)",
-                ));
-            }
             let (mv0, mv1) = assign_compound_mv(
                 dec,
                 cdfs,
@@ -34567,13 +34562,6 @@ fn decode_inter_block8(
                         comp_stack.ref_mv_ctx,
                     )
                 };
-                // lane-av112bit: refused by name -- see `COMPOUND_12BIT_REFUSAL`.
-                if bit_depth(fctx) == 12 {
-                    return Err(Error::unsupported(
-                    "AV1 tile decode",
-                    "a compound inter block at 12 bits (no 12-bit compound witness exists: the 12-bit inter gate is a single-reference stream)",
-                ));
-                }
                 if crate::envflags::env_flag!("EC_TRACE_MODE") {
                     eprintln!(
                         "EC_LEAFMODE mi_row={} mi_col={} cmode={} stack={} newmv_ctx={} refmv_ctx={} rng={}",
