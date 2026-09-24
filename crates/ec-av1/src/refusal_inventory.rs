@@ -38,6 +38,12 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
+    // lane-av1-444 c4's rect/1:4 chroma port added two shape guards whose
+    // strings never landed here (continuation 8's suite run caught the
+    // drift); both are decoder-side "no table for that shape yet" guards on
+    // 4:4:4 rect strips, same family as the rect luma/chroma entries below.
+    "a 64-axis strip whose chroma unit has no coefficient table",
+    "a rectangular chroma transform whose size has no coefficient table",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an OBMC neighbour whose switchable interp filter was never recorded",
@@ -88,7 +94,7 @@ const REFUSALS: &[&str] = &[
     // hardcoded 4:2:0, the probe emits 4:2:0 planes only); it is now refused
     // at the sequence header. Gate:
     // `a_non_420_subsampled_sequence_header_is_refused_by_name`.
-    "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
+    "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
     // lane-av1txr-r2: the third member of the same silent-garbage family.
     // `using_qmatrix`/`qm_y`/`qm_u`/`qm_v` are parsed by `ec-av1-syntax` but
     // read by NOTHING on the decode path -- dequantisation is `base_q_idx` +
@@ -380,7 +386,7 @@ const PROVEN: &[(&str, &str)] = &[
     // profile-0 CONTROL still decodes -- the refusal is exercised, not merely
     // present.
     (
-        "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
+        "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
         "a_non_420_subsampled_sequence_header_is_refused_by_name",
     ),
     // lane-av1txr-r2: the gate encodes the same source twice with real aomenc

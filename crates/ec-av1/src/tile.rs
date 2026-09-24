@@ -4972,7 +4972,8 @@ fn write_palette_syntax(
                 &pal.map,
                 uv_side,
                 n,
-                crate::decode::palette_onscreen_uv((side, side), on, (uv_side, uv_side)),
+                // The encoder writes 4:2:0 only (`palette_uv_side` above).
+                crate::decode::palette_onscreen_uv((side, side), on, (uv_side, uv_side), (1, 1)),
             );
             note_palette_uv(n);
         }

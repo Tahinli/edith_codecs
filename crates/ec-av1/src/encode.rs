@@ -6500,6 +6500,8 @@ fn search_chroma(
                 side.min(luma.true_height.saturating_sub(y)),
             ),
             (at.side, at.side),
+            // The encoder writes 4:2:0 only (`palette_uv_side` above).
+            (1, 1),
         );
         for mut pal in palette_candidates(&u_source) {
             let n = usize::from(pal.size);

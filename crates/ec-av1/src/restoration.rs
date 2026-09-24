@@ -415,6 +415,16 @@ pub(crate) struct RestorationGrid {
 
 impl RestorationGrid {
     pub(crate) fn new(lr: &LoopRestorationParams, frame_width: u32, frame_height: u32) -> Self {
+        Self::with_ss(lr, frame_width, frame_height, 1, 1)
+    }
+
+    pub(crate) fn with_ss(
+        lr: &LoopRestorationParams,
+        frame_width: u32,
+        frame_height: u32,
+        ss_x: u8,
+        ss_y: u8,
+    ) -> Self {
         let mut horz_units = [1usize; 3];
         let mut vert_units = [1usize; 3];
         let mut units: [Vec<UnitFilter>; 3] = [Vec::new(), Vec::new(), Vec::new()];
@@ -425,7 +435,10 @@ impl RestorationGrid {
             let (pw, ph) = if plane == 0 {
                 (frame_width, frame_height)
             } else {
-                ((frame_width + 1) / 2, (frame_height + 1) / 2)
+                (
+                    (frame_width + u32::from(ss_x)) >> ss_x,
+                    (frame_height + u32::from(ss_y)) >> ss_y,
+                )
             };
             let unit_size = lr.loop_restoration_size[plane];
             horz_units[plane] = count_units(pw, unit_size);
@@ -488,7 +501,11 @@ pub(crate) fn read_lr(
         if ftype == RestorationType::None {
             continue;
         }
-        let mi_size = if plane == 0 { 4u32 } else { 2u32 };
+        let mi_size = if plane == 0 {
+            4u32
+        } else {
+            4u32 >> (crate::decode::ss_x(fctx) as u32)
+        };
         let unit_size = lr.loop_restoration_size[plane];
         let horz_units = grid.horz_units[plane] as u32;
         let vert_units = grid.vert_units[plane] as u32;

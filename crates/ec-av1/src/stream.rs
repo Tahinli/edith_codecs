@@ -1708,10 +1708,11 @@ fn decode_frame(
     // unaffected. Gates: `a_non_420_subsampled_sequence_header_is_refused_by_
     // name` below (hand-built profile 1/2 headers plus a real aomenc 4:4:4
     // stream).
-    if seq.subsampling_x != 1 || seq.subsampling_y != 1 {
+    // lane-av1-444: 4:4:4 (ss 0,0) is decoded. 4:2:2 (ss_x != ss_y) is not.
+    if seq.subsampling_x != seq.subsampling_y {
         return Err(Error::unsupported(
             "AV1 decode_stream",
-            "a chroma format other than 4:2:0 (subsampling_x/y != 1/1): every chroma extent in this decoder is hardcoded to 4:2:0 and the probe emits 4:2:0 planes only, so a 4:4:4/4:2:2 stream would decode silently wrong pixels",
+            "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
         ));
     }
     // lane-av1txr-r2: `quantization_params.using_qmatrix` (spec 5.9.12) is
@@ -1799,6 +1800,7 @@ fn decode_frame(
     // the bit depth so a mono frame decoded on a thread that last saw a
     // 4:2:0 one never inherits the wrong plane count.
     crate::decode::set_mono(seq.mono_chrome, fctx);
+    crate::decode::set_subsampling(seq.subsampling_x, seq.subsampling_y, fctx);
     // lane-av1txr: spec 5.9.2 `disable_cdf_update` -- a frame that sets it
     // codes every tile symbol against the CDFs it started with, so the tile
     // readers must not adapt (libaom `decodeframe.c:2909`:
@@ -2180,11 +2182,11 @@ pub(crate) mod tests {
     #[test]
     fn a_non_420_subsampled_sequence_header_is_refused_by_name() {
         const NAME: &str = "a_non_420_subsampled_sequence_header_is_refused_by_name";
-        const REFUSAL: &str = "a chroma format other than 4:2:0";
+        const REFUSAL: &str = "a chroma format of 4:2:2";
         let fctx = &crate::decode::FrameCtx::new();
         let picture = test_card(64, 64);
         let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
-        for (profile, label, sx, sy) in [(1u8, "4:4:4", 0u8, 0u8), (2, "4:2:2", 1, 0)] {
+        for (profile, label, sx, sy) in [(2u8, "4:2:2", 1u8, 0u8)] {
             let color = ec_av1_syntax::ColorConfig {
                 num_planes: 3,
                 subsampling_x: sx,
