@@ -169,3 +169,24 @@ at every dequant site).
   three lane gates and the fail-pre-fix run (§3).
 - `deferred(aomenc has no recipe; unblock = an encoder that emits seg SKIP/REF on intra-only frames — needs a per-segment skip guard on the intra-frame path, where libaom's own read has a stale-segment-id wrinkle worth a look first)`: SEG_LVL_SKIP/REF on INTRA-only frames is not applied on our intra path. aomenc never emits it (features are cleared on key frames, `configure_static_seg_features:334-344`; ROI/active-map gate `!frame_is_intra_only`/`frame_is_intra_only`), and the stream-level refusal is being lifted for none of it — GLOBALMV frames still refuse wholesale. No stream in the suite can reach the shape.
 - `deferred(no decoder-side effect found; unblock = a census arm that catches configure_static_seg_features going live — the two-pass arm + parse tally in the re-scoped census is that tripwire)`: the arf `ALT_LF(-2)` tables and overlay `REF_FRAME/SKIP` tables cannot reach a stream while `static_segmentation` stays 0. The deblocker's per-segment `ALT_LF` port (`decode.rs`, lane-seg) is in place but stays unwitnessed by a real stream for the same reason.
+
+## 6. Merge-side note (local main, 2026-09-24)
+
+- Merged `--no-ff` into local main as **2e78e641** (lane tip 2fdfa9a2 = code
+  5a96bff9 + the P3 arm drop); **no push**. Git auto-merged decode.rs /
+  stream.rs / refusal_inventory.rs with zero textual conflicts; both behaviors
+  verified present in the merged tree — the lane's verbatim per-cell
+  `copy_segment_ids` + min-as-block-id (`decode.rs` ~1096/1255) AND main's
+  four-unit 128 mu-chunk chroma walk (`decode.rs` ~16185, from the 128 merge).
+  `cargo check -p ec-av1 --all-targets` green, **0 warnings**
+  (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1segm`).
+- Reviewer: **PASS 0.95**.
+- VPS suite **605 passed / 2 failed / 60 skipped — both failures were staging
+  missing files**, not regressions (matching the av1-444-128 pattern).
+- Local seg-suite still running at merge time; result lands out-of-band.
+- P3: the aq-mode=2 lag16 census arm was vacuous (0 seg-enabled frames —
+  complexity AQ never reaches the seg table at that recipe) and was dropped in
+  2fdfa9a2, with the census-only `SEG_LVL_ALT_Q`/`SEG_LVL_MAX` imports scoped
+  to `cfg(test)` in the same commit; the aggregate asserts are unchanged and
+  the firing arms (162 seg-enabled frames over 4 lag/two-pass arms) carry the
+  census.
