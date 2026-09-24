@@ -216,18 +216,54 @@ pub fn dequant_coeff_wh(
     dq2.clamp(-bound, bound - 1) as i32
 }
 
+use crate::hits::hit_do;
+
+thread_local! {
+    /// lane-av1-qmatrix: transform units whose dequantisation actually
+    /// scaled at least one NONZERO level through a quantisation matrix --
+    /// the witness gate's non-vacuity proof (`qm_scaled_units() > 0` on the
+    /// `--enable-qm=1` arm, `== 0` on the qm-off control). Same feature gate
+    /// as every other `*_HITS` counter in this crate.
+    static QM_SCALED_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`QM_SCALED_UNITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn qm_scaled_units() -> usize {
+    QM_SCALED_UNITS.with(|c| c.get())
+}
+
+/// Zeroes [`QM_SCALED_UNITS`] (the witness gate's per-arm reset).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_qm_scaled_units() {
+    QM_SCALED_UNITS.with(|c| c.set(0));
+}
+
 /// Dequantize a whole raster-order coefficient grid of a `side` x `side`
 /// transform.
 pub fn dequant(levels: &[i32], side: usize, bit_depth: u8, q_idx: i32) -> Vec<i32> {
-    dequant_wh(levels, side, side, bit_depth, q_idx, 0, 0)
+    dequant_wh(levels, side, side, bit_depth, q_idx, 0, 0, None)
 }
 
 /// [`dequant`] widened to `(w, h)` (lane-recttx), threading the same
 /// [`QuantDeltas`]-shaped `dc_delta`/`ac_delta` pair as [`dequant_coeff_wh`].
+/// `qm` is the block's inverse quantisation matrix (lane-av1-qmatrix);
+/// `None` dequantises flat.
 #[allow(clippy::too_many_arguments)]
-pub fn dequant_wh(levels: &[i32], w: usize, h: usize, bit_depth: u8, q_idx: i32, dc_delta: i32, ac_delta: i32) -> Vec<i32> {
+pub fn dequant_wh(
+    levels: &[i32],
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    dc_delta: i32,
+    ac_delta: i32,
+    qm: Option<crate::qm::Iqm>,
+) -> Vec<i32> {
     let mut out = Vec::new();
-    dequant_wh_into(levels, &mut out, w, h, bit_depth, q_idx, dc_delta, ac_delta);
+    dequant_wh_into(
+        levels, &mut out, w, h, bit_depth, q_idx, dc_delta, ac_delta, qm,
+    );
     out
 }
 
@@ -238,6 +274,10 @@ pub fn dequant_wh(levels: &[i32], w: usize, h: usize, bit_depth: u8, q_idx: i32,
 /// self time). A zero level dequantizes to zero for every parameter set, so
 /// the common all-but-EOB tail costs a compare instead of a 64-bit multiply
 /// and divide. The arithmetic on a non-zero level is the spec's, unchanged.
+/// `qm` (lane-av1-qmatrix, spec 7.12.3's per-position `dqv` scale, libaom
+/// `get_dqv`) rescales the DC/AC quantizer per coefficient BEFORE the
+/// multiply; `None` is the flat dequantization every caller before
+/// lane-av1-qmatrix ran.
 #[allow(clippy::too_many_arguments)]
 pub fn dequant_wh_into(
     levels: &[i32],
@@ -248,22 +288,37 @@ pub fn dequant_wh_into(
     q_idx: i32,
     dc_delta: i32,
     ac_delta: i32,
+    qm: Option<crate::qm::Iqm>,
 ) {
     let dcq = i64::from(dc_q(bit_depth, q_idx + dc_delta));
     let acq = i64::from(ac_q(bit_depth, q_idx + ac_delta));
     let denom = dq_denom_area(w * h);
     let bound = 1i64 << (7 + u32::from(bit_depth));
-    let apply = |l: i32, q: i64| -> i32 {
+    let apply = |pos: usize, l: i32, q: i64| -> i32 {
+        let q = match &qm {
+            None => q,
+            Some(m) => crate::qm::dqv_at(m, pos, w, q),
+        };
         let dq = i64::from(l) * q;
         let sign = if dq < 0 { -1 } else { 1 };
         let dq2 = sign * ((dq.abs() & 0xFF_FFFF) / denom);
         dq2.clamp(-bound, bound - 1) as i32
     };
+    hit_do! {
+        if qm.is_some() && levels.iter().any(|&l| l != 0) {
+            QM_SCALED_UNITS.with(|c| c.set(c.get() + 1));
+        }
+    }
     out.clear();
     out.reserve(levels.len());
-    out.extend(levels.iter().map(|&l| if l == 0 { 0 } else { apply(l, acq) }));
+    out.extend(
+        levels
+            .iter()
+            .enumerate()
+            .map(|(pos, &l)| if l == 0 { 0 } else { apply(pos, l, acq) }),
+    );
     if let (Some(dst), Some(&l)) = (out.first_mut(), levels.first()) {
-        *dst = if l == 0 { 0 } else { apply(l, dcq) };
+        *dst = if l == 0 { 0 } else { apply(0, l, dcq) };
     }
 }
 
@@ -299,11 +354,10 @@ mod tests {
             for bit_depth in [8u8, 10, 12] {
                 for (q_idx, dc, ac) in [(20, 0, 0), (140, -8, 5), (255, 12, -12)] {
                     let n = (w * h).min(levels.len());
-                    dequant_wh_into(&levels[..n], &mut out, w, h, bit_depth, q_idx, dc, ac);
+                    dequant_wh_into(&levels[..n], &mut out, w, h, bit_depth, q_idx, dc, ac, None);
                     for (i, &got) in out.iter().enumerate() {
-                        let want = dequant_coeff_wh(
-                            levels[i], i == 0, bit_depth, q_idx, dc, ac, w, h,
-                        );
+                        let want =
+                            dequant_coeff_wh(levels[i], i == 0, bit_depth, q_idx, dc, ac, w, h);
                         assert_eq!(got, want, "{w}x{h} depth {bit_depth} q {q_idx} coeff {i}");
                     }
                 }

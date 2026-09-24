@@ -113,14 +113,13 @@ const REFUSALS: &[&str] = &[
     // at the sequence header. Gate:
     // `a_non_420_subsampled_sequence_header_is_refused_by_name`.
     "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
-    // lane-av1txr-r2: the third member of the same silent-garbage family.
-    // `using_qmatrix`/`qm_y`/`qm_u`/`qm_v` are parsed by `ec-av1-syntax` but
-    // read by NOTHING on the decode path -- dequantisation is `base_q_idx` +
-    // the plane DC/AC deltas only -- so a real `aomenc --enable-qm=1` stream
-    // decoded with no refusal and wrong pixels (measured: byte-diff vs ffmpeg
-    // while the qm-off control is byte-exact). Refused at the frame header.
-    // Gate: `a_frame_using_quantisation_matrices_is_refused_by_name`.
-    "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
+    // lane-av1txr-r2 added, lane-av1-qmatrix RETIRED: the third member of the
+    // silent-garbage family (`using_qmatrix`/`qm_y`/`qm_u`/`qm_v`, refused by
+    // name at the frame header) now DEQUANTISES through libaom's
+    // `iwt_matrix_ref`/`get_dqv` port (`crate::qm`): the parsed 4-bit levels
+    // select per-plane matrices, 1D/identity transforms and lossless blocks
+    // stay flat. Witness:
+    // `a_real_aomenc_quantisation_matrix_stream_decodes_pixel_exact`.
     // lane-lossless/lane-lossless2: a lossless frame (base_q_idx 0) decodes
     // sample-exact, KEY and INTER -- TX_4X4 with the Walsh-Hadamard transform
     // on every plane, no `tx_type` symbol, `is_cfl_allowed` narrowed to a
@@ -407,14 +406,12 @@ const PROVEN: &[(&str, &str)] = &[
         "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
         "a_non_420_subsampled_sequence_header_is_refused_by_name",
     ),
-    // lane-av1txr-r2: the gate encodes the same source twice with real aomenc
-    // (`--enable-qm=1` and `--enable-qm=0`), asserts the qm-off CONTROL decodes
-    // and the qm-on stream is refused by name -- so the refusal is exercised
-    // against the exact encoder path it names, not merely present.
-    (
-        "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
-        "a_frame_using_quantisation_matrices_is_refused_by_name",
-    ),
+    // lane-av1txr-r2 paired, lane-av1-qmatrix RETIRED with its gate: the
+    // refusal's witness is now
+    // `a_real_aomenc_quantisation_matrix_stream_decodes_pixel_exact`, which
+    // asserts the qm-on stream DECODES pixel-exact vs ffmpeg and the
+    // matrices were really applied (census counters), while the qm-off
+    // control stays exact and flat.
     // lane-av1-ibcrect: the pairing for "intra block copy on a HORZ/VERT/1:4
     // rect intra strip (reconstruction is not ported at this shape)" is GONE
     // with the string -- lane-av1-intrabc/rect14 reconstructed the
