@@ -38,21 +38,6 @@ fn no_grain() -> bool {
     std::env::var_os("EC_AV1_NO_GRAIN").is_some()
 }
 
-/// lane-av112bit: film grain synthesis has no 12-bit byte-exact witness (the
-/// lane's witnesses encode with grain off), so a 12-bit frame that would
-/// synthesise grain is refused by name at output rather than trusted --
-/// `film_grain.rs` is bit-depth generic since lane-hbd10, but generic is not
-/// proven until a real 12-bit grain stream compares exact.
-fn grain_refusal(bit_depth: u32) -> Result<()> {
-    if bit_depth == 12 {
-        return Err(Error::unsupported(
-            "AV1 decode_stream",
-            "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
-        ));
-    }
-    Ok(())
-}
-
 // lane-hidden r1: where `EC_AV1_FINAL_DUMP`'s per-frame dump goes for the
 // current thread, overriding the environment variable. Every ffmpeg/aomdec
 // pixel gate in this repo compares SHOWN frames only (class
@@ -699,7 +684,6 @@ pub fn decode_stream_with_threads(
                 pictures_shown += 1;
                 let grain = header.film_grain;
                 let seq = SeqFlags::read(&parser);
-                grain_refusal(u32::from(seq.bit_depth))?;
                 let tx = tx.clone();
                 jobs.submit(move || {
                     let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -751,13 +735,6 @@ pub fn decode_stream_with_threads(
                 }
                 picture
             };
-            if header.film_grain.apply_grain {
-                grain_refusal(
-                    parser
-                        .sequence_header()
-                        .map_or(8, |seq| u32::from(seq.color_config.bit_depth)),
-                )?;
-            }
             let output = if header.film_grain.apply_grain && !no_grain() {
                 // lane-hbd10 r1: grain synthesis is bit-depth generic
                 // (`film_grain.rs`'s `grain_range`/`scale_lut`, spec 7.18.3).
@@ -1097,9 +1074,6 @@ pub fn decode_stream_with_threads(
                     // Grain is synthesised for OUTPUT only: a hidden frame is
                     // reported to the sink clean, exactly as the inline path
                     // below reports it (spec 7.18.3.1).
-                    if header.film_grain.apply_grain {
-                        grain_refusal(u32::from(seq.bit_depth))?;
-                    }
                     let output = if shown && header.film_grain.apply_grain && !no_grain() {
                         std::sync::Arc::new(crate::film_grain::apply_grain(
                             &picture,
@@ -1234,9 +1208,6 @@ pub fn decode_stream_with_threads(
             decode::note_fwd_kf();
         }
         if header.show_frame {
-            if header.film_grain.apply_grain {
-                grain_refusal(u32::from(seq.bit_depth))?;
-            }
             let output = if header.film_grain.apply_grain && !no_grain() {
                 let mc_identity = seq.mc_identity;
                 std::sync::Arc::new(crate::film_grain::apply_grain(
@@ -1676,10 +1647,12 @@ fn decode_frame(
     // the CONV_BUF gain), and CDEF/deblock/quant tables/SGR/palette reads/
     // superres upscale were already bit-depth generic (10-bit-proven).
     // Everything no 12-bit witness reached stays refused BY NAME at its own
-    // site: warp (decode.rs, warp's reduce bits inherit the 12-bit round_0),
-    // film grain (`grain_refusal`, the witnesses run with grain off), and
-    // any per-feature gap the witnesses' counters prove unreached -- see the
-    // 12-bit refusals in decode.rs and `refusal_inventory.rs`.
+    // site: warp (decode.rs, warp's reduce bits inherit the 12-bit round_0)
+    // and any per-feature gap the witnesses' counters prove unreached -- see
+    // the 12-bit refusals in decode.rs and `refusal_inventory.rs`.
+    // lane-av112bitg: film grain joined the witnessed set (`grain_refusal`
+    // deleted; the two-arm witness is
+    // `a_real_aomenc_12bit_film_grain_stream_decodes_pixel_exact`).
     // lane-av1txr: `color_config.subsampling_x/y` (spec 5.5.2) are parsed by
     // `ec-av1-syntax` -- profile 1 forces 4:4:4, profile 2 below 12-bit forces
     // 4:2:2, and the sRGB identity description forces full-range 4:4:4 -- but
@@ -7794,9 +7767,12 @@ pub(crate) mod tests {
     // restoration (Wiener AND SGR), and translational subpel motion
     // compensation through the bit-depth-parameterised `round_0`/`round_1`
     // (libaom `convolve.h:81..86`). Everything else stays refused by name:
-    // warp, film grain, screen content tools (palette/intrabc) at the frame
-    // level, compound inter blocks at the mode read, each with its own
-    // real-stream refusal gate below.
+    // warp and screen content tools (palette/intrabc) at the frame level,
+    // each with its own real-stream refusal gate below.
+    // lane-av112bitc: compound joined the witnessed set (refusal gate became
+    // the six-frame compound witness).
+    // lane-av112bitg: film grain joined the witnessed set (refusal gate became
+    // `a_real_aomenc_12bit_film_grain_stream_decodes_pixel_exact`).
     // -------------------------------------------------------------------
 
     /// The 12-bit witness source, byte-identical to the lane's committed
@@ -8123,25 +8099,95 @@ pub(crate) mod tests {
         }
     }
 
-    /// The 12-bit film grain refusal: a real `--film-grain-test=1` stream
-    /// (grain params present AND applied) is refused by name at output.
+    /// lane-av112bitg: the 12-bit film grain witness. A real
+    /// `aomenc --bit-depth=12 --profile=2 --film-grain-test=5` stream -- grain
+    /// params present AND applied (2 luma + 9 cb + 9 cr scaling points,
+    /// overlap blending on, clip-to-restricted-range on; the second frame is
+    /// an INTER frame that inherits the params via `update_grain = 0`) --
+    /// decoded byte-exact against ffmpeg's own 12-bit decode of the identical
+    /// bytes (ffmpeg synthesizes grain by default; no grain-disable flag is
+    /// passed anywhere in this file). Proves the bit-depth-generic grain path
+    /// at 12 bits: `grain_range`'s ±(128 << 4) AR clamp and overlap-blend
+    /// clamp, the `gauss_sec_shift = 12 - bd` Gaussian shift, the 4096-entry
+    /// expanded scaling-LUT interpolation, and the `<< (bit_depth - 8)`
+    /// chroma offsets and legal-range clamps. HARD-asserts the parsed headers
+    /// really carry that coverage and `film_grain::grain_hits()` fired, so
+    /// neither a params-without-apply stream nor a silently-skipped synthesis
+    /// can pass vacuously.
     #[test]
-    fn a_12bit_film_grain_stream_is_refused_by_name() {
-        const NAME: &str = "a_12bit_film_grain_stream_is_refused_by_name";
+    fn a_real_aomenc_12bit_film_grain_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_12bit_film_grain_stream_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
         if !have_aomenc() {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let y4m = y4m_12bit_subpel_source(1);
-        let stream = encode_12bit(&y4m, 1, &["--film-grain-test=1"]);
-        let err = decode_stream(&stream).unwrap_err().to_string();
-        assert!(
-            err.contains(
-                "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)"
-            ),
-            "{NAME}: expected the 12-bit grain refusal, got: {err}"
+        let y4m = y4m_12bit_subpel_source(2);
+        // Warp stays refused at 12 bits (lane-av112bitg lifts GRAIN only), so
+        // the arm pins both motion tools off exactly once each -- aomenc
+        // otherwise picks warped motion on this fixture's sub-pel motion.
+        let stream = encode_12bit(
+            &y4m,
+            2,
+            &[
+                "--film-grain-test=5",
+                "--enable-warped-motion=0",
+                "--enable-global-motion=0",
+            ],
         );
+        assert_12bit_sequence_header(&stream, NAME);
+        // The arm is only honest if the stream itself carries the coverage:
+        // grain applied on every frame, scaling points on all three planes,
+        // overlap blending and restricted-range clipping on.
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut grain_frames = 0usize;
+        while pos < stream.len() {
+            let obu = probe.parse_obu(&stream[pos..]).unwrap();
+            pos += obu.total_size;
+            if let ObuKind::Frame(header, _) = obu.kind {
+                let fg = &header.film_grain;
+                assert!(
+                    fg.apply_grain,
+                    "{NAME}: frame without apply_grain -- aomenc emitted params it does not apply"
+                );
+                assert!(
+                    fg.num_y_points > 0 && fg.num_cb_points > 0 && fg.num_cr_points > 0,
+                    "{NAME}: grain without all three planes' scaling points -- the bit-depth \
+                     LUT math would not be exercised"
+                );
+                assert!(
+                    fg.overlap_flag,
+                    "{NAME}: overlap off -- the grain_min/grain_max blend clamp is not exercised"
+                );
+                assert!(
+                    fg.clip_to_restricted_range,
+                    "{NAME}: clip_to_restricted_range off -- the << (bd - 8) legal-range clamps \
+                     are not exercised"
+                );
+                grain_frames += 1;
+            }
+        }
+        assert_eq!(grain_frames, 2, "{NAME}: expected grain on both frames");
+        let before = crate::film_grain::grain_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: decode_stream refused a real 12-bit grain stream: {e}"));
+        assert_eq!(frames.len(), 2);
+        assert!(
+            crate::film_grain::grain_hits() > before,
+            "{NAME}: matched but zero grain_hits -- grain synthesis never ran"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 2);
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: luma vs ffmpeg (12-bit grain, frame {i})");
+            assert_eq!(ours.u, theirs.u, "{NAME}: U vs ffmpeg (12-bit grain, frame {i})");
+            assert_eq!(ours.v, theirs.v, "{NAME}: V vs ffmpeg (12-bit grain, frame {i})");
+        }
+        eprintln!("{NAME}: byte-exact, grain_hits={}", crate::film_grain::grain_hits());
     }
 
     /// The 12-bit screen-content refusal: a real `--tune-content=screen
