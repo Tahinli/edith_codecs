@@ -10997,7 +10997,11 @@ fn decode_intra_rect_in_inter(
         hit!(SMOOTH_LUMA_HITS);
     }
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(mi_r, mi_c, r, c);
-    let depth = if fctx.tx_select_inter.with(std::cell::Cell::get) {
+    // lane-av1mixloss: the lossless-segment early return (`decodeframe.c:1203`)
+    // precedes `TX_MODE_SELECT`, so a lossless-segment intra-rect block inside
+    // an inter frame codes no depth symbol either (`xd->lossless` is per
+    // segment regardless of frame type; class sweep of the sub8 leaf's fix).
+    let depth = if fctx.tx_select_inter.with(std::cell::Cell::get) && !lossless(fctx) {
         // The frame's own `TXFM_CONTEXT` bands -- [`tx_size_context_txfm_rect`].
         let ctx = tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw.min(64), bh.min(64), fctx);
         let d = match tx_cat {
@@ -11585,7 +11589,11 @@ fn decode_block_rect(
     // desynced the tile from that point on. That is why both strips of the
     // pinned HORZ quadrant were wrong from their very first pixel, and why our
     // range after the read equalled the oracle's range for the whole block.
-    let depth = if tx_select {
+    // lane-av1mixloss: the lossless-segment early return
+    // (`decodeframe.c:1203`) precedes `TX_MODE_SELECT`, so a lossless-segment
+    // rect block codes no depth symbol here either (class sweep of the sub8
+    // leaf's fix).
+    let depth = if tx_select && !lossless(fctx) {
         // lane-av1txbands: EVERY frame now reads the real `TXFM_CONTEXT`
         // bands (`get_tx_size_context`, libaom `pred_common.h:342`) -- an
         // intra-only frame publishes them from every block too
@@ -12101,9 +12109,16 @@ fn decode_leaf_rect(
     // filter type is the NEIGHBOUR's `uv_mode` (libaom `get_filt_type`), not
     // a constant `false`.
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
-    let depth = if tx_select {
+    let depth = if tx_select && !lossless(fctx) {
         // lane-t900 r2 (sibling sweep): the in-inter `TXFM_CONTEXT` band read
         // every other rect reader now does -- a no-op on a key frame.
+        // lane-av1mixloss: libaom `read_tx_size`'s first line
+        // (`decodeframe.c:1203`, `if (xd->lossless[segment_id]) return
+        // TX_4X4;`) precedes the `TX_MODE_SELECT` test, so a lossless-segment
+        // rect leaf codes NO depth symbol (`depth_to_tx_wh` clamps to 4x4).
+        // The mixed frame's 16x8 leaf at mi(10,0) forked exactly here: ours
+        // read `tx_size_cat1` (rng 55700->49918) where the oracle's next
+        // read was the leaf's own txb_skip.
         let ctx = tx_size_context_txfm_rect(neighbours, leaf_mi, bw, bh, fctx);
         // lane-rectsplitx r1: `bsize_to_tx_size_cat` (libaom `blockd.h`,
         // `bsize_to_tx_size_depth_table`) is 2 for BLOCK_16X8/BLOCK_8X16, so
@@ -12455,7 +12470,10 @@ fn decode_block_rect4(
     } else {
         uv_mode
     };
-    let depth = if tx_select {
+    // lane-av1mixloss: the lossless-segment early return (`decodeframe.c:1203`)
+    // precedes `TX_MODE_SELECT`, so a lossless-segment rect4 block codes no
+    // depth symbol here either (class sweep of the sub8 leaf's fix).
+    let depth = if tx_select && !lossless(fctx) {
         // lane-av1txbands: EVERY frame now reads the real `TXFM_CONTEXT`
         // bands (`get_tx_size_context`, libaom `pred_common.h:342`) -- an
         // intra-only frame publishes them from every block too
@@ -13523,7 +13541,11 @@ fn decode_rect4_16_strip(
         // TX_16X4 and `sub_tx_size_map` reaches TX_4X4 in two steps, so the
         // depth symbol is the 3-symbol `tx_size_cat1` -- not the 2-symbol
         // `cat0` a 4x8 leaf reads nor the `cat2` a 32x8 strip does.
-        let depth = if tx_select {
+        // lane-av1mixloss: the lossless-segment early return
+        // (`decodeframe.c:1203`) precedes `TX_MODE_SELECT`, so a
+        // lossless-segment strip codes no depth symbol here either (class
+        // sweep of the sub8 leaf's fix).
+        let depth = if tx_select && !lossless(fctx) {
             // lane-av1txbands: every frame reads the real `TXFM_CONTEXT` bands
             // (`get_tx_size_context`, libaom `pred_common.h:342`).
             let ctx = tx_size_context_txfm_rect(neighbours, lmi, bw, bh, fctx);
@@ -14095,7 +14117,10 @@ fn decode_block_rect64(
         uv_mode
     };
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
-    let depth = if tx_select {
+    // lane-av1mixloss: the lossless-segment early return (`decodeframe.c:1203`)
+    // precedes `TX_MODE_SELECT`, so a lossless-segment 64-axis rect block codes
+    // no depth symbol here either (class sweep of the sub8 leaf's fix).
+    let depth = if tx_select && !lossless(fctx) {
         // lane-av1txbands: EVERY frame now reads the real `TXFM_CONTEXT`
         // bands (`get_tx_size_context`, libaom `pred_common.h:342`) -- an
         // intra-only frame publishes them from every block too

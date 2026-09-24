@@ -62,3 +62,31 @@
 - `fix-now | deferred(lane suivante) | accepted` : le fix du drift CDF lui-même.
   Unbloqué par : re-diff de l'historique d'adaptation du CDF (les valeurs des TUs 0-18 sont
   archivées dans les traces), puis comparaison de l'ordre d'application des updates CDF vs l'oracle.
+
+## Diagnostic de la divergence (session r2, 24-09-2026, session Ali-2)
+
+- Le « fork CDF » de r1 (TU#19, cdf0 23340 vs 10886) et le « mi(6,0) br=1 ctx=1 non
+  adapté » du r1-bis sont tous deux des **artefacts de convention d'impression** :
+  notre `EC_COEFF_STEP tag=all_zero side=` imprime la ligne `txb_skip` **pré**-adaptation
+  (copie `dbg_txbskip` avant `dec.symbol`, decode.rs), l'oracle instrumenté imprime
+  **post**-adaptation. 25197 = 26876 - (26876>>4) : une adaptation du même défaut neuf
+  `AOM_CDF2(5892)` (32768-5892=26876). **Aucune mise à jour CDF manquante.**
+- Vrai fork : entre la lecture #151 (chroma) et le txb luma de mi(10,0), nous
+  consommons **9 bits** contre **7 chez l'oracle** — un symbole `tx_size_cat1`
+  en trop (rng 55700->49918, s=1) lu par `decode_leaf_rect` pour une feuille
+  rect **16x8 d'un segment lossless** : le `read_tx_size` de libaom rend TX_4X4
+  AVANT le test `TX_MODE_SELECT` (decodeframe.c:1203), donc l'oracle ne code
+  aucun symbole de profondeur ici.
+- Balayage de la classe : `&& !lossless(fctx)` ajouté aux lectures de profondeur
+  de `decode_leaf_rect`, `decode_block_rect`, `decode_block_rect4`,
+  `decode_rect4_16_strip`, `decode_block_rect64`, `decode_intra_rect_in_inter`
+  (`decode_intra_sub8_leaf`, `decode_leaf_rect8`, le lecteur 128-root et
+  `read_tx_size` l'avaient déjà).
+- Preuve : mix.obu (cache, non ré-encodé) — chaîne rng EC identique à l'oracle
+  (9565 all_zero, 2982 eob, valeurs identiques) et **4 frames byte-exact** vs
+  l'aomdec instrumenté (294912 octets, `cmp` implicite par comparaison de
+  tableaux). Porte témoin `a_real_aomenc_mixed_lossless_segment_frame_decodes_
+  sample_exact` verte (3 arms, sample-exact vs ffmpeg, unités WHT comptées).
+- Instrument de session : sonde `EC_SYMR` ajoutée à
+  `~/.cache/aom-oracle/src/aom_dsp/bitreader.h` (aom_read_symbol_) — arbre
+  scratch hors repo.
