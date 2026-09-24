@@ -94,8 +94,11 @@ const REFUSALS: &[&str] = &[
     // lane-av112bitc: compound joined the witnessed set (six-frame 12-bit
     // compound stream byte-exact vs ffmpeg; the combines already absorbed
     // the CONV_BUF gain drop through `INTER_POST_ROUND - delta`).
+    // lane-av112bitg: film grain joined the witnessed set (two-frame
+    // `--film-grain-test=5` stream byte-exact vs ffmpeg; the gate that
+    // replaced the refusal is
+    // `a_real_aomenc_12bit_film_grain_stream_decodes_pixel_exact`).
     "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
-    "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
     "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
     // lane-av1txr: the silent-garbage guard. A 4:4:4/4:2:2 stream used to
     // decode with no refusal and wrong pixels (every chroma extent is
@@ -377,13 +380,12 @@ const PROVEN: &[(&str, &str)] = &[
     // lane-av112bitc: the compound pair left with its refusal -- the
     // six-frame compound stream now DECODES byte-exact
     // (`a_real_aomenc_12bit_compound_inter_sequence_decodes_pixel_exact`).
+    // lane-av112bitg: the grain refusal left with its witness -- the
+    // two-frame 12-bit grain stream now DECODES byte-exact
+    // (`a_real_aomenc_12bit_film_grain_stream_decodes_pixel_exact`).
     (
         "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
         "a_12bit_warped_motion_stream_is_refused_by_name",
-    ),
-    (
-        "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
-        "a_12bit_film_grain_stream_is_refused_by_name",
     ),
     (
         "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
