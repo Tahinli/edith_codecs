@@ -21218,12 +21218,13 @@ pub(crate) mod tests {
     /// `mc::predict_compound_intermediate`. `compound_warp_hits() > 0` is a
     /// hard assert: a run where the encoder never emitted one proves nothing.
     /// A decode error or a pixel mismatch is a FAILURE, never a skip.
-    fn run_compound_global_warp_gate(name: &str, bd: u32) {
+    fn run_compound_global_warp_gate(name: &str, bd: u32, min_part: u32, leaf8_assert: bool) {
         let _gate_lock = lock_gate_counters();
         assert!(have_ffmpeg(), "{name}: ffmpeg required");
         assert!(have_aomenc(), "{name}: no aomenc at {}", aomenc_path().display());
         let (width, height, frame_count) = (64usize, 64usize, 24usize);
         let before = crate::decode::compound_warp_hits();
+        let before8 = crate::decode::compound_warp_hits_8();
         let mut matched = 0u32;
         let mut named_refusals = 0u32;
         let mut attempts = 0u32;
@@ -21303,12 +21304,13 @@ pub(crate) mod tests {
                     "--enable-cdef=0",
                     "--enable-restoration=0",
                     "--max-partition-size=32",
-                    "--min-partition-size=32",
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
                     "--enable-ref-frame-mvs=0",
                 ];
+                let min_part_arg = format!("--min-partition-size={min_part}");
+                args.push(min_part_arg.as_str());
                 if bd != 8 {
                     args.extend_from_slice(&[
                         in_depth_arg.as_str(),
@@ -21365,15 +21367,25 @@ pub(crate) mod tests {
             }
         }
         let hits = crate::decode::compound_warp_hits() - before;
+        let hits8 = crate::decode::compound_warp_hits_8() - before8;
         eprintln!(
             "{name}: {matched}/{attempts} pixel-exact, {named_refusals} named refusals, \
-             compound_warp_hits={hits}"
+             compound_warp_hits={hits} compound_warp_hits_8={hits8}"
         );
-        assert!(
-            hits > 0,
-            "{name}: no compound block was predicted through a per-ref global warp \
-             ({matched} matches, {named_refusals} refusals of {attempts}) -- gate vacuous"
-        );
+        if leaf8_assert {
+            assert!(
+                hits8 > 0,
+                "{name}: no 8x8 COMPOUND leaf was predicted through a per-ref global \
+                 warp ({hits} bigger compound warp blocks, {matched} matches, \
+                 {named_refusals} refusals of {attempts}) -- gate vacuous"
+            );
+        } else {
+            assert!(
+                hits > 0,
+                "{name}: no compound block was predicted through a per-ref global warp \
+                 ({matched} matches, {named_refusals} refusals of {attempts}) -- gate vacuous"
+            );
+        }
         assert!(matched > 0, "{name}: every attempt refused -- no pixel comparison ran");
     }
 
@@ -21596,7 +21608,12 @@ pub(crate) mod tests {
     /// 8-bit arm of [`run_compound_global_warp_gate`].
     #[test]
     fn a_real_compound_global_warp_stream_decodes_pixel_exact() {
-        run_compound_global_warp_gate("a_real_compound_global_warp_stream_decodes_pixel_exact", 8);
+        run_compound_global_warp_gate(
+            "a_real_compound_global_warp_stream_decodes_pixel_exact",
+            8,
+            32,
+            false,
+        );
     }
 
     /// 10-bit arm of [`run_compound_global_warp_gate`] -- both of his films are
@@ -21616,6 +21633,8 @@ pub(crate) mod tests {
         run_compound_global_warp_gate(
             "a_real_compound_global_warp_10bit_stream_decodes_pixel_exact",
             10,
+            32,
+            false,
         );
     }
 
@@ -21631,6 +21650,26 @@ pub(crate) mod tests {
         run_compound_global_warp_gate(
             "a_real_compound_global_warp_12bit_stream_decodes_pixel_exact",
             12,
+            32,
+            false,
+        );
+    }
+
+    /// 12-bit 8x8 compound-warp LEAF arm (lane-av112bitw, reviewer gap): the
+    /// same recipe with the 32x32 partition pin dropped to min 8, so the RD
+    /// can code an 8x8 `GLOBAL_GLOBALMV` leaf whose two references warp per
+    /// slot -- `decode_inter_block8`'s `COMPOUND_WARP_HITS_8` path, which
+    /// the 32x32-pinned compound witness structurally cannot reach. Hard-
+    /// asserts `compound_warp_hits_8() > 0` (an 8x8 compound warp leaf bumps
+    /// it alongside [`decode::compound_warp_hits`]; a 16x16+ one cannot), so
+    /// a stream of only bigger warped blocks fails this gate.
+    #[test]
+    fn a_real_compound_global_warp_12bit_8x8_leaf_stream_decodes_pixel_exact() {
+        run_compound_global_warp_gate(
+            "a_real_compound_global_warp_12bit_8x8_leaf_stream_decodes_pixel_exact",
+            12,
+            8,
+            true,
         );
     }
 
