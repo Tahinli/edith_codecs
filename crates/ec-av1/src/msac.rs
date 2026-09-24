@@ -402,7 +402,11 @@ impl<'a> SymbolDecoder<'a> {
         // TABLE it read, so every coding tool is accounted without a
         // per-call-site label. Off (`EC_AV1_BITCENSUS` unset) this is one
         // relaxed load.
-        let t0 = if crate::census::armed() { self.tell_bits() } else { 0.0 };
+        let t0 = if crate::census::armed() {
+            self.tell_bits()
+        } else {
+            0.0
+        };
         let s = self.symbol_fixed(cdf);
         // lane-av1txr: spec 5.9.2's `disable_cdf_update` -- a frame that sets
         // it codes every symbol against the tables it started with, so this
@@ -410,7 +414,7 @@ impl<'a> SymbolDecoder<'a> {
         // allow_update_cdf && !cm->features.disable_cdf_update`,
         // decodeframe.c:2909). The flag is per-reader (see `Self::adapt`).
         if self.adapt {
-        update_cdf(cdf, s);
+            update_cdf(cdf, s);
         }
         if crate::census::armed() {
             crate::census::charge(cdf.as_ptr() as usize, self.tell_bits() - t0);
@@ -443,13 +447,16 @@ impl<'a> SymbolDecoder<'a> {
     #[inline]
     fn symbol_fixed_raw(&mut self, cdf: &[u16]) -> usize {
         let nsyms = cdf.len() - 1;
+        if symtrace::ecdump_armed() {
+            symtrace::ecdump(0, self.value, self.range, self.bit as i64);
+        }
         // Two-symbol alphabets are most of the stream (every flag, every bit of
         // a literal), and their walk has exactly one boundary: computing it
         // straight skips the loop and its bounds work.
         if nsyms == 2 {
             let f = u32::from(CDF_TOP - cdf[0]);
-            let cur = (((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
-                + EC_MIN_PROB;
+            let cur =
+                (((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
             return self.bool_cur(cur);
         }
         // Loop-invariant: the coder's range does not move until the symbol is
@@ -829,13 +836,21 @@ pub(crate) mod tests {
                 (a, b as u32)
             };
             assert_eq!(a, b, "item {i} (pick {pick})");
-            assert_eq!(a, if pick == usize::MAX { a } else { arg }, "item {i} vs written");
+            assert_eq!(
+                a,
+                if pick == usize::MAX { a } else { arg },
+                "item {i} vs written"
+            );
             assert_eq!(
                 fast.debug_state(),
                 slow.debug_state(),
                 "coder state after item {i} (pick {pick})"
             );
-            assert_eq!(fast_cdfs[pick.min(14)], slow_cdfs[pick.min(14)], "cdf after item {i}");
+            assert_eq!(
+                fast_cdfs[pick.min(14)],
+                slow_cdfs[pick.min(14)],
+                "cdf after item {i}"
+            );
         }
     }
 
@@ -898,6 +913,7 @@ pub(crate) mod tests {
 /// Off (the variable unset) this is one relaxed load per symbol.
 pub(crate) mod symtrace {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::sync::OnceLock;
 
     static DIR: OnceLock<Option<String>> = OnceLock::new();
@@ -906,11 +922,76 @@ pub(crate) mod symtrace {
 
     thread_local! {
         static BUF: RefCell<(String, usize)> = const { RefCell::new((String::new(), 0)) };
+        static ECD: RefCell<VecDeque<(u32, u32, u32, u32)>> = RefCell::new(VecDeque::new());
+        static ECD_READER: RefCell<Option<std::fs::File>> = const { RefCell::new(None) };
+        static ECD_IDX: RefCell<usize> = const { RefCell::new(0) };
+    }
+
+    /// lane-av1mix: `(low, value, rng, bitpos)` state register dump, one line
+    /// per symbol read, byte-for-byte diffable against libaom's `EC_ECDUMP`
+    /// (`decodetxb.c`, `r->ec.dif` masked to 16 bits / `r->ec.rng` /
+    /// `od_ec_dec_tell`). Reader-only, `EC_AV1_ECDUMP=<dir>`: each reader
+    /// writes `<dir>/ecdump-<n>.txt`.
+    pub(crate) fn ecdump(low: u32, value: u32, rng: u32, bitpos: i64) {
+        if !ecdump_armed() {
+            return;
+        }
+        let dir = std::env::var("EC_AV1_ECDUMP").unwrap_or_else(|_| "/tmp".to_string());
+        let idx = ECD_IDX.with(|c| {
+            let mut g = c.borrow_mut();
+            let n = *g;
+            *g += 1;
+            n
+        });
+        let _ = idx;
+        let line = format!("{idx} ({low},{value},{rng},{bitpos})\n");
+        ECD_READER.with(|f| {
+            let mut slot = f.borrow_mut();
+            if slot.is_none() {
+                let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = format!("{dir}/ecdump-{seq:05}.txt");
+                *slot = Some(std::fs::File::create(&path).expect("ecdump file"));
+                eprintln!("ECDUMP -> {path}");
+            }
+            use std::io::Write;
+            let _ = slot.as_mut().unwrap().write_all(line.as_bytes());
+        });
+        ECD.with(|q| {
+            let mut q = q.borrow_mut();
+            q.push_back((low, value, rng, bitpos as u32));
+            if q.len() > 512 {
+                q.pop_front();
+            }
+        });
+    }
+
+    /// lane-av1mix: the last `n` dumped register states (most recent last).
+    #[allow(dead_code)] // diagnostic helper for lane sessions
+    pub(crate) fn ecdump_recent(n: usize) -> Vec<(u32, u32, u32, u32)> {
+        if std::env::var_os("EC_AV1_ECDUMP").is_none() {
+            return Vec::new();
+        }
+        ECD.with(|q| {
+            let q = q.borrow();
+            let skip = q.len().saturating_sub(n);
+            q.iter().skip(skip).copied().collect()
+        })
     }
 
     pub(crate) fn dir() -> Option<&'static str> {
-        DIR.get_or_init(|| crate::envflags::var("EC_AV1_SYMTRACE").ok().filter(|v| !v.is_empty()))
-            .as_deref()
+        DIR.get_or_init(|| {
+            crate::envflags::var("EC_AV1_SYMTRACE")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+        .as_deref()
+    }
+
+    /// lane-av1mix: `EC_AV1_ECDUMP=<dir>` arms the decoder state-register dump.
+    pub(crate) fn ecdump_armed() -> bool {
+        static ARMED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("EC_AV1_ECDUMP").is_some());
+        *ARMED
     }
 
     /// `EC_AV1_SYMTRACE_AT=<i>` or `=<from>:<to>` (inclusive).
@@ -940,7 +1021,10 @@ pub(crate) mod symtrace {
         BUF.with(|b| {
             let (buf, n) = &mut *b.borrow_mut();
             if at().is_some_and(|(a, b)| (a..=b).contains(n)) {
-                eprintln!("SYMTRACE at {n}: {}", std::backtrace::Backtrace::force_capture());
+                eprintln!(
+                    "SYMTRACE at {n}: {}",
+                    std::backtrace::Backtrace::force_capture()
+                );
             }
             buf.push_str(&format!("{n} {value} {nsyms} {cdf0}\n"));
             *n += 1;

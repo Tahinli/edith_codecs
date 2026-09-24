@@ -6625,6 +6625,13 @@ fn read_coeffs(
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
+    if crate::envflags::env_flag!("EC_ECDUMP_IN") {
+        let (range, value) = dec.debug_state();
+        let bit = dec.debug_bitpos();
+        eprintln!(
+            "EC_ECDUMP_IN side={side} ctx={skip_ctx} dcctx={sign_ctx} ECIN=({value},{range},{bit})"
+        );
+    }
     let dbg_txbskip = if coeff_trace_on() {
         coding.txb_skip[skip_ctx]
     } else {
@@ -8340,9 +8347,18 @@ impl Neighbours {
                 (0..w_mi).map(|k| self.above[mi_c + k][0].level.to_string()).collect();
             let lf: Vec<String> =
                 (0..h_mi).map(|k| self.left[mi_r + k][0].level.to_string()).collect();
+            // lane-av1mix: the last few msac register states, so the
+            // byte-position of the `all_zero` read can be matched against
+            // aomdec's `EC=(value,rng,bytepos)` dump (decodetxb.c) without a
+            // second run.
+            let recent = crate::msac::symtrace::ecdump_recent(4)
+                .iter()
+                .map(|(_low, value, rng, bytepos)| format!("({value},{rng},{bytepos})"))
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!(
-                "EC_ECDUMP plane=0 mi=({mi_r},{mi_c}) wh=({w_mi},{h_mi}) ctx={ctx} above=[{},] left=[{},]",
-                ab.join(","), lf.join(",")
+                "EC_ECDUMP plane=0 mi=({mi_r},{mi_c}) wh=({w_mi},{h_mi}) ctx={ctx} above=[{},] left=[{},] recentEC=[{}]",
+                ab.join(","), lf.join(","), recent
             );
         }
         if crate::envflags::env_flag!("EC_AV1_TRACE") {
@@ -18240,7 +18256,13 @@ fn decode_leaf_rect8(
         // Missing this read consumed one symbol fewer than the encoder wrote
         // and desynced the tile at the very first rect leaf (class
         // `symbol-consumption-gap`).
-        let depth = if tx_select {
+        // lane-av1mix: libaom `read_tx_size`'s FIRST line
+        // (`decodeframe.c:1203`, `if (xd->lossless[...]) return TX_4X4`)
+        // fires before the `TX_MODE_SELECT` test, so a lossless-segment leaf
+        // codes NO depth symbol even in `TxMode::Select` -- the mixed-lossless
+        // frame's sub8 leaves forked exactly here (ours read the symbol at
+        // (12477,50864) bit 3011, the oracle's all_zero used it).
+        let depth = if tx_select && !lossless(fctx) {
             // lane-av1txbands: the `TXFM_CONTEXT` band read every other rect
             // reader already does.
             let ctx = tx_size_context_txfm_rect(neighbours, lmi, bw, bh, fctx);
@@ -33525,7 +33547,11 @@ fn decode_intra_sub8_leaf(
     // context bands, which on an inter frame are live.
     // `block_signals_txsize(BLOCK_4X4)` is false (blockd.h:1027): the 4x4 leaf
     // codes no depth symbol at all, its transform is its own size.
-    let depth = if tx_select && bw != bh {
+    // lane-av1mix: the lossless early return (`decodeframe.c:1203`) sits
+    // before the `TX_MODE_SELECT` test, so a lossless-segment rect leaf codes
+    // no depth symbol either (sweep of the class fixed at the key-frame pair
+    // path).
+    let depth = if tx_select && bw != bh && !lossless(fctx) {
         let ctx = tx_size_context_txfm_rect(neighbours, lmi, bw, bh, fctx);
         let d = dec.symbol(&mut cdfs.tx_size_cat0[ctx]);
         if step {
