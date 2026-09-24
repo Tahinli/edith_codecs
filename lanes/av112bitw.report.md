@@ -66,6 +66,15 @@ content refused by name.
   (below), and `run_compound_global_warp_gate` was generalised
   `ten_bit: bool` -> `bd: u32` with a third caller. The 8/10-bit arms are
   byte-identical recipes (8-bit still passes NO depth flags).
+- **stream.rs, reviewer round (post-cbb3a9b9)** — Elif's FAIL: the
+  compound witness pins `--min/--max-partition-size=32`, so it structurally
+  cannot emit an 8x8 compound-warp LEAF, and it asserts
+  `compound_warp_hits()`, not `compound_warp_hits_8()` — the 8x8 arm was
+  unwitnessed (its only prior gate was 8-bit). The helper gained
+  `min_part: u32` + `leaf8_assert: bool`; the new
+  `a_real_compound_global_warp_12bit_8x8_leaf_stream_decodes_pixel_exact`
+  drops the pin to min 8 and hard-asserts `compound_warp_hits_8() > 0`
+  (only an 8x8 compound warp leaf bumps it).
 
 ## The witnesses
 
@@ -88,6 +97,12 @@ fixtures are untouched (no new fixture needed).
    the gate's own hard asserts (`hits > 0`, `matched > 0`, no refusal may
    contain "warp"). Pre-lift the same gate FAILED with the warp refusal on
    attempt 1 — non-vacuity both directions.
+3. **8x8 compound-warp LEAF** (reviewer round)
+   `a_real_compound_global_warp_12bit_8x8_leaf_stream_decodes_pixel_exact`
+   — the same recipe with the partition pin dropped to min 8: **6/6
+   pixel-exact, compound_warp_hits = 128, compound_warp_hits_8 = 81**, the
+   leaf counter hard-asserted `> 0`. This closes the 8x8
+   `decode_inter_block8` compound-warp arm at 12 bits.
 
 ## Results
 
@@ -95,7 +110,8 @@ fixtures are untouched (no new fixture needed).
   byte-exact; `a_12bit_screen_content_stream_is_refused_by_name` and
   `a_12bit_film_grain_stream_is_refused_by_name` still refuse by name.
 - Warp family: 8-bit and 10-bit cwarp gates green (the parameterisation is
-  a no-op at bd <= 10, proven not just claimed), both fimv
+  a no-op at bd <= 10, proven not just claimed), the 12-bit compound and
+  12-bit 8x8-leaf cwarp gates green, both fimv
   force-integer-mv warp-alphabet gates green, both 10-bit film fixture
   gates with warp green (`a_10bit_128sb_film_frames_with_warp_cdef_and_interintra...`,
   `a_10bit_film_frames_with_small_side_globalmv_and_rect_warp_reach...`).
@@ -109,7 +125,7 @@ fixtures are untouched (no new fixture needed).
    `warp_affine` filter, bit-depth-independent model source, both pieces
    witnessed. A stream whose single-ref blocks warp under a ROTZOOM global
    model would close it outright; the mandelbrot content produces those
-   models only on compound blocks here.
+   models only on compound blocks here. STAYS OPEN per Main.
 2. **Grain and screen content stay refused by name** (untouched, per
    charter): `film grain synthesis at 12 bits ...` and
    `a 12-bit frame with screen content tools ...` with their real-stream
@@ -119,5 +135,5 @@ fixtures are untouched (no new fixture needed).
 
 Exactly one new file: this report. Touched: `warp.rs` (the parameterisation),
 `decode.rs` (three refusal deletions + header comment), `stream.rs` (witness
-gate swap + gate generalisation), `refusal_inventory.rs` (two row removals +
-notes). No fixture, no junk file.
+gate swap + gate generalisation + the 8x8-leaf arm), `refusal_inventory.rs`
+(two row removals + notes). No fixture, no junk file.
