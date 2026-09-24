@@ -17050,6 +17050,17 @@ fn decode_leaf8(
         Some((yb, _, _)) => Some(yb.clone()),
         None => palette_y_buf,
     };
+    // lane-av1intrapred: the chroma twin of the `palette_y_buf` wrap above --
+    // `decode_block` does the same for its own `palette_uv_bufs`
+    // (decode.rs's single-TU and multi-TU chroma reads). Without it, an
+    // intrabc leaf whose var-tx tree split to TX_4X4 reached the TX4 arm's
+    // chroma reads with the override unset: the unit predicted INTRA from
+    // the UV mode (intrabc's is DC) instead of copying the frame at the DV,
+    // R5 first differing pixel U(184,4), block mi (2,92).
+    let palette_uv_bufs = match &intrabc_bufs {
+        Some((_, ub, vb)) => Some((ub.clone(), vb.clone())),
+        None => palette_uv_bufs,
+    };
     let (luma_grid, u_grid, v_grid);
     if skip {
         // lane-hgkf r2 (same shape as `decode_block`'s own skip branch): an
