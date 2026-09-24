@@ -72,7 +72,15 @@ const REFUSALS: &[&str] = &[
     // (`a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal`)
     // still runs: it now reports `reached = 0` with the same non-vacuous
     // premise (allow_intrabc frames + decoded sub-8 leaves).
-    "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
+    // lane-av112bit: the blanket 12-bit refusal is REPLACED by the four
+    // named refusals below -- the witnessed paths (intra stack, dequant/
+    // transforms at the 12-bit tables, deblock, CDEF, Wiener+SGR
+    // restoration, translational subpel MC through the parameterised
+    // round_0/round_1) are lifted by the lane's byte-exact ffmpeg gates.
+    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
+    "a compound inter block at 12 bits (no 12-bit compound witness exists: the 12-bit inter gate is a single-reference stream)",
+    "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
+    "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
     // lane-av1txr: the silent-garbage guard. A 4:4:4/4:2:2 stream used to
     // decode with no refusal and wrong pixels (every chroma extent is
     // hardcoded 4:2:0, the probe emits 4:2:0 planes only); it is now refused
@@ -347,9 +355,24 @@ const PROVEN: &[(&str, &str)] = &[
         "a motion_mode symbol for a block shape with no CDF row here",
         "every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row",
     ),
+    // lane-av112bit: four real-aomenc 12-bit streams, each refused by name
+    // (the gates encode with aomenc --bit-depth=12 and assert the exact
+    // string; the two pixel witnesses are the same battery's Ok arms).
     (
-        "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
-        "a_twelve_bit_sequence_header_is_refused_by_name",
+        "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
+        "a_12bit_warped_motion_stream_is_refused_by_name",
+    ),
+    (
+        "a compound inter block at 12 bits (no 12-bit compound witness exists: the 12-bit inter gate is a single-reference stream)",
+        "a_12bit_compound_inter_stream_is_refused_by_name",
+    ),
+    (
+        "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
+        "a_12bit_film_grain_stream_is_refused_by_name",
+    ),
+    (
+        "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
+        "a_12bit_screen_content_stream_is_refused_by_name",
     ),
     // lane-av1txr: the guard's own gate builds a profile-1 and a profile-2
     // sequence header by hand and asserts each refuses by name while the
@@ -589,7 +612,11 @@ mod tests {
             .chain(REFUSALS)
             .map(|&s| s.to_owned())
             .collect();
-        assert!(found.len() >= 30, "the refusal scan found only {} reasons -- it is broken, not the decoder", found.len());
+        assert!(
+            found.len() >= 30,
+            "the refusal scan found only {} reasons -- it is broken, not the decoder",
+            found.len()
+        );
 
         let added: Vec<&String> = found.difference(&listed).collect();
         assert!(
@@ -635,9 +662,14 @@ mod tests {
         let mut found: BTreeSet<String> = BTreeSet::new();
         for (i, _) in src.match_indices("\"SKIP ") {
             let rest = &src[i + "\"SKIP ".len()..];
-            let Some(colon) = rest.find(':') else { continue };
+            let Some(colon) = rest.find(':') else {
+                continue;
+            };
             let name = &rest[..colon];
-            if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
                 continue;
             }
             // The tail of the message says what was skipped. Only "{e}" -- the
@@ -650,7 +682,10 @@ mod tests {
             }
         }
         let listed: BTreeSet<&str> = GATES_THAT_SKIP_ON_A_DECODE_ERROR.iter().copied().collect();
-        let added: Vec<&String> = found.iter().filter(|n| !listed.contains(n.as_str())).collect();
+        let added: Vec<&String> = found
+            .iter()
+            .filter(|n| !listed.contains(n.as_str()))
+            .collect();
         assert!(
             added.is_empty(),
             "these gates turn a decode error into a printed SKIP and are not declared: \
@@ -723,9 +758,18 @@ mod tests {
     fn every_partition_value_of_an_enumerated_alphabet_has_an_arm() {
         // (the refusal in the fallback arm, the alphabet its CDF codes)
         let blocks: [(&str, usize); 4] = [
-            ("a 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
-            ("an INTER 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
-            ("a 128x128 superblock partition value outside the 8-symbol alphabet", crate::cdf::PARTITION_W128[0].len() - 1),
+            (
+                "a 32x32 partition type this decoder does not code",
+                crate::cdf::PARTITION_W32[0].len() - 1,
+            ),
+            (
+                "an INTER 32x32 partition type this decoder does not code",
+                crate::cdf::PARTITION_W32[0].len() - 1,
+            ),
+            (
+                "a 128x128 superblock partition value outside the 8-symbol alphabet",
+                crate::cdf::PARTITION_W128[0].len() - 1,
+            ),
             // lane-t900 r24: the key-frame superblock root. Its `part` is
             // either a `partition_w64` symbol or, at a frame edge, one of the
             // three gathered outcomes (PARTITION_HORZ, PARTITION_VERT,
@@ -779,7 +823,10 @@ mod tests {
                 "the `match` at decode.rs:{} refuses {reason:?} but has no arm for {:?} -- that \
                  is a real gap in its {alphabet}-value alphabet, not a dead refusal",
                 i + 1,
-                missing.iter().map(|v| PARTITION_NAMES[*v]).collect::<Vec<_>>()
+                missing
+                    .iter()
+                    .map(|v| PARTITION_NAMES[*v])
+                    .collect::<Vec<_>>()
             );
         }
         assert_eq!(
@@ -833,7 +880,11 @@ mod tests {
                 .next()
                 .unwrap_or("")
                 .to_owned();
-            assert!(!var.is_empty(), "the chain at decode.rs:{} tests nothing", head + 1);
+            assert!(
+                !var.is_empty(),
+                "the chain at decode.rs:{} tests nothing",
+                head + 1
+            );
 
             // Walk up collecting every branch head of this chain, each read to
             // the line that opens its body.
@@ -843,7 +894,8 @@ mod tests {
             loop {
                 i -= 1;
                 let t = lines[i].trim_start();
-                if indent(lines[i]) != outer || !(t.starts_with("} else if ") || t.starts_with("if "))
+                if indent(lines[i]) != outer
+                    || !(t.starts_with("} else if ") || t.starts_with("if "))
                 {
                     if i == 0 {
                         break;
@@ -893,7 +945,10 @@ mod tests {
                 "the chain at decode.rs:{} refuses {reason:?} but no branch names {:?} -- that \
                  is a real gap in its {alphabet}-value alphabet, not a dead refusal",
                 head + 1,
-                missing.iter().map(|v| PARTITION_NAMES[*v]).collect::<Vec<_>>()
+                missing
+                    .iter()
+                    .map(|v| PARTITION_NAMES[*v])
+                    .collect::<Vec<_>>()
             );
         }
         assert_eq!(found, chains.len());
@@ -996,11 +1051,18 @@ mod tests {
             values.insert(((1u64 << length) - 2) as u32);
         }
         let max = *values.iter().max().unwrap();
-        assert_eq!(max, (1u32 << 20) - 2, "the enumeration misses the spec's own ceiling");
+        assert_eq!(
+            max,
+            (1u32 << 20) - 2,
+            "the enumeration misses the spec's own ceiling"
+        );
         // A coefficient is masked to 20 bits (spec 5.11.39), and the base and
         // base-range syntax contribute at most 15 of that before the tail, so
         // this is the largest tail a legal coefficient can need.
-        assert!(max >= 0xF_FFFF - 15, "the ceiling is below the largest legal tail");
+        assert!(
+            max >= 0xF_FFFF - 15,
+            "the ceiling is below the largest legal tail"
+        );
         for value in values {
             match roundtrip(value) {
                 Ok(read) => assert_eq!(read, value, "the Golomb tail {value} read back as {read}"),
@@ -1056,7 +1118,11 @@ mod tests {
         ];
         assert_eq!(alphabets[0].1, 13, "the y_mode alphabet changed size");
         for group in &crate::cdf::Y_MODE {
-            assert_eq!(group.len() - 1, alphabets[0].1, "the y_mode rows disagree on width");
+            assert_eq!(
+                group.len() - 1,
+                alphabets[0].1,
+                "the y_mode rows disagree on width"
+            );
         }
 
         let src = include_str!("decode.rs");
@@ -1064,12 +1130,17 @@ mod tests {
         let mut sites = 0usize;
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim();
-            let Some(rest) = t.strip_prefix("if mode >= ") else { continue };
+            let Some(rest) = t.strip_prefix("if mode >= ") else {
+                continue;
+            };
             let Some(threshold) = rest.trim_end_matches(" {").parse::<usize>().ok() else {
                 continue;
             };
             // Only the guards carrying THIS refusal.
-            if !lines[i..(i + 4).min(lines.len())].join("\n").contains(REFUSAL) {
+            if !lines[i..(i + 4).min(lines.len())]
+                .join("\n")
+                .contains(REFUSAL)
+            {
                 continue;
             }
             sites += 1;
@@ -1099,7 +1170,10 @@ mod tests {
                 i + 1
             );
         }
-        assert_eq!(sites, 3, "the intra-mode guard is at three sites, found {sites}");
+        assert_eq!(
+            sites, 3,
+            "the intra-mode guard is at three sites, found {sites}"
+        );
     }
 
     /// lane-t900 r31, ENUMERATION for "a HORZ/VERT intra strip in a
@@ -1159,7 +1233,10 @@ mod tests {
                 }
             }
         }
-        assert!(with_128 > 0, "enumeration is vacuous -- no 128-sided footprint was tried");
+        assert!(
+            with_128 > 0,
+            "enumeration is vacuous -- no 128-sided footprint was tried"
+        );
         assert_eq!(
             allowed_at_128, 0,
             "a footprint with a 128-pixel side passed av1_allow_palette's bound -- the \
@@ -1271,11 +1348,17 @@ mod tests {
         // (3) The two tables, read out of decode_rect_split's own text: every
         // `(w, h) =>` / `(w, h) |` match arm head between the table's `let`
         // and the guard that follows it.
-        let body_at = src.find("fn decode_rect_split(").expect("decode_rect_split is gone");
+        let body_at = src
+            .find("fn decode_rect_split(")
+            .expect("decode_rect_split is gone");
         let body = &src[body_at..];
         let slice = |from: &str, to: &str| -> &str {
-            let a = body.find(from).unwrap_or_else(|| panic!("{from:?} is gone from decode_rect_split"));
-            let b = body[a..].find(to).unwrap_or_else(|| panic!("{to:?} is gone from decode_rect_split"));
+            let a = body
+                .find(from)
+                .unwrap_or_else(|| panic!("{from:?} is gone from decode_rect_split"));
+            let b = body[a..]
+                .find(to)
+                .unwrap_or_else(|| panic!("{to:?} is gone from decode_rect_split"));
             &body[a..a + b]
         };
         let arm_shapes = |text: &str| -> BTreeSet<(usize, usize)> {
@@ -1348,7 +1431,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 40, "the strip domain is not the ten rect shapes x four depths");
+        assert_eq!(
+            checked, 40,
+            "the strip domain is not the ten rect shapes x four depths"
+        );
     }
 
     /// lane-t900 r33, ENUMERATION for "CfL, filter intra or a palette on a
@@ -1458,9 +1544,15 @@ mod tests {
                 }
                 continue;
             }
-            let Some(rest) = line.strip_prefix('(') else { continue };
-            let Some((pair, _)) = rest.split_once(") =>") else { continue };
-            let Some((a, b)) = pair.split_once(',') else { continue };
+            let Some(rest) = line.strip_prefix('(') else {
+                continue;
+            };
+            let Some((pair, _)) = rest.split_once(") =>") else {
+                continue;
+            };
+            let Some((a, b)) = pair.split_once(',') else {
+                continue;
+            };
             let bw: usize = a.trim().parse().expect("arm bw");
             let bh: usize = b.trim().parse().expect("arm bh");
             assert!(
@@ -1472,9 +1564,18 @@ mod tests {
             seen.push((bw, bh));
             arms += 1;
         }
-        assert!(arms >= 10, "only {arms} arms parsed -- the table's shape changed");
-        assert!(saw_none_fallback, "filter_intra_size_class_rect lost its `_ => None` fallback");
-        assert!(saw_square_delegate, "filter_intra_size_class_rect lost its square-delegate arm");
+        assert!(
+            arms >= 10,
+            "only {arms} arms parsed -- the table's shape changed"
+        );
+        assert!(
+            saw_none_fallback,
+            "filter_intra_size_class_rect lost its `_ => None` fallback"
+        );
+        assert!(
+            saw_square_delegate,
+            "filter_intra_size_class_rect lost its square-delegate arm"
+        );
         // The guard arm delegates square strips to `filter_intra_size_class`;
         // drive the delegate directly, so a widening there turns THIS test red
         // (the numeric walk never reaches the guard arm).
@@ -1524,7 +1625,10 @@ mod tests {
                 );
             }
         }
-        assert_eq!(sites, 8, "the call-site audit found {sites} sites, not the 8 it enumerated");
+        assert_eq!(
+            sites, 8,
+            "the call-site audit found {sites} sites, not the 8 it enumerated"
+        );
     }
 
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
@@ -1543,7 +1647,9 @@ mod tests {
                 "{reason:?} is listed as proven but is no longer a decode-path refusal --                  drop it from PROVEN (the capability landed) or fix the string"
             );
             assert!(
-                sources.iter().any(|src| src.contains(&format!("fn {gate}("))),
+                sources
+                    .iter()
+                    .any(|src| src.contains(&format!("fn {gate}("))),
                 "{reason:?} names the proving test {gate}, which exists in neither stream.rs \
                  nor decode.rs"
             );

@@ -9745,7 +9745,7 @@ fn mc_trial_compound_typed(
             side,
             fctx.interp_filter.get(),
             fctx.interp_filter.get(),
-            dst,
+            dst, fctx,
         );
     }
     let mut blended16 = [0u16; BLOCK * BLOCK];
@@ -9838,7 +9838,7 @@ fn predict_compound_u8(
             side,
             fctx.interp_filter.get(),
             fctx.interp_filter.get(),
-            dst,
+            dst, fctx,
         );
     }
     let mut blended = vec![0u16; side * side];
