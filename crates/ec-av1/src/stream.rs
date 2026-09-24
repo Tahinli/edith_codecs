@@ -1712,24 +1712,31 @@ fn decode_frame(
             "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
         ));
     }
-    // lane-av1txr-r2: `quantization_params.using_qmatrix` (spec 5.9.12) is
-    // parsed by `ec-av1-syntax` along with `qm_y`/`qm_u`/`qm_v` (frame.rs
-    // :190-196, :1418-1426), but this decoder reads NONE of them: every
-    // dequantisation below is `base_q_idx` plus the plane DC/AC deltas only
-    // (`Quantizer::new`), so a stream that applies quantisation matrices
-    // dequantises every coefficient off the wrong table. The same
-    // silent-garbage class as the non-4:2:0 guard above. Measured: a real
-    // `aomenc --enable-qm=1` key frame (`using_qmatrix = 1`, `qm_y/u/v = 5`)
-    // decodes with NO refusal and its planes byte-differ from ffmpeg, while
-    // the `--enable-qm=0` control of the same source and recipe is
-    // byte-exact. Refuse by name rather than return garbage. Gate:
-    // `a_frame_using_quantisation_matrices_is_refused_by_name` below.
-    if header.quantization.using_qmatrix {
-        return Err(Error::unsupported(
-            "AV1 decode_stream",
-            "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
-        ));
-    }
+    // lane-av1-qmatrix: `quantization_params.using_qmatrix` + `qm_y`/`qm_u`/
+    // `qm_v` (spec 5.9.12) select per-plane INVERSE QUANTISATION MATRICES --
+    // spec 7.12.3's per-position `dqv` scale, libaom `get_dqv` over
+    // `iwt_matrix_ref`. The parsed 4-bit values ARE the table levels
+    // (libaom `quant_params->qmatrix_level_y/u/v`); 15 is libaom's flat
+    // NULL-table sentinel, and a `using_qmatrix == 0` frame keeps all three
+    // parked there, selecting no matrix. Frame-constant: recorded here (the
+    // spot where this decoder refused such frames until this lane), read by
+    // every dequantisation call site through [`crate::decode::block_iqmatrix`].
+    // A real `aomenc --enable-qm=1` stream (`using_qmatrix = 1`, levels 5)
+    // decodes byte-exact vs ffmpeg; the witness is
+    // `a_real_aomenc_quantisation_matrix_stream_decodes_pixel_exact` below.
+    let q = &header.quantization;
+    // When the bit is UNSET the parsed 4-bit fields read 0 but mean nothing
+    // (spec: they are not even coded): libaom parks the level at
+    // `NUM_QM_LEVELS - 1`, its flat NULL-table sentinel
+    // (`setup_segmentation_dequant`: `use_qmatrix ? qmatrix_level_y : 15`),
+    // so a matrix-free frame selects no matrix.
+    let flat = crate::qm::NUM_QM_LEVELS as u8 - 1;
+    let levels = if q.using_qmatrix {
+        [q.qm_y, q.qm_u, q.qm_v]
+    } else {
+        [flat; 3]
+    };
+    crate::decode::set_qm_levels(levels, fctx);
     // lane-av112bit: the frame-level half of the 12-bit gate -- screen
     // content tools. Neither palette nor intrabc has a 12-bit witness (the
     // 12-bit gates are natural content), and both hang off this header bit:
@@ -2211,28 +2218,22 @@ pub(crate) mod tests {
         assert_eq!(frames.len(), 1, "{NAME}: the 4:2:0 control decoded no frame");
     }
 
-    /// lane-av1txr-r2: a frame using quantisation matrices is refused by name
-    /// -- the THIRD member of the silent-garbage family the non-4:2:0 gate
-    /// above opened (the verifier's census miss).
+    /// lane-av1-qmatrix: WITNESS for the lifted `using_qmatrix` refusal (the
+    /// old gate `a_frame_using_quantisation_matrices_is_refused_by_name` is
+    /// its mirror image -- its own panic said "flip this gate to a witness"
+    /// the moment the dequant landed).
     ///
-    /// `using_qmatrix`/`qm_y`/`qm_u`/`qm_v` are parsed by `ec-av1-syntax`
-    /// (frame.rs:190-196, :1418-1426) but have NO consumer anywhere on the
-    /// decode path -- every dequantisation is `base_q_idx` plus the plane
-    /// DC/AC deltas only. Measured on a real aomenc pair (same source and
-    /// recipe, only `--enable-qm` flipped): the qm-OFF control decodes
-    /// byte-exact vs ffmpeg, the qm-ON stream used to decode with NO refusal
-    /// and byte-differ from ffmpeg (silent garbage; class
-    /// `refusal-hides-a-defect` read the other way -- a silent wrong decode
-    /// is worse than a named gap).
-    ///
-    /// Both arms are real encoder output, so this is a reachability gate, not
-    /// a hand-built construction: the qm-on arm carries `using_qmatrix = 1`
-    /// (`qm_y/u/v = 5` on the measured fixture) and the refusal names the
-    /// field rather than desyncing.
+    /// A REAL `aomenc --enable-qm=1` stream (same source and recipe as the
+    /// refusal's gate, plus its `--enable-qm=0` control) now DECODES, and
+    /// every frame of both arms is pixel-exact against ffmpeg's own decode
+    /// of the same OBU. The census proves the feature non-vacuously both
+    /// ways (class `gate-blind-to-feature`): the parsed frame headers really
+    /// carry `using_qmatrix = 1`, the dequantiser really SCALED transform
+    /// units through a matrix on the qm-on arm (`qm_scaled_units() > 0`),
+    /// and the qm-off control really scaled none (`== 0`).
     #[test]
-    fn a_frame_using_quantisation_matrices_is_refused_by_name() {
-        const NAME: &str = "a_frame_using_quantisation_matrices_is_refused_by_name";
-        const REFUSAL: &str = "a frame using quantisation matrices";
+    fn a_real_aomenc_quantisation_matrix_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_quantisation_matrix_stream_decodes_pixel_exact";
         if !have_ffmpeg() || !have_aomenc() {
             eprintln!(
                 "SKIP {NAME}: needs ffmpeg + an aomenc oracle at {}",
@@ -2240,26 +2241,149 @@ pub(crate) mod tests {
             );
             return;
         }
+        const W: usize = 128;
+        const H: usize = 96;
+        const FRAMES: usize = 3;
+        // Every frame header's (using_qmatrix, qm_y, qm_u, qm_v), parsed
+        // straight off the encoded bytes.
+        let qm_headers = |stream: &[u8]| -> Vec<(bool, u8, u8, u8)> {
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut out = Vec::new();
+            while pos < stream.len() {
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, _) = obu.kind {
+                    let q = &header.quantization;
+                    out.push((q.using_qmatrix, q.qm_y, q.qm_u, q.qm_v));
+                }
+            }
+            out
+        };
+        // `census_attempt` hands back only the stream LENGTH; this witness
+        // needs the BYTES to hand ffmpeg, so the same recipe (its base args
+        // verbatim, `testsrc2` 128x96 @ 25fps, 3 frames) runs inline.
+        let encode = |extra: &[&str]| -> Vec<u8> {
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("testsrc2=size={W}x{H}:rate=25"),
+                    "-t",
+                    "0.12",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(y4m.status.success(), "ffmpeg refused the {W}x{H} fixture");
+            let mut args: Vec<String> = [
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--threads=1",
+                "--row-mt=0",
+                "--kf-max-dist=9999",
+                "--lag-in-frames=0",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+            args.push(format!("--limit={FRAMES}"));
+            args.extend(extra.iter().map(|s| (*s).to_owned()));
+            args.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+            assert!(
+                out.status.success(),
+                "aomenc refused {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        // Pixel-exact every decoded frame of `stream` against ffmpeg, plane
+        // by plane, first differing sample named.
+        let compare = |stream: &[u8], frames: usize, label: &str| {
+            let want = ffmpeg_decode_sequence(stream, W, H, frames);
+            let got =
+                decode_stream(stream).unwrap_or_else(|e| panic!("{NAME}: {label} decode: {e}"));
+            assert_eq!(got.len(), want.len(), "{NAME}: {label} frame count");
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                for (plane, (gp, wp)) in
+                    [(&g.y, &w.y), (&g.u, &w.u), (&g.v, &w.v)].into_iter().enumerate()
+                {
+                    assert_eq!(gp, wp,
+                        "{NAME}: {label} frame {i} plane {plane} differs from ffmpeg (first mismatching sample: got {}, want {})",
+                        gp.iter().zip(wp.iter()).find(|(a, b)| a != b).map_or(0, |(a, _)| *a),
+                        gp.iter().zip(wp.iter()).find(|(a, b)| a != b).map_or(0, |(_, b)| *b));
+                }
+            }
+        };
+
         // CONTROL: the same source and recipe with quantisation matrices OFF
-        // still decodes -- so the refusal below is about the qm bit, not about
-        // the source or the encoder settings.
-        let (_, control) = census_attempt("testsrc2", 128, 96, 3, &["--enable-qm=0"]);
-        let frames = control.unwrap_or_else(|e| {
-            panic!("{NAME}: the --enable-qm=0 control must decode, got: {e}")
-        });
-        assert!(frames >= 1, "{NAME}: the qm-off control decoded no frame");
-        // The qm-on stream is the new refusal.
-        let (_, qm) = census_attempt("testsrc2", 128, 96, 3, &["--enable-qm=1"]);
-        let err = qm.err().unwrap_or_else(|| {
-            panic!("{NAME}: the --enable-qm=1 stream now decodes -- flip this gate to a witness")
-        });
+        // -- unchanged by this lane, and it must not scale a single unit
+        // through a matrix.
+        crate::quant::reset_qm_scaled_units();
+        let control_stream = encode(&["--enable-qm=0"]);
+        let control_frames = decode_stream(&control_stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the --enable-qm=0 control must decode, got: {e}"))
+            .len();
         assert!(
-            err.contains(REFUSAL),
-            "{NAME}: the qm-on stream stopped without the named refusal {REFUSAL:?} \
-             -- re-measure before trusting this gate. got: {err}"
+            control_frames >= 1,
+            "{NAME}: the qm-off control decoded no frame"
+        );
+        for (using, y, u, v) in qm_headers(&control_stream) {
+            assert!(!using, "{NAME}: the control's frame header set using_qmatrix");
+            assert_eq!(
+                (y, u, v),
+                (0, 0, 0),
+                "{NAME}: the control's frame header carried qm levels {y}/{u}/{v}"
+            );
+        }
+        compare(&control_stream, control_frames, "qm-off control");
+        assert_eq!(
+            crate::quant::qm_scaled_units(),
+            0,
+            "{NAME}: the qm-off control scaled units through a matrix"
+        );
+
+        // The qm-on stream: decodes now, pixel-exact, levels 5 per plane as
+        // aomenc writes them.
+        crate::quant::reset_qm_scaled_units();
+        let qm_stream = encode(&["--enable-qm=1"]);
+        let qm_frames = decode_stream(&qm_stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the --enable-qm=1 stream must decode, got: {e}"))
+            .len();
+        assert!(qm_frames >= 1, "{NAME}: the qm-on stream decoded no frame");
+        let headers = qm_headers(&qm_stream);
+        assert!(
+            !headers.is_empty() && headers.iter().all(|h| h.0),
+            "{NAME}: not every qm-on frame header set using_qmatrix: {headers:?}"
+        );
+        assert!(
+            headers.iter().all(|h| (h.1, h.2, h.3) == (5, 5, 5)),
+            "{NAME}: expected aomenc's qm levels 5/5/5, got {headers:?}"
+        );
+        compare(&qm_stream, qm_frames, "qm-on");
+        let scaled = crate::quant::qm_scaled_units();
+        assert!(
+            scaled > 0,
+            "{NAME}: the --enable-qm=1 stream dequantized every unit flat -- \
+             the matrices were never applied (class gate-blind-to-feature)"
         );
         eprintln!(
-            "{NAME}: qm-off control {frames} frames, qm-on refused by name ({REFUSAL})"
+            "{NAME}: qm-off control {control_frames} frames exact (0 matrix-scaled units), \
+             qm-on {qm_frames} frames exact ({scaled} matrix-scaled units, levels 5/5/5)"
         );
     }
 

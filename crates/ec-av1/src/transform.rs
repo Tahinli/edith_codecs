@@ -146,7 +146,10 @@ impl Lane for i32 {
     }
 
     unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
-        (clamp_range(a.wrapping_add(b), r), clamp_range(a.wrapping_sub(b), r))
+        (
+            clamp_range(a.wrapping_add(b), r),
+            clamp_range(a.wrapping_sub(b), r),
+        )
     }
 }
 
@@ -183,7 +186,7 @@ impl Lane for [i32; 8] {
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod simd {
-    use super::{COS_BITS, Lane, inverse_dct_n};
+    use super::{inverse_dct_n, Lane, COS_BITS};
     use std::arch::x86_64::*;
 
     /// Eight `i32` lanes in one AVX2 register.
@@ -205,7 +208,10 @@ mod simd {
             let sv = _mm256_set1_epi32(s as i32);
             let rnd = _mm256_set1_epi64x(1 << (COS_BITS - 1));
             let (ae, be) = (a.0, b.0);
-            let (ao, bo) = (_mm256_shuffle_epi32(a.0, 0xB1), _mm256_shuffle_epi32(b.0, 0xB1));
+            let (ao, bo) = (
+                _mm256_shuffle_epi32(a.0, 0xB1),
+                _mm256_shuffle_epi32(b.0, 0xB1),
+            );
             let half = |x: __m256i, y: __m256i, u: __m256i, v: __m256i| {
                 let p = _mm256_sub_epi64(_mm256_mul_epi32(x, u), _mm256_mul_epi32(y, v));
                 let q = _mm256_add_epi64(_mm256_mul_epi32(x, v), _mm256_mul_epi32(y, u));
@@ -666,6 +672,16 @@ pub enum TxType {
 }
 
 impl TxType {
+    /// `is_2d_transform` (`av1/common/quant_common.c:237`): both axes are a
+    /// real transform, i.e. libaom's `tx_type < IDTX`. The quantisation
+    /// matrices weight a 2D frequency tiling, so a 1D/identity transform
+    /// (`V_DCT`, `H_DCT`, `IDTX`, the `V_ADST` family) reads the FLAT
+    /// matrix -- [`crate::qm::iwt_matrix`]'s `None`.
+    pub(crate) fn is_2d_transform(self) -> bool {
+        use TxType1d::Identity;
+        !matches!(self.axes(), (Identity, _) | (_, Identity))
+    }
+
     /// The inverse of `Tx_Type_Intra_Inv_Set2`'s CDF symbol order.
     pub fn from_symbol(t: usize) -> Option<Self> {
         match t {
@@ -1171,7 +1187,11 @@ pub fn inverse_transform_2d_typed_wh(
             // row: every butterfly and Hadamard of zeros is zero, and
             // `Round2(0, n)` is zero at every `n`, so this is the full
             // network's own answer, not an approximation of it.
-            let src = if i < 32 { &dequant[i * w..i * w + cols] } else { &[][..] };
+            let src = if i < 32 {
+                &dequant[i * w..i * w + cols]
+            } else {
+                &[][..]
+            };
             if src.iter().all(|&c| c == 0) {
                 dst.fill(0);
                 continue;
@@ -1306,18 +1326,26 @@ pub fn dequant_and_inverse_typed(
     ac_delta: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
-    let r =
-        dequant_and_inverse_typed_wh(levels, side, side, bit_depth, q_idx, dc_delta, ac_delta, tx_type);
+    let r = dequant_and_inverse_typed_wh(
+        levels, side, side, bit_depth, q_idx, dc_delta, ac_delta, tx_type, None,
+    );
     // This square entry point keeps the dense contract (its callers are the
     // encoder-side model and the gates, which index the result directly);
     // only the decoder's `_wh` path speaks the empty marker.
-    if r.is_empty() { vec![0i32; side * side] } else { r }
+    if r.is_empty() {
+        vec![0i32; side * side]
+    } else {
+        r
+    }
 }
 
 /// [`dequant_and_inverse_typed`] widened to `(w, h)` (lane-recttx). `dc_delta`/
 /// `ac_delta` are the per-plane quantizer-index offsets (lane-sbpart r11,
 /// spec 5.9.12/7.12.2, [`crate::quant::QuantDeltas`]) -- `0`/`0` for the
-/// unaffected callers below.
+/// unaffected callers below. `qm` is the block's inverse quantisation matrix
+/// (lane-av1-qmatrix, spec 5.9.12/7.12.3, [`crate::qm::Iqm`]); `None`
+/// dequantises flat, and every caller that models a matrix-free stream (the
+/// encoder, the transform gates) passes `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn dequant_and_inverse_typed_wh(
     levels: &[i32],
@@ -1328,6 +1356,7 @@ pub fn dequant_and_inverse_typed_wh(
     dc_delta: i32,
     ac_delta: i32,
     tx_type: TxType,
+    qm: Option<crate::qm::Iqm>,
 ) -> Vec<i32> {
     // 60% of the transform units of a 4K inter stream carry no coefficient at
     // all (measured on the perf segment: 3.46M of 5.7M calls). Dequantization
@@ -1345,7 +1374,9 @@ pub fn dequant_and_inverse_typed_wh(
     }
     DQ_SCRATCH.with(|cell| {
         let mut dq = cell.borrow_mut();
-        crate::quant::dequant_wh_into(levels, &mut dq, w, h, bit_depth, q_idx, dc_delta, ac_delta);
+        crate::quant::dequant_wh_into(
+            levels, &mut dq, w, h, bit_depth, q_idx, dc_delta, ac_delta, qm,
+        );
         // lane-d792: the DEQUANTIZED grid, in row-major `(row/col)` pairs --
         // the twin of the oracle's `EC_DQCOEFF` rung (whose own layout is
         // column-major `input[c * h + r]`), so a residual mismatch whose
@@ -1436,7 +1467,10 @@ fn build_axis_basis(n: usize, kind: TxType1d) -> Vec<f64> {
         // enough that nothing clamps at the 24-bit range passed below.
         t[u] = 1 << 12;
         inverse_1d(&mut t, log2, 24, kind);
-        let norm = (0..n).map(|i| f64::from(t[i]) * f64::from(t[i])).sum::<f64>().sqrt();
+        let norm = (0..n)
+            .map(|i| f64::from(t[i]) * f64::from(t[i]))
+            .sum::<f64>()
+            .sqrt();
         for i in 0..n {
             basis[u * n + i] = f64::from(t[i]) / norm;
         }
@@ -1448,7 +1482,8 @@ fn build_axis_basis(n: usize, kind: TxType1d) -> Vec<f64> {
 fn axis_basis(n: usize, kind: TxType1d) -> &'static [f64] {
     use std::sync::OnceLock;
     static CACHE: OnceLock<[[OnceLock<Vec<f64>>; 5]; 3]> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
+    let cache =
+        CACHE.get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
     let k = match kind {
         TxType1d::Dct => 0,
         TxType1d::Adst => 1,
@@ -1467,7 +1502,8 @@ fn axis_basis(n: usize, kind: TxType1d) -> &'static [f64] {
 fn axis_basis_t(n: usize, kind: TxType1d) -> &'static [f64] {
     use std::sync::OnceLock;
     static CACHE: OnceLock<[[OnceLock<Vec<f64>>; 5]; 3]> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
+    let cache =
+        CACHE.get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
     let k = match kind {
         TxType1d::Dct => 0,
         TxType1d::Adst => 1,
@@ -1517,7 +1553,11 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
     } else {
         Vec::new()
     };
-    let residual: &[i32] = if mirrored.is_empty() { residual } else { &mirrored };
+    let residual: &[i32] = if mirrored.is_empty() {
+        residual
+    } else {
+        &mirrored
+    };
     let (row_kind, col_kind) = tx_type.axes();
     let (hb, vb) = (axis_basis_t(side, row_kind), axis_basis_t(side, col_kind));
     let mut rows = vec![0.0f64; side * side];
@@ -1754,7 +1794,18 @@ fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
         }
     }
     for i in 0..2 {
-        butterfly(t, 2 * i, 2 * i + 1, if i == 0 { 32 + 16 * i as i32 } else { -(32 + 16 * i as i32) }, i == 0, r);
+        butterfly(
+            t,
+            2 * i,
+            2 * i + 1,
+            if i == 0 {
+                32 + 16 * i as i32
+            } else {
+                -(32 + 16 * i as i32)
+            },
+            i == 0,
+            r,
+        );
     }
     if N == 6 {
         for i in 0..8 {
@@ -1799,9 +1850,11 @@ fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
             butterfly(
                 t,
                 8 + i,
-                15 - i, -(12 + ((brev(2, 3 - i) as i32) << 4)),
+                15 - i,
+                -(12 + ((brev(2, 3 - i) as i32) << 4)),
                 false,
-                r);
+                r,
+            );
         }
     }
     if N == 6 {
@@ -1814,9 +1867,11 @@ fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
             butterfly(
                 t,
                 16 + i,
-                31 - i, -(6 + ((brev(3, 7 - i) as i32) << 3)),
+                31 - i,
+                -(6 + ((brev(3, 7 - i) as i32) << 3)),
                 false,
-                r);
+                r,
+            );
         }
     }
     if N == 6 {
@@ -2072,8 +2127,14 @@ pub fn forward_and_quantize_scaled(
     deadzone: f64,
 ) -> (Vec<i32>, Vec<f32>) {
     let mut scaled = vec![0f32; side * side];
-    let levels =
-        forward_and_quantize_into(residual, side, bit_depth, q_idx, deadzone, Some(&mut scaled));
+    let levels = forward_and_quantize_into(
+        residual,
+        side,
+        bit_depth,
+        q_idx,
+        deadzone,
+        Some(&mut scaled),
+    );
     (levels, scaled)
 }
 
@@ -2154,8 +2215,24 @@ mod tests {
                 }
             }
         }
-        for (w, h) in [(4, 4), (8, 8), (16, 16), (32, 32), (64, 64), (8, 16), (16, 8), (4, 16), (32, 8)] {
-            for tx in [TxType::DctDct, TxType::AdstAdst, TxType::Idtx, TxType::AdstDct, TxType::DctAdst] {
+        for (w, h) in [
+            (4, 4),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (64, 64),
+            (8, 16),
+            (16, 8),
+            (4, 16),
+            (32, 8),
+        ] {
+            for tx in [
+                TxType::DctDct,
+                TxType::AdstAdst,
+                TxType::Idtx,
+                TxType::AdstDct,
+                TxType::DctAdst,
+            ] {
                 if w.max(h) > 16 && tx != TxType::DctDct && tx != TxType::Idtx {
                     continue;
                 }
@@ -2163,7 +2240,10 @@ mod tests {
                     continue;
                 }
                 let out = inverse_transform_2d_typed_wh(&vec![0i32; w * h], w, h, 10, tx);
-                assert!(out.iter().all(|&v| v == 0), "2D {w}x{h} {tx:?} left a non-zero");
+                assert!(
+                    out.iter().all(|&v| v == 0),
+                    "2D {w}x{h} {tx:?} left a non-zero"
+                );
             }
         }
     }
@@ -2172,8 +2252,10 @@ mod tests {
     #[ignore]
     fn txrd_gain_probe() {
         for side in [4usize, 8, 16, 32] {
-            let residual: Vec<i32> =
-                noise(side * side, 7 + side as u64).iter().map(|&v| v / 4).collect();
+            let residual: Vec<i32> = noise(side * side, 7 + side as u64)
+                .iter()
+                .map(|&v| v / 4)
+                .collect();
             let all = [
                 TxType::DctDct,
                 TxType::AdstDct,
@@ -2191,8 +2273,11 @@ mod tests {
                 }
                 let levels = forward_and_quantize_typed(&residual, side, 8, 20, 0.5, tx);
                 let back = dequant_and_inverse_typed(&levels, side, 8, 20, 0, 0, tx);
-                let num: f64 =
-                    residual.iter().zip(&back).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
+                let num: f64 = residual
+                    .iter()
+                    .zip(&back)
+                    .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                    .sum();
                 let den: f64 = residual.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
                 let nz = levels.iter().filter(|&&l| l != 0).count();
                 let energy: f64 = levels.iter().map(|&l| f64::from(l.abs())).sum();
@@ -2632,9 +2717,7 @@ mod tests {
         inverse_adst16(&mut t, 16);
         assert_eq!(
             t,
-            [
-                32, 73, 28, 6, -45, -28, 111, -52, 135, -54, 85, -67, 305, 190, 102, 145
-            ]
+            [32, 73, 28, 6, -45, -28, 111, -52, 135, -54, 85, -67, 305, 190, 102, 145]
         );
     }
 
@@ -2654,9 +2737,7 @@ mod tests {
         inverse_identity(&mut t16, 16);
         assert_eq!(
             t16,
-            [
-                283, -141, 71, 20, -8, 170, -34, 23, 42, -113, 93, -14, 62, 3, -198, 124
-            ]
+            [283, -141, 71, 20, -8, 170, -34, 23, 42, -113, 93, -14, 62, 3, -198, 124]
         );
 
         let mut t32 = [0i32; 32];
@@ -2988,7 +3069,6 @@ mod tests {
             }
         }
     }
-
 }
 
 /// The lossless inverse transform: libaom `av1_iwht4x4_16_add_c`
@@ -3011,8 +3091,12 @@ pub fn inverse_wht4x4(dq: &[i32]) -> Vec<i32> {
     // the DC-only units correctly and drifts by +-1 everywhere else.
     let mut out = [0i32; 16];
     for i in 0..4 {
-        let (mut a1, mut c1, mut d1, mut b1) =
-            (dq[i * 4] >> 2, dq[i * 4 + 1] >> 2, dq[i * 4 + 2] >> 2, dq[i * 4 + 3] >> 2);
+        let (mut a1, mut c1, mut d1, mut b1) = (
+            dq[i * 4] >> 2,
+            dq[i * 4 + 1] >> 2,
+            dq[i * 4 + 2] >> 2,
+            dq[i * 4 + 3] >> 2,
+        );
         a1 += c1;
         d1 -= b1;
         let e1 = (a1 - d1) >> 1;
@@ -3027,8 +3111,7 @@ pub fn inverse_wht4x4(dq: &[i32]) -> Vec<i32> {
     }
     let mut res = vec![0i32; 16];
     for i in 0..4 {
-        let (mut a1, mut c1, mut d1, mut b1) =
-            (out[i], out[4 + i], out[8 + i], out[12 + i]);
+        let (mut a1, mut c1, mut d1, mut b1) = (out[i], out[4 + i], out[8 + i], out[12 + i]);
         a1 += c1;
         d1 -= b1;
         let e1 = (a1 - d1) >> 1;
@@ -3059,7 +3142,12 @@ pub fn dequant_and_inverse_wht4x4(
     }
     DQ_SCRATCH.with(|cell| {
         let mut dq = cell.borrow_mut();
-        crate::quant::dequant_wh_into(levels, &mut dq, 4, 4, bit_depth, q_idx, dc_delta, ac_delta);
+        // Lossless dequantizes flat: a lossless frame (index 0, zero deltas)
+        // can never select a quantisation matrix (libaom `av1_use_qmatrix`),
+        // so there is no `qm` input to thread here.
+        crate::quant::dequant_wh_into(
+            levels, &mut dq, 4, 4, bit_depth, q_idx, dc_delta, ac_delta, None,
+        );
         inverse_wht4x4(&dq[..16])
     })
 }
@@ -3088,8 +3176,12 @@ mod lossless_tx_tests {
         fn fwht(residual: &[i32]) -> Vec<i32> {
             let mut t = [0i32; 16];
             for i in 0..4 {
-                let (a, b, c, d) =
-                    undo(residual[i], residual[4 + i], residual[8 + i], residual[12 + i]);
+                let (a, b, c, d) = undo(
+                    residual[i],
+                    residual[4 + i],
+                    residual[8 + i],
+                    residual[12 + i],
+                );
                 t[i] = a;
                 t[4 + i] = c;
                 t[8 + i] = d;
@@ -3117,7 +3209,11 @@ mod lossless_tx_tests {
             // The forward pass already carries libaom's `UNIT_QUANT_SHIFT`
             // scale-up, so the coded level is `levels / 4` and qindex 0's
             // dequantization (times 4) hands `levels` straight back.
-            assert_eq!(super::inverse_wht4x4(&levels), residual, "levels={levels:?}");
+            assert_eq!(
+                super::inverse_wht4x4(&levels),
+                residual,
+                "levels={levels:?}"
+            );
         }
     }
 }
@@ -3140,9 +3236,23 @@ mod d792_tests {
         const W: usize = 16;
         // (libaom index, dequantized value).
         const NZ: [(usize, i32); 17] = [
-            (0, 1554), (1, -1768), (2, 624), (3, -104), (9, 104), (10, -520), (11, 312),
-            (16, -104), (17, 104), (18, -104), (24, -104), (25, 104), (27, -104), (32, 208),
-            (33, -104), (35, -104), (40, 104),
+            (0, 1554),
+            (1, -1768),
+            (2, 624),
+            (3, -104),
+            (9, 104),
+            (10, -520),
+            (11, 312),
+            (16, -104),
+            (17, 104),
+            (18, -104),
+            (24, -104),
+            (25, 104),
+            (27, -104),
+            (32, 208),
+            (33, -104),
+            (35, -104),
+            (40, 104),
         ];
         let mut grid = vec![0i32; W * H];
         for (i, v) in NZ {

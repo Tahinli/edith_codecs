@@ -2874,7 +2874,7 @@ impl Plane<'_> {
         // residual reconstructs to the prediction itself -- `clamp(p + 0)` is
         // `p` for a `u8`, so the bytes are the same.
         let coded = dequant_and_inverse_typed_wh(
-            &levels, side, side, 8, i32::from(base_q_idx), 0, 0, tx_type,
+            &levels, side, side, 8, i32::from(base_q_idx), 0, 0, tx_type, None,
         );
         #[cfg(test)]
         stage_since(2, t);
@@ -3032,6 +3032,7 @@ impl Plane<'_> {
             0,
             0,
             tx_type,
+            None,
         );
         #[cfg(test)]
         stage_since(2, t);
