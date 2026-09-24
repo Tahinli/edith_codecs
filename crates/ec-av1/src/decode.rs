@@ -110,6 +110,15 @@ pub(crate) struct FrameCtx {
     pub(crate) delta_q_res: std::cell::Cell<i32>,
     pub(crate) current_q_idx: std::cell::Cell<i32>,
     pub(crate) quant_deltas: std::cell::Cell<crate::quant::QuantDeltas>,
+    /// lane-av1-qmatrix: this frame's quantisation-matrix LEVEL per plane,
+    /// straight from spec 5.9.12's `qm_y`/`qm_u`/`qm_v` (the parsed 4-bit
+    /// value IS the table level -- libaom `quant_params->qmatrix_level_y/u/v`,
+    /// decodeframe.c:1902-1917; the `aom_get_qmlevel` formula that maps
+    /// base_q_idx onto a level is encoder-side only). 15 is libaom's flat
+    /// sentinel (`NUM_QM_LEVELS - 1`, stored as NULL tables) and the default
+    /// every `using_qmatrix == 0` frame keeps, so a matrix-free stream
+    /// selects no matrix.
+    pub(crate) qm_levels: std::cell::Cell<[u8; 3]>,
     pub(crate) delta_lf_present: std::cell::Cell<bool>,
     pub(crate) delta_lf_res: std::cell::Cell<i32>,
     pub(crate) delta_lf_multi: std::cell::Cell<bool>,
@@ -221,6 +230,7 @@ impl FrameCtx {
                 v_dc: 0,
                 v_ac: 0,
             }),
+            qm_levels: std::cell::Cell::new([crate::qm::NUM_QM_LEVELS as u8 - 1; 3]),
             delta_lf_present: std::cell::Cell::new(false),
             delta_lf_res: std::cell::Cell::new(1),
             delta_lf_multi: std::cell::Cell::new(false),
@@ -765,6 +775,54 @@ fn plane_q_delta(plane_idx: usize, fctx: &crate::decode::FrameCtx) -> (i32, i32)
         1 => (d.u_dc, d.u_ac),
         _ => (d.v_dc, d.v_ac),
     }
+}
+
+/// lane-av1-qmatrix: records this FRAME's quantisation-matrix levels
+/// ([`crate::decode::FrameCtx::qm_levels`]) from the parsed
+/// `quantization_params`. Called from `stream.rs` at the frame header, where
+/// the refusal this lane lifted used to sit.
+pub(crate) fn set_qm_levels(levels: [u8; 3], fctx: &crate::decode::FrameCtx) {
+    fctx.qm_levels.with(|c| c.set(levels));
+}
+
+/// This block's inverse quantisation matrix -- libaom `av1_get_iqmatrix`
+/// (`av1/common/quant_common.c:243`) plus `setup_segmentation_dequant`'s
+/// `av1_use_qmatrix` gate, evaluated per dequantisation call site the same
+/// way the site already evaluates its quantizer index. `None` dequantises
+/// flat (the only behaviour before lane-av1-qmatrix):
+/// - a level of 15, which is both libaom's flat sentinel and what every
+///   `using_qmatrix == 0` frame's levels are parked at;
+/// - a 1D/identity transform (`is_2d_transform` false: libaom's
+///   `av1_get_iqmatrix` reads the NULL slot for those);
+/// - a LOSSLESS block (libaom `av1_use_qmatrix`'s `!xd->lossless[seg]`: the
+///   segment-adjusted quantizer index clamped to 0 with all five plane
+///   deltas zero -- the same `block_q_idx` every other dequant site reads).
+fn block_iqmatrix(
+    fctx: &crate::decode::FrameCtx,
+    plane_idx: usize,
+    w: usize,
+    h: usize,
+    tx_type: TxType,
+) -> Option<crate::qm::Iqm> {
+    let levels = fctx.qm_levels.with(|c| c.get());
+    let level = levels[plane_idx.min(2)];
+    if usize::from(level) >= crate::qm::NUM_QM_LEVELS - 1 {
+        return None;
+    }
+    if !tx_type.is_2d_transform() {
+        return None;
+    }
+    let d = fctx.quant_deltas.with(|c| c.get());
+    if block_q_idx(fctx) == 0
+        && d.y_dc == 0
+        && d.u_dc == 0
+        && d.u_ac == 0
+        && d.v_dc == 0
+        && d.v_ac == 0
+    {
+        return None;
+    }
+    crate::qm::iwt_matrix(usize::from(level), plane_idx != 0, w, h)
 }
 
 /// `read_delta_qindex`/`read_delta_q_params` (spec 5.11.10, libaom
@@ -2375,6 +2433,10 @@ pub(crate) struct TxParams {
     pub(crate) dc_delta: i32,
     pub(crate) ac_delta: i32,
     pub(crate) tx_type: TxType,
+    /// lane-av1-qmatrix: this unit's inverse quantisation matrix, selected
+    /// on the parse thread by [`block_iqmatrix`] and captured here so the
+    /// recon worker scales identically without touching frame state.
+    pub(crate) qm: Option<crate::qm::Iqm>,
     pub(crate) stride: usize,
     /// lane-lossless: this transform unit belongs to a lossless frame, so the
     /// residual comes off the 4x4 Walsh-Hadamard
@@ -2398,6 +2460,7 @@ impl TxParams {
             dequant_and_inverse_typed_wh(
                 grid, self.w, self.h, self.bit_depth, self.q_idx, self.dc_delta, self.ac_delta,
                 self.tx_type,
+                self.qm,
             )
         };
         // An all-zero grid transforms to the empty marker, and a strided copy
@@ -10010,6 +10073,7 @@ fn decode_rect_split(
                     plane_q_delta(0, fctx).0,
                     plane_q_delta(0, fctx).1,
                     tu_tx_type,
+                        block_iqmatrix(fctx, 0, tx_w, tx_h, tu_tx_type),
                 );
                 push_intra_rect(0, 
                     tu_px,
@@ -10066,6 +10130,7 @@ fn decode_rect_split(
                     plane_q_delta(0, fctx).0,
                     plane_q_delta(0, fctx).1,
                     tu_tx_type,
+                        block_iqmatrix(fctx, 0, tx_w, tx_h, tu_tx_type),
                 );
                 push_intra_rect(0, 
                     tu_px,
@@ -10248,6 +10313,7 @@ fn decode_rect_split(
                 plane_q_delta(plane_idx, fctx).0,
                 plane_q_delta(plane_idx, fctx).1,
                 tx_type,
+                    block_iqmatrix(fctx, plane_idx, chroma_w, chroma_h, tx_type),
             );
             let cfl = m
                 .alpha
@@ -11756,6 +11822,7 @@ fn decode_block_rect(
             plane_q_delta(0, fctx).0,
             plane_q_delta(0, fctx).1,
             luma_tx_type,
+                block_iqmatrix(fctx, 0, bw, bh, luma_tx_type),
         );
         push_intra_rect(0, 
             px,
@@ -11801,6 +11868,7 @@ fn decode_block_rect(
             plane_q_delta(1, fctx).0,
             plane_q_delta(1, fctx).1,
             u_tx_type,
+                block_iqmatrix(fctx, 1, chroma_w, chroma_h, u_tx_type),
         );
         push_intra_rect(1, 
             cpx,
@@ -11845,6 +11913,7 @@ fn decode_block_rect(
             plane_q_delta(2, fctx).0,
             plane_q_delta(2, fctx).1,
             v_tx_type,
+                block_iqmatrix(fctx, 2, chroma_w, chroma_h, v_tx_type),
         );
         push_intra_rect(2, 
             cpx,
@@ -12165,6 +12234,7 @@ fn decode_leaf_rect(
         let luma_residual = dequant_and_inverse_typed_wh(
             &luma_levels, bw, bh, crate::decode::bit_depth(fctx),
             block_q_idx(fctx), plane_q_delta(0, fctx).0, plane_q_delta(0, fctx).1, luma_tx_type,
+                block_iqmatrix(fctx, 0, bw, bh, luma_tx_type),
         );
         if let Some(b) = &palette_y_buf {
             set_palette_pred(b.clone(), fctx);
@@ -12185,6 +12255,7 @@ fn decode_leaf_rect(
         let u_residual = dequant_and_inverse_typed_wh(
             &u_levels, chroma_w, chroma_h, crate::decode::bit_depth(fctx),
             block_q_idx(fctx), plane_q_delta(1, fctx).0, plane_q_delta(1, fctx).1, u_tx_type,
+                block_iqmatrix(fctx, 1, chroma_w, chroma_h, u_tx_type),
         );
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
@@ -12204,6 +12275,7 @@ fn decode_leaf_rect(
         let v_residual = dequant_and_inverse_typed_wh(
             &v_levels, chroma_w, chroma_h, crate::decode::bit_depth(fctx),
             block_q_idx(fctx), plane_q_delta(2, fctx).0, plane_q_delta(2, fctx).1, v_tx_type,
+                block_iqmatrix(fctx, 2, chroma_w, chroma_h, v_tx_type),
         );
         if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
@@ -12556,6 +12628,7 @@ fn decode_block_rect4(
             plane_q_delta(0, fctx).0,
             plane_q_delta(0, fctx).1,
             luma_tx_type,
+                block_iqmatrix(fctx, 0, bw, bh, luma_tx_type),
         );
         if let Some(b) = &palette_y_buf {
             set_palette_pred(b.clone(), fctx);
@@ -12587,6 +12660,7 @@ fn decode_block_rect4(
                 plane_q_delta(plane, fctx).0,
                 plane_q_delta(plane, fctx).1,
                 tx_type,
+                    block_iqmatrix(fctx, plane, chroma_w, chroma_h, tx_type),
             );
             if let Some((ub, vb)) = &palette_uv_bufs {
                 set_palette_pred(if plane == 1 { ub.clone() } else { vb.clone() }, fctx);
@@ -13538,6 +13612,7 @@ fn decode_rect4_16_strip(
                             plane_q_delta(0, fctx).0,
                             plane_q_delta(0, fctx).1,
                             tu_tx_type,
+                                block_iqmatrix(fctx, 0, tx_w, tx_h, tu_tx_type),
                         );
                         push_intra_rect(0, 
                             tu_px, tu_py, tx_w, tx_h, mode, angle_delta_y, tu_reach, &residual,
@@ -13620,6 +13695,7 @@ fn decode_rect4_16_strip(
                 plane_q_delta(0, fctx).0,
                 plane_q_delta(0, fctx).1,
                 tx_type,
+                    block_iqmatrix(fctx, 0, bw, bh, tx_type),
             );
             if let Some(b) = &palette_y_buf {
                 set_palette_pred(b.clone(), fctx);
@@ -13836,6 +13912,7 @@ fn decode_rect4_16_strip(
                         plane_q_delta(plane, fctx).0,
                         plane_q_delta(plane, fctx).1,
                         tx_type,
+                            block_iqmatrix(fctx, plane, cw, ch, tx_type),
                     );
                     if let Some((ub, vb)) = &palette_uv_bufs {
                         set_palette_pred(if plane == 1 { ub.clone() } else { vb.clone() }, fctx);
@@ -14287,6 +14364,7 @@ fn decode_block_rect64(
             plane_q_delta(0, fctx).0,
             plane_q_delta(0, fctx).1,
             luma_tx_type,
+                block_iqmatrix(fctx, 0, bw, bh, luma_tx_type),
         );
         push_intra_rect(0, 
             px,
@@ -14371,6 +14449,7 @@ fn decode_block_rect64(
             plane_q_delta(1, fctx).0,
             plane_q_delta(1, fctx).1,
             u_tx_type,
+                block_iqmatrix(fctx, 1, chroma_w, chroma_h, u_tx_type),
         );
         // lane-t900 r34: the UV-palette prediction override, exactly as the
         // `skip` arm above installs it. The [`PALETTE_PRED`] slot is a
@@ -14436,6 +14515,7 @@ fn decode_block_rect64(
             plane_q_delta(2, fctx).0,
             plane_q_delta(2, fctx).1,
             v_tx_type,
+                block_iqmatrix(fctx, 2, chroma_w, chroma_h, v_tx_type),
         );
         if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
@@ -15512,7 +15592,8 @@ fn read_plane(
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let tx = TxParams {
         w: side, h: side, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta,
-        ac_delta, tx_type, stride: 0, lossless: lossless(fctx),
+        ac_delta, tx_type, qm: block_iqmatrix(fctx, plane_idx, side, side, tx_type), stride: 0,
+        lossless: lossless(fctx),
     };
     if crate::envflags::env_flag!("EC_AV1_TRACE") {
         let residual = tx.run(&levels);
@@ -18087,6 +18168,7 @@ fn decode_leaf_rect8(
                 let residual = dequant_and_inverse_typed_wh(
                         &levels, tw, th, crate::decode::bit_depth(fctx), block_q_idx(fctx),
                     plane_q_delta(0, fctx).0, plane_q_delta(0, fctx).1, tx_type,
+                        block_iqmatrix(fctx, 0, tw, th, tx_type),
                 );
                     if (tw, th) == (4, 4) {
                         push_intra(0, tu_px, tu_py, 4, DC_PRED, 0, tu_reach, &residual, None, None, smooth_neighbor, fctx);
@@ -18323,6 +18405,7 @@ fn decode_leaf_rect8(
                 plane_q_delta(0, fctx).0,
                 plane_q_delta(0, fctx).1,
                 tx_type,
+                    block_iqmatrix(fctx, 0, bw, bh, tx_type),
             );
             push_intra_rect(0, 
                 px, py, bw, bh, mode, angle_delta_y, reach, &residual, None, filter_intra,
@@ -20491,6 +20574,7 @@ fn read_inter_plane_rect(
     // (`TxParams::stride`) after the inverse transform.
     let tx = TxParams {
         w, h, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta, ac_delta, tx_type,
+        qm: block_iqmatrix(fctx, plane_idx, w, h, tx_type),
         stride, lossless: lossless(fctx),
     };
     push_mc_rect_tx(plane_idx, x, y, stride, w, h, prediction, tx, &grid, fctx);
@@ -26736,7 +26820,8 @@ fn read_inter_plane(
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let tx = TxParams {
         w: side, h: side, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta,
-        ac_delta, tx_type, stride: 0, lossless: lossless(fctx),
+        ac_delta, tx_type, qm: block_iqmatrix(fctx, plane_idx, side, side, tx_type), stride: 0,
+        lossless: lossless(fctx),
     };
     push_mc_rect_tx(plane_idx, x, y, side, side, side, prediction, tx, &grid, fctx);
     Ok((grid, tx_type))
@@ -33391,6 +33476,7 @@ fn decode_intra_sub8_leaf(
                 plane_q_delta(0, fctx).0,
                 plane_q_delta(0, fctx).1,
                 tx_type,
+                    block_iqmatrix(fctx, 0, bw, bh, tx_type),
             );
             push_intra_rect(0, 
                 px, py, bw, bh, mode, angle_delta_y, reach, &residual, None, filter_intra,
