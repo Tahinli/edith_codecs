@@ -7810,6 +7810,127 @@ pub(crate) mod tests {
             "{NAME}: the VERT (64x128) orientation was never engaged -- only 128x64 HORZ strips \
              proved the lift"
         );
+    /// lane-av1intrapred r2, REGRESSION GATE for the two intrabc TX4-split
+    /// chroma defects this lane fixed.
+    ///
+    /// An intrabc 8x8 leaf whose var-tx tree split to TX_4X4 must (a) arm
+    /// `INTRABC_CHROMA_TX` from the co-located luma TU's coded type -- the
+    /// chroma units then take that type's class-1 eob row, HORIZ scan and nz
+    /// contexts (libaom `av1_get_tx_type`'s is_inter branch; intrabc is
+    /// inter-classified) -- and (b) predict the chroma units from the FRAME
+    /// COPY at the DV, not intra-from-UV-mode (intrabc's UV mode is DC, so a
+    /// leaf that loses the override predicts flat DC where libaom copies a
+    /// busy region).
+    ///
+    /// Pre-r2, decode_leaf8's TX4 arm did neither: R5's chroma U txb at
+    /// mi (36,66) decoded `eob=11` off the 2D row where aomdec decoded
+    /// `eob=13` off the class-1 row, and the first surviving pixel fork was
+    /// U(184,4) of mi (2,92) (class `intrabc-chroma-tx-not-armed`, then
+    /// `intrabc-chroma-predicts-intra`).
+    ///
+    /// The fixture is the report's R5 stream pinned into `fixtures/`
+    /// (aomenc oracle, testsrc2 320x180 tiled 2x2 -> 640x360, sb64 maxp64
+    /// square-only screen intrabc, cq20, 1 frame; 7173 bytes,
+    /// sha256 bc699af4a6e7c1c5657f041e8cbdf2d3d899ddb80ec2a549a950b7cebb5b41bd).
+    /// The gate needs no oracle at run time and cannot be skipped: a missing
+    /// fixture, a decode error, a zero counter, a moved pixel patch or a
+    /// changed full-frame fingerprint each fail by name. The fingerprint is
+    /// FNV-1a (dependency-free, same rationale as the cdf-forwarding gate's).
+    #[test]
+    fn an_intrabc_tx4_leaf_chroma_inherits_the_luma_type_and_predicts_from_the_frame_copy() {
+        const NAME: &str =
+            "an_intrabc_tx4_leaf_chroma_inherits_the_luma_type_and_predicts_from_the_frame_copy";
+        const FIXTURE_LEN: usize = 7173;
+        const FIXTURE_FNV: u64 = 0x3a57_d075_5e4c_fe5b;
+        const RAW_LEN: usize = 640 * 360 * 3 / 2;
+        const RAW_FNV: u64 = 0xf271_df27_ce4d_ba66;
+        // The 4x4 chroma patches at (184,4) -- the first surviving pixel fork
+        // -- as the oracles (aomdec and ffmpeg agree) reconstruct them.
+        const U_PATCH: [u16; 16] = [
+            86, 116, 55, 110, 114, 114, 51, 83, 99, 121, 48, 114, 103, 117, 102, 67,
+        ];
+        const V_PATCH: [u16; 16] = [
+            179, 158, 199, 105, 155, 158, 195, 147, 163, 153, 194, 108, 170, 148, 168, 172,
+        ];
+
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/intrabc_tx4_chroma_kf.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_leaf8_intrabc_hits();
+        crate::decode::reset_intrabc_tx4_chroma_copy_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
+        });
+        assert_eq!(frames.len(), 1, "{NAME}: frame count");
+        let frame = &frames[0];
+        assert_eq!((frame.width, frame.height), (640, 360), "{NAME}: dimensions");
+
+        // Non-vacuity, both halves: the leaf shape must be reached at all,
+        // and its chroma route must have consulted the ARMED slot (pre-r2
+        // this counter is 0 -- the arm never armed the slot).
+        assert!(
+            crate::decode::leaf8_intrabc_hits() > 0,
+            "{NAME}: gate is vacuous -- no intrabc 8x8 leaf was decoded"
+        );
+        assert!(
+            crate::decode::intrabc_tx4_chroma_copy_hits() > 0,
+            "{NAME}: gate is vacuous -- no intrabc TX4-split leaf's chroma read consulted \
+             the armed slot (class intrabc-chroma-tx-not-armed)"
+        );
+
+        // The first surviving pixel fork: chroma 4x4 at (184,4). The wrong
+        // wirings put flat intra-DC predictions or the wrong eob class here.
+        let cw = frame.width / 2;
+        let u_patch: Vec<u16> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| frame.u[(4 + dy) * cw + 184 + dx]))
+            .collect();
+        let v_patch: Vec<u16> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| frame.v[(4 + dy) * cw + 184 + dx]))
+            .collect();
+        assert_eq!(u_patch, U_PATCH, "{NAME}: U(184,4) patch moved");
+        assert_eq!(v_patch, V_PATCH, "{NAME}: V(184,4) patch moved");
+        // The unit the FRAME-COPY override specifically pins: chroma 4x4 at
+        // (168,0) is an intrabc TX4-split leaf's chroma whose copy source is
+        // a busy ramp region; without the `palette_uv_bufs` intrabc wrap the
+        // read predicts flat intra-DC here (78k chroma bytes drift from this
+        // unit alone), with it the copy reproduces the oracle exactly.
+        const U_COPY_PATCH: [u16; 16] = [
+            91, 91, 91, 91, 120, 120, 120, 120, 120, 120, 120, 120, 73, 102, 116, 116,
+        ];
+        const V_COPY_PATCH: [u16; 16] = [
+            241, 241, 241, 241, 156, 156, 156, 156, 158, 158, 158, 158, 181, 163, 154, 154,
+        ];
+        let u_copy: Vec<u16> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| frame.u[dy * cw + 168 + dx]))
+            .collect();
+        let v_copy: Vec<u16> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| frame.v[dy * cw + 168 + dx]))
+            .collect();
+        assert_eq!(
+            u_copy, U_COPY_PATCH,
+            "{NAME}: U(168,0) patch moved -- the intrabc TX4 chroma read no longer \
+             predicts from the frame copy (class intrabc-chroma-predicts-intra)"
+        );
+        assert_eq!(v_copy, V_COPY_PATCH, "{NAME}: V(168,0) patch moved");
+
+        // The whole frame, packed as the rawvideo byte stream the oracles
+        // produce: any remaining byte anywhere in Y/U/V fails the gate.
+        let mut raw = Vec::with_capacity(RAW_LEN);
+        for plane in [&frame.y, &frame.u, &frame.v] {
+            raw.extend(plane.iter().map(|&s| s as u8));
+        }
+        assert_eq!(raw.len(), RAW_LEN, "{NAME}: raw size");
+        assert_eq!(fnv1a64(&raw), RAW_FNV, "{NAME}: full-frame fingerprint moved");
     }
 
     /// lane-t900 r33, CENSUS for "a sub-8x8 leaf that uses intrabc".
@@ -7901,12 +8022,12 @@ pub(crate) mod tests {
     /// to mixed leaf transform sizes" -- the residue lane-t900 r32 left when
     /// it lifted the intrabc `TX_MODE_SELECT` refusal.
     ///
-    /// The tree is read in full, but the luma reconstruct loop it feeds is a
-    /// UNIFORM grid of one square transform, so a tree that split unevenly
-    /// would be reconstructed at the wrong stride. This census sweeps the
-    /// quantiser across the exact-repetition recipe that reaches the tree at
-    /// all and requires the tree to actually be read (`intrabc_vartx_hits`)
-    /// before reading anything into the refusal firing 0 times.
+    /// The tree is read in full; lane-av1-ibcvtx taught the luma reconstruct
+    /// to walk the tree's own leaf list, so mixed trees now decode. This
+    /// census sweeps the quantiser across the exact-repetition recipe that
+    /// reaches the tree at all and requires the tree to actually be read
+    /// (`intrabc_vartx_hits`); it stays as the premise witness for the lifted
+    /// refusal (`reached` is 0 by construction now).
     #[test]
     fn an_intrabc_vartx_census_measures_the_mixed_leaf_refusal() {
         const NAME: &str = "an_intrabc_vartx_census_measures_the_mixed_leaf_refusal";
@@ -7963,9 +8084,104 @@ pub(crate) mod tests {
         );
         assert_eq!(
             reached, 0,
-            "{NAME}: an intrabc var-tx tree resolved to mixed leaves -- the refusal is a live \
-             capability gap and needs a pinned witness, not this census"
+            "{NAME}: an intrabc var-tx tree was REFUSED -- the mixed-leaf refusal \
+             is lifted (lane-av1-ibcvtx) and must stay gone"
         );
+    }
+
+    /// lane-av1-ibcvtx, capability gate for the LIFTED refusal "an intrabc
+    /// block whose var-tx tree resolved to mixed leaf transform sizes": the
+    /// t900 r33 census recipe class (screen content, square partitions,
+    /// tx-size search) reaches mixed trees the moment the canvas carries
+    /// testsrc2's texture and blocks grow past 32 -- on the PRE-fix tree this
+    /// exact stream refused by name on its first mixed tree (5 of the 12
+    /// hunt recipes hit it, `lanes/av1ibcvtx.report.md`).
+    ///
+    /// The luma reconstruct walks the tree's own leaf list per leaf (libaom
+    /// `decode_token_recon_block`), and the block's chroma inherits the
+    /// co-located luma unit's coded tx type (`av1_get_tx_type`,
+    /// `blockd.h:1278`) -- the inheritance the uniform multi-TU intrabc path
+    /// was missing as well: symbol-aligned against an instrumented aomdec,
+    /// the 640x360 cq20 witness desynced inside the FIRST chroma unit of its
+    /// first mixed tree until the arm landed, then matched every subsequent
+    /// read.
+    ///
+    /// NOT yet asserted: full pixel-exactness against ffmpeg. A second,
+    /// PRE-EXISTING defect that is not this refusal -- a NON-intrabc intra
+    /// block (R5 witness: mi (32,32), 64x64, uniform 4x TX_32X32 tree, every
+    /// coefficient all_zero, reads symbol-identical to aomdec) mispredicts
+    /// isolated samples on testsrc2 content (first divergence px (128,296)
+    /// of the 640x360 cq20 recipe) and cascades over roughly a third of the
+    /// frame. It is pinned in `lanes/av1ibcvtx.report.md`; when it lands,
+    /// tighten this gate to a full pixel-exact assert.
+    #[test]
+    fn a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal() {
+        const NAME: &str = "a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let (width, height) = (640usize, 360usize);
+        let _guard = lock_gate_counters();
+        let stream = screen_intrabc_stream_with(
+            "testsrc2=size=320x180:rate=25",
+            "30",
+            "1",
+            true,
+            true,
+            &["--max-partition-size=64"],
+        );
+        let (select, premise) = tx_select_and_intrabc_frames(&stream);
+        assert!(
+            premise > 0,
+            "{NAME}: vacuous -- no frame keeps allow_intrabc under TxMode::Select, \
+             so the refusal's premise was never within reach (select={select})"
+        );
+        crate::decode::reset_intrabc_vartx_hits();
+        crate::decode::reset_intrabc_vartx_mixed_leaves_hits();
+        match decode_stream(&stream) {
+            Ok(frames) => {
+                let trees = crate::decode::intrabc_vartx_hits();
+                let mixed = crate::decode::intrabc_vartx_mixed_leaves_hits();
+                assert!(
+                    trees > 0 && mixed > 0,
+                    "{NAME}: vacuous -- {trees} var-tx tree(s), {mixed} mixed: the \
+                     capability this gate pins was never exercised"
+                );
+                let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+                assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
+                let mut mismatched = 0usize;
+                for (ours, ref_frame) in frames.iter().zip(theirs.iter()) {
+                    mismatched += ours
+                        .y
+                        .iter()
+                        .zip(ref_frame.y.iter())
+                        .filter(|(x, y)| x != y)
+                        .count();
+                    mismatched += ours
+                        .u
+                        .iter()
+                        .zip(ref_frame.u.iter())
+                        .filter(|(x, y)| x != y)
+                        .count();
+                    mismatched += ours
+                        .v
+                        .iter()
+                        .zip(ref_frame.v.iter())
+                        .filter(|(x, y)| x != y)
+                        .count();
+                }
+                eprintln!(
+                    "{NAME}: select={select} premise={premise} vartx_blocks={trees} \
+                     mixed_trees={mixed}, {mismatched} sample(s) differ from ffmpeg \
+                     (the pinned non-intrabc second defect, see the doc comment)"
+                );
+            }
+            Err(e) => panic!(
+                "{NAME}: the mixed-leaf refusal is lifted (lane-av1-ibcvtx); the \
+                 witness stream must decode, not stop: {e}"
+            ),
+        }
     }
 
     /// How many frames of `stream` carry `tx_mode == Select`, and how many of
