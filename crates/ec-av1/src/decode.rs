@@ -3745,6 +3745,10 @@ thread_local! {
     /// var-tx partition tree (unskipped, `TX_MODE_SELECT`) -- the capability
     /// that replaced the refusal "an intrabc block under TxMode::Select".
     static INTRABC_VARTX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-ibcvtx: intrabc var-tx trees that resolved to MIXED leaf
+    /// sizes (not one square size across every leaf) -- the engagement
+    /// counter proving a witness actually exercises the per-leaf reconstruct.
+    static INTRABC_VARTX_MIXED_LEAVES_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// lane-av1txr: as above for a `BLOCK_4X8`/`BLOCK_8X4` intrabc leaf --
     /// libaom's `block_signals_txsize` is `bsize > BLOCK_4X4`, so these leaves
     /// signal a transform size where a plain `BLOCK_4X4` does not. Reading no
@@ -3811,15 +3815,26 @@ pub fn intrabc_rect_vartx_hits() -> usize {
 }
 
 /// Current value of [`INTRABC_VARTX_HITS`].
-#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
-pub(crate) fn intrabc_vartx_hits() -> usize {
+pub fn intrabc_vartx_hits() -> usize {
     INTRABC_VARTX_HITS.with(|c| c.get())
+}
+
+/// Current value of [`INTRABC_VARTX_MIXED_LEAVES_HITS`].
+pub fn intrabc_vartx_mixed_leaves_hits() -> usize {
+    INTRABC_VARTX_MIXED_LEAVES_HITS.with(|c| c.get())
 }
 
 /// Zeroes [`INTRABC_VARTX_HITS`] (gate tests call this before a decode).
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_intrabc_vartx_hits() {
     INTRABC_VARTX_HITS.with(|c| c.set(0));
+}
+
+/// Zeroes [`INTRABC_VARTX_MIXED_LEAVES_HITS`] (gate tests call this before a
+/// decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_vartx_mixed_leaves_hits() {
+    INTRABC_VARTX_MIXED_LEAVES_HITS.with(|c| c.set(0));
 }
 
 /// Current value of [`RECT_INTRABC_VARTX_HITS`].
@@ -15671,23 +15686,31 @@ fn decode_block(
             }
         }
         hit!(INTRABC_VARTX_HITS);
-        // The luma reconstruct loop below is a UNIFORM grid of one square
-        // transform (the intra `tx_depth` shape), so a tree that resolved to
-        // mixed leaf sizes is refused by name rather than reconstructed at the
-        // wrong stride.
+        // lane-t900 r33 census: the t900 recipes resolved every tree UNIFORM.
+        // lane-av1-ibcvtx: a tree that resolved to mixed leaf sizes is no
+        // longer refused -- the luma reconstruct below walks the tree's own
+        // leaf list per leaf (libaom `decode_token_recon_block`, whose token
+        // loop reconstructs whatever `read_tx_size_vartx` resolved, per
+        // transform unit), so mixed sizes reconstruct at their own stride.
+        // The counter marks the shape so a gate can prove a witness actually
+        // carries a mixed tree and not merely another uniform one.
         let uniform = leaves
             .first()
             .is_some_and(|f| leaves.iter().all(|l| (l.2, l.3) == (f.2, f.3) && l.2 == l.3));
         if !uniform {
-            return Err(unsupported(
-                "an intrabc block whose var-tx tree resolved to mixed leaf transform sizes",
-            ));
+            hit!(INTRABC_VARTX_MIXED_LEAVES_HITS);
+            if crate::envflags::env_flag!("EC_AV1_IBCVTX_DEBUG") {
+                eprintln!(
+                    "IBCVTX mixed intrabc tree mi=({mi_r},{mi_c}) side={side} \
+                     dv={intrabc_dv:?} leaves={leaves:?}"
+                );
+            }
         }
-        Some(leaves[0].2)
+        Some(leaves)
     } else {
         None
     };
-    let (logical_tx, coeff_tx_side) = if let Some(tx) = intrabc_leaves {
+    let (logical_tx, coeff_tx_side) = if let Some(tx) = intrabc_leaves.as_ref().map(|l| l[0].2) {
         (tx, if tx == 64 { 32 } else { tx })
     } else if tx_select && !intrabc_skip_tx {
         let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side);
@@ -16055,25 +16078,54 @@ fn decode_block(
         let chroma_ctx_offset = if cn > 1 { Some(3) } else { None };
         let tpc = (n_axis / nchunk).max(1);
         let cpc = (cn / nchunk).max(1);
+        // The block's luma transform units, raster order inside each mu
+        // chunk. lane-av1-ibcvtx: an intrabc block's units are the var-tx
+        // tree's own leaf list -- mixed sizes included, exactly what libaom's
+        // `decode_token_recon_block` token loop reconstructs (one
+        // `av1_read_coeffs_txb` + inverse transform per resolved unit) --
+        // while every other block's list is the uniform `logical_tx` grid
+        // this loop has always walked, generated here in the same order.
+        let mut chunk_tus: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); nchunk * nchunk];
+        if let Some(leaves) = &intrabc_leaves {
+            for &(lr, lc, tw, _th) in leaves {
+                let (off_y, off_x) = (lr * MI, lc * MI);
+                chunk_tus[(off_y / 64) * nchunk + (off_x / 64)].push((off_y, off_x, tw));
+            }
+        } else {
+            for tu_row in 0..n_axis {
+                for tu_col in 0..n_axis {
+                    chunk_tus[(tu_row / tpc) * nchunk + (tu_col / tpc)].push((
+                        tu_row * logical_tx,
+                        tu_col * logical_tx,
+                        logical_tx,
+                    ));
+                }
+            }
+        }
         let mut last_grids = [Grid::Zero(0), Grid::Zero(0)];
         let mut units: Vec<((usize, usize), usize, Grid, Grid)> = Vec::new();
         for ch_row in 0..nchunk {
         for ch_col in 0..nchunk {
-        for tu_row in ch_row * tpc..(ch_row + 1) * tpc {
-            for tu_col in ch_col * tpc..(ch_col + 1) * tpc {
-                let tu_mi = (
-                    mi_r + tu_row * (logical_tx / MI),
-                    mi_c + tu_col * (logical_tx / MI),
-                );
-                let tu_px = px + tu_col * logical_tx;
-                let tu_py = py + tu_row * logical_tx;
+        // lane-av1-ibcvtx: the chunk's chroma units inherit the CHROMA tx
+        // type of the co-located luma position (`av1_get_tx_type`,
+        // blockd.h:1278: a non-Y plane of an inter-classified block -- and
+        // intrabc is one -- reads `tx_type_map`, i.e. the coded type of the
+        // luma unit covering it). Inside a mu chunk that is the chunk's
+        // FIRST luma unit in raster order (the chunk origin is always the
+        // first leaf's own origin). Captured right after that unit's read;
+        // the single-TU arm below does the same for a whole-block unit.
+        let mut first_leaf_tx: Option<TxType> = None;
+        for &(tu_off_y, tu_off_x, tu_tx) in &chunk_tus[ch_row * nchunk + ch_col] {
+                let tu_mi = (mi_r + tu_off_y / MI, mi_c + tu_off_x / MI);
+                let tu_px = px + tu_off_x;
+                let tu_py = py + tu_off_y;
                 // Same libaom clip as `decode_rect_split`'s loop above; a
                 // square block only hangs off the frame when the frame's mi
                 // dimensions are odd at the block's own level.
                 if tu_px >= y.true_width || tu_py >= y.true_height {
                     continue;
                 }
-                let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
+                let tu_around = neighbours.around_mi(tu_mi, tu_tx)[0];
                 // A transform unit inside a block is NOT a block at that
                 // position (lane-palette2 r12): `Reach::of` granted the
                 // top-right 8x8 unit of a 16x16 D203 block bottom-left
@@ -16082,35 +16134,48 @@ fn decode_block(
                 let tu_reach = tu_reach(
                     side,
                     side,
-                    tu_col * logical_tx,
-                    tu_row * logical_tx,
-                    logical_tx,
+                    tu_off_x,
+                    tu_off_y,
+                    tu_tx,
                     reach,
                     px,
                     py,
                     y.width,
                     y.height, fctx,
                 );
-                // This transform unit's own bsize (`logical_tx`) is smaller
+                // This transform unit's own bsize (`tu_tx`) is smaller
                 // than the block it sits in (`side`), so `txb_skip_ctx` is
                 // the neighbour-magnitude table, not the lone-TU 0 (spec
                 // `get_txb_ctx_general`'s `plane_bsize != tx_size` branch).
-                let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, logical_tx / MI);
+                let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tu_tx / MI);
+                // An intrabc unit's CDF set and scan follow the unit's OWN
+                // resolved size (`get_txsize_entropy_ctx` /
+                // `av1_get_scan` per `av1_read_coeffs_txb` call); the
+                // uniform grid's precomputed pair already matches because
+                // `tu_tx == logical_tx` there.
+                let (tu_set, tu_scan) = if intrabc_dv.is_some() {
+                    (
+                        inter_txbset_for(tu_tx, reduced_tx_set),
+                        scan_for(if tu_tx == 64 { 32 } else { tu_tx }, scan32, scan16, scan8, scan4),
+                    )
+                } else {
+                    (luma_set, luma_scan)
+                };
                 if let Some(buf) = &palette_y_buf {
                     hit!(PALETTE_SPLIT_TX_HITS);
-                    let mut window = vec![0u16; logical_tx * logical_tx];
-                    for row in 0..logical_tx {
-                        let src = (tu_row * logical_tx + row) * side + tu_col * logical_tx;
-                        window[row * logical_tx..][..logical_tx]
-                            .copy_from_slice(&buf[src..][..logical_tx]);
+                    let mut window = vec![0u16; tu_tx * tu_tx];
+                    for row in 0..tu_tx {
+                        let src = (tu_off_y + row) * side + tu_off_x;
+                        window[row * tu_tx..][..tu_tx]
+                            .copy_from_slice(&buf[src..][..tu_tx]);
                     }
                     set_palette_pred(window, fctx);
                 }
                 let tu_grid = read_plane(
                     dec,
                     cdfs,
-                    luma_set,
-                    luma_scan,
+                    tu_set,
+                    tu_scan,
                     0,
                     tu_around,
                     mode,
@@ -16120,12 +16185,12 @@ fn decode_block(
                     y,
                     tu_px,
                     tu_py,
-                    logical_tx,
+                    tu_tx,
                     // The unit's own COEFFICIENT grid, half its side at
                     // TX_64X64 (a 64-point transform codes nothing past 32);
-                    // identical to `logical_tx` at every smaller size
+                    // identical to `tu_tx` at every smaller size
                     // (lane-sb128b r1).
-                    coeff_tx_side,
+                    if tu_tx == 64 { 32 } else { tu_tx },
                     base_q_idx,
                     None,
                     filter_intra,
@@ -16140,12 +16205,22 @@ fn decode_block(
                         dec.debug_bitpos()
                     );
                 }
-                neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
-            }
+                neighbours.record_mi_luma(tu_mi, tu_tx, &tu_grid);
+                if first_leaf_tx.is_none() {
+                    first_leaf_tx = Some(fctx.luma_tx_type.with(std::cell::Cell::get));
+                }
         }
         // CfL is only allowed up to 32x32, i.e. only at `nchunk == 1`, where
         // this still runs after every luma unit of the block.
         let ac = alpha.map(|_| cfl_src(px, py, side));
+        // lane-av1-ibcvtx: an intrabc block's chroma rides the luma's coded
+        // tx type (see `first_leaf_tx` above) -- the same arm the single-TU
+        // branch sets before its own chroma reads.
+        if intrabc_dv.is_some() {
+            if let Some(t) = first_leaf_tx {
+                fctx.intrabc_chroma_tx.with(|c| c.set(Some(t)));
+            }
+        }
         // The block's uv plane block is `chroma_side` across but its uv
         // transform is `chroma_tx` (`av1_get_max_uv_txsize` =
         // `av1_get_adjusted_tx_size(max_txsize_rect_lookup[uv_plane_bsize])`):
@@ -16256,6 +16331,9 @@ fn decode_block(
             }
         }
         }
+        }
+        if intrabc_dv.is_some() {
+            fctx.intrabc_chroma_tx.with(|c| c.set(None));
         }
         }
         // Mode/side bookkeeping plus, at `cn == 1`, the whole-plane chroma

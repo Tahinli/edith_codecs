@@ -7187,12 +7187,12 @@ pub(crate) mod tests {
     /// to mixed leaf transform sizes" -- the residue lane-t900 r32 left when
     /// it lifted the intrabc `TX_MODE_SELECT` refusal.
     ///
-    /// The tree is read in full, but the luma reconstruct loop it feeds is a
-    /// UNIFORM grid of one square transform, so a tree that split unevenly
-    /// would be reconstructed at the wrong stride. This census sweeps the
-    /// quantiser across the exact-repetition recipe that reaches the tree at
-    /// all and requires the tree to actually be read (`intrabc_vartx_hits`)
-    /// before reading anything into the refusal firing 0 times.
+    /// The tree is read in full; lane-av1-ibcvtx taught the luma reconstruct
+    /// to walk the tree's own leaf list, so mixed trees now decode. This
+    /// census sweeps the quantiser across the exact-repetition recipe that
+    /// reaches the tree at all and requires the tree to actually be read
+    /// (`intrabc_vartx_hits`); it stays as the premise witness for the lifted
+    /// refusal (`reached` is 0 by construction now).
     #[test]
     fn an_intrabc_vartx_census_measures_the_mixed_leaf_refusal() {
         const NAME: &str = "an_intrabc_vartx_census_measures_the_mixed_leaf_refusal";
@@ -7249,9 +7249,104 @@ pub(crate) mod tests {
         );
         assert_eq!(
             reached, 0,
-            "{NAME}: an intrabc var-tx tree resolved to mixed leaves -- the refusal is a live \
-             capability gap and needs a pinned witness, not this census"
+            "{NAME}: an intrabc var-tx tree was REFUSED -- the mixed-leaf refusal \
+             is lifted (lane-av1-ibcvtx) and must stay gone"
         );
+    }
+
+    /// lane-av1-ibcvtx, capability gate for the LIFTED refusal "an intrabc
+    /// block whose var-tx tree resolved to mixed leaf transform sizes": the
+    /// t900 r33 census recipe class (screen content, square partitions,
+    /// tx-size search) reaches mixed trees the moment the canvas carries
+    /// testsrc2's texture and blocks grow past 32 -- on the PRE-fix tree this
+    /// exact stream refused by name on its first mixed tree (5 of the 12
+    /// hunt recipes hit it, `lanes/av1ibcvtx.report.md`).
+    ///
+    /// The luma reconstruct walks the tree's own leaf list per leaf (libaom
+    /// `decode_token_recon_block`), and the block's chroma inherits the
+    /// co-located luma unit's coded tx type (`av1_get_tx_type`,
+    /// `blockd.h:1278`) -- the inheritance the uniform multi-TU intrabc path
+    /// was missing as well: symbol-aligned against an instrumented aomdec,
+    /// the 640x360 cq20 witness desynced inside the FIRST chroma unit of its
+    /// first mixed tree until the arm landed, then matched every subsequent
+    /// read.
+    ///
+    /// NOT yet asserted: full pixel-exactness against ffmpeg. A second,
+    /// PRE-EXISTING defect that is not this refusal -- a NON-intrabc intra
+    /// block (R5 witness: mi (32,32), 64x64, uniform 4x TX_32X32 tree, every
+    /// coefficient all_zero, reads symbol-identical to aomdec) mispredicts
+    /// isolated samples on testsrc2 content (first divergence px (128,296)
+    /// of the 640x360 cq20 recipe) and cascades over roughly a third of the
+    /// frame. It is pinned in `lanes/av1ibcvtx.report.md`; when it lands,
+    /// tighten this gate to a full pixel-exact assert.
+    #[test]
+    fn a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal() {
+        const NAME: &str = "a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let (width, height) = (640usize, 360usize);
+        let _guard = lock_gate_counters();
+        let stream = screen_intrabc_stream_with(
+            "testsrc2=size=320x180:rate=25",
+            "30",
+            "1",
+            true,
+            true,
+            &["--max-partition-size=64"],
+        );
+        let (select, premise) = tx_select_and_intrabc_frames(&stream);
+        assert!(
+            premise > 0,
+            "{NAME}: vacuous -- no frame keeps allow_intrabc under TxMode::Select, \
+             so the refusal's premise was never within reach (select={select})"
+        );
+        crate::decode::reset_intrabc_vartx_hits();
+        crate::decode::reset_intrabc_vartx_mixed_leaves_hits();
+        match decode_stream(&stream) {
+            Ok(frames) => {
+                let trees = crate::decode::intrabc_vartx_hits();
+                let mixed = crate::decode::intrabc_vartx_mixed_leaves_hits();
+                assert!(
+                    trees > 0 && mixed > 0,
+                    "{NAME}: vacuous -- {trees} var-tx tree(s), {mixed} mixed: the \
+                     capability this gate pins was never exercised"
+                );
+                let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+                assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
+                let mut mismatched = 0usize;
+                for (ours, ref_frame) in frames.iter().zip(theirs.iter()) {
+                    mismatched += ours
+                        .y
+                        .iter()
+                        .zip(ref_frame.y.iter())
+                        .filter(|(x, y)| x != y)
+                        .count();
+                    mismatched += ours
+                        .u
+                        .iter()
+                        .zip(ref_frame.u.iter())
+                        .filter(|(x, y)| x != y)
+                        .count();
+                    mismatched += ours
+                        .v
+                        .iter()
+                        .zip(ref_frame.v.iter())
+                        .filter(|(x, y)| x != y)
+                        .count();
+                }
+                eprintln!(
+                    "{NAME}: select={select} premise={premise} vartx_blocks={trees} \
+                     mixed_trees={mixed}, {mismatched} sample(s) differ from ffmpeg \
+                     (the pinned non-intrabc second defect, see the doc comment)"
+                );
+            }
+            Err(e) => panic!(
+                "{NAME}: the mixed-leaf refusal is lifted (lane-av1-ibcvtx); the \
+                 witness stream must decode, not stop: {e}"
+            ),
+        }
     }
 
     /// How many frames of `stream` carry `tx_mode == Select`, and how many of
