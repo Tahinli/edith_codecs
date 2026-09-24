@@ -191,6 +191,30 @@ pub fn sb128_rect_counters() -> (usize, usize, usize, usize) {
     )
 }
 
+/// lane-av1-ibcrect: the 128 root's interior partition arms plus the key-frame
+/// intra 128-axis blocks -- (split, none, horz, vert, ab[4], intra_horz,
+/// intra_vert). Non-zero horz/vert mean a stream carried real PARTITION_HORZ/
+/// VERT at the 128 root, so an intrabc-rect hunt can tell "the partition was
+/// never chosen" from "chosen and decoded intra (or refused)".
+pub fn part128_census() -> (usize, usize, usize, usize, [usize; 4], usize, usize) {
+    (
+        crate::decode::part128_split_hits(),
+        crate::decode::part128_none_hits(),
+        crate::decode::part128_horz_hits(),
+        crate::decode::part128_vert_hits(),
+        crate::decode::part128_ab_hits(),
+        crate::decode::intra_sb128_hits().0,
+        crate::decode::intra_sb128_hits().1,
+    )
+}
+
+/// lane-av1-ibcrect: `use_intrabc` blocks on a 128-root HORZ/VERT strip whose
+/// reconstruction ([`crate::decode::decode_intrabc_128rect`]) ran -- the
+/// engagement counter the sb128 intrabc-rect gate asserts on.
+pub fn intrabc_128rect_hits() -> usize {
+    crate::decode::intrabc_128rect_hits()
+}
+
 /// Blocks reconstructed with intra block copy at an 8x8 LEAF specifically
 /// (lane-kf900 r7's shape); [`crate::decode::intrabc_hits`] counts every shape.
 pub fn leaf8_intrabc_hits() -> usize {
@@ -7515,6 +7539,182 @@ pub(crate) mod tests {
              block, so `enable-intrabc` coverage there would rest on the flag spelling alone",
             blocks_at_depth[0],
             blocks_at_depth[1]
+        );
+    }
+
+    /// lane-av1-ibcrect: `use_intrabc` on a 128-root HORZ/VERT strip
+    /// (BLOCK_128X64 / BLOCK_64X128) decodes PIXEL-EXACT against the
+    /// instrumented oracle -- the witness the refusal inventory names after
+    /// `decode_block_128rect`'s rect-strip intrabc refusal was lifted
+    /// (`decode_intrabc_128rect`). The square-block twin is
+    /// [`an_sb128_screen_stream_with_intrabc_decodes_pixel_exact`] above.
+    ///
+    /// The recipes are the hunt's proven arms (lanes/ibcrect r1/r2, the same
+    /// `--sb-size=128 --min-partition-size=64 --enable-rect-partitions=1
+    /// --enable-ab-partitions=0 --enable-1to4-partitions=0` partition recipe
+    /// [`a_real_aomenc_sb128_intra_rect_block_decodes_pixel_exact`] uses, plus
+    /// `--tune-content=screen --enable-intrabc=1` over the DETERMINISTIC geq
+    /// sinusoid sources -- lavfi `gradients` ignores its seed and re-rolls
+    /// every run, so a "flake" there was really this):
+    ///
+    /// * HORZ arm: 384x320 cq32, 5 all-key frames -- 14 unskipped 128x64
+    ///   intrabc blocks (`skip=false`, real residual reads);
+    /// * VERT arm: 512x512 cq45, 5 all-key frames -- an unskipped 64x128
+    ///   intrabc block at mi(64,96).
+    ///
+    /// Both arms HARD-assert `intrabc_128rect_hits() > 0` and decode-order
+    /// pixel-exactness of EVERY frame (hidden alt-refs included) against the
+    /// oracle's own dump, so a stream that stopped engaging the shape fails
+    /// the gate instead of passing vacuously (class `gate-blind-to-feature`).
+    ///
+    /// The 10-bit arm engages the shape. Hunt r2 and the witness re-run both
+    /// measured `intrabc_128rect_hits` +15 on arm 3, so aomenc does take a
+    /// 128-root HORZ/VERT strip at 10 bit under this recipe. There is no
+    /// per-depth coverage gap to print. The gate's hard asserts already
+    /// cover that arm.
+    ///
+    /// The chroma context this shape reads was the r2 defect: per-unit chroma
+    /// entropy states were stamped inside the mu-chunk loop, then the
+    /// end-of-block `record_split_luma_rect_mi` re-stamped BOTH planes over
+    /// the whole 128x64 span with ONE composed state -- level = the SUM of
+    /// both 64x64 chunks' units, dc = chunk-0's top-left (class
+    /// `override-slot-on-one-arm`; the inter-128 path fixed the same class
+    /// with its `mu_chroma_units` replay, decode.rs). The next block then
+    /// read `txb_skip` off the smeared state.
+    #[test]
+    fn an_sb128_rect_strip_with_intrabc_decodes_pixel_exact() {
+        const NAME: &str = "an_sb128_rect_strip_with_intrabc_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // (tag, width, height, cq, geq luma, 10-bit)
+        // The geq sources are the hunt's GEO_SMOOTH / GEO_SMOOTH_512,
+        // byte-identical across runs (see the sb128 intra-rect gate's note).
+        let arms: [(u32, usize, usize, &str, &str, bool); 3] = [
+            (
+                1,
+                384,
+                320,
+                "32",
+                "128+90*sin((X+2*N)/37)+30*sin(Y/29)",
+                false,
+            ),
+            (
+                2,
+                512,
+                512,
+                "45",
+                "128+80*sin((X+3*N)/17)+50*sin(Y/29)+30*sin((X+Y)/13)",
+                false,
+            ),
+            (3, 384, 320, "32", "128+90*sin((X+2*N)/37)+30*sin(Y/29)", true),
+        ];
+        let mut engaged_arms = 0u32;
+        let mut vert_arms = 0u32;
+        for (tag, width, height, cq, lum, ten_bit) in arms {
+            let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!(
+                        "nullsrc=size={width}x{height}:rate=25,format=yuv420p,\
+                         geq=lum='{lum}':\
+                         cb='128+30*sin(X/23)':cr='128+30*sin((Y+N)/19)'"
+                    ),
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.2",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let cq_arg = format!("--cq-level={cq}");
+            let mut args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                &cq_arg,
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=1",
+                "--limit=5",
+                "--tile-columns=0",
+                "--sb-size=128",
+                "--min-partition-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-palette=0",
+                "--tune-content=screen",
+                "--enable-intrabc=1",
+                "--deltaq-mode=0",
+                "--enable-tx-size-search=0",
+            ];
+            if ten_bit {
+                args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+            }
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the arm {tag} fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = crate::decode::intrabc_128rect_hits();
+            let (frames, hidden) = decode_all_frames_vs_oracle(
+                &stream,
+                &format!("ibcrect-strip-{tag}-{width}x{height}"),
+            );
+            let hits = crate::decode::intrabc_128rect_hits() - before;
+            eprintln!(
+                "{NAME}: arm {tag} {width}x{height} cq={cq} {}bit: {frames} decode-order frames \
+                 pixel-exact ({hidden} hidden), intrabc_128rect_hits=+{hits}",
+                if ten_bit { 10 } else { 8 },
+            );
+            if hits > 0 {
+                engaged_arms += 1;
+                // The VERT arm is tag 2; its engagement is what proves the
+                // 64x128 orientation, not just 128x64.
+                if tag == 2 {
+                    vert_arms += 1;
+                }
+            }
+        }
+        assert!(
+            engaged_arms > 0,
+            "{NAME}: {engaged_arms} arm(s) decoded pixel-exact but NOT ONE decoded a 128-root \
+             rect-strip intrabc block -- the shape this gate exists for was never engaged"
+        );
+        assert!(
+            vert_arms > 0,
+            "{NAME}: the VERT (64x128) orientation was never engaged -- only 128x64 HORZ strips \
+             proved the lift"
         );
     }
 
