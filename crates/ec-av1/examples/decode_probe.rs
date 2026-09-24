@@ -63,6 +63,12 @@ fn main() {
             ec_av1::decode::intrabc_rect_hits(),
             ec_av1::decode::intrabc_rect_vartx_hits()
         );
+        // lane-av1-ibcrect: `use_intrabc` on a 128-root HORZ/VERT strip --
+        // the shape `decode_block_128rect` used to refuse.
+        println!(
+            "intrabc_128rect: {}",
+            ec_av1::stream::intrabc_128rect_hits()
+        );
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         println!(
@@ -141,6 +147,14 @@ fn main() {
         println!(
             "sb128_rect: edge_horz={} edge_vert={} inter_128x64={} inter_64x128={}",
             sb.0, sb.1, sb.2, sb.3
+        );
+        // lane-av1-ibcrect: the interior 128-root partition arms and the key
+        // frame's intra 128-axis blocks, so a recipe sweep can tell "the
+        // encoder never chose HORZ/VERT at the 128 root" from "it did".
+        let p128 = ec_av1::stream::part128_census();
+        println!(
+            "part128: split={} none={} horz={} vert={} ab={:?} intra_horz={} intra_vert={}",
+            p128.0, p128.1, p128.2, p128.3, p128.4, p128.5, p128.6
         );
         // lane-sbab r1: the superblock-level inter AB arms.
         let sbab = ec_av1::decode::sb_ab_inter_hits_by_arm();
