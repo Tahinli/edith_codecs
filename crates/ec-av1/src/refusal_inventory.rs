@@ -80,7 +80,14 @@ const REFUSALS: &[&str] = &[
     // lane-av112bitc: compound joined the witnessed set (six-frame 12-bit
     // compound stream byte-exact vs ffmpeg; the combines already absorbed
     // the CONV_BUF gain drop through `INTER_POST_ROUND - delta`).
-    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
+    // lane-av112bitw: warp joined too -- the refusal left all three decision
+    // sites (compound, 16x16+, 8x8 leaf): `warp::warp_round_0` implements
+    // convolve.h's 12-bit `round_0` bump (3 -> 5), and both the single-ref
+    // witness (`a_12bit_warped_motion_stream_decodes_pixel_exact`, the exact
+    // recipe that refused pre-lift) and the rotating-mandelbrot
+    // compound-warp witness
+    // (`a_real_compound_global_warp_12bit_stream_decodes_pixel_exact`, 28
+    // compound warp blocks) are byte-exact vs ffmpeg.
     "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
     "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
     // lane-av1txr: the silent-garbage guard. A 4:4:4/4:2:2 stream used to
@@ -363,10 +370,11 @@ const PROVEN: &[(&str, &str)] = &[
     // lane-av112bitc: the compound pair left with its refusal -- the
     // six-frame compound stream now DECODES byte-exact
     // (`a_real_aomenc_12bit_compound_inter_sequence_decodes_pixel_exact`).
-    (
-        "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
-        "a_12bit_warped_motion_stream_is_refused_by_name",
-    ),
+    // lane-av112bitw: the warp pair left too -- its gate now WITNESSES
+    // (`a_12bit_warped_motion_stream_decodes_pixel_exact`, the same recipe
+    // that refused pre-lift) and the compound-warp arm witnesses through
+    // `a_real_compound_global_warp_12bit_stream_decodes_pixel_exact`
+    // (hard `compound_warp_hits > 0`).
     (
         "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
         "a_12bit_film_grain_stream_is_refused_by_name",

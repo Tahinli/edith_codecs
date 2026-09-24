@@ -28,15 +28,18 @@ use ec_av1_syntax::{
 };
 use ec_core::{Error, Result};
 
-// lane-av112bit: the 12-bit warp refusals below are inline literals
-// (refusal_inventory.rs extracts them from the decode source); each names the
-// witness gap that keeps the path refused -- warp's reduce bits inherit the
-// 12-bit `conv_params->round_0` (warped_motion.c:295, convolve.h:81..86).
-// lane-av112bitc lifted the compound pair of the same family: the compound
-// combines absorb the CONV_BUF gain drop (`INTER_POST_ROUND - delta`, see
-// `mc::combine_compound`) and the six-frame 12-bit compound witness is
-// byte-exact vs ffmpeg. All sites are PARSE-time: a refused stream never
-// builds a warp predictor.
+// lane-av112bit: the 12-bit warp refusal that used to stand at all three
+// warp decision sites (compound, 16x16+, 8x8 leaf) was an inline literal
+// (refusal_inventory.rs extracts refusal strings from the decode source);
+// it named the real gap: warp's reduce bits inherited the 12-bit
+// `conv_params->round_0` (warped_motion.c:295, convolve.h:81..86) and no
+// witness existed.
+// lane-av112bitw lifted it from all three sites: `warp::warp_round_0`
+// implements the bump (`round_0 += max(bd + FILTER_BITS - round_0 - 14, 0)`,
+// 5 at 12 bits), and the single-ref witness plus the rotating-mandelbrot
+// compound-warp witness are both byte-exact vs ffmpeg. Compound inter
+// itself was lifted by lane-av112bitc before that (the combines absorb the
+// CONV_BUF gain drop, `INTER_POST_ROUND - delta`, see `mc::combine_compound`).
 
 /// Per-frame decode state, one instance per decoded stream (lane-thread1).
 ///
@@ -29094,13 +29097,12 @@ fn decode_inter_block(
             let warp1 = compound_warp(ref1, is_global_mv1).filter(|_| ref_unscaled(ref1));
             if warp0.is_some() || warp1.is_some() {
                 hit!(COMPOUND_WARP_HITS);
-                // lane-av112bit: refused by name -- see `WARP_12BIT_REFUSAL`.
-                if bit_depth(fctx) == 12 {
-                    return Err(Error::unsupported(
-                    "AV1 tile decode",
-                    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
-                ));
-                }
+                // lane-av112bitw: the 12-bit refusal that stood here is
+                // LIFTED with the compound-warp witness: the rotating-
+                // mandelbrot 12-bit recipe refused exactly here pre-lift and
+                // now decodes byte-exact vs ffmpeg through the same bumped
+                // `warp::warp_round_0` shifts
+                // (`a_real_compound_global_warp_12bit_stream_decodes_pixel_exact`).
             }
             // spec `get_ref_filter_type`: matches when EITHER of the
             // neighbour's two references equals this block's own ref0 --
@@ -30677,15 +30679,13 @@ fn decode_inter_block(
                     hit!(AFFINE_GM_HITS);
                 }
             }
-            // lane-av112bit: a local `WARPED_CAUSAL` projection (set above) or
-            // a global warp model both land here with `warp_params` set --
-            // refused by name at 12 bits (see `WARP_12BIT_REFUSAL`).
-            if bit_depth(fctx) == 12 && warp_params.is_some() {
-                return Err(Error::unsupported(
-                    "AV1 tile decode",
-                    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
-                ));
-            }
+            // lane-av112bitw: a local `WARPED_CAUSAL` projection (set above)
+            // or a global warp model both land here with `warp_params` set --
+            // the 12-bit refusal that used to stand here is LIFTED: warp.rs's
+            // rounding is parameterised on the bumped `conv_params->round_0`
+            // (`warp::warp_round_0`, 5 at 12 bits) and the six-frame 12-bit
+            // warp stream decodes byte-exact vs ffmpeg
+            // (`a_12bit_warped_motion_stream_decodes_pixel_exact`).
             if crate::envflags::env_flag!("EC_AV1_TELL") {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_motion_mode eligible={} tell={} range={}",
@@ -35528,15 +35528,11 @@ fn decode_inter_block8(
                 hit!(AFFINE_GM_HITS);
             }
         }
-        // lane-av112bit: same 12-bit refusal as the 16x16+ leaf -- a local
+        // lane-av112bitw: same lift as the 16x16+ leaf -- a local
         // `WARPED_CAUSAL` projection or a global model both leave
-        // `warp_params` set here (see `WARP_12BIT_REFUSAL`).
-        if bit_depth(fctx) == 12 && warp_params.is_some() {
-            return Err(Error::unsupported(
-                    "AV1 tile decode",
-                    "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)",
-                ));
-        }
+        // `warp_params` set here; the 12-bit refusal that stood here is
+        // lifted with the same witness (`warp::warp_round_0` moved the
+        // filter's shifts; the same stream decodes byte-exact vs ffmpeg).
         if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_WARP8 mi_row={} mi_col={} warp={} globalblk={is_global_mv_block}",
