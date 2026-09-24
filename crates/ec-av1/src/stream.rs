@@ -17,8 +17,13 @@
 
 use ec_av1_syntax::{
     Av1Parser, FrameHeader, FrameType, MAX_SEGMENTS, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE,
-    SEG_LVL_ALT_Q, SEG_LVL_GLOBALMV, SEG_LVL_MAX, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, Tile, TxMode,
+    SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, Tile, TxMode,
 };
+// Census-only: read outside `mod tests` only in comments; the non-test lib
+// target never touches them, so they ride in behind cfg(test) (via the test
+// module's `use super::*`).
+#[cfg(test)]
+use ec_av1_syntax::{SEG_LVL_ALT_Q, SEG_LVL_MAX};
 use ec_core::{Error, Result};
 
 use crate::cdf_state::Cdfs;
@@ -2889,7 +2894,7 @@ pub(crate) mod tests {
         // REF_FRAME/SKIP/GLOBALMV, so an ALT_LF-only stream would decode
         // silently past it -- but a direct parse of every frame header's
         // `feature_enabled` table.
-        let lag_recipes: [(&str, &str, usize, usize, Vec<&str>); 4] = [
+        let lag_recipes: [(&str, &str, usize, usize, Vec<&str>); 3] = [
             (
                 "aq-mode=1 lag16 mandelbrot",
                 "mandelbrot",
@@ -2911,13 +2916,12 @@ pub(crate) mod tests {
                 128,
                 vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=63", "--lag-in-frames=16", "--auto-alt-ref=1"],
             ),
-            (
-                "aq-mode=2 lag16",
-                "mandelbrot",
-                192,
-                128,
-                vec!["--cpu-used=4", "--aq-mode=2", "--cq-level=45", "--lag-in-frames=16", "--auto-alt-ref=1"],
-            ),
+            // `--aq-mode=2 lag16` (complexity AQ over an alt-ref group) was
+            // measured 2026-09-24: it encodes and decodes cleanly but codes
+            // ZERO segmentation-enabled frames -- complexity AQ never reaches
+            // the seg table at this recipe -- so as a census arm it measures
+            // nothing (class gate-blind-to-feature) and was dropped; the
+            // 1-pass `aq-mode=2` r27 arm above stays.
         ];
         let mut total_enabled = 0usize;
         let mut total_inherited = 0usize;
@@ -2995,7 +2999,7 @@ pub(crate) mod tests {
             );
         }
         eprintln!(
-            "SEGCENSUS lag/twopass: {total_enabled} seg-enabled frames over 5 arms, {total_inherited} inherited-map frames, {total_alt_q} with ALT_Q, all other SEG_LVL features: 0 frames"
+            "SEGCENSUS lag/twopass: {total_enabled} seg-enabled frames over 4 arms, {total_inherited} inherited-map frames, {total_alt_q} with ALT_Q, all other SEG_LVL features: 0 frames"
         );
     }
 
