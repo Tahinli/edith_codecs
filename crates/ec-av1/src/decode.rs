@@ -1089,6 +1089,27 @@ fn write_segment_id(mi_r: usize, mi_c: usize, w_mi: usize, h_mi: usize, id: u8, 
     SEG_IDS_SEEN.with(|c| c.set(c.get() | 1 << id));
 }
 
+/// `copy_segment_id` (libaom `decodemv.c:342`): the previous frame's map is
+/// inherited VERBATIM over this block's own mi footprint -- per-cell copies,
+/// not the minified id [`predicted_segment_id`] hands the block. Without a
+/// previous map the footprint is zeroed, exactly as the C NULL branch does.
+fn copy_segment_ids(mi_r: usize, mi_c: usize, w_mi: usize, h_mi: usize, fctx: &crate::decode::FrameCtx) {
+    let (mi_rows, mi_cols) = fctx.seg_mi_dims.with(|c| c.get());
+    let (x_mis, y_mis) = (w_mi.min(mi_cols.saturating_sub(mi_c)), h_mi.min(mi_rows.saturating_sub(mi_r)));
+    fctx.seg_ids.with(|m| {
+        let mut m = m.borrow_mut();
+        fctx.prev_seg_ids.with(|p| {
+            let p = p.borrow();
+            for y in 0..y_mis {
+                for x in 0..x_mis {
+                    let idx = (mi_r + y) * mi_cols + mi_c + x;
+                    m[idx] = p.get(idx).copied().unwrap_or(0);
+                }
+            }
+        });
+    });
+}
+
 /// `get_predicted_segment_id` (libaom `dec_get_segment_id` over
 /// `last_frame_seg_map`): the minimum previous-frame segment id over the
 /// block's own mi footprint. `0` when there is no previous map.
@@ -1230,9 +1251,19 @@ fn inter_segment_id(
         return;
     }
     if !update_map {
-        // The map is inherited wholesale from the previous frame.
+        // The map is inherited from the previous frame, and libaom's
+        // `copy_segment_id` (decodemv.c:342) does that VERBATIM -- a memcpy of
+        // the previous map over the block's own footprint, mixed ids intact --
+        // while the id the BLOCK itself carries is the min over that footprint
+        // (`get_predicted_segment_id`). Stamping the min here flattened mixed
+        // footprints into the saved map, and every later frame whose
+        // `update_map == 0` copy or temporal prediction read that position
+        // dequantized with the wrong segment's `SEG_LVL_ALT_Q` (class
+        // `simplified-inheritance`).
+        copy_segment_ids(mi_r, mi_c, w_mi, h_mi, fctx);
         let id = predicted_segment_id(mi_r, mi_c, w_mi, h_mi, fctx);
-        write_segment_id(mi_r, mi_c, w_mi, h_mi, id, fctx);
+        fctx.cur_segment_id.with(|c| c.set(id));
+        SEG_IDS_SEEN.with(|c| c.set(c.get() | 1 << id));
         return;
     }
     if pre_skip && !pre_skip_frame {
