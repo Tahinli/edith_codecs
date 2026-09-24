@@ -43,6 +43,21 @@ fn no_grain() -> bool {
     std::env::var_os("EC_AV1_NO_GRAIN").is_some()
 }
 
+/// lane-av112bit: film grain synthesis has no 12-bit byte-exact witness (the
+/// lane's witnesses encode with grain off), so a 12-bit frame that would
+/// synthesise grain is refused by name at output rather than trusted --
+/// `film_grain.rs` is bit-depth generic since lane-hbd10, but generic is not
+/// proven until a real 12-bit grain stream compares exact.
+fn grain_refusal(bit_depth: u32) -> Result<()> {
+    if bit_depth == 12 {
+        return Err(Error::unsupported(
+            "AV1 decode_stream",
+            "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)",
+        ));
+    }
+    Ok(())
+}
+
 // lane-hidden r1: where `EC_AV1_FINAL_DUMP`'s per-frame dump goes for the
 // current thread, overriding the environment variable. Every ffmpeg/aomdec
 // pixel gate in this repo compares SHOWN frames only (class
@@ -689,6 +704,7 @@ pub fn decode_stream_with_threads(
                 pictures_shown += 1;
                 let grain = header.film_grain;
                 let seq = SeqFlags::read(&parser);
+                grain_refusal(u32::from(seq.bit_depth))?;
                 let tx = tx.clone();
                 jobs.submit(move || {
                     let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -740,6 +756,13 @@ pub fn decode_stream_with_threads(
                 }
                 picture
             };
+            if header.film_grain.apply_grain {
+                grain_refusal(
+                    parser
+                        .sequence_header()
+                        .map_or(8, |seq| u32::from(seq.color_config.bit_depth)),
+                )?;
+            }
             let output = if header.film_grain.apply_grain && !no_grain() {
                 // lane-hbd10 r1: grain synthesis is bit-depth generic
                 // (`film_grain.rs`'s `grain_range`/`scale_lut`, spec 7.18.3).
@@ -1081,6 +1104,9 @@ pub fn decode_stream_with_threads(
                     // Grain is synthesised for OUTPUT only: a hidden frame is
                     // reported to the sink clean, exactly as the inline path
                     // below reports it (spec 7.18.3.1).
+                    if header.film_grain.apply_grain {
+                        grain_refusal(u32::from(seq.bit_depth))?;
+                    }
                     let output = if shown && header.film_grain.apply_grain && !no_grain() {
                         std::sync::Arc::new(crate::film_grain::apply_grain(
                             &picture,
@@ -1215,6 +1241,9 @@ pub fn decode_stream_with_threads(
             decode::note_fwd_kf();
         }
         if header.show_frame {
+            if header.film_grain.apply_grain {
+                grain_refusal(u32::from(seq.bit_depth))?;
+            }
             let output = if header.film_grain.apply_grain && !no_grain() {
                 let mc_identity = seq.mc_identity;
                 std::sync::Arc::new(crate::film_grain::apply_grain(
@@ -1647,19 +1676,23 @@ fn decode_frame(
     // reason as `set_enable_edge_filter` above. Defaults to 8 when no
     // sequence header has been seen yet, matching every existing fixture.
     let bit_depth = seq.bit_depth;
-    // lane-bd12: the sequence-header parser accepts `twelve_bit`, but every
-    // rounding shift below is written for 8/10-bit only -- `warp.rs`'s
-    // `REDUCE_BITS_HORIZ` is a hard 3 where libaom uses
-    // `round_0 + max(bd + FILTER_BITS - round_0 - 14, 0)` (5 at bd 12), the
-    // MC `round_0`/`round_1` change at 12-bit (libaom convolve.h:83), the
-    // Wiener rounding bits change, and neither CDEF nor film grain has a
-    // 12-bit path. Refuse by name rather than decode silently wrong pixels.
-    if bit_depth == 12 {
-        return Err(Error::unsupported(
-            "AV1 decode_stream",
-            "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
-        ));
-    }
+    // lane-av112bit: the blanket 12-bit refusal is LIFTED for the paths the
+    // lane's witnesses prove byte-exact against ffmpeg on real `aomenc
+    // --bit-depth=12` streams (key frame and inter sequence, CDEF and loop
+    // restoration ON, grain off -- gates
+    // `a_real_aomenc_12bit_stream_decodes_pixel_exact` and
+    // `a_real_aomenc_12bit_inter_sequence_decodes_pixel_exact`). The
+    // rounding sites that move at 12 bits are parameterised from libaom's
+    // own rule (`mc.rs`'s `round_pair` -- convolve.h:81..86's `intbufrange`
+    // delta: round_0 += bd-10, non-compound round_1 -= bd-10; the Wiener
+    // pair via `get_conv_params_wiener`; the compound post-rounds absorb
+    // the CONV_BUF gain), and CDEF/deblock/quant tables/SGR/palette reads/
+    // superres upscale were already bit-depth generic (10-bit-proven).
+    // Everything no 12-bit witness reached stays refused BY NAME at its own
+    // site: warp (decode.rs, warp's reduce bits inherit the 12-bit round_0),
+    // film grain (`grain_refusal`, the witnesses run with grain off), and
+    // any per-feature gap the witnesses' counters prove unreached -- see the
+    // 12-bit refusals in decode.rs and `refusal_inventory.rs`.
     // lane-av1txr: `color_config.subsampling_x/y` (spec 5.5.2) are parsed by
     // `ec-av1-syntax` -- profile 1 forces 4:4:4, profile 2 below 12-bit forces
     // 4:2:2, and the sRGB identity description forces full-range 4:4:4 -- but
@@ -1697,6 +1730,20 @@ fn decode_frame(
         return Err(Error::unsupported(
             "AV1 decode_stream",
             "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
+        ));
+    }
+    // lane-av112bit: the frame-level half of the 12-bit gate -- screen
+    // content tools. Neither palette nor intrabc has a 12-bit witness (the
+    // 12-bit gates are natural content), and both hang off this header bit:
+    // `allow_screen_content_tools` is what lets a block code a palette or
+    // read a `use_intrabc` symbol. Refusing the FRAME by name keeps every
+    // palette/intrabc code path 12-bit-unreachable rather than unwitnessed
+    // and trusted. Gate:
+    // `a_12bit_screen_content_stream_is_refused_by_name`.
+    if bit_depth == 12 && header.allow_screen_content_tools {
+        return Err(Error::unsupported(
+            "AV1 decode_stream",
+            "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
         ));
     }
     // lane-dpm1: a LOSSLESS frame (`qindex == 0` with zero deltas, spec 5.9.12)
@@ -2115,39 +2162,6 @@ pub(crate) mod tests {
             }
         }
         picture
-    }
-
-    /// A stream whose sequence header says `twelve_bit` is refused by name
-    /// rather than decoded with the 8/10-bit rounding shifts (`warp.rs`'s
-    /// hard `REDUCE_BITS_HORIZ = 3`, MC/Wiener round bits, ungated CDEF and
-    /// film grain). Reachability, not a pixel claim: the header is written at
-    /// `seq_profile = 2` so `twelve_bit` is actually coded, and the frame's
-    /// tile payload is never reached.
-    #[test]
-    fn a_twelve_bit_sequence_header_is_refused_by_name() {
-    let fctx = &crate::decode::FrameCtx::new();
-        let picture = test_card(64, 64);
-        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
-        let mut color = ec_av1_syntax::ColorConfig {
-            bit_depth: 12,
-            ..Default::default()
-        };
-        color.num_planes = 3;
-        // Only seq_profile 2 codes the `twelve_bit` bit (spec 5.5.2).
-        let (mut seq, header) =
-            crate::encode::key_frame_headers_colour(64, 64, 100, color).unwrap();
-        seq.seq_profile = 2;
-        let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
-        stream.extend_from_slice(&crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap());
-
-        let err = decode_stream(&stream).unwrap_err().to_string();
-        assert!(
-            err.contains(
-                "a bit depth of 12 (this decoder is gated at 8 and 10 only: \
-                 warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)"
-            ),
-            "expected the 12-bit refusal, got: {err}"
-        );
     }
 
     /// lane-av1txr: a sequence header describing any chroma shape but 4:2:0 is
@@ -8176,6 +8190,410 @@ pub(crate) mod tests {
     /// actually parses to says `bit_depth == 10` before trusting any pixel
     /// match -- a stream that silently fell back to 8-bit would still
     /// "match" trivially.
+    // -------------------------------------------------------------------
+    // lane-av112bit: the 12-bit gate battery. The blanket refusal is lifted
+    // for what these gates witness byte-exact against ffmpeg on real
+    // `aomenc --bit-depth=12 --profile=2` streams: the full intra stack,
+    // dequant/transforms at the 12-bit dequant tables, deblock, CDEF, loop
+    // restoration (Wiener AND SGR), and translational subpel motion
+    // compensation through the bit-depth-parameterised `round_0`/`round_1`
+    // (libaom `convolve.h:81..86`). Everything else stays refused by name:
+    // warp, film grain, screen content tools (palette/intrabc) at the frame
+    // level, compound inter blocks at the mode read, each with its own
+    // real-stream refusal gate below.
+    // -------------------------------------------------------------------
+
+    /// The 12-bit witness source, byte-identical to the lane's committed
+    /// fixture recipe: 160x128 C420p12, a gradient + fine-texture base with a
+    /// 24x20 box that travels 1.25 px/frame horizontally and 0.75 px/frame
+    /// vertically with linear edge coverage -- sub-pixel true motion, so an
+    /// inter frame over it cannot be coded whole-pel-only.
+    fn y4m_12bit_subpel_source(frames: usize) -> Vec<u8> {
+        const W: usize = 160;
+        const H: usize = 128;
+        let cov = |a: f64, b: f64, i: i64| (b.min(i as f64 + 1.0) - a.max(i as f64)).max(0.0);
+        let mut y4m = format!("YUV4MPEG2 W{W} H{H} F30:1 Ip A1:1 C420p12\n").into_bytes();
+        for t in 0..frames {
+            let (ax, ay) = (12.0 + 1.25 * t as f64, 10.0 + 0.75 * t as f64);
+            let (bx, by) = (ax + 24.0, ay + 20.0);
+            y4m.extend_from_slice(b"FRAME\n");
+            for j in 0..H as i64 {
+                for i in 0..W as i64 {
+                    let g = (i * 190) / W as i64 + (j * 150) / H as i64;
+                    let mut v = (g * 12
+                        + if (i * 5 + j * 3 + t as i64) % 7 < 3 { 90 } else { 220 }
+                        + if (60..110).contains(&i) && (70..110).contains(&j) { 640 } else { 0 })
+                        as f64;
+                    let c = cov(ax, bx, i) * cov(ay, by, j);
+                    if c > 0.0 {
+                        v = v * (1.0 - c) + 3500.0 * c;
+                    }
+                    y4m.extend_from_slice(&(v.min(4095.0) as u16).to_le_bytes());
+                }
+            }
+            for (base, fx) in [(1900usize, 0usize), (2100, 1)] {
+                for j in 0..H / 2 {
+                    for i in 0..W / 2 {
+                        let v = if fx == 0 {
+                            base + (((i / 5 + t * 2) % 7) * 120 + (j * 60) / H)
+                        } else {
+                            base + (((j / 4 + t) % 5) * 140 + (i * 40) / W)
+                        };
+                        y4m.extend_from_slice(&(v.min(4095) as u16).to_le_bytes());
+                    }
+                }
+            }
+        }
+        y4m
+    }
+
+    /// The 12-bit coding recipe shared by the witness gates (cpu-used=0 so
+    /// every search runs; explicit CDEF/restoration ON). Warp/global-motion
+    /// are deliberately NOT spelled here: this aomenc honours the LAST
+    /// occurrence of these flags (measured), so a base pin plus an override
+    /// would silently take the base value -- each gate spells what it needs
+    /// exactly once.
+    fn encode_12bit(y4m: &[u8], frames: usize, extra: &[&str]) -> Vec<u8> {
+        let limit = format!("--limit={frames}");
+        let mut args: Vec<&str> = vec![
+            "--codec=av1",
+            "--profile=2",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=20",
+            "--cpu-used=0",
+            "--threads=1",
+            "--row-mt=0",
+            "--sb-size=64",
+            "--lag-in-frames=0",
+            "--auto-alt-ref=0",
+            "--kf-max-dist=1000",
+            "--input-bit-depth=12",
+            "--bit-depth=12",
+            "--enable-cdef=1",
+            "--enable-restoration=1",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+            &limit,
+        ];
+        // AOMENC FLAG PRECEDENCE (COMMON): aomenc keeps the FIRST occurrence
+        // of a flag, so the per-arm override goes BEFORE the base list.
+        args.splice(1..1, extra.iter().copied());
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), y4m);
+        assert!(
+            out.status.success(),
+            "aomenc refused the 12-bit fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    /// Asserts the stream's sequence header really says 12-bit before any
+    /// pixel comparison is trusted.
+    fn assert_12bit_sequence_header(stream: &[u8], name: &str) {
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe.parse_obu(&stream[pos..]).unwrap();
+            pos += obu.total_size;
+        }
+        let seq = probe.sequence_header().expect("stream has a sequence header OBU");
+        assert_eq!(
+            seq.color_config.bit_depth, 12,
+            "{name}: aomenc did not actually write a 12-bit sequence header"
+        );
+    }
+
+    fn ffmpeg_decode_sequence_12bit(stream: &[u8], width: usize, height: usize, frames: usize) -> Vec<Pic> {
+        let out = run_with_stdin(
+            Command::new("ffmpeg").args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt",
+                "yuv420p12le", "-",
+            ]),
+            stream,
+        );
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the 12-bit stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_bytes = (luma + 2 * chroma) * 2;
+        assert_eq!(
+            out.stdout.len(),
+            frame_bytes * frames,
+            "expected {frames} 4:2:0 12-bit frames, ffmpeg said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fn le16(bytes: &[u8]) -> Vec<u16> {
+            bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        }
+        (0..frames)
+            .map(|i| {
+                let base = i * frame_bytes;
+                Pic {
+                    width,
+                    height,
+                    y: le16(&out.stdout[base..base + luma * 2]),
+                    u: le16(&out.stdout[base + luma * 2..base + luma * 2 + chroma * 2]),
+                    v: le16(&out.stdout[base + luma * 2 + chroma * 2..base + frame_bytes]),
+                }
+            })
+            .collect()
+    }
+
+    /// The 12-bit KEY witness: CDEF and loop restoration ON, grain off.
+    /// Byte-exact against ffmpeg, and the 12-bit-sensitive pixel paths hard-
+    /// assert fired: a CDEF index literal read (bits > 0) and at least one
+    /// Wiener or SGR restoration unit. Gauntlet for the parameterised
+    /// rounding sites: MC/Wiener round pairs, `coeff_shift = bd - 8` CDEF,
+    /// the 12-bit dequant tables, bd-scaled SGR box sums.
+    #[test]
+    fn a_real_aomenc_12bit_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_12bit_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let y4m = y4m_12bit_subpel_source(1);
+        let stream = encode_12bit(
+            &y4m,
+            1,
+            &["--enable-warped-motion=0", "--enable-global-motion=0"],
+        );
+        assert_12bit_sequence_header(&stream, NAME);
+        let before_cdef = decode::cdef_idx_hits();
+        let before_lr =
+            crate::restoration::wiener_hits() + crate::restoration::sgrproj_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: decode_stream refused a real 12-bit key frame: {e}"));
+        assert_eq!(frames.len(), 1);
+        assert!(
+            decode::cdef_idx_hits() > before_cdef,
+            "{NAME}: no CDEF index literal was read -- CDEF is not exercised"
+        );
+        assert!(
+            crate::restoration::wiener_hits() + crate::restoration::sgrproj_hits() > before_lr,
+            "{NAME}: no loop restoration unit was decoded -- LR is not exercised"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg (12-bit key)");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (12-bit key)");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (12-bit key)");
+    }
+
+    /// The 12-bit INTER witness: a key frame plus one P frame over sub-pixel
+    /// true motion. Byte-exact against ffmpeg; hard-asserts the two-pass
+    /// SUBPEL prediction path ran (`MC_SUBPEL_HITS`), so the frame's own
+    /// `round_0`/`round_1` -- 5/9 at 12 bits, the whole point of the mc.rs
+    /// parameterisation -- really executed, and asserts
+    /// `compound_mode_hits` UNCHANGED (this recipe offers no divergent
+    /// second reference, so no compound mode symbol is read -- the lane's
+    /// compound witness is the six-frame gate below).
+    #[test]
+    fn a_real_aomenc_12bit_inter_sequence_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_12bit_inter_sequence_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let y4m = y4m_12bit_subpel_source(2);
+        let stream = encode_12bit(
+            &y4m,
+            2,
+            &["--enable-warped-motion=0", "--enable-global-motion=0"],
+        );
+        assert_12bit_sequence_header(&stream, NAME);
+        let before_subpel = crate::mc::mc_subpel_hits();
+        let before_compound = decode::compound_mode_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: decode_stream refused a real 12-bit inter stream: {e}"));
+        assert_eq!(frames.len(), 2);
+        assert!(
+            crate::mc::mc_subpel_hits() > before_subpel,
+            "{NAME}: no subpel inter prediction decoded -- the 12-bit round pair is unexercised"
+        );
+        assert_eq!(
+            decode::compound_mode_hits(),
+            before_compound,
+            "{NAME}: a compound mode symbol was read -- the single-reference premise is gone"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 2);
+        for (i, (ours, reference)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, reference.y, "frame {i} luma vs ffmpeg (12-bit inter)");
+            assert_eq!(ours.u, reference.u, "frame {i} U vs ffmpeg (12-bit inter)");
+            assert_eq!(ours.v, reference.v, "frame {i} V vs ffmpeg (12-bit inter)");
+        }
+    }
+
+    /// The 12-bit warp refusal, exercised on a REAL stream: the same source
+    /// and recipe with the warp tools ON -- aomenc picks a global warp model
+    /// on this content (measured: the decode refuses at the first warped
+    /// block) -- is refused by name.
+    #[test]
+    fn a_12bit_warped_motion_stream_is_refused_by_name() {
+        const NAME: &str = "a_12bit_warped_motion_stream_is_refused_by_name";
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let y4m = y4m_12bit_subpel_source(6);
+        // Exactly the recipe measured to refuse at warp: warp ON, global
+        // motion NOT spelled (spelling it ON makes a GLOBAL_GLOBALMV
+        // compound block reach the compound refusal first), six frames --
+        // the warp model fires at the third frame.
+        let stream = encode_12bit(&y4m, 6, &["--enable-warped-motion=1"]);
+        let err = decode_stream(&stream).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)"
+            ),
+            "{NAME}: expected the 12-bit warp refusal, got: {err}"
+        );
+    }
+
+    /// The 12-bit COMPOUND witness (lane-av112bitc): the parent's source
+    /// and recipe with warp pinned OFF -- with six frames LAST diverges
+    /// from GOLDEN from frame 2 on and aomenc codes compound inter blocks
+    /// (pre-lift measurement: the decode refused at the compound mode
+    /// read). Two arms: the default recipe (dist-weighted average
+    /// combines live) and `--enable-dist-wtd-comp=0` (pushes compound AND
+    /// the masked choice harder: 6 diffwtd blends). Both byte-exact
+    /// against ffmpeg; each hard-asserts compound mode symbols and
+    /// masked-diffwtd blends really ran, so the parameterised combine
+    /// rounds (`INTER_POST_ROUND - delta`, diffwtd `+ (bd-8) - delta` at
+    /// 12 bits) and the ffmpeg-pinned pixel path genuinely executed.
+    #[test]
+    fn a_real_aomenc_12bit_compound_inter_sequence_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_12bit_compound_inter_sequence_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let y4m = y4m_12bit_subpel_source(6);
+        for (arm, extra) in [
+            ("dist-wtd", &["--enable-warped-motion=0"][..]),
+            ("plain-masked", &["--enable-warped-motion=0", "--enable-dist-wtd-comp=0"][..]),
+        ] {
+            let stream = encode_12bit(&y4m, 6, &extra);
+            assert_12bit_sequence_header(&stream, NAME);
+            let before_compound = decode::compound_mode_hits();
+            let before_masked = decode::masked_compound_hits();
+            let before_diffwtd = decode::diffwtd_hits();
+            let before_wedge = decode::wedge_hits();
+            let frames = decode_stream(&stream).unwrap_or_else(|e| {
+                panic!("{NAME} [{arm}]: decode_stream refused a real 12-bit compound stream: {e}")
+            });
+            assert_eq!(frames.len(), 6, "{NAME} [{arm}]: frame count");
+            let (comp, masked, diffwtd, wedge) = (
+                decode::compound_mode_hits() - before_compound,
+                decode::masked_compound_hits() - before_masked,
+                decode::diffwtd_hits() - before_diffwtd,
+                decode::wedge_hits() - before_wedge,
+            );
+            eprintln!(
+                "{NAME} [{arm}]: compound blocks={comp} masked={masked} diffwtd={diffwtd} wedge={wedge}"
+            );
+            assert!(comp > 0, "{NAME} [{arm}]: no compound mode symbol was read -- the compound path is unexercised");
+            assert!(masked > 0, "{NAME} [{arm}]: no masked compound block ran -- the masked combine is unexercised");
+            assert!(diffwtd > 0, "{NAME} [{arm}]: no diffwtd blend ran -- the diffwtd combine is unexercised");
+            let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 6);
+            for (i, (ours, reference)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(ours.y, reference.y, "{NAME} [{arm}] frame {i} luma vs ffmpeg");
+                assert_eq!(ours.u, reference.u, "{NAME} [{arm}] frame {i} U vs ffmpeg");
+                assert_eq!(ours.v, reference.v, "{NAME} [{arm}] frame {i} V vs ffmpeg");
+            }
+        }
+    }
+
+    /// The 12-bit film grain refusal: a real `--film-grain-test=1` stream
+    /// (grain params present AND applied) is refused by name at output.
+    #[test]
+    fn a_12bit_film_grain_stream_is_refused_by_name() {
+        const NAME: &str = "a_12bit_film_grain_stream_is_refused_by_name";
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let y4m = y4m_12bit_subpel_source(1);
+        let stream = encode_12bit(&y4m, 1, &["--film-grain-test=1"]);
+        let err = decode_stream(&stream).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "film grain synthesis at 12 bits (no byte-exact 12-bit grain witness exists: the 12-bit gates encode with grain off)"
+            ),
+            "{NAME}: expected the 12-bit grain refusal, got: {err}"
+        );
+    }
+
+    /// The 12-bit screen-content refusal: a real `--tune-content=screen
+    /// --enable-palette=1 --enable-intrabc=1` frame carries
+    /// `allow_screen_content_tools = 1` and is refused by name at the frame
+    /// gate -- palette and intrabc have no 12-bit witness.
+    #[test]
+    fn a_12bit_screen_content_stream_is_refused_by_name() {
+        const NAME: &str = "a_12bit_screen_content_stream_is_refused_by_name";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", "smptebars=s=128x128:r=25",
+                "-pix_fmt", "yuv420p12le", "-strict", "-1", "-frames:v", "2",
+                "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg failed to render the 12-bit screen fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let stream = encode_12bit(
+            &y4m.stdout,
+            1,
+            &["--tune-content=screen", "--enable-palette=1", "--enable-intrabc=1"],
+        );
+        let err = decode_stream(&stream).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)"
+            ),
+            "{NAME}: expected the 12-bit screen content refusal, got: {err}"
+        );
+    }
+
     #[test]
     fn a_real_aomenc_10bit_stream_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_10bit_stream_decodes_pixel_exact";
