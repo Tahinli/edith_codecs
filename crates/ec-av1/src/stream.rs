@@ -7147,12 +7147,11 @@ pub(crate) mod tests {
     /// oracle's own dump, so a stream that stopped engaging the shape fails
     /// the gate instead of passing vacuously (class `gate-blind-to-feature`).
     ///
-    /// The 10-bit arm rides along DECODE-ONLY: measured (hunt r2), aomenc
-    /// never engages the 128-strip intrabc shape at these recipes at 10 bit
-    /// (no 128-root HORZ/VERT partition is taken at all), so there is nothing
-    /// to assert there beyond "decodes without refusing and matches the
-    /// oracle" -- the per-depth firing assert would be vacuous, and this is
-    /// the known, printed coverage gap, not a silent pass.
+    /// The 10-bit arm engages the shape. Hunt r2 and the witness re-run both
+    /// measured `intrabc_128rect_hits` +15 on arm 3, so aomenc does take a
+    /// 128-root HORZ/VERT strip at 10 bit under this recipe. There is no
+    /// per-depth coverage gap to print. The gate's hard asserts already
+    /// cover that arm.
     ///
     /// The chroma context this shape reads was the r2 defect: per-unit chroma
     /// entropy states were stamped inside the mu-chunk loop, then the
