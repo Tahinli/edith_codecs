@@ -17255,6 +17255,7 @@ fn decode_leaf8(
         // 8x8 `mode` and reading its own fresh context off the earlier
         // units in this same leaf (the same per-TU pattern `decode_block`'s
         // multi-TU branch runs at bigger blocks).
+        let mut first_leaf_tx: Option<TxType> = None;
         for tu_row in 0..2 {
             for tu_col in 0..2 {
                 let tu_mi = (leaf_mi.0 + tu_row, leaf_mi.1 + tu_col);
@@ -17327,6 +17328,28 @@ fn decode_leaf8(
                     );
                 }
                 neighbours.record_mi_luma(tu_mi, 4, &tu_grid);
+                // The FIRST (top-left, co-located with this group's chroma)
+                // TU's coded tx_type is what the group's chroma inherits --
+                // the same capture [`decode_block`]'s multi-TU branch makes
+                // for `first_leaf_tx` (libaom `av1_get_tx_type`, blockd.h:
+                // an inter-classified block's `PLANE_TYPE_UV` reads
+                // `tx_type_map`, and intrabc is inter-classified).
+                if first_leaf_tx.is_none() {
+                    first_leaf_tx = Some(fctx.luma_tx_type.with(std::cell::Cell::get));
+                }
+            }
+        }
+        // lane-av1intrapred: an intrabc leaf whose var-tx tree split to
+        // TX_4X4 never armed [`INTRABC_CHROMA_TX`], so its chroma reads fell
+        // back to `default_intra_tx_type(DC_PRED)` = `DCT_DCT` and took the
+        // 2D scan, the 2D eob row and the 2D nz contexts where libaom takes
+        // the inherited luma type's (R5's first fork: mi (36,66), luma
+        // (0,0) coded `H_ADST` off the 16-symbol inter set, chroma U then
+        // decoded its `eob` from the wrong CDF row). Same arm the
+        // `resolved != 4` branch above runs for its whole-leaf unit.
+        if intrabc_dv.is_some() {
+            if let Some(t) = first_leaf_tx {
+                fctx.intrabc_chroma_tx.with(|c| c.set(Some(t)));
             }
         }
         let ac = alpha.map(|_| cfl_src(px, py, 8));
@@ -17381,6 +17404,15 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv, fctx,
         )?;
+        // The two chroma reads above are the only consulters of this leaf's
+        // armed [`INTRABC_CHROMA_TX`]; leaving it set would make the NEXT
+        // leaf's chroma inherit this leaf's luma type instead of its own
+        // derivation (class armed-slot-leak-into-next-leaf, seen live: the
+        // regular-intra leaf after an intrabc TX4 leaf took the intrabc
+        // luma's `V_ADST` for its chroma eob row).
+        if intrabc_dv.is_some() {
+            fctx.intrabc_chroma_tx.with(|c| c.set(None));
+        }
         // `record_split_luma` expects a `record`-style `(r, c)` position in
         // `SUB`-grid units and rescales it by `SUB / MI`; `leaf_mi` is
         // already in mi units, so calling it here double-scaled the
