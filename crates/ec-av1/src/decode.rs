@@ -3874,6 +3874,27 @@ pub fn intrabc_rect_vartx_hits() -> usize {
     INTRABC_RECT_VARTX_HITS.with(|c| c.get())
 }
 
+thread_local! {
+    /// lane-av1-ibcrect: `use_intrabc` blocks on a 128-root HORZ/VERT strip
+    /// (BLOCK_128X64 / BLOCK_64X128) whose reconstruction
+    /// [`decode_intrabc_128rect`] ran -- the shape the named refusal used to
+    /// guard (`decode_block_128rect`). A refused block bumps
+    /// [`INTRABC_HITS`] but never this one.
+    static INTRABC_128RECT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRABC_128RECT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_128rect_hits() -> usize {
+    INTRABC_128RECT_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`INTRABC_128RECT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_128rect_hits() {
+    INTRABC_128RECT_HITS.with(|c| c.set(0));
+}
+
 /// Current value of [`INTRABC_VARTX_HITS`].
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intrabc_vartx_hits() -> usize {
@@ -11602,6 +11623,447 @@ fn decode_intrabc_rect(
     Ok(())
 }
 
+/// lane-av1-ibcrect: reconstruction for a `use_intrabc` block on a 128-root
+/// HORZ/VERT strip (`BLOCK_128X64` / `BLOCK_64X128`) -- the shape
+/// `decode_block_128rect` refused by name before this port. libaom decodes
+/// such a block through the INTER machinery (an intrabc block
+/// `is_inter_block`): `predict_inter_block` copies the whole block from this
+/// frame's own reconstruction at the integer block vector once, then
+/// `decode_token_recon_block`'s inter arm walks 64x64 "mu" chunks --
+/// per chunk every plane, luma units at the block's own resolved transform
+/// (`read_block_tx_size_rect`, TX_64X64 roots) and chroma at
+/// `av1_get_max_uv_txsize(BLOCK_128X64)` = TX_32X32, one unit per plane per
+/// chunk at 4:2:0. Chroma never codes its own `tx_type`; each unit inherits
+/// the coded type of the luma leaf covering its quadrant (`av1_get_tx_type`,
+/// blockd.h:1291). `mode`/`uv_mode` read as `DC_PRED`/`UV_DC_PRED` back in
+/// [`read_intra_mode_rect`]; no palette/filter-intra/CFL symbol exists here.
+#[allow(clippy::too_many_arguments)]
+fn decode_intrabc_128rect(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    (bw, bh): (usize, usize),
+    skip: bool,
+    (dv_row, dv_col): (i32, i32),
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    base_q_idx: u8,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<()> {
+    hit!(INTRABC_128RECT_HITS);
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
+        let (rng, _) = dec.debug_state();
+        eprintln!(
+            "EC_IBC128 mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} skip={skip} dv=({dv_row},{dv_col}) rng={rng}"
+        );
+    }
+    let (px, py) = (mi_c * MI, mi_r * MI);
+    let (cpx, cpy) = (px / 2, py / 2);
+    let (cw, ch) = (bw / 2, bh / 2);
+    // The square strides the proven INTER path lays its residual grids,
+    // prediction windows and `TxParams` at (see [`decode_intrabc_rect`]'s r2
+    // note): 128/64 here.
+    let side = bw.max(bh);
+    let cside = cw.max(ch);
+    // `av1_calc_mi_size`'s 8-px-aligned grid: units past the frame edge code
+    // nothing (`decode_reconstruct_tx`'s max_blocks_* early return).
+    let mi_cols = 2 * y.true_width.div_ceil(8);
+    let mi_rows = 2 * y.true_height.div_ceil(8);
+    // An intrabc block is is_inter_block: the tx tree is the INTER one, and
+    // [`read_block_tx_size_rect`]'s 128-root branch already carries the
+    // LARGEST (no symbol, two TX_64X64 units), TX_MODE_SELECT (var-tx tree
+    // rooted at TX_64X64), skip (band stamp only) and lossless (TX_4X4 grid)
+    // arms (lane-sb128c r7).
+    let leaves = read_block_tx_size_rect(
+        dec,
+        cdfs,
+        neighbours,
+        (mi_r, mi_c),
+        (bw, bh),
+        (mi_cols, mi_rows),
+        skip, fctx,
+    )?;
+    // Whole-block prediction, once, before any coefficient is read
+    // (`predict_inter_block`); the source is this frame's own
+    // reconstruction, including the writes this superblock has queued.
+    flush_recon(fctx, y, u, v);
+    let mut pred_y_dense = vec![0u16; bw * bh];
+    mc::predict_with_filter(
+        &y.data, y.width, y.true_width, y.true_height,
+        mv_to_q4(px, dv_col, true), mv_to_q4(py, dv_row, true),
+        bw, bh, mc::InterpFilterKind::Bilinear, &mut pred_y_dense, fctx,
+    );
+    let mut pred_y = vec![0u16; side * side];
+    for row in 0..bh {
+        pred_y[row * side..][..bw].copy_from_slice(&pred_y_dense[row * bw..][..bw]);
+    }
+    let mut pred_u_dense = vec![0u16; cw * ch];
+    mc::predict_with_filter(
+        &u.data, u.width, u.true_width, u.true_height,
+        mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+        cw, ch, mc::InterpFilterKind::Bilinear, &mut pred_u_dense, fctx,
+    );
+    let mut pred_u = vec![0u16; cside * cside];
+    for row in 0..ch {
+        pred_u[row * cside..][..cw].copy_from_slice(&pred_u_dense[row * cw..][..cw]);
+    }
+    let mut pred_v_dense = vec![0u16; cw * ch];
+    mc::predict_with_filter(
+        &v.data, v.width, v.true_width, v.true_height,
+        mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+        cw, ch, mc::InterpFilterKind::Bilinear, &mut pred_v_dense, fctx,
+    );
+    let mut pred_v = vec![0u16; cside * cside];
+    for row in 0..ch {
+        pred_v[row * cside..][..cw].copy_from_slice(&pred_v_dense[row * cw..][..cw]);
+    }
+    let (luma_grid, u_grid, v_grid);
+    // lane-av1-ibcrect: whether the coded arm stamped its CHROMA neighbour
+    // contexts per transform unit -- the replay after this fn's end-of-block
+    // record restores them (the record itself re-stamps both planes with ONE
+    // composed state, class `override-slot-on-one-arm`).
+    let mut mu_chroma = false;
+    if skip {
+        // No residual syntax at all: the prediction IS the block. Strides are
+        // `side`/`cside`, not `bw` -- `reconstruct_mc_rect` indexes
+        // `row * stride + w` for row in 0..h (the r5 VERT-strip overrun).
+        push_mc_rect(0, px, py, side, bw, bh, Pred::Inline(&pred_y, side), &ZERO_RESIDUAL[..side * side], fctx);
+        push_mc_rect(1, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_u, cside), &ZERO_RESIDUAL[..cside * cside], fctx);
+        push_mc_rect(2, cpx, cpy, cside, cw, ch, Pred::Inline(&pred_v, cside), &ZERO_RESIDUAL[..cside * cside], fctx);
+        if let Some(ls) = leaves.as_ref() {
+            // A LOSSLESS frame's `read_block_tx_size_rect` resolves the TX_4X4
+            // grid before it looks at `skip`; the skipped block still zeroes
+            // its entropy-band footprint over every unit (libaom
+            // `av1_reset_entropy_context` under `if (mbmi->skip_txfm)`) --
+            // the same arm [`decode_intrabc_rect`]'s loss64 merge added.
+            hit!(SKIP_LOSSLESS_BAND_RESET_HITS);
+            for &(row, col, tw, th) in ls {
+                neighbours.record_mi_luma_rect(
+                    (mi_r + row, mi_c + col),
+                    tw,
+                    th,
+                    &ZERO_RESIDUAL[..tw * th],
+                );
+            }
+        }
+        luma_grid = Grid::Zero(side * side);
+        u_grid = Grid::Zero(cside * cside);
+        v_grid = Grid::Zero(cside * cside);
+    } else {
+        let leaves = leaves.expect(
+            "read_block_tx_size_rect returns None only for skip below 128 at this shape",
+        );
+        // libaom `get_transform_size`'s split override applies to LUMA only,
+        // per leaf -- each unit's own transform edges get filtered
+        // ([`decode_intrabc_rect`]'s P2, the proven inter path's step).
+        for &(row, col, tw, th) in leaves.iter() {
+            neighbours.fill_lf_grid_leaf_luma(
+                (mi_r + row, mi_c + col),
+                tw / MI,
+                th / MI,
+                tw as u8,
+                th as u8,
+            );
+        }
+        let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
+        let mut u_units: Vec<i32> = Vec::new();
+        let mut v_units: Vec<i32> = Vec::new();
+        let mut leaf_tx_types: Vec<(usize, usize, usize, usize, TxType)> = Vec::new();
+        // Frame-edge clip of the mu walk (`max_block_wide/high`): a unit whose
+        // top-left sample is outside the frame codes nothing.
+        let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(mi_c));
+        let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(mi_r));
+        for (idx, &(row, col, tw, th)) in leaves.iter().enumerate() {
+            debug_assert_eq!(tw, th, "a square TX_64X64 tree root only yields square leaves");
+            let tu_mi = (mi_r + row, mi_c + col);
+            let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+            if tu_px >= y.true_width || tu_py >= y.true_height {
+                continue;
+            }
+            let tu_pred = Pred::Inline(&pred_y, side).offset(row * MI * side + col * MI);
+            let scan = default_scan(tw.min(32));
+            let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tw / MI);
+            let (tu_grid, tu_tx_type) = read_inter_plane(
+                dec,
+                cdfs,
+                inter_txbset_for(tw, reduced),
+                &scan,
+                0,
+                neighbours.around_mi(tu_mi, tw)[0],
+                0,
+                y,
+                tu_px,
+                tu_py,
+                tw,
+                base_q_idx,
+                tu_pred,
+                None,
+                Some(tu_skip_ctx), fctx,
+            )?;
+            leaf_tx_types.push((row, col, tw, th, tu_tx_type));
+            neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
+            // libaom `decode_token_recon_block` codes EVERY PLANE of a 64x64
+            // mu chunk before the next one starts: once this chunk's leaves
+            // are done, its chroma is read immediately (the inter 128 path's
+            // interleave).
+            let chunk = (row / 16, col / 16);
+            let done = idx + 1 == leaves.len()
+                || (leaves[idx + 1].0 / 16, leaves[idx + 1].1 / 16) != chunk;
+            if done {
+                let (cr, cc) = chunk;
+                // `av1_get_max_uv_txsize(BLOCK_128X64)` = TX_32X32: one
+                // TX_32X32 chroma unit per plane per chunk at 4:2:0, raster
+                // within the chunk, plane-major inside the chunk.
+                let cu_tx = 32usize;
+                let chunk_chroma = cside * 64 / side;
+                let unit_luma = cu_tx * (side / cside);
+                let chunk_w_mi = 16.min(max_w_mi.saturating_sub(cc * 16));
+                let chunk_h_mi = 16.min(max_h_mi.saturating_sub(cr * 16));
+                let units_x = chunk_w_mi / (unit_luma / MI);
+                let units_y = chunk_h_mi / (unit_luma / MI);
+                if lossless(fctx) {
+                    // TX_4X4 chroma units over this chunk (lane-lossless2's
+                    // walk, shared with the inter 128 path).
+                    read_inter_chroma_lossless(
+                        dec, cdfs, neighbours, u, v,
+                        Pred::Inline(&pred_u, cside), Pred::Inline(&pred_v, cside),
+                        (mi_r, mi_c), (cpx, cpy),
+                        (cc * chunk_chroma, cr * chunk_chroma),
+                        (chunk_chroma, chunk_chroma),
+                        (cw, ch),
+                        cside, 0, base_q_idx,
+                        &mut u_units, &mut v_units, fctx,
+                    )?;
+                    // lane-av1-ibcrect: read_inter_chroma_lossless stamped
+                    // every TX_4X4 unit's own context (`record_mi_chroma`
+                    // inside the walk) -- the end-of-block record below must
+                    // not overwrite them with the composed grid (the inter
+                    // 128 path sets the same flag on this arm).
+                    mu_chroma = true;
+                    continue;
+                }
+                let cu_scan = default_scan(cu_tx);
+                for plane_idx in 1..3 {
+                    let (src, buf) = if plane_idx == 1 {
+                        (Pred::Inline(&pred_u, cside), &mut *u)
+                    } else {
+                        (Pred::Inline(&pred_v, cside), &mut *v)
+                    };
+                    for ur in 0..units_y {
+                        for uc in 0..units_x {
+                            let unit_mi = (
+                                mi_r + cr * 16 + ur * (unit_luma / MI),
+                                mi_c + cc * 16 + uc * (unit_luma / MI),
+                            );
+                            // Per unit, AFTER the earlier units' stamps: this
+                            // unit's coefficient context must see them.
+                            let cu_around = neighbours.around_mi(unit_mi, unit_luma);
+                            if crate::envflags::env_flag!("EC_ECDUMP") {
+                                for p in 1..3 {
+                                    let ab: Vec<String> = (0..unit_luma / MI)
+                                        .map(|k| {
+                                            format!(
+                                                "{:?}/{}",
+                                                neighbours.above[unit_mi.1 + k][p].dc,
+                                                neighbours.above[unit_mi.1 + k][p].level
+                                            )
+                                        })
+                                        .collect();
+                                    let lf: Vec<String> = (0..unit_luma / MI)
+                                        .map(|k| {
+                                            format!(
+                                                "{:?}/{}",
+                                                neighbours.left[unit_mi.0 + k][p].dc,
+                                                neighbours.left[unit_mi.0 + k][p].level
+                                            )
+                                        })
+                                        .collect();
+                                    eprintln!(
+                                        "EC_IBC128_BANDS mi=({mi_r},{mi_c}) unit=({cr},{cc}) plane={p} ctx=({},{},{}) above=[{}] left=[{}]",
+                                        cu_around[p].0, cu_around[p].1, cu_around[p].2, ab.join(","), lf.join(",")
+                                    );
+                                }
+                            }
+                            let (cu_x, cu_y) = (
+                                cpx + cc * chunk_chroma + uc * cu_tx,
+                                cpy + cr * chunk_chroma + ur * cu_tx,
+                            );
+                            // `av1_get_tx_type` (blockd.h:1291): an inter
+                            // block's chroma unit never codes a tx_type; it
+                            // inherits the coded type of the luma leaf
+                            // covering its own quadrant (all of this chunk's
+                            // leaves are read by now).
+                            let unit_rel_mi = (
+                                unit_mi.0 - mi_r,
+                                unit_mi.1 - mi_c,
+                            );
+                            let covering = leaf_tx_types
+                                .iter()
+                                .copied()
+                                .find(|&(lr, lc, lw, lh, _)| {
+                                    lr <= unit_rel_mi.0
+                                        && unit_rel_mi.0 < lr + lh / MI
+                                        && lc <= unit_rel_mi.1
+                                        && unit_rel_mi.1 < lc + lw / MI
+                                })
+                                .map(|(_, _, _, _, t)| t);
+                            let cu_pred = src.offset(
+                                (cr * chunk_chroma + ur * cu_tx) * cside
+                                    + cc * chunk_chroma
+                                    + uc * cu_tx,
+                            );
+                            let cu_grid = read_inter_plane(
+                                dec,
+                                cdfs,
+                                TxbSet::Chroma32,
+                                &cu_scan,
+                                plane_idx,
+                                cu_around[plane_idx],
+                                0,
+                                buf,
+                                cu_x,
+                                cu_y,
+                                cu_tx,
+                                base_q_idx,
+                                cu_pred,
+                                Some(covering.unwrap_or(TxType::DctDct)),
+                                Some(3), fctx,
+                            )?
+                            .0;
+                            // Immediately, so the NEXT unit reads this one's
+                            // coefficient context.
+                            neighbours.record_mi_chroma(
+                                unit_mi,
+                                unit_luma,
+                                unit_luma,
+                                plane_idx,
+                                &cu_grid,
+                            );
+                            if crate::envflags::env_flag!("EC_ECDUMP") {
+                                let st = crate::decode::neighbour_state(&cu_grid);
+                                eprintln!(
+                                    "EC_IBC128_STAMP mi=({mi_r},{mi_c}) unit=({cr},{cc}) plane={plane_idx} state=({:?},{})",
+                                    st.dc, st.level
+                                );
+                            }
+                            hit!(CHROMA_SPLIT_TX_HITS);
+                            // lane-av1-ibcrect: per-unit chroma context -- the
+                            // end-of-block record's composed-grid re-stamp
+                            // must not stand (replayed below).
+                            mu_chroma = true;
+                            let dst = mu_units(
+                                if plane_idx == 1 { &mut u_units } else { &mut v_units },
+                                cside * cside,
+                            );
+                            for rr in 0..cu_tx {
+                                let start = (cr * chunk_chroma + ur * cu_tx + rr)
+                                    * cside
+                                    + cc * chunk_chroma
+                                    + uc * cu_tx;
+                                dst[start..start + cu_tx]
+                                    .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The block-level luma bands were recorded per leaf above; the
+        // composed chroma grids carry every unit in place.
+        luma_grid = Grid::Zero(side * side);
+        u_grid = if u_units.is_empty() {
+            Grid::Zero(cside * cside)
+        } else {
+            Grid::Own(std::mem::take(&mut u_units))
+        };
+        v_grid = if v_units.is_empty() {
+            Grid::Zero(cside * cside)
+        } else {
+            Grid::Own(std::mem::take(&mut v_units))
+        };
+    }
+    // Bookkeeping (see [`decode_intrabc_rect`]): DC_PRED everywhere a
+    // neighbour reads a mode, zeroed palette state, the skip grid, the
+    // TXFM_CONTEXT bands (`read_block_tx_size_rect` already stamped them),
+    // and the DV into the intrabc mi grid.
+    if skip {
+        neighbours.record_rect_mi(
+            (mi_r, mi_c), bw, bh, DC_PRED, DC_PRED,
+            &[&luma_grid[..], &u_grid[..], &v_grid[..]],
+        );
+    } else {
+        neighbours.record_split_luma_rect_mi(
+            (mi_r, mi_c), bw, bh, DC_PRED, DC_PRED, [&u_grid[..], &v_grid[..]],
+        );
+    }
+    // lane-av1-ibcrect: the coded arm's chroma contexts were stamped PER
+    // TRANSFORM UNIT (libaom `av1_set_entropy_contexts` inside
+    // `decode_reconstruct_tx`'s mu-chunk loop), but the record above re-stamps
+    // both planes with ONE `neighbour_state(composed_grid)` over the whole
+    // span -- level = the SUM of every unit's levels and dc = the top-left
+    // unit's sign (lane-vert46 r1 measured the same smearing at the 64x128
+    // inter block: the next block read a stale `dc_sign_ctx` one row low).
+    // Measured on this shape: the 128x64 block at mi(64,32) of the
+    // `ibcrect-hunt/E2` sb128 screen stream left chunk-1 U's level 1 smeared
+    // into chunk-0's cells and the block below read `txb_skip` off the sum.
+    // Replay every coded unit's own state after the record, in mu-chunk order
+    // so a later unit still wins over an earlier one on the shared seam cells
+    // (the composed construction `mu_chroma_units` uses, transcribed here).
+    if mu_chroma {
+        let cu = if lossless(fctx) { 4usize } else { 32usize };
+        // The unit's own footprint on the LUMA mi grid (the chroma context
+        // bands are luma-mi indexed, [`Self::record_mi_chroma`]'s
+        // convention): 8 px x2 per TX_4X4 unit, 64 px per TX_32X32 one.
+        let unit_luma = cu * 2;
+        // Raster over the block's chroma plane, `chunk_chroma` per mu chunk
+        // (the same extents the read loop above laid the composed grid out
+        // at) -- a unit the frame edge clipped codes nothing and carries no
+        // composed samples beyond the clip, so it replays as the zero state
+        // exactly like libaom's uncoded unit.
+        let chunk_chroma = cside * 64 / side;
+        let (rows, cols) = ((ch / chunk_chroma).max(1), (cw / chunk_chroma).max(1));
+        for cr in 0..rows {
+            for cc in 0..cols {
+                let unit_mi = (mi_r + cr * (unit_luma / MI), mi_c + cc * (unit_luma / MI));
+                for (plane_idx, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
+                    let mut unit = Vec::with_capacity(cu * cu);
+                    for rr in 0..cu {
+                        let start =
+                            (cr * chunk_chroma + rr) * cside + cc * chunk_chroma;
+                        unit.extend_from_slice(&grid[start..start + cu]);
+                    }
+                    neighbours.record_mi_chroma(
+                        unit_mi, unit_luma, unit_luma, plane_idx, &unit,
+                    );
+                }
+            }
+        }
+    }
+    neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
+    neighbours.fill_lf_grid_rect(
+        (mi_r, mi_c),
+        bw / MI,
+        bh / MI,
+        bw.min(64) as u8,
+        bh.min(64) as u8,
+        0, fctx,
+    );
+    record_intrabc_mi_rect(
+        mi_r,
+        mi_c,
+        bw / MI,
+        bh / MI,
+        Some((dv_row, dv_col)),
+        neighbours,
+        fctx,
+    );
+    Ok(())
+}
+
 /// Decodes one true `bw`x`bh` `PARTITION_HORZ`/`PARTITION_VERT` intra strip
 /// (lane-intradisp r1, spec `decode_block` restricted to a 32x32 quadrant's
 /// two rect children). Only the `skip` case is supported: `skip`/`y_mode`/
@@ -16798,10 +17260,24 @@ fn decode_block_128rect(
             mi_r,
             mi_c, fctx,
         )?;
-    if intrabc.is_some() {
-        return Err(unsupported(
-            "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
-        ));
+    if let Some((dv_row, dv_col)) = intrabc {
+        // lane-av1-ibcrect: the reconstruction is ported -- an intrabc block
+        // is is_inter_block, so libaom predicts the whole 128x64/64x128 strip
+        // from this frame's own reconstruction and runs the INTER residual
+        // walk (`decode_token_recon_block`'s else arm) over it.
+        return decode_intrabc_128rect(
+            dec,
+            cdfs,
+            neighbours,
+            (mi_r, mi_c),
+            (bw, bh),
+            skip,
+            (dv_row, dv_col),
+            y,
+            u,
+            v,
+            base_q_idx, fctx,
+        );
     }
     if alpha.is_some() || filter_intra.is_some() || palette_y.is_some() || palette_uv.is_some() {
         return Err(unsupported(

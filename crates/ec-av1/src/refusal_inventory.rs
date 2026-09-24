@@ -69,7 +69,15 @@ const REFUSALS: &[&str] = &[
     // reader a real ctx/cache pair, so no stream could reach either (audit
     // `every_read_intra_mode_call_site_hands_the_reader_a_palette_cache`,
     // which keeps that invariant now the refusal is gone).
-    "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
+    // lane-av1-ibcrect: `intra block copy on a HORZ/VERT/1:4 rect intra strip
+    // (reconstruction is not ported at this shape)` is GONE -- lane-av1-intrabc
+    // and lane-av1-rect14 reconstructed the 16x16/32x32-level strips, and this
+    // lane ported the last site, `decode_block_128rect`'s 128-root HORZ/VERT
+    // strip (`decode_intrabc_128rect`; a 128 root has no 1:4 arm at all).
+    // Witness:
+    // `an_sb128_rect_strip_with_intrabc_decodes_pixel_exact` (real aomenc
+    // sb128 screen streams coding `use_intrabc` on BLOCK_128X64 strips,
+    // pixel-exact vs ffmpeg).
     // lane-av1txr: `a sub-8x8 leaf that uses intrabc (…)` is GONE -- the
     // capability landed in this lane (4x4 / 4x8 / 8x4 intrabc leaves read the
     // DV and reconstruct a frame copy + the INTER residual; gates
@@ -397,15 +405,12 @@ const PROVEN: &[(&str, &str)] = &[
         "a frame using quantisation matrices (using_qmatrix=1): dequantisation here is base_q_idx plus the plane DC/AC deltas only, so qm_y/qm_u/qm_v would be ignored and the frame would decode silently wrong pixels",
         "a_frame_using_quantisation_matrices_is_refused_by_name",
     ),
-    // lane-av1-rect14: the 16x16- and 32x32-level strips are reconstructed
-    // (`decode_intrabc_rect` / `decode_intrabc_pair_strip`). The string remains
-    // only in `decode_block_128rect`. No sb128 screen recipe in this lane
-    // reached that arm (256x192 cq50 sb128 decoded without entering it), so
-    // the pairing still names the rect-strip gate, which no longer refuses.
-    (
-        "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
-        "a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips",
-    ),
+    // lane-av1-ibcrect: the pairing for "intra block copy on a HORZ/VERT/1:4
+    // rect intra strip (reconstruction is not ported at this shape)" is GONE
+    // with the string -- lane-av1-intrabc/rect14 reconstructed the
+    // 16x16/32x32-level strips and this lane ported the last site,
+    // `decode_block_128rect`'s 128-root strip. Witness:
+    // `an_sb128_rect_strip_with_intrabc_decodes_pixel_exact`.
     // lane-t900 r26, enumeration: a y_mode symbol comes from a 13-symbol CDF
     // and all three guards refuse 13 and above.
     (
