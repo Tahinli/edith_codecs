@@ -10031,6 +10031,15 @@ fn decode_rect_split(
     // next block then read `dc_sign_ctx` 1 where libaom reads 0). They are
     // collected here and replayed after that record.
     let mut ll_chroma_units: Vec<((usize, usize), usize, Grid)> = Vec::new();
+    // The chroma_tiled arm below stamps each unit's coefficient context
+    // immediately (so the NEXT unit reads it), then the whole-strip
+    // `record_split_luma_rect_mi` rewrites every chroma cell with ONE
+    // whole-strip state and the per-unit DC signs and levels are lost
+    // (class `override-slot-on-one-arm`). The units are collected here and
+    // replayed after that record, the way the lossless arm's
+    // `ll_chroma_units` and `decode_inter_block`'s `mu_chroma_units` tail
+    // already do.
+    let mut tiled_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = Vec::new();
     let ac = m.alpha.map(|_| cfl_src_rect(px, py, bw, bh));
     let reach = block_reach;
     let (u_grid, v_grid) = if mono(fctx) {
@@ -10179,6 +10188,13 @@ fn decode_rect_split(
                         levels
                     };
                     neighbours.record_mi_chroma(cu_mi, luma_span_x, luma_span_y, plane_idx, &levels);
+                    tiled_chroma_units.push((
+                        cu_mi,
+                        plane_idx,
+                        levels.clone(),
+                        luma_span_x,
+                        luma_span_y,
+                    ));
                     last[plane_idx - 1] = levels;
                 }
             }
@@ -10269,6 +10285,9 @@ fn decode_rect_split(
     );
     for (cu_mi, plane, unit) in &ll_chroma_units {
         neighbours.record_mi_chroma(*cu_mi, 8, 8, *plane, unit);
+    }
+    for (cu_mi, plane, unit, span_w, span_h) in &tiled_chroma_units {
+        neighbours.record_mi_chroma(*cu_mi, *span_w, *span_h, *plane, unit);
     }
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, m.skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0, fctx);
@@ -13320,6 +13339,13 @@ fn decode_block_rect64(
         let bigger = nw * nh > 1;
         let mut u_levels = vec![0i32; chroma_w * chroma_h];
         let mut v_levels = vec![0i32; chroma_w * chroma_h];
+        // The tiled units below stamp their own coefficient context
+        // immediately, then the whole-strip `record_rect` rewrite paints
+        // every chroma cell with ONE whole-strip state and the per-unit DC
+        // signs and levels are lost (class `override-slot-on-one-arm`, same
+        // shape as `decode_rect_split`'s chroma_tiled clobber). Collected
+        // here and replayed after that record, the c8 `mu_chroma_units` way.
+        let mut tiled_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = Vec::new();
         for plane_idx in 1..=2 {
             for cu_row in 0..nh {
                 for cu_col in 0..nw {
@@ -13387,11 +13413,24 @@ fn decode_block_rect64(
                             (mi_r + cu_row * (lsy / MI), mi_c + cu_col * (lsx / MI)),
                             lsx, lsy, plane_idx, &levels,
                         );
+                        tiled_chroma_units.push((
+                            (mi_r + cu_row * (lsy / MI), mi_c + cu_col * (lsx / MI)),
+                            plane_idx,
+                            levels.clone(),
+                            lsx,
+                            lsy,
+                        ));
                     }
                 }
             }
         }
                 neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[&luma_levels[..], &u_levels[..], &v_levels[..]]);
+        // The per-unit re-stamp: `record_rect` above wrote the whole strip's
+        // chroma cells from the assembled grids' one whole-strip state,
+        // overwriting exactly the stamps the tiled loop just made.
+        for (cu_mi, plane, unit, span_w, span_h) in &tiled_chroma_units {
+            neighbours.record_mi_chroma(*cu_mi, *span_w, *span_h, *plane, unit);
+        }
         hit!(RECT_COEFF_HITS);
     }
     let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
@@ -19704,12 +19743,19 @@ fn read_inter_rect_chroma(
     mode_for_tx: usize,
     luma_tx_type: TxType,
     fctx: &crate::decode::FrameCtx,
-) -> Result<(Grid, Grid)> {
+) -> Result<(Grid, Grid, Vec<((usize, usize), usize, Grid, usize, usize)>)> {
     let (uw, uh) = (write_chroma_w.min(32), write_chroma_h.min(32));
     let (nx, ny) = (write_chroma_w / uw, write_chroma_h / uh);
     let multi = nx * ny > 1;
     let set = rect_inter_chroma_set(uw, uh)?;
     let mut assembled: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+    // The multi-unit stamps below are rewritten by the caller's whole-block
+    // record (`record_rect_mi`/`record_split_luma_rect_mi` write ONE
+    // whole-block chroma state, class `override-slot-on-one-arm`). The
+    // block tail's square-mu derivation cannot express a non-square strip's
+    // units, so the TRUE units travel back for the tail's `mu_chroma_units`
+    // replay (the c8 re-stamp, at the strip's own tiling).
+    let mut units: Vec<((usize, usize), usize, Grid, usize, usize)> = Vec::new();
     if multi {
         hit!(CHROMA_SPLIT_TX_HITS);
         assembled = [
@@ -19760,6 +19806,7 @@ fn read_inter_rect_chroma(
                         let start = (cu_row * uh + rr) * chroma_side + cu_col * uw;
                         dst[start..start + uw].copy_from_slice(&cu_grid[rr * uw..][..uw]);
                     }
+                    units.push((cu_mi, plane_idx, cu_grid, span_x, span_y));
                 } else {
                     assembled[plane_idx - 1] = embed_rect_grid(&cu_grid, uw, uh, chroma_side);
                 }
@@ -19767,7 +19814,7 @@ fn read_inter_rect_chroma(
         }
     }
     let [ug, vg] = assembled;
-    Ok((Grid::Own(ug), Grid::Own(vg)))
+    Ok((Grid::Own(ug), Grid::Own(vg), units))
 }
 
 /// [`read_inter_plane`] for a rectangular transform unit (lane-inter4 r2):
@@ -28297,6 +28344,12 @@ fn decode_inter_block(
     let mode_for_tx;
     let uv_predict_mode;
     let (luma_grid, u_grid, v_grid);
+    // The rect_tu arms' chroma helper returns its TRUE per-unit coefficient
+    // context stamps (see `read_inter_rect_chroma`); they are appended to
+    // `mu_chroma_units` below so the block tail replays them after the
+    // whole-block record. `mu_chroma`'s own square-mu derivation cannot
+    // express a non-square strip's units.
+    let mut rect_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = Vec::new();
     let block_filter;
     let ref_frame_for_lf;
     let globalmv_for_lf;
@@ -29510,7 +29563,7 @@ fn decode_inter_block(
                 } else if rect_tu {
                     // One chroma read for the whole strip at 4:2:0, two
                     // 32-capped units at 4:4:4 -- see the helper.
-                    (u_grid, v_grid) = read_inter_rect_chroma(
+                    (u_grid, v_grid, rect_chroma_units) = read_inter_rect_chroma(
                         dec,
                         cdfs,
                         neighbours,
@@ -30893,7 +30946,7 @@ fn decode_inter_block(
                 } else if rect_tu {
                     // One chroma read for the whole strip at 4:2:0, two
                     // 32-capped units at 4:4:4 -- see the helper.
-                    (u_grid, v_grid) = read_inter_rect_chroma(
+                    (u_grid, v_grid, rect_chroma_units) = read_inter_rect_chroma(
                         dec,
                         cdfs,
                         neighbours,
@@ -31795,7 +31848,7 @@ fn decode_inter_block(
     // the partial right superblock read row 1 where libaom reads row 2). The
     // units are collected here and re-stamped after that record, in mu-chunk
     // order so a later unit still wins over an earlier one.
-    let mu_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = if mu_chroma {
+    let mut mu_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = if mu_chroma {
         // lane-lossless2: the unit is TX_32X32 (one per 64x64 mu chunk)
         // normally and TX_4X4 on a lossless frame, where the whole chroma
         // plane block is a raster of them.
@@ -31860,6 +31913,9 @@ fn decode_inter_block(
     } else {
         Vec::new()
     };
+    // The rect_tu strips' true units (`read_inter_rect_chroma`'s return):
+    // replayed by the same loop below, after the whole-block record.
+    mu_chroma_units.extend(rect_chroma_units);
     // libaom `av1_reset_entropy_context` / `av1_set_entropy_contexts`:
     // `nplanes = 1 + (num_planes - 1) * xd->is_chroma_ref` -- a block that is
     // NOT the chroma reference of its 4:2:0 pair codes no chroma transform at
@@ -32609,7 +32665,20 @@ fn decode_inter_sub8_split4(
     // block's `get_intra_edge_filter_type` must see that SMOOTH_H left
     // neighbour, not the DC_PRED this stamp used to paint over it). So the
     // group-level stamp runs only where the 4:2:0 group unit is real.
-    if !chroma_444 {
+    //
+    // 4:2:0 "real" means the group unit was painted by the INTER arm below:
+    // when the chroma-reference sub-block was INTRA, that leaf's own tail
+    // ([`decode_intra_sub8_leaf`]) already recorded the group cell with its
+    // real `uv_predict_mode` -- possibly a SMOOTH mode the next block's
+    // chroma edge filter must see. The 444 delta's unconditional
+    // `!chroma_444` stamp ran after it and painted DC over the mi-exact
+    // cell, so every later chroma block read `intra_edge_filter_type` 0
+    // where libaom (and the pre-delta tree) read 1 -- 188 chroma ops of the
+    // gm_small_side witness flipped their smooth flag and 10-bit film
+    // frames mismatched ffmpeg by +-1..7 (class
+    // `override-slot-on-one-arm`, this lane's own 10-bit film gate
+    // regression at 1ad7e0fc; port of lane-av1-cfl's 7c6dad53).
+    if !chroma_444 && !intra_chroma {
         neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
     }
     // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
@@ -33884,7 +33953,15 @@ fn decode_inter_sub8_rect2(
     // over an intra piece's real `uv_mode` and the next block's
     // `get_intra_edge_filter_type` lost the smooth neighbour (same class as
     // [`decode_inter_sub8_split4`]'s tail, frame 19 of the fixture).
-    if !chroma_444 {
+    // 4:2:0 needs the same second half as the split twin: the stamp must run
+    // only when the group unit was painted by the INTER arm below. When the
+    // chroma-reference sub-block was INTRA, its own
+    // [`decode_intra_sub8_leaf`] tail recorded the group cell with the real
+    // `uv_predict_mode`, and this DC stamp ran after it and flattened the
+    // mi-exact cell (class `override-slot-on-one-arm`, this lane's own
+    // 10-bit film gate regression at 1ad7e0fc; port of lane-av1-cfl's
+    // 7c6dad53).
+    if !chroma_444 && !intra_chroma {
         neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
     }
     // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
