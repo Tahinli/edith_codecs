@@ -28062,7 +28062,7 @@ pub(crate) mod tests {
     /// `av1_get_max_uv_txsize(BLOCK_128X128)` = `TX_32X32`), each unit read
     /// at its own origin against its own entropy-cell span and stamped
     /// immediately (`av1_set_entropy_contexts`). The census asserts the walk
-    /// actually ran (two units per plane per coded 128-none block); the key
+    /// actually ran (four units per plane per coded 128-none block); the key
     /// frame splits to 64x64 (detailed testsrc2 content), so the whole
     /// stream stays inside the 4:2:0 paths this tree decodes. The 4:4:4 twin
     /// of this shape (FOUR TX_32X32 units per chunk per plane) is witnessed
@@ -28182,7 +28182,7 @@ pub(crate) mod tests {
         assert!(
             chroma_units >= 8 * 8,
             "{NAME}: only {chroma_units} mu-chunk chroma units read -- the per-unit walk this \
-             gate names never fired (two units per plane per coded 128-none inter block)"
+             gate names never fired (four units per plane per coded 128-none inter block)"
         );
         eprintln!(
             "{NAME}: {frames} decode-order frames pixel-exact ({hidden} hidden), \
