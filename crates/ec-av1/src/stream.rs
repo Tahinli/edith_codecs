@@ -8619,31 +8619,68 @@ pub(crate) mod tests {
         }
     }
 
-    /// The 12-bit warp refusal, exercised on a REAL stream: the same source
-    /// and recipe with the warp tools ON -- aomenc picks a global warp model
-    /// on this content (measured: the decode refuses at the first warped
-    /// block) -- is refused by name.
+    /// The 12-bit WARP witness (lane-av112bitw): the same source and recipe
+    /// with the warp tools ON -- aomenc picks warp models on this content
+    /// (measured pre-lift: the warp model fires at the third frame, and the
+    /// decode refused by name at exactly that block) -- now decodes
+    /// BYTE-EXACT against ffmpeg. The warp filter's shifts are the bumped
+    /// `conv_params->round_0` (`warp::warp_round_0`, 5 at 12 bits, feeding
+    /// `reduce_bits_horiz`, the derived non-compound
+    /// `reduce_bits_vert = 2*FILTER_BITS - round_0` and both `offset_bits`),
+    /// the whole libaom `get_conv_params_no_round` 12-bit bump.
+    ///
+    /// Non-vacuous: the same recipe refused by name before the lift, the
+    /// gate hard-asserts a warp predictor was really resolved (a warpless
+    /// stream would pass the pixel compare and prove nothing), and every
+    /// plane of every frame compares against ffmpeg's decode.
     #[test]
-    fn a_12bit_warped_motion_stream_is_refused_by_name() {
-        const NAME: &str = "a_12bit_warped_motion_stream_is_refused_by_name";
+    fn a_12bit_warped_motion_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_12bit_warped_motion_stream_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
         if !have_aomenc() {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
         let y4m = y4m_12bit_subpel_source(6);
-        // Exactly the recipe measured to refuse at warp: warp ON, global
-        // motion NOT spelled (spelling it ON makes a GLOBAL_GLOBALMV
-        // compound block reach the compound refusal first), six frames --
-        // the warp model fires at the third frame.
+        // Exactly the recipe measured to refuse at warp pre-lift: warp ON,
+        // global motion NOT spelled (spelling it ON drives a GLOBAL_GLOBALMV
+        // compound block into the compound-warp arm -- see the compound gate
+        // below), six frames -- the warp model fires at the third frame.
         let stream = encode_12bit(&y4m, 6, &["--enable-warped-motion=1"]);
-        let err = decode_stream(&stream).unwrap_err().to_string();
-        assert!(
-            err.contains(
-                "warped motion at 12 bits (warp's reduce bits inherit the 12-bit round_0 and no 12-bit warp witness exists)"
-            ),
-            "{NAME}: expected the 12-bit warp refusal, got: {err}"
+        assert_12bit_sequence_header(&stream, NAME);
+        let (before_selected, before_warp8, before_affine) = (
+            decode::warp_selected_hits(),
+            decode::warp_hits_8(),
+            decode::affine_gm_hits(),
         );
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: decode_stream refused a real 12-bit warp stream: {e}")
+        });
+        assert_eq!(frames.len(), 6);
+        let (delta_selected, delta_warp8, delta_affine) = (
+            decode::warp_selected_hits() - before_selected,
+            decode::warp_hits_8() - before_warp8,
+            decode::affine_gm_hits() - before_affine,
+        );
+        eprintln!(
+            "{NAME}: warp_engagement selected(16x16+ symbol)={delta_selected} \
+             warped8(usable 8x8 model)={delta_warp8} affine_gm(6-param model)={delta_affine}"
+        );
+        assert!(
+            delta_selected + delta_warp8 + delta_affine > 0,
+            "{NAME}: no warp predictor was resolved -- the stream carries no \
+             warp model and the pixel compare would prove nothing"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 6);
+        for (i, (ours, reference)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, reference.y, "frame {i} luma vs ffmpeg (12-bit warp)");
+            assert_eq!(ours.u, reference.u, "frame {i} U vs ffmpeg (12-bit warp)");
+            assert_eq!(ours.v, reference.v, "frame {i} V vs ffmpeg (12-bit warp)");
+        }
     }
 
     /// The 12-bit COMPOUND witness (lane-av112bitc): the parent's source
@@ -21833,12 +21870,13 @@ pub(crate) mod tests {
     /// `mc::predict_compound_intermediate`. `compound_warp_hits() > 0` is a
     /// hard assert: a run where the encoder never emitted one proves nothing.
     /// A decode error or a pixel mismatch is a FAILURE, never a skip.
-    fn run_compound_global_warp_gate(name: &str, ten_bit: bool) {
+    fn run_compound_global_warp_gate(name: &str, bd: u32, min_part: u32, leaf8_assert: bool) {
         let _gate_lock = lock_gate_counters();
         assert!(have_ffmpeg(), "{name}: ffmpeg required");
         assert!(have_aomenc(), "{name}: no aomenc at {}", aomenc_path().display());
         let (width, height, frame_count) = (64usize, 64usize, 24usize);
         let before = crate::decode::compound_warp_hits();
+        let before8 = crate::decode::compound_warp_hits_8();
         let mut matched = 0u32;
         let mut named_refusals = 0u32;
         let mut attempts = 0u32;
@@ -21856,7 +21894,11 @@ pub(crate) mod tests {
                     h = height * 2,
                     sx = -0.6 + 0.01 * (i as f64),
                 );
-                let pix_fmt = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = match bd {
+                    8 => "yuv420p",
+                    10 => "yuv420p10le",
+                    _ => "yuv420p12le",
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
                         "-v", "error", "-f", "lavfi", "-i", &source, "-t",
@@ -21874,6 +21916,8 @@ pub(crate) mod tests {
                     String::from_utf8_lossy(&y4m.stderr)
                 );
                 let cq_arg = format!("--cq-level={cq}");
+                let (in_depth_arg, depth_arg) =
+                    (format!("--input-bit-depth={bd}"), format!("--bit-depth={bd}"));
                 let mut args: Vec<&str> = vec![
                     "--codec=av1",
                     "--passes=1",
@@ -21912,14 +21956,18 @@ pub(crate) mod tests {
                     "--enable-cdef=0",
                     "--enable-restoration=0",
                     "--max-partition-size=32",
-                    "--min-partition-size=32",
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
                     "--enable-ref-frame-mvs=0",
                 ];
-                if ten_bit {
-                    args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+                let min_part_arg = format!("--min-partition-size={min_part}");
+                args.push(min_part_arg.as_str());
+                if bd != 8 {
+                    args.extend_from_slice(&[
+                        in_depth_arg.as_str(),
+                        depth_arg.as_str(),
+                    ]);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
                 let out = run_with_stdin(Command::new(aomenc_path())
@@ -21947,10 +21995,10 @@ pub(crate) mod tests {
                     }
                     Ok(frames) => frames,
                 };
-                let want = if ten_bit {
-                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
-                } else {
-                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                let want = match bd {
+                    8 => ffmpeg_decode_sequence(&stream, width, height, frame_count),
+                    10 => ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count),
+                    _ => ffmpeg_decode_sequence_12bit(&stream, width, height, frame_count),
                 };
                 assert_eq!(frames.len(), frame_count);
                 if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
@@ -21971,15 +22019,25 @@ pub(crate) mod tests {
             }
         }
         let hits = crate::decode::compound_warp_hits() - before;
+        let hits8 = crate::decode::compound_warp_hits_8() - before8;
         eprintln!(
             "{name}: {matched}/{attempts} pixel-exact, {named_refusals} named refusals, \
-             compound_warp_hits={hits}"
+             compound_warp_hits={hits} compound_warp_hits_8={hits8}"
         );
-        assert!(
-            hits > 0,
-            "{name}: no compound block was predicted through a per-ref global warp \
-             ({matched} matches, {named_refusals} refusals of {attempts}) -- gate vacuous"
-        );
+        if leaf8_assert {
+            assert!(
+                hits8 > 0,
+                "{name}: no 8x8 COMPOUND leaf was predicted through a per-ref global \
+                 warp ({hits} bigger compound warp blocks, {matched} matches, \
+                 {named_refusals} refusals of {attempts}) -- gate vacuous"
+            );
+        } else {
+            assert!(
+                hits > 0,
+                "{name}: no compound block was predicted through a per-ref global warp \
+                 ({matched} matches, {named_refusals} refusals of {attempts}) -- gate vacuous"
+            );
+        }
         assert!(matched > 0, "{name}: every attempt refused -- no pixel comparison ran");
     }
 
@@ -22202,7 +22260,12 @@ pub(crate) mod tests {
     /// 8-bit arm of [`run_compound_global_warp_gate`].
     #[test]
     fn a_real_compound_global_warp_stream_decodes_pixel_exact() {
-        run_compound_global_warp_gate("a_real_compound_global_warp_stream_decodes_pixel_exact", false);
+        run_compound_global_warp_gate(
+            "a_real_compound_global_warp_stream_decodes_pixel_exact",
+            8,
+            32,
+            false,
+        );
     }
 
     /// 10-bit arm of [`run_compound_global_warp_gate`] -- both of his films are
@@ -22221,6 +22284,43 @@ pub(crate) mod tests {
     fn a_real_compound_global_warp_10bit_stream_decodes_pixel_exact() {
         run_compound_global_warp_gate(
             "a_real_compound_global_warp_10bit_stream_decodes_pixel_exact",
+            10,
+            32,
+            false,
+        );
+    }
+
+    /// 12-bit arm of [`run_compound_global_warp_gate`] (lane-av112bitw): the
+    /// same rotating-mandelbrot recipe at `--bit-depth=12`. Pre-lift the
+    /// first `GLOBAL_GLOBALMV` block under a ROTZOOM model refused ("warped
+    /// motion at 12 bits"); the lift runs the same `warp::warp_round_0` bump
+    /// through `warp_affine_compound` (`reduce_bits_horiz` 5, compound
+    /// `reduce_bits_vert` stays 7, the CONV_BUF blend bias one octave down:
+    /// `(1 << (bd + 2)) + (1 << (bd + 1))`).
+    #[test]
+    fn a_real_compound_global_warp_12bit_stream_decodes_pixel_exact() {
+        run_compound_global_warp_gate(
+            "a_real_compound_global_warp_12bit_stream_decodes_pixel_exact",
+            12,
+            32,
+            false,
+        );
+    }
+
+    /// 12-bit 8x8 compound-warp LEAF arm (lane-av112bitw, reviewer gap): the
+    /// same recipe with the 32x32 partition pin dropped to min 8, so the RD
+    /// can code an 8x8 `GLOBAL_GLOBALMV` leaf whose two references warp per
+    /// slot -- `decode_inter_block8`'s `COMPOUND_WARP_HITS_8` path, which
+    /// the 32x32-pinned compound witness structurally cannot reach. Hard-
+    /// asserts `compound_warp_hits_8() > 0` (an 8x8 compound warp leaf bumps
+    /// it alongside [`decode::compound_warp_hits`]; a 16x16+ one cannot), so
+    /// a stream of only bigger warped blocks fails this gate.
+    #[test]
+    fn a_real_compound_global_warp_12bit_8x8_leaf_stream_decodes_pixel_exact() {
+        run_compound_global_warp_gate(
+            "a_real_compound_global_warp_12bit_8x8_leaf_stream_decodes_pixel_exact",
+            12,
+            8,
             true,
         );
     }

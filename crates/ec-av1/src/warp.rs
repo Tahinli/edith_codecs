@@ -328,12 +328,20 @@ fn get_shear_params(wmmat: [i32; 6]) -> Option<(i16, i16, i16, i16)> {
         return None;
     }
     let mat = wmmat.map(|v| v as i64);
-    let mut alpha = clamp(mat[2] - (1 << WARPEDMODEL_PREC_BITS), i16::MIN as i64, i16::MAX as i64);
+    let mut alpha = clamp(
+        mat[2] - (1 << WARPEDMODEL_PREC_BITS),
+        i16::MIN as i64,
+        i16::MAX as i64,
+    );
     let beta = clamp(mat[3], i16::MIN as i64, i16::MAX as i64);
     let (y_mag, shift) = resolve_divisor_32(mat[2].unsigned_abs() as u32);
     let y = if mat[2] < 0 { -y_mag } else { y_mag };
     let v = (mat[4] * (1 << WARPEDMODEL_PREC_BITS)) * y;
-    let mut gamma = clamp(round2_signed(v, shift as u32), i16::MIN as i64, i16::MAX as i64);
+    let mut gamma = clamp(
+        round2_signed(v, shift as u32),
+        i16::MIN as i64,
+        i16::MAX as i64,
+    );
     let v = (mat[3] * mat[4]) * y;
     let mut delta = clamp(
         mat[5] - round2_signed(v, shift as u32) - (1 << WARPEDMODEL_PREC_BITS),
@@ -414,7 +422,13 @@ pub fn find_projection(
 /// translational fallback in that rare case.
 pub fn global_warp_params(wmmat: [i32; 6]) -> Option<WarpParams> {
     let (alpha, beta, gamma, delta) = get_shear_params(wmmat)?;
-    Some(WarpParams { wmmat, alpha, beta, gamma, delta })
+    Some(WarpParams {
+        wmmat,
+        alpha,
+        beta,
+        gamma,
+        delta,
+    })
 }
 
 fn clip_pixel(v: i32, fctx: &crate::decode::FrameCtx) -> u16 {
@@ -442,17 +456,30 @@ pub(crate) fn warp_affine(
     p_height: i32,
     p_stride: i32,
     subsampling_x: i32,
-    subsampling_y: i32, fctx: &crate::decode::FrameCtx,
+    subsampling_y: i32,
+    fctx: &crate::decode::FrameCtx,
 ) {
     if crate::envflags::env_flag!("EC_MC_TRACE") {
         eprintln!("EC_MC_WARP x={p_col} y={p_row} w={p_width} h={p_height}");
     }
     let bd = i32::from(crate::decode::bit_depth(fctx));
-    // `reduce_bits_vert`, non-compound: `2 * FILTER_BITS - round_0`.
-    let reduce_bits_vert = 2 * FILTER_BITS - REDUCE_BITS_HORIZ;
+    // `reduce_bits_vert`, non-compound: `2 * FILTER_BITS - round_0` (the
+    // bumped `conv_params->round_0`, [`warp_round_0`]).
+    let reduce_bits_vert = 2 * FILTER_BITS - warp_round_0(bd);
     warp_inner(
-        params, reference, width, height, stride, p_col, p_row, p_width, p_height,
-        subsampling_x, subsampling_y, bd, reduce_bits_vert,
+        params,
+        reference,
+        width,
+        height,
+        stride,
+        p_col,
+        p_row,
+        p_width,
+        p_height,
+        subsampling_x,
+        subsampling_y,
+        bd,
+        reduce_bits_vert,
         |row, col, sum| {
             dst[row * p_stride as usize + col] =
                 clip_pixel(sum - (1 << (bd - 1)) - (1 << bd), fctx);
@@ -471,8 +498,8 @@ pub(crate) fn warp_affine(
 /// both roundings exactly because both exceed their shift) and subtracts
 /// `(1 << (offset_bits - round_1)) + (1 << (offset_bits - round_1 - 1))`
 /// at the blend; this crate's intermediates are UNBIASED (see
-/// [`mc::diffwtd_mask`]'s derivation), so the identical constant --
-/// `(1 << (bd + 4)) + (1 << (bd + 3))` -- is removed here instead, making
+/// [`mc::diffwtd_mask`]'s derivation), so the identical constant, derived
+/// from the bumped `round_0` below, is removed here instead, making
 /// the output directly interchangeable with
 /// [`mc::predict_compound_intermediate`]'s for
 /// [`mc::combine_compound`]/[`mc::blend_masked_compound`].
@@ -490,26 +517,60 @@ pub(crate) fn warp_affine_compound(
     p_height: i32,
     p_stride: i32,
     subsampling_x: i32,
-    subsampling_y: i32, fctx: &crate::decode::FrameCtx,
+    subsampling_y: i32,
+    fctx: &crate::decode::FrameCtx,
 ) {
     let bd = i32::from(crate::decode::bit_depth(fctx));
-    let bias = (1 << (bd + 4)) + (1 << (bd + 3));
+    // The CONV_BUF bias libaom subtracts at the blend:
+    // `(1 << (offset_bits - round_1)) + (1 << (offset_bits - round_1 - 1))`
+    // with `offset_bits = bd + 2 * FILTER_BITS - round_0` (round_0 the bumped
+    // [`warp_round_0`], round_1 [`COMPOUND_ROUND1_BITS`], unbumped for
+    // compound): `(1 << (bd + 4)) + (1 << (bd + 3))` at 8/10-bit, one octave
+    // less at 12-bit.
+    let offset_bits = bd + 2 * FILTER_BITS - warp_round_0(bd);
+    let bias = (1 << (offset_bits - COMPOUND_ROUND1_BITS))
+        + (1 << (offset_bits - COMPOUND_ROUND1_BITS - 1));
     warp_inner(
-        params, reference, width, height, stride, p_col, p_row, p_width, p_height,
-        subsampling_x, subsampling_y, bd, COMPOUND_ROUND1_BITS,
+        params,
+        reference,
+        width,
+        height,
+        stride,
+        p_col,
+        p_row,
+        p_width,
+        p_height,
+        subsampling_x,
+        subsampling_y,
+        bd,
+        COMPOUND_ROUND1_BITS,
         |row, col, sum| {
             dst[row * p_stride as usize + col] = sum - bias;
         },
     );
 }
 
-/// `conv_params->round_0` (`ROUND0_BITS`), the warp filter's horizontal
-/// rounding -- `InterRound0`, bit-depth independent for 8/10-bit content
-/// (libaom only raises it at `bd == 12`, which this decoder refuses).
-const REDUCE_BITS_HORIZ: i32 = 3;
+/// `ROUND0_BITS` (`convolve.h`): `conv_params->round_0` before
+/// `get_conv_params_no_round`'s high-bitdepth buffer-range bump.
+const ROUND0_BITS: i32 = 3;
 /// `COMPOUND_ROUND1_BITS` (`convolve.h`): `conv_params->round_1` when
-/// `is_compound`.
+/// `is_compound` (NOT bumped at 12 bits -- the bump moves `round_0` and, for
+/// non-compound, `round_1` by the same delta, keeping the filter gain
+/// constant).
 const COMPOUND_ROUND1_BITS: i32 = 7;
+
+/// `conv_params->round_0` after `get_conv_params_no_round`'s bump
+/// (`convolve.h`): `round_0 += max(bd + FILTER_BITS - round_0 - 14, 0)` --
+/// 3 at 8/10-bit, 5 at 12-bit (`intbufrange = bd + FILTER_BITS - round_0 +
+/// 2` overflows 16 bits from bd 12 on). The warp filter's
+/// `reduce_bits_horiz` IS `conv_params->round_0` (`warped_motion.c:295`),
+/// and the non-compound `reduce_bits_vert` plus both `offset_bits_*` terms
+/// read back through it, so this one parameter moves every shift the warp
+/// filter runs (lane-av112bitw: the 12-bit warp witness decodes byte-exact
+/// through it).
+fn warp_round_0(bd: i32) -> i32 {
+    ROUND0_BITS + (bd + FILTER_BITS - ROUND0_BITS - 14).max(0)
+}
 
 /// The shared body of [`warp_affine`]/[`warp_affine_compound`]
 /// (`av1_highbd_warp_affine_c`): everything up to and including the
@@ -539,7 +600,7 @@ fn warp_inner(
         params.gamma as i64,
         params.delta as i64,
     );
-    let reduce_bits_horiz = REDUCE_BITS_HORIZ;
+    let reduce_bits_horiz = warp_round_0(bd);
     let offset_bits_horiz = bd + FILTER_BITS - 1;
     let offset_bits_vert = bd + 2 * FILTER_BITS - reduce_bits_horiz;
 
@@ -570,8 +631,8 @@ fn warp_inner(
                 let mut sx = sx4 + beta * (k as i64 + 4);
                 for l in -4..4i32 {
                     let ix = ix4 + l - 3;
-                    let offs =
-                        (round2(sx, WARPEDDIFF_PREC_BITS) as i32 + WARPEDPIXEL_PREC_SHIFTS) as usize;
+                    let offs = (round2(sx, WARPEDDIFF_PREC_BITS) as i32 + WARPEDPIXEL_PREC_SHIFTS)
+                        as usize;
                     let coeffs = &AV1_WARPED_FILTER[offs];
                     let mut sum: i32 = 1 << offset_bits_horiz;
                     for (m, &c) in coeffs.iter().enumerate() {
@@ -591,12 +652,13 @@ fn warp_inner(
                 let l_hi = (4i32).min(p_col + p_width - j - 4);
                 let mut l = -4i32;
                 while l < l_hi {
-                    let offs =
-                        (round2(sy, WARPEDDIFF_PREC_BITS) as i32 + WARPEDPIXEL_PREC_SHIFTS) as usize;
+                    let offs = (round2(sy, WARPEDDIFF_PREC_BITS) as i32 + WARPEDPIXEL_PREC_SHIFTS)
+                        as usize;
                     let coeffs = &AV1_WARPED_FILTER[offs];
                     let mut sum: i32 = 1 << offset_bits_vert;
                     for m in 0..8i32 {
-                        sum += tmp[(k + m + 4) as usize][(l + 4) as usize] * coeffs[m as usize] as i32;
+                        sum +=
+                            tmp[(k + m + 4) as usize][(l + 4) as usize] * coeffs[m as usize] as i32;
                     }
                     sum = round2(sum as i64, reduce_bits_vert as u32) as i32;
                     store(
