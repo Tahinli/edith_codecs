@@ -124,22 +124,84 @@ pub fn source(
 /// carry the real diagnosis.
 ///
 /// # Panics
-/// When the child cannot be spawned or reaped, or the writer thread panics.
+/// When the child cannot be spawned or reaped, when the writer thread
+/// panics, or when the child is still running after the deadline (below):
+/// it is killed and the test fails naming the command, the timeout and the
+/// kill -- the CFL suite lost 11h41m to a wedged aomenc child because the
+/// pre-pipedrain spawn had no bound (class: aomenc-stdin-pipe-deadlock).
+///
+/// The deadline is 1800 s per child, overridable with
+/// `EC_AV1_CHILD_TIMEOUT_SECS`. Every legitimate child here is an
+/// aomenc/ffmpeg over an at-most-a-few-MB fixture: seconds, not minutes.
 #[cfg(test)]
 pub(crate) fn run_with_stdin(cmd: &mut Command, input: &[u8]) -> std::process::Output {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let timeout = std::env::var("EC_AV1_CHILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(Duration::from_secs(1800), Duration::from_secs);
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("encoder failed to start");
     let mut stdin = child.stdin.take().expect("encoder stdin");
+    let mut stdout = child.stdout.take().expect("encoder stdout");
+    let mut stderr = child.stderr.take().expect("encoder stderr");
+    let program = cmd.get_program().to_string_lossy().into_owned();
+
     let payload = input.to_vec();
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&payload);
     });
-    let out = child.wait_with_output().expect("encoder failed to run");
+    // Both output pipes drained from the first millisecond: the child can
+    // never wedge on a full stdout/stderr pipe while we are still writing
+    // stdin (the pre-pipedrain inline `write_all` + `wait_with_output`
+    // pattern that deadlocked the CFL suite's census gate).
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().expect("encoder status") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let killed = child.wait().expect("encoder reap");
+                // The dead child closed every pipe, so all three threads
+                // are out of their syscalls: the joins below are bounded.
+                let _ = writer.join();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                panic!(
+                    "{program}: still running {secs}s after spawn -- killed ({killed}). \
+                     A live child here hangs the whole suite, which is how the CFL run lost \
+                     11h41m to aomenc wedged in anon_pipe_write \
+                     (class: aomenc-stdin-pipe-deadlock). Check its wchan/fds before blaming \
+                     the decoder.",
+                    secs = timeout.as_secs(),
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let out = out_reader.join().expect("encoder stdout reader thread");
+    let err = err_reader.join().expect("encoder stderr reader thread");
     writer.join().expect("encoder stdin writer thread");
-    out
+    std::process::Output {
+        status,
+        stdout: out,
+        stderr: err,
+    }
 }
