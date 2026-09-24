@@ -23,7 +23,7 @@
 use crate::hits::{hit, hit_do};
 
 use ec_av1_syntax::{
-    CdefParams, DeltaParams, LoopFilterParams, LoopRestorationParams,
+    CdefParams, DeltaParams, LoopFilterParams, LoopRestorationParams, MAX_SEGMENTS,
     SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SegmentationParams, TileInfo,
 };
 use ec_core::{Error, Result};
@@ -90,13 +90,18 @@ pub(crate) struct FrameCtx {
     /// [`filter_ctx_copy`]) so a tile-search worker thread reads the same
     /// kernel the frame header wrote instead of the default.
     pub(crate) interp_filter: std::cell::Cell<crate::mc::InterpFilterKind>,
-    /// lane-lossless: this frame's `CodedLossless` (spec 5.9.12) -- every
-    /// segment at `qindex == 0` with zero plane deltas. It forces TX_4X4 with
-    /// the Walsh-Hadamard transform on every plane, drops the `tx_type`
-    /// symbol and narrows `is_cfl_allowed` (libaom `read_tx_size`
-    /// (`decodeframe.c`), `read_tx_type` (`decodetxb.c`), `is_cfl_allowed`
-    /// (`blockd.h`)).
-    pub(crate) lossless_flag: std::cell::Cell<bool>,
+    /// lane-lossless: this frame's per-segment lossless table -- libaom's
+    /// `xd->lossless[MAX_SEGMENTS]`, computed ONCE per frame in the header
+    /// (spec 5.9.12 `CodedLossless`: each segment at `qindex == 0` with zero
+    /// plane deltas, `get_qindex` applying that segment's own `SEG_LVL_ALT_Q`).
+    /// Every block-decoder rule that reads [`decode::lossless`] resolves it
+    /// through the BLOCK's own `segment_id`: TX_4X4 with the Walsh-Hadamard
+    /// transform on every plane, the dropped `tx_type` symbol and the narrowed
+    /// `is_cfl_allowed` (libaom `read_tx_size` (`decodeframe.c`),
+    /// `read_tx_type` (`decodetxb.c`), `is_cfl_allowed` (`blockd.h`)) follow
+    /// the SEGMENT, so a frame whose segments disagree codes lossless and
+    /// lossy blocks side by side.
+    pub(crate) lossless_per_seg: std::cell::Cell<[bool; MAX_SEGMENTS]>,
     /// lane-av1txr: this frame header's `disable_cdf_update` (spec 5.9.2).
     /// When set, the tile reader must not adapt any CDF it reads, or its
     /// tables drift away from the encoder's and the frame desyncs mid-tile
@@ -225,7 +230,7 @@ impl FrameCtx {
             // the size this process encodes -- see [`FrameCtx::for_encoder`].
             sb128_flag: std::cell::Cell::new(false),
             interp_filter: std::cell::Cell::new(crate::mc::InterpFilterKind::Regular),
-            lossless_flag: std::cell::Cell::new(false),
+            lossless_per_seg: std::cell::Cell::new([false; MAX_SEGMENTS]),
             disable_cdf_update: std::cell::Cell::new(false),
             cdef_bits: std::cell::Cell::new(0),
             bit_depth: std::cell::Cell::new(8),
@@ -431,14 +436,26 @@ pub(crate) fn set_sb128(v: bool, fctx: &crate::decode::FrameCtx) {
     crate::encode::set_reach_superblock_px(if v { 128 } else { 64 }, fctx);
 }
 
-/// Sets [`FrameCtx::lossless_flag`] (called once per frame from `stream.rs`).
-pub(crate) fn set_lossless(v: bool, fctx: &crate::decode::FrameCtx) {
-    fctx.lossless_flag.with(|c| c.set(v));
+/// lane-av1mixloss: sets [`FrameCtx::lossless_per_seg`] (called once per frame
+/// from `stream.rs`).
+pub(crate) fn set_lossless_per_seg(
+    table: [bool; MAX_SEGMENTS],
+    fctx: &crate::decode::FrameCtx,
+) {
+    fctx.lossless_per_seg.with(|c| c.set(table));
 }
 
-/// This frame's `CodedLossless` -- see [`FrameCtx::lossless_flag`].
+/// The BLOCK's own lossless bit: libaom's `xd->lossless[mbmi->segment_id]`.
+/// The table is computed once per frame (libaom `decodeframe.c:5205`:
+/// `qindex == 0` with every plane delta 0, `av1_get_qindex` applying the
+/// segment's `SEG_LVL_ALT_Q`), but the frame never carries ONE lossless rule
+/// -- `read_tx_size`, `read_tx_type` and `is_cfl_allowed` all index it by the
+/// BLOCK's own segment id, which the spec-order `segment_id` read sets before
+/// any mode/transform symbol of the block. A frame whose segments disagree
+/// codes TX_4X4/WHT blocks and normal blocks side by side.
 pub(crate) fn lossless(fctx: &crate::decode::FrameCtx) -> bool {
-    fctx.lossless_flag.with(|c| c.get())
+    let seg_id = usize::from(fctx.cur_segment_id.with(|c| c.get()));
+    fctx.lossless_per_seg.with(|c| c.get())[seg_id]
 }
 
 /// Sets [`FrameCtx::disable_cdf_update`] (called once per frame from
@@ -454,7 +471,7 @@ pub(crate) fn cdf_update_disabled(fctx: &crate::decode::FrameCtx) -> bool {
 }
 
 /// The transform side a block of `side` pixels codes: its own (capped at the
-/// caller's own largest) normally, 4 on a lossless frame, where libaom's
+/// caller's own largest) normally, 4 on a lossless BLOCK, where libaom's
 /// `read_tx_size` returns TX_4X4 before it looks at anything else
 /// (`decodeframe.c`: `if (xd->lossless[xd->mi[0]->segment_id]) return
 /// TX_4X4;`).
@@ -463,7 +480,7 @@ pub(crate) fn lossless_tx(px: usize, fctx: &crate::decode::FrameCtx) -> usize {
 }
 
 /// `is_cfl_allowed` (libaom `blockd.h`): CfL is offered on a block up to
-/// 32x32 -- but on a LOSSLESS frame only when the block's CHROMA plane block
+/// 32x32 -- but on a LOSSLESS BLOCK only when the block's CHROMA plane block
 /// is exactly BLOCK_4X4, i.e. (at 4:2:0) a luma block of 8x8 or smaller.
 /// Getting this wrong picks the 14-symbol CFL `uv_mode` alphabet where libaom
 /// picks the 13-symbol one (class `wrong-alphabet-same-value`).
@@ -2509,11 +2526,26 @@ pub(crate) struct TxParams {
     /// recon worker scales identically without touching frame state.
     pub(crate) qm: Option<crate::qm::Iqm>,
     pub(crate) stride: usize,
-    /// lane-lossless: this transform unit belongs to a lossless frame, so the
-    /// residual comes off the 4x4 Walsh-Hadamard
+    /// lane-lossless: this transform unit belongs to a lossless BLOCK (its
+    /// segment's `xd->lossless[segment_id]` bit), so the residual comes off
+    /// the 4x4 Walsh-Hadamard
     /// ([`crate::transform::dequant_and_inverse_wht4x4`]) instead of the
     /// DCT/ADST network (libaom `inv_txfm_add`, `av1/common/idct.c`).
     pub(crate) lossless: bool,
+}
+
+/// lane-av1mixloss: Walsh-Hadamard transform units actually reconstructed.
+/// The mixed-lossless witness's proof the per-segment lossless path really
+/// ran on a frame that is NOT `CodedLossless`. Atomic because the wavefront
+/// workers run this on their own threads.
+static LOSSLESS_WHT_UNITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// [`LOSSLESS_WHT_UNITS`] -- total over the process, read as a before/after
+/// delta around one decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lossless_wht_units() -> usize {
+    LOSSLESS_WHT_UNITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl TxParams {
@@ -2522,6 +2554,7 @@ impl TxParams {
     /// are the same function on the same inputs and byte-identical.
     fn run(self, grid: &[i32]) -> Vec<i32> {
         let residual = if self.lossless {
+            LOSSLESS_WHT_UNITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug_assert_eq!((self.w, self.h), (4, 4));
             debug_assert_eq!(self.tx_type, TxType::DctDct);
             crate::transform::dequant_and_inverse_wht4x4(
@@ -6712,6 +6745,13 @@ fn read_coeffs(
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
+    if crate::envflags::env_flag!("EC_ECDUMP_IN") {
+        let (range, value) = dec.debug_state();
+        let bit = dec.debug_bitpos();
+        eprintln!(
+            "EC_ECDUMP_IN side={side} ctx={skip_ctx} dcctx={sign_ctx} ECIN=({value},{range},{bit})"
+        );
+    }
     let dbg_txbskip = if coeff_trace_on() {
         coding.txb_skip[skip_ctx]
     } else {
@@ -8442,9 +8482,18 @@ impl Neighbours {
                 (0..above_mi).map(|k| self.above[mi_c + k][0].level.to_string()).collect();
             let lf: Vec<String> =
                 (0..left_mi).map(|k| self.left[mi_r + k][0].level.to_string()).collect();
+            // lane-av1mix: the last few msac register states, so the
+            // byte-position of the `all_zero` read can be matched against
+            // aomdec's `EC=(value,rng,bytepos)` dump (decodetxb.c) without a
+            // second run.
+            let recent = crate::msac::symtrace::ecdump_recent(4)
+                .iter()
+                .map(|(_low, value, rng, bytepos)| format!("({value},{rng},{bytepos})"))
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!(
-                "EC_ECDUMP plane=0 mi=({mi_r},{mi_c}) wh=({w_mi},{h_mi}) ctx={ctx} above=[{},] left=[{},]",
-                ab.join(","), lf.join(",")
+                "EC_ECDUMP plane=0 mi=({mi_r},{mi_c}) wh=({w_mi},{h_mi}) ctx={ctx} above=[{},] left=[{},] recentEC=[{}]",
+                ab.join(","), lf.join(","), recent
             );
         }
         if crate::envflags::env_flag!("EC_AV1_TRACE") {
@@ -11201,7 +11250,11 @@ fn decode_intra_rect_in_inter(
         hit!(SMOOTH_LUMA_HITS);
     }
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(mi_r, mi_c, r, c, fctx);
-    let depth = if fctx.tx_select_inter.with(std::cell::Cell::get) {
+    // lane-av1mixloss: the lossless-segment early return (`decodeframe.c:1203`)
+    // precedes `TX_MODE_SELECT`, so a lossless-segment intra-rect block inside
+    // an inter frame codes no depth symbol either (`xd->lossless` is per
+    // segment regardless of frame type; class sweep of the sub8 leaf's fix).
+    let depth = if fctx.tx_select_inter.with(std::cell::Cell::get) && !lossless(fctx) {
         // The frame's own `TXFM_CONTEXT` bands -- [`tx_size_context_txfm_rect`].
         let ctx = tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw.min(64), bh.min(64), fctx);
         let d = match tx_cat {
@@ -12230,7 +12283,11 @@ fn decode_block_rect(
     // desynced the tile from that point on. That is why both strips of the
     // pinned HORZ quadrant were wrong from their very first pixel, and why our
     // range after the read equalled the oracle's range for the whole block.
-    let depth = if tx_select {
+    // lane-av1mixloss: the lossless-segment early return
+    // (`decodeframe.c:1203`) precedes `TX_MODE_SELECT`, so a lossless-segment
+    // rect block codes no depth symbol here either (class sweep of the sub8
+    // leaf's fix).
+    let depth = if tx_select && !lossless(fctx) {
         // lane-av1txbands: EVERY frame now reads the real `TXFM_CONTEXT`
         // bands (`get_tx_size_context`, libaom `pred_common.h:342`) -- an
         // intra-only frame publishes them from every block too
@@ -12764,9 +12821,16 @@ fn decode_leaf_rect(
     // filter type is the NEIGHBOUR's `uv_mode` (libaom `get_filt_type`), not
     // a constant `false`.
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c, fctx);
-    let depth = if tx_select {
+    let depth = if tx_select && !lossless(fctx) {
         // lane-t900 r2 (sibling sweep): the in-inter `TXFM_CONTEXT` band read
         // every other rect reader now does -- a no-op on a key frame.
+        // lane-av1mixloss: libaom `read_tx_size`'s first line
+        // (`decodeframe.c:1203`, `if (xd->lossless[segment_id]) return
+        // TX_4X4;`) precedes the `TX_MODE_SELECT` test, so a lossless-segment
+        // rect leaf codes NO depth symbol (`depth_to_tx_wh` clamps to 4x4).
+        // The mixed frame's 16x8 leaf at mi(10,0) forked exactly here: ours
+        // read `tx_size_cat1` (rng 55700->49918) where the oracle's next
+        // read was the leaf's own txb_skip.
         let ctx = tx_size_context_txfm_rect(neighbours, leaf_mi, bw, bh, fctx);
         // lane-rectsplitx r1: `bsize_to_tx_size_cat` (libaom `blockd.h`,
         // `bsize_to_tx_size_depth_table`) is 2 for BLOCK_16X8/BLOCK_8X16, so
@@ -13124,7 +13188,10 @@ fn decode_block_rect4(
     } else {
         uv_mode
     };
-    let depth = if tx_select {
+    // lane-av1mixloss: the lossless-segment early return (`decodeframe.c:1203`)
+    // precedes `TX_MODE_SELECT`, so a lossless-segment rect4 block codes no
+    // depth symbol here either (class sweep of the sub8 leaf's fix).
+    let depth = if tx_select && !lossless(fctx) {
         // lane-av1txbands: EVERY frame now reads the real `TXFM_CONTEXT`
         // bands (`get_tx_size_context`, libaom `pred_common.h:342`) -- an
         // intra-only frame publishes them from every block too
@@ -14215,7 +14282,11 @@ fn decode_rect4_16_strip(
         // TX_16X4 and `sub_tx_size_map` reaches TX_4X4 in two steps, so the
         // depth symbol is the 3-symbol `tx_size_cat1` -- not the 2-symbol
         // `cat0` a 4x8 leaf reads nor the `cat2` a 32x8 strip does.
-        let depth = if tx_select {
+        // lane-av1mixloss: the lossless-segment early return
+        // (`decodeframe.c:1203`) precedes `TX_MODE_SELECT`, so a
+        // lossless-segment strip codes no depth symbol here either (class
+        // sweep of the sub8 leaf's fix).
+        let depth = if tx_select && !lossless(fctx) {
             // lane-av1txbands: every frame reads the real `TXFM_CONTEXT` bands
             // (`get_tx_size_context`, libaom `pred_common.h:342`).
             let ctx = tx_size_context_txfm_rect(neighbours, lmi, bw, bh, fctx);
@@ -14805,7 +14876,10 @@ fn decode_block_rect64(
         uv_mode
     };
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
-    let depth = if tx_select {
+    // lane-av1mixloss: the lossless-segment early return (`decodeframe.c:1203`)
+    // precedes `TX_MODE_SELECT`, so a lossless-segment 64-axis rect block codes
+    // no depth symbol here either (class sweep of the sub8 leaf's fix).
+    let depth = if tx_select && !lossless(fctx) {
         // lane-av1txbands: EVERY frame now reads the real `TXFM_CONTEXT`
         // bands (`get_tx_size_context`, libaom `pred_common.h:342`) -- an
         // intra-only frame publishes them from every block too
@@ -16391,24 +16465,6 @@ fn decode_block(
     tx_select: bool,
     reduced_tx_set: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
-    // lane-lossless: a lossless frame's transform is TX_4X4 on every plane
-    // (libaom `read_tx_size`, `decodeframe.c`), so the caller's per-size
-    // tables/scans are replaced by the 4x4 ones and the block always takes the
-    // multi-transform-unit path below.
-    let (luma_set, chroma_set, luma_tx, chroma_tx, scans) = if lossless(fctx) {
-        (TxbSet::Luma4, TxbSet::Chroma4, 4, 4, (scan4, scan4))
-    } else if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
-        let tx = if side >= 64 { 32 } else { side };
-        let (set, scan): (TxbSet, &[u16]) = match tx {
-            32 => (TxbSet::Chroma32, scan32),
-            16 => (TxbSet::Chroma16, scan16),
-            8 => (TxbSet::Chroma8, scan8),
-            _ => (TxbSet::Chroma4, scan4),
-        };
-        (luma_set, set, luma_tx, tx, (scans.0, scan))
-    } else {
-        (luma_set, chroma_set, luma_tx, chroma_tx, scans)
-    };
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
@@ -16435,6 +16491,34 @@ fn decode_block(
     if at_tile_left && palette_y.is_some() {
         hit!(PALETTE_TILE_LEFT_HITS);
     }
+    // lane-lossless: a lossless BLOCK's transform is TX_4X4 on every plane
+    // (libaom `read_tx_size`, `decodeframe.c`), so the caller's per-size
+    // tables/scans are replaced by the 4x4 ones and the block always takes the
+    // multi-transform-unit path below. lane-av1mixloss: this rewrite used to
+    // sit at the TOP of the function -- before `read_intra_mode`, which is
+    // where the block's own `segment_id` is read -- so a mixed frame resolved
+    // every block's geometry against the PREVIOUS block's segment (a lossless
+    // neighbour forced 4x4 units on a lossy block; a lossy one handed the
+    // lossless TxParams an 8x8 grid). libaom's order is the opposite one:
+    // `decode_mbmi_block` (segment id included) runs before any tx-size rule.
+    // lane-av1mixmerge: the 4:4:4 chroma-size arm from main's copy of this
+    // rewrite (which sat above `read_intra_mode`) rides along here -- same
+    // per-frame `ss_x`/`ss_y` condition, now resolved against the block's own
+    // segment like the lossless arm above it.
+    let (luma_set, chroma_set, luma_tx, chroma_tx, scans) = if lossless(fctx) {
+        (TxbSet::Luma4, TxbSet::Chroma4, 4, 4, (scan4, scan4))
+    } else if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
+        let tx = if side >= 64 { 32 } else { side };
+        let (set, scan): (TxbSet, &[u16]) = match tx {
+            32 => (TxbSet::Chroma32, scan32),
+            16 => (TxbSet::Chroma16, scan16),
+            8 => (TxbSet::Chroma8, scan8),
+            _ => (TxbSet::Chroma4, scan4),
+        };
+        (luma_set, set, luma_tx, tx, (scans.0, scan))
+    } else {
+        (luma_set, chroma_set, luma_tx, chroma_tx, scans)
+    };
     let intrabc_dv = fctx.intrabc_dv.with(|c| c.take());
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
     // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
@@ -16476,7 +16560,14 @@ fn decode_block(
     // `is_inter_block`, so both branches of `read_block_tx_size` treat an
     // intrabc block as inter.
     let intrabc_skip_tx = intrabc_dv.is_some() && skip;
-    let intrabc_vartx = intrabc_dv.is_some() && tx_select && !skip;
+    // libaom `parse_decode_block`'s var-tx tree condition carries
+    // `!xd->lossless[mbmi->segment_id]` (decodeframe.c:1237): an intrabc
+    // block inside a LOSSLESS segment of a mixed frame reads NO
+    // `txfm_partition` tree -- it falls to `read_tx_size`, whose first line
+    // hands back TX_4X4. Invisible while every lossless frame was also
+    // `CodedLossless` (`tx_mode` forced `Only4x4`, tree unreachable), which
+    // is why the mixed frame is the first stream to reach it.
+    let intrabc_vartx = intrabc_dv.is_some() && tx_select && !skip && !lossless(fctx);
     let intrabc_leaves = if intrabc_vartx {
         let max_tx = side.min(64);
         // `max_block_wide`/`max_block_high`: the frame's own mi grid
@@ -16516,7 +16607,7 @@ fn decode_block(
     let (logical_tx, coeff_tx_side) = if let Some(tx) = intrabc_leaves {
         (tx, if tx == 64 { 32 } else { tx })
     } else if tx_select && !intrabc_skip_tx {
-        let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side);
+        let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side, fctx);
         (resolved, if resolved == 64 { 32 } else { resolved })
     } else {
         // lane-sb128b r1: `max_txsize_rect_lookup[BLOCK_128X128]` is
@@ -17825,7 +17916,11 @@ fn decode_leaf8(
     // UNSKIPPED one reads the inter var-tx tree (lane-t900 r32). At 8x8 that
     // tree is one `txfm_split` symbol: TX_8X8, or TX_4X4 over all four mi
     // cells (`read_var_tx_size`'s `sub_txs == TX_4X4` early return).
-    let resolved = if tx_select && intrabc_dv.is_some() && !skip {
+    // `parse_decode_block`'s tree condition carries
+    // `!xd->lossless[mbmi->segment_id]` (see [`decode_block`]'s own copy):
+    // a lossless segment's intrabc leaf reads no tree, TX_4X4 via
+    // `read_tx_size`'s first line (lane-av1mixloss).
+    let resolved = if tx_select && intrabc_dv.is_some() && !skip && !lossless(fctx) {
         let mut leaves = Vec::new();
         let mi_cols = 2 * y.true_width.div_ceil(8);
         let mi_rows = 2 * y.true_height.div_ceil(8);
@@ -17848,7 +17943,7 @@ fn decode_leaf8(
         hit!(INTRABC_VARTX_HITS);
         leaves.first().map_or(8, |l| l.2)
     } else if tx_select && intrabc_dv.is_none() {
-        read_tx_size(dec, cdfs, neighbours, leaf_mi, 8)
+        read_tx_size(dec, cdfs, neighbours, leaf_mi, 8, fctx)
     } else {
         // lane-lossless: TX_4X4 on a lossless frame, no symbol
         // (libaom `read_tx_size`).
@@ -19339,7 +19434,13 @@ fn decode_leaf_rect8(
         // Missing this read consumed one symbol fewer than the encoder wrote
         // and desynced the tile at the very first rect leaf (class
         // `symbol-consumption-gap`).
-        let depth = if tx_select {
+        // lane-av1mix: libaom `read_tx_size`'s FIRST line
+        // (`decodeframe.c:1203`, `if (xd->lossless[...]) return TX_4X4`)
+        // fires before the `TX_MODE_SELECT` test, so a lossless-segment leaf
+        // codes NO depth symbol even in `TxMode::Select` -- the mixed-lossless
+        // frame's sub8 leaves forked exactly here (ours read the symbol at
+        // (12477,50864) bit 3011, the oracle's all_zero used it).
+        let depth = if tx_select && !lossless(fctx) {
             // lane-av1txbands: the `TXFM_CONTEXT` band read every other rect
             // reader already does.
             let ctx = tx_size_context_txfm_rect(neighbours, lmi, bw, bh, fctx);
@@ -20595,7 +20696,18 @@ fn read_tx_size(
     n: &Neighbours,
     at_mi: (usize, usize),
     side: usize,
+    fctx: &crate::decode::FrameCtx,
 ) -> usize {
+    // libaom `read_tx_size`'s FIRST line (decodeframe.c:1203):
+    // `if (xd->lossless[xd->mi[0]->segment_id]) return TX_4X4;` -- before the
+    // `tx_mode == TX_MODE_SELECT` test and before any symbol. Invisible while
+    // every lossless frame was ALSO `CodedLossless` (its `tx_mode` is forced
+    // `Only4x4`, so this function never ran); a MIXED frame keeps
+    // `TxMode::Select`, so its lossless segments reach the symbol read and
+    // must take the early return (lane-av1mixloss).
+    if lossless(fctx) {
+        return 4;
+    }
     // `max_txsize_rect_lookup[bsize]` (libaom `read_selected_tx_size` /
     // `get_tx_size_context`): a block wider than 64 still tops out at
     // TX_64X64, so BLOCK_128X128 reads BLOCK_64X64's own category (its depth
@@ -21092,13 +21204,7 @@ fn read_block_tx_size(
     let tx = if is_inter {
         side.min(64)
     } else {
-        read_tx_size(
-            dec,
-            cdfs,
-            n,
-            at_mi,
-            side,
-        )
+        read_tx_size(dec, cdfs, n, at_mi, side, fctx)
     };
     set_txfm_ctxs(n, at_mi, tx, side_mi, side_mi, skip && is_inter);
     if !is_inter && tx != side {
@@ -35080,7 +35186,11 @@ fn decode_intra_sub8_leaf(
     // context bands, which on an inter frame are live.
     // `block_signals_txsize(BLOCK_4X4)` is false (blockd.h:1027): the 4x4 leaf
     // codes no depth symbol at all, its transform is its own size.
-    let depth = if tx_select && bw != bh {
+    // lane-av1mix: the lossless early return (`decodeframe.c:1203`) sits
+    // before the `TX_MODE_SELECT` test, so a lossless-segment rect leaf codes
+    // no depth symbol either (sweep of the class fixed at the key-frame pair
+    // path).
+    let depth = if tx_select && bw != bh && !lossless(fctx) {
         let ctx = tx_size_context_txfm_rect(neighbours, lmi, bw, bh, fctx);
         let d = dec.symbol(&mut cdfs.tx_size_cat0[ctx]);
         if step {

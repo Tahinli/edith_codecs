@@ -126,9 +126,12 @@ const REFUSALS: &[&str] = &[
     // BLOCK_4X4 chroma plane block, and the chroma plane walked as 4x4 units
     // plane-major inside each mu chunk (gates
     // `a_lossless_libaom_key_frame_decodes_sample_exact` /
-    // `a_lossless_libaom_inter_frame_decodes_sample_exact`). A frame whose
-    // segments disagree is still refused: every lossless rule is per segment.
-    "a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)",
+    // `a_lossless_libaom_inter_frame_decodes_sample_exact`). The refusal
+    // that stood here for a frame whose SEGMENTS disagree ("the TX_4X4/WHT
+    // rules are per segment there") is LIFTED too: lane-av1mixloss ports the
+    // per-segment table (libaom `decodeframe.c:5205`), and
+    // `a_real_aomenc_mixed_lossless_segment_frame_decodes_sample_exact`
+    // proves a real aq-mode stream sample-exact.
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with no mode-info grid",
@@ -245,9 +248,12 @@ const REFUSALS: &[&str] = &[
 /// The two that are NOT spec-conformant, and are kept as named capability gaps
 /// with an assessment (a real gap libaom accepts, no reachable witness here):
 /// a reference picture whose height differs (libaom SCALES,
-/// `decodeframe.c:5089`) and a frame mixing lossless and lossy segments
-/// (libaom decodes it per segment, `decodeframe.c:5205`; now WITNESSED by
-/// `a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name`).
+/// `decodeframe.c:5089`). A third one -- a frame mixing lossless and lossy
+/// segments (libaom decodes it per segment, `decodeframe.c:5205`) -- was the
+/// same kind of gap until lane-av1mixloss ported the per-segment table; its
+/// refusal is gone and
+/// `a_real_aomenc_mixed_lossless_segment_frame_decodes_sample_exact` is the
+/// witness.
 #[cfg(test)]
 const PROVEN: &[(&str, &str)] = &[
     // lane-t900 r20, census: three real streams present exactly the 18
@@ -523,18 +529,6 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
         "an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name",
-    ),
-    // lane-hdrlossless, WITNESS: the one refusal the pilot report left with
-    // NO proving test. It is a REAL aomenc output, not a defensive pin:
-    // `--end-usage=q --cq-level=0 --aq-mode=1` codes a frame whose segments
-    // disagree about lossless (`aq_variance.c` sets `SEG_LVL_ALT_Q` per
-    // segment with no clamp once `base_qindex == 0`), libaom decodes it
-    // (`xd->lossless[segment_id]`, `decodeframe.c:5205`), and THIS decoder
-    // refuses it by name. A named capability gap until the block-decoder
-    // lift lands (see the refusal's own doc in `stream.rs`).
-    (
-        "a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)",
-        "a_real_aomenc_mixed_lossless_segment_frame_is_refused_by_name",
     ),
 ];
 
