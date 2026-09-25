@@ -77,9 +77,12 @@
   `sub8_leaf_chroma422` (parent lane's three fixes) untouched.
 - The 8-bit `EC_AV1_POSTCDEF_DUMP` rung was added to the ORACLE's source
   tree (`$HOME/.cache/aom-oracle/src/av1/decoder/decodeframe.c`, rebuilt
-  with ninja), not to this repo's `scripts/instrument-aom-oracle.sh` — the
-  script's generator should grow the same patch if the oracle is ever
-  rebuilt from scratch.
+  with ninja) and transcribed into
+  `scripts/instrument-aom-oracle.sh` as rung 15 — its generator block
+  reproduces the hand patch byte-for-byte (verified by strip-and-replay on
+  the live tree; the marker `EC_INSTRUMENTED_POSTCDEF` keeps re-runs
+  no-op), so `build-aom-oracle.sh` + the script rebuild the full ladder
+  from scratch again.
 
 ## Verification
 
