@@ -30988,12 +30988,6 @@ pub(crate) fn obmc_plan(
     // `av1_setup_build_prediction_by_above_pred` passing that ref's own
     // `scale_factors`).
     frame_width: usize,
-    // lane-av1-422sub8rect: the plane's own subsampling shifts -- every
-    // chroma extent below derives from the luma rule by `>> ss` on the
-    // subsampled axis (`build_obmc_inter_pred_above`'s
-    // `overlap >> pd->subsampling_y` and the left pass's matching `>> ss_x`),
-    // never a blind half. 4:2:0 and 4:4:4 reduce to the old /2s and 0s.
-    ss: (usize, usize),
 ) -> Result<ObmcPlan> {
     // lane-rect r2 (libaom av1_build_obmc_inter_prediction): each pass has
     // its OWN neighbour cap (width-log2 for above, height-log2 for left) and
@@ -31025,16 +31019,16 @@ pub(crate) fn obmc_plan(
     let overlap_above = write_h.min(64) / 2;
     let overlap_left = write_w.min(64) / 2;
     // lane-inter8 r1 / lane-scaledref r1: `av1_skip_u4x4_pred_in_obmc`
-    // (reconinter.c:829) keys on the CHROMA plane block
-    // (`get_plane_block_size(bsize, ss_x, ss_y)`): BLOCK_4X4/BLOCK_8X4/
-    // BLOCK_4X8 return `dir == 0`, so the ABOVE pass skips chroma for those
-    // and the LEFT pass never does. lane-av1-422sub8rect: keyed on the
-    // per-axis-shifted plane shape now -- an 8x8 leaf is (4, 4) at 4:2:0
-    // (skip) and (4, 8) at 4:2:2 (still skip, BLOCK_4X8 is in the list),
-    // while 8x4/4x8 luma leaves are (4, 4) or (8, 4) at 4:2:2.
-    let (ss_x, ss_y) = ss;
-    let skip_chroma_above =
-        matches!((write_w >> ss_x, write_h >> ss_y), (4, 4) | (8, 4) | (4, 8));
+    // (`reconinter.c` 820) returns `dir == 0` when the chroma plane's own
+    // block is BLOCK_4X4/8X4/4X8 (an 8x8, 16x8 or 8x16 luma block at 4:2:0):
+    // the ABOVE pass skips chroma entirely, the LEFT pass still blends it.
+    // lane-av1-422sub8rect stop-note: keyed on the LUMA write shape -- a
+    // 4:4:4 block's plane block is square, so libaom's plane-block test
+    // would run the above pass there; this tree keeps the 4:2:0-shaped
+    // corner-cut (measured: the ss-shifted conformant port moved a boundary
+    // sample AWAY from aomdec on the obmc444 fixture, lanes/ report) and
+    // leaves the 444-conformant flip to the owning 444 lane.
+    let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
     let mut above = Vec::new();
     for (off4, span4, nb, src4) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
@@ -31102,7 +31096,6 @@ pub(crate) fn obmc_plan(
         cpy,
         overlap_above,
         overlap_left,
-        ss,
         skip_chroma_above,
     })
 }
@@ -31136,8 +31129,6 @@ pub(crate) struct ObmcPlan {
     cpy: usize,
     overlap_above: usize,
     overlap_left: usize,
-    /// The plane's own subsampling shifts ([`obmc_plan`]).
-    ss: (usize, usize),
     skip_chroma_above: bool,
 }
 
@@ -31165,18 +31156,9 @@ pub(crate) fn obmc_run(
         cpy,
         overlap_above,
         overlap_left,
-        ss,
         skip_chroma_above,
         ..
     } = plan;
-    // lane-av1-422sub8rect: every chroma extent is the luma rule shifted by
-    // the plane's own subsampling (`build_obmc_inter_pred_above`'s
-    // `overlap >> pd->subsampling_y`, the left pass's `>> ss_x`, the
-    // neighbour-span `>> ss` per axis) -- 4:2:0 and 4:4:4 reduce to the old
-    // halves, 4:2:2 keeps the unhalved height.
-    let (ss_x, ss_y) = ss;
-    let chroma_w = write_w >> ss_x;
-    let chroma_h = write_h >> ss_y;
     // lane-alloc: one neighbour-prediction buffer per plane for the whole
     // block, reused by every neighbour of the above and left passes.
     let (mut tmp_y, mut tmp_u, mut tmp_v) = (Vec::new(), Vec::new(), Vec::new());
@@ -31195,8 +31177,7 @@ pub(crate) fn obmc_run(
         let (x, y) = (f[1].parse::<usize>().ok()?, f[2].parse::<usize>().ok()?);
         let fr = f.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
         let idx = PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst) as i64;
-        let (mcb_cw, mcb_ch) = (write_w >> ss_x, write_h >> ss_y);
-        if x >= cpx && x < cpx + mcb_cw && y >= cpy && y < cpy + mcb_ch
+        if x >= cpx && x < cpx + write_w / 2 && y >= cpy && y < cpy + write_h / 2
             && (fr < 0 || fr == idx)
         {
             Some((x, y, idx))
@@ -31207,11 +31188,11 @@ pub(crate) fn obmc_run(
     if let Some((_, _, idx)) = ec_mcb {
         eprintln!(
             "OUR_MCB pre f={idx} cpx={cpx} cpy={cpy} cw={} ch={}",
-            write_w >> ss_x,
-            write_h >> ss_y
+            write_w / 2,
+            write_h / 2
         );
-        for r in 0..(write_h >> ss_y) {
-            let row: Vec<u16> = (0..(write_w >> ss_x)).map(|c| pred_u[r * chroma_side + c]).collect();
+        for r in 0..write_h / 2 {
+            let row: Vec<u16> = (0..write_w / 2).map(|c| pred_u[r * chroma_side + c]).collect();
             eprintln!("OUR_MCB prerow{r}: {row:?}");
         }
     }
@@ -31227,10 +31208,9 @@ pub(crate) fn obmc_run(
         if !skip_chroma_above {
             // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
             // sizes only the OBMC PREDICTION buffer; the blend length is the
-            // plain `overlap >> ss_y` (`build_obmc_inter_pred_above`:
-            // `bh = overlap >> pd->subsampling_y`).
-            let (cbw, cbh, cox) = (bw >> ss_x, overlap_above >> ss_y, ox >> ss_x);
-            let cw = cbw.min(chroma_w - cox);
+            // plain half (`build_obmc_inter_pred_above`: `overlap >> ss_y`).
+            let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
+            let cw = cbw.min(write_w / 2 - cox);
             obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
             obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
@@ -31245,7 +31225,7 @@ pub(crate) fn obmc_run(
         let (bw, bh, oy) = (overlap_left, nb.span4 * 4, nb.off4 * 4);
         obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_y, fctx);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh.min(write_h - oy), &tmp_y);
-        let (cbw, cbh, coy) = (overlap_left >> ss_x, bh >> ss_y, oy >> ss_y);
+        let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
         obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
         if let Some((_, _, idx)) = ec_mcb {
             eprintln!(
@@ -31257,14 +31237,14 @@ pub(crate) fn obmc_run(
                 eprintln!("OUR_MCB lrow{r}: {row:?}");
             }
         }
-        let ch = cbh.min(chroma_h - coy);
+        let ch = cbh.min(write_h / 2 - coy);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
         obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
-        for r in 0..chroma_h {
-            let row: Vec<u16> = (0..chroma_w).map(|c| pred_u[r * chroma_side + c]).collect();
+        for r in 0..write_h / 2 {
+            let row: Vec<u16> = (0..write_w / 2).map(|c| pred_u[r * chroma_side + c]).collect();
             eprintln!("OUR_MCB post f={idx} row{r}: {row:?}");
         }
     }
@@ -34116,7 +34096,6 @@ fn decode_inter_block(
                     refpix,
                     interp_fixed,
                     frame_width,
-                    (ss_x(fctx), ss_y(fctx)),
                 )?)
             } else {
                 None
@@ -39835,7 +39814,6 @@ ss_y(fctx),
                 refpix,
                 interp_fixed,
                 frame_width,
-                (ss_x(fctx), ss_y(fctx)),
             )?)
         } else {
             None
