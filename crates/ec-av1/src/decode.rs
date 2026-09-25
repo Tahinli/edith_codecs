@@ -41520,22 +41520,50 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     // so there is no pair: each strip codes
                                     // and predicts its own chroma from its
                                     // own motion (`prev` = None).
-                                    let strip_has_chroma =
-                                        i % 2 == 1 || ss_y(fctx) == 0;
-                                    let pair_mi = if !strip_has_chroma || ss_x(fctx) == 0 {
-                                        at_mi
-                                    } else if horz {
-                                        (at_mi.0 - 1, at_mi.1)
+                                    // lane-av1-422l: a strip pairs along its
+                                    // OWN subsampled axis -- horz strips pair
+                                    // on rows (no pair once ss_y == 0: chroma
+                                    // has no row parity, every 16x4 strip is
+                                    // its own reference, exactly the intra
+                                    // strip arm's `else if ss_y(fctx) == 0`);
+                                    // vert strips pair on columns (ss_x == 0
+                                    // => every strip self-pairs, 4:2:2 keeps
+                                    // the 4:2:0 column pairing -- a VERT_4
+                                    // 4x16 strip's `ss_size_lookup` chroma
+                                    // at ss (1,0) is BLOCK_INVALID, so only
+                                    // the pair shape can ever be coded).
+                                    let strip_has_chroma = if horz {
+                                        i % 2 == 1 || ss_y(fctx) == 0
                                     } else {
-                                        (at_mi.0, at_mi.1 - 1)
+                                        i % 2 == 1 || ss_x(fctx) == 0
                                     };
+                                    let pair_mi =
+                                        if !strip_has_chroma
+                                            || (if horz {
+                                                ss_y(fctx) == 0
+                                            } else {
+                                                ss_x(fctx) == 0
+                                            })
+                                        {
+                                            at_mi
+                                        } else if horz {
+                                            (at_mi.0 - 1, at_mi.1)
+                                        } else {
+                                            (at_mi.0, at_mi.1 - 1)
+                                        };
                                     fctx.inter_strip_chroma.with(|c| {
                                         c.set(Some(InterStripChroma {
                                             has_chroma: strip_has_chroma,
                                             horz,
                                             pair_mi,
-                                            prev: if strip_has_chroma && ss_x(fctx) == 1 {
-                                                fctx.inter_last_mc.with(std::cell::Cell::get)
+                                            prev: if strip_has_chroma
+                                                && (if horz {
+                                                    ss_y(fctx) == 1
+                                                } else {
+                                                    ss_x(fctx) == 1
+                                                }) {
+                                                fctx.inter_last_mc
+                                                    .with(std::cell::Cell::get)
                                             } else {
                                                 None
                                             },
