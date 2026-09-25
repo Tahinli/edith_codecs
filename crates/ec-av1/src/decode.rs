@@ -22417,6 +22417,13 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> Result<TxbSet> {
         // block (`av1_get_max_uv_txsize` adjusts `TX_64X32`/`TX_32X64` to
         // `TX_32X32`); `get_txsize_entropy_ctx(TX_32X32)` is the 32x32 set.
         (32, 32) => TxbSet::Chroma32,
+        // lane-av1-422j: square chroma units of a 4:2:2 strip -- a 16x8
+        // (8x16) luma strip's chroma plane block is 8x8 (16x16) square, and
+        // the square-block routing above sends it here. The sets are the
+        // exact `get_txsize_entropy_ctx` tables the square arms use.
+        (16, 16) => TxbSet::Chroma16,
+        (8, 8) => TxbSet::Chroma8,
+        (4, 4) => TxbSet::Chroma4,
         _ => {
             return Err(unsupported(
                 "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
@@ -22471,6 +22478,11 @@ fn rect_scan(w: usize, h: usize) -> Result<&'static [u16]> {
         (4, 8) => &SCAN_4X8,
         (32, 8) => &SCAN_32X8,
         (8, 32) => &SCAN_8X32,
+        // lane-av1-422j: square units routed through the rect reader -- a
+        // 4:2:2 strip's square chroma plane block (8x8 under a 16x8 strip,
+        // 16x16 under an 8x16 one). The default 2D scan is exactly what the
+        // square reader uses for the same side.
+        (w, h) if w == h => default_scan(w),
         _ => {
             return Err(unsupported(
                 "a rectangular transform unit whose shape has no coefficient scan table here",
@@ -31224,7 +31236,17 @@ fn decode_inter_block(
         Some(s) if s.has_chroma => (s.pair_mi.1 * MI >> ss_x(fctx), s.pair_mi.0 * MI >> ss_y(fctx)),
         _ => (px >> ss_x(fctx), py >> ss_y(fctx)),
     };
-    let chroma_side = side >> ss_x(fctx);
+    // lane-av1-422j: the chroma prediction/residual buffers are
+    // `chroma_side`-square and every consumer indexes them
+    // `row * chroma_side + col` over the WRITE rect (`write_chroma_w` x
+    // `write_chroma_h`). At ss (1,0) that rect is `side/2 x side` (an 8x16
+    // strip's 4x16 chroma), so a `side >> ss_x` square is shorter than
+    // `row * chroma_side + write_chroma_w` on rows `>= side/2` -- frame 1's
+    // skipped VERT_B strip read `prediction[64..68]` out of the 64-sample
+    // buffer (reconstruct_mc_rect panic, decode.rs:29094). The enclosing
+    // square of the chroma rect is the max: unchanged at 4:2:0 (side/2) and
+    // 4:4:4 (side), so only 4:2:2 changes shape.
+    let chroma_side = (side >> ss_x(fctx)).max(side >> ss_y(fctx));
     let (write_chroma_w, write_chroma_h) = match strip_chroma {
         Some(s) if s.has_chroma => {
             // 4:2:0: the PAIR's 8x4 / 4x8. 4:4:4: the strip's own 16x4 /
@@ -32699,9 +32721,19 @@ fn decode_inter_block(
                     // whole-block record must not overwrite them with the
                     // assembled grid (class `override-slot-on-one-arm`).
                     mu_chroma = true;
-                } else if rect_tu {
+                } else if rect_tu
+                    || (write_chroma_w, write_chroma_h) != (chroma_side, chroma_side)
+                {
                     // One chroma read for the whole strip at 4:2:0, two
                     // 32-capped units at 4:4:4 -- see the helper.
+                    // lane-av1-422j: a 4:2:2 square block's chroma plane is the
+                    // (side/2 x side) rect (a 32x32 block's 16x32), never
+                    // `chroma_side`-square -- the square read below would pair
+                    // a `chroma_side`-square unit with the 4:2:0 unit scan
+                    // (one-coefficient-per-position assert in
+                    // inverse_transform_2d_typed_wh). The rect reader codes
+                    // the exact `av1_get_max_uv_txsize` unit (TX_16X32,
+                    // `rect_inter_chroma_set`'s tables).
                     (u_grid, v_grid, rect_chroma_units) = read_inter_rect_chroma(
                         dec,
                         cdfs,
@@ -34199,9 +34231,16 @@ fn decode_inter_block(
                     // whole-block record must not overwrite them with the
                     // assembled grid (class `override-slot-on-one-arm`).
                     mu_chroma = true;
-                } else if rect_tu {
+                } else if rect_tu
+                    || (write_chroma_w, write_chroma_h) != (chroma_side, chroma_side)
+                {
                     // One chroma read for the whole strip at 4:2:0, two
                     // 32-capped units at 4:4:4 -- see the helper.
+                    // lane-av1-422j: same rule as the compound arm above -- a
+                    // 4:2:2 square block's chroma plane is the
+                    // (side/2 x side) rect, so the rect reader takes it
+                    // instead of pairing a `chroma_side`-square unit with the
+                    // 4:2:0 scan.
                     (u_grid, v_grid, rect_chroma_units) = read_inter_rect_chroma(
                         dec,
                         cdfs,
