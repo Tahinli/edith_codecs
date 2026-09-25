@@ -2038,6 +2038,22 @@ pub fn chroma422_square_hits() -> usize {
     CHROMA422_SQUARE_HITS.with(|c| c.get())
 }
 
+// lane-av1-422f: how many RECT chroma coefficient units the square-block
+// path read on a 4:2:2 frame (ss 1,0) -- TX_4X8 / TX_8X16 / TX_16X32, the
+// plane block's own half-width, unhalved-height shape. A 4:2:0 or 4:4:4
+// frame never takes the rect branch (their units are square
+// `chroma_tx == chroma_tx_h`), so a witness gate reading 0 here proves the
+// model reverted to squares.
+thread_local! {
+    static CHROMA422_RECT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CHROMA422_RECT_HITS`].
+pub fn chroma422_rect_hits() -> usize {
+    CHROMA422_RECT_HITS.with(|c| c.get())
+}
+
 // How many HORZ/VERT intra strips actually predicted with filter intra
 // (lane-rectsplit r1) -- the case `decode_block_rect` refused by name
 // ("this decoder predicts square-only") until `predict_filter_intra` took
@@ -8469,6 +8485,46 @@ impl Neighbours {
         let left_mi = side_mi.min(self.mi_rows.saturating_sub(mi_r));
         let mut out = [(false, false, 0i32); 3];
         for cell in 0..above_mi {
+            let above = &self.above[mi_c + cell];
+            for (plane, o) in out.iter_mut().enumerate() {
+                o.0 |= above[plane].level != 0;
+                o.2 += dc_vote(above[plane].dc);
+            }
+        }
+        for cell in 0..left_mi {
+            let left = &self.left[mi_r + cell];
+            for (plane, o) in out.iter_mut().enumerate() {
+                o.1 |= left[plane].level != 0;
+                o.2 += dc_vote(left[plane].dc);
+            }
+        }
+        out
+    }
+
+    /// [`Self::around_mi_rect`] for the CHROMA planes of a 4:2:2 frame
+    /// (lane-av1-422f): libaom `get_txb_ctx_general` reads its above votes
+    /// over `txb_w_unit` CHROMA 4-px cells, and at ss_x 1 one chroma cell
+    /// spans TWO luma mi columns. Both cells of a column carry the covering
+    /// unit's whole-unit dc sign (the same value libaom stores), so the
+    /// per-luma-mi sum counts each chroma column twice -- and
+    /// `dc_sign_ctx`'s signum flips whenever the above and left votes have
+    /// opposite signs with equal magnitude (measured at mi(4,4) plane 1 of
+    /// the t422 fixture: ours read `dc_sign_cdf[1]`, the oracle row 0).
+    /// Sampling every second above cell counts each chroma column once,
+    /// which IS libaom's sum. The left extent is unsubsquared at ss_y 0, so
+    /// its per-mi cells already line up one-to-one. The level booleans are
+    /// ORs over duplicated cells, so the sampling cannot change them.
+    fn around_mi_422_chroma(
+        &self,
+        (mi_r, mi_c): (usize, usize),
+        w: usize,
+        h: usize,
+    ) -> [(bool, bool, i32); 3] {
+        let (w_mi, h_mi) = (w / MI, h / MI);
+        let above_mi = w_mi.min(self.mi_cols.saturating_sub(mi_c));
+        let left_mi = h_mi.min(self.mi_rows.saturating_sub(mi_r));
+        let mut out = [(false, false, 0i32); 3];
+        for cell in (0..above_mi).step_by(2) {
             let above = &self.above[mi_c + cell];
             for (plane, o) in out.iter_mut().enumerate() {
                 o.0 |= above[plane].level != 0;
@@ -16620,6 +16676,100 @@ fn read_plane(
     Ok(levels)
 }
 
+/// [`push_intra`] when the unit is square, [`push_intra_rect`] when it is a
+/// rect (lane-av1-422f): a 4:2:2 square-block chroma unit is the plane
+/// block's own rect shape, and the `rect` flag selects
+/// [`PlaneBuf::reconstruct_rect`]'s two-dimensional loop.
+#[allow(clippy::too_many_arguments)]
+fn push_intra_unit(
+    plane: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    mode: usize,
+    angle_delta: i32,
+    reach: Reach,
+    residual: &[i32],
+    cfl: Option<(i32, CflSrc)>,
+    filter_intra: Option<usize>,
+    smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
+) {
+    if w == h {
+        push_intra(plane, x, y, w, mode, angle_delta, reach, residual, cfl,
+            filter_intra, smooth_neighbor, fctx);
+    } else {
+        push_intra_rect(plane, x, y, w, h, mode, angle_delta, reach, residual, cfl,
+            filter_intra, smooth_neighbor, fctx);
+    }
+}
+
+/// ONE RECT chroma transform unit of a square block's uv plane
+/// (lane-av1-422f) -- a 4:2:2 frame's plane block is `(side/2, side)` and
+/// `av1_get_max_uv_txsize` fills it with a single rect unit below side 64
+/// (TX_4X8 / TX_8X16 / TX_16X32), which the square-shaped [`read_plane`]
+/// cannot express. Same shape as [`leaf8_chroma422_unit`]'s proven read: the
+/// [`TxbSet`] whose entropy class the unit squares up to, the unit-shaped
+/// scan, `txb_skip_ctx` = above + left in the offset-7 rows (the unit covers
+/// the plane block exactly, so no `+3` bigger-plane term -- that one lives in
+/// the square multi-unit walks' `chroma_ctx_offset`), and the plane's
+/// predicted mode supplies the mode-derived default `tx_type` unless an armed
+/// [`INTRABC_CHROMA_TX`] slot carries the intrabc luma's own -- except at an
+/// entropy class of 32x32 and up, where the spec forces `DCT_DCT`
+/// ([`read_plane`]'s `side >= 32` clamp).
+#[allow(clippy::too_many_arguments)]
+fn read_rect_chroma_unit(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    set: TxbSet,
+    scan: &[u16],
+    w: usize,
+    h: usize,
+    plane_idx: usize,
+    around: (bool, bool, i32),
+    uv_predict_mode: usize,
+    angle_delta_uv: i32,
+    reach: Reach,
+    // Unread, like [`read_plane`]'s own: the borrow proves the caller holds
+    // the plane exclusively while the unit's coefficients are parsed.
+    _plane: &mut PlaneBuf<'static>,
+    x: usize,
+    y: usize,
+    // Signature parity with [`read_plane`]; the dequant reads its q index
+    // off `block_q_idx(fctx)` like every other reader here.
+    _base_q_idx: u8,
+    cfl: Option<(i32, CflSrc)>,
+    smooth_neighbor_uv: bool, fctx: &crate::decode::FrameCtx,
+) -> Result<Grid> {
+    if ss_x(fctx) == 1 && ss_y(fctx) == 0 && w != h {
+        hit!(CHROMA422_RECT_HITS);
+    }
+    let default_tx = if w.max(h) >= 32 {
+        TxType::DctDct
+    } else {
+        fctx
+            .intrabc_chroma_tx
+            .with(std::cell::Cell::get)
+            .unwrap_or_else(|| default_intra_tx_type(uv_predict_mode as u8))
+    };
+    let mut coding = cdfs.txb(set, uv_predict_mode);
+    let (levels, tx_type) = read_coeffs_rect(
+        dec, &mut coding, scan, w, h,
+        usize::from(around.0) + usize::from(around.1),
+        dc_sign_ctx(around.2), default_tx,
+    )?;
+    let residual = dequant_and_inverse_typed_wh(
+        &levels, w, h, crate::decode::bit_depth(fctx), block_q_idx(fctx),
+        plane_q_delta(plane_idx, fctx).0, plane_q_delta(plane_idx, fctx).1,
+        tx_type, block_iqmatrix(fctx, plane_idx, w, h, tx_type),
+    );
+    push_intra_rect(
+        plane_idx, x, y, w, h, uv_predict_mode, angle_delta_uv, reach,
+        &residual, cfl, None, smooth_neighbor_uv, fctx,
+    );
+    Ok(levels)
+}
+
 /// Decodes one whole-block coded superblock/quadrant/leaf: its mode, then its
 /// three planes, reconstructing them into `y`/`u`/`v` and updating
 /// `neighbours`.
@@ -16690,8 +16840,8 @@ fn decode_block(
     // rewrite (which sat above `read_intra_mode`) rides along here -- same
     // per-frame `ss_x`/`ss_y` condition, now resolved against the block's own
     // segment like the lossless arm above it.
-    let (luma_set, chroma_set, luma_tx, chroma_tx, scans) = if lossless(fctx) {
-        (TxbSet::Luma4, TxbSet::Chroma4, 4, 4, (scan4, scan4))
+    let (luma_set, chroma_set, luma_tx, chroma_tx, chroma_tx_h, scans) = if lossless(fctx) {
+        (TxbSet::Luma4, TxbSet::Chroma4, 4, 4, 4, (scan4, scan4))
     } else if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
         let tx = if side >= 64 { 32 } else { side };
         let (set, scan): (TxbSet, &[u16]) = match tx {
@@ -16700,27 +16850,39 @@ fn decode_block(
             8 => (TxbSet::Chroma8, scan8),
             _ => (TxbSet::Chroma4, scan4),
         };
-        (luma_set, set, luma_tx, tx, (scans.0, scan))
+        (luma_set, set, luma_tx, tx, tx, (scans.0, scan))
     } else if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
-        // lane-av1-422b: the uv plane block is (side/2, side)
-        // (`ss_size_lookup[..][1][0]`), so `av1_get_max_uv_txsize` is the
-        // SQUARE transform of the smaller dimension, capped at TX_32X32
-        // (`av1_get_adjusted_tx_size` only ever shrinks): 4 -> TX_4X4 (the
-        // 2x4 plane rounds up to BLOCK_4X4), 8 -> TX_4X4 (BLOCK_4X8),
-        // 16 -> TX_8X8 (BLOCK_8X16), 32 -> TX_16X16, 64 -> TX_32X32
-        // (BLOCK_32X64), 128 -> TX_32X32 (BLOCK_64X128 adjusts TX_64X64
-        // down). The units stay square; the UNIT GRID is (side/2)/tx wide
-        // by side/tx tall -- never square above a 4x4 luma block.
-        let tx = if side >= 64 { 32 } else { (side / 2).max(4) };
-        let (set, scan): (TxbSet, &[u16]) = match tx {
-            32 => (TxbSet::Chroma32, scan32),
-            16 => (TxbSet::Chroma16, scan16),
-            8 => (TxbSet::Chroma8, scan8),
-            _ => (TxbSet::Chroma4, scan4),
+        // lane-av1-422f: the uv plane block is the (side/2, side) rect
+        // (`ss_size_lookup[..][1][0]`), and `av1_get_max_uv_txsize` is
+        // `av1_get_adjusted_tx_size(max_txsize_rect_lookup[plane_bsize])` --
+        // the RECT that fills the plane block, NOT the square transform of
+        // the smaller side (the oracle reads ONE TX_8X16 for a 16x16 block's
+        // 8x16 plane where the old model read two 8x8 units): 4 -> TX_4X4
+        // (the 2x4 plane rounds up to BLOCK_4X4), 8 -> TX_4X8, 16 ->
+        // TX_8X16, 32 -> TX_16X32 (one unit per plane, the whole plane
+        // block), 64 -> TX_32X64 adjusts to TX_32X32 and 128 -> TX_64X64
+        // adjusts to TX_32X32 (square units, a 1x2 / 2x4 grid).
+        // `chroma_tx` is the unit WIDTH, `chroma_tx_h` its HEIGHT; the
+        // chroma walks below read one (chroma_tx, chroma_tx_h) unit per grid
+        // cell and key their rect reads on `chroma_tx != chroma_tx_h`.
+        let (tx_w, tx_h) = match side {
+            4 => (4, 4),
+            8 => (4, 8),
+            16 => (8, 16),
+            32 => (16, 32),
+            // 64 and 128: TX_32X64 / TX_64X64 adjust down to TX_32X32.
+            _ => (32, 32),
         };
-        (luma_set, set, luma_tx, tx, (scans.0, scan))
+        let (set, scan): (TxbSet, &[u16]) = match side {
+            4 => (TxbSet::Chroma4, scan4),
+            8 => (TxbSet::ChromaRect8x4, &SCAN_4X8[..]),
+            16 => (TxbSet::ChromaRect16x8, &SCAN_8X16[..]),
+            32 => (TxbSet::ChromaRect32x16, &SCAN_16X32[..]),
+            _ => (TxbSet::Chroma32, scan32),
+        };
+        (luma_set, set, luma_tx, tx_w, tx_h, (scans.0, scan))
     } else {
-        (luma_set, chroma_set, luma_tx, chroma_tx, scans)
+        (luma_set, chroma_set, luma_tx, chroma_tx, chroma_tx, scans)
     };
     let intrabc_dv = fctx.intrabc_dv.with(|c| c.take());
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
@@ -17020,11 +17182,13 @@ fn decode_block(
         // square at 4:2:0/4:4:4, at 4:2:2 `(side/2)/tx` units wide by
         // `side/tx` tall (the plane block is (side/2, side)). A unit's LUMA
         // anchor follows the per-axis shifts: `chroma_tx << ss_x` wide,
-        // `chroma_tx << ss_y` tall.
+        // `chroma_tx_h << ss_y` tall (lane-av1-422f: the unit itself is the
+        // (chroma_tx, chroma_tx_h) rect, so a 4:2:2 frame below side 64
+        // reads ONE unit per plane, the whole plane block).
         let cn_cols = (chroma_side / chroma_tx).max(1);
-        let cn_rows = (chroma_height / chroma_tx).max(1);
+        let cn_rows = (chroma_height / chroma_tx_h).max(1);
         let luma_span_x = chroma_tx << ss_x(fctx);
-        let luma_span_y = chroma_tx << ss_y(fctx);
+        let luma_span_y = chroma_tx_h << ss_y(fctx);
         for cu_row in 0..cn_rows {
             for cu_col in 0..cn_cols {
                 let cu_r = if cn_rows == 1 && cn_cols == 1 {
@@ -17036,18 +17200,19 @@ fn decode_block(
                         reach, px, py, y.width, y.height, fctx,
                     )
                 };
-                let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx);
+                let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx_h);
                 if let Some((ub, _)) = &palette_uv_bufs {
                     set_palette_pred(ub.clone(), fctx);
                 }
-                push_intra(1, 
+                push_intra_unit(1, 
                     cu_x,
                     cu_y,
                     chroma_tx,
+                    chroma_tx_h,
                     uv_predict_mode,
                     angle_delta_uv,
                     cu_r,
-                    &ZERO_RESIDUAL[..chroma_tx * chroma_tx],
+                    &ZERO_RESIDUAL[..chroma_tx * chroma_tx_h],
                     alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                     None,
                     smooth_neighbor_uv, fctx,
@@ -17055,14 +17220,15 @@ fn decode_block(
                 if let Some((_, vb)) = &palette_uv_bufs {
                     set_palette_pred(vb.clone(), fctx);
                 }
-                push_intra(2, 
+                push_intra_unit(2, 
                     cu_x,
                     cu_y,
                     chroma_tx,
+                    chroma_tx_h,
                     uv_predict_mode,
                     angle_delta_uv,
                     cu_r,
-                    &ZERO_RESIDUAL[..chroma_tx * chroma_tx],
+                    &ZERO_RESIDUAL[..chroma_tx * chroma_tx_h],
                     alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                     None,
                     smooth_neighbor_uv, fctx,
@@ -17120,11 +17286,15 @@ fn decode_block(
         // At 4:2:0 `chroma_side == chroma_tx`, so it stays one read.
         // lane-av1-422b: 4:2:2 never collapses to one read above a 4x4 luma
         // block -- the unit grid is `(side/2)/tx` wide by `side/tx` tall.
+        // lane-av1-422f: `chroma_tx` is the unit WIDTH and `chroma_tx_h` its
+        // HEIGHT, so below side 64 a 4:2:2 frame's grid is 1x1 and the one
+        // unit is the plane block's own rect.
         let cn_cols = (chroma_side / chroma_tx).max(1);
-        let cn_rows = (chroma_height / chroma_tx).max(1);
+        let cn_rows = (chroma_height / chroma_tx_h).max(1);
         let luma_span_x = chroma_tx << ss_x(fctx);
-        let luma_span_y = chroma_tx << ss_y(fctx);
+        let luma_span_y = chroma_tx_h << ss_y(fctx);
         let (u_grid, v_grid, chroma_units) = if cn_rows == 1 && cn_cols == 1 {
+            if chroma_tx == chroma_tx_h {
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
@@ -17182,6 +17352,37 @@ fn decode_block(
                 smooth_neighbor_uv, fctx,
             )?;
             (u_grid, v_grid, Vec::new())
+            } else {
+                // lane-av1-422f: the one unit is a RECT filling the plane
+                // block -- the square-shaped [`read_plane`] cannot express
+                // it, so both planes go through [`read_rect_chroma_unit`]
+                // (U, then V, the same order the square arm reads). The
+                // chroma context reads per chroma 4-px cell (see
+                // [`Neighbours::around_mi_422_chroma`]).
+                let chroma_around =
+                    neighbours.around_mi_422_chroma((mi_r, mi_c), side, side);
+                if let Some((ub, _)) = &palette_uv_bufs {
+                    set_palette_pred(ub.clone(), fctx);
+                }
+                let u_grid = read_rect_chroma_unit(
+                    dec, cdfs, chroma_set, scans.1, chroma_tx, chroma_tx_h, 1,
+                    chroma_around[1], uv_predict_mode, angle_delta_uv, reach, u,
+                    cpx, cpy, base_q_idx,
+                    alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+                    smooth_neighbor_uv, fctx,
+                )?;
+                if let Some((_, vb)) = &palette_uv_bufs {
+                    set_palette_pred(vb.clone(), fctx);
+                }
+                let v_grid = read_rect_chroma_unit(
+                    dec, cdfs, chroma_set, scans.1, chroma_tx, chroma_tx_h, 2,
+                    chroma_around[2], uv_predict_mode, angle_delta_uv, reach, v,
+                    cpx, cpy, base_q_idx,
+                    alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+                    smooth_neighbor_uv, fctx,
+                )?;
+                (u_grid, v_grid, Vec::new())
+            }
         } else {
             let chroma_ctx_offset = Some(3);
             let mut u_pass: Vec<Grid> = Vec::new();
@@ -17195,8 +17396,13 @@ fn decode_block(
                             mi_r + cu_row * (luma_span_y / MI),
                             mi_c + cu_col * (luma_span_x / MI),
                         );
-                        let cu_around =
-                            neighbours.around_mi_rect(cu_mi, luma_span_x, luma_span_y);
+                        let cu_around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                            // lane-av1-422f: chroma-only loop; per-chroma-cell
+                            // above votes (see [`Neighbours::around_mi_422_chroma`]).
+                            neighbours.around_mi_422_chroma(cu_mi, luma_span_x, luma_span_y)
+                        } else {
+                            neighbours.around_mi_rect(cu_mi, luma_span_x, luma_span_y)
+                        };
                         let cu_reach = tu_reach_rect(
                             side,
                             side,
@@ -17210,13 +17416,14 @@ fn decode_block(
                             y.width,
                             y.height, fctx,
                         );
-                        let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx);
+                        let (cu_x, cu_y) =
+                            (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx_h);
                         if let Some((ub, vb)) = &palette_uv_bufs {
                             let pbuf = if plane_pass == 1 { ub } else { vb };
                             set_palette_pred(
                                 palette_window(
-                                    pbuf, chroma_side, cu_col * chroma_tx, cu_row * chroma_tx,
-                                    chroma_tx, chroma_tx,
+                                    pbuf, chroma_side, cu_col * chroma_tx,
+                                    cu_row * chroma_tx_h, chroma_tx, chroma_tx_h,
                                 ),
                                 fctx,
                             );
@@ -17270,10 +17477,13 @@ fn decode_block(
         // the earlier tiles in this same block already wrote -- the same
         // per-TU pattern [`decode_leaf8`] already runs for an 8x8 leaf.
         let n_axis = side / logical_tx;
+        // lane-av1-422f: unit width/height per axis, like walk 2 above --
+        // a 4:2:2 frame below side 64 reads ONE rect unit per plane per
+        // chunk, the whole plane block.
         let cn_cols = (chroma_side / chroma_tx).max(1);
-        let cn_rows = (chroma_height / chroma_tx).max(1);
+        let cn_rows = (chroma_height / chroma_tx_h).max(1);
         let luma_span_x = chroma_tx << ss_x(fctx);
-        let luma_span_y = chroma_tx << ss_y(fctx);
+        let luma_span_y = chroma_tx_h << ss_y(fctx);
         // libaom's transform-block loop is over 64x64 luma "mu" chunks
         // (`decode_token_recon_block`: `mu_blocks_wide/high` =
         // `mi_size_wide[BLOCK_64X64]`), and it codes EVERY PLANE of a chunk
@@ -17473,22 +17683,38 @@ fn decode_block(
                     (2 * y.true_height.div_ceil(8)) as i32 - mi_r as i32 - span_mi as i32;
                 let plane_px = ((span_mi * 2).max(4)) as i32;
                 let max_units_w = ((plane_px + 2 * over_w_mi.min(0)) >> 2).max(0) as usize;
-                let max_units_h = ((plane_px + 2 * over_h_mi.min(0)) >> 2).max(0) as usize;
-                let unit = chroma_tx / 4; // TU side in 4x4 chroma units
-                if cu_col * unit >= max_units_w || cu_row * unit >= max_units_h {
+                // lane-av1-422f: the shared halved formula below the `else`
+                // counts the plane span in 4-px units through the 2-px-per-mi
+                // subsampled height, which a 4:2:2 plane does not have (ss_y
+                // 0) -- its span is the full luma mi count, so a keyed
+                // formula clips the same units libaom's `max_block_high`
+                // does. 4:2:0 and 4:4:4 keep the proven shared rows.
+                let max_units_h = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                    (span_mi as i32 + over_h_mi.min(0)).max(0) as usize
+                } else {
+                    ((plane_px + 2 * over_h_mi.min(0)) >> 2).max(0) as usize
+                };
+                let (unit_w, unit_h) = (chroma_tx / 4, chroma_tx_h / 4);
+                if cu_col * unit_w >= max_units_w || cu_row * unit_h >= max_units_h {
                     hit!(CHROMA_EDGE_TU_CLIP_HITS);
                     continue;
                 }
                 // The chroma context arrays are indexed in LUMA mi, so this
                 // unit's anchor is its own luma quadrant (lane-av1-422b: the
                 // quadrant spans `chroma_tx << ss_x` luma px wide by
-                // `chroma_tx << ss_y` tall -- at 4:2:2 a rect twice as wide
-                // as it is tall).
+                // `chroma_tx_h << ss_y` tall -- at 4:2:2 below side 64 the
+                // one unit's quadrant is the whole block).
                 let cu_mi = (
                     mi_r + cu_row * (luma_span_y / MI),
                     mi_c + cu_col * (luma_span_x / MI),
                 );
-                let cu_around = neighbours.around_mi_rect(cu_mi, luma_span_x, luma_span_y);
+                let cu_around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                    // lane-av1-422f: chroma-only loop; per-chroma-cell above
+                    // votes (see [`Neighbours::around_mi_422_chroma`]).
+                    neighbours.around_mi_422_chroma(cu_mi, luma_span_x, luma_span_y)
+                } else {
+                    neighbours.around_mi_rect(cu_mi, luma_span_x, luma_span_y)
+                };
                 let cu_reach = if cn_rows == 1 && cn_cols == 1 {
                     reach
                 } else {
@@ -17498,28 +17724,44 @@ fn decode_block(
                         reach, px, py, y.width, y.height, fctx,
                     )
                 };
-                let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx);
+                let (cu_x, cu_y) =
+                    (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx_h);
                 if let Some((ub, vb)) = &palette_uv_bufs {
                     let pbuf = if plane_pass == 1 { ub } else { vb };
                     set_palette_pred(
                         palette_window(
-                            pbuf, chroma_side, cu_col * chroma_tx, cu_row * chroma_tx,
-                            chroma_tx, chroma_tx,
+                            pbuf, chroma_side, cu_col * chroma_tx,
+                            cu_row * chroma_tx_h, chroma_tx, chroma_tx_h,
                         ),
                         fctx,
                     );
                 }
                 let buf: &mut PlaneBuf<'static> =
                     if plane_pass == 1 { &mut *u } else { &mut *v };
-                let cu_grid = read_plane(
-                    dec, cdfs, chroma_set, scans.1, plane_pass, cu_around[plane_pass], mode,
-                    uv_predict_mode, angle_delta_uv, cu_reach, buf, cu_x, cu_y,
-                    chroma_tx, chroma_tx, base_q_idx,
-                    alpha.zip(ac).map(|((au, av), ac)| {
-                        (if plane_pass == 1 { au } else { av }, ac)
-                    }),
-                    None, chroma_ctx_offset, smooth_neighbor_uv, fctx,
-                )?;
+                let cu_grid = if chroma_tx == chroma_tx_h {
+                    read_plane(
+                        dec, cdfs, chroma_set, scans.1, plane_pass, cu_around[plane_pass], mode,
+                        uv_predict_mode, angle_delta_uv, cu_reach, buf, cu_x, cu_y,
+                        chroma_tx, chroma_tx, base_q_idx,
+                        alpha.zip(ac).map(|((au, av), ac)| {
+                            (if plane_pass == 1 { au } else { av }, ac)
+                        }),
+                        None, chroma_ctx_offset, smooth_neighbor_uv, fctx,
+                    )?
+                } else {
+                    // lane-av1-422f: the whole plane block as one rect unit;
+                    // `chroma_ctx_offset` is `None` there (the unit covers
+                    // the plane block, so the offset-7 skip rows are right).
+                    read_rect_chroma_unit(
+                        dec, cdfs, chroma_set, scans.1, chroma_tx, chroma_tx_h, plane_pass,
+                        cu_around[plane_pass], uv_predict_mode, angle_delta_uv, cu_reach, buf,
+                        cu_x, cu_y, base_q_idx,
+                        alpha.zip(ac).map(|((au, av), ac)| {
+                            (if plane_pass == 1 { au } else { av }, ac)
+                        }),
+                        smooth_neighbor_uv, fctx,
+                    )?
+                };
                 if cn_rows * cn_cols > 1 {
                     hit!(CHROMA_SPLIT_TX_HITS);
                     if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
