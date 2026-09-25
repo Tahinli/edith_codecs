@@ -40,6 +40,7 @@ fn main() {
             "chroma422_square: {}",
             ec_av1::decode::chroma422_square_hits()
         );
+        println!("chroma422_rect: {}", ec_av1::decode::chroma422_rect_hits());
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
         println!(
