@@ -6809,6 +6809,7 @@ fn obmc_prediction(
         &refpix,
         Some(fctx.interp_filter.get()),
         frame_width,
+        (crate::decode::ss_x(fctx), crate::decode::ss_y(fctx)),
     )
     .ok()?;
     let mut pred = [

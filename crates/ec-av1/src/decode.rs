@@ -2069,6 +2069,22 @@ pub fn chroma422_sub8_hits() -> usize {
     CHROMA422_SUB8_HITS.with(|c| c.get())
 }
 
+// lane-av1-422sub8rect: how many PER-PIECE TX_4X4 chroma coefficient units
+// the INTER sub-8x8 split4 path read on a 4:2:2 frame (ss 1,0) -- one per
+// non-skipped odd-column piece per plane (`is_chroma_reference`'s
+// `mi_col & 0x01` at ss_x 1). 4:2:0 goes through the shared group unit and
+// 4:4:4 through [`sub8_leaf_chroma444`]'s own per-piece twin, so a witness
+// gate reading 0 here proves the inter 4:2:2 per-piece arm never ran.
+thread_local! {
+    static CHROMA422_INTER_SUB8_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CHROMA422_INTER_SUB8_HITS`].
+pub fn chroma422_inter_sub8_hits() -> usize {
+    CHROMA422_INTER_SUB8_HITS.with(|c| c.get())
+}
+
 // lane-av1-422m: how many TX_4X4 chunk units the invalid-ss-size chroma arm
 // read (the 8x32 luma block whose 4:2:2 plane has no `ss_size_lookup` block).
 // A 4:2:0 or 4:4:4 frame cannot increment it, so a non-zero read proves the
@@ -2668,7 +2684,10 @@ impl TxParams {
         if self.stride == 0 {
             return residual;
         }
-        let mut strided = vec![0i32; self.stride * self.stride];
+        // lane-av1-422sub8rect: `h` rows of `stride` -- a rect unit whose
+        // height exceeds its (narrow) prediction stride needs the full
+        // stride * h; every square caller has h == stride and is unchanged.
+        let mut strided = vec![0i32; self.stride * self.h];
         for row in 0..self.h {
             strided[row * self.stride..][..self.w]
                 .copy_from_slice(&residual[row * self.w..][..self.w]);
@@ -30740,6 +30759,8 @@ fn interintra_blend(
     bw: usize,
     bh: usize,
     stride: usize,
+    subw: usize,
+    subh: usize,
     ii_mode: u8,
     wedge: Option<(&'static [u8], usize)>,
     pred: &mut [u16], fctx: &crate::decode::FrameCtx,
@@ -30786,25 +30807,38 @@ fn interintra_blend(
             let m = u32::from(match wedge {
                 // lane-wii r2: wedge-interintra mask (aom_blend_a64_mask
                 // over the wedge codebook, intra as src0, fixed sign 0).
-                // Luma plane: mask rows are luma-resolution, ms == side.
-                // 4:2:0 chroma: 2x2 box average (reconinter.c sub8x8 --
-                // subw == subh == 1).
-                Some((mask, ms)) if ms == stride => mask[i * stride + j],
-                Some((mask, ms)) => {
-                    let t = 2 * i * ms + 2 * j;
-                    ((u32::from(mask[t])
-                        + u32::from(mask[t + 1])
-                        + u32::from(mask[t + ms])
-                        + u32::from(mask[t + ms + 1])
-                        + 2)
-                        >> 2) as u8
-                }
-                None => match ii_mode {
-                    0 => 32,
+                // `(subw, subh)` are the plane's own subsampling shifts;
+                // the four branches mirror aom_dsp/blend-a64-mask.c's
+                // `subw`/`subh` pair handling exactly: luma (0, 0) reads
+                // the direct sample, (1, 1) the 2x2 box average
+                // (reconinter.c sub8x8), and 4:2:2's (1, 0) the
+                // `AOM_BLEND_AVG` column pair.
+                Some((mask, ms)) => match (subw, subh) {
+                    (0, 0) => u32::from(mask[i * ms + j]),
+                    (1, 1) => {
+                        let t = 2 * i * ms + 2 * j;
+                        (u32::from(mask[t])
+                            + u32::from(mask[t + 1])
+                            + u32::from(mask[t + ms])
+                            + u32::from(mask[t + ms + 1])
+                            + 2)
+                            >> 2
+                    }
+                    (1, 0) => {
+                        let t = i * ms + 2 * j;
+                        (u32::from(mask[t]) + u32::from(mask[t + 1]) + 1) >> 1
+                    }
+                    (_sw, _sh) => {
+                        let t = 2 * i * ms + j;
+                        (u32::from(mask[t]) + u32::from(mask[t + ms]) + 1) >> 1
+                    }
+                },
+                None => u32::from(match ii_mode {
+                    0 => 32u8,
                     1 => II_WEIGHTS_1D[i * scale],
                     2 => II_WEIGHTS_1D[j * scale],
                     _ => II_WEIGHTS_1D[i.min(j) * scale],
-                },
+                }),
             });
             let idx = i * stride + j;
             pred[idx] = ((m * u32::from(intra[i * bw + j]) + (64 - m) * u32::from(pred[idx]) + 32)
@@ -30954,6 +30988,12 @@ pub(crate) fn obmc_plan(
     // `av1_setup_build_prediction_by_above_pred` passing that ref's own
     // `scale_factors`).
     frame_width: usize,
+    // lane-av1-422sub8rect: the plane's own subsampling shifts -- every
+    // chroma extent below derives from the luma rule by `>> ss` on the
+    // subsampled axis (`build_obmc_inter_pred_above`'s
+    // `overlap >> pd->subsampling_y` and the left pass's matching `>> ss_x`),
+    // never a blind half. 4:2:0 and 4:4:4 reduce to the old /2s and 0s.
+    ss: (usize, usize),
 ) -> Result<ObmcPlan> {
     // lane-rect r2 (libaom av1_build_obmc_inter_prediction): each pass has
     // its OWN neighbour cap (width-log2 for above, height-log2 for left) and
@@ -30985,10 +31025,16 @@ pub(crate) fn obmc_plan(
     let overlap_above = write_h.min(64) / 2;
     let overlap_left = write_w.min(64) / 2;
     // lane-inter8 r1 / lane-scaledref r1: `av1_skip_u4x4_pred_in_obmc`
-    // (`reconinter.c` 820) returns `dir == 0` when the chroma plane's own
-    // block is BLOCK_4X4/8X4/4X8 (an 8x8, 16x8 or 8x16 luma block at 4:2:0):
-    // the ABOVE pass skips chroma entirely, the LEFT pass still blends it.
-    let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
+    // (reconinter.c:829) keys on the CHROMA plane block
+    // (`get_plane_block_size(bsize, ss_x, ss_y)`): BLOCK_4X4/BLOCK_8X4/
+    // BLOCK_4X8 return `dir == 0`, so the ABOVE pass skips chroma for those
+    // and the LEFT pass never does. lane-av1-422sub8rect: keyed on the
+    // per-axis-shifted plane shape now -- an 8x8 leaf is (4, 4) at 4:2:0
+    // (skip) and (4, 8) at 4:2:2 (still skip, BLOCK_4X8 is in the list),
+    // while 8x4/4x8 luma leaves are (4, 4) or (8, 4) at 4:2:2.
+    let (ss_x, ss_y) = ss;
+    let skip_chroma_above =
+        matches!((write_w >> ss_x, write_h >> ss_y), (4, 4) | (8, 4) | (4, 8));
     let mut above = Vec::new();
     for (off4, span4, nb, src4) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
@@ -31056,6 +31102,7 @@ pub(crate) fn obmc_plan(
         cpy,
         overlap_above,
         overlap_left,
+        ss,
         skip_chroma_above,
     })
 }
@@ -31089,6 +31136,8 @@ pub(crate) struct ObmcPlan {
     cpy: usize,
     overlap_above: usize,
     overlap_left: usize,
+    /// The plane's own subsampling shifts ([`obmc_plan`]).
+    ss: (usize, usize),
     skip_chroma_above: bool,
 }
 
@@ -31116,9 +31165,18 @@ pub(crate) fn obmc_run(
         cpy,
         overlap_above,
         overlap_left,
+        ss,
         skip_chroma_above,
         ..
     } = plan;
+    // lane-av1-422sub8rect: every chroma extent is the luma rule shifted by
+    // the plane's own subsampling (`build_obmc_inter_pred_above`'s
+    // `overlap >> pd->subsampling_y`, the left pass's `>> ss_x`, the
+    // neighbour-span `>> ss` per axis) -- 4:2:0 and 4:4:4 reduce to the old
+    // halves, 4:2:2 keeps the unhalved height.
+    let (ss_x, ss_y) = ss;
+    let chroma_w = write_w >> ss_x;
+    let chroma_h = write_h >> ss_y;
     // lane-alloc: one neighbour-prediction buffer per plane for the whole
     // block, reused by every neighbour of the above and left passes.
     let (mut tmp_y, mut tmp_u, mut tmp_v) = (Vec::new(), Vec::new(), Vec::new());
@@ -31137,7 +31195,8 @@ pub(crate) fn obmc_run(
         let (x, y) = (f[1].parse::<usize>().ok()?, f[2].parse::<usize>().ok()?);
         let fr = f.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
         let idx = PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst) as i64;
-        if x >= cpx && x < cpx + write_w / 2 && y >= cpy && y < cpy + write_h / 2
+        let (mcb_cw, mcb_ch) = (write_w >> ss_x, write_h >> ss_y);
+        if x >= cpx && x < cpx + mcb_cw && y >= cpy && y < cpy + mcb_ch
             && (fr < 0 || fr == idx)
         {
             Some((x, y, idx))
@@ -31148,11 +31207,11 @@ pub(crate) fn obmc_run(
     if let Some((_, _, idx)) = ec_mcb {
         eprintln!(
             "OUR_MCB pre f={idx} cpx={cpx} cpy={cpy} cw={} ch={}",
-            write_w / 2,
-            write_h / 2
+            write_w >> ss_x,
+            write_h >> ss_y
         );
-        for r in 0..write_h / 2 {
-            let row: Vec<u16> = (0..write_w / 2).map(|c| pred_u[r * chroma_side + c]).collect();
+        for r in 0..(write_h >> ss_y) {
+            let row: Vec<u16> = (0..(write_w >> ss_x)).map(|c| pred_u[r * chroma_side + c]).collect();
             eprintln!("OUR_MCB prerow{r}: {row:?}");
         }
     }
@@ -31168,9 +31227,10 @@ pub(crate) fn obmc_run(
         if !skip_chroma_above {
             // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
             // sizes only the OBMC PREDICTION buffer; the blend length is the
-            // plain half (`build_obmc_inter_pred_above`: `overlap >> ss_y`).
-            let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
-            let cw = cbw.min(write_w / 2 - cox);
+            // plain `overlap >> ss_y` (`build_obmc_inter_pred_above`:
+            // `bh = overlap >> pd->subsampling_y`).
+            let (cbw, cbh, cox) = (bw >> ss_x, overlap_above >> ss_y, ox >> ss_x);
+            let cw = cbw.min(chroma_w - cox);
             obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
             obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
@@ -31185,7 +31245,7 @@ pub(crate) fn obmc_run(
         let (bw, bh, oy) = (overlap_left, nb.span4 * 4, nb.off4 * 4);
         obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_y, fctx);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh.min(write_h - oy), &tmp_y);
-        let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
+        let (cbw, cbh, coy) = (overlap_left >> ss_x, bh >> ss_y, oy >> ss_y);
         obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
         if let Some((_, _, idx)) = ec_mcb {
             eprintln!(
@@ -31197,14 +31257,14 @@ pub(crate) fn obmc_run(
                 eprintln!("OUR_MCB lrow{r}: {row:?}");
             }
         }
-        let ch = cbh.min(write_h / 2 - coy);
+        let ch = cbh.min(chroma_h - coy);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
         obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
-        for r in 0..write_h / 2 {
-            let row: Vec<u16> = (0..write_w / 2).map(|c| pred_u[r * chroma_side + c]).collect();
+        for r in 0..chroma_h {
+            let row: Vec<u16> = (0..chroma_w).map(|c| pred_u[r * chroma_side + c]).collect();
             eprintln!("OUR_MCB post f={idx} row{r}: {row:?}");
         }
     }
@@ -32643,7 +32703,7 @@ fn decode_inter_block(
             };
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
-                    &inter0_y, &inter1_y, mask_y, side, side, side, false, &mut pred_y, fctx,
+                    &inter0_y, &inter1_y, mask_y, side, side, side, 0, 0, &mut pred_y, fctx,
                 );
             } else {
                 mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y, fctx);
@@ -32707,6 +32767,13 @@ fn decode_inter_block(
             }
             let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_side * chroma_side);
             if let Some(mask_y) = mask_y {
+                // lane-av1-422sub8rect stop-note: this fn's 4:2:2 chroma
+                // prediction is still the square-cut model (the owning
+                // parent-lane surface) -- its buffer is `chroma_side`-square
+                // and cannot be indexed by the subsampled-axis mask walks,
+                // so at ss_x != ss_y the blend keeps the direct
+                // luma-resolution read (the pre-port behaviour, known
+                // divergent there) until that surface itself is ported.
                 mc::blend_masked_compound(
                     &inter0_u,
                     &inter1_u,
@@ -32714,7 +32781,8 @@ fn decode_inter_block(
                     side,
                     chroma_side,
                     chroma_side,
-                    ss_x(fctx) == 1 && ss_y(fctx) == 1,
+                    if ss_x(fctx) == ss_y(fctx) { ss_x(fctx) } else { 0 },
+                    if ss_x(fctx) == ss_y(fctx) { ss_y(fctx) } else { 0 },
                     &mut pred_u, fctx,
                 );
             } else {
@@ -32779,6 +32847,13 @@ fn decode_inter_block(
             }
             let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_side * chroma_side);
             if let Some(mask_y) = mask_y {
+                // lane-av1-422sub8rect stop-note: this fn's 4:2:2 chroma
+                // prediction is still the square-cut model (the owning
+                // parent-lane surface) -- its buffer is `chroma_side`-square
+                // and cannot be indexed by the subsampled-axis mask walks,
+                // so at ss_x != ss_y the blend keeps the direct
+                // luma-resolution read (the pre-port behaviour, known
+                // divergent there) until that surface itself is ported.
                 mc::blend_masked_compound(
                     &inter0_v,
                     &inter1_v,
@@ -32786,7 +32861,8 @@ fn decode_inter_block(
                     side,
                     chroma_side,
                     chroma_side,
-                    ss_x(fctx) == 1 && ss_y(fctx) == 1,
+                    if ss_x(fctx) == ss_y(fctx) { ss_x(fctx) } else { 0 },
+                    if ss_x(fctx) == ss_y(fctx) { ss_y(fctx) } else { 0 },
                     &mut pred_v, fctx,
                 );
             } else {
@@ -34040,6 +34116,7 @@ fn decode_inter_block(
                     refpix,
                     interp_fixed,
                     frame_width,
+                    (ss_x(fctx), ss_y(fctx)),
                 )?)
             } else {
                 None
@@ -34201,14 +34278,14 @@ fn decode_inter_block(
                 if write_w != write_h {
                     hit!(INTERINTRA_RECT_HITS);
                 }
-                interintra_blend(y, px, py, write_w, write_h, side, ii, wedge_mask, &mut pred_y, fctx);
+                interintra_blend(y, px, py, write_w, write_h, side, 0, 0, ii, wedge_mask, &mut pred_y, fctx);
                 interintra_blend(
-                    u, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ii, wedge_mask,
-                    &mut pred_u, fctx,
+                    u, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ss_x(fctx),
+                    ss_y(fctx), ii, wedge_mask, &mut pred_u, fctx,
                 );
                 interintra_blend(
-                    v, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ii, wedge_mask,
-                    &mut pred_v, fctx,
+                    v, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ss_x(fctx),
+                    ss_y(fctx), ii, wedge_mask, &mut pred_v, fctx,
                 );
             }
             if let Some(plan) = &obmc {
@@ -36202,6 +36279,17 @@ fn decode_inter_sub8_split4(
     // frame 1: plane 0,1,2 per leaf in leaf order) -- there is no shared
     // group unit and no 2x2-piece group prediction.
     let chroma_444 = ss_x(fctx) == 0 && ss_y(fctx) == 0;
+    // 4:2:2 (lane-av1-422sub8rect): `is_chroma_reference` for a BLOCK_4X4
+    // piece at ss (1, 0) is `(mi_col & 0x01) || !(bw & 0x01) || !ss_x`
+    // == ODD mi_col (av1_common_int.h:1459) -- pieces 1 and 3 of the group
+    // are their plane's own chroma references and each codes its own
+    // TX_4X4 unit right after its luma, exactly the key-frame split-group
+    // behaviour the pinned t422 fixture's frame 0 traces (groups (18,54)
+    // and (30,42): U+V read on BOTH odd-column leaves) and frame 1's
+    // inter group at mi(12,2) repeats (U+V TX_4X4 ctx 8 on leaf (12,3)
+    // alone -- the bottom-right leaf was skipped, so it codes nothing).
+    // The 4:2:0 shared group unit never exists at 4:2:2.
+    let chroma_422 = ss_x(fctx) == 1 && ss_y(fctx) == 0;
     for i in 0..4usize {
         let (dr, dc) = (i / 2, i % 2);
         let lmi = (gr + dr, gc + dc);
@@ -36254,7 +36342,9 @@ fn decode_inter_sub8_split4(
             }
             // lane-sub8intra: the `BLOCK_4X4` twin of the HORZ/VERT arm --
             // same [`decode_intra_sub8_leaf`], no tx-depth symbol, chroma on
-            // the LAST sub-block (`is_chroma_reference` under 4:2:0).
+            // the chroma-reference sub-blocks (`is_chroma_reference`: the
+            // LAST one under 4:2:0, BOTH odd-column ones at 4:2:2, every
+            // one at 4:4:4).
             decode_intra_sub8_leaf(
                 dec,
                 cdfs,
@@ -36263,7 +36353,7 @@ fn decode_inter_sub8_split4(
                 group_mi,
                 lmi,
                 (B4, B4),
-                chroma_444 || i == 3,
+                chroma_444 || (cmi & 1 == 1 && chroma_422) || i == 3,
                 skip,
                 scan4,
                 y,
@@ -36635,6 +36725,150 @@ fn decode_inter_sub8_split4(
                 neighbours.record_mi_chroma(lmi, B4, B4, 1, &ug);
                 neighbours.record_mi_chroma(lmi, B4, B4, 2, &vg);
             }
+        // lane-av1-422sub8rect: the 4:2:2 per-piece arm. `is_chroma_reference`
+        // for a BLOCK_4X4 at ss (1, 0) is the odd mi_col (`av1_common_int.h`
+        // :1459), so THIS piece (right column of the group) is a chroma
+        // reference and codes its own U and V TX_4X4 units right after its
+        // luma -- measured on the pinned t422 fixture: frame 0 key-frame
+        // groups (18,54)/(30,42) read U+V on both odd-column leaves, and
+        // frame 1's inter group at mi(12,2) reads U+V TX_4X4 ctx 8 on leaf
+        // (12,3) alone (its bottom-right twin was skipped).
+        //
+        // The unit anchors at the FLOORED chroma cell
+        // (`av1_setup_dst_planes`' `(mi_col & !1) * MI >> ss_x`, the
+        // lane-av1-422kf2 rule), so the 4-px-wide square covers the group's
+        // whole chroma width, and the prediction walks
+        // `build_inter_predictors_sub8x8` (reconinter_template.inc): the
+        // left 2x4 half from the LEFT piece's own ref/mv/filters, the right
+        // 2x4 half from this piece's -- unless the left piece is intra (or
+        // off-frame), which makes `is_sub8x8_inter` false and predicts the
+        // whole 4x4 from THIS piece's own mv. A skipped reference piece
+        // still predicts (spec 7.11.3: `predict_inter_block_visit` runs
+        // before the `skip_txfm` guard) but codes no coefficients.
+        } else if chroma_422 && (cmi & 1) == 1 {
+            let (pc_ref, pc_mv, pc_hf, pc_vf) = piece[i].expect("inter piece recorded above");
+            let unit_x = ((cmi & !1) * MI) >> ss_x(fctx);
+            let unit_y = py >> ss_y(fctx);
+            // `is_sub8x8_inter`'s left-neighbour probe (`mi[-1]`): the piece
+            // one mi to the LEFT, when it exists and is inter.
+            let piece_left = piece[i - 1];
+            let build_c = move |_y: &mut PlaneBuf<'static>,
+                                _u: &mut PlaneBuf<'static>,
+                                _v: &mut PlaneBuf<'static>,
+                                fctx: &crate::decode::FrameCtx,
+                                out: &mut [Vec<u16>; 3]| {
+                let Some((pc_ref_y, sref_u, sref_v)) = ref_planes_deferred(pc_ref, refpix) else {
+                    return;
+                };
+                let pc_scale = mc::scale_factor(pc_ref_y.width, frame_width);
+                // The left piece's own reference planes + mv/filters, when it
+                // is an inter piece (`is_sub8x8_inter`'s `mi[-1]` probe).
+                let left = piece_left
+                    .as_ref()
+                    .map(|&(l_ref, l_mv, l_hf, l_vf)| {
+                        (l_ref, l_mv, l_hf, l_vf)
+                    })
+                    .and_then(|(l_ref, l_mv, l_hf, l_vf)| {
+                        ref_planes_deferred(l_ref, refpix).map(|planes| {
+                            let (lp_y, _, _) = planes;
+                            let l_scale = mc::scale_factor(lp_y.width, frame_width);
+                            (l_mv, l_hf, l_vf, planes, l_scale)
+                        })
+                    });
+                let mut pred_u = refill(std::mem::take(&mut out[1]), B4 * B4);
+                let mut pred_v = refill(std::mem::take(&mut out[2]), B4 * B4);
+                for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
+                    let mut buf = vec![0u16; B4 * B4];
+                    // Right 2x4 half: this piece's own ref/mv/filters.
+                    let mut half = vec![0u16; 2 * 4];
+                    mc::predict_maybe_scaled(
+                        &plane.data,
+                        plane.width,
+                        plane.true_width,
+                        plane.true_height,
+                        mv_to_q4(unit_x + 2, pc_mv.1, ss_x(fctx)),
+                        mv_to_q4(unit_y, pc_mv.0, ss_y(fctx)),
+                        pc_scale,
+                        2,
+                        4,
+                        pc_hf,
+                        pc_vf,
+                        &mut half, fctx,
+                    );
+                    for row in 0..4 {
+                        buf[row * B4 + 2..row * B4 + 4]
+                            .copy_from_slice(&half[row * 2..row * 2 + 2]);
+                    }
+                    // Left 2x4 half: the LEFT piece's own mv/filters
+                    // (sub8x8-inter); a mixed group (left piece intra or
+                    // off-frame) predicts it from THIS piece too, which
+                    // reduces to the whole-4x4-from-own rule.
+                    let (l_mv, l_hf, l_vf, l_planes, l_scale) = match left {
+                        Some((l_mv, l_hf, l_vf, l_planes, l_scale)) => {
+                            (l_mv, l_hf, l_vf, l_planes, l_scale)
+                        }
+                        None => (pc_mv, pc_hf, pc_vf, (pc_ref_y, sref_u, sref_v), pc_scale),
+                    };
+                    let (_, l_ref_u, _) = l_planes;
+                    mc::predict_maybe_scaled(
+                        &l_ref_u.data,
+                        l_ref_u.width,
+                        l_ref_u.true_width,
+                        l_ref_u.true_height,
+                        mv_to_q4(unit_x, l_mv.1, ss_x(fctx)),
+                        mv_to_q4(unit_y, l_mv.0, ss_y(fctx)),
+                        l_scale,
+                        2,
+                        4,
+                        l_hf,
+                        l_vf,
+                        &mut half, fctx,
+                    );
+                    for row in 0..4 {
+                        buf[row * B4..row * B4 + 2].copy_from_slice(&half[row * 2..row * 2 + 2]);
+                    }
+                    dst.copy_from_slice(&buf);
+                }
+                out[1] = pred_u;
+                out[2] = pred_v;
+            };
+            let (pred_cu, pred_cv): (Vec<u16>, Vec<u16>);
+            let (su, sv) = if recon_deferred(fctx) {
+                push_pred(fctx, build_c);
+                (
+                    Pred::Cur { plane: 1, stride: B4, off: 0 },
+                    Pred::Cur { plane: 2, stride: B4, off: 0 },
+                )
+            } else {
+                let mut built: [Vec<u16>; 3] = Default::default();
+                build_c(y, u, v, fctx, &mut built);
+                let [_, bu, bv] = built;
+                (pred_cu, pred_cv) = (bu, bv);
+                (Pred::Inline(&pred_cu, B4), Pred::Inline(&pred_cv, B4))
+            };
+            // The unit's entropy context: one chroma cell wide, floored --
+            // [`Neighbours::around_mi_422_chroma`] at the unit's own 8x4
+            // luma span (the [`sub8_leaf_chroma422`] rule).
+            let ctx_mi = (rmi, cmi & !1);
+            let ca = neighbours.around_mi_422_chroma(ctx_mi, 8, 4);
+            if skip {
+                push_mc(1, unit_x, unit_y, B4, su, &ZERO_RESIDUAL[..B4 * B4], fctx);
+                push_mc(2, unit_x, unit_y, B4, sv, &ZERO_RESIDUAL[..B4 * B4], fctx);
+                neighbours.record_mi_chroma(ctx_mi, 8, 4, 1, &ZERO_RESIDUAL[..B4 * B4]);
+                neighbours.record_mi_chroma(ctx_mi, 8, 4, 2, &ZERO_RESIDUAL[..B4 * B4]);
+            } else {
+                hit!(CHROMA422_INTER_SUB8_HITS);
+                let (ug, _) = read_inter_plane(
+                    dec, cdfs, TxbSet::Chroma4, scan4, 1, ca[1], 0, u, unit_x, unit_y, B4,
+                    base_q_idx, su, Some(piece_tx_type), None, fctx,
+                )?;
+                let (vg, _) = read_inter_plane(
+                    dec, cdfs, TxbSet::Chroma4, scan4, 2, ca[2], 0, v, unit_x, unit_y, B4,
+                    base_q_idx, sv, Some(piece_tx_type), None, fctx,
+                )?;
+                neighbours.record_mi_chroma(ctx_mi, 8, 4, 1, &ug);
+                neighbours.record_mi_chroma(ctx_mi, 8, 4, 2, &vg);
+            }
         }
         neighbours.record_mode_mi(rmi, cmi, 1, 1, DC_PRED);
         neighbours.record_inter_rect_mi(lmi, 1, 1, skip, true, ref_frame, resolved_filter, false);
@@ -36674,7 +36908,7 @@ fn decode_inter_sub8_split4(
     // frames mismatched ffmpeg by +-1..7 (class
     // `override-slot-on-one-arm`, this lane's own 10-bit film gate
     // regression at 1ad7e0fc; port of lane-av1-cfl's 7c6dad53).
-    if !chroma_444 && !intra_chroma {
+    if !chroma_444 && !chroma_422 && !intra_chroma {
         neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
     }
     // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
@@ -36686,10 +36920,12 @@ fn decode_inter_sub8_split4(
     // 0). No sub-8x8 piece can itself be a palette (`av1_allow_palette`
     // needs `bsize >= BLOCK_8X8`), so the group always clears.
     record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
-    if !chroma_444 && !intra_chroma {
+    if !chroma_444 && !chroma_422 && !intra_chroma {
         // Chroma, once for the whole group, on the last sub-block's own `skip`
         // flag -- prediction from all four sub-blocks (2x2 pieces), residual as
-        // one TX_4X4 unit per plane.
+        // one TX_4X4 unit per plane. lane-av1-422sub8rect: 4:2:2 never takes
+        // this arm -- the shared group unit does not exist at ss (1, 0); each
+        // odd-column piece coded its own chroma inside the loop above.
         // `is_sub8x8_inter` (reconinter_template.inc:54) is false as soon as ANY
         // mi of the group is intra: the group's 4x4 chroma is then predicted WHOLE
         // from the chroma-reference (last) sub-block's own mv, not in 2x2 pieces.
@@ -37214,6 +37450,29 @@ fn decode_intra_sub8_leaf(
     // ours ctx 2 where libaom gathers 1).
     record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
     if !has_chroma {
+        // lane-av1-422sub8rect: 4:2:2 has no shared group unit whose tail
+        // would stamp the mi map (`is_chroma_reference` runs per piece), so
+        // a non-referenced piece publishes its own cell -- libaom leaves
+        // `uv_mode` unset on it, `is_smooth` reads 0, i.e. DC_PRED.
+        if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+            neighbours.record_uv_mode_mi(lmi.0, lmi.1, 1, 1, DC_PRED);
+        }
+        return Ok(mode);
+    }
+    // lane-av1-422sub8rect: at 4:2:2 this (odd-column) piece is its plane's
+    // OWN chroma reference -- the key-frame split group's per-leaf TX_4X4
+    // model, floored anchor and per-chroma-cell context included
+    // ([`sub8_leaf_chroma422`], measured on the pinned t422 fixture frame 0:
+    // groups (18,54)/(30,42) code U+V on both odd-column leaves), never a
+    // shared group unit. Inter frames code no intrabc, so `intrabc_dv` is
+    // `None` here.
+    if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+        sub8_leaf_chroma422(
+            dec, cdfs, neighbours, lmi, uv_mode, 0, alpha, skip,
+            None, y, u, v, scan4, base_q_idx,
+            neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx),
+            (bw, bh), fctx,
+        )?;
         return Ok(mode);
     }
     // The group's single 4x4 chroma unit, intra-predicted from THIS
@@ -38293,18 +38552,30 @@ fn decode_inter_block8(
     // bookkeeping. Always `false` outside a `TxMode::Select` inter frame.
     let split8;
     const SIDE: usize = 8;
-    // lane-av1-444: this 8x8 leaf's chroma plane block is `8 >> ss` a side --
-    // 4 at 4:2:0 (one TX_4X4 unit) and the full 8 at 4:4:4, where libaom
-    // codes ONE TX_8X8 unit (`av1_get_max_uv_txsize(BLOCK_8X8)` at ss 0/0,
-    // measured against aomdec's EC_COEFF on `av1-profile1-444.ivf` frame 1:
-    // plane=1 tx=TX_8X8 per 8x8 block, not a 4:2:0 4x4).
-    let chroma_side: usize = SIDE >> ss_x(fctx);
-    let (chroma_set, chroma_scan): (TxbSet, &[u16]) = if chroma_side == 8 {
+    // lane-av1-444 / lane-av1-422sub8rect: this 8x8 leaf's chroma plane block
+    // is `ss_size_lookup[BLOCK_8X8][ss_x][ss_y]` -- 4:2:0 BLOCK_4X4 (one
+    // TX_4X4 unit), 4:4:4 BLOCK_8X8 (ONE TX_8X8 unit, `av1_get_max_uv_txsize`
+    // at ss 0/0, measured against aomdec's EC_COEFF on `av1-profile1-444.ivf`
+    // frame 1), and 4:2:2 BLOCK_4X8 (ONE TX_4X8 RECT unit per plane, measured
+    // on the pinned t422 fixture: frame 1 mi(0,0) reads plane 1 tx_size 5 ==
+    // TX_4X8 at rng 55168 right after the agreed luma TX_8X8 txb_skip -- the
+    // old `SIDE >> ss_x` square read was the first-divergence defect this
+    // port fixes).
+    let chroma_w: usize = SIDE >> ss_x(fctx);
+    let chroma_h: usize = SIDE >> ss_y(fctx);
+    let chroma_422 = ss_x(fctx) == 1 && ss_y(fctx) == 0;
+    let (chroma_set, chroma_scan): (TxbSet, &[u16]) = if chroma_422 {
+        // `get_txsize_entropy_ctx(TX_4X8)`: the rect fills its plane block,
+        // so the tables are the rect set and the SCAN_4X8 walk, exactly the
+        // pairing the key-frame BLOCK_4X8 arm (`decode_block`'s lane-av1-422f
+        // table) reads byte-exact.
+        (TxbSet::ChromaRect8x4, &SCAN_4X8[..])
+    } else if chroma_w == 8 {
         (TxbSet::Chroma8, scan8)
     } else {
         (TxbSet::Chroma4, scan4)
     };
-    let chroma_tx = if chroma_side == 8 { TX8 } else { TX4 };
+    let chroma_tx = if chroma_w == 8 { TX8 } else { TX4 };
 
     let (r, c) = outer_at;
     // lane-inter8 r2: this leaf's OWN mi cell, not the enclosing 16x16's --
@@ -38805,13 +39076,13 @@ fn decode_inter_block8(
                 };
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
-                        &inter0_y, &inter1_y, mask_y, SIDE, SIDE, SIDE, false, &mut pred_y, fctx,
+                        &inter0_y, &inter1_y, mask_y, SIDE, SIDE, SIDE, 0, 0, &mut pred_y, fctx,
                     );
                 } else {
                     mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y, fctx);
                 }
 
-                let mut inter0_u = vec![0i32; chroma_side * chroma_side];
+                let mut inter0_u = vec![0i32; chroma_w * chroma_h];
                 mc::predict_compound_intermediate(
                     &pu0.data,
                     pu0.width,
@@ -38820,13 +39091,13 @@ fn decode_inter_block8(
                     mv_to_q4(cpx, mv0.1, ss_x(fctx)),
                     mv_to_q4(cpy, mv0.0, ss_x(fctx)),
                     scale0,
-                    chroma_side,
-                    chroma_side,
+                    chroma_w,
+                    chroma_h,
                     h_filter,
                     v_filter,
                     &mut inter0_u, fctx,
                 );
-                let mut inter1_u = vec![0i32; chroma_side * chroma_side];
+                let mut inter1_u = vec![0i32; chroma_w * chroma_h];
                 mc::predict_compound_intermediate(
                     &pu1.data,
                     pu1.width,
@@ -38835,29 +39106,30 @@ fn decode_inter_block8(
                     mv_to_q4(cpx, mv1.1, ss_x(fctx)),
                     mv_to_q4(cpy, mv1.0, ss_x(fctx)),
                     scale1,
-                    chroma_side,
-                    chroma_side,
+                    chroma_w,
+                    chroma_h,
                     h_filter,
                     v_filter,
                     &mut inter1_u, fctx,
                 );
-                let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_side * chroma_side);
+                let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_w * chroma_h);
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_u,
                         &inter1_u,
                         mask_y,
                         SIDE,
-                        chroma_side,
-                        chroma_side,
-                        ss_x(fctx) == 1 && ss_y(fctx) == 1,
+                        chroma_w,
+                        chroma_h,
+                        ss_x(fctx),
+ss_y(fctx),
                         &mut pred_u, fctx,
                     );
                 } else {
                     mc::combine_compound(&inter0_u, &inter1_u, fwd_offset, bck_offset, &mut pred_u, fctx);
                 }
 
-                let mut inter0_v = vec![0i32; chroma_side * chroma_side];
+                let mut inter0_v = vec![0i32; chroma_w * chroma_h];
                 mc::predict_compound_intermediate(
                     &pv0.data,
                     pv0.width,
@@ -38866,13 +39138,13 @@ fn decode_inter_block8(
                     mv_to_q4(cpx, mv0.1, ss_x(fctx)),
                     mv_to_q4(cpy, mv0.0, ss_x(fctx)),
                     scale0,
-                    chroma_side,
-                    chroma_side,
+                    chroma_w,
+                    chroma_h,
                     h_filter,
                     v_filter,
                     &mut inter0_v, fctx,
                 );
-                let mut inter1_v = vec![0i32; chroma_side * chroma_side];
+                let mut inter1_v = vec![0i32; chroma_w * chroma_h];
                 mc::predict_compound_intermediate(
                     &pv1.data,
                     pv1.width,
@@ -38881,22 +39153,23 @@ fn decode_inter_block8(
                     mv_to_q4(cpx, mv1.1, ss_x(fctx)),
                     mv_to_q4(cpy, mv1.0, ss_x(fctx)),
                     scale1,
-                    chroma_side,
-                    chroma_side,
+                    chroma_w,
+                    chroma_h,
                     h_filter,
                     v_filter,
                     &mut inter1_v, fctx,
                 );
-                let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_side * chroma_side);
+                let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_w * chroma_h);
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_v,
                         &inter1_v,
                         mask_y,
                         SIDE,
-                        chroma_side,
-                        chroma_side,
-                        ss_x(fctx) == 1 && ss_y(fctx) == 1,
+                        chroma_w,
+                        chroma_h,
+                        ss_x(fctx),
+ss_y(fctx),
                         &mut pred_v, fctx,
                     );
                 } else {
@@ -38911,8 +39184,8 @@ fn decode_inter_block8(
                             push_pred(fctx, build);
                             (
                                 Pred::Cur { plane: 0, stride: SIDE, off: 0 },
-                                Pred::Cur { plane: 1, stride: chroma_side, off: 0 },
-                                Pred::Cur { plane: 2, stride: chroma_side, off: 0 },
+                                Pred::Cur { plane: 1, stride: chroma_w, off: 0 },
+                                Pred::Cur { plane: 2, stride: chroma_w, off: 0 },
                             )
                         } else {
                             let mut built: [Vec<u16>; 3] = Default::default();
@@ -38921,8 +39194,8 @@ fn decode_inter_block8(
                             (pred_y, pred_u, pred_v) = (by, bu, bv);
                             (
                                 Pred::Inline(&pred_y, SIDE),
-                                Pred::Inline(&pred_u, chroma_side),
-                                Pred::Inline(&pred_v, chroma_side),
+                                Pred::Inline(&pred_u, chroma_w),
+                                Pred::Inline(&pred_v, chroma_w),
                             )
                         };
                 split8 = read_block_tx_size(
@@ -38939,25 +39212,43 @@ fn decode_inter_block8(
                 .is_some();
                 if skip {
                     push_mc(0, px, py, SIDE, sy, &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
-                    push_mc(1, 
+                    // lane-av1-422sub8rect: the plane block is the (chroma_w,
+                    // chroma_h) rect at 4:2:2 -- the recorded write is
+                    // stride `chroma_w`, full `chroma_h` rows.
+                    push_mc_rect(1,
                         cpx,
                         cpy,
-                        chroma_side,
+                        chroma_w,
+                        chroma_w,
+                        chroma_h,
                         su,
-                        &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
+                        &ZERO_RESIDUAL[..chroma_w * chroma_h], fctx,
                     );
-                    push_mc(2, 
+                    push_mc_rect(2,
                         cpx,
                         cpy,
-                        chroma_side,
+                        chroma_w,
+                        chroma_w,
+                        chroma_h,
                         sv,
-                        &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
+                        &ZERO_RESIDUAL[..chroma_w * chroma_h], fctx,
                     );
                     luma_grid = Grid::Zero(SIDE * SIDE);
-                    u_grid = Grid::Zero(chroma_side * chroma_side);
-                    v_grid = Grid::Zero(chroma_side * chroma_side);
+                    u_grid = Grid::Zero(chroma_w * chroma_h);
+                    v_grid = Grid::Zero(chroma_w * chroma_h);
                 } else {
                     let around = neighbours.around_mi(leaf_mi, 8);
+                    // lane-av1-422sub8rect: the 4:2:2 chroma unit is the
+                    // TX_4X8 rect -- its `txb_skip_ctx` reads per chroma
+                    // 4-px cell ([`Neighbours::around_mi_422_chroma`], the
+                    // key-frame BLOCK_4X8 arm's own context walk), and the
+                    // coefficients go through the inter rect reader with the
+                    // inherited luma tx type.
+                    let chroma_around = if chroma_422 {
+                        neighbours.around_mi_422_chroma(leaf_mi, 8, 8)
+                    } else {
+                        around
+                    };
                     let (grid8, luma_tx_type) = read_inter_luma8(
                         dec,
                         cdfs,
@@ -38975,42 +39266,82 @@ fn decode_inter_block8(
                         split8, fctx,
                     )?;
                     luma_grid = grid8;
-                    u_grid = read_inter_plane(
-                        dec,
-                        cdfs,
-                        chroma_set,
-                        chroma_scan,
-                        1,
-                        around[1],
-                        mode_for_tx,
-                        u,
-                        cpx,
-                        cpy,
-                        chroma_side,
-                        base_q_idx,
-                        su,
-                        Some(luma_tx_type),
-                        None, fctx,
-                    )?
-                    .0;
-                    v_grid = read_inter_plane(
-                        dec,
-                        cdfs,
-                        chroma_set,
-                        chroma_scan,
-                        2,
-                        around[2],
-                        mode_for_tx,
-                        v,
-                        cpx,
-                        cpy,
-                        chroma_side,
-                        base_q_idx,
-                        sv,
-                        Some(luma_tx_type),
-                        None, fctx,
-                    )?
-                    .0;
+                    u_grid = if chroma_422 {
+                        read_inter_plane_rect(
+                            dec,
+                            cdfs,
+                            chroma_set,
+                            (chroma_w, chroma_h),
+                            chroma_w,
+                            1,
+                            chroma_around[1],
+                            mode_for_tx,
+                            u,
+                            cpx,
+                            cpy,
+                            su,
+                            Some(luma_tx_type),
+                            None, fctx,
+                        )?
+                        .0
+                    } else {
+                        read_inter_plane(
+                            dec,
+                            cdfs,
+                            chroma_set,
+                            chroma_scan,
+                            1,
+                            chroma_around[1],
+                            mode_for_tx,
+                            u,
+                            cpx,
+                            cpy,
+                            chroma_w,
+                            base_q_idx,
+                            su,
+                            Some(luma_tx_type),
+                            None, fctx,
+                        )?
+                        .0
+                    };
+                    v_grid = if chroma_422 {
+                        read_inter_plane_rect(
+                            dec,
+                            cdfs,
+                            chroma_set,
+                            (chroma_w, chroma_h),
+                            chroma_w,
+                            2,
+                            chroma_around[2],
+                            mode_for_tx,
+                            v,
+                            cpx,
+                            cpy,
+                            sv,
+                            Some(luma_tx_type),
+                            None, fctx,
+                        )?
+                        .0
+                    } else {
+                        read_inter_plane(
+                            dec,
+                            cdfs,
+                            chroma_set,
+                            chroma_scan,
+                            2,
+                            chroma_around[2],
+                            mode_for_tx,
+                            v,
+                            cpx,
+                            cpy,
+                            chroma_w,
+                            base_q_idx,
+                            sv,
+                            Some(luma_tx_type),
+                            None, fctx,
+                        )?
+                        .0
+                    };
                 }
                 // lane-inter8 r2: the COMPOUND leaf used to return here
                 // WITHOUT the end-of-function `record_mi`/`fill_lf_grid` the
@@ -39496,7 +39827,7 @@ fn decode_inter_block8(
                 SIDE,
                 SIDE,
                 SIDE,
-                chroma_side,
+                chroma_w,
                 px,
                 py,
                 cpx,
@@ -39504,6 +39835,7 @@ fn decode_inter_block8(
                 refpix,
                 interp_fixed,
                 frame_width,
+                (ss_x(fctx), ss_y(fctx)),
             )?)
         } else {
             None
@@ -39520,15 +39852,15 @@ fn decode_inter_block8(
             return;
         };
         let mut pred_y = refill(std::mem::take(&mut out[0]), SIDE * SIDE);
-        let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_side * chroma_side);
-        let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_side * chroma_side);
+        let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_w * chroma_h);
+        let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_w * chroma_h);
         // Merge of lane-gmaffine (this leaf's own switchable filters) with
         // lane-scaledref (spec 7.11.3.3's scaled walk): same kernels either
         // way, only the sample walk differs.
-        for (plane, x, y, dim, dst) in [
-            (sref_y, px, py, SIDE, &mut pred_y),
-            (sref_u, cpx, cpy, chroma_side, &mut pred_u),
-            (sref_v, cpx, cpy, chroma_side, &mut pred_v),
+        for (plane, x, y, (dim_w, dim_h), dst) in [
+            (sref_y, px, py, (SIDE, SIDE), &mut pred_y),
+            (sref_u, cpx, cpy, (chroma_w, chroma_h), &mut pred_u),
+            (sref_v, cpx, cpy, (chroma_w, chroma_h), &mut pred_v),
         ] {
             let luma = std::ptr::eq(plane, sref_y);
             if luma_scale == mc::REF_NO_SCALE {
@@ -39539,8 +39871,8 @@ fn decode_inter_block8(
                     plane.true_height,
                     mv_to_q4(x, mv.1, if luma { 0 } else { ss_x(fctx) }),
                     mv_to_q4(y, mv.0, if luma { 0 } else { ss_y(fctx) }),
-                    dim,
-                    dim,
+                    dim_w,
+                    dim_h,
                     h_filter,
                     v_filter,
                     dst, fctx,
@@ -39554,8 +39886,8 @@ fn decode_inter_block8(
                     mv_to_q4(x, mv.1, if luma { 0 } else { ss_x(fctx) }),
                     mv_to_q4(y, mv.0, if luma { 0 } else { ss_y(fctx) }),
                     luma_scale,
-                    dim,
-                    dim,
+                    dim_w,
+                    dim_h,
                     h_filter,
                     v_filter,
                     dst, fctx,
@@ -39577,19 +39909,21 @@ fn decode_inter_block8(
                 SIDE as i32, SIDE as i32, 0, 0, fctx,
             );
             // `av1_init_warp_params`'s per-plane `block_width/height < 8`
-            // bail-out: an 8x8 leaf's chroma plane is 4x4 in 420, so it is
-            // predicted translationally even when the luma warps.
+            // bail-out: an 8x8 leaf's chroma plane block is narrower than 8
+            // at any subsampled format (4:2:0 4x4, 4:2:2 4x8), so it is
+            // predicted translationally even when the luma warps; 4:4:4's
+            // 8x8 chroma warps with the luma.
             #[allow(clippy::absurd_extreme_comparisons)]
-            if chroma_side >= 8 {
+            if chroma_w >= 8 {
                 crate::warp::warp_affine(
                     params, &sref_u.data, sref_u.true_width as i32, sref_u.true_height as i32,
-                    sref_u.width as i32, &mut pred_u, cpx as i32, cpy as i32, chroma_side as i32,
-                    chroma_side as i32, chroma_side as i32, ss_x(fctx) as i32, ss_y(fctx) as i32, fctx,
+                    sref_u.width as i32, &mut pred_u, cpx as i32, cpy as i32, chroma_w as i32,
+                    chroma_h as i32, chroma_w as i32, ss_x(fctx) as i32, ss_y(fctx) as i32, fctx,
                 );
                 crate::warp::warp_affine(
                     params, &sref_v.data, sref_v.true_width as i32, sref_v.true_height as i32,
-                    sref_v.width as i32, &mut pred_v, cpx as i32, cpy as i32, chroma_side as i32,
-                    chroma_side as i32, chroma_side as i32, ss_x(fctx) as i32, ss_y(fctx) as i32, fctx,
+                    sref_v.width as i32, &mut pred_v, cpx as i32, cpy as i32, chroma_w as i32,
+                    chroma_h as i32, chroma_w as i32, ss_x(fctx) as i32, ss_y(fctx) as i32, fctx,
                 );
             }
         }
@@ -39601,12 +39935,14 @@ fn decode_inter_block8(
         // Non-wedge interintra blend, mutually exclusive with OBMC (the
         // motion_mode symbol is not read for an interintra block).
         if let Some(ii) = interintra_mode {
-            interintra_blend(y, px, py, SIDE, SIDE, SIDE, ii, wedge_mask, &mut pred_y, fctx);
+            interintra_blend(y, px, py, SIDE, SIDE, SIDE, 0, 0, ii, wedge_mask, &mut pred_y, fctx);
             interintra_blend(
-                u, cpx, cpy, chroma_side, chroma_side, chroma_side, ii, wedge_mask, &mut pred_u, fctx,
+                u, cpx, cpy, chroma_w, chroma_h, chroma_w, ss_x(fctx), ss_y(fctx), ii, wedge_mask,
+                &mut pred_u, fctx,
             );
             interintra_blend(
-                v, cpx, cpy, chroma_side, chroma_side, chroma_side, ii, wedge_mask, &mut pred_v, fctx,
+                v, cpx, cpy, chroma_w, chroma_h, chroma_w, ss_x(fctx), ss_y(fctx), ii, wedge_mask,
+                &mut pred_v, fctx,
             );
         }
 
@@ -39618,8 +39954,8 @@ fn decode_inter_block8(
             push_pred(fctx, build);
             (
                 Pred::Cur { plane: 0, stride: SIDE, off: 0 },
-                Pred::Cur { plane: 1, stride: chroma_side, off: 0 },
-                Pred::Cur { plane: 2, stride: chroma_side, off: 0 },
+                Pred::Cur { plane: 1, stride: chroma_w, off: 0 },
+                Pred::Cur { plane: 2, stride: chroma_w, off: 0 },
             )
         } else {
             // The interintra predictor reads this block's own above/left
@@ -39634,8 +39970,8 @@ fn decode_inter_block8(
             (pred_y, pred_u, pred_v) = (by, bu, bv);
             (
                 Pred::Inline(&pred_y, SIDE),
-                Pred::Inline(&pred_u, chroma_side),
-                Pred::Inline(&pred_v, chroma_side),
+                Pred::Inline(&pred_u, chroma_w),
+                Pred::Inline(&pred_v, chroma_w),
             )
         };
         split8 = read_block_tx_size(
@@ -39652,25 +39988,43 @@ fn decode_inter_block8(
         .is_some();
         if skip {
             push_mc(0, px, py, SIDE, sy, &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
-            push_mc(1, 
+            // lane-av1-422sub8rect: the plane block is the (chroma_w,
+            // chroma_h) rect at 4:2:2 -- the recorded write is stride
+            // `chroma_w`, full `chroma_h` rows.
+            push_mc_rect(1,
                 cpx,
                 cpy,
-                chroma_side,
+                chroma_w,
+                chroma_w,
+                chroma_h,
                 su,
-                &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
+                &ZERO_RESIDUAL[..chroma_w * chroma_h], fctx,
             );
-            push_mc(2, 
+            push_mc_rect(2,
                 cpx,
                 cpy,
-                chroma_side,
+                chroma_w,
+                chroma_w,
+                chroma_h,
                 sv,
-                &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
+                &ZERO_RESIDUAL[..chroma_w * chroma_h], fctx,
             );
             luma_grid = Grid::Zero(SIDE * SIDE);
-            u_grid = Grid::Zero(chroma_side * chroma_side);
-            v_grid = Grid::Zero(chroma_side * chroma_side);
+            u_grid = Grid::Zero(chroma_w * chroma_h);
+            v_grid = Grid::Zero(chroma_w * chroma_h);
         } else {
             let around = neighbours.around_mi(leaf_mi, 8);
+            // lane-av1-422sub8rect: the 4:2:2 chroma unit is the TX_4X8
+            // rect -- its `txb_skip_ctx` reads per chroma 4-px cell
+            // ([`Neighbours::around_mi_422_chroma`], the key-frame
+            // BLOCK_4X8 arm's own context walk), and the coefficients go
+            // through the inter rect reader with the inherited luma tx
+            // type.
+            let chroma_around = if chroma_422 {
+                neighbours.around_mi_422_chroma(leaf_mi, 8, 8)
+            } else {
+                around
+            };
             let (grid8, luma_tx_type) = read_inter_luma8(
                 dec,
                 cdfs,
@@ -39688,42 +40042,82 @@ fn decode_inter_block8(
                 split8, fctx,
             )?;
             luma_grid = grid8;
-            u_grid = read_inter_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                chroma_scan,
-                1,
-                around[1],
-                mode_for_tx,
-                u,
-                cpx,
-                cpy,
-                chroma_side,
-                base_q_idx,
-                su,
-                Some(luma_tx_type),
-                None, fctx,
-            )?
-            .0;
-            v_grid = read_inter_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                chroma_scan,
-                2,
-                around[2],
-                mode_for_tx,
-                v,
-                cpx,
-                cpy,
-                chroma_side,
-                base_q_idx,
-                sv,
-                Some(luma_tx_type),
-                None, fctx,
-            )?
-            .0;
+            u_grid = if chroma_422 {
+                read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    (chroma_w, chroma_h),
+                    chroma_w,
+                    1,
+                    chroma_around[1],
+                    mode_for_tx,
+                    u,
+                    cpx,
+                    cpy,
+                    su,
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?
+                .0
+            } else {
+                read_inter_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    chroma_scan,
+                    1,
+                    chroma_around[1],
+                    mode_for_tx,
+                    u,
+                    cpx,
+                    cpy,
+                    chroma_w,
+                    base_q_idx,
+                    su,
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?
+                .0
+            };
+            v_grid = if chroma_422 {
+                read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    (chroma_w, chroma_h),
+                    chroma_w,
+                    2,
+                    chroma_around[2],
+                    mode_for_tx,
+                    v,
+                    cpx,
+                    cpy,
+                    sv,
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?
+                .0
+            } else {
+                read_inter_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    chroma_scan,
+                    2,
+                    chroma_around[2],
+                    mode_for_tx,
+                    v,
+                    cpx,
+                    cpy,
+                    chroma_w,
+                    base_q_idx,
+                    sv,
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?
+                .0
+            };
         }
     } else {
         let mode = dec.symbol(&mut cdfs.y_mode[SIZE_GROUP_8]);
@@ -39933,17 +40327,17 @@ fn decode_inter_block8(
             PaletteY { size: n, colors, map }
         });
         let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
-            // `av1_get_plane_block_size(BLOCK_8X8, 1, 1)` at the sequence's
-            // own subsampling: BLOCK_4X4 at 4:2:0, BLOCK_8X8 at 4:4:4
-            // (`chroma_side`, lane-av1-444).
+            // `av1_get_plane_block_size(BLOCK_8X8, ss)` at the sequence's own
+            // subsampling: BLOCK_4X4 at 4:2:0, BLOCK_8X8 at 4:4:4, and at
+            // 4:2:2 the BLOCK_4X8 plane block (lane-av1-422sub8rect).
             let on = palette_onscreen_uv(
                 (SIDE, SIDE),
                 palette_onscreen(rmi, cmi, SIDE, SIDE, fctx),
-                (chroma_side, chroma_side),
+                (chroma_w, chroma_h),
                 (ss_x(fctx), ss_y(fctx)),
             );
             let map =
-                decode_color_index_map_wh(dec, cdfs, n, chroma_side, chroma_side, on, true);
+                decode_color_index_map_wh(dec, cdfs, n, chroma_w, chroma_h, on, true);
             hit!(PALETTE_UV_HITS);
             hit!(INTRA_IN_INTER_PALETTE_UV_HITS);
             hit_do! {
@@ -40114,14 +40508,18 @@ fn decode_inter_block8(
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
-            push_intra(1, 
+            // lane-av1-422sub8rect: the plane block is the (chroma_w,
+            // chroma_h) rect at 4:2:2 -- the recorded prediction/write uses
+            // the rect push.
+            push_intra_rect(1,
                 cpx,
                 cpy,
-                chroma_side,
+                chroma_w,
+                chroma_h,
                 uv_predict_mode,
                 angle_delta_uv,
                 reach,
-                &ZERO_RESIDUAL[..chroma_side * chroma_side],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
                 alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
@@ -40129,21 +40527,22 @@ fn decode_inter_block8(
             if let Some((_, vb)) = &palette_uv_bufs {
                 set_palette_pred(vb.clone(), fctx);
             }
-            push_intra(2, 
+            push_intra_rect(2,
                 cpx,
                 cpy,
-                chroma_side,
+                chroma_w,
+                chroma_h,
                 uv_predict_mode,
                 angle_delta_uv,
                 reach,
-                &ZERO_RESIDUAL[..chroma_side * chroma_side],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
                 alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
             );
             luma_grid = Grid::Zero(SIDE * SIDE);
-            u_grid = Grid::Zero(chroma_side * chroma_side);
-            v_grid = Grid::Zero(chroma_side * chroma_side);
+            u_grid = Grid::Zero(chroma_w * chroma_h);
+            v_grid = Grid::Zero(chroma_w * chroma_h);
         } else {
             let around = neighbours.around_mi(leaf_mi, 8);
             luma_grid = if split8 {
@@ -40187,56 +40586,89 @@ fn decode_inter_block8(
             )?
             };
             let ac = alpha.map(|_| cfl_src(px, py, SIDE));
+            // lane-av1-422sub8rect: at 4:2:2 the plane block is the BLOCK_4X8
+            // rect and the key-frame arm's own reader applies -- one
+            // TX_4X8 `ChromaRect8x4` unit per plane through
+            // [`read_rect_chroma_unit`] with the per-chroma-cell context
+            // walk ([`Neighbours::around_mi_422_chroma`], the
+            // lane-av1-422f model this leaf's key-frame twin proves
+            // byte-exact). 4:2:0/4:4:4 keep the square [`read_plane`] read.
+            let (chroma_around_u, chroma_around_v) = if chroma_422 {
+                let ca = neighbours.around_mi_422_chroma(leaf_mi, 8, 8);
+                (ca[1], ca[2])
+            } else {
+                (around[1], around[2])
+            };
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
-            u_grid = read_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                chroma_scan,
-                1,
-                around[1],
-                mode,
-                uv_predict_mode,
-                angle_delta_uv,
-                reach,
-                u,
-                cpx,
-                cpy,
-                chroma_side,
-                chroma_tx,
-                base_q_idx,
-                alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
-                None,
-                None,
-                smooth_neighbor_uv, fctx,
-            )?;
+            u_grid = if chroma_422 {
+                read_rect_chroma_unit(
+                    dec, cdfs, chroma_set, chroma_scan, chroma_w, chroma_h, 1,
+                    chroma_around_u, uv_predict_mode, angle_delta_uv, reach, u,
+                    cpx, cpy, base_q_idx, None,
+                    alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+                    smooth_neighbor_uv, fctx,
+                )?
+            } else {
+                read_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    chroma_scan,
+                    1,
+                    chroma_around_u,
+                    mode,
+                    uv_predict_mode,
+                    angle_delta_uv,
+                    reach,
+                    u,
+                    cpx,
+                    cpy,
+                    chroma_w,
+                    chroma_tx,
+                    base_q_idx,
+                    alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+                    None,
+                    None,
+                    smooth_neighbor_uv, fctx,
+                )?
+            };
             if let Some((_, vb)) = &palette_uv_bufs {
                 set_palette_pred(vb.clone(), fctx);
             }
-            v_grid = read_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                chroma_scan,
-                2,
-                around[2],
-                mode,
-                uv_predict_mode,
-                angle_delta_uv,
-                reach,
-                v,
-                cpx,
-                cpy,
-                chroma_side,
-                chroma_tx,
-                base_q_idx,
-                alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
-                None,
-                None,
-                smooth_neighbor_uv, fctx,
-            )?;
+            v_grid = if chroma_422 {
+                read_rect_chroma_unit(
+                    dec, cdfs, chroma_set, chroma_scan, chroma_w, chroma_h, 2,
+                    chroma_around_v, uv_predict_mode, angle_delta_uv, reach, v,
+                    cpx, cpy, base_q_idx, None,
+                    alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+                    smooth_neighbor_uv, fctx,
+                )?
+            } else {
+                read_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    chroma_scan,
+                    2,
+                    chroma_around_v,
+                    mode,
+                    uv_predict_mode,
+                    angle_delta_uv,
+                    reach,
+                    v,
+                    cpx,
+                    cpy,
+                    chroma_w,
+                    chroma_tx,
+                    base_q_idx,
+                    alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+                    None,
+                    None,
+                    smooth_neighbor_uv, fctx,
+                )?
+            };
         }
     }
     // lane-txselect: a split leaf's plane-0 neighbour context is per 4x4
