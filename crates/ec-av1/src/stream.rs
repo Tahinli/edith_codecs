@@ -5476,6 +5476,158 @@ pub(crate) mod tests {
         }
     }
 
+    /// As [`ffmpeg_decode_sequence`], for a 4:4:4 stream: chroma planes are
+    /// FULL resolution (`yuv444p` rawvideo), the shape lane-av1-llinter's
+    /// lossless profile-1 fixture codes.
+    fn ffmpeg_decode_sequence_444(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Pic> {
+        let out = run_with_stdin(
+            Command::new("ffmpeg").args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv444p", "-",
+            ]),
+            stream,
+        );
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the 4:4:4 stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plane = width * height;
+        let frame_bytes = 3 * plane;
+        assert_eq!(
+            out.stdout.len(),
+            frame_bytes * frames,
+            "expected {frames} 4:4:4 frames, ffmpeg said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (0..frames)
+            .map(|i| {
+                let base = i * frame_bytes;
+                Pic {
+                    width,
+                    height,
+                    y: out.stdout[base..base + plane].iter().map(|&v| u16::from(v)).collect(),
+                    u: out.stdout[base + plane..base + 2 * plane].iter().map(|&v| u16::from(v)).collect(),
+                    v: out.stdout[base + 2 * plane..base + 3 * plane].iter().map(|&v| u16::from(v)).collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// lane-av1-llinter: the firing gate for the lossless 4:4:4 INTER chroma
+    /// fix. The fixture is the report's dodge2 stream pinned into `fixtures/`:
+    /// aomenc profile 1 over testsrc2 128x96 yuv444p, `--lossless=1`,
+    /// `--sb-size=64 --min-partition-size=64 --max-partition-size=64`, 6
+    /// frames; 37658 bytes, sha256
+    /// `5a070fa351a3f2109de855234f2b3d0a872970f3e7f658db21f65c12eeb135b4`.
+    /// The firing counter is the EXISTING `decode::chroma_split_tx_hits` (one
+    /// bump per lossless chroma TX unit read): with min=max partition 64 the
+    /// roots stay whole 64x64 inter blocks -- no 8x8 leaf exists in this
+    /// stream -- so every chroma unit goes through the big-block ss-aware
+    /// lossless route this lane fixed (fixes 2-5). A 4:2:0 lossless stream
+    /// fires the same counter, but the fixture bytes are pinned, so the gate
+    /// cannot run on anything else; the pre-fix 4:2:0-hardcoded math corrupts
+    /// at 4:4:4, so the pixel-exact compares are what prove the ss-aware path
+    /// (class `gate-blind-to-feature`). Every frame must come out pixel-exact
+    /// through BOTH the oracle `aomdec --rawvideo` and ffmpeg. The
+    /// default-partition ll444 stream is deliberately NOT claimed here: its
+    /// key frame is still the intra lane's named sub8-chroma stop
+    /// (lanes/av1llintra.report.md).
+    #[test]
+    fn a_lossless_444_min_partition64_inter_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_lossless_444_min_partition64_inter_stream_decodes_pixel_exact";
+        const FIXTURE_LEN: usize = 37658;
+        const FIXTURE_FNV: u64 = 0xf68d_c26f_a14d_283c;
+        const W: usize = 128;
+        const H: usize = 96;
+        const FRAMES: usize = 6;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_minp64_inter.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        let before = crate::decode::chroma_split_tx_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
+        });
+        let hits = crate::decode::chroma_split_tx_hits();
+        assert!(
+            hits > before,
+            "{NAME}: gate is vacuous -- no lossless chroma TX unit was read \
+             (delta {before} -> {hits})"
+        );
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for f in &frames {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+
+        // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
+        if aomdec_path().is_file() {
+            let dir = std::env::temp_dir().join(format!("ec-av1-ll444-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let raw = dir.join("aomdec.raw");
+            let out = Command::new(aomdec_path())
+                .args(["--codec=av1", "--rawvideo", "-o"])
+                .arg(&raw)
+                .arg(&obu)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("aomdec failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: the oracle aomdec refused the stream: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(ref_raw.len(), W * H * 3 * FRAMES, "{NAME}: aomdec raw size");
+            for (i, f) in frames.iter().enumerate() {
+                let base = i * W * H * 3;
+                for ((plane, off), p) in [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
+                    .into_iter()
+                    .zip(["y", "u", "v"])
+                {
+                    let want = &ref_raw[base + off..base + off + W * H];
+                    let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                    assert_eq!(bad, 0, "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ");
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+        }
+
+        // ffmpeg's decoder: same frames, full-resolution chroma.
+        if have_ffmpeg() {
+            let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
+            for (i, (got, want)) in frames.iter().zip(refs.iter()).enumerate() {
+                for (p, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                    .iter()
+                    .enumerate()
+                {
+                    let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                    assert_eq!(bad, 0, "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ");
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME} ffmpeg arm: no ffmpeg");
+        }
+    }
+
     /// lane-lossless128: a LOSSLESS key frame that codes a 128-axis
     /// (`BLOCK_64X128`) intra block -- the shape libaom's `read_tx_size` forces
     /// to `TX_4X4` on its very first line (`decodeframe.c:1183`), so every plane
