@@ -10666,6 +10666,20 @@ fn decode_rect_split(
                             ),
                         )
                     });
+                    // lane-av1-422kf: the palette colour map is consumed per
+                    // unit here like every other chroma arm (`av1_visit_palette`
+                    // feeds the whole plane block; window it to this unit).
+                    // Without this the square chroma rows decoded a uv-palette
+                    // strip's chroma as plain DC (class same-symbols-silent-
+                    // prediction: the rng stayed in sync, only the prediction
+                    // was dropped).
+                    if let Some((ub, vb)) = &m.palette_uv {
+                        let buf = if plane_idx == 1 { ub } else { vb };
+                        set_palette_pred(
+                            palette_window(buf, chroma_w, cu_col * uw, cu_row * uh, uw, uh),
+                            fctx,
+                        );
+                    }
                     // 32x32 does not fit read_coeffs_rect's scratch (768). The
                     // square reader is the path every other 32x32 chroma unit uses.
                     let levels = if uw == uh {
