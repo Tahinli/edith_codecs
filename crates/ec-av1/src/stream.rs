@@ -5905,9 +5905,11 @@ pub(crate) mod tests {
     /// Non-vacuity, twice over: the `PIPELINE_TAKEN` delta proves the second
     /// decode really constructed the pipeline on both inter frames (frame 0
     /// is a key frame and the key-frame path runs whole-frame filters by
-    /// construction), and the `LR_STRIPE0_HITS` delta proves a real filter
-    /// ran on stripe 0 -- RU row 0's own first stripe, the span the named
-    /// defect left un-restored. Frames 0/1 are additionally asserted
+    /// construction), and the `LR_PIPELINE_ROW0` delta proves the pipeline's
+    /// band release itself flushed RU row 0 -- a process-global counter
+    /// bumped by `pipe_run_lr`'s worker, so frame 0's whole-frame LR (which
+    /// runs on the gate's own thread and satisfies the thread-local
+    /// `LR_STRIPE0_HITS`) cannot fake it. Frames 0/1 are additionally asserted
     /// byte-exact against BOTH the oracle aomdec and ffmpeg THROUGH the
     /// pipeline. (Frame 2's own residual is the entropy lane's inter
     /// rect-strip recon defect -- see lanes/av1lrflush.report.md r3 -- and
@@ -5942,7 +5944,7 @@ pub(crate) mod tests {
         assert_eq!(serial.len(), FRAMES, "{NAME}: frame count");
 
         let pipe_before = crate::decode::pipeline_taken_frames();
-        let stripe0_before = crate::restoration::lr_stripe0_hits();
+        let row0_before = crate::decode::lr_pipeline_row0_flushes();
         let piped = {
             let _bands = crate::par::override_filter_threads(4);
             decode_stream(&stream)
@@ -5956,10 +5958,18 @@ pub(crate) mod tests {
              arm decoded serial and proves nothing (class \
              gate-blind-to-feature)"
         );
-        assert!(
-            crate::restoration::lr_stripe0_hits() - stripe0_before > 0,
-            "{NAME}: no stripe-0 (RU row 0's first stripe) filter ran -- RU row \
-             0 was never restored in this arm (class gate-blind-to-feature)"
+        // f1 restores all three planes, f2 all but U -> 3 + 2 row-0 flushes.
+        // `LR_PIPELINE_ROW0` is process-global and bumped by the pipeline's
+        // own worker, so this delta cannot be satisfied by frame 0's
+        // whole-frame LR (which runs on this test's thread and never touches
+        // the counter).
+        assert_eq!(
+            crate::decode::lr_pipeline_row0_flushes() - row0_before,
+            5,
+            "{NAME}: the pipeline never flushed RU row 0 ({} planes' worth \
+             expected) -- the named defect class is present (class \
+             lr-band-release)",
+            5
         );
 
         // The refutation itself: pipeline == serial, byte for byte, on every
