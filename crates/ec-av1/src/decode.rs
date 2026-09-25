@@ -20277,6 +20277,15 @@ const CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
 const CDEF_VERY_LARGE: i32 = 0x4000;
 const CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
 const CDEF_SEC_TAPS: [i32; 2] = [2, 1];
+/// lane-av1422filter: libaom `av1_cdef_filter_fb` (cdef_block.c) remaps the
+/// luma direction before filtering CHROMA whenever `xdec != ydec` — the
+/// direction grid lives on the subsampled chroma grid, so a direction found
+/// on the 8x8 luma block means a different line there. `conv422` applies
+/// under 4:2:2 (`xdec` set), `conv440` under its mirror (not expressible in
+/// the profiles this decoder accepts, kept for fidelity). 4:2:0 and 4:4:4
+/// (`xdec == ydec`) take no remap, exactly as before this lane.
+const CDEF_DIR_CONV422: [usize; 8] = [7, 0, 2, 4, 5, 6, 6, 6];
+const CDEF_DIR_CONV440: [usize; 8] = [1, 2, 2, 2, 3, 4, 6, 0];
 
 fn cdef_msb(x: i32) -> i32 {
     31 - x.leading_zeros() as i32
@@ -24802,7 +24811,19 @@ fn cdef_band(
 
                     let t_uv = i32::from(cdef.uv_pri_strength[sidx]) << coeff_shift;
                     let uv_sec_strength = i32::from(cdef.uv_sec_strength[sidx]) << coeff_shift;
-                    let uv_dir = if t_uv != 0 { dir } else { 0 };
+                    // lane-av1422filter: the chroma direction is the luma one
+                    // remapped through `conv422`/`conv440` under asymmetric
+                    // subsampling (see [`CDEF_DIR_CONV422`]); identical to the
+                    // raw luma direction for 4:2:0 and 4:4:4.
+                    let uv_dir = if t_uv != 0 {
+                        match (ss_x(fctx), ss_y(fctx)) {
+                            (1, 0) => CDEF_DIR_CONV422[dir],
+                            (0, 1) => CDEF_DIR_CONV440[dir],
+                            _ => dir,
+                        }
+                    } else {
+                        0
+                    };
                     let enable_primary_uv = t_uv != 0;
                     let enable_secondary_uv = uv_sec_strength != 0;
                     if let Some(w) = wrote.as_deref_mut() {
@@ -25005,8 +25026,11 @@ fn pipe_run(
             let j = k - 2;
             if let Some((sy2, su2, sv2)) = snap.as_mut() {
                 snap_band(sy2.data.to_mut(), y, 0, j * 64, (j + 1) * 64, cfg.cdef_on);
-                snap_band(su2.data.to_mut(), u, 1, j * 32, (j + 1) * 32, cfg.cdef_on);
-                snap_band(sv2.data.to_mut(), v, 1, j * 32, (j + 1) * 32, cfg.cdef_on);
+                // lane-av1422filter: chroma band rows follow the frame's ss_y
+                // (4:2:2 chroma bands the luma 64-row grid, not 32).
+                let (c_lo, c_hi) = ((j * 64) >> ss_y(fctx), ((j + 1) * 64) >> ss_y(fctx));
+                snap_band(su2.data.to_mut(), u, ss_y(fctx) as u32, c_lo, c_hi, cfg.cdef_on);
+                snap_band(sv2.data.to_mut(), v, ss_y(fctx) as u32, c_lo, c_hi, cfg.cdef_on);
             }
         }
         if cfg.cdef_on && k >= 3 && k - 3 < nb {
@@ -25061,8 +25085,23 @@ fn pipe_run_lr(
     let (fw, fh) = (cfg.frame_w, cfg.frame_h);
     let dims = [
         (fw, fh, 0u32, y.width, y.data.len()),
-        (fw.div_ceil(2), fh.div_ceil(2), 1, u.width, u.data.len()),
-        (fw.div_ceil(2), fh.div_ceil(2), 1, v.width, v.data.len()),
+        // lane-av1422filter: chroma plane extents and stripe geometry follow
+        // the frame's own subsampling -- 4:2:2 chroma is full-height with
+        // luma-grid stripes (only 4:2:0 halves both).
+        (
+            round_ss(fw, ss_x(fctx)),
+            round_ss(fh, ss_y(fctx)),
+            ss_y(fctx) as u32,
+            u.width,
+            u.data.len(),
+        ),
+        (
+            round_ss(fw, ss_x(fctx)),
+            round_ss(fh, ss_y(fctx)),
+            ss_y(fctx) as u32,
+            v.width,
+            v.data.len(),
+        ),
     ];
     let mut planes: Vec<LrPlane> = Vec::new();
     for (p, &(pw, ph, ss, stride, len)) in dims.iter().enumerate() {
@@ -28044,8 +28083,20 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
             && lr.loop_restoration_size[p] != 0
     });
-    let deblocked =
-        lr_active.then(|| (plane_snapshot(&y, 0), plane_snapshot(&u, 1), plane_snapshot(&v, 1)));
+    let deblocked = lr_active.then(|| {
+        (
+            plane_snapshot(&y, 0),
+            // lane-av1422filter: the bands are the LR stripe-boundary context
+            // (`RESTORATION_UNIT_OFFSET >> ss_y` above/below each 64-luma-row
+            // stripe). Chroma stripes are half-height ONLY under 4:2:0; a
+            // 4:2:2 frame's chroma (ss_y = 0) stripes on the luma grid, so
+            // the hardcoded `1` saved bands at rows 26/60/92/124 where LR
+            // reads rows 54..57/118..121 -- every 4:2:2 boundary
+            // substitution read uninitialised zeros (frame-0 V (48,0)).
+            plane_snapshot(&u, ss_y(fctx) as u32),
+            plane_snapshot(&v, ss_y(fctx) as u32),
+        )
+    });
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -42388,7 +42439,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             (false, None) => None,
         }
     } else {
-        lr_active.then(|| (plane_snapshot(&y, 0), plane_snapshot(&u, 1), plane_snapshot(&v, 1)))
+        // lane-av1422filter: chroma band geometry follows the frame's own
+        // ss_y (see the keyframe path's note) -- 4:2:2 stripes full-height.
+        lr_active.then(|| {
+            (
+                plane_snapshot(&y, 0),
+                plane_snapshot(&u, ss_y(fctx) as u32),
+                plane_snapshot(&v, ss_y(fctx) as u32),
+            )
+        })
     };
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
