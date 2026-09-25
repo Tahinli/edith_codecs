@@ -10103,6 +10103,10 @@ fn decode_rect_split(
         (4, 8) => Some((TxbSet::ChromaRect8x4, &SCAN_4X8[..])),
         _ => None,
     };
+    // A 4:4:4 64-axis strip's chroma plane block is larger than one adjusted
+    // UV transform (TX_64X32 adjusts to TX_32X32). Those sizes are tiled
+    // below; everything else still needs a single-unit table.
+    let chroma_tiled = matches!((chroma_w, chroma_h), (64, 32) | (32, 64) | (64, 16) | (16, 64));
     if !m.skip {
         if let Some(i) = match (chroma_w, chroma_h) {
             (32, 8) => Some(0),
@@ -10119,11 +10123,24 @@ fn decode_rect_split(
                 });
             }
         }
-        if chroma.is_none() {
+        if chroma.is_none() && !chroma_tiled {
             // Diagnostic for the next caller that lands here (class
             // refusal-names-a-correlate: the message names the tool, not the
             // shape); the refusal below keeps its inventory-pinned wording.
-            eprintln!("EC_RECTCHROMA_GAP luma={bw}x{bh} tx={tx_w}x{tx_h} chroma={chroma_w}x{chroma_h}");
+            // The condition is the refusal's exact precondition, so the
+            // print can never fire without the refusal (or vice versa): the
+            // four 64-axis chroma shapes are tiled below and at LOSSLESS the
+            // 4x4 walk never consults `chroma` at all -- libaom has no such
+            // transform to name a row for (`av1_get_tx_size` returns TX_4X4
+            // for every plane at lossless, blockd.h:1383; outside it
+            // `av1_get_adjusted_tx_size` collapses TX_64X32/32X64 to TX_32X32
+            // for chroma, blockd.h:1361-1367). lane-av1-ll64: the old
+            // ungated print fired on those working routes and mislabelled
+            // them a gap (one lane report cited it as a decode stop).
+            eprintln!(
+                "EC_RECTCHROMA_GAP luma={bw}x{bh} tx={tx_w}x{tx_h} \
+                 chroma={chroma_w}x{chroma_h} libaom_lossless_tx=none"
+            );
         }
     }
     // lane-rectsplit r2 (verifier finding): with both callers wired
@@ -10133,10 +10150,6 @@ fn decode_rect_split(
     // caller -- a new strip size would otherwise hit the `expect` below and
     // panic instead of refusing by name -- and so stays in
     // `refusal_inventory::REFUSALS`.
-    // A 4:4:4 64-axis strip's chroma plane block is larger than one adjusted
-    // UV transform (TX_64X32 adjusts to TX_32X32). Those sizes are tiled
-    // below; everything else still needs a single-unit table.
-    let chroma_tiled = matches!((chroma_w, chroma_h), (64, 32) | (32, 64) | (64, 16) | (16, 64));
     if !m.skip && chroma.is_none() && !chroma_tiled {
         return Err(unsupported(
             "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
