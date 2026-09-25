@@ -35617,6 +35617,83 @@ fn decode_inter_block(
                     None,
                     smooth_neighbor_uv, fctx,
                 )?
+            } else if side == 64 {
+                // lane-av1-422inter: `av1_get_max_uv_txsize(BLOCK_64X64)` at
+                // ss (1,0) adjusts `max_txsize_rect_lookup[BLOCK_32X64]` =
+                // TX_32X64 down to TX_32X32 (`av1_get_adjusted_tx_size`), so
+                // the (side/2, side) = (32, 64) plane block codes TWO stacked
+                // SQUARE TX_32X32 units per plane, plane-major -- the
+                // key-frame path's own model (`decode_block`'s 4:2:2
+                // chroma_tx table, "64 and 128: TX_32X64 / TX_64X64 adjust
+                // down to TX_32X32", proven byte-exact on this fixture's
+                // frame 0) and the twin of this function's own side>64
+                // mu-chunk walk above. The whole-plane-block rect read this
+                // arm replaced handed [`read_coeffs_rect`] a 36x68 levels
+                // frame it never had (the frame-9 panic) and would have read
+                // a full TX_32X64 scan libaom never codes.
+                let cu_scan = default_scan(32);
+                let (cu_w, cu_h) = (32usize, 32usize);
+                let luma_span_x = cu_w << ss_x(fctx);
+                let luma_span_y = cu_h << ss_y(fctx);
+                let mut assembled = vec![0i32; chroma_side * chroma_side];
+                for cu_row in 0..chroma_h / cu_h {
+                    let cu_mi = (at_mi.0 + cu_row * (luma_span_y / MI), at_mi.1);
+                    let cu_around =
+                        neighbours.around_mi_422_chroma(cu_mi, luma_span_x, luma_span_y);
+                    let cu_reach = tu_reach_rect(
+                        side,
+                        side,
+                        0,
+                        cu_row * luma_span_y,
+                        luma_span_x,
+                        luma_span_y,
+                        reach,
+                        px,
+                        py,
+                        y.width,
+                        y.height, fctx,
+                    );
+                    let cu_grid = read_plane(
+                        dec,
+                        cdfs,
+                        TxbSet::Chroma32,
+                        &cu_scan,
+                        1,
+                        cu_around[1],
+                        mode,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        cu_reach,
+                        u,
+                        cpx,
+                        cpy + cu_row * cu_h,
+                        cu_w,
+                        cu_w,
+                        base_q_idx,
+                        alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+                        None,
+                        // The uv plane block (32x64) is larger than the unit
+                        // (32x32): `get_txb_ctx`'s offset-10 rows, +3 on the
+                        // `txb_skip_chroma_32` table (lane-sb128b r3).
+                        Some(3),
+                        smooth_neighbor_uv, fctx,
+                    )?;
+                    hit!(CHROMA_SPLIT_TX_HITS);
+                    hit!(CHROMA422_SQUARE_HITS);
+                    // Immediately, so the next unit of this plane reads this
+                    // one's coefficient context; the whole-block record below
+                    // re-stamps the block over these and the tail's
+                    // `mu_chroma_units` replay puts the per-unit state back
+                    // (lane-dpm1).
+                    neighbours.record_mi_chroma(cu_mi, luma_span_x, luma_span_y, 1, &cu_grid);
+                    for rr in 0..cu_h {
+                        let start = (cu_row * cu_h + rr) * chroma_side;
+                        assembled[start..start + cu_w]
+                            .copy_from_slice(&cu_grid[rr * cu_w..][..cu_w]);
+                    }
+                }
+                mu_chroma = true;
+                Grid::Own(assembled)
             } else {
                 let (rect_set, rect_scan): (TxbSet, &[u16]) = match side {
                     4 => (TxbSet::Chroma4, default_scan(4)),
@@ -35659,6 +35736,66 @@ fn decode_inter_block(
                     None,
                     smooth_neighbor_uv, fctx,
                 )?
+            } else if side == 64 {
+                // lane-av1-422inter: plane 2 of the TX_32X32-adjusted walk
+                // above -- same two stacked square units, plane-major (every
+                // U unit, then every V unit, libaom `decode_token_recon_block`'s
+                // per-mu-chunk plane loop).
+                let cu_scan = default_scan(32);
+                let (cu_w, cu_h) = (32usize, 32usize);
+                let luma_span_x = cu_w << ss_x(fctx);
+                let luma_span_y = cu_h << ss_y(fctx);
+                let mut assembled = vec![0i32; chroma_side * chroma_side];
+                for cu_row in 0..chroma_h / cu_h {
+                    let cu_mi = (at_mi.0 + cu_row * (luma_span_y / MI), at_mi.1);
+                    let cu_around =
+                        neighbours.around_mi_422_chroma(cu_mi, luma_span_x, luma_span_y);
+                    let cu_reach = tu_reach_rect(
+                        side,
+                        side,
+                        0,
+                        cu_row * luma_span_y,
+                        luma_span_x,
+                        luma_span_y,
+                        reach,
+                        px,
+                        py,
+                        y.width,
+                        y.height, fctx,
+                    );
+                    let cu_grid = read_plane(
+                        dec,
+                        cdfs,
+                        TxbSet::Chroma32,
+                        &cu_scan,
+                        2,
+                        cu_around[2],
+                        mode,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        cu_reach,
+                        v,
+                        cpx,
+                        cpy + cu_row * cu_h,
+                        cu_w,
+                        cu_w,
+                        base_q_idx,
+                        alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+                        None,
+                        Some(3),
+                        smooth_neighbor_uv, fctx,
+                    )?;
+                    hit!(CHROMA_SPLIT_TX_HITS);
+                    hit!(CHROMA422_SQUARE_HITS);
+                    neighbours.record_mi_chroma(cu_mi, luma_span_x, luma_span_y, 2, &cu_grid);
+                    for rr in 0..cu_h {
+                        let start = (cu_row * cu_h + rr) * chroma_side;
+                        assembled[start..start + cu_w]
+                            .copy_from_slice(&cu_grid[rr * cu_w..][..cu_w]);
+                    }
+                }
+                mu_chroma = true;
+                Grid::Own(assembled)
             } else {
                 let (rect_set, rect_scan): (TxbSet, &[u16]) = match side {
                     4 => (TxbSet::Chroma4, default_scan(4)),
