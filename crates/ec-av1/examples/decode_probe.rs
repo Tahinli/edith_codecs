@@ -109,6 +109,10 @@ fn main() {
             "llintra8_chroma_walk: {}",
             ec_av1::decode::llintra8_chroma_walk_hits()
         );
+        println!(
+            "sub8rect444_chroma_walk: {}",
+            ec_av1::decode::llsub8rect444_chroma_walk_hits()
+        );
         let si = ec_av1::stream::sub8_intra_rect_hits();
         println!(
             "sub8_intra_rect: horz8x4={} vert4x8={} chroma_ref={} mixed={} split4x4={}",
