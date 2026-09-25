@@ -35698,9 +35698,20 @@ fn decode_intra_sub8_leaf(
     // No angle delta below 8x8 (`av1_use_angle_delta`), for luma or chroma.
     let angle_delta_y = 0;
     let (uv_mode, alpha) = if has_chroma {
-        // `is_cfl_allowed` is `wide <= 32 && high <= 32` -- true for this
-        // shape, so the 14-symbol CFL alphabet is the right one.
-        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        // `is_cfl_allowed` (blockd.h): away from lossless it is
+        // `wide <= 32 && high <= 32` -- true for this shape; at lossless the
+        // CHROMA plane block must be a single TX_4X4, so at 4:4:4 only the
+        // 4x4 leaf keeps the 14-symbol CFL alphabet while an 8x4/4x8 leaf
+        // reads the 13-symbol `uv_mode_no_cfl` one (the t6 frame-1 8x4 leaf
+        // desynced at its uv_mode symbol reading the CFL alphabet,
+        // lane-av1llintercdf). At 4:2:0 a sub-8 shape's chroma block is
+        // always 4x4-or-smaller, so the predicate stays true and this read
+        // is unchanged.
+        let uv_mode = if cfl_allowed_px(bw, bh, fctx) {
+            dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
+        };
         if step {
             eprintln!(
                 "EC_ISTEP mi_row={} mi_col={} name=uv_mode val={uv_mode} rng={}",
