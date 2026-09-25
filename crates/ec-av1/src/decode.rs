@@ -486,7 +486,15 @@ pub(crate) fn lossless_tx(px: usize, fctx: &crate::decode::FrameCtx) -> usize {
 /// picks the 13-symbol one (class `wrong-alphabet-same-value`).
 pub(crate) fn cfl_allowed_px(bw: usize, bh: usize, fctx: &crate::decode::FrameCtx) -> bool {
     if lossless(fctx) {
-        bw <= 8 && bh <= 8
+        // `is_cfl_allowed`: at lossless CfL is available only when the
+        // partition size equals the transform size -- the CHROMA plane block
+        // must be a single TX_4X4. True for an 8x8 partition at 4:2:0 (its
+        // plane block is 4x4) and for 4x4 partitions; FALSE for an 8x8
+        // partition at 4:4:4, whose plane block is 8x8 -- that partition
+        // reads the 13-symbol uv_mode CDF, and reading the CFL alphabet
+        // there desynced the tile from the leaf's own uv_mode symbol (class
+        // `wrong-alphabet-same-value`).
+        (bw >> ss_x(fctx)).max(4) == 4 && (bh >> ss_y(fctx)).max(4) == 4
     } else {
         bw <= 32 && bh <= 32
     }
@@ -17279,9 +17287,17 @@ fn decode_block(
                     (2 * y.true_width.div_ceil(8)) as i32 - mi_c as i32 - span_mi as i32;
                 let over_h_mi =
                     (2 * y.true_height.div_ceil(8)) as i32 - mi_r as i32 - span_mi as i32;
-                let plane_px = ((span_mi * 2).max(4)) as i32;
-                let max_units_w = ((plane_px + 2 * over_w_mi.min(0)) >> 2).max(0) as usize;
-                let max_units_h = ((plane_px + 2 * over_h_mi.min(0)) >> 2).max(0) as usize;
+                // `max_block_wide/high` in chroma pixels: the plane block's
+                // own span (`side` at 4:4:4, `side / 2` at 4:2:0 -- the old
+                // hardcoded `span_mi * 2` clipped three quarters of a 4:4:4
+                // block's coded units and desynced the tile) plus the
+                // negative overhang (`mb_to_*_edge >> (3 + ss)`), whose
+                // chroma-px scale is `MI >> ss` per mi.
+                let plane_px = (((span_mi * MI) >> ss_x(fctx)).max(4)) as i32;
+                let over_w_px = over_w_mi.min(0) * (MI >> ss_x(fctx)) as i32;
+                let over_h_px = over_h_mi.min(0) * (MI >> ss_y(fctx)) as i32;
+                let max_units_w = ((plane_px + over_w_px) >> 2).max(0) as usize;
+                let max_units_h = ((plane_px + over_h_px) >> 2).max(0) as usize;
                 let unit = chroma_tx / 4; // TU side in 4x4 chroma units
                 if cu_col * unit >= max_units_w || cu_row * unit >= max_units_h {
                     hit!(CHROMA_EDGE_TU_CLIP_HITS);
@@ -18169,12 +18185,45 @@ fn decode_leaf8(
             );
         }
         let ac = alpha.map(|_| cfl_src(px, py, 8));
+        // 4:4:4 lossless: the leaf's chroma plane block is a 2x2 raster of
+        // TX_4X4 units (`av1_get_tx_size`: lossless forces TX_4X4 on EVERY
+        // plane), so a skipped leaf predicts per unit -- each from its own
+        // edges -- like the luma `SKIP_SPLIT_TX` loop above. CfL never fires
+        // here (`is_cfl_allowed` at lossless needs plane_bsize == 4x4; this
+        // chroma plane block is 8x8), and intrabc/palette keep the
+        // whole-plane-block prediction they already run.
+        let chroma_units_444 = chroma_444
+            && lossless(fctx)
+            && intrabc_bufs.is_none()
+            && palette_uv_bufs.is_none();
         if let Some((_, ub, _)) = &intrabc_bufs {
             set_palette_pred(ub.clone(), fctx);
         } else if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
-        push_intra(1, 
+        if chroma_units_444 {
+            for cu_row in 0..2 {
+                for cu_col in 0..2 {
+                    let cu_reach = tu_reach(
+                        8, 8, cu_col * 4, cu_row * 4, 4,
+                        reach, px, py, y.width, y.height, fctx,
+                    );
+                    push_intra(1,
+                        cpx + cu_col * 4,
+                        cpy + cu_row * 4,
+                        4,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        cu_reach,
+                        &ZERO_RESIDUAL[..16],
+                        None,
+                        None,
+                        smooth_neighbor_uv, fctx,
+                    );
+                }
+            }
+        } else {
+        push_intra(1,
             cpx,
             cpy,
             csz,
@@ -18186,12 +18235,35 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv, fctx,
         );
+        }
         if let Some((_, _, vb)) = &intrabc_bufs {
             set_palette_pred(vb.clone(), fctx);
         } else if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
         }
-        push_intra(2, 
+        if chroma_units_444 {
+            for cu_row in 0..2 {
+                for cu_col in 0..2 {
+                    let cu_reach = tu_reach(
+                        8, 8, cu_col * 4, cu_row * 4, 4,
+                        reach, px, py, y.width, y.height, fctx,
+                    );
+                    push_intra(2,
+                        cpx + cu_col * 4,
+                        cpy + cu_row * 4,
+                        4,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        cu_reach,
+                        &ZERO_RESIDUAL[..16],
+                        None,
+                        None,
+                        smooth_neighbor_uv, fctx,
+                    );
+                }
+            }
+        } else {
+        push_intra(2,
             cpx,
             cpy,
             csz,
@@ -18203,6 +18275,7 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv, fctx,
         );
+        }
         luma_grid = Grid::Zero(64);
         u_grid = Grid::Zero(csz * csz);
         v_grid = Grid::Zero(csz * csz);
@@ -18416,6 +18489,28 @@ fn decode_leaf8(
         if fctx.intrabc_chroma_tx.with(std::cell::Cell::get).is_some() {
             hit!(INTRABC_TX4_CHROMA_COPY_HITS);
         }
+        if chroma_444 && lossless(fctx) {
+            // 4:4:4 lossless: the leaf's chroma plane block is a 2x2 raster
+            // of TX_4X4 units per plane, PLANE-MAJOR (`av1_get_tx_size`:
+            // lossless forces TX_4X4 on EVERY plane) -- the same walk
+            // `read_intra_chroma_lossless` runs for whole blocks. Reading one
+            // TX_8X8 unit here panicked before: the lossless inverse is the
+            // 4x4-only WHT (`TxParams::run`'s own `(w, h) == (4, 4)`
+            // invariant), and the unit count desyncs the tile either way.
+            // Per-unit `record_mi_chroma` calls stamp the neighbour bands
+            // inside, which is why the tail's whole-leaf chroma stamp below
+            // is skipped for this shape.
+            let (mut uo, mut vo) = (Vec::new(), Vec::new());
+            read_intra_chroma_lossless(
+                dec, cdfs, neighbours, u, v, leaf_mi, (px, py), (cpx, cpy),
+                8, (8, 8), (0, 0), (8, 8), 8, reach, (y.width, y.height), mode,
+                uv_predict_mode, angle_delta_uv,
+                palette_uv_bufs.as_ref().map(|(a, b)| (&a[..], &b[..])),
+                smooth_neighbor_uv, base_q_idx, &mut uo, &mut vo, fctx,
+            )?;
+            u_grid = if uo.is_empty() { Grid::Zero(64) } else { Grid::Own(uo) };
+            v_grid = if vo.is_empty() { Grid::Zero(64) } else { Grid::Own(vo) };
+        } else {
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
@@ -18466,6 +18561,7 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv, fctx,
         )?;
+        }
         // The two chroma reads above are the only consulters of this leaf's
         // armed [`INTRABC_CHROMA_TX`]; leaving it set would make the NEXT
         // leaf's chroma inherit this leaf's luma type instead of its own
@@ -18493,14 +18589,21 @@ fn decode_leaf8(
         let bound_w = round_up_even(neighbours.mi_cols);
         let u_state = neighbour_state(&u_grid);
         let v_state = neighbour_state(&v_grid);
-        for cell in 0..side_mi {
-            if cell < side_mi.min(bound_h.saturating_sub(leaf_mi.0)) {
-                neighbours.left[leaf_mi.0 + cell][1] = u_state;
-                neighbours.left[leaf_mi.0 + cell][2] = v_state;
-            }
-            if cell < side_mi.min(bound_w.saturating_sub(leaf_mi.1)) {
-                neighbours.above[leaf_mi.1 + cell][1] = u_state;
-                neighbours.above[leaf_mi.1 + cell][2] = v_state;
+        // The 4:4:4 lossless walk above already stamped these bands PER UNIT
+        // (its raster-order last writer per cell is exactly libaom's
+        // per-entry last update); this whole-leaf aggregate would clobber
+        // four distinct unit states with one, so it runs only for the shapes
+        // whose chroma really is one unit.
+        if !(chroma_444 && lossless(fctx)) {
+            for cell in 0..side_mi {
+                if cell < side_mi.min(bound_h.saturating_sub(leaf_mi.0)) {
+                    neighbours.left[leaf_mi.0 + cell][1] = u_state;
+                    neighbours.left[leaf_mi.0 + cell][2] = v_state;
+                }
+                if cell < side_mi.min(bound_w.saturating_sub(leaf_mi.1)) {
+                    neighbours.above[leaf_mi.1 + cell][1] = u_state;
+                    neighbours.above[leaf_mi.1 + cell][2] = v_state;
+                }
             }
         }
     // This leaf's own palette state into the mi-granular above/left bands
@@ -28391,7 +28494,13 @@ fn read_intra_chroma_lossless(
                 if cpx + ox >= u.true_width || cpy + oy >= u.true_height {
                     continue;
                 }
-                let cu_mi = (at_mi.0 + oy / 2, at_mi.1 + ox / 2);
+                // Chroma pixels per mi cell: 2 at 4:2:0, 4 at 4:4:4. At
+                // 4:2:0 a TX_4X4 chroma unit spans two mi cells and anchors
+                // at the even one; at 4:4:4 it IS one mi cell.
+                let cu_mi = (
+                    at_mi.0 + oy / (MI >> ss_y(fctx)),
+                    at_mi.1 + ox / (MI >> ss_x(fctx)),
+                );
                 // libaom's chroma entropy-context arrays are SUBSAMPLED:
                 // `get_txb_ctx` reads exactly one entry per plane for a
                 // TX_4X4 chroma unit (`a[0]`/`l[0]`). Our bands are luma-mi
@@ -28400,8 +28509,12 @@ fn read_intra_chroma_lossless(
                 // cell is past the band on a unit whose block hangs off the
                 // frame edge, which libaom still codes.
                 let cu_around = neighbours.around_mi(cu_mi, MI);
+                // The unit's origin and extent in LUMA pixels: `<< ss` at
+                // 4:2:0 (8x8 luma for a 4x4 chroma unit), identity at 4:4:4.
                 let cu_reach = tu_reach(
-                    side, side, ox * 2, oy * 2, 8, reach, px, py, frame_w, frame_h, fctx,
+                    side, side,
+                    ox << ss_x(fctx), oy << ss_y(fctx), 4 << ss_x(fctx),
+                    reach, px, py, frame_w, frame_h, fctx,
                 );
                 if let Some((ub, vb)) = palette_uv_bufs {
                     let buf = if plane_idx == 1 { ub } else { vb };
@@ -28432,7 +28545,11 @@ fn read_intra_chroma_lossless(
                     smooth_neighbor_uv,
                     fctx,
                 )?;
-                neighbours.record_mi_chroma(cu_mi, 8, 8, plane_idx, &cu_grid);
+                // The unit's own footprint on the LUMA mi grid: 8 luma px
+                // (two cells) at 4:2:0, 4 (one cell) at 4:4:4.
+                neighbours.record_mi_chroma(
+                    cu_mi, 4 << ss_x(fctx), 4 << ss_y(fctx), plane_idx, &cu_grid,
+                );
                 hit!(CHROMA_SPLIT_TX_HITS);
                 let dst = mu_units(
                     if plane_idx == 1 { &mut *u_out } else { &mut *v_out },
