@@ -34627,6 +34627,89 @@ fn decode_inter_block(
                 u_grid = if uo.is_empty() { Grid::Zero(zero) } else { Grid::Own(uo) };
                 v_grid = if vo.is_empty() { Grid::Zero(zero) } else { Grid::Own(vo) };
                 mu_chroma = true;
+            } else if ss_x(fctx) == 0 && ss_y(fctx) == 0 && chroma_side > chroma_tx {
+                // lane-av1-rect128recon: at ss 0/0 the uv plane block of a
+                // 64x64 intra block inside an inter frame is 64x64 while
+                // `av1_get_max_uv_txsize` caps the unit at TX_32X32 -- FOUR
+                // plane-major TX_32X32 units (libaom
+                // `decode_token_recon_block`'s plane loop), each with its own
+                // neighbour context and `get_txb_ctx`'s offset-10 rows (+3 on
+                // the `txb_skip_chroma_32` table, lane-sb128b r3), each
+                // stamped immediately so the next unit reads it. The old arm
+                // read ONE whole-plane unit with the block-level context and
+                // no offset: three quarters of the plane's residual was never
+                // read, the unit's `txb_skip` came off the offset-7 row (444
+                // witness f2, right-half intra 64x64: U unit (0,0) ctx 0
+                // where aom reads 10), and the coded corner was even
+                // dequantized at the TX_64X64 dqDenom.
+                let mu_units_n = chroma_side / chroma_tx;
+                let mut u_acc = vec![0i32; chroma_side * chroma_side];
+                let mut v_acc = vec![0i32; chroma_side * chroma_side];
+                for plane_idx in 1..=2 {
+                    let buf: &mut PlaneBuf<'static> =
+                        if plane_idx == 1 { &mut *u } else { &mut *v };
+                    for cu_row in 0..mu_units_n {
+                        for cu_col in 0..mu_units_n {
+                            let cu_mi = (
+                                at_mi.0 + cu_row * (chroma_tx / MI),
+                                at_mi.1 + cu_col * (chroma_tx / MI),
+                            );
+                            let cu_around = neighbours.around_mi(cu_mi, chroma_tx);
+                            let cu_reach = crate::decode::tu_reach(
+                                side,
+                                side,
+                                cu_col * chroma_tx,
+                                cu_row * chroma_tx,
+                                chroma_tx,
+                                reach,
+                                px,
+                                py,
+                                y.width,
+                                y.height, fctx,
+                            );
+                            let cu_grid = read_plane(
+                                dec,
+                                cdfs,
+                                chroma_set,
+                                scan_chroma,
+                                plane_idx,
+                                cu_around[plane_idx],
+                                mode,
+                                uv_predict_mode,
+                                angle_delta_uv,
+                                cu_reach,
+                                buf,
+                                cpx + cu_col * chroma_tx,
+                                cpy + cu_row * chroma_tx,
+                                chroma_tx,
+                                chroma_tx,
+                                base_q_idx,
+                                // CfL is capped at 32x32 (`is_cfl_allowed`),
+                                // so a block this size never carries alpha.
+                                None,
+                                None,
+                                Some(3),
+                                smooth_neighbor_uv, fctx,
+                            )?;
+                            // Immediately, so the NEXT unit reads this one's
+                            // coefficient context.
+                            neighbours.record_mi_chroma(
+                                cu_mi, chroma_tx, chroma_tx, plane_idx, &cu_grid,
+                            );
+                            hit!(CHROMA_SPLIT_TX_HITS);
+                            let acc = if plane_idx == 1 { &mut u_acc } else { &mut v_acc };
+                            for rr in 0..chroma_tx {
+                                let start =
+                                    (cu_row * chroma_tx + rr) * chroma_side + cu_col * chroma_tx;
+                                acc[start..start + chroma_tx]
+                                    .copy_from_slice(&cu_grid[rr * chroma_tx..][..chroma_tx]);
+                            }
+                        }
+                    }
+                }
+                mu_chroma = true;
+                u_grid = Grid::Own(u_acc);
+                v_grid = Grid::Own(v_acc);
             } else {
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
