@@ -14641,9 +14641,16 @@ fn decode_rect4_16_strip(
                                     angle_delta_uv, cu_reach, &ZERO_RESIDUAL[..16], None, None,
                                     smooth_neighbor_uv, fctx,
                                 );
-                                let cu_mi = (pair_mi.0 + oy / 2, pair_mi.1 + ox / 2);
+                                let cu_mi = (
+                                    pair_mi.0 + (oy << ss_y(fctx)) / MI,
+                                    pair_mi.1 + (ox << ss_x(fctx)) / MI,
+                                );
                                 neighbours.record_mi_chroma(
-                                    cu_mi, 8, 8, plane, &ZERO_RESIDUAL[..16],
+                                    cu_mi,
+                                    4 << ss_x(fctx),
+                                    4 << ss_y(fctx),
+                                    plane,
+                                    &ZERO_RESIDUAL[..16],
                                 );
                             }
                         }
@@ -14663,7 +14670,25 @@ fn decode_rect4_16_strip(
                                 if cpx + ox >= u.true_width || cpy + oy >= u.true_height {
                                     continue;
                                 }
-                                let cu_mi = (pair_mi.0 + oy / 2, pair_mi.1 + ox / 2);
+                                // The unit's stamp is its own span: aom
+                                // `av1_set_entropy_contexts` (blockd.c:29)
+                                // memsets exactly `tx_size_wide_unit` x
+                                // `tx_size_high_unit` cells at the unit's own
+                                // `(aoff, loff)` -- for TX_4X4 ONE above cell
+                                // and ONE left cell. `(oy / 2, ox / 2)` +
+                                // `(8, 8)` is the 4:2:0 subsampled form (one
+                                // chroma cell = 8 luma px = 2 mi cells); at
+                                // 4:4:4 a unit is ONE mi cell, and the 2x2
+                                // smear let a 4-wide strip's later units
+                                // overwrite the NEXT COLUMN's above cell with
+                                // their own state -- a column aom never sees
+                                // this block write -- so the following block's
+                                // `all_zero` read the wrong `txb_skip` row
+                                // (frame-0 read #452, the llkf named gap).
+                                let cu_mi = (
+                                    pair_mi.0 + (oy << ss_y(fctx)) / MI,
+                                    pair_mi.1 + (ox << ss_x(fctx)) / MI,
+                                );
                                 // One luma-mi cell: the chroma entropy arrays
                                 // are subsampled, and our bands replicate that
                                 // one entry over the unit's two cells
@@ -14685,7 +14710,13 @@ fn decode_rect4_16_strip(
                                     cu_reach, buf, cpx + ox, cpy + oy, 4, 4, base_q_idx,
                                     None, None, offset, smooth_neighbor_uv, fctx,
                                 )?;
-                                neighbours.record_mi_chroma(cu_mi, 8, 8, plane, &cu_grid);
+                                neighbours.record_mi_chroma(
+                                    cu_mi,
+                                    4 << ss_x(fctx),
+                                    4 << ss_y(fctx),
+                                    plane,
+                                    &cu_grid,
+                                );
                                 hit!(CHROMA_SPLIT_TX_HITS);
                                 let dst = if plane == 1 { &mut uo } else { &mut vo };
                                 for row in 0..4 {
