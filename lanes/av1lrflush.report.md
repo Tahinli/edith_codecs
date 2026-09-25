@@ -49,12 +49,17 @@
    pinned fixture, asserting (a) `PIPELINE_TAKEN` delta == 2 (the arm really
    pipelined both inter frames; robust against the once-per-process
    `filter_threads()` env cache that would otherwise silently serialise the arm),
-   (b) `LR_STRIPE0_HITS` delta > 0 (a real filter ran on RU row 0's own first stripe
-   through the pipeline), (c) pipelined == serial byte-exact on every frame, and
-   (d) frames 0/1 byte-exact vs oracle aomdec AND ffmpeg THROUGH the pipeline.
-   Mutation-verified: hard-disabling the RU-row-0 release in `pipe_run_lr`'s band
-   walk turns the gate red at assert (c) ("pipelined frame 1 plane 0 differs",
-   class lr-band-release); reverted, green.
+   (b) `LR_PIPELINE_ROW0` delta == 5 (f1 restores all three planes, f2 all but U:
+   the pipeline's band release flushed RU row 0 that many times), (c) pipelined ==
+   serial byte-exact on every frame, and (d) frames 0/1 byte-exact vs oracle
+   aomdec AND ffmpeg THROUGH the pipeline. r4 review hole, fixed: the original (b)
+   used the thread-local `LR_STRIPE0_HITS`, which the gate's own thread can
+   satisfy from frame 0's whole-frame LR alone — vacuous as a pipeline witness;
+   the replacement is a process-global counter bumped by `pipe_run_lr`'s
+   filter-pool worker itself, so only a real pipeline row-0 flush can move it.
+   Mutation-verified: hard-disabling the RU-row-0 release in `pipe_run_lr`'s
+   band walk turns the gate red (row-0 delta 0 and "pipelined frame 1 plane 0
+   differs", class lr-band-release); reverted, green.
 6. Gate-extension status for the original acceptance item: extending
    `a_444_sb128_root_rect_stream_with_restoration_decodes_pixel_exact` to assert f2
    byte-exact vs aomdec/ffmpeg is **deferred** — f2 is not green and its fix belongs
