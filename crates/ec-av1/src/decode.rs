@@ -15190,11 +15190,13 @@ fn decode_rect4_16_strip(
                             cpx,
                             cpy + unit_row * 8,
                             base_q_idx,
-                            // lane-av1-422p: `None` keeps this arm on the
-                            // offset-7 rows exactly as before; the
-                            // offset-10 question for this arm is the
-                            // owning lane's (see lanes/av1422p.report.md).
-                            None,
+                            // lane-av1-422q: the offset-10 rows -- the same
+                            // measured rule as the 4x32 arm (plane_bsize
+                            // BLOCK_INVALID for the pair's BLOCK_4X16 too;
+                            // num_pels_log2_lookup[255] = 0xff at the
+                            // 0xc0de70 copy -> +3 on the offset-7-first
+                            // chroma tables; see lanes/av1422q.report.md).
+                            Some(3),
                             alpha
                                 .zip(ac)
                                 .map(|((au, av), ac)| (if plane == 1 { au } else { av }, ac)),
