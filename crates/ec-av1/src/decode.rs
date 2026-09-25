@@ -17712,8 +17712,16 @@ fn decode_block_128rect(
     let mi_rows = 2 * y.true_height.div_ceil(8);
     let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(mi_c));
     let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(mi_r));
-    // Non-lossless: one 32x32 chroma unit per mu chunk, per plane.
-    debug_assert!(lossless_frame || (chroma_w / chroma_tx, chroma_h / chroma_tx) == (nch_x, nch_y));
+    // Non-lossless: per mu chunk, `(64 >> ss) / chroma_tx` chroma units per
+    // axis (one 32x32 at 4:2:0, four 32x32 at 4:4:4 — lane-av1-444sb).
+    debug_assert!(
+        lossless_frame
+            || (chroma_w / chroma_tx, chroma_h / chroma_tx)
+                == (
+                    nch_x * ((64 >> ss_x(fctx)) / chroma_tx),
+                    nch_y * ((64 >> ss_y(fctx)) / chroma_tx)
+                )
+    );
     let tpc = 64 / logical_tx;
     let zero_tu = vec![0i32; logical_tx * logical_tx];
     let zero_cu = vec![0i32; chroma_tx * chroma_tx];
@@ -17791,9 +17799,13 @@ fn decode_block_128rect(
                     neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
                 }
             }
-            // Transform units per axis inside this mu chunk's 32x32 chroma
-            // span: one 32x32 unit normally, 8x8 TX_4X4 units when lossless.
-            let cn = (32 / chroma_tx).max(1);
+            // Transform units per axis inside this mu chunk's chroma span:
+            // a 64x64 luma chunk covers `64 >> ss` chroma pixels per axis, so
+            // it holds `(64 >> ss) / chroma_tx` units — one 32x32 at 4:2:0,
+            // four at 4:4:4 (lane-av1-444sb: the hardcoded 4:2:0 span read
+            // one unit per chunk there, left six of a 128x64 block's eight
+            // 32x32 units unread and desynced the tile from that block on).
+            let cn = ((64 >> ss_x(fctx)) / chroma_tx).max(1);
             // libaom's per-chunk `unit_width/height` (plane-mi units of the
             // luma mi grid): `min(mu_blocks + col, max_blocks) >> ss`.
             let unit_w = ((ch_col + 1) * 16).min(max_w_mi) >> ss_x(fctx);
@@ -17807,13 +17819,13 @@ fn decode_block_128rect(
             for plane_pass in 1..=2usize {
                 for ci_row in 0..cn {
                     for ci_col in 0..cn {
-                        if ch_col * 8 + ci_col * stepc >= unit_w
-                            || ch_row * 8 + ci_row * stepc >= unit_h
+                        if ch_col * (16 >> ss_x(fctx)) + ci_col * stepc >= unit_w
+                            || ch_row * (16 >> ss_y(fctx)) + ci_row * stepc >= unit_h
                         {
                             continue;
                         }
-                        let cu_x = cpx + ch_col * 32 + ci_col * chroma_tx;
-                        let cu_y = cpy + ch_row * 32 + ci_row * chroma_tx;
+                        let cu_x = cpx + ch_col * (64 >> ss_x(fctx)) + ci_col * chroma_tx;
+                        let cu_y = cpy + ch_row * (64 >> ss_y(fctx)) + ci_row * chroma_tx;
                         let cu_mi = (
                             mi_r + ch_row * 16 + ci_row * ((chroma_tx << ss_y(fctx)) / 4),
                             mi_c + ch_col * 16 + ci_col * ((chroma_tx << ss_x(fctx)) / 4),
