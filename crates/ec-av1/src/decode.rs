@@ -25255,6 +25255,19 @@ fn wave_rows_complete(fctx: &crate::decode::FrameCtx) -> usize {
 static PIPE_FRAMES: AtomicU64 = AtomicU64::new(0);
 static PIPE_WHOLE: AtomicU64 = AtomicU64::new(0);
 
+/// lane-av1lrflush: frames that CONSTRUCTED the filter pipeline, counted
+/// unconditionally. Read by gates through [`pipeline_taken_frames`] as a
+/// before/after delta -- the non-vacuity witness that a "pipelined" gate arm
+/// really ran `pipe_run`/`pipe_run_lr` rather than silently falling back to
+/// the whole-frame path.
+static PIPELINE_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of [`PIPELINE_TAKEN`], for a gate's own before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn pipeline_taken_frames() -> u64 {
+    PIPELINE_TAKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether this frame's filters may run per superblock row. Everything that
 /// reads the picture out of band order, or the pipeline's own inputs out of
 /// row order, keeps the whole-frame path: superres (a between-CDEF-and-LR
@@ -39831,6 +39844,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let snap_on = pipe_on && (cdef_on || lr_active);
     let mut pipe_snap = snap_on.then(|| (snap_alloc(&y), snap_alloc(&u), snap_alloc(&v)));
     let mut pipe = pipe_on.then(|| {
+        // lane-av1lrflush: counted unconditionally (unlike `PIPE_FRAMES`
+        // below, which is `EC_AV1_WAVE_STATS`-gated) so a gate can prove a
+        // pipelined arm actually took the pipeline even when
+        // `filter_threads()`'s once-per-process env read was already cached
+        // by an earlier test in the same binary.
+        PIPELINE_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if wave_stats() {
             PIPE_FRAMES.fetch_add(1, Relaxed);
         }

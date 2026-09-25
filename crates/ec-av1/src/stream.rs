@@ -5891,6 +5891,155 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1lrflush: the pipelined loop-restoration band release flushes
+    /// RU row 0 on the inter frame whose top superblock row carries a
+    /// 128-root rect -- the exact shape lanes/av1444sb.report.md r2 named as
+    /// its stop-with-site DEFECT 3 ("`pipe_run_lr`'s `rrows` branch plus the
+    /// `ls.note`/`ls.close` band release never flushes RU row 0 on frame 2").
+    /// r3 REFUTED that defect by measurement: on this fixture the filter
+    /// pipeline (deblock/CDEF/LR band workers over `ls.note` releases)
+    /// produces output byte-identical to the whole-frame path on every frame
+    /// -- this gate pins that refutation so a future band-accounting
+    /// regression on a 128-root-rect inter frame cannot land silently.
+    ///
+    /// Non-vacuity, twice over: the `PIPELINE_TAKEN` delta proves the second
+    /// decode really constructed the pipeline on both inter frames (frame 0
+    /// is a key frame and the key-frame path runs whole-frame filters by
+    /// construction), and the `LR_STRIPE0_HITS` delta proves a real filter
+    /// ran on stripe 0 -- RU row 0's own first stripe, the span the named
+    /// defect left un-restored. Frames 0/1 are additionally asserted
+    /// byte-exact against BOTH the oracle aomdec and ffmpeg THROUGH the
+    /// pipeline. (Frame 2's own residual is the entropy lane's inter
+    /// rect-strip recon defect -- see lanes/av1lrflush.report.md r3 -- and
+    /// is identical on the serial and pipelined runs, so the pipeline
+    /// equality covers it without pinning its wrong samples.)
+    #[test]
+    fn a_444_sb128_witness_lr_pipeline_flushes_ru_row_0_pixel_exact() {
+        const NAME: &str = "a_444_sb128_witness_lr_pipeline_flushes_ru_row_0_pixel_exact";
+        const FIXTURE_LEN: usize = 794;
+        const FIXTURE_FNV: u64 = 0xf5a7_27f4_3fa7_abc3;
+        const W: usize = 192;
+        const H: usize = 160;
+        const FRAMES: usize = 3;
+        /// The inter (pipelinable) frames of the witness; frame 0 is the key
+        /// frame and never constructs the pipeline.
+        const INTER_FRAMES: u64 = 2;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_sb128rect_lr_witness.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot \
+                 run, which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        let serial = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: serial decode failed: {e}"));
+        assert_eq!(serial.len(), FRAMES, "{NAME}: frame count");
+
+        let pipe_before = crate::decode::pipeline_taken_frames();
+        let stripe0_before = crate::restoration::lr_stripe0_hits();
+        let piped = {
+            let _bands = crate::par::override_filter_threads(4);
+            decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: pipelined decode failed: {e}"))
+        };
+        assert_eq!(piped.len(), FRAMES, "{NAME}: frame count");
+        assert_eq!(
+            crate::decode::pipeline_taken_frames() - pipe_before,
+            INTER_FRAMES,
+            "{NAME}: the filter pipeline did not take both inter frames -- the \
+             arm decoded serial and proves nothing (class \
+             gate-blind-to-feature)"
+        );
+        assert!(
+            crate::restoration::lr_stripe0_hits() - stripe0_before > 0,
+            "{NAME}: no stripe-0 (RU row 0's first stripe) filter ran -- RU row \
+             0 was never restored in this arm (class gate-blind-to-feature)"
+        );
+
+        // The refutation itself: pipeline == serial, byte for byte, on every
+        // frame -- including frame 2, the 128-root-rect inter frame the
+        // r2 defect named.
+        for (i, (s, p)) in serial.iter().zip(piped.iter()).enumerate() {
+            for (pl, (a, b)) in
+                [(&s.y, &p.y), (&s.u, &p.u), (&s.v, &p.v)].into_iter().enumerate()
+            {
+                assert_eq!(
+                    a, b,
+                    "{NAME}: pipelined frame {i} plane {pl} differs from the \
+                     whole-frame path (class lr-band-release)"
+                );
+            }
+        }
+
+        // Frames 0/1 through the PIPELINE, byte-exact vs both oracles.
+        if aomdec_path().is_file() {
+            let dir = std::env::temp_dir().join(format!("ec-av1-lrflush-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let raw = dir.join("aomdec.raw");
+            let out = Command::new(aomdec_path())
+                .args(["--codec=av1", "--rawvideo", "-o"])
+                .arg(&raw)
+                .arg(&obu)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("aomdec failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: the oracle aomdec refused the stream: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(ref_raw.len(), W * H * 3 * FRAMES, "{NAME}: aomdec raw size");
+            for (i, f) in piped.iter().enumerate().take(2) {
+                let base = i * W * H * 3;
+                for ((plane, off), p) in
+                    [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
+                        .into_iter()
+                        .zip(["y", "u", "v"])
+                {
+                    let want = &ref_raw[base + off..base + off + W * H];
+                    let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: aomdec frame {i} plane {p} THROUGH THE PIPELINE: \
+                         {bad} samples differ (class lr-band-release)"
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+        }
+        if have_ffmpeg() {
+            let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
+            for (i, (got, want)) in piped.iter().zip(refs.iter()).enumerate().take(2) {
+                for (p, (g, r)) in
+                    [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                        .iter()
+                        .enumerate()
+                {
+                    let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: ffmpeg frame {i} plane {p} THROUGH THE PIPELINE: \
+                         {bad} samples differ"
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME} ffmpeg arm: no ffmpeg");
+        }
+    }
+
     /// lane-lossless128: a LOSSLESS key frame that codes a 128-axis
     /// (`BLOCK_64X128`) intra block -- the shape libaom's `read_tx_size` forces
     /// to `TX_4X4` on its very first line (`decodeframe.c:1183`), so every plane
