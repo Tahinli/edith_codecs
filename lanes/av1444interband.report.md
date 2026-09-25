@@ -94,6 +94,20 @@ Sibling ownership clean: the edit is in `decode_inter_block`'s tail
   untouched).
 - Commit d5325172 on lane-av1-444interband. Not pushed.
 
+### Addendum (review P2): the t6 pin is now an in-tree gate
+
+Main's review follow-up: commit
+`ll444_defaultp_inter_strip.obu` (force-added fixture, 32487 bytes,
+sha256 `1e6dd4e05038c8d51e2c8d29f8c337130c4fea0aed629415535e6e53af9a2c72`,
+FNV1a64 `52789f0fce2d1e52` per the crate's pin convention) and gate
+`a_lossless_444_defaultp_inter_strip_stream_decodes_byte_exact`
+(stream.rs, av1llpredgate2's pinned-fixture pattern): len + FNV pin,
+the 1:4 counter delta pinned to `horz4=20 vert4=28 chroma_pairs=0`,
+and the env-conditional aomdec arm requiring all 6 frames sample-exact.
+Mutation-proven load-bearing: with the ss-0 filter reverted the gate
+fails at the pre-fix refusal; restored, it is green (8 passed in the
+a_lossless battery).
+
 ## Named, not chased (spoken)
 
 1. `Neighbour::level` clamps `cul_level` to 7 while aom stores up to 15
