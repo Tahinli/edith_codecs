@@ -8980,6 +8980,13 @@ impl Neighbours {
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
         let state = neighbour_state(grid);
+        if crate::envflags::env_flag!("EC_CHROMA_PUB") {
+            eprintln!(
+                "EC_CHROMA_PUB plane={plane} mi=({mi_r},{mi_c}) wh=({w_px},{h_px}) lvl={} dc={}",
+                state.level,
+                state.dc.map_or(-1, |s| i32::from(s))
+            );
+        }
         for cell in 0..(h_px / MI).min(bound_h.saturating_sub(mi_r)) {
             self.left[mi_r + cell][plane] = state;
         }
@@ -34691,8 +34698,21 @@ fn decode_inter_block(
     // strip's own record wrote empty chroma state over those cells -- this
     // rewrite is what libaom's single `av1_set_contexts` call for the 8x4
     // (4x8) chroma unit leaves behind.
+    // lane-av1-444interband: 4:2:0 ONLY. At ss 0/0 every strip IS its own
+    // chroma reference (`is_chroma_reference`, no mi parity test), its own
+    // `record_rect_mi` above already stamps exactly the strip's 16x4 (4x16)
+    // chroma span -- libaom `av1_set_entropy_contexts`, or
+    // `av1_reset_entropy_context` for a skipped strip (decodeframe.c:1180)
+    // -- and the pair-form 16x8 (8x16) span anchored at `pair_mi` (== the
+    // strip's own mi at ss 0/0) smeared the strip's state over one extra
+    // row/col of cells: a skipped strip wrote zero over `left[r+1][1..2]`,
+    // erasing the 16x16-intra block to its left's U/V stamps, and the strip
+    // below read its chroma `txb_skip` off the wrong CDF row (t6 frame 1,
+    // U unit (2,8): our base 0 vs aom's base 1, `left[2][1]` 0 vs 23 --
+    // `INTER16_CHROMA_PAIR_HITS` fired 31x on a stream that has no pairs).
     let pair_chroma = strip_chroma
         .filter(|s| s.has_chroma)
+        .filter(|_| ss_x(fctx) == 1 && ss_y(fctx) == 1)
         .map(|s| (s, neighbour_state(&u_grid), neighbour_state(&v_grid)));
     // lane-vert46 r1: libaom stamps the chroma entropy context PER TRANSFORM
     // UNIT (`av1_set_entropy_contexts` inside `decode_reconstruct_tx`'s mu-chunk
