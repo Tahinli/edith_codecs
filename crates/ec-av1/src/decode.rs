@@ -34943,6 +34943,17 @@ fn decode_inter_block(
                 }
             }
         }
+        // lane-av1-422k: the chroma PREDICTION shape is the plane block
+        // (`side >> ss_x`, `side >> ss_y`) -- square at 4:2:0/4:4:4, a
+        // (side/2, side) rect at 4:2:2. `chroma_side` (the 422j enclosing
+        // square of that rect) is the right size for BOOKKEEPING buffers but
+        // the wrong SHAPE to predict and reconstruct at: an intra-in-inter
+        // block's chroma prediction indexes its CFL signal and residual
+        // `row * chroma_w + col` over the plane block, and a 16x16 luma
+        // block's 8x16 chroma CFL signal is 128 samples -- predicting at the
+        // 16x16 square read `ac[128]` out of it (frame 1, px=192 py=96).
+        let chroma_w = side >> ss_x(fctx);
+        let chroma_h = side >> ss_y(fctx);
         if side > 64 {
             // Chroma is already coded and reconstructed per mu chunk above.
             luma_grid = Grid::Zero(side * side);
@@ -34979,14 +34990,15 @@ fn decode_inter_block(
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
-            push_intra(1, 
+            push_intra_unit(1,
                 cpx,
                 cpy,
-                chroma_side,
+                chroma_w,
+                chroma_h,
                 uv_predict_mode,
                 angle_delta_uv,
                 reach,
-                &ZERO_RESIDUAL[..chroma_side * chroma_side],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
                 alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
@@ -34994,21 +35006,22 @@ fn decode_inter_block(
             if let Some((_, vb)) = &palette_uv_bufs {
                 set_palette_pred(vb.clone(), fctx);
             }
-            push_intra(2, 
+            push_intra_unit(2,
                 cpx,
                 cpy,
-                chroma_side,
+                chroma_w,
+                chroma_h,
                 uv_predict_mode,
                 angle_delta_uv,
                 reach,
-                &ZERO_RESIDUAL[..chroma_side * chroma_side],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
                 alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
             );
             luma_grid = Grid::Zero(side * side);
-            u_grid = Grid::Zero(chroma_side * chroma_side);
-            v_grid = Grid::Zero(chroma_side * chroma_side);
+            u_grid = Grid::Zero(chroma_w * chroma_h);
+            v_grid = Grid::Zero(chroma_w * chroma_h);
         } else {
             let around = neighbours.around_mi(at, side);
             if split_luma {
@@ -35061,56 +35074,100 @@ fn decode_inter_block(
                 v_grid = if vo.is_empty() { Grid::Zero(zero) } else { Grid::Own(vo) };
                 mu_chroma = true;
             } else {
+            // lane-av1-422k: the chroma plane block is (`chroma_w`,
+            // `chroma_h`) -- the square read above at 4:2:0/4:4:4, one rect
+            // TX_{side/2}X{side} unit through [`read_rect_chroma_unit`] at
+            // 4:2:2 (the key-frame path's proven set/scan rows, and the
+            // per-chroma-cell context read [`around_mi_422_chroma`]).
+            let chroma_around = if chroma_w == chroma_h {
+                around
+            } else {
+                neighbours.around_mi_422_chroma(at, side, side)
+            };
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
-            u_grid = read_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                scan_chroma,
-                1,
-                around[1],
-                mode,
-                uv_predict_mode,
-                angle_delta_uv,
-                reach,
-                u,
-                cpx,
-                cpy,
-                chroma_side,
-                chroma_tx,
-                base_q_idx,
-                alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
-                None,
-                None,
-                smooth_neighbor_uv, fctx,
-            )?;
+            u_grid = if chroma_w == chroma_h {
+                read_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    scan_chroma,
+                    1,
+                    chroma_around[1],
+                    mode,
+                    uv_predict_mode,
+                    angle_delta_uv,
+                    reach,
+                    u,
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    chroma_tx,
+                    base_q_idx,
+                    alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+                    None,
+                    None,
+                    smooth_neighbor_uv, fctx,
+                )?
+            } else {
+                let (rect_set, rect_scan): (TxbSet, &[u16]) = match side {
+                    4 => (TxbSet::Chroma4, default_scan(4)),
+                    8 => (TxbSet::ChromaRect8x4, &SCAN_4X8[..]),
+                    16 => (TxbSet::ChromaRect16x8, &SCAN_8X16[..]),
+                    32 => (TxbSet::ChromaRect32x16, &SCAN_16X32[..]),
+                    _ => (TxbSet::Chroma32, default_scan(32)),
+                };
+                read_rect_chroma_unit(
+                    dec, cdfs, rect_set, rect_scan, chroma_w, chroma_h, 1,
+                    chroma_around[1], uv_predict_mode, angle_delta_uv, reach, u,
+                    cpx, cpy, base_q_idx,
+                    alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+                    smooth_neighbor_uv, fctx,
+                )?
+            };
             if let Some((_, vb)) = &palette_uv_bufs {
                 set_palette_pred(vb.clone(), fctx);
             }
-            v_grid = read_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                scan_chroma,
-                2,
-                around[2],
-                mode,
-                uv_predict_mode,
-                angle_delta_uv,
-                reach,
-                v,
-                cpx,
-                cpy,
-                chroma_side,
-                chroma_tx,
-                base_q_idx,
-                alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
-                None,
-                None,
-                smooth_neighbor_uv, fctx,
-            )?;
+            v_grid = if chroma_w == chroma_h {
+                read_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    scan_chroma,
+                    2,
+                    chroma_around[2],
+                    mode,
+                    uv_predict_mode,
+                    angle_delta_uv,
+                    reach,
+                    v,
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    chroma_tx,
+                    base_q_idx,
+                    alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+                    None,
+                    None,
+                    smooth_neighbor_uv, fctx,
+                )?
+            } else {
+                let (rect_set, rect_scan): (TxbSet, &[u16]) = match side {
+                    4 => (TxbSet::Chroma4, default_scan(4)),
+                    8 => (TxbSet::ChromaRect8x4, &SCAN_4X8[..]),
+                    16 => (TxbSet::ChromaRect16x8, &SCAN_8X16[..]),
+                    32 => (TxbSet::ChromaRect32x16, &SCAN_16X32[..]),
+                    _ => (TxbSet::Chroma32, default_scan(32)),
+                };
+                read_rect_chroma_unit(
+                    dec, cdfs, rect_set, rect_scan, chroma_w, chroma_h, 2,
+                    chroma_around[2], uv_predict_mode, angle_delta_uv, reach, v,
+                    cpx, cpy, base_q_idx,
+                    alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+                    smooth_neighbor_uv, fctx,
+                )?
+            };
             }
         }
     }
