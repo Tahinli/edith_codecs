@@ -12801,7 +12801,9 @@ fn decode_block_rect(
 /// caller uses once, after both strips, exactly like the `VERT_B` arm next
 /// to it). The non-skip case (lane-rectx) reads real `TX_16X8`/`TX_8X16`
 /// luma coefficients (`TxbSet::LumaRect16x8`) and their `TX_8X4`/`TX_4X8`
-/// chroma half (`TxbSet::ChromaRect8x4`), the two size classes one level
+/// chroma half (`TxbSet::ChromaRect8x4`) at 4:2:0 -- an 8x8 *square* chroma
+/// plane (`TxbSet::Chroma8` + the default scan) at 4:2:2 (lane-av1-422e:
+/// half-width, unhalved height), the two size classes one level
 /// under [`decode_block_rect`]'s own 32x16/16x32 strip.
 #[allow(clippy::too_many_arguments)]
 fn decode_leaf_rect(
@@ -13057,14 +13059,28 @@ fn decode_leaf_rect(
         // `use_reduced_set` branch returns `EXT_TX_SET_DTT4_IDTX` at
         // `tx_size_sqr_up == TX_16X16` regardless of the true, non-square
         // `tx_size`) and its chroma half (8x4/4x8, `TxbSet::ChromaRect8x4`).
+        // lane-av1-422e: a 4:2:2 strip halves only the width, so the chroma
+        // half of a 16x8/8x16 luma leaf is an 8x8 SQUARE (`TxbSet::Chroma8` +
+        // the default scan -- the pairing any 8x8 chroma plane reads). 4:2:0
+        // halves both axes (8x4/4x8 rect, `TxbSet::ChromaRect8x4`); 4:4:4
+        // leaves the full 16x8/8x16 rect (`TxbSet::ChromaRect16x8`).
+        let chroma_422 = ss_x(fctx) == 1 && ss_y(fctx) == 0;
         let (luma_scan, chroma_scan): (&[u16], &[u16]) = if ss_x(fctx) == 0 {
             if bw == 16 { (&SCAN_16X8, &SCAN_16X8) } else { (&SCAN_8X16, &SCAN_8X16) }
+        } else if chroma_422 {
+            if bw == 16 { (&SCAN_16X8, default_scan(8)) } else { (&SCAN_8X16, default_scan(8)) }
         } else if bw == 16 {
             (&SCAN_16X8, &SCAN_8X4)
         } else {
             (&SCAN_8X16, &SCAN_4X8)
         };
-        let chroma_rect_set = if ss_x(fctx) == 0 { TxbSet::ChromaRect16x8 } else { TxbSet::ChromaRect8x4 };
+        let chroma_rect_set = if ss_x(fctx) == 0 {
+            TxbSet::ChromaRect16x8
+        } else if chroma_422 {
+            TxbSet::Chroma8
+        } else {
+            TxbSet::ChromaRect8x4
+        };
         let around = neighbours.around_mi_rect(leaf_mi, bw, bh);
         let luma_set = if reduced_tx_set {
             TxbSet::LumaRect16x8
