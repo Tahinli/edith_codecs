@@ -36625,6 +36625,23 @@ fn decode_inter_sub8_rect2(
                 push_mc_rect(2, px, py, SIDE, bw, bh, sv, &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
                 neighbours.record_mi_chroma(lmi, bw, bh, 1, &ZERO_RESIDUAL[..bw * bh]);
                 neighbours.record_mi_chroma(lmi, bw, bh, 2, &ZERO_RESIDUAL[..bw * bh]);
+            } else if lossless(fctx) && !mono(fctx) {
+                // lane-av1-llsub8b: lossless codes TX_4X4 on EVERY plane
+                // (`av1_get_tx_size`, blockd.h:1383), so this 4:4:4 piece's
+                // (8,4)/(4,8) chroma plane block is a 2x1/1x2 raster of
+                // TX_4X4 units, not the ONE TX_8X4 rect unit the lossy arm
+                // below reads -- that single rect is what tripped
+                // `TxParams::run`'s WHT assert ((8,4) != (4,4),
+                // decode.rs:2566). The walk stamps each unit's own
+                // coefficient context, so -- unlike the lossy arm -- no
+                // whole-block `record_mi_chroma` runs after it: the walk's
+                // per-unit stamps ARE the block's chroma contexts (the same
+                // rule `leaf8_inter_chroma_lossless`'s caller obeys).
+                read_inter_chroma_lossless(
+                    dec, cdfs, neighbours, u, v, su, sv,
+                    (rmi, cmi), (px, py), (0, 0), (bw, bh), (bw, bh), SIDE, 0,
+                    base_q_idx, &mut Vec::new(), &mut Vec::new(), fctx,
+                )?;
             } else {
                 let ca = neighbours.around_mi_rect(lmi, bw, bh);
                 let (ug, _) = read_inter_plane_rect(
