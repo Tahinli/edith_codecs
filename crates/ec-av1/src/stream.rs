@@ -5808,20 +5808,20 @@ pub(crate) mod tests {
         for f in &frames {
             assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
         }
-        // Frames 0 and 1 are the byte-exact pin for the ss-aware 128-rect
-        // chroma walk itself (frame 0's keyframe PARTITION_VERT 64x128 and
-        // frame 1's inter pieces). Frame 2 carries a SEPARATE, named
-        // residual: its top LR stripe (RU row 0, rows 0..63, all three
-        // planes) is never loop-restored on this inter frame -- our output
-        // equals the post-CDEF plane there while the oracle restores it
-        // (ours-vs-oracle final Y 7308 / U 9685 / V 14012, deterministic;
-        // recon, deblock and CDEF are byte-exact at PREFILT/POSTDEBLOCK/
-        // POSTCDEF). Site: the pipelined LR band accounting
-        // (`pipe_run_lr`'s `rrows` branch plus the `ls.note`/`ls.close`
-        // band release in `decode.rs`'s filter pipeline) never flushes RU
-        // row 0 when the top superblock row carries a 128-root rect block
-        // (this frame's inter 64x128 at (128,0)). That flush fix is its own
-        // lane; asserting f2's current samples here would pin the bug.
+        // All three frames are pinned byte-exact against both oracles (the
+        // aomdec/ffmpeg arms below run over `.take(3)`): frame 0's keyframe
+        // PARTITION_VERT 64x128, frame 1's inter pieces, and frame 2 -- whose
+        // right superblock column (the 128-root VERT piece at the frame edge)
+        // is three intra blocks (64x64, 64x32, 64x32) whose chroma units ride
+        // the inter-frame intra tail. That tail read ONE whole-plane chroma
+        // unit with the block-level context where 4:4:4 codes four
+        // plane-major TX_32X32 units with per-unit contexts and the
+        // offset-10 `get_txb_ctx` rows, which left three quarters of the
+        // planes' residual unread and misaligned the symbol stream from the
+        // first chroma unit on (f2 PREFILT Y 6952 / U 9568 / V 13496, first
+        // diffs entering at column 128). Fixed on lane-av1-rect128recon;
+        // the earlier "LR never restores RU row 0" attribution on this frame
+        // was a stage-ladder mixup, refuted in lane-av1lrflush r3.
 
         // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
         if aomdec_path().is_file() {
@@ -5847,7 +5847,7 @@ pub(crate) mod tests {
             let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(ref_raw.len(), W * H * 3 * FRAMES, "{NAME}: aomdec raw size");
-            for (i, f) in frames.iter().enumerate().take(2) {
+            for (i, f) in frames.iter().enumerate().take(3) {
                 let base = i * W * H * 3;
                 for ((plane, off), p) in
                     [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
@@ -5868,12 +5868,11 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
         }
 
-        // ffmpeg's decoder: same frames, full-resolution chroma. Same f0/f1
-        // scope as the aomdec arm above (frame 2 = the named LR-stripe-0
-        // residual).
+        // ffmpeg's decoder: same frames, full-resolution chroma. Same
+        // three-frame scope as the aomdec arm above.
         if have_ffmpeg() {
             let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
-            for (i, (got, want)) in frames.iter().zip(refs.iter()).enumerate().take(2) {
+            for (i, (got, want)) in frames.iter().zip(refs.iter()).enumerate().take(3) {
                 for (p, (g, r)) in
                     [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
                         .iter()
