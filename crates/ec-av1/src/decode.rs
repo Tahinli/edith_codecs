@@ -22425,6 +22425,15 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> Result<TxbSet> {
         (8, 8) => TxbSet::Chroma8,
         (4, 4) => TxbSet::Chroma4,
         _ => {
+            // lane-av1-422l: the refusing (w, h) for the owning lane -- the
+            // 4:2:2 frontier stops here at (4, 32), the plane residual of an
+            // 8x32 luma block, which libaom itself marks BLOCK_INVALID
+            // (`av1_ss_size_lookup[BLOCK_8X32][1][0]`, common_data.c:38) and
+            // for which no TX_4X32 exists -- that chroma is coded as a
+            // TX_8X32-chunked merge, not a 4-px unit.
+            if crate::envflags::env_flag!("EC_AV1_TRACE_422") {
+                eprintln!("EC_422 rect_inter_chroma_set missing (w,h)=({w},{h})");
+            }
             return Err(unsupported(
                 "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
             ));
