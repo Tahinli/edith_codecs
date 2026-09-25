@@ -1990,6 +1990,23 @@ pub(crate) fn rect_split_chroma_shape_hits() -> [usize; 4] {
     RECT_SPLIT_CHROMA_SHAPE_HITS.with(|c| c.get())
 }
 
+// lane-av1-422: how many SQUARE chroma coefficient units the strip path read
+// on a 4:2:2 frame (ss 1,0) -- the half-width, unhalved-height shape whose
+// tables only exist because of the square rows in the chroma_tiled arm. A
+// 4:2:0 or 4:4:4 frame can never increment it (their rect strips' chroma is
+// itself rect), and a restored `/2 chroma height` diverts 4:2:2 squares onto
+// the rect rows, so the witness gate reads 0 there and fails.
+thread_local! {
+    static CHROMA422_SQUARE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CHROMA422_SQUARE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma422_square_hits() -> usize {
+    CHROMA422_SQUARE_HITS.with(|c| c.get())
+}
+
 // How many HORZ/VERT intra strips actually predicted with filter intra
 // (lane-rectsplit r1) -- the case `decode_block_rect` refused by name
 // ("this decoder predicts square-only") until `predict_filter_intra` took
@@ -10116,7 +10133,12 @@ fn decode_rect_split(
     // A 4:4:4 64-axis strip's chroma plane block is larger than one adjusted
     // UV transform (TX_64X32 adjusts to TX_32X32). Those sizes are tiled
     // below; everything else still needs a single-unit table.
-    let chroma_tiled = matches!((chroma_w, chroma_h), (64, 32) | (32, 64) | (64, 16) | (16, 64));
+    // lane-av1-422: a 4:2:2 strip's chroma plane keeps the strip's HEIGHT and
+    // halves only the width, so a rect luma strip codes a SQUARE chroma block
+    // (16x8 luma -> 8x8 chroma) -- the square rows below. At 4:2:0 and 4:4:4 a
+    // rect strip's chroma is itself rect, so the square rows are unreachable
+    // there and cannot change their results.
+    let chroma_tiled = matches!((chroma_w, chroma_h), (64, 32) | (32, 64) | (64, 16) | (16, 64) | (32, 32) | (16, 16) | (8, 8));
     if !m.skip && chroma.is_none() && !chroma_tiled {
         return Err(unsupported(
             "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
@@ -10487,11 +10509,20 @@ fn decode_rect_split(
         (ug, vg)
     } else if chroma_tiled {
         let (uw, uh, set, scan): (usize, usize, TxbSet, &[u16]) = match (chroma_w, chroma_h) {
-            (64, 32) | (32, 64) => (32, 32, TxbSet::Chroma32, default_scan(32)),
+            (64, 32) | (32, 64) | (32, 32) => (32, 32, TxbSet::Chroma32, default_scan(32)),
             (64, 16) => (32, 16, TxbSet::ChromaRect32x16, &SCAN_32X16),
             (16, 64) => (16, 32, TxbSet::ChromaRect32x16, &SCAN_16X32),
+            // lane-av1-422: the 4:2:2 square chroma planes (height unhalved),
+            // through the square reader like every other square chroma unit.
+            (16, 16) => (16, 16, TxbSet::Chroma16, default_scan(16)),
+            (8, 8) => (8, 8, TxbSet::Chroma8, default_scan(8)),
             _ => unreachable!("chroma_tiled"),
         };
+        // lane-av1-422: the witness counter, keyed to ss (1,0) so only a 4:2:2
+        // frame's square chroma units count it.
+        if uw == uh && ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+            hit!(CHROMA422_SQUARE_HITS);
+        }
         let (nw, nh) = (chroma_w / uw, chroma_h / uh);
         let bigger = chroma_w * chroma_h > uw * uh;
         let default_tx = TxType::DctDct;
@@ -12518,6 +12549,16 @@ fn decode_block_rect(
             (16, 32) => (TxbSet::ChromaRect32x16, &SCAN_16X32),
             (16, 8) => (TxbSet::ChromaRect16x8, &SCAN_16X8),
             (8, 16) => (TxbSet::ChromaRect16x8, &SCAN_8X16),
+            // lane-av1-422: a 4:2:2 strip halves only the width. A 32x16
+            // luma strip's chroma is a 16x16 SQUARE (`TxbSet::Chroma16`, the
+            // set any 16x16 chroma plane reads); a 16x32 strip's chroma is
+            // 8x32, whose entropy set is the 16x16 one and whose DCT-only
+            // default follows the >=32 rule below -- the same pairing the
+            // (8,32) row of [`decode_rect_split`]'s chroma table proves. At
+            // 4:2:0 and 4:4:4 a strip's chroma is itself rect, so neither row
+            // is reachable there.
+            (16, 16) => (TxbSet::Chroma16, default_scan(16)),
+            (8, 32) => (TxbSet::Chroma16, &SCAN_8X32),
             _ => {
                 return Err(unsupported(
                     "a rectangular chroma transform whose size has no coefficient table",
@@ -13366,7 +13407,17 @@ fn decode_block_rect4(
         (4, 16) => (TxbSet::Chroma8, &SCAN_4X16[..]),
         (32, 8) => (TxbSet::Chroma16, &SCAN_32X8[..]),
         (8, 32) => (TxbSet::Chroma16, &SCAN_8X32[..]),
-        _ => unreachable!("decode_block_rect4 chroma shape set is closed"),
+        // lane-av1-422: a 4:2:2 1:4 strip halves only the width, so the
+        // landscape leaves (32x8, 16x4 luma) code their chroma as the RECT
+        // (16,8)/(8,4) -- the same TxbSet/scan pair the (16,8)/(8,4) rows of
+        // [`decode_rect_split`]'s chroma table use. The portrait leaves are
+        // unreachable: ss_size_lookup marks them BLOCK_INVALID at (1,0), so
+        // a conformant 4:2:2 stream cannot carry that leaf size.
+        (16, 8) => (TxbSet::ChromaRect16x8, &SCAN_16X8[..]),
+        (8, 4) => (TxbSet::ChromaRect8x4, &SCAN_8X4[..]),
+        _ => unreachable!(
+            "decode_block_rect4 chroma shape set is closed: {chroma_w}x{chroma_h}"
+        ),
     };
     let luma_scan: &[u16] = if bw > bh { &SCAN_32X8 } else { &SCAN_8X32 };
     let (luma_levels, u_levels, v_levels) = if skip {
@@ -13635,7 +13686,7 @@ fn decode_rect4_16(
         // lane-av1-444: at 4:4:4 every strip is its own chroma reference
         // (no mi-parity test at ss 0/0, and the strip's own chroma block is
         // already >= 4x4) -- there is no 4:2:0 pair to close.
-        let has_chroma = i % 2 == 1 || (ss_x(fctx) == 0 && ss_y(fctx) == 0);
+        let has_chroma = i % 2 == 1 || ss_y(fctx) == 0;
         let (mode, uv, _tx) = decode_rect4_16_strip(
             dec,
             cdfs,
@@ -14537,6 +14588,17 @@ fn decode_rect4_16_strip(
             // ss 0/0, so the neighbour reads below anchor at the strip.)
             let (pair_mi, pw, ph) = if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
                 (lmi, bw, bh)
+            } else if ss_y(fctx) == 0 {
+                // lane-av1-422: chroma height is NOT subsampled, so every
+                // strip is its own chroma reference (libaom is_chroma_reference
+                // loses its row-parity clause) and codes its own
+                // `ss_size_lookup[bsize][1][0]` chroma block -- the 8x4 of a
+                // 16x4 luma strip. The 4:2:0 pair merge below never applies,
+                // exactly like the ss 0/0 arm above. (A VERTICAL 4x16 strip
+                // cannot reach this arm at 4:2:2: its chroma block
+                // `ss_size_lookup[BLOCK_4X16][1][0]` is BLOCK_INVALID, so a
+                // conformant stream carries no such leaf.)
+                (lmi, bw, bh)
             } else if horz {
                 ((lmi.0 - 1, lmi.1), 16, 8)
             } else {
@@ -14694,6 +14756,17 @@ fn decode_rect4_16_strip(
                     (4, 8) => (TxbSet::ChromaRect8x4, &SCAN_4X8[..]),
                     (16, 4) => (TxbSet::Chroma8, &SCAN_16X4[..]),
                     (4, 16) => (TxbSet::Chroma8, &SCAN_4X16[..]),
+                    // lane-av1-422: a 4:2:2 HORZ pair (16x8 luma) keeps the
+                    // pair's height: an 8x8 SQUARE chroma block, the same
+                    // `TxbSet::Chroma8` set any 8x8 chroma plane reads. The
+                    // 4:2:0 pair's chroma is 8x4 and 4:4:4's is 16x4, so this
+                    // row is unreachable there. It is also the witness arm:
+                    // a restored `/2 chroma height` lands on (8,4) and the
+                    // counter reads 0.
+                    (8, 8) => {
+                        hit!(CHROMA422_SQUARE_HITS);
+                        (TxbSet::Chroma8, default_scan(8))
+                    }
                     _ => unreachable!("decode_rect4_16_strip chroma shape set is closed"),
                 };
                 let mut planes = Vec::with_capacity(2);
@@ -15797,6 +15870,29 @@ fn cfl_ac_ss(
         let avg = (sum + num_pel / 2) >> num_pel.trailing_zeros();
         ac.iter_mut().for_each(|v| *v -= avg);
         ac
+    } else if ss_x == 1 && ss_y == 0 {
+        // lane-av1-422: `cfl_luma_subsampling_422_lbd_c` -- each chroma sample
+        // averages the HORIZONTAL luma pair above it, at full chroma height
+        // (`(a + b) >> 1` in Q3 is `(a + b) << 2`). A rect luma strip's chroma
+        // is square here, and the 4:2:0 rect/square helpers below would halve
+        // the height it must keep.
+        let (cw, ch) = (bw >> 1, bh);
+        let mut ac = vec![0i32; cw * ch];
+        let mut sum = 0i32;
+        for row in 0..ch {
+            for col in 0..cw {
+                let (lx, ly) = (px + col * 2, py + row);
+                let q3 = (i32::from(y.data[ly * y.width + lx])
+                    + i32::from(y.data[ly * y.width + lx + 1]))
+                    << 2;
+                ac[row * cw + col] = q3;
+                sum += q3;
+            }
+        }
+        let num_pel = (cw * ch) as i32;
+        let avg = (sum + num_pel / 2) >> num_pel.trailing_zeros();
+        ac.iter_mut().for_each(|v| *v -= avg);
+        ac
     } else if bw == bh {
         cfl_ac_q3(y, px, py, bw)
     } else {
@@ -16694,13 +16790,13 @@ fn decode_block(
         let mut ub = vec![0u16; chroma_side * chroma_side];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
-            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_x(fctx)),
+            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
             chroma_side, chroma_side, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
         let mut vb = vec![0u16; chroma_side * chroma_side];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
-            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_x(fctx)),
+            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
             chroma_side, chroma_side, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
         (yb, ub, vb)
@@ -18074,13 +18170,13 @@ fn decode_leaf8(
         let mut ub = vec![0u16; 4 * 4];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
-            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_x(fctx)),
+            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
             4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
         let mut vb = vec![0u16; 4 * 4];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
-            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_x(fctx)),
+            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
             4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
         (yb, ub, vb)
@@ -19189,13 +19285,13 @@ fn decode_leaf_split4(
         let mut ub = vec![0u16; 16];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
-            mv_to_q4(cpx, dv.1, ss_x(fctx)), mv_to_q4(cpy, dv.0, ss_x(fctx)),
+            mv_to_q4(cpx, dv.1, ss_x(fctx)), mv_to_q4(cpy, dv.0, ss_y(fctx)),
             4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
         let mut vb = vec![0u16; 16];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
-            mv_to_q4(cpx, dv.1, ss_x(fctx)), mv_to_q4(cpy, dv.0, ss_x(fctx)),
+            mv_to_q4(cpx, dv.1, ss_x(fctx)), mv_to_q4(cpy, dv.0, ss_y(fctx)),
             4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
@@ -19872,13 +19968,13 @@ fn decode_leaf_rect8(
         let mut ub = vec![0u16; 16];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
-            mv_to_q4(cpx, dv.1, ss_x(fctx)), mv_to_q4(cpy, dv.0, ss_x(fctx)),
+            mv_to_q4(cpx, dv.1, ss_x(fctx)), mv_to_q4(cpy, dv.0, ss_y(fctx)),
             4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
         let mut vb = vec![0u16; 16];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
-            mv_to_q4(cpx, dv.1, ss_x(fctx)), mv_to_q4(cpy, dv.0, ss_x(fctx)),
+            mv_to_q4(cpx, dv.1, ss_x(fctx)), mv_to_q4(cpy, dv.0, ss_y(fctx)),
             4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
         if leaf_skips[1] {
@@ -40551,7 +40647,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     // and predicts its own chroma from its
                                     // own motion (`prev` = None).
                                     let strip_has_chroma =
-                                        i % 2 == 1 || (ss_x(fctx) == 0 && ss_y(fctx) == 0);
+                                        i % 2 == 1 || ss_y(fctx) == 0;
                                     let pair_mi = if !strip_has_chroma || ss_x(fctx) == 0 {
                                         at_mi
                                     } else if horz {
