@@ -13818,7 +13818,17 @@ fn decode_rect4_16(
         // lane-av1-444: at 4:4:4 every strip is its own chroma reference
         // (no mi-parity test at ss 0/0, and the strip's own chroma block is
         // already >= 4x4) -- there is no 4:2:0 pair to close.
-        let has_chroma = i % 2 == 1 || ss_y(fctx) == 0;
+        // lane-av1-422o: the parity rule is per axis, straight out of
+        // `is_chroma_reference`: a HORZ 16x4 strip (1 mi tall) keeps the
+        // `ss_y == 0 -> every strip a reference` row rule, but a VERT 4x16
+        // strip (1 mi wide) keeps the COLUMN clause `(mi_col & 1) || !(bw &
+        // 1) || !ss_x`, which with bw == 1 mi reduces to `mi_col odd` for
+        // every ss_x == 1 format -- the ODD strip closes the pair and reads
+        // the chroma, exactly like 4:2:0. (VERT_4 partitions start on an
+        // even mi_col, so `i % 2 == 1` is that clause.)
+        let has_chroma = i % 2 == 1
+            || (horz && ss_y(fctx) == 0)
+            || (!horz && ss_x(fctx) == 0);
         let (mode, uv, _tx) = decode_rect4_16_strip(
             dec,
             cdfs,
@@ -14720,16 +14730,18 @@ fn decode_rect4_16_strip(
             // ss 0/0, so the neighbour reads below anchor at the strip.)
             let (pair_mi, pw, ph) = if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
                 (lmi, bw, bh)
-            } else if ss_y(fctx) == 0 {
-                // lane-av1-422: chroma height is NOT subsampled, so every
-                // strip is its own chroma reference (libaom is_chroma_reference
-                // loses its row-parity clause) and codes its own
-                // `ss_size_lookup[bsize][1][0]` chroma block -- the 8x4 of a
-                // 16x4 luma strip. The 4:2:0 pair merge below never applies,
-                // exactly like the ss 0/0 arm above. (A VERTICAL 4x16 strip
-                // cannot reach this arm at 4:2:2: its chroma block
-                // `ss_size_lookup[BLOCK_4X16][1][0]` is BLOCK_INVALID, so a
-                // conformant stream carries no such leaf.)
+            } else if ss_y(fctx) == 0 && horz {
+                // lane-av1-422: chroma height is NOT subsampled, so a HORZ
+                // 16x4 strip is its own chroma reference (`is_chroma_reference`
+                // at ss(1,0): bh == 1 mi, so the row clause reduces to
+                // `!ss_y`) and codes its own `ss_size_lookup[BLOCK_16X4][1][0]`
+                // = BLOCK_8X4 chroma block -- a valid transform, no pair.
+                // (lane-av1-422o: a VERTICAL 4x16 strip now falls through to
+                // the pair merge below -- its own chroma block
+                // `ss_size_lookup[BLOCK_4X16][1][0]` is BLOCK_INVALID, the
+                // walk proved such leaves exist, and libaom codes the pair's
+                // chroma from the closing strip; the chunk lives in the
+                // `chroma422_pair16` arm below.)
                 (lmi, bw, bh)
             } else if horz {
                 ((lmi.0 - 1, lmi.1), 16, 8)
@@ -14739,6 +14751,19 @@ fn decode_rect4_16_strip(
             let (ppx, ppy) = (pair_mi.1 * MI, pair_mi.0 * MI);
             let (cpx, cpy) = (ppx >> ss_x(fctx), ppy >> ss_y(fctx));
             let (cw, ch) = (pw >> ss_x(fctx), ph >> ss_y(fctx));
+            // lane-av1-422o: the 4:2:2 pair's chroma of a VERT 4x16 strip
+            // pair: (4, 16) at ss(1,0). The bsize is still BLOCK_4X16, whose
+            // `ss_size_lookup[..][1][0]` is BLOCK_INVALID, so libaom's
+            // `av1_get_tx_size` reads `max_txsize_rect_lookup[255]` -- the
+            // out-of-bounds byte is TX_4X8 in the pinned Release oracle, and
+            // `av1_get_adjusted_tx_size` has no TX_4X8 case to adjust it.
+            // `decode_token_recon_block` walks unit_width =
+            // ROUND_POWER_OF_TWO(1, 1) = 1, unit_height = 4, with stepr =
+            // tx_size_high_unit[TX_4X8] = 2: TWO TX_4X8 units per plane
+            // (chroma rows 0..8 and 8..16), plane-major. Even the skip arm
+            // walks per unit: `predict_and_reconstruct_intra_block` predicts
+            // every unit regardless of `skip_txfm`.
+            let chroma422_pair16 = (cw, ch) == (4, 16) && ss_x(fctx) == 1;
             let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
             if (V_PRED..=D67_PRED).contains(&uv_predict_mode) {
                 hit!(RECT4_16_CHROMA_DIR_HITS);
@@ -14858,6 +14883,41 @@ fn decode_rect4_16_strip(
                     hit!(CHROMA_SKIP_CFL_HITS);
                 }
                 for (_buf, plane) in [(&mut *u, 1usize), (&mut *v, 2)] {
+                    if chroma422_pair16 {
+                        // lane-av1-422o: two TX_4X8 units, each predicted on
+                        // its own edges (the lower one off the upper one's
+                        // samples); no coefficients are coded, and libaom's
+                        // `set_entropy_context` zeroed the block's own cells,
+                        // so the pair-wide zero stamp below stays correct.
+                        for unit_row in 0..2usize {
+                            let unit_reach = tu_reach_rect(
+                                pw, ph, 0, unit_row * 8, 8, 8, pair_reach,
+                                ppx, ppy, y.width, y.height, fctx,
+                            );
+                            if let Some((ub, vb)) = &palette_uv_bufs {
+                                let pbuf = if plane == 1 { ub } else { vb };
+                                set_palette_pred(
+                                    palette_window(pbuf, cw, 0, unit_row * 8, 4, 8),
+                                    fctx,
+                                );
+                            }
+                            push_intra_rect(plane,
+                                cpx,
+                                cpy + unit_row * 8,
+                                4,
+                                8,
+                                uv_predict_mode,
+                                angle_delta_uv,
+                                unit_reach,
+                                &ZERO_RESIDUAL[..4 * 8],
+                                alpha
+                                    .zip(ac)
+                                    .map(|((au, av), ac)| (if plane == 1 { au } else { av }, ac)),
+                                None,
+                                smooth_neighbor_uv, fctx,
+                            );
+                        }
+                    } else {
                     if let Some((ub, vb)) = &palette_uv_bufs {
                         set_palette_pred(if plane == 1 { ub.clone() } else { vb.clone() }, fctx);
                     }
@@ -14876,8 +14936,69 @@ fn decode_rect4_16_strip(
                         None,
                         smooth_neighbor_uv, fctx,
                     );
+                    }
                 }
                 (zeros.clone(), zeros)
+            } else if chroma422_pair16 {
+                // lane-av1-422o: the pair's 4x16 chroma as TWO TX_4X8 units
+                // per plane, plane-major (every U unit, then every V). Each
+                // unit: the `ChromaRect8x4` tables (`get_txsize_entropy_ctx`
+                // squares TX_4X8 up to the 8x8 class), `SCAN_4X8`, and a
+                // `txb_skip_ctx` of above+left in the OFFSET-10 rows -- the
+                // offset comes from `num_pels_log2_lookup[plane_bsize] >
+                // num_pels_log2_lookup[BLOCK_4X8]` with plane_bsize =
+                // BLOCK_INVALID (255), and the byte at that table's +255 in
+                // the pinned Release oracle is 255 (`cmpb` against the
+                // `0xc0db70` copy decodetxb.c links), i.e. the bigger-plane
+                // arm: +3 on the offset-7-first chroma tables. No tx_type
+                // symbol (only y plane's is transmitted); the unit's type is
+                // `intra_mode_to_tx_type(UV mode)` kept by the all-16 ext-tx
+                // set -- [`read_rect_chroma_unit`]'s own default. CfL params
+                // are computed ONCE per block (`are_parameters_computed`)
+                // over the pair's luma, shared by both units. Each unit is
+                // predicted and recorded immediately, so the lower unit
+                // reads the upper one's coefficient context.
+                let ac = alpha.map(|_| cfl_src_rect(ppx, ppy, pw, ph));
+                for (plane, buf) in [(1usize, &mut *u), (2usize, &mut *v)] {
+                    for unit_row in 0..2usize {
+                        let unit_mi = (pair_mi.0 + unit_row * 2, pair_mi.1);
+                        let unit_reach = tu_reach_rect(
+                            pw, ph, 0, unit_row * 8, 8, 8, pair_reach,
+                            ppx, ppy, y.width, y.height, fctx,
+                        );
+                        if let Some((ub, vb)) = &palette_uv_bufs {
+                            let pbuf = if plane == 1 { ub } else { vb };
+                            set_palette_pred(
+                                palette_window(pbuf, cw, 0, unit_row * 8, 4, 8),
+                                fctx,
+                            );
+                        }
+                        let chroma_around = neighbours.around_mi_422_chroma(unit_mi, 8, 8);
+                        let unit_grid = read_rect_chroma_unit(
+                            dec,
+                            cdfs,
+                            TxbSet::ChromaRect8x4,
+                            &SCAN_4X8,
+                            4,
+                            8,
+                            plane,
+                            chroma_around[plane],
+                            uv_predict_mode,
+                            angle_delta_uv,
+                            unit_reach,
+                            buf,
+                            cpx,
+                            cpy + unit_row * 8,
+                            base_q_idx,
+                            alpha
+                                .zip(ac)
+                                .map(|((au, av), ac)| (if plane == 1 { au } else { av }, ac)),
+                            smooth_neighbor_uv, fctx,
+                        )?;
+                        neighbours.record_mi_chroma(unit_mi, 8, 8, plane, &unit_grid);
+                    }
+                }
+                (Grid::Zero(cw * ch), Grid::Zero(cw * ch))
             } else {
                 let around = neighbours.around_mi_rect(pair_mi, pw, ph);
                 // lane-av1-444: the strip's own 16x4 / 4x16 chroma at ss 0/0
@@ -14887,6 +15008,10 @@ fn decode_rect4_16_strip(
                     (8, 4) => (TxbSet::ChromaRect8x4, &SCAN_8X4[..]),
                     (4, 8) => (TxbSet::ChromaRect8x4, &SCAN_4X8[..]),
                     (16, 4) => (TxbSet::Chroma8, &SCAN_16X4[..]),
+                    // lane-av1-444: 4:4:4's own-strip vert chroma is (4,16)
+                    // -- one TX_4X16. (lane-av1-422o: the 4:2:2 pair's
+                    // (4,16) never reaches this row; `chroma422_pair16`
+                    // intercepts it above and chunks it into TX_4X8 units.)
                     (4, 16) => (TxbSet::Chroma8, &SCAN_4X16[..]),
                     // lane-av1-422: a 4:2:2 HORZ pair (16x8 luma) keeps the
                     // pair's height: an 8x8 SQUARE chroma block, the same
@@ -14899,6 +15024,9 @@ fn decode_rect4_16_strip(
                         hit!(CHROMA422_SQUARE_HITS);
                         (TxbSet::Chroma8, default_scan(8))
                     }
+                    // lane-av1-422o: with the `chroma422_pair16` arm above,
+                    // the (2,16) own-strip shape and the 4:4:4 shapes are the
+                    // only residents; anything else is a named-lane gap.
                     _ => unreachable!("decode_rect4_16_strip chroma shape set is closed"),
                 };
                 let mut planes = Vec::with_capacity(2);
@@ -14963,7 +15091,11 @@ fn decode_rect4_16_strip(
             neighbours.record_uv_mode_mi(pair_mi.0, pair_mi.1, pw / MI, ph / MI, uv_predict_mode);
             // A lossless pair already stamped each TX_4X4 (`record_mi_chroma`).
             // The single-state rewrite below is the non-lossless TX_8X4/TX_4X8.
-            if !lossless_pair {
+            // lane-av1-422o: the chunked pair's cells are stamped PER UNIT in
+            // the arm above (libaom's coefficient contexts are per
+            // 4x4-cell); a pair-wide state would erase the unit boundary the
+            // next block reads.
+            if !lossless_pair && !chroma422_pair16 {
             // The chroma planes' coefficient context, over the PAIR's mi span
             // (`decode_leaf_rect8`'s own rule: a subsampled plane's bound is
             // the luma one rounded up to its 4x4 unit).
