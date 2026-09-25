@@ -5628,6 +5628,123 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1llpredgate2: the debug-exact pin for the ss-aware
+    /// `obmc_skip_chroma_above` decision (lane-av1-llpred2). Fixture is the
+    /// llpred/llpred2 reports' stream pinned into `fixtures/`: testsrc2
+    /// 128x96 yuv444p, aomenc `--profile=1 --lossless=1 --enable-palette=0
+    /// --enable-intrabc=0 --min-partition-size=8 --max-partition-size=64`,
+    /// 6 frames; 34037 bytes, sha256
+    /// `04fb6d38de5382e647bfb70b6a17802f1fccc5502e6698c0394167891f2b27dc`.
+    ///
+    /// This is a DEBUG-build path by construction: the old ratio-based ss
+    /// derivation read `write_h >> trailing_zeros(0)` = `>> 64` on this
+    /// stream's 4:4:4 OBMC rect strips, a panic ONLY under
+    /// debug_assertions (release wraps and was already byte-exact), so
+    /// `cargo test`'s default dev profile is the profile where the defect
+    /// class reproduces and where the parent's byte-exact proof was
+    /// measured.
+    ///
+    /// No skip-arm counter gate is possible on this stream, measured:
+    /// OBMC runs 77 times with 20 rect leaves, but
+    /// `obmc_skip_chroma_above` returns true 0 times -- at 4:4:4 the skip
+    /// needs a 4x4/8x4/4x8 PLANE block and min-partition-8 never codes one.
+    /// So per the lane ticket the proof splits in two: the decision TABLE
+    /// (4:2:0 rect strips still skip, 4:4:4 shifts never leave `usize`)
+    /// stays pinned by `decode::obmc_skip_chroma_tests::
+    /// rect_strips_skip_above_chroma_at_420_and_shift_never_overflows`,
+    /// and THIS stream gate pins the end-to-end behaviour -- every sample
+    /// of every frame must match the oracle aomdec exactly, so a returning
+    /// chroma diff (the lane-av1-llpred ss-blind re-blend class
+    /// `obmc-ss-blind-chroma-above`) or the debug shift panic goes red
+    /// here by name.
+    #[test]
+    fn a_lossless_444_min_partition8_inter_stream_decodes_sample_exact() {
+        const NAME: &str = "a_lossless_444_min_partition8_inter_stream_decodes_sample_exact";
+        const FIXTURE_LEN: usize = 34037;
+        const FIXTURE_FNV: u64 = 0x2c8f_4a2c_c025_52da;
+        const W: usize = 128;
+        const H: usize = 96;
+        const FRAMES: usize = 6;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_minp8_inter.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
+        });
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for f in &frames {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+
+        // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
+        if aomdec_path().is_file() {
+            let dir = std::env::temp_dir().join(format!("ec-av1-llminp8-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let raw = dir.join("aomdec.raw");
+            let out = Command::new(aomdec_path())
+                .args(["--codec=av1", "--rawvideo", "-o"])
+                .arg(&raw)
+                .arg(&obu)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("aomdec failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: the oracle aomdec refused the stream: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(ref_raw.len(), W * H * 3 * FRAMES, "{NAME}: aomdec raw size");
+            for (i, f) in frames.iter().enumerate() {
+                let base = i * W * H * 3;
+                for ((plane, off), p) in [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
+                    .into_iter()
+                    .zip(["y", "u", "v"])
+                {
+                    let want = &ref_raw[base + off..base + off + W * H];
+                    let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ \
+                         (class obmc-ss-blind-chroma-above)"
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+        }
+
+        // ffmpeg's decoder: same frames, full-resolution chroma.
+        if have_ffmpeg() {
+            let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
+            for (i, (got, want)) in frames.iter().zip(refs.iter()).enumerate() {
+                for (p, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                    .iter()
+                    .enumerate()
+                {
+                    let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                    assert_eq!(bad, 0, "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ");
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME} ffmpeg arm: no ffmpeg");
+        }
+    }
+
     /// lane-lossless128: a LOSSLESS key frame that codes a 128-axis
     /// (`BLOCK_64X128`) intra block -- the shape libaom's `read_tx_size` forces
     /// to `TX_4X4` on its very first line (`decodeframe.c:1183`), so every plane
