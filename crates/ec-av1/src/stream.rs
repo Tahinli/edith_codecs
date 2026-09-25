@@ -126,6 +126,23 @@ pub fn rect_intrabc_reads() -> usize {
     crate::decode::rect_intrabc_reads()
 }
 
+/// lane-av1-ibc444rect: unskipped intrabc 8x4/4x8 leaves whose luma a lossless
+/// frame walked as per-4x4 inter units.
+pub fn intrabc_rect8_lossless_luma_hits() -> usize {
+    crate::decode::intrabc_rect8_lossless_luma_hits()
+}
+
+/// lane-av1-ibc444rect: unskipped intrabc 8x4/4x8 leaves whose chroma a
+/// lossless 4:4:4 frame walked as per-4x4 `Chroma4` units.
+pub fn intrabc_rect8_lossless_chroma_hits() -> usize {
+    crate::decode::intrabc_rect8_lossless_chroma_hits()
+}
+
+/// Gate-side reset for the lane-av1-ibc444rect counters above.
+pub fn reset_ibc444rect_hits() {
+    crate::decode::reset_ibc444rect_hits()
+}
+
 /// `(y, uv)` palette blocks RECONSTRUCTED inside an inter frame (lane-t900
 /// r22) -- the counter a screen-content witness gate reads to prove it
 /// exercises the inter-frame palette path, not the key frame's.
@@ -5971,6 +5988,99 @@ pub(crate) mod tests {
         eprintln!(
             "{NAME}: full-frame exact, {resets} band resets, \
              {intrabc_skips} skipped intrabc chroma predictions"
+        );
+    }
+
+    /// lane-av1-ibc444rect: an unskipped intrabc `BLOCK_8X4`/`BLOCK_4X8` leaf
+    /// on a lossless 4:4:4 frame walks its coefficients as per-4x4 inter
+    /// `TX_4X4` units on every plane -- `read_tx_size`'s lossless first line
+    /// (`decodeframe.c:1203`) forces TX_4X4 before any tree, the frame's
+    /// `TxMode` is `ONLY_4X4` so no var-tx tree is read either, and
+    /// `av1_read_tx_type`'s qindex==0 early return (`decodemv.c:681`) drops
+    /// the tx_type symbol the lossy 4x4 inter sets carry -- NOT the single
+    /// `LumaRect8x4Inter`/`ChromaRect8x4` rect unit the non-lossless arm
+    /// reads, and not the lossy per-unit arm's tx_type read.
+    ///
+    /// The pinned fixture `ll444_ibc_rect.obu` (99614 bytes, provenance and
+    /// the full pixel measurement in `lanes/av1ibc444rect.report.md`) is a
+    /// lossless `--profile=1 --i444 --enable-intrabc=1` key frame. Its first
+    /// unskipped intrabc rect leaf (mi (33,2), 8x4, dv (-64, -832)) must walk
+    /// its luma + chroma per-4x4 units with the tile's entropy ladder still
+    /// aligned afterwards -- three leaves walk before the frame reaches an
+    /// intrabc `BLOCK_8X8` leaf, whose llintra-deferred 8x8 chroma prediction
+    /// buffers
+    /// (`decode_leaf8`'s 16-sample `ub`/`vb`, their deferral in
+    /// `lanes/av1llintra.report.md`) panic in `palette_window` -- on the
+    /// committed tree that panic is this gate's ALIGNMENT WITNESS: any
+    /// unit-structure, context or tx_type regression in the walk desyncs the
+    /// tile long before mi (32,10) and the death signature moves (the
+    /// fail-before was the lossless WHT assert `(4, 8) != (4, 4)` at
+    /// `TxParams::run`). Measured with the two-line 8x8 buffer probe applied
+    /// (never committed): the walk is pixel-exact, luma 0 differing samples
+    /// on all 339 walked leaves and the walked leaves' chroma clean; the only
+    /// remaining diffs sit on SKIPPED intrabc blocks (the skipped-intrabc
+    /// sub8 chroma predictor defect, class-adjacent to the reserved 4:2:0
+    /// tail skip arm). When the 8x8 buffers are fixed in their owning lane,
+    /// this gate flips to a full-frame exact `aomdec` comparison.
+    #[test]
+    fn a_lossless_444_intrabc_rect_leaf_walks_per_4x4_units() {
+        const NAME: &str = "a_lossless_444_intrabc_rect_leaf_walks_per_4x4_units";
+        const FIXTURE_LEN: usize = 99614;
+        const FIXTURE_FNV: u64 = 0xa1b6_a84e_ac6a_656f;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_ibc_rect.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_ibc444rect_hits();
+        // The known leaf8 panic is the expected outcome; keep it out of the
+        // test log and catch it as a value.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(std::boxed::Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_stream(&stream)
+        }));
+        std::panic::set_hook(prev_hook);
+        let luma = crate::decode::intrabc_rect8_lossless_luma_hits();
+        let chroma = crate::decode::intrabc_rect8_lossless_chroma_hits();
+        assert_eq!(
+            (luma, chroma),
+            (3, 3),
+            "{NAME}: the walk must fire exactly three times before the known \
+             leaf8 death (got luma {luma}, chroma {chroma}) -- zero means the \
+             fixture no longer reaches the fixed body (class \
+             gate-blind-to-feature), more means the entropy desynced and \
+             garbage blocks read as intrabc rect leaves"
+        );
+        let payload = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "{NAME}: the fixture decoded to completion -- the known \
+                 llintra-deferred leaf8 panic at mi (32,10) is gone; flip this \
+                 gate to the full-frame exact aomdec comparison"
+            ),
+        };
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&'static str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("range end index 4 out of range for slice of length 0"),
+            "{NAME}: the decode died somewhere OTHER than the known leaf8 \
+             palette_window site -- the walk desynced the tile (panic: {msg})"
+        );
+        eprintln!(
+            "{NAME}: walk fired once (luma + chroma), entropy aligned through \
+             the leaf, death at the known leaf8 site"
         );
     }
 
