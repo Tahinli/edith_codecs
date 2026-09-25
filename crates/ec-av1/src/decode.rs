@@ -18771,7 +18771,21 @@ fn read_intra_mode_sub8(
     // desynced the tile at the very next element.
     let angle_delta_y = 0;
     let chroma = if has_chroma {
-        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        // `is_cfl_allowed` (blockd.h): at lossless CfL needs the CHROMA plane
+        // block to be a single TX_4X4 (`cfl_allowed_px`). True for this leaf
+        // at 4:2:0 (the group's plane block is 4x4) and for a 4:4:4
+        // `BLOCK_4X4` split leaf, but FALSE for a 4:4:4 `BLOCK_8X4`/`BLOCK_4X8`
+        // rect leaf, whose plane block is the rect itself -- that shape reads
+        // the 13-symbol `uv_mode_no_cfl` CDF, and reading the CFL alphabet
+        // there desynced the tile at the rect leaf's own uv_mode symbol (measured:
+        // ours consumed the 14-symbol interval where the oracle read 13, first
+        // divergence at the rect leaf mi (8,16) of `ll444.obu`; class
+        // `wrong-alphabet-same-value`, lane-av1-llsub8).
+        let uv_mode = if cfl_allowed_px(seg_w_mi * MI, seg_h_mi * MI, fctx) {
+            dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
+        };
         if trace {
             eprintln!("TRACE sub8 uv_mode value={uv_mode} rng={}", dec.debug_state().0);
         }
@@ -18839,7 +18853,7 @@ fn sub8_leaf_chroma444(
     base_q_idx: u8,
     smooth_neighbor_uv: bool,
     fctx: &crate::decode::FrameCtx,
-) -> Result<(Grid, Grid)> {
+) -> Result<(Grid, Grid, usize, usize)> {
     let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
     let (w_mi, h_mi) = (bw / MI, bh / MI);
     neighbours.record_uv_mode_mi(lmi.0, lmi.1, w_mi, h_mi, uv_predict_mode);
@@ -18867,7 +18881,7 @@ fn sub8_leaf_chroma444(
             hit!(SKIPPED_INTRABC_CHROMA_ARM_HITS);
             fctx.intrabc_chroma_tx.with(|c| c.set(None));
         }
-        (Grid::Zero(bw * bh), Grid::Zero(bw * bh))
+        (Grid::Zero(bw * bh), Grid::Zero(bw * bh), 4, 4)
     } else if let Some(dv) = intrabc_dv {
         // Frame copy at the DV; the residual still reads the ordinary chroma
         // tables with the inherited luma `tx_type` (see the 4:2:0 tails).
@@ -18897,12 +18911,12 @@ fn sub8_leaf_chroma444(
                 0, reach, v, px, py, 4, TX4, base_q_idx,
                 None, None, None, smooth_neighbor_uv, fctx,
             )?;
-            (ug, vg)
+            (ug, vg, 4, 4)
         } else {
             let scan: &[u16] = if bw > bh { &SCAN_8X4 } else { &SCAN_4X8 };
             let default_tx =
                 fctx.intrabc_chroma_tx.with(std::cell::Cell::get).unwrap_or(TxType::DctDct);
-            let mut out = (Grid::Zero(bw * bh), Grid::Zero(bw * bh));
+            let mut out = (Grid::Zero(bw * bh), Grid::Zero(bw * bh), bw, bh);
             for (plane_idx, buf) in [(1usize, ub), (2usize, vb)] {
                 let skip_ctx =
                     usize::from(around[plane_idx].0) + usize::from(around[plane_idx].1);
@@ -18942,14 +18956,62 @@ fn sub8_leaf_chroma444(
                 0, reach, v, px, py, 4, TX4, base_q_idx,
                 alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
             )?;
-            (ug, vg)
+            (ug, vg, 4, 4)
+        } else if lossless(fctx) {
+            // lane-av1-llsub8: `read_tx_size` answers TX_4X4 for EVERY plane of
+            // a lossless block, so this rect leaf's chroma is (bw/4)*(bh/4)
+            // TX_4X4 units at their own 4x4 origins -- not the single
+            // TX_8X4/TX_4X8 rect unit the non-lossless arm below reads (that
+            // one is `av1_get_max_uv_txsize(BLOCK_8X4)`'s rect transform, which
+            // lossless never reaches). Measured on `ll444.obu`'s HORZ leaf at
+            // mi (8,16): the oracle codes U units at bc 0,1 with
+            // `get_txb_ctx`'s +10 rows (`txb_skip_cdf[0][10..12]`,
+            // plane pels 32 > tx pels 16) where the rect-unit read consumed
+            // `txb_skip_cdf[1][0]` -- the tile desynced at that U unit's
+            // all_zero symbol. Walk is plane-major like libaom
+            // `decode_token_recon_block`'s plane/row/col loop; each unit adds
+            // 3 to the chroma context (Chroma4's `big` rows, the same fold
+            // [`read_plane`]'s 128x128 caller uses); CFL is never allowed at
+            // lossless, so no alpha rides along.
+            let mut out_u = Grid::Own(vec![0i32; bw * bh]);
+            let mut out_v = Grid::Own(vec![0i32; bw * bh]);
+            for (plane_idx, buf) in [(1usize, u), (2usize, v)] {
+                for ur in 0..bh / 4usize {
+                    for uc in 0..bw / 4usize {
+                        let (umi_r, umi_c) = (lmi.0 + ur, lmi.1 + uc);
+                        let (upx, upy) = (px + uc * 4, py + ur * 4);
+                        let unit_around = neighbours.around_mi_rect((umi_r, umi_c), 4, 4);
+                        let unit_reach = Reach::of(4, upx, upy, y.width, y.height, fctx);
+                        let grid = read_plane(
+                            dec, cdfs, TxbSet::Chroma4, scan4, plane_idx, unit_around[plane_idx],
+                            uv_mode, uv_predict_mode, 0, unit_reach, buf, upx, upy, 4,
+                            TX4, base_q_idx, None, None, Some(3), smooth_neighbor_uv, fctx,
+                        )?;
+                        let cell = grid_unit_state(&grid, 4, 0, 0, 4, 4);
+                        if umi_r < neighbours.mi_rows {
+                            neighbours.left[umi_r][plane_idx] = cell;
+                        }
+                        if umi_c < neighbours.mi_cols {
+                            neighbours.above[umi_c][plane_idx] = cell;
+                        }
+                        let out = if plane_idx == 1 { &mut out_u } else { &mut out_v };
+                        if let Grid::Own(v) = out {
+                            for r in 0..4usize {
+                                v[(ur * 4 + r) * bw + uc * 4..][..4]
+                                    .copy_from_slice(&grid[r * 4..][..4]);
+                            }
+                        }
+                    }
+                }
+            }
+            (out_u, out_v, 4, 4)
         } else {
             // `av1_get_max_uv_txsize(BLOCK_4X8/8X4)` at ss 0/0 is the rect
             // transform itself; its `tx_type` is mode-derived with the
             // <32 set (`decode_rect_split`'s own rule for this shape).
             let scan: &[u16] = if bw > bh { &SCAN_8X4 } else { &SCAN_4X8 };
             let default_tx = default_intra_tx_type(uv_predict_mode as u8);
-            let mut out = (Grid::Zero(bw * bh), Grid::Zero(bw * bh));
+            let mut out = (Grid::Zero(bw * bh), Grid::Zero(bw * bh), bw, bh);
             for plane_idx in 1..=2usize {
                 let skip_ctx =
                     usize::from(around[plane_idx].0) + usize::from(around[plane_idx].1);
@@ -18977,23 +19039,54 @@ fn sub8_leaf_chroma444(
         }
     };
     // libaom `av1_set_entropy_contexts` stamps above/left PER TRANSFORM UNIT:
-    // the leaf's own chroma span, not the 8x8 group's.
-    let (u_grid, v_grid) = grids;
-    let u_state = neighbour_state(&u_grid);
-    let v_state = neighbour_state(&v_grid);
-    for cell in 0..h_mi {
-        if lmi.0 + cell < neighbours.mi_rows {
-            neighbours.left[lmi.0 + cell][1] = u_state;
-            neighbours.left[lmi.0 + cell][2] = v_state;
+    // the leaf's own chroma span, not the 8x8 group's. A rect leaf's lossless
+    // units (4x4) each carry their own state -- a 4:2:0-style whole-leaf smear
+    // gave one unit's state to its neighbour's cells (lane-av1-llsub8).
+    let (u_grid, v_grid, unit_w, unit_h) = grids;
+    // One unit covers `unit_w/MI` mi columns and `unit_h/MI` mi rows (a 4x4
+    // unit: one cell each; the non-lossless rect unit: the whole leaf).
+    let (uw_cells, uh_cells) = ((unit_w / MI).max(1), (unit_h / MI).max(1));
+    for ur in 0..h_mi / uh_cells {
+        for uc in 0..w_mi / uw_cells {
+            let (x0, y0) = (uc * unit_w, ur * unit_h);
+            let us = grid_unit_state(&u_grid, bw, x0, y0, unit_w, unit_h);
+            let vs = grid_unit_state(&v_grid, bw, x0, y0, unit_w, unit_h);
+            for cell in 0..uh_cells {
+                if lmi.0 + ur * uh_cells + cell < neighbours.mi_rows {
+                    neighbours.left[lmi.0 + ur * uh_cells + cell][1] = us;
+                    neighbours.left[lmi.0 + ur * uh_cells + cell][2] = vs;
+                }
+            }
+            for cell in 0..uw_cells {
+                if lmi.1 + uc * uw_cells + cell < neighbours.mi_cols {
+                    neighbours.above[lmi.1 + uc * uw_cells + cell][1] = us;
+                    neighbours.above[lmi.1 + uc * uw_cells + cell][2] = vs;
+                }
+            }
         }
     }
-    for cell in 0..w_mi {
-        if lmi.1 + cell < neighbours.mi_cols {
-            neighbours.above[lmi.1 + cell][1] = u_state;
-            neighbours.above[lmi.1 + cell][2] = v_state;
+    Ok((u_grid, v_grid, unit_w, unit_h))
+}
+
+/// [`neighbour_state`] over one `(unit_w x unit_h)` transform unit at offset
+/// `(x0, y0)` inside a `bw`-wide assembled chroma grid -- the per-unit stamp
+/// the rect arms need when a leaf carries more than one unit.
+fn grid_unit_state(grid: &Grid, bw: usize, x0: usize, y0: usize, unit_w: usize, unit_h: usize) -> Neighbour {
+    let mut cul = 0u32;
+    let mut dc = None;
+    for r in 0..unit_h {
+        for c in 0..unit_w {
+            let v = grid[(y0 + r) * bw + x0 + c];
+            cul += v.unsigned_abs();
+            if r == 0 && c == 0 && v != 0 {
+                dc = Some(v < 0);
+            }
         }
     }
-    Ok((u_grid, v_grid))
+    if cul == 0 {
+        return Neighbour::default();
+    }
+    Neighbour { level: cul.min(7) as u8, dc }
 }
 
 
