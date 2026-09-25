@@ -10129,6 +10129,13 @@ pub(crate) mod tests {
             "hg_arf_witness.obu",
             "palette_screen_witness.obu",
             "palette_screen_witness_10bit.obu",
+            // lane-av1wavefront: the 4:4:4 inter witness. The wavefront's
+            // replay-side chroma (`mv_to_q4(.., ss_x(fctx))` in the deferred
+            // builds, `exec_intra`'s CfL AC) used to read the worker's fresh
+            // `FrameCtx` 4:2:0 DEFAULT instead of the frame's subsampling --
+            // invisible on the three 4:2:0 streams above, chroma-only loss on
+            // this one (f1 U 17504 / V 3, f2 U 25472 / V 1472 at PREFILT).
+            "444_sb128rect_lr_witness.obu",
         ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("fixtures")
