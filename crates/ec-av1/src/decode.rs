@@ -29854,6 +29854,13 @@ pub(crate) fn obmc_plan(
     side: usize,
     write_w: usize,
     write_h: usize,
+    // lane-av1-llpred2: the FRAME's own subsampling pair -- the same pair the
+    // chroma window half in [`obmc_run`] shifts by. A rect strip's ss cannot
+    // be derived from a rect size over the square `chroma_side`: that ratio
+    // gave a 16x8 strip at 4:2:0 ss=(1,0) (losing its above-chroma skip) and
+    // divides by zero at 4:4:4 (`trailing_zeros(0)` = 64, a debug shift panic).
+    ss_x: usize,
+    ss_y: usize,
     chroma_side: usize,
     px: usize,
     py: usize,
@@ -29904,13 +29911,13 @@ pub(crate) fn obmc_plan(
     // lane-av1-llpred: the old luma-shape list `(8,8)|(16,8)|(8,16)`
     // hardcoded the 4:2:0 plane sizes; at 4:4:4 the plane block is the luma
     // block itself (never 4-wide), so every one of those blocks was silently
-    // missing its above-pass chroma OBMC blend. Derive ss from `chroma_side`
-    // (`obmc_plan` has no `fctx`, and the encoder callsite passes the same
-    // square pair).
-    let ss_x = (write_w / chroma_side).trailing_zeros() as usize;
-    let ss_y = (write_h / chroma_side).trailing_zeros() as usize;
-    let skip_chroma_above =
-        matches!((write_w >> ss_x, write_h >> ss_y), (4, 4) | (8, 4) | (4, 8));
+    // missing its above-pass chroma OBMC blend.
+    // lane-av1-llpred2: ss is the FRAME's own pair (`ss_x`/`ss_y(fctx)`, the
+    // same values [`obmc_run`]'s chroma windows shift by), never a ratio of
+    // the rect write size over the square `chroma_side` -- that ratio gave a
+    // 4:2:0 16x8 strip ss=(1,0) and dropped its above-chroma skip, and at
+    // 4:4:4 divided to zero (`trailing_zeros(0)` = 64, a debug shift panic).
+    let skip_chroma_above = obmc_skip_chroma_above(write_w, write_h, ss_x, ss_y);
     let mut above = Vec::new();
     for (off4, span4, nb, src4) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
@@ -29980,6 +29987,56 @@ pub(crate) fn obmc_plan(
         overlap_left,
         skip_chroma_above,
     })
+}
+
+/// `av1_skip_u4x4_pred_in_obmc`'s above-pass decision (libaom
+/// `reconinter.c` 829): the PLANE block (`write_w >> ss_x`, `write_h >>
+/// ss_y`) is 4x4, 8x4 or 4x8. `ss_x`/`ss_y` are the FRAME's own pair -- the
+/// same values [`obmc_run`]'s chroma windows shift by -- never a ratio over
+/// the square `chroma_side` (lane-av1-llpred2: that ratio dropped the
+/// 4:2:0 16x8/8x16 skip and shifted by 64 at 4:4:4). Pure so the check
+/// below pins the rect-strip decision without decoding a stream.
+pub(crate) fn obmc_skip_chroma_above(
+    write_w: usize,
+    write_h: usize,
+    ss_x: usize,
+    ss_y: usize,
+) -> bool {
+    matches!(
+        (write_w >> ss_x, write_h >> ss_y),
+        (4, 4) | (8, 4) | (4, 8)
+    )
+}
+
+#[cfg(test)]
+mod obmc_skip_chroma_tests {
+    use super::obmc_skip_chroma_above;
+
+    /// lane-av1-llpred2: the above-chroma skip keys off the PLANE block
+    /// under the frame's own ss pair. At 4:2:0 a 16x8/8x16 rect strip's
+    /// plane block is 8x4/4x8 and MUST still skip (the old `chroma_side`
+    /// ratio read ss=(1,0) off a 16x8 strip and made it blend); at 4:4:4
+    /// the plane block is the luma block, so only true 4-wide/high shapes
+    /// skip and the shift never leaves `usize` range (the old ratio's
+    /// `trailing_zeros(0)` = 64 panicked a debug build).
+    #[test]
+    fn rect_strips_skip_above_chroma_at_420_and_shift_never_overflows() {
+        // 4:2:0 (ss 1,1): 8x8 -> 4x4, 16x8 -> 8x4, 8x16 -> 4x8 all skip.
+        assert!(obmc_skip_chroma_above(8, 8, 1, 1));
+        assert!(obmc_skip_chroma_above(16, 8, 1, 1));
+        assert!(obmc_skip_chroma_above(8, 16, 1, 1));
+        // ... larger plane blocks blend, exactly libaom's own list.
+        assert!(!obmc_skip_chroma_above(16, 16, 1, 1));
+        assert!(!obmc_skip_chroma_above(32, 16, 1, 1));
+        assert!(!obmc_skip_chroma_above(16, 32, 1, 1));
+        // 4:4:4 (ss 0,0): the plane block is the luma block itself.
+        assert!(obmc_skip_chroma_above(4, 4, 0, 0));
+        assert!(obmc_skip_chroma_above(8, 4, 0, 0));
+        assert!(obmc_skip_chroma_above(4, 8, 0, 0));
+        assert!(!obmc_skip_chroma_above(8, 8, 0, 0));
+        assert!(!obmc_skip_chroma_above(16, 8, 0, 0));
+        assert!(!obmc_skip_chroma_above(8, 16, 0, 0));
+    }
 }
 
 /// One OBMC neighbour as the PARSE thread resolved it (lane-defer8): every
@@ -32939,6 +32996,8 @@ fn decode_inter_block(
                     side,
                     write_w,
                     write_h,
+                    ss_x(fctx),
+                    ss_y(fctx),
                     chroma_side,
                     px,
                     py,
@@ -38280,6 +38339,8 @@ fn decode_inter_block8(
                 SIDE,
                 SIDE,
                 SIDE,
+                ss_x(fctx),
+                ss_y(fctx),
                 chroma_side,
                 px,
                 py,
