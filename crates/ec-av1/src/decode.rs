@@ -18699,6 +18699,19 @@ fn decode_leaf8(
         }
     } else if resolved != 4 {
         let around = neighbours.around_mi(leaf_mi, 8);
+        // lane-av1-422h: the 4:2:2 chroma rect unit's `get_txb_ctx_general`
+        // reads its above votes over CHROMA 4-px cells -- at ss_x 1 one chroma
+        // cell spans TWO luma mi columns, so the per-luma-mi sum counts each
+        // above chroma column twice and `dc_sign_ctx`'s signum flips whenever
+        // the doubled sum crosses zero (the same class
+        // [`Neighbours::around_mi_422_chroma`] fixes for the rect readers;
+        // measured at mi(2,24) plane 2: ours dc_sign row 0, oracle row 2).
+        // The left extent is unsubsquared at ss_y 0 and stays one-to-one.
+        let chroma_around = if chroma_422 {
+            neighbours.around_mi_422_chroma(leaf_mi, 8, 8)
+        } else {
+            around
+        };
         if let Some(buf) = &palette_y_buf {
             set_palette_pred(buf.clone(), fctx);
         }
@@ -18742,14 +18755,14 @@ fn decode_leaf8(
             // at ss (1,0) == TX_4X8), covering the plane block exactly, off the
             // leaf's own 8x8-span entropy context (`chroma_tiled`'s convention).
             u_grid = leaf8_chroma422_unit(
-                dec, cdfs, around[1], uv_predict_mode, angle_delta_uv, reach,
+                dec, cdfs, chroma_around[1], uv_predict_mode, angle_delta_uv, reach,
                 1, alpha.zip(ac).map(|((au, _), ac)| (au, ac)), false,
                 intrabc_bufs.as_ref().map(|(_, ub, _)| ub.clone())
                     .or_else(|| palette_uv_bufs.as_ref().map(|(ub, _)| ub.clone())),
                 u, cpx, cpy, smooth_neighbor_uv, fctx,
             )?;
             v_grid = leaf8_chroma422_unit(
-                dec, cdfs, around[2], uv_predict_mode, angle_delta_uv, reach,
+                dec, cdfs, chroma_around[2], uv_predict_mode, angle_delta_uv, reach,
                 2, alpha.zip(ac).map(|((_, av), ac)| (av, ac)), false,
                 intrabc_bufs.as_ref().map(|(_, _, vb)| vb.clone())
                     .or_else(|| palette_uv_bufs.as_ref().map(|(_, vb)| vb.clone())),
@@ -18920,7 +18933,13 @@ fn decode_leaf8(
             }
         }
         let ac = alpha.map(|_| cfl_src(px, py, 8));
-        let chroma_around = neighbours.around_mi(leaf_mi, 8);
+        // lane-av1-422h: same ss_x-1 dc-vote sampling as the whole-leaf arm
+        // above -- the doubled above sum crosses zero at mi(2,24) plane 2.
+        let chroma_around = if chroma_422 {
+            neighbours.around_mi_422_chroma(leaf_mi, 8, 8)
+        } else {
+            neighbours.around_mi(leaf_mi, 8)
+        };
         // lane-av1intrapred: the non-vacuity counter -- armed slot consulted
         // by this arm's chroma reads means the frame-copy + inherited-type
         // route ran; zero at gate time means the fixture stopped reaching it.
@@ -19529,10 +19548,20 @@ fn sub8_leaf_chroma422(
     neighbours.record_uv_mode_mi(lmi.0, lmi.1, 1, 1, uv_predict_mode);
     let (px, py) = (lmi.1 * MI, lmi.0 * MI);
     let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));
+    // lane-av1-422h: the entropy-context anchor is the unit's FLOOR chroma
+    // cell (`pd->above_entropy_context + (mi_col >> ss_x)`): an ODD-column
+    // leaf's 4-px unit starts at a chroma px that is NOT cell aligned, and
+    // both its ctx read and its ctx write live in the cell containing that
+    // start -- one luma mi column to the LEFT of the leaf's own. Even-column
+    // (cell-aligned) leaves keep their own column. The state write spans the
+    // anchor's two luma mi columns, so the second (odd) leaf of a split group
+    // overwrites exactly the cell the first one wrote, as libaom's
+    // `av1_set_entropy_contexts` per-TU writes do.
+    let ctx_mi = (lmi.0, lmi.1 & !1);
     // The square unit takes the leaf's own `Reach::of` (its luma's), the way
     // [`decode_leaf8`]'s 422 arm passes the enclosing block's luma reach.
     let reach = Reach::of(4, px, py, y.width, y.height, fctx);
-    let chroma_around = neighbours.around_mi_422_chroma(lmi, 8, 4);
+    let chroma_around = neighbours.around_mi_422_chroma(ctx_mi, 8, 4);
     let ac = alpha.map(|_| cfl_src_rect(px, py, 8, 4));
     let grids: (Grid, Grid) = if skip {
         // A skipped chroma-reference leaf still predicts (the CfL contribution
@@ -19601,13 +19630,13 @@ fn sub8_leaf_chroma422(
     let u_state = neighbour_state(&u_grid);
     let v_state = neighbour_state(&v_grid);
     if lmi.0 < neighbours.mi_rows {
-        neighbours.left[lmi.0][1] = u_state;
-        neighbours.left[lmi.0][2] = v_state;
+        neighbours.left[ctx_mi.0][1] = u_state;
+        neighbours.left[ctx_mi.0][2] = v_state;
     }
     for cell in 0..2 {
-        if lmi.1 + cell < neighbours.mi_cols {
-            neighbours.above[lmi.1 + cell][1] = u_state;
-            neighbours.above[lmi.1 + cell][2] = v_state;
+        if ctx_mi.1 + cell < neighbours.mi_cols {
+            neighbours.above[ctx_mi.1 + cell][1] = u_state;
+            neighbours.above[ctx_mi.1 + cell][2] = v_state;
         }
     }
     Ok((u_grid, v_grid))
@@ -19699,7 +19728,12 @@ fn decode_leaf_split4(
         let has_chroma = if chroma_444 {
             true
         } else if chroma_422 {
-            (lmi.1 & 1) == 0
+            // lane-av1-422h: `is_chroma_reference`'s column clause at ss_x 1 is
+            // `(mi_col & 1)` for a BLOCK_4X4 leaf -- the ODD-column leaf is the
+            // chroma reference (oracle, mi(30,42) split group: uv_mode read at
+            // mi(30,43) and mi(31,43) only). The even-column rule this
+            // replaces came from 422f's pre-partition-trace misreading.
+            (lmi.1 & 1) == 1
         } else {
             i == 3
         };
@@ -20107,6 +20141,15 @@ fn decode_leaf_rect8(
     // full-resolution rect chroma unit right after its luma.
     let chroma_444 = ss_x(fctx) == 0 && ss_y(fctx) == 0;
     let mut last_uv444 = DC_PRED;
+    // lane-av1-422h: at ss (1,0) `is_chroma_reference`
+    // (av1_common_int.h:1459) resolves per strip shape --
+    // `((mi_row & 1) || !(bh_mi & 1) || !ss_y) && ((mi_col & 1) || !(bw_mi & 1) || !ss_x)`:
+    // a HORZ pair is two BLOCK_8X4 strips at the group's even column, so
+    // BOTH strips are chroma references (`!(bw & 1)`); a VERT pair is two
+    // BLOCK_4X8 strips, and the column clause keeps only the ODD-column
+    // strip (i == 1, the same leaf the 4:2:0 rule reads chroma on).
+    let chroma_422 = ss_x(fctx) == 1 && ss_y(fctx) == 0;
+    let mut last_uv422 = DC_PRED;
     for i in 0..2usize {
         let lmi = if vert {
             (leaf_mi.0, leaf_mi.1 + i)
@@ -20125,7 +20168,13 @@ fn decode_leaf_rect8(
         } else {
             neighbours.mode_left_mi(lmi.0, lmi.1).unwrap_or(left_mode)
         };
-        let has_chroma = chroma_444 || i == 1;
+        let has_chroma = if chroma_444 {
+            true
+        } else if chroma_422 {
+            !vert || i == 1
+        } else {
+            i == 1
+        };
         let skip_ctx = neighbours.skip_txfm_ctx(lmi.0, lmi.1);
         let (skip, mode, angle_delta_y, chroma, filter_intra, intrabc) = read_intra_mode_sub8(
             dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra,
@@ -20312,6 +20361,15 @@ fn decode_leaf_rect8(
                         neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
                     )?;
                     last_uv444 = DC_PRED;
+                } else if chroma_422 {
+                    // lane-av1-422h: same at ss (1,0) -- the strip's own square
+                    // TX_4X4 chroma unit at its halved position.
+                    sub8_leaf_chroma422(
+                        dec, cdfs, neighbours, lmi, DC_PRED, 0, None, skip,
+                        Some(dv), y, u, v, scan4, base_q_idx,
+                        neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
+                    )?;
+                    last_uv422 = DC_PRED;
                 } else {
                     last_uv = Some((DC_PRED, 0, None));
                     last_intrabc = Some(dv);
@@ -20469,6 +20527,17 @@ fn decode_leaf_rect8(
                         neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
                     )?;
                     last_uv444 = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+                } else if chroma_422 {
+                    // lane-av1-422h: the strip's own square TX_4X4 chroma unit
+                    // per plane right after its split luma (one per ref strip).
+                    let (uv_mode, angle_delta_uv, alpha) =
+                        chroma.expect("4:2:2 chroma references read uv_mode");
+                    sub8_leaf_chroma422(
+                        dec, cdfs, neighbours, lmi, uv_mode, angle_delta_uv, alpha,
+                        skip, None, y, u, v, scan4, base_q_idx,
+                        neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
+                    )?;
+                    last_uv422 = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
                 } else {
                     last_uv = chroma;
                 }
@@ -20558,6 +20627,20 @@ fn decode_leaf_rect8(
                     neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
                 )?;
                 last_uv444 = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+            } else if chroma_422 {
+                // lane-av1-422h: the strip's own square TX_4X4 chroma unit
+                // per plane right after its luma -- libaom codes each
+                // BLOCK_8X4 strip's chroma under the strip itself (both
+                // strips of a HORZ pair are chroma references), not one
+                // shared group unit.
+                let (uv_mode, angle_delta_uv, alpha) =
+                    chroma.expect("4:2:2 chroma references read uv_mode");
+                sub8_leaf_chroma422(
+                    dec, cdfs, neighbours, lmi, uv_mode, angle_delta_uv, alpha,
+                    skip, None, y, u, v, scan4, base_q_idx,
+                    neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
+                )?;
+                last_uv422 = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
             } else {
                 last_uv = chroma;
             }
@@ -20573,6 +20656,15 @@ fn decode_leaf_rect8(
         // the loop above; only the coarse slots remain (last leaf's mode).
         neighbours.above_uv_mode[c] = last_uv444;
         neighbours.left_uv_mode[r] = last_uv444;
+        (Grid::Zero(16), Grid::Zero(16))
+    } else if chroma_422 {
+        // lane-av1-422h: every chroma-reference strip coded and reconstructed
+        // its own chroma unit in the loop above (and stamped its own entropy
+        // span), so the 4:2:0 shared group unit below must not run. Only the
+        // coarse 16x16 slots remain: libaom's `above_uv_mode`/`left_uv_mode`
+        // end up holding the LAST chroma reference's mode (decode order).
+        neighbours.above_uv_mode[c] = last_uv422;
+        neighbours.left_uv_mode[r] = last_uv422;
         (Grid::Zero(16), Grid::Zero(16))
     } else {
     let (gpx, gpy) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
@@ -20698,7 +20790,9 @@ fn decode_leaf_rect8(
     }
     // lane-av1-444: at 4:4:4 [`sub8_leaf_chroma444`] already stamped each
     // leaf's own span as it decoded; these placeholder grids carry no state.
-    if !chroma_444 {
+    // lane-av1-422h: same at ss (1,0) -- [`sub8_leaf_chroma422`] stamped each
+    // chroma-reference strip's own span in decode order.
+    if !(chroma_444 || chroma_422) {
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let bound_h = round_up_even(neighbours.mi_rows);
         let bound_w = round_up_even(neighbours.mi_cols);
