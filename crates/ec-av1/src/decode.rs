@@ -3926,6 +3926,30 @@ pub(crate) fn reset_skipped_intrabc_chroma_arm_hits() {
     SKIPPED_INTRABC_CHROMA_ARM_HITS.with(|c| c.set(0));
 }
 
+thread_local! {
+    /// lane-av1-ibcskip2: a sub-8x8 4:4:4 leaf that is BOTH intrabc AND
+    /// `skip` -- the arm whose chroma is the bare frame copy at the DV
+    /// (libaom `av1_build_inter_predictors_sb` runs regardless of `skip`).
+    /// Before the fix this route predicted intra-DC and every one of this
+    /// fixture's 150 such cells differed from the oracle on both chroma
+    /// planes.
+    static SKIPPED_INTRABC_DV_COPY_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SKIPPED_INTRABC_DV_COPY_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn skipped_intrabc_dv_copy_hits() -> usize {
+    SKIPPED_INTRABC_DV_COPY_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`SKIPPED_INTRABC_DV_COPY_HITS`] (gate tests call this before a
+/// decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_skipped_intrabc_dv_copy_hits() {
+    SKIPPED_INTRABC_DV_COPY_HITS.with(|c| c.set(0));
+}
+
 /// Zeroes [`INTRABC_HITS`] (gate tests call this before a decode).
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_intrabc_hits() {
@@ -18902,7 +18926,10 @@ fn read_intra_mode_sub8(
 /// arm for arm at leaf scale: a skipped leaf keeps its CfL contribution, an
 /// intrabc leaf predicts a frame copy at its DV with the luma `tx_type`
 /// inherited through [`INTRABC_CHROMA_TX`] (the caller arms it right after
-/// the luma read). The chroma position, reach and entropy-context span are
+/// the luma read) -- and a SKIPPED intrabc leaf is still the DV copy, never
+/// an intra prediction (lane-av1-ibcskip2: libaom's
+/// `av1_build_inter_predictors_sb` runs for an intrabc block regardless of
+/// `skip`). The chroma position, reach and entropy-context span are
 /// the leaf's own (ss 0/0); the 4x8/8x4 unit reads the same
 /// `ChromaRect8x4` tables [`decode_rect_split`] proves for that shape.
 /// Records the leaf's own `uv_mode` map entry and chroma above/left state,
@@ -18939,7 +18966,50 @@ fn sub8_leaf_chroma444(
     } else {
         Reach::of_rect(bw, bh, px, py, y.width, y.height, fctx)
     };
-    let grids = if skip {
+    let grids = if let Some(dv) = intrabc_dv.filter(|_| skip) {
+        // lane-av1-ibcskip2: a SKIPPED intrabc leaf still predicts the frame
+        // copy at its DV -- libaom's `av1_build_inter_predictors_sb` runs for
+        // an intrabc block regardless of `skip` (only the residual read is
+        // dropped), so the reconstruction is the bare DV copy. The intra push
+        // in the next arm is the NON-intrabc route; predicting DC there
+        // decoded flat cells where this fixture's oracle copies frame bytes
+        // (class skipped-intrabc-predicts-intra,
+        // lanes/av1ibcskip2.report.md). Same armed-palette-slot route the
+        // leaf's own luma skip arm uses (`decode_leaf_split4` /
+        // `decode_leaf_rect8`); the caller already flushed the recon queue
+        // before its luma DV copy, so the source samples are current.
+        let mut ub = vec![0u16; bw * bh];
+        mc::predict_with_filter(
+            &u.data, u.width, u.true_width, u.true_height,
+            mv_to_q4(px, dv.1, 0), mv_to_q4(py, dv.0, 0),
+            bw, bh, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+        );
+        let mut vb = vec![0u16; bw * bh];
+        mc::predict_with_filter(
+            &v.data, v.width, v.true_width, v.true_height,
+            mv_to_q4(px, dv.1, 0), mv_to_q4(py, dv.0, 0),
+            bw, bh, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+        );
+        hit!(SKIPPED_INTRABC_DV_COPY_HITS);
+        let zeros = &ZERO_RESIDUAL[..bw * bh];
+        if square {
+            set_palette_pred(ub, fctx);
+            push_intra(1, px, py, 4, DC_PRED, 0, reach, zeros, None, None, smooth_neighbor_uv, fctx);
+            set_palette_pred(vb, fctx);
+            push_intra(2, px, py, 4, DC_PRED, 0, reach, zeros, None, None, smooth_neighbor_uv, fctx);
+        } else {
+            set_palette_pred(ub, fctx);
+            push_intra_rect(1, px, py, bw, bh, DC_PRED, 0, reach, zeros, None, None, smooth_neighbor_uv, fctx);
+            set_palette_pred(vb, fctx);
+            push_intra_rect(2, px, py, bw, bh, DC_PRED, 0, reach, zeros, None, None, smooth_neighbor_uv, fctx);
+        }
+        // The same arm-without-clear route the 4:2:0 tails count: a skipped
+        // leaf reads no coefficient, so the inherited chroma `tx_type` is
+        // dropped unconsumed.
+        hit!(SKIPPED_INTRABC_CHROMA_ARM_HITS);
+        fctx.intrabc_chroma_tx.with(|c| c.set(None));
+        (Grid::Zero(bw * bh), Grid::Zero(bw * bh), 4, 4)
+    } else if skip {
         let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
         if square {
             push_intra(1, px, py, 4, uv_predict_mode, 0, reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
