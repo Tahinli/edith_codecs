@@ -18150,17 +18150,27 @@ fn decode_leaf8(
             mv_to_q4(px, dv_col, 0), mv_to_q4(py, dv_row, 0),
             8, 8, mc::InterpFilterKind::Bilinear, &mut yb, fctx,
         );
-        let mut ub = vec![0u16; 4 * 4];
+        // The chroma extent is THIS frame's subsampled size of the 8x8 luma
+        // leaf (`get_plane_block_size`): 4x4 at 4:2:0, 8x8 at 4:4:4. The
+        // literal 4x4 this replaces hardcoded the 4:2:0 halving -- at 4:4:4
+        // the 16-sample override fed this leaf's own 8x8 chroma reconstruct,
+        // which indexed `prediction[16]` of a 16-sample buffer
+        // (len 16, index 16 at `PlaneBuf::reconstruct`). The same buffers
+        // are windowed at stride 8 by `read_intra_chroma_lossless` (the TX4
+        // 4:4:4-lossless arm) and consumed whole by the TX8 and skip arms,
+        // so all three heal with this one sizing.
+        let (cw, ch) = (8 >> ss_x(fctx), 8 >> ss_y(fctx));
+        let mut ub = vec![0u16; cw * ch];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
-            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_x(fctx)),
-            4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
+            cw, ch, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
-        let mut vb = vec![0u16; 4 * 4];
+        let mut vb = vec![0u16; cw * ch];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
-            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_x(fctx)),
-            4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
+            cw, ch, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
         (yb, ub, vb)
     });
