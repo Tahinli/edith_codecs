@@ -5399,6 +5399,83 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1-llband: the pinned 4:4:4 LOSSLESS key frame
+    /// (`fixtures/ll444-lossless-key.obu`, the `ll444` recipe's frame 0 --
+    /// `testsrc2 128x96` yuv444p cut to its key frame) decodes sample-exact,
+    /// and its HORZ/VERT strips really walked their chroma as 4x4 units at
+    /// subsampling 0/0 (one unit per mi cell). That unit walk used the 4:2:0
+    /// span (8 luma px per 4x4 chroma unit) unconditionally, so every unit
+    /// past the first column/row read its `txb_skip` context two mi cells
+    /// over and stamped a 2-cell smear -- the 178-byte key-frame miss, first
+    /// divergence at the 16x8 leaf mi (16,24)'s U bc=2 unit (oracle
+    /// `txb_skip` base 0 off `above[26]`, ours base 1 off the polluted
+    /// `above[29]`). The counter assertion is the non-vacuity half (class
+    /// `gate-blind-to-feature`): a stream that never reaches the 4:4:4 unit
+    /// walk must not pass.
+    #[test]
+    fn a_real_aomenc_lossless_444_key_frame_decodes_sample_exact() {
+        const NAME: &str = "a_real_aomenc_lossless_444_key_frame_decodes_sample_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let Ok(stream) = std::fs::read(pin_dir().join("ll444-lossless-key.obu")) else {
+            eprintln!(
+                "SKIP {NAME}: no pinned bytes at {} -- regenerate with \
+                 `testsrc2 128x96` yuv444p 6 frames, aomenc --profile=1 --lossless=1 \
+                 --enable-palette=0 --enable-intrabc=0, cut to the key frame's OBUs",
+                pin_dir().join("ll444-lossless-key.obu").display()
+            );
+            return;
+        };
+        // Blindness guard: the pinned fixture must really be a lossless frame.
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut lossless = false;
+        while pos < stream.len() {
+            let obu = parser.parse_obu(&stream[pos..]).expect("aomenc OBU parses");
+            pos += obu.total_size.max(1);
+            if let ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) = obu.kind {
+                lossless = h.lossless.iter().all(|&l| l);
+            }
+        }
+        assert!(lossless, "{NAME} went blind: the pinned frame is not lossless");
+        let before = crate::decode::rect_split_lossless_chroma444_hits();
+        let ours = decode_stream(&stream).expect("a 444 lossless key-frame stream decodes");
+        assert_eq!(ours.len(), 1, "{NAME}: frame count");
+        assert!(
+            crate::decode::rect_split_lossless_chroma444_hits() > before,
+            "{NAME} went blind: no lossless HORZ/VERT strip walked its chroma \
+             as 4x4 units at subsampling 0/0"
+        );
+        let refs = Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv444p", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.as_mut().expect("stdin").write_all(&stream)?;
+                child.wait_with_output()
+            })
+            .expect("ffmpeg 444 decode failed");
+        assert!(refs.status.success(), "{}", String::from_utf8_lossy(&refs.stderr));
+        let frame = &ours[0];
+        let planes = [
+            (&frame.y, frame.width * frame.height),
+            (&frame.u, frame.width * frame.height),
+            (&frame.v, frame.width * frame.height),
+        ];
+        let mut off = 0usize;
+        for (plane, (g, len)) in planes.iter().enumerate() {
+            let raw = &refs.stdout[off..off + len];
+            let bad = g.iter().zip(raw.iter()).filter(|&(&a, &b)| a != u16::from(b)).count();
+            assert_eq!(bad, 0, "{NAME}: plane {plane}: {bad} samples differ");
+            off += len;
+        }
+    }
+
     /// lane-lossless128: a LOSSLESS key frame that codes a 128-axis
     /// (`BLOCK_64X128`) intra block -- the shape libaom's `read_tx_size` forces
     /// to `TX_4X4` on its very first line (`decodeframe.c:1183`), so every plane

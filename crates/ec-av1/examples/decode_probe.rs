@@ -216,6 +216,10 @@ fn main() {
             ec_av1::decode::chroma_edge_tu_clip_hits(),
             ec_av1::decode::skip_lossless_band_reset_hits(),
         );
+        println!(
+            "llband: rect_split_lossless_chroma444={}",
+            ec_av1::decode::rect_split_lossless_chroma444_hits()
+        );
         // lane-t900 r12: chroma edge-filter neighbour answered from the mi-granular
         // uv_mode grid instead of the coarse one-slot-per-column map.
         println!(

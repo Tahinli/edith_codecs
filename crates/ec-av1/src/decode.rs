@@ -5321,6 +5321,10 @@ thread_local! {
     /// entropy bands were zeroed per unit (libaom `av1_reset_entropy_context`,
     /// decodeframe.c:1262) instead of leaking the previous occupant's.
     static SKIP_LOSSLESS_BAND_RESET_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-llband: 4x4 chroma transform units a lossless HORZ/VERT strip
+    /// walked at subsampling 0/0 (one unit per mi cell -- the geometry the
+    /// hardcoded 4:2:0 span mis-stepped).
+    static RECT_SPLIT_LOSSLESS_CHROMA444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
@@ -5341,6 +5345,14 @@ pub fn chroma_edge_tu_clip_hits() -> usize {
 /// bands zeroed per unit (lane-av1-loss64).
 pub fn skip_lossless_band_reset_hits() -> usize {
     SKIP_LOSSLESS_BAND_RESET_HITS.with(|c| c.get())
+}
+
+/// How many 4x4 chroma transform units a lossless HORZ/VERT strip walked at
+/// subsampling 0/0 (lane-av1-llband). Zero means a stream never decoded the
+/// 4:4:4 lossless unit walk this counter proves -- a gate asserting the fix
+/// must see this nonzero.
+pub fn rect_split_lossless_chroma444_hits() -> usize {
+    RECT_SPLIT_LOSSLESS_CHROMA444_HITS.with(|c| c.get())
 }
 
 /// Gate-side reset for the two lane-av1-loss64 counters above.
@@ -10403,7 +10415,7 @@ fn decode_rect_split(
     // them with the LAST unit's state (class `override-slot-on-one-arm`: the
     // next block then read `dc_sign_ctx` 1 where libaom reads 0). They are
     // collected here and replayed after that record.
-    let mut ll_chroma_units: Vec<((usize, usize), usize, Grid)> = Vec::new();
+    let mut ll_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = Vec::new();
     // The chroma_tiled arm below stamps each unit's coefficient context
     // immediately (so the NEXT unit reads it), then the whole-strip
     // `record_split_luma_rect_mi` rewrites every chroma cell with ONE
@@ -10451,19 +10463,29 @@ fn decode_rect_split(
         let scan4 = default_scan(4);
         let offset = (chroma_w > 4 || chroma_h > 4).then_some(3);
         let (cw_n, ch_n) = (chroma_w / 4, chroma_h / 4);
+        // lane-av1-llband: one 4x4 chroma unit's extent in LUMA pixels -- 4
+        // chroma px scaled by the plane's own subsampling. The hardcoded 8
+        // was the 4:2:0 unit's span; at 4:4:4 a unit is 4x4 LUMA px (one mi
+        // cell), and the 8-px step made every unit past the first column/row
+        // read its `txb_skip` context at the WRONG mi (two cells over) and
+        // stamp a 2-cell span with one unit's state -- the polluted above-band
+        // cell behind a 16x8 leaf's U bc=2 unit of the 444 lossless key frame
+        // (measured: oracle `EC_DBGCTX` reads 1-cell spans at 1-mi steps;
+        // ours read `above[28..29]` where the oracle read `above[26]`).
+        let span_x = 4 << ss_x(fctx);
+        let span_y = 4 << ss_y(fctx);
         let mut last = [Grid::Zero(16), Grid::Zero(16)];
         for plane_idx in 1..=2 {
             for cu_row in 0..ch_n {
                 for cu_col in 0..cw_n {
-                    let luma_span = 8;
                     let cu_mi = (
-                        mi_r + cu_row * (luma_span / MI),
-                        mi_c + cu_col * (luma_span / MI),
+                        mi_r + cu_row * (span_y / MI),
+                        mi_c + cu_col * (span_x / MI),
                     );
-                    let cu_around = neighbours.around_mi(cu_mi, luma_span);
+                    let cu_around = neighbours.around_mi_rect(cu_mi, span_x, span_y);
                     let cu_reach = tu_reach(
                         bw, bh,
-                        cu_col * luma_span, cu_row * luma_span, luma_span,
+                        cu_col * span_x, cu_row * span_y, span_x,
                         block_reach, px, py, y.width, y.height, fctx,
                     );
                     let (cu_x, cu_y) = (cpx + cu_col * 4, cpy + cu_row * 4);
@@ -10485,8 +10507,11 @@ fn decode_rect_split(
                         }),
                         None, offset, m.smooth_neighbor_uv, fctx,
                     )?;
-                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, plane_idx, &grid);
-                    ll_chroma_units.push((cu_mi, plane_idx, grid.clone()));
+                    if span_x == 4 && span_y == 4 {
+                        hit!(RECT_SPLIT_LOSSLESS_CHROMA444_HITS);
+                    }
+                    neighbours.record_mi_chroma(cu_mi, span_x, span_y, plane_idx, &grid);
+                    ll_chroma_units.push((cu_mi, plane_idx, grid.clone(), span_x, span_y));
                     last[plane_idx - 1] = grid;
                 }
             }
@@ -10658,8 +10683,8 @@ fn decode_rect_split(
         m.uv_predict_mode,
         [&u_grid, &v_grid],
     );
-    for (cu_mi, plane, unit) in &ll_chroma_units {
-        neighbours.record_mi_chroma(*cu_mi, 8, 8, *plane, unit);
+    for (cu_mi, plane, unit, span_w, span_h) in &ll_chroma_units {
+        neighbours.record_mi_chroma(*cu_mi, *span_w, *span_h, *plane, unit);
     }
     for (cu_mi, plane, unit, span_w, span_h) in &tiled_chroma_units {
         neighbours.record_mi_chroma(*cu_mi, *span_w, *span_h, *plane, unit);
