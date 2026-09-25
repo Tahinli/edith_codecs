@@ -25795,6 +25795,21 @@ pub(crate) fn chroma_split_tx_hits() -> usize {
     CHROMA_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// How many INTRA leaves of an inter frame's 8x8 block ran the lossless
+    /// 4:4:4 chroma walk ([`read_intra_chroma_lossless`], lane-av1-llintra8)
+    /// -- one bump per leaf, four units per plane inside it. A gate proving
+    /// the arm must see this nonzero; CHROMA_SPLIT_TX_HITS alone cannot
+    /// attribute its bumps to THIS leaf.
+    pub(crate) static LLINTRA8_CHROMA_WALK_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`LLINTRA8_CHROMA_WALK_HITS`]: lossless 4:4:4 chroma walks through an
+/// inter frame's 8x8 INTRA leaf.
+pub fn llintra8_chroma_walk_hits() -> usize {
+    LLINTRA8_CHROMA_WALK_HITS.with(|c| c.get())
+}
+
 fn read_sb128_root(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -38539,10 +38554,22 @@ fn decode_inter_block8(
         // but `DC_PRED` was refused here, which is what blocked the low-cq
         // CDEF arms and the 10-bit gates.
         let has_chroma = !mono(fctx);
+        // lane-av1-llintra8: `read_intra_mode_uv` (decodemv.c:145) picks the
+        // uv CDF row by `is_cfl_allowed` (cfl.h:23) -- at LOSSLESS that is
+        // "the chroma plane block is BLOCK_4X4" (cfl.h:29), for this
+        // BLOCK_8X8 leaf only at 4:2:0. The 4:4:4 lossless leaf reads the
+        // 13-symbol `uv_mode_no_cfl` alphabet; the unconditional CFL row
+        // consumed a different partition than aomdec at the leaf's own
+        // uv_mode symbol (class wrong-alphabet-same-value) and desynced
+        // every stream that reached the leaf's lossless chroma walk below.
+        // 4:2:0 and every non-lossless partition keep the CFL row
+        // (`cfl_allowed_px` answers true exactly as before).
         let uv_mode = if !has_chroma {
             DC_PRED
-        } else {
+        } else if cfl_allowed_px(SIDE, SIDE, fctx) {
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
             eprintln!(
@@ -38952,6 +38979,33 @@ fn decode_inter_block8(
             )?
             };
             let ac = alpha.map(|_| cfl_src(px, py, SIDE));
+            if chroma_side == 8 && lossless(fctx) && !mono(fctx) {
+                // lane-av1-llintra8: lossless codes TX_4X4 on EVERY plane
+                // (`av1_get_tx_size`, blockd.h:1383), so this intra leaf's 8x8
+                // chroma plane block is a 2x2 raster of TX_4X4 units per
+                // plane, plane-major -- the same per-unit walk the >=16x16
+                // intra-in-inter block runs, not one TX_8X8 unit (whose WHT
+                // hits `TxParams::run`'s `(8, 8) != (4, 4)` lossless assert).
+                // The walk stamps each unit's own coefficient context
+                // (`record_mi_chroma` inside it), so the tail's whole-block
+                // `record_mi` gets its chroma half saved/restored around --
+                // the same rule the INTER arms'
+                // `leaf8_inter_chroma_lossless` obeys. 4:2:0 keeps its single
+                // TX_4X4 unit in the `else` below.
+                let (mut uo, mut vo) = (Vec::new(), Vec::new());
+                read_intra_chroma_lossless(
+                    dec, cdfs, neighbours, u, v, leaf_mi, (px, py), (cpx, cpy),
+                    SIDE, (chroma_side, chroma_side), (0, 0),
+                    (chroma_side, chroma_side), chroma_side, reach,
+                    (y.width, y.height), mode, uv_predict_mode, angle_delta_uv,
+                    palette_uv_bufs.as_ref().map(|(a, b)| (&a[..], &b[..])),
+                    smooth_neighbor_uv, base_q_idx, &mut uo, &mut vo, fctx,
+                )?;
+                u_grid = if uo.is_empty() { Grid::Zero(64) } else { Grid::Own(uo) };
+                v_grid = if vo.is_empty() { Grid::Zero(64) } else { Grid::Own(vo) };
+                chroma_stamped_per_unit = true;
+                hit!(LLINTRA8_CHROMA_WALK_HITS);
+            } else {
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
@@ -39002,6 +39056,7 @@ fn decode_inter_block8(
                 None,
                 smooth_neighbor_uv, fctx,
             )?;
+            }
         }
     }
     // lane-txselect: a split leaf's plane-0 neighbour context is per 4x4
