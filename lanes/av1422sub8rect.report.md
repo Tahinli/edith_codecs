@@ -71,7 +71,10 @@
      behaviour, named for the owning lane.
 4. MEASURED after the port (17-frame probe run under the reverted bypass;
    comparator: ours padded 256x160/128x160 u8 cropped vs the instrumented
-   `$HOME/.cache/aom-oracle/build` aomdec):
+   `$HOME/.cache/aom-oracle/build` aomdec; NOTE the probe prints REFUSED and
+   still exits 0 -- the committed tree stops at frame 11 with the
+   pre-existing "HORZ/VERT strip ... no rect coefficient tables" frontier
+   refusal, exactly like the reworked tree):
    - frame 0: **byte-exact at PREFILT, POSTCDEF (and FINAL by the u16
      comparator) on Y, U and V — 0 diffs everywhere**, so the rect read,
      the split4 per-piece model and every shared-helper change are exact on
@@ -105,6 +108,56 @@
   `stream::tests` green after the revert).
 - 4:2:0/4:4:4 untouched by construction (ss-keyed arms); the 4:2:0
   group-tail SKIP arm untouched; `read_coeffs_rect` untouched.
+
+## Review rework (r2, post-review findings 1-3)
+
+The review correctly rejected two byte-identity claims and one
+justification:
+
+1. **444 OBMC behaviour now UNCHANGED from the parent.** The first commit
+   made `obmc_plan`/`obmc_run` ss-exact (`av1_skip_u4x4_pred_in_obmc`
+   keyed on the plane block; chroma extents `>> ss`), which is what
+   reconinter.c does -- but it CHANGES 4:4:4 behaviour (the above-pass
+   chroma skip flips to run on square plane blocks, the blend extents
+   double) and is NOT byte-identical, with no 444 OBMC gate covering it.
+   Measured before reworking: fixture `/tmp/obmc444/obmc444.obu` sha256
+   `4b5c0a473c7ca5bd460e76bb5d7fde541dc996bec45f60bfcc393eb2f11731ef`
+   (10-frame 128x96 4:4:4 aomenc `--enable-obmc=1 --profile=1`, 2 rect
+   OBMC leaves firing per the probe census), decoded parent (4e8c6073)
+   vs tip vs instrumented aomdec: parent and tip read IDENTICAL symbols
+   and differ in exactly ONE V sample (f1, (82,80)): oracle 110 ==
+   parent, tip 111. Attribution by single-change revert builds: reverting
+   `TxParams::strided` alone (varB) reproduces tip exactly; reverting the
+   OBMC ss semantics alone (varA) reproduces the parent exactly -- so the
+   whole parent<->tip delta is the OBMC change, and on this fixture the
+   conformant variant is one sample FARTHER from aomdec, never closer.
+   Per the review protocol ("if worse, rework") the OBMC ss semantics are
+   REVERTED to the parent's 4:2:0-shaped corner-cut (luma-keyed
+   `skip_chroma_above`, half chroma blend extents); the 444-conformant
+   port stays deferred to the owning 444 lane, which can measure it on
+   OBMC-heavy 444 content once that lane's reconstruction class is exact
+   enough to gate on. `encode.rs` carries no change any more (the ss
+   argument is gone with the parameter).
+2. **`TxParams::strided` justification corrected.** The commit text
+   claimed "every pre-existing caller has h == stride" -- wrong:
+   `read_inter_plane_rect` callers pass rect units with `h < stride`
+   (e.g. an 8x4 unit in an 8x8-strided plane buffer), and for those the
+   scratch shrinks from `stride*stride` to `stride*h`. Output identity
+   holds because the copy loop only ever writes `h` rows of `w <= stride`
+   and every consumer reads the residual through the same dense bounds --
+   verified empirically (the 4:2:0 pixel-exact witness, 4:4:4 frame
+   equality with the parent on the obmc444 fixture, and the varB
+   revert experiment), not by the removed claim. The `stride * h` sizing
+   itself STAYS: the 4:2:2 leaf's TX_4X8 unit (stride 4, h 8) panics on
+   the old square sizing.
+3. The t422 measurement note above also corrects the probe's exit-status
+   reading (REFUSED still exits 0; both the committed and reworked trees
+   stop at frame 11 on the pre-existing strip-chroma frontier refusal).
+
+Everything else in Outcome 3 (the leaf8 rect port, the split4 per-piece
+model, the ss-keyed masked/interintra blends) is untouched by the rework;
+frame 0 re-verified byte-exact at PREFILT/POSTCDEF after it, and both
+gates re-run green post-revert.
 
 ## Verification
 
