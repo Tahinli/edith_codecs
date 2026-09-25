@@ -2069,6 +2069,20 @@ pub fn chroma422_sub8_hits() -> usize {
     CHROMA422_SUB8_HITS.with(|c| c.get())
 }
 
+// lane-av1-422m: how many TX_4X4 chunk units the invalid-ss-size chroma arm
+// read (the 8x32 luma block whose 4:2:2 plane has no `ss_size_lookup` block).
+// A 4:2:0 or 4:4:4 frame cannot increment it, so a non-zero read proves the
+// chunked 4:2:2 chroma really decoded.
+thread_local! {
+    static CHROMA422_CHUNK_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CHROMA422_CHUNK_HITS`].
+pub fn chroma422_chunk_hits() -> usize {
+    CHROMA422_CHUNK_HITS.with(|c| c.get())
+}
+
 // How many HORZ/VERT intra strips actually predicted with filter intra
 // (lane-rectsplit r1) -- the case `decode_block_rect` refused by name
 // ("this decoder predicts square-only") until `predict_filter_intra` took
@@ -22753,6 +22767,25 @@ fn read_inter_rect_chroma(
     fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, Grid, Vec<((usize, usize), usize, Grid, usize, usize)>)> {
     let (uw, uh) = (write_chroma_w.min(32), write_chroma_h.min(32));
+    // lane-av1-422m: an 8x32 luma block HAS no 4:2:2 plane residual block --
+    // `av1_ss_size_lookup[BLOCK_8X32][1][0]` is BLOCK_INVALID
+    // (`av1/common/common_data.c:38`) -- so libaom never codes its chroma as
+    // a (4, 32) unit, and no such coefficient set exists (no TX_4X32
+    // either). The plane is still coded, CHUNKED at luma-granular TX_4X4:
+    // `decode_token_recon_block` (`decodeframe.c:1022`) steps the plane in
+    // `get_vartx_max_txsize` units, where the `BLOCK_INVALID` plane size
+    // indexes `max_txsize_rect_lookup` one past its end and in the pinned
+    // release build reads the adjacent `vtx_tab[0]` = DCT_1D = 0 = TX_4X4;
+    // `decode_reconstruct_tx`'s `if (tx_size == plane_tx_size || plane)`
+    // never recurses for chroma, so every unit reads at TX_4X4. Chunk the
+    // same way: 8 units per plane over the 4x32 chroma plane. TX_4X4 units
+    // also never inherit a tx_type (`av1_get_tx_type` returns DCT_DCT for
+    // `tx_size == TX_4X4`, blockd.h), so the inherited luma type is dropped.
+    let invalid_ss_plane = ss_x(fctx) == 1
+        && ss_y(fctx) == 0
+        && (write_chroma_w, write_chroma_h) == (4, 32);
+    let (uw, uh) = if invalid_ss_plane { (4, 4) } else { (uw, uh) };
+    let inherit_tx_type = if invalid_ss_plane { None } else { Some(luma_tx_type) };
     let (nx, ny) = (write_chroma_w / uw, write_chroma_h / uh);
     let multi = nx * ny > 1;
     let set = rect_inter_chroma_set(uw, uh)?;
@@ -22800,10 +22833,13 @@ fn read_inter_rect_chroma(
                     cu_x,
                     cu_y,
                     cu_pred,
-                    Some(luma_tx_type),
+                    inherit_tx_type,
                     multi.then_some(3), fctx,
                 )?
                 .0;
+                if invalid_ss_plane {
+                    hit!(CHROMA422_CHUNK_HITS);
+                }
                 if multi {
                     // Immediately, so the next unit of this block reads this
                     // one's coefficient context (libaom updates the chroma
