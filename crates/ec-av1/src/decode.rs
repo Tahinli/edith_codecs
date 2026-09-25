@@ -1509,6 +1509,36 @@ fn tu_reach(
     fixed
 }
 
+/// [`tu_reach`] for a unit whose LUMA footprint is a `tx_w` x `tx_h` rect
+/// (lane-av1-422b: a 4:2:2 chroma unit is square in chroma pixels, but its
+/// luma anchor is `(chroma_tx << ss_x, chroma_tx << ss_y)` -- at ss (1,0)
+/// twice as wide as it is tall). Same predicate as [`tu_reach`]; the
+/// square mismatch counter only means anything when the footprint actually
+/// is square.
+#[allow(clippy::too_many_arguments)]
+fn tu_reach_rect(
+    bw: usize,
+    bh: usize,
+    col_off: usize,
+    row_off: usize,
+    tx_w: usize,
+    tx_h: usize,
+    block: Reach,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize, fctx: &crate::decode::FrameCtx,
+) -> Reach {
+    let fixed = Reach::of_tu(bw, bh, col_off, row_off, tx_w, tx_h, block);
+    if tx_w == tx_h {
+        let standalone = Reach::of(tx_w, px + col_off, py + row_off, width, height, fctx);
+        if fixed != standalone {
+            hit!(SPLIT_TU_REACH_FIX_HITS);
+        }
+    }
+    fixed
+}
+
 // How many `uv_mode` reads resolved to `SMOOTH_PRED..=PAETH_PRED` (9..=12),
 // across every call on the current thread -- lane-chroma r3's own before/after
 // counter, proving a stream actually exercised chroma's smooth/paeth
@@ -2002,8 +2032,9 @@ thread_local! {
 }
 
 /// Current value of [`CHROMA422_SQUARE_HITS`].
-#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
-pub(crate) fn chroma422_square_hits() -> usize {
+// lane-av1-422b: `pub` so `examples/decode_probe.rs` can census it the way
+// it does every other capability counter.
+pub fn chroma422_square_hits() -> usize {
     CHROMA422_SQUARE_HITS.with(|c| c.get())
 }
 
@@ -16648,6 +16679,24 @@ fn decode_block(
             _ => (TxbSet::Chroma4, scan4),
         };
         (luma_set, set, luma_tx, tx, (scans.0, scan))
+    } else if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+        // lane-av1-422b: the uv plane block is (side/2, side)
+        // (`ss_size_lookup[..][1][0]`), so `av1_get_max_uv_txsize` is the
+        // SQUARE transform of the smaller dimension, capped at TX_32X32
+        // (`av1_get_adjusted_tx_size` only ever shrinks): 4 -> TX_4X4 (the
+        // 2x4 plane rounds up to BLOCK_4X4), 8 -> TX_4X4 (BLOCK_4X8),
+        // 16 -> TX_8X8 (BLOCK_8X16), 32 -> TX_16X16, 64 -> TX_32X32
+        // (BLOCK_32X64), 128 -> TX_32X32 (BLOCK_64X128 adjusts TX_64X64
+        // down). The units stay square; the UNIT GRID is (side/2)/tx wide
+        // by side/tx tall -- never square above a 4x4 luma block.
+        let tx = if side >= 64 { 32 } else { (side / 2).max(4) };
+        let (set, scan): (TxbSet, &[u16]) = match tx {
+            32 => (TxbSet::Chroma32, scan32),
+            16 => (TxbSet::Chroma16, scan16),
+            8 => (TxbSet::Chroma8, scan8),
+            _ => (TxbSet::Chroma4, scan4),
+        };
+        (luma_set, set, luma_tx, tx, (scans.0, scan))
     } else {
         (luma_set, chroma_set, luma_tx, chroma_tx, scans)
     };
@@ -16773,6 +16822,9 @@ fn decode_block(
     let reach = Reach::of(side, px, py, y.width, y.height, fctx);
     let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));
     let chroma_side = side >> ss_x(fctx);
+    // lane-av1-422b: chroma extent per axis, `side` at ss_y 0 (4:2:2/4:4:4),
+    // `side / 2` at 4:2:0.
+    let chroma_height = side >> ss_y(fctx);
     // spec 7.11.3.4 with `use_intrabc`: the reference is the *current*
     // frame's own pre-loop-filter reconstruction (all loop filters are off
     // whenever `allow_intrabc`, frame.rs:194/210/252/272) at the full-pel
@@ -16787,17 +16839,17 @@ fn decode_block(
             mv_to_q4(px, dv_col, 0), mv_to_q4(py, dv_row, 0),
             side, side, mc::InterpFilterKind::Bilinear, &mut yb, fctx,
         );
-        let mut ub = vec![0u16; chroma_side * chroma_side];
+        let mut ub = vec![0u16; chroma_side * chroma_height];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
             mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
-            chroma_side, chroma_side, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+            chroma_side, chroma_height, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
-        let mut vb = vec![0u16; chroma_side * chroma_side];
+        let mut vb = vec![0u16; chroma_side * chroma_height];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
             mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
-            chroma_side, chroma_side, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+            chroma_side, chroma_height, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
         (yb, ub, vb)
     });
@@ -16942,16 +16994,23 @@ fn decode_block(
             );
         }
         let ac = alpha.map(|_| cfl_src(px, py, side));
-        let cn = (chroma_side / chroma_tx).max(1);
-        for cu_row in 0..cn {
-            for cu_col in 0..cn {
-                let luma_span = chroma_tx << ss_x(fctx);
-                let cu_r = if cn == 1 {
+        // lane-av1-422b: the chroma unit grid is `cn_cols` x `cn_rows` --
+        // square at 4:2:0/4:4:4, at 4:2:2 `(side/2)/tx` units wide by
+        // `side/tx` tall (the plane block is (side/2, side)). A unit's LUMA
+        // anchor follows the per-axis shifts: `chroma_tx << ss_x` wide,
+        // `chroma_tx << ss_y` tall.
+        let cn_cols = (chroma_side / chroma_tx).max(1);
+        let cn_rows = (chroma_height / chroma_tx).max(1);
+        let luma_span_x = chroma_tx << ss_x(fctx);
+        let luma_span_y = chroma_tx << ss_y(fctx);
+        for cu_row in 0..cn_rows {
+            for cu_col in 0..cn_cols {
+                let cu_r = if cn_rows == 1 && cn_cols == 1 {
                     reach
                 } else {
-                    tu_reach(
+                    tu_reach_rect(
                         side, side,
-                        cu_col * luma_span, cu_row * luma_span, luma_span,
+                        cu_col * luma_span_x, cu_row * luma_span_y, luma_span_x, luma_span_y,
                         reach, px, py, y.width, y.height, fctx,
                     )
                 };
@@ -17037,8 +17096,13 @@ fn decode_block(
         // TX_32X32, so a 64x64 block codes four chroma units, plane-major
         // (every U, then every V) — the same loop the multi-TU arm runs.
         // At 4:2:0 `chroma_side == chroma_tx`, so it stays one read.
-        let cn = (chroma_side / chroma_tx).max(1);
-        let (u_grid, v_grid, chroma_units) = if cn == 1 {
+        // lane-av1-422b: 4:2:2 never collapses to one read above a 4x4 luma
+        // block -- the unit grid is `(side/2)/tx` wide by `side/tx` tall.
+        let cn_cols = (chroma_side / chroma_tx).max(1);
+        let cn_rows = (chroma_height / chroma_tx).max(1);
+        let luma_span_x = chroma_tx << ss_x(fctx);
+        let luma_span_y = chroma_tx << ss_y(fctx);
+        let (u_grid, v_grid, chroma_units) = if cn_rows == 1 && cn_cols == 1 {
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
@@ -17099,24 +17163,25 @@ fn decode_block(
         } else {
             let chroma_ctx_offset = Some(3);
             let mut u_pass: Vec<Grid> = Vec::new();
-            let mut units: Vec<((usize, usize), usize, Grid, Grid)> = Vec::new();
+            let mut units: Vec<((usize, usize), usize, usize, Grid, Grid)> = Vec::new();
             let mut last_grids = [Grid::Zero(0), Grid::Zero(0)];
             for plane_pass in 1..=2usize {
                 let mut pass_idx = 0usize;
-                for cu_row in 0..cn {
-                    for cu_col in 0..cn {
-                        let luma_span = chroma_tx << ss_x(fctx);
+                for cu_row in 0..cn_rows {
+                    for cu_col in 0..cn_cols {
                         let cu_mi = (
-                            mi_r + cu_row * (luma_span / MI),
-                            mi_c + cu_col * (luma_span / MI),
+                            mi_r + cu_row * (luma_span_y / MI),
+                            mi_c + cu_col * (luma_span_x / MI),
                         );
-                        let cu_around = neighbours.around_mi(cu_mi, luma_span);
-                        let cu_reach = tu_reach(
+                        let cu_around =
+                            neighbours.around_mi_rect(cu_mi, luma_span_x, luma_span_y);
+                        let cu_reach = tu_reach_rect(
                             side,
                             side,
-                            cu_col * luma_span,
-                            cu_row * luma_span,
-                            luma_span,
+                            cu_col * luma_span_x,
+                            cu_row * luma_span_y,
+                            luma_span_x,
+                            luma_span_y,
                             reach,
                             px,
                             py,
@@ -17146,16 +17211,21 @@ fn decode_block(
                             None, chroma_ctx_offset, smooth_neighbor_uv, fctx,
                         )?;
                         hit!(CHROMA_SPLIT_TX_HITS);
+                        if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                            hit!(CHROMA422_SQUARE_HITS);
+                        }
                         // Immediately, so the next unit of this block reads this
                         // one's coefficient context. `record` below stamps one
                         // chroma state across the whole block; the replay after
                         // it puts the per-unit state back.
-                        neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, plane_pass, &cu_grid);
+                        neighbours.record_mi_chroma(
+                            cu_mi, luma_span_x, luma_span_y, plane_pass, &cu_grid,
+                        );
                         if plane_pass == 1 {
                             u_pass.push(cu_grid);
                         } else {
                             let u_grid = std::mem::replace(&mut u_pass[pass_idx], Grid::Zero(0));
-                            units.push((cu_mi, luma_span, u_grid.clone(), cu_grid.clone()));
+                            units.push((cu_mi, luma_span_x, luma_span_y, u_grid.clone(), cu_grid.clone()));
                             last_grids = [u_grid, cu_grid];
                         }
                         pass_idx += 1;
@@ -17166,9 +17236,9 @@ fn decode_block(
         };
         fctx.intrabc_chroma_tx.with(|c| c.set(None));
         neighbours.record(at, side, mode, uv_predict_mode, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
-        for (cu_mi, luma_span, u_unit, v_unit) in &chroma_units {
-            neighbours.record_mi_chroma(*cu_mi, *luma_span, *luma_span, 1, u_unit);
-            neighbours.record_mi_chroma(*cu_mi, *luma_span, *luma_span, 2, v_unit);
+        for (cu_mi, sw, sh, u_unit, v_unit) in &chroma_units {
+            neighbours.record_mi_chroma(*cu_mi, *sw, *sh, 1, u_unit);
+            neighbours.record_mi_chroma(*cu_mi, *sw, *sh, 2, v_unit);
         }
     } else {
         // Several luma transform units, raster order (spec
@@ -17178,7 +17248,10 @@ fn decode_block(
         // the earlier tiles in this same block already wrote -- the same
         // per-TU pattern [`decode_leaf8`] already runs for an 8x8 leaf.
         let n_axis = side / logical_tx;
-        let cn = (chroma_side / chroma_tx).max(1);
+        let cn_cols = (chroma_side / chroma_tx).max(1);
+        let cn_rows = (chroma_height / chroma_tx).max(1);
+        let luma_span_x = chroma_tx << ss_x(fctx);
+        let luma_span_y = chroma_tx << ss_y(fctx);
         // libaom's transform-block loop is over 64x64 luma "mu" chunks
         // (`decode_token_recon_block`: `mu_blocks_wide/high` =
         // `mi_size_wide[BLOCK_64X64]`), and it codes EVERY PLANE of a chunk
@@ -17190,9 +17263,10 @@ fn decode_block(
         let nchunk = (side / 64).max(1);
         // `cn > 1` means the uv plane block is larger than the uv transform,
         // which moves libaom's chroma `txb_skip_ctx` offset from 7 to 10.
-        let chroma_ctx_offset = if cn > 1 { Some(3) } else { None };
+        let chroma_ctx_offset = if cn_rows * cn_cols > 1 { Some(3) } else { None };
         let tpc = (n_axis / nchunk).max(1);
-        let cpc = (cn / nchunk).max(1);
+        let cpc_rows = (cn_rows / nchunk).max(1);
+        let cpc_cols = (cn_cols / nchunk).max(1);
         // The block's luma transform units, raster order inside each mu
         // chunk. lane-av1-ibcvtx: an intrabc block's units are the var-tx
         // tree's own leaf list -- mixed sizes included, exactly what libaom's
@@ -17218,7 +17292,7 @@ fn decode_block(
             }
         }
         let mut last_grids = [Grid::Zero(0), Grid::Zero(0)];
-        let mut units: Vec<((usize, usize), usize, Grid, Grid)> = Vec::new();
+        let mut units: Vec<((usize, usize), usize, usize, Grid, Grid)> = Vec::new();
         for ch_row in 0..nchunk {
         for ch_col in 0..nchunk {
         // lane-av1-ibcvtx: the chunk's chroma units inherit the CHROMA tx
@@ -17352,8 +17426,8 @@ fn decode_block(
         let mut u_pass: Vec<Grid> = Vec::new();
         for plane_pass in 1..=2usize {
         let mut pass_idx = 0usize;
-        for cu_row in ch_row * cpc..(ch_row + 1) * cpc {
-            for cu_col in ch_col * cpc..(ch_col + 1) * cpc {
+        for cu_row in ch_row * cpc_rows..(ch_row + 1) * cpc_rows {
+            for cu_col in ch_col * cpc_cols..(ch_col + 1) * cpc_cols {
                 // libaom `decode_reconstruct_tx`'s frame-edge clip
                 // (decodeframe.c:299, `blk_row >= max_blocks_high || blk_col
                 // >= max_blocks_wide` returns before ANY symbol is read): a
@@ -17384,20 +17458,21 @@ fn decode_block(
                     continue;
                 }
                 // The chroma context arrays are indexed in LUMA mi, so this
-                // unit's anchor is its own luma quadrant: `chroma_tx` chroma
-                // pixels span `2 * chroma_tx` luma ones.
-                let luma_span = chroma_tx << ss_x(fctx);
+                // unit's anchor is its own luma quadrant (lane-av1-422b: the
+                // quadrant spans `chroma_tx << ss_x` luma px wide by
+                // `chroma_tx << ss_y` tall -- at 4:2:2 a rect twice as wide
+                // as it is tall).
                 let cu_mi = (
-                    mi_r + cu_row * (luma_span / MI),
-                    mi_c + cu_col * (luma_span / MI),
+                    mi_r + cu_row * (luma_span_y / MI),
+                    mi_c + cu_col * (luma_span_x / MI),
                 );
-                let cu_around = neighbours.around_mi(cu_mi, luma_span);
-                let cu_reach = if cn == 1 {
+                let cu_around = neighbours.around_mi_rect(cu_mi, luma_span_x, luma_span_y);
+                let cu_reach = if cn_rows == 1 && cn_cols == 1 {
                     reach
                 } else {
-                    tu_reach(
+                    tu_reach_rect(
                         side, side,
-                        cu_col * luma_span, cu_row * luma_span, luma_span,
+                        cu_col * luma_span_x, cu_row * luma_span_y, luma_span_x, luma_span_y,
                         reach, px, py, y.width, y.height, fctx,
                     )
                 };
@@ -17423,22 +17498,27 @@ fn decode_block(
                     }),
                     None, chroma_ctx_offset, smooth_neighbor_uv, fctx,
                 )?;
-                if cn > 1 {
+                if cn_rows * cn_cols > 1 {
                     hit!(CHROMA_SPLIT_TX_HITS);
+                    if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                        hit!(CHROMA422_SQUARE_HITS);
+                    }
                     // Immediately, so the NEXT unit of this same block reads
                     // this one's coefficient context (libaom's chroma
                     // `txb_skip_ctx` for the second quadrant is 11, i.e. base
                     // 1 from this left neighbour -- measured against aomdec).
                     // The same writes are replayed after `record_split_luma`
                     // below, which would otherwise clobber them whole-block.
-                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, plane_pass, &cu_grid);
+                    neighbours.record_mi_chroma(
+                        cu_mi, luma_span_x, luma_span_y, plane_pass, &cu_grid,
+                    );
                 }
                 if plane_pass == 1 {
                     u_pass.push(cu_grid);
                 } else {
                     let u_grid = std::mem::replace(&mut u_pass[pass_idx], Grid::Zero(0));
-                    if cn > 1 {
-                        units.push((cu_mi, luma_span, u_grid.clone(), cu_grid.clone()));
+                    if cn_rows * cn_cols > 1 {
+                        units.push((cu_mi, luma_span_x, luma_span_y, u_grid.clone(), cu_grid.clone()));
                     }
                     last_grids = [u_grid, cu_grid];
                 }
@@ -17455,9 +17535,9 @@ fn decode_block(
         // context write; at `cn > 1` the per-unit writes above are what the
         // next block reads, so they run after this (last writer wins).
         neighbours.record_split_luma(at, side, mode, uv_predict_mode, [&last_grids[0], &last_grids[1]]);
-        for (cu_mi, luma_span, u_grid, v_grid) in &units {
-            neighbours.record_mi_chroma(*cu_mi, *luma_span, *luma_span, 1, u_grid);
-            neighbours.record_mi_chroma(*cu_mi, *luma_span, *luma_span, 2, v_grid);
+        for (cu_mi, sw, sh, u_grid, v_grid) in &units {
+            neighbours.record_mi_chroma(*cu_mi, *sw, *sh, 1, u_grid);
+            neighbours.record_mi_chroma(*cu_mi, *sw, *sh, 2, v_grid);
         }
     }
     // Unconditional, `size == 0` for a non-palette block: clears any stale
@@ -26319,7 +26399,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             // mirroring [`crate::tile::sb_coeff_key_frame_tile`]'s own
             // three-way write exactly.
             let part = if has_cols && has_rows {
+                if crate::envflags::env_flag!("EC_TRACE") {
+                    eprintln!("EC_PART mi_row={} mi_col={} bsize=12 ctx={} tell={} rng={}", sb_r * SB_MI, sb_c * SB_MI, ctx, dec.debug_bitpos(), dec.debug_state().0);
+                }
                 let p = dec.symbol(&mut cdfs.partition_w64[ctx]);
+                if crate::envflags::env_flag!("EC_TRACE") {
+                    eprintln!("EC_PART_VAL mi_row={} mi_col={} bsize=12 value={}", sb_r * SB_MI, sb_c * SB_MI, p);
+                }
                 if crate::envflags::env_flag!("EC_AV1_TRACE") {
                     eprintln!("TRACE partition_w64 ctx={ctx} value={p}");
                 }
@@ -26396,7 +26482,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                             has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                         );
                         let part32 = if has_cols32 && has_rows32 {
+                            if crate::envflags::env_flag!("EC_TRACE") {
+                                eprintln!("EC_PART mi_row={} mi_col={} bsize=9 ctx={} tell={} rng={}", r32 * BLOCK_MI, c32 * BLOCK_MI, ctx32, dec.debug_bitpos(), dec.debug_state().0);
+                            }
                             let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
+                            if crate::envflags::env_flag!("EC_TRACE") {
+                                eprintln!("EC_PART_VAL mi_row={} mi_col={} bsize=9 value={}", r32 * BLOCK_MI, c32 * BLOCK_MI, p);
+                            }
                             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                 let (rng, _) = dec.debug_state();
                                 eprintln!(
@@ -26482,7 +26574,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     let at16 = (sr, sc);
                                     let ctx16 = neighbours.partition_ctx(at16, SUB);
                                     if has_cols16 && has_rows16 {
+                                        if crate::envflags::env_flag!("EC_TRACE") {
+                                            eprintln!("EC_PART mi_row={} mi_col={} bsize=6 ctx={} tell={} rng={}", at16.0, at16.1, ctx16, dec.debug_bitpos(), dec.debug_state().0);
+                                        }
                                         let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                        if crate::envflags::env_flag!("EC_TRACE") {
+                                            eprintln!("EC_PART_VAL mi_row={} mi_col={} bsize=6 value={}", at16.0, at16.1, part16);
+                                        }
                                         if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                             eprintln!(
                                                 "TRACE partition_w16 mi=({},{}) ctx={ctx16} value={part16}",
@@ -26806,8 +26904,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 }
                                             }
                                             let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                            if crate::envflags::env_flag!("EC_TRACE") {
+                                                eprintln!("EC_PART mi_row={} mi_col={} bsize=3 ctx={} tell={} rng={}", leaf_mi.0, leaf_mi.1, leaf_ctx, dec.debug_bitpos(), dec.debug_state().0);
+                                            }
                                             let part8 =
                                                 dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                            if crate::envflags::env_flag!("EC_TRACE") {
+                                                eprintln!("EC_PART_VAL mi_row={} mi_col={} bsize=3 value={}", leaf_mi.0, leaf_mi.1, part8);
+                                            }
                                             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                                 eprintln!(
                                                     "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
