@@ -19919,12 +19919,43 @@ fn sub8_leaf_chroma422(
     scan4: &[u16],
     base_q_idx: u8,
     smooth_neighbor_uv: bool,
+    // The owning luma leaf's own shape (`(4, 4)` for a split leaf, `(8, 4)` /
+    // `(4, 8)` for a rect pair's strip): libaom's `has_top_right` /
+    // `has_bottom_left` answer for this chroma TX_4X4 unit comes from the
+    // LEAF's own rect table row at the leaf's mi (`bsize` is the leaf, the
+    // unit covers it whole), never the standalone square-4x4 table the old
+    // `Reach::of(4, ..)` lookup used -- that said 1 where `has_tr_8x4` says 0
+    // at mi(27,44) (the oracle's own EC_PRED prints `n_tr=0` there), so the
+    // D45 unit read undecoded pixels to its upper right.
+    leaf_shape: (usize, usize),
     fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, Grid)> {
     let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
-    neighbours.record_uv_mode_mi(lmi.0, lmi.1, 1, 1, uv_predict_mode);
+    // lane-av1-422kf2: libaom writes one MB_MODE_INFO per mi cell the LEAF
+    // covers, and `chroma_left_mbmi`/`chroma_above_mbmi` read whichever of
+    // those cells the next block's snap lands on -- an 8x4 strip's SM_V
+    // uv_mode must therefore be visible at BOTH of its mi columns, or the
+    // block to its right (mi (30,50): left neighbour cell (30,49)) missed the
+    // smooth neighbour and skipped libaom's strength-1 intra edge filter
+    // (class context-read-from-one-cell, the 4:2:2 sub-8 twin of the
+    // lane-kf900 snap fix).
+    neighbours.record_uv_mode_mi(
+        lmi.0,
+        lmi.1,
+        (leaf_shape.0 / MI).max(1),
+        (leaf_shape.1 / MI).max(1),
+        uv_predict_mode,
+    );
     let (px, py) = (lmi.1 * MI, lmi.0 * MI);
-    let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));
+    // lane-av1-422kf2: the unit's WRITE/PREDICTION anchor is the same floored
+    // chroma cell as the entropy anchor below -- libaom positions the sub-8
+    // chroma plane block at `av1_setup_dst_planes`' mi-exact floor
+    // (`(mi_col & !1) * MI >> ss_x`), NOT at the odd leaf's own chroma x:
+    // the oracle's mi(18,55) TX_4X4 unit reconstructed chroma px 108..111
+    // (a pure V-copy of the row above at 108..111), while the leaf's own
+    // chroma x is 110 -- anchoring there left px 108..109 unwritten (zeros)
+    // and stepped px 112..113 with the unit's right columns.
+    let (cpx, cpy) = (((lmi.1 & !1) * MI) >> ss_x(fctx), py >> ss_y(fctx));
     // lane-av1-422h: the entropy-context anchor is the unit's FLOOR chroma
     // cell (`pd->above_entropy_context + (mi_col >> ss_x)`): an ODD-column
     // leaf's 4-px unit starts at a chroma px that is NOT cell aligned, and
@@ -19935,9 +19966,17 @@ fn sub8_leaf_chroma422(
     // overwrites exactly the cell the first one wrote, as libaom's
     // `av1_set_entropy_contexts` per-TU writes do.
     let ctx_mi = (lmi.0, lmi.1 & !1);
-    // The square unit takes the leaf's own `Reach::of` (its luma's), the way
-    // [`decode_leaf8`]'s 422 arm passes the enclosing block's luma reach.
-    let reach = Reach::of(4, px, py, y.width, y.height, fctx);
+    // lane-av1-422kf2: the square unit takes the leaf's OWN reach: a split
+    // leaf is a standalone BLOCK_4X4 (square table), a rect pair's strip is
+    // `of_rect` on the strip's true (8x4 / 4x8) shape -- libaom passes the
+    // LEAF's bsize to `has_top_right`/`has_bottom_left`, so a rect strip's
+    // answer comes from `has_tr_8x4`/`has_tr_4x8` at the strip's mi, not
+    // from a 4x4-block lookup.
+    let reach = if leaf_shape == (4, 4) {
+        Reach::of(4, px, py, y.width, y.height, fctx)
+    } else {
+        Reach::of_rect(leaf_shape.0, leaf_shape.1, px, py, y.width, y.height, fctx)
+    };
     let chroma_around = neighbours.around_mi_422_chroma(ctx_mi, 8, 4);
     let ac = alpha.map(|_| cfl_src_rect(px, py, 8, 4));
     let grids: (Grid, Grid) = if skip {
@@ -20206,7 +20245,8 @@ fn decode_leaf_split4(
                     sub8_leaf_chroma422(
                         dec, cdfs, neighbours, lmi, DC_PRED, 0, None, skip,
                         Some(dv), y, u, v, scan4, base_q_idx,
-                        neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
+                        neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx),
+                        (4, 4), fctx,
                     )?;
                     last_uv422 = DC_PRED;
                 } else {
@@ -20280,7 +20320,8 @@ fn decode_leaf_split4(
                 sub8_leaf_chroma422(
                     dec, cdfs, neighbours, lmi, uv_mode, angle_delta_uv, alpha, skip,
                     None, y, u, v, scan4, base_q_idx,
-                    neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
+                    neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx),
+                    (4, 4), fctx,
                 )?;
                 last_uv422 = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
             } else {
@@ -20744,7 +20785,8 @@ fn decode_leaf_rect8(
                     sub8_leaf_chroma422(
                         dec, cdfs, neighbours, lmi, DC_PRED, 0, None, skip,
                         Some(dv), y, u, v, scan4, base_q_idx,
-                        neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
+                        neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx),
+                        (bw, bh), fctx,
                     )?;
                     last_uv422 = DC_PRED;
                 } else {
@@ -20912,7 +20954,8 @@ fn decode_leaf_rect8(
                     sub8_leaf_chroma422(
                         dec, cdfs, neighbours, lmi, uv_mode, angle_delta_uv, alpha,
                         skip, None, y, u, v, scan4, base_q_idx,
-                        neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
+                        neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx),
+                        (bw, bh), fctx,
                     )?;
                     last_uv422 = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
                 } else {
@@ -21015,7 +21058,8 @@ fn decode_leaf_rect8(
                 sub8_leaf_chroma422(
                     dec, cdfs, neighbours, lmi, uv_mode, angle_delta_uv, alpha,
                     skip, None, y, u, v, scan4, base_q_idx,
-                    neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx), fctx,
+                    neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c, fctx),
+                    (bw, bh), fctx,
                 )?;
                 last_uv422 = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
             } else {
