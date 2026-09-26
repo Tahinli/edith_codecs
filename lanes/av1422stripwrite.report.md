@@ -142,12 +142,25 @@ REVERTED).
   verbatim — the only thing between them is the inserted 4:2:2 test, which
   can only fire on a count a 4:2:0 or 4:4:4 plane does not have.
   *Brute-forced:* against the producer's own `round_ss` crops
-  (`decode.rs:25806`) over every `w, h` in `1..=128`, all three formats
-  route correctly for **every `w >= 2 && h >= 2`**, every misread is
-  confined to `w == 1` or `h == 1` (where the counts genuinely coincide,
-  so no length test can separate them — not reachable by a decodable
-  frame), and **zero** 4:2:0 shapes differ from what the old two-way test
-  produced.
+  (`decode.rs:25806`) over every `w, h` in `1..=128`, the 4:4:4 and 4:2:2
+  counts are distinct from each other and from the 4:2:0 count and both
+  route correctly for **every `w >= 2 && h >= 2`**; nothing a decodable
+  frame produces falls outside that (the pinned fixture's chroma is
+  128x144).
+  *4:2:0 at odd dimensions — an open, pre-existing gap, not a clean bill.*
+  The floor arm is byte-identical to the parent, but it is the wrong shape
+  for an odd-dimension 4:2:0 reference: the producer stored
+  `round_ss(w, 1) x round_ss(h, 1)`, so the floor under-declares. Over the
+  `1..=128` square that is 12160 of the 16256 pairs with `w >= 2` (12288 of
+  all 16384; the extra 128 are the `w == 1` column, where the arm declares
+  a 0-wide plane), and it differs from the parent's floor at `h == 1` for
+  the 127 pairs with `w >= 2` — there only by *correcting* the parent,
+  which claimed zero rows. At `w == 1` and `h >= 2` the 4:2:0 count
+  collides with neither other count, so the length test puts it in the
+  right arm; the floor fallback simply cannot express
+  `(1, round_ss(h, 1))`. A ceil fallback would close the whole gap, at
+  the cost of departing from the parent on every odd-dimension 4:2:0
+  shape with no in-tree coverage to justify it. Recorded, not taken.
   *Gated:* `cargo test -p ec-av1 --lib -- lossless decodes_sample_exact
   444 reference_chroma` in its own target dir
   `~/.cache/cargo-target-av1422stripwrite-gate` — see below for what that
