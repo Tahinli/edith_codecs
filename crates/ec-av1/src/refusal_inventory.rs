@@ -42,6 +42,10 @@ const REFUSALS: &[&str] = &[
     // strings never landed here (continuation 8's suite run caught the
     // drift); both are decoder-side "no table for that shape yet" guards on
     // 4:4:4 rect strips, same family as the rect luma/chroma entries below.
+    // lane-av1-refusalaudit: the 64-axis one is PROVEN unreachable -- its
+    // chroma-unit table covers every conformant strip unit in both supported
+    // chroma formats (enumeration in PROVEN; the witness2 hunt reached
+    // nothing). The chroma-size one below is still live.
     "a 64-axis strip whose chroma unit has no coefficient table",
     "a rectangular chroma transform whose size has no coefficient table",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
@@ -271,6 +275,15 @@ const PROVEN: &[(&str, &str)] = &[
     // `(side, write_w, write_h)` triples `INTER_BLOCK_SHAPES` lists, and
     // `rect_inter_residual_supported` covers every rectangular one -- the only
     // footprints `reject_residual` is set for.
+    // lane-av1-witness2 (8 more inter encodes: banded and busy content,
+    // --max-partition-size=32, a single-ref arm, cq 20..45, cpu-used 0..1):
+    // no refusal -- every rect strip the encoder produced sat inside the
+    // supported set. Static half, from the same hunt: the supported list plus
+    // the partition walker's piece set (SB pieces 64x32/32x64/64x16/16x64,
+    // the 32- and 16-level rect/1:4/AB twins, 128 halves tiled as two
+    // TX_64X64) enumerate every rect footprint AV1 partitioning can present;
+    // 1:4 stops at 64 because the 128 root has no 1:4 symbol. No conformant
+    // stream can name an unsupported footprint.
     (
         "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
         "a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable",
@@ -294,6 +307,12 @@ const PROVEN: &[(&str, &str)] = &[
     // lane-t900 r20, census: the rect transform tables and scans, enumerated
     // over the shapes the measured block-shape domain hands each helper (block
     // footprint, 4:2:0 chroma unit, rect var-tx leaf, clamped coded corner).
+    // lane-av1-witness2 (8 inter encodes, --enable-tx-size-search=1, rect+1:4
+    // on, --min-partition-size=4, 4:2:0 and 4:4:4, sb 64/128, cq 10..45,
+    // cpu-used 0..2): no refusal while the domain was genuinely exercised --
+    // whole-block 32x8 inter TUs and sub-8 rect pieces decoded. The fourteen
+    // rect shapes the enumeration covers are the whole alphabet, so the `_`
+    // arm has no conformant input.
     (
         "a rectangular inter luma transform unit whose shape has no coefficient table set here",
         "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
@@ -478,6 +497,13 @@ const PROVEN: &[(&str, &str)] = &[
     // `segment_id` symbols, and nothing else; the map-inheritance defect that
     // census surfaced (verbatim copy, decodemv.c:342) is fixed and witnessed
     // by `a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_    // pixel_exact`.
+    // lane-av1-witness2 re-confirmed the census on the current aomenc build:
+    // it has no --enable-segmentation flag at all (aq-mode is the only
+    // segmentation driver; aq-mode 4 is out of range for the build), and 8
+    // aq-mode recipes (1/2/3, + --delta-lf-mode=1, 4:4:4, banded content)
+    // wrote SEG_LVL_ALT_Q tables and segment_id symbols where segmentation
+    // engaged, decoded clean, and never coded one of the three
+    // mode-overriding features.
     (
         "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
         "a_frame_whose_segmentation_overrides_a_block_mode_is_refused_by_name",
@@ -513,6 +539,19 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
         "every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table",
+    ),
+    // lane-av1-refusalaudit, enumeration + witness2 hunt: decode_block_rect64's
+    // chroma-unit table covers every conformant 64-axis strip unit in both
+    // supported chroma formats -- at 4:4:4 the strips 64x32/32x64/64x16/16x64
+    // tile to (32,32)/(32,16)/(16,32); at 4:2:0 the halved footprints land on
+    // (32,16)/(16,32)/(32,8)/(8,32). A 128-root half is
+    // `decode_block_128rect`'s, and the 128 root has no 1:4 arm. The hunt (8
+    // real aomenc key-frame encodes: screen+intrabc, rect+1:4, sb 64 and 128,
+    // cq 10..63, cpu-used 0..2) never reached the arm; the three streams that
+    // decode to completion never enter decode_block_rect64 at all.
+    (
+        "a 64-axis strip whose chroma unit has no coefficient table",
+        "every_chroma_unit_a_64_axis_strip_can_present_has_a_coefficient_table",
     ),
     // lane-t900 r33, enumeration: each of the four symbols this guard tests is
     // read under a size gate that no 128-pixel side passes (the call site's
@@ -1469,6 +1508,162 @@ mod tests {
         assert_eq!(
             checked, 40,
             "the strip domain is not the ten rect shapes x four depths"
+        );
+    }
+
+    /// lane-av1-refusalaudit, ENUMERATION for "a 64-axis strip whose chroma
+    /// unit has no coefficient table" -- [`decode_block_rect64`]'s `_` arm,
+    /// reached only for depth-0, non-skip, non-lossless superblock-level
+    /// HORZ/VERT/1:4 strips.
+    ///
+    /// The unit is the strip's chroma shape capped at 32 per axis
+    /// (`(chroma_w.min(32), chroma_h.min(32))`), so the enumeration walks the
+    /// strip domain -- the 64-axis 2:1 and 1:4 footprints, the only shapes the
+    /// two callers (`read_sb128_root`, `decode_intra_rect_in_inter`) hand the
+    /// function -- through both supported chroma formats (4:4:4 and 4:2:0;
+    /// every mixed format is refused at the sequence header) against the
+    /// `match` arms read out of decode.rs itself (class
+    /// `table-and-reader-move-together`).
+    ///
+    /// lane-av1-witness2 hunted the shape with 8 real aomenc key-frame encodes
+    /// (screen+intrabc, rect+1:4, sb 64 and 128, cq 10..63, cpu-used 0..2):
+    /// no recipe reached the arm, and the three streams that decode to
+    /// completion never enter `decode_block_rect64` at all.
+    #[test]
+    fn every_chroma_unit_a_64_axis_strip_can_present_has_a_coefficient_table() {
+        let src = include_str!("decode.rs");
+
+        // (1) The caller set. Each call's enclosing function is the last
+        // top-level `fn` before it.
+        let fn_starts: Vec<(usize, String)> = src
+            .match_indices("\nfn ")
+            .map(|(i, _)| {
+                let rest = &src[i + 4..];
+                let name = rest[..rest.find('(').unwrap_or(0)].to_string();
+                (i, name)
+            })
+            .collect();
+        let mut callers: BTreeSet<String> = BTreeSet::new();
+        for (at, _) in src.match_indices("decode_block_rect64(") {
+            let enclosing = fn_starts
+                .iter()
+                .filter(|(i, _)| *i < at)
+                .next_back()
+                .expect("a decode_block_rect64 call outside any function");
+            if enclosing.1 != "decode_block_rect64" {
+                callers.insert(enclosing.1.clone());
+            }
+        }
+        let expected: BTreeSet<String> = ["decode_intra_rect_in_inter", "read_sb128_root"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            callers, expected,
+            "the set of functions that call decode_block_rect64 changed -- re-derive the \
+             strip domain below from the new caller (a 128-sided or sub-8 caller makes the \
+             refusal live)"
+        );
+
+        // (2) The unit derivation, asserted against its own source before it
+        // is applied: chroma shape = the strip halved by the plane's
+        // subsampling; unit = each axis capped at 32.
+        let body_at = src
+            .find("fn decode_block_rect64(")
+            .expect("decode_block_rect64 is gone");
+        let rest = &src[body_at..];
+        let body = &rest[..rest.find("\nfn ").expect("unterminated fn")];
+        assert!(
+            body.contains("(bw >> ss_x(fctx), bh >> ss_y(fctx))"),
+            "decode_block_rect64's chroma shape is no longer the strip halved by the \
+             plane's subsampling -- re-derive this enumeration"
+        );
+        const CAP: &str = "let (uw, uh) = (chroma_w.min(32), chroma_h.min(32));";
+        assert_eq!(
+            src.matches(CAP).count(),
+            1,
+            "the 32-per-axis chroma unit cap is no longer spelled the way this enumeration \
+             mirrors it"
+        );
+
+        // (3) The table, read out of the match that follows the cap.
+        let from = body.find(CAP).expect("cap is outside decode_block_rect64");
+        let to = body
+            .find("a 64-axis strip whose chroma unit has no coefficient table")
+            .expect("the refusal string is gone from decode_block_rect64");
+        let table = &body[from..to];
+        let mut arms: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let bytes = table.as_bytes();
+        for (i, _) in table.match_indices('(') {
+            let mut j = i + 1;
+            let mut w = 0usize;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                w = w * 10 + usize::from(bytes[j] - b'0');
+                j += 1;
+            }
+            if j == i + 1 || !table[j..].starts_with(", ") {
+                continue;
+            }
+            j += 2;
+            let mut h = 0usize;
+            let start_h = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                h = h * 10 + usize::from(bytes[j] - b'0');
+                j += 1;
+            }
+            if j == start_h || !table[j..].starts_with(") =>") {
+                continue;
+            }
+            // Only an arm HEAD counts, never a `(32, 8)` inside prose.
+            arms.insert((w, h));
+        }
+        let handled: BTreeSet<(usize, usize)> = [(32, 32), (32, 16), (16, 32), (32, 8), (8, 32)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            arms, handled,
+            "decode_block_rect64's chroma-unit table changed -- re-derive the enumeration \
+             (a unit outside these five arms makes the refusal live for some strip)"
+        );
+
+        // (4) The enumeration: every 64-axis 2:1 and 1:4 strip (the shapes
+        // superblock partitioning presents at the 64 level) x every supported
+        // chroma format lands on a handled arm.
+        let mut checked = 0u32;
+        let mut hit: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for wl in 4..=6u32 {
+            for hl in 4..=6u32 {
+                let (bw, bh) = (1usize << wl, 1usize << hl);
+                if bw.max(bh) != 64 {
+                    continue;
+                }
+                let ratio = bw.max(bh) / bw.min(bh);
+                if ratio != 2 && ratio != 4 {
+                    continue;
+                }
+                // (ss_x, ss_y): (0, 0) is 4:4:4, (1, 1) is 4:2:0. The mixed
+                // formats are refused by name at the sequence header.
+                for (ss_x, ss_y) in [(0usize, 0usize), (1, 1)] {
+                    let (chroma_w, chroma_h) = (bw >> ss_x, bh >> ss_y);
+                    let unit = (chroma_w.min(32), chroma_h.min(32));
+                    assert!(
+                        arms.contains(&unit),
+                        "a {bw}x{bh} strip at subsampling ({ss_x},{ss_y}) resolves to the \
+                         chroma unit {unit:?}, which has no coefficient table -- the \
+                         refusal is LIVE for a conformant stream"
+                    );
+                    hit.insert(unit);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            checked, 8,
+            "the strip domain is not the four 64-axis strips x two supported formats"
+        );
+        assert_eq!(
+            hit, handled,
+            "the enumeration stopped exercising every arm -- the proof went vacuous"
         );
     }
 
