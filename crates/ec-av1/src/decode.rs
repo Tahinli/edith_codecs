@@ -30322,15 +30322,13 @@ impl<'p> RefPix<'p> {
                 (
                     whole_plane(&g.y, g.width, g.height),
                     {
-                        // Reference pictures carry no subsampling field. A
-                        // 4:4:4 chroma plane is luma-sized; 4:2:0 is the quarter.
-                        let full = g.u.len() == g.width * g.height;
-                        let (cw, ch) = if full { (g.width, g.height) } else { (g.width / 2, g.height / 2) };
+                        // No subsampling field on a stored reference: the
+                        // chroma format comes off its own sample count.
+                        let (cw, ch) = ref_chroma_shape(g.u.len(), g.width, g.height);
                         whole_plane(&g.u, cw, ch)
                     },
                     {
-                        let full = g.v.len() == g.width * g.height;
-                        let (cw, ch) = if full { (g.width, g.height) } else { (g.width / 2, g.height / 2) };
+                        let (cw, ch) = ref_chroma_shape(g.v.len(), g.width, g.height);
                         whole_plane(&g.v, cw, ch)
                     },
                 )
@@ -30394,6 +30392,32 @@ fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+    }
+}
+
+/// A reference picture's own chroma plane shape, `(width, height)`, from its
+/// luma size and its chroma sample count. A stored reference carries no
+/// subsampling field, but the count is exact and unambiguous:
+/// `w * h` is 4:4:4, `(w / 2) * h` is 4:2:2, `(w / 2) * (h / 2)` is 4:2:0.
+///
+/// The two-way test this replaces ("luma-sized, else a quarter") folded 4:2:2
+/// into the 4:2:0 shape, so a 4:2:2 reference plane claimed `h / 2` rows --
+/// half the samples it actually holds. Every chroma MC reading such a plane
+/// then had its source row clamped against `true_height` (spec 7.11.3.4 /
+/// libaom's `dec_calc_subpel_params_and_extend` clamps to the reference's
+/// valid area), which folded every chroma row at or past the frame's
+/// midpoint back onto the last valid row: on the pinned t422 fixture
+/// frame 1, the 8x4 inter strip at luma (88, 208) MC-predicted chroma
+/// (88, 104) from frame 0 with mv 0 and a pure copy, yet wrote
+/// (206, 204, 202, 200) x4 rows where the reference holds
+/// (202, 204, 204, 167) / (185, 190, 190, 165) / ...
+fn ref_chroma_shape(len: usize, width: usize, height: usize) -> (usize, usize) {
+    if len == width * height {
+        (width, height)
+    } else if len == (width / 2) * height {
+        (width / 2, height)
+    } else {
+        (width / 2, height / 2)
     }
 }
 
