@@ -18566,18 +18566,17 @@ fn decode_block_128rect(
     let mi_rows = 2 * y.true_height.div_ceil(8);
     let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(mi_c));
     let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(mi_r));
-    // Non-lossless: per mu chunk, the chroma units per axis are
-    // ((64 >> ss_x) / chroma_tx, (64 >> ss_y) / chroma_tx) -- one 32x32 unit
-    // per chunk at 4:2:0, TWO stacked on the tall axis at 4:2:2 (the chunk's
-    // chroma plane block is 32x64), four at 4:4:4. The old square-cut assert
-    // demanded one unit per chunk on BOTH axes, which no 4:2:2 stream can
-    // satisfy (lane-av1-422bigblock: the s2.obu witness).
-    let chunk_cw = (64usize) >> ss_x(fctx);
-    let chunk_ch = (64usize) >> ss_y(fctx);
+    // Non-lossless: per mu chunk, `(64 >> ss) / chroma_tx` chroma units per
+    // axis -- one 32x32 at 4:2:0, two stacked on the tall axis at 4:2:2
+    // (lane-av1-422bigblock: the chunk's chroma plane block is 32x64 there),
+    // four at 4:4:4 (lane-av1-444sb's own finding on this same walk).
     debug_assert!(
         lossless_frame
-            || (nch_x * (chunk_cw / chroma_tx), nch_y * (chunk_ch / chroma_tx))
-                == (chroma_w / chroma_tx, chroma_h / chroma_tx)
+            || (chroma_w / chroma_tx, chroma_h / chroma_tx)
+                == (
+                    nch_x * ((64 >> ss_x(fctx)) / chroma_tx),
+                    nch_y * ((64 >> ss_y(fctx)) / chroma_tx)
+                )
     );
     let tpc = 64 / logical_tx;
     let zero_tu = vec![0i32; logical_tx * logical_tx];
@@ -18657,12 +18656,15 @@ fn decode_block_128rect(
                     neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
                 }
             }
-            // Transform units per axis inside this mu chunk's chroma span
-            // -- (64 >> ss_x) x (64 >> ss_y): one 32x32 unit at 4:2:0, TWO
-            // stacked TX_32X32 at 4:2:2, four at 4:4:4; 8x8 TX_4X4 units
-            // when lossless.
-            let cn_w = (chunk_cw / chroma_tx).max(1);
-            let cn_h = (chunk_ch / chroma_tx).max(1);
+            // Transform units per axis inside this mu chunk's chroma span:
+            // a 64x64 luma chunk covers `64 >> ss` chroma pixels per axis,
+            // so it holds `(64 >> ss) / chroma_tx` units -- one 32x32 at
+            // 4:2:0, four at 4:4:4 (lane-av1-444sb), TWO STACKED TX_32X32 on
+            // the tall axis at 4:2:2 (lane-av1-422bigblock: the chunk's
+            // chroma plane block is 32x64 there, so the two axes' counts
+            // part ways -- 1 x 2); 8x8 TX_4X4 units when lossless.
+            let cn = ((64 >> ss_x(fctx)) / chroma_tx).max(1);
+            let cn_h = ((64 >> ss_y(fctx)) / chroma_tx).max(1);
             // libaom's per-chunk `unit_width/height` (plane-mi units of the
             // luma mi grid): `min(mu_blocks + col, max_blocks) >> ss`.
             let unit_w = ((ch_col + 1) * 16).min(max_w_mi) >> ss_x(fctx);
@@ -18675,7 +18677,7 @@ fn decode_block_128rect(
             // frame's 4x4 chroma units are where it becomes observable.
             for plane_pass in 1..=2usize {
                 for ci_row in 0..cn_h {
-                    for ci_col in 0..cn_w {
+                    for ci_col in 0..cn {
                         // The clamp strides are the CHUNK's chroma mi extent
                         // per axis: 16 luma mi >> the axis's own ss.
                         if ch_col * (16 >> ss_x(fctx)) + ci_col * stepc >= unit_w
@@ -18683,8 +18685,8 @@ fn decode_block_128rect(
                         {
                             continue;
                         }
-                        let cu_x = cpx + ch_col * chunk_cw + ci_col * chroma_tx;
-                        let cu_y = cpy + ch_row * chunk_ch + ci_row * chroma_tx;
+                        let cu_x = cpx + ch_col * (64 >> ss_x(fctx)) + ci_col * chroma_tx;
+                        let cu_y = cpy + ch_row * (64 >> ss_y(fctx)) + ci_row * chroma_tx;
                         let cu_mi = (
                             mi_r + ch_row * 16 + ci_row * ((chroma_tx << ss_y(fctx)) / 4),
                             mi_c + ch_col * 16 + ci_col * ((chroma_tx << ss_x(fctx)) / 4),

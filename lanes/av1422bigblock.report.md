@@ -95,8 +95,13 @@ PARTITION_NONE non-skip inter block carries all three causes; the oracle codes
    pixels were right (the crop is ss-aware) — only inter prediction off the
    slot was wrong, so the bottom mu-chunk row predicted from a clamped row-63
    edge (±1–2 diffs over chroma rows 64..127, 3.3–3.6k samples/plane). Fixed
-   with a three-way length inference (`w*h` / `halfw*h` / `halfw*halfh` —
-   pairwise distinct for every w,h ≥ 1).
+   with a three-way length inference (`w*h` / `halfw*h` / `halfw*halfh`,
+   `halfw = (w+1)/2`, `halfh = (h+1)/2` — the three lengths are pairwise
+   distinct for every w,h ≥ 1). DISCLOSED 4:2:0 edge: at ODD reference
+   dimensions the half-width uses ceil (`(w+1)/2`, matching the picture
+   crop's `round_ss`) where the old guess used floor (`w/2`) — ceil is the
+   correct stored-crop shape and the change is visible only at odd w/h, which
+   no committed fixture exercises.
 
 After the fixes: `422_sb128_3f.obu` and the full `b422_wit.obu` decode
 pixel-exact vs aomdec; every coefficient unit of every frame pairs
@@ -119,10 +124,19 @@ intra 128-rect twin of the square-cut walk:
 - `decode_block_128rect`'s chroma walk was chunk-square (`cn = 32/chroma_tx`,
   `cu_y = cpy + ch_row*32`, clamp strides 8/8) with a `debug_assert!` that no
   4:2:2 stream can satisfy. Fixed per-axis exactly like the inter walk
-  (`cn_w/cn_h`, per-axis chunk offsets and clamp strides, `tu_reach_rect`,
-  `around_mi_rect`, per-axis record spans). 420/444 degenerate to the old
-  values; 4:4:4's previously-broken (assert-caught) non-lossless 128-rect
-  chroma becomes correct as a side effect.
+  (`tu_reach_rect`, `around_mi_rect`, per-axis record spans), in the SAME
+  expression shape the already-reviewed 444 fix landed on lane-av1-444sb
+  (`349b3918`): `cn = ((64 >> ss_x)/chroma_tx).max(1)` for the width axis
+  plus the added `cn_h = ((64 >> ss_y)/chroma_tx).max(1)` for the height
+  axis, per-axis chunk offsets `(64 >> ss)` and clamp strides `(16 >> ss)` —
+  at ss(0,0) the code reduces line-for-line to `349b3918`'s form, so the
+  merge with that chain is a semantic union. DISCLOSED 4:4:4 behavior change:
+  the parent's walk was provably broken at ss(0,0) (one unit per chunk instead
+  of four; the stale assert caught it) and this rewrite, like `349b3918`,
+  codes the four units — NOT byte-identical to parent at 4:4:4, by design,
+  and pinned by `349b3918`'s own witness on the merged tree (see the identity
+  section). DISCLOSED 4:2:0 identity: at ss(1,1) every new expression reduces
+  to the old constant (32, offsets 32, strides 8, one unit).
 
 Result: s2.obu decodes all 16 frames, no panic (`OK: 16 frames decoded,
 256x144`). The crash the charter assigned is closed. **Deferred (named for its
@@ -142,8 +156,25 @@ unit 38, mi(12,24), TX_4X8, plane 2.
 - `a_real_aomenc_10bit_inter_sequence_decodes_pixel_exact` — green.
 - `a_real_aomenc_stream_with_two_tile_rows_decodes_through_decode_stream`
   (live aomenc, 420, inter, tiles) — green.
-- `a_lossless_sb128_rect_intra_block_decodes_sample_exact` (4:4:4 lossless
-  sb128) — green.
+- `a_lossless_sb128_rect_intra_block_decodes_sample_exact` — green. LABEL
+  CORRECTION (review finding 2): this stream is 4:2:0 (seq_profile 0 in the
+  fixture bytes), NOT 4:4:4 as this report first claimed; it is a 4:2:0
+  lossless sb128 gate and proves nothing about 4:4:4.
+- 4:4:4 evidence, done properly: `444_sb128rect_lr_witness.obu` (sha256
+  `27825e14…`, the lane-av1-444sb witness, 192x160 profile-1, 3 frames) was
+  decoded on THIS tree (`OK: 3 frames decoded`) and its output is
+  BYTE-IDENTICAL to the parent commit's output on the same stream — measured
+  by stash-and-rebuild, all three frames — so the rewrite is proven
+  output-neutral on it. The stream itself still diverges from aomdec on this
+  ancestry, identically before and after the fix: this branch predates the
+  444 chain's chroma-context fixes (`9e77c16b` ss-aware chroma-above skip,
+  `76f8c3fe`), the desync starts at frame-0 Y sample 128 (the first
+  128-column superblock) and the first 128-rect block never fires downstream
+  of it, so `decode_block_128rect` codes no samples on this stream on this
+  ancestry. `349b3918`'s own gate
+  (`a_444_sb128_root_rect_stream_with_restoration_decodes_pixel_exact`,
+  frames 0/1 byte-exact vs aomdec AND ffmpeg) is the merged-tree pin: at
+  ss(0,0) this lane's walk reduces verbatim to that reviewed form.
 - `a_128_root_block_with_a_real_residual_decodes_exact_through_both_decoders`
   and `a_128_root_compound_block_decodes_exact_through_both_decoders` (solo,
   they pin the process-global superblock size) — green.
