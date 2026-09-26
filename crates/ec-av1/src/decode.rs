@@ -2099,6 +2099,21 @@ pub fn chroma422_chunk_hits() -> usize {
     CHROMA422_CHUNK_HITS.with(|c| c.get())
 }
 
+// lane-av1-422stripanchor: how many 4-wide-strip PAIR chroma units
+// ([`decode_rect_split`]'s ported floored-pair anchor) decoded. A 4:2:0 or
+// 4:4:4 frame cannot increment it (the arm is keyed to a 2-px-wide chroma
+// block, which only a 1-mi-wide strip at ss (1, 0) produces), so a non-zero
+// read proves a stream routed a 4-wide strip through the split path.
+thread_local! {
+    static CHROMA422_PAIR_WIDE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CHROMA422_PAIR_WIDE_HITS`].
+pub fn chroma422_pair_wide_hits() -> usize {
+    CHROMA422_PAIR_WIDE_HITS.with(|c| c.get())
+}
+
 // How many HORZ/VERT intra strips actually predicted with filter intra
 // (lane-rectsplit r1) -- the case `decode_block_rect` refused by name
 // ("this decoder predicts square-only") until `predict_filter_intra` took
@@ -10168,6 +10183,35 @@ fn depth_to_tx_wh(
     (w, h)
 }
 
+/// lane-av1-422stripanchor: [`decode_rect_split`]'s 4-wide-strip port of the
+/// split4 floored-pair anchor ([`sub8_leaf_chroma422`]'s rule). A 1-mi-wide
+/// strip (luma `(4, 16)` / `(4, 8)`) has NO chroma plane block of its own at
+/// ss (1, 0) -- `av1_ss_size_lookup[BLOCK_4X16][1][0]` and
+/// `[BLOCK_4X8][1][0]` are both BLOCK_INVALID (`common_data.c`), and a
+/// 2-px-wide area is not a transform shape. The strip pairs with its
+/// even-column sibling (`is_chroma_reference`'s `mi_col & 1` column clause,
+/// the rule [`decode_rect4_16_strip`] implements one partition level up), and
+/// the ODD-column strip codes the PAIR's `(4, bh)` plane anchored at
+/// `av1_setup_dst_planes`' mi-exact floor `(mi_col & !1) * MI >> ss_x`, with
+/// the entropy context on the floored cell. Returns
+/// `(pair block width, pair block height, write anchor x, entropy mi column)`
+/// for that pair, or `None` when the strip keeps its own plane block at its
+/// own origin -- which is every 4:2:0 and 4:4:4 cell (their chroma is never
+/// 2 px wide) and every 4:2:2 strip of 8 px or more.
+fn chroma422_pair_plane(
+    ss_x: bool,
+    ss_y: bool,
+    mi_col: usize,
+    bw: usize,
+    bh: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if ss_x && !ss_y && (bw >> 1) == 2 {
+        Some((4, bh, ((mi_col & !1) * MI) >> 1, mi_col & !1))
+    } else {
+        None
+    }
+}
+
 /// Decodes the planes of one `bw`x`bh` HORZ/VERT intra strip whose luma
 /// transform is SPLIT (`tx_depth != 0`) -- lane-rectsplit r1, the case every
 /// rect path here refused by name until now ("per-unit rect prediction is not
@@ -10228,6 +10272,21 @@ fn decode_rect_split(
             (bw, bh),
             (8, 16) | (16, 32) | (32, 64) | (64, 128) | (8, 32) | (16, 64)
         );
+    // lane-av1-422stripanchor: the 4-wide strips' PAIR chroma -- the ported
+    // floored-pair anchor. `chroma422_pair_plane` is `Some` exactly when this
+    // strip's own chroma block would be 2 px wide at ss (1, 0); the pair's
+    // plane is then `(4, chroma_h)` written at the FLOORED cell
+    // (`chroma_x`), and the skip/tiled chroma arms below tile it in (4, 8)
+    // units (the OOB `max_txsize_rect_lookup[BLOCK_INVALID]` byte, TX_4X8 --
+    // the same walk the (8, 32) class takes). The lossless raster arm keeps
+    // the strip's own geometry: no caller of this function can present a
+    // 4-wide strip yet (the enumeration test pins the five callers at
+    // `8 <= min`), and the skip/tiled arms are the routes a future caller
+    // needs.
+    let chroma422_pair = chroma422_pair_plane(ss_x(fctx) == 1, ss_y(fctx) == 0, mi_c, bw, bh);
+    let chroma_422_pair_wide = chroma422_pair.is_some();
+    let (chroma_block_w, chroma_block_h, chroma_x) = chroma422_pair
+        .map_or((chroma_w, chroma_h, cpx), |(w, h, x, _)| (w, h, x));
     // The chroma transform is picked before any symbol is read, so an
     // unsupported chroma shape refuses before this strip desyncs the tile.
     let chroma: Option<(TxbSet, &[u16])> = match (chroma_w, chroma_h) {
@@ -10272,7 +10331,8 @@ fn decode_rect_split(
     // diagnostic names only the shapes that would actually refuse -- it used
     // to fire for every tiled square too (the parent lane's `chroma=8x8`
     // rows) and sent the next lane chasing handled shapes.
-    let chroma_tiled = chroma_422_oob
+    let chroma_tiled = chroma_422_pair_wide
+        || chroma_422_oob
         || matches!(
             (chroma_w, chroma_h),
             (64, 32) | (32, 64) | (64, 16) | (16, 64) | (32, 32) | (16, 16) | (8, 8)
@@ -10586,8 +10646,25 @@ fn decode_rect_split(
     // `ll_chroma_units` and `decode_inter_block`'s `mu_chroma_units` tail
     // already do.
     let mut tiled_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = Vec::new();
-    let ac = m.alpha.map(|_| cfl_src_rect(px, py, bw, bh));
-    let reach = block_reach;
+    let ac = m.alpha.map(|_| {
+        // lane-av1-422stripanchor: the pair unit's CfL source is the PAIR's
+        // luma -- the 8-px-wide region the floored 4-px chroma block covers
+        // (`av1_setup_dst_planes`' floor), never the odd strip's own 4 px.
+        if chroma_422_pair_wide {
+            cfl_src_rect((mi_c & !1) * MI, py, 8, bh)
+        } else {
+            cfl_src_rect(px, py, bw, bh)
+        }
+    });
+    let reach = if chroma_422_pair_wide {
+        // The chroma units predict off the PAIR block's edges: an odd-column
+        // strip's pair starts 4 luma px to the strip's left, so the strip's
+        // own answer names the wrong above/right samples (the pair16 arm's
+        // `pair_reach`, one partition level up).
+        Reach::of_rect(8, bh, (mi_c & !1) * MI, py, y.width, y.height, fctx)
+    } else {
+        block_reach
+    };
     let (u_grid, v_grid) = if mono(fctx) {
         // lane-av1mono: a monochrome frame codes no chroma coefficients on
         // any block (`plane < av1_num_planes == 1`), so the whole chroma
@@ -10596,25 +10673,28 @@ fn decode_rect_split(
         let zero = Grid::Zero(chroma_w * chroma_h);
         (zero.clone(), zero)
     } else if m.skip {
-        let zero = Grid::Zero(chroma_w * chroma_h);
-        if chroma_422_oob {
+        let zero = Grid::Zero(chroma_block_w * chroma_block_h);
+        if chroma_422_pair_wide || chroma_422_oob {
             // lane-av1-422blockhalf: libaom predicts an INTRA strip's chroma
             // per transform unit even when the strip is skipped
             // (`decode_token_recon_block`'s per-TU plane walk runs before the
             // skip guard), so the BLOCK_INVALID plane predicts as (4, 8)
             // units -- one whole-plane push here would ask the intra
             // predictor for a 1:8 rect it never needs.
+            // lane-av1-422stripanchor: the 4-wide strip's PAIR plane does the
+            // same, over the pair's own `(chroma_block_w, chroma_block_h)`
+            // grid at the floored anchor `chroma_x`.
             let (uw, uh) = (4usize, 8usize);
             for plane_idx in 1..=2 {
                 if let Some((ub, vb)) = &m.palette_uv {
                     let buf = if plane_idx == 1 { ub } else { vb };
                     set_palette_pred(buf.clone(), fctx);
                 }
-                for cu_row in 0..chroma_h / uh {
-                    for cu_col in 0..chroma_w / uw {
+                for cu_row in 0..chroma_block_h / uh {
+                    for cu_col in 0..chroma_block_w / uw {
                         push_intra_rect(
                             plane_idx,
-                            cpx + cu_col * uw,
+                            chroma_x + cu_col * uw,
                             cpy + cu_row * uh,
                             uw,
                             uh,
@@ -10706,10 +10786,13 @@ fn decode_rect_split(
         let [ug, vg] = last;
         (ug, vg)
     } else if chroma_tiled {
-        let (uw, uh, set, scan): (usize, usize, TxbSet, &[u16]) = if chroma_422_oob {
-            // lane-av1-422blockhalf: the BLOCK_INVALID-plane strip's (4, 8)
-            // units -- the Release oracle's out-of-bounds
-            // `max_txsize_rect_lookup[BLOCK_INVALID]` byte (see above).
+        let (uw, uh, set, scan): (usize, usize, TxbSet, &[u16]) =
+            if chroma_422_pair_wide || chroma_422_oob {
+            // lane-av1-422blockhalf / lane-av1-422stripanchor: the
+            // BLOCK_INVALID-plane chroma's (4, 8) units -- the Release
+            // oracle's out-of-bounds `max_txsize_rect_lookup` byte (TX_4X8,
+            // see above). For the 4-wide strip the units tile the PAIR's
+            // plane, stepping from the floored anchor.
             (4, 8, TxbSet::ChromaRect8x4, &SCAN_4X8)
         } else {
             match (chroma_w, chroma_h) {
@@ -10728,8 +10811,15 @@ fn decode_rect_split(
         if uw == uh && ss_x(fctx) == 1 && ss_y(fctx) == 0 {
             hit!(CHROMA422_SQUARE_HITS);
         }
-        let (nw, nh) = (chroma_w / uw, chroma_h / uh);
-        let bigger = chroma_w * chroma_h > uw * uh;
+        if chroma_422_pair_wide {
+            hit!(CHROMA422_PAIR_WIDE_HITS);
+        }
+        let (nw, nh) = (chroma_block_w / uw, chroma_block_h / uh);
+        // lane-av1-422stripanchor: the pair's plane block is BLOCK_INVALID
+        // whatever the pair size (`num_pels_log2_lookup[255]` reads 0xff in
+        // the pinned Release oracle), so its txb_skip rows always carry the
+        // bigger-plane +3 (the av1422q rule the pair16 arm measures).
+        let bigger = chroma_422_pair_wide || chroma_w * chroma_h > uw * uh;
         // `av1_get_ext_tx_set_type`: a chroma transform whose square-up size
         // is TX_32X32 or bigger resolves to `EXT_TX_SET_DCTONLY` for intra;
         // smaller rect units (the 4:2:2 BLOCK_INVALID-plane (4, 8)s) take the
@@ -10747,7 +10837,8 @@ fn decode_rect_split(
                     let luma_span_y = uh << ss_y(fctx);
                     let cu_mi = (
                         mi_r + cu_row * (luma_span_y / MI),
-                        mi_c + cu_col * (luma_span_x / MI),
+                        if chroma_422_pair_wide { mi_c & !1 } else { mi_c }
+                            + cu_col * (luma_span_x / MI),
                     );
                     // lane-av1-422blockhalf: the 4:2:2 (4, 8) units read their
                     // chroma context per chroma cell
@@ -10755,22 +10846,33 @@ fn decode_rect_split(
                     // rule) -- the plain rect walk samples one chroma cell
                     // twice at ss_x 1. Every pre-existing shape keeps its own
                     // walk.
-                    let cu_around = if chroma_422_oob {
+                    let cu_around = if chroma_422_pair_wide || chroma_422_oob {
                         neighbours.around_mi_422_chroma(cu_mi, luma_span_x, luma_span_y)
                     } else {
                         neighbours.around_mi_rect(cu_mi, luma_span_x, luma_span_y)
                     };
-                    let (cu_x, cu_y) = (cpx + cu_col * uw, cpy + cu_row * uh);
+                    let (cu_x, cu_y) = (chroma_x + cu_col * uw, cpy + cu_row * uh);
                     let cfl = m.alpha.map(|(au, av)| {
                         let alpha = if plane_idx == 1 { au } else { av };
                         (
                             alpha,
-                            cfl_src_rect(
-                                px + cu_col * luma_span_x,
-                                py + cu_row * luma_span_y,
-                                luma_span_x,
-                                luma_span_y,
-                            ),
+                            if chroma_422_pair_wide {
+                                // The unit's co-located luma is the PAIR's
+                                // 8-px-wide band at the floored mi column.
+                                cfl_src_rect(
+                                    (mi_c & !1) * MI + cu_col * luma_span_x,
+                                    py + cu_row * luma_span_y,
+                                    luma_span_x,
+                                    luma_span_y,
+                                )
+                            } else {
+                                cfl_src_rect(
+                                    px + cu_col * luma_span_x,
+                                    py + cu_row * luma_span_y,
+                                    luma_span_x,
+                                    luma_span_y,
+                                )
+                            },
                         )
                     });
                     // lane-av1-422kf: the palette colour map is consumed per
@@ -10783,7 +10885,14 @@ fn decode_rect_split(
                     if let Some((ub, vb)) = &m.palette_uv {
                         let buf = if plane_idx == 1 { ub } else { vb };
                         set_palette_pred(
-                            palette_window(buf, chroma_w, cu_col * uw, cu_row * uh, uw, uh),
+                            palette_window(
+                                buf,
+                                chroma_block_w,
+                                cu_col * uw,
+                                cu_row * uh,
+                                uw,
+                                uh,
+                            ),
                             fctx,
                         );
                     }
@@ -11114,6 +11223,87 @@ fn every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row() {
         17,
         "17 eligible footprints must fill all 17 rows of the motion_mode table"
     );
+}
+
+/// lane-av1-422stripanchor, format-cell census for the 4-wide-strip pair port
+/// ([`chroma422_pair_plane`], [`decode_rect_split`]'s chroma routing): over
+/// every `BLOCK_SIZES_ALL` footprint at every subsampling cell, the pair arm
+/// fires exactly when libaom's own `av1_ss_size_lookup[..][1][0]` column
+/// (`common_data.c`) marks the plane block BLOCK_INVALID AND the plane would
+/// be 2 px wide -- the 4-wide footprints. The tall/wide BLOCK_INVALID shapes
+/// stay on the pre-existing `chroma_422_oob` (4, 8) tiling, and 4:2:0 /
+/// 4:4:4 never enter either arm (the byte-identical claim, checked per cell).
+#[test]
+fn chroma422_pair_plane_matches_the_ss_size_lookup_cells() {
+    // The `av1_ss_size_lookup[..][1][0]` column verbatim (pinned oracle,
+    // `common_data.c`), keyed by footprint: `true` = BLOCK_INVALID.
+    let ss10_invalid: &[(&str, bool)] = &[
+        ("4x4", false),
+        ("4x8", true),
+        ("8x4", false),
+        ("8x8", false),
+        ("8x16", true),
+        ("16x8", false),
+        ("16x16", false),
+        ("16x32", true),
+        ("32x16", false),
+        ("32x32", false),
+        ("32x64", true),
+        ("64x32", false),
+        ("64x64", false),
+        ("64x128", true),
+        ("128x64", false),
+        ("128x128", false),
+        ("4x16", true),
+        ("16x4", false),
+        ("8x32", true),
+        ("32x8", false),
+        ("16x64", true),
+        ("64x16", false),
+    ];
+    for (footprint, invalid10) in ss10_invalid {
+        let (w, h) = footprint.split_once('x').unwrap();
+        let (bw, bh) = (w.parse::<usize>().unwrap(), h.parse::<usize>().unwrap());
+        // BLOCK_4X4 is the SQUARE path's leaf, never a strip: its ss cell is
+        // valid because a (2, 4) plane area rounds UP to the 4x4 read
+        // (`sub8_leaf_chroma422`'s own rule), and it never reaches
+        // [`decode_rect_split`] at all.
+        if (bw, bh) == (4, 4) {
+            continue;
+        }
+        // 4:2:0 and 4:4:4: the port never fires, whatever the footprint.
+        for (ss_x, ss_y) in [(false, false), (true, true)] {
+            assert!(
+                chroma422_pair_plane(ss_x, ss_y, 7, bw, bh).is_none(),
+                "{bw}x{bh} at ss ({ss_x}, {ss_y}) must keep its own plane block"
+            );
+        }
+        // 4:2:2: the pair arm is exactly the 2-px-wide (4-wide) slice of the
+        // BLOCK_INVALID column, anchored at the floored mi column.
+        let pair = chroma422_pair_plane(true, false, 7, bw, bh);
+        assert_eq!(
+            pair.is_some(),
+            *invalid10 && bw == 4,
+            "{bw}x{bh} at ss (1, 0): pair routing disagrees with ss_size_lookup"
+        );
+        if let Some((block_w, block_h, x, ctx_col)) = pair {
+            assert_eq!((block_w, block_h), (4, bh), "{bw}x{bh} pair plane shape");
+            assert_eq!(x, ((7 & !1) * MI) >> 1, "{bw}x{bh} floored write anchor");
+            assert_eq!(ctx_col, 6, "{bw}x{bh} entropy cell is the floored column");
+            // An even-column strip anchors at its own cell.
+            let (x_even, col_even) = match chroma422_pair_plane(true, false, 6, bw, bh) {
+                Some((_, _, x, c)) => (x, c),
+                None => panic!("{bw}x{bh} lost its pair arm at an even mi_col"),
+            };
+            assert_eq!((x_even, col_even), (12, 6), "even column keeps its own cell");
+        }
+    }
+    // The tall/wide BLOCK_INVALID shapes (8 px wide or more) are the
+    // `chroma_422_oob` tiling's residents, not the pair arm's: both are
+    // 4:2:2-only, so the two arms partition the BLOCK_INVALID column.
+    for (bw, bh) in [(8usize, 16), (16, 32), (32, 64), (64, 128), (8, 32), (16, 64)] {
+        assert!(chroma422_pair_plane(true, false, 7, bw, bh).is_none());
+    }
 }
 
 fn decode_intra_rect_in_inter(
