@@ -29731,7 +29731,8 @@ pub(crate) fn obmc_run(
     let (mut tmp_y, mut tmp_u, mut tmp_v) = (Vec::new(), Vec::new(), Vec::new());
 
     // lane-t900 r13 rung: EC_MCB="<plane>:<px>:<py>[:<frame>]" (chroma plane
-    // 1 only) prints this block's chroma prediction rows before and after the
+    // 1 only; <px>:<py> are chroma-plane pixels, the oracle's own dump
+    // window) prints this block's chroma prediction rows before and after the
     // OBMC blend, matching the instrumented aomdec's EC_MCB dump.
     let ec_mcb: Option<(usize, usize, i64)> = crate::envflags::env_flag!("EC_MCB")
         .then(|| crate::envflags::var("EC_MCB").ok())
@@ -29744,22 +29745,23 @@ pub(crate) fn obmc_run(
         let (x, y) = (f[1].parse::<usize>().ok()?, f[2].parse::<usize>().ok()?);
         let fr = f.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
         let idx = PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst) as i64;
-        if x >= cpx && x < cpx + write_w / 2 && y >= cpy && y < cpy + write_h / 2
-            && (fr < 0 || fr == idx)
-        {
+        // lane-av1ecmcb: the window is the CHROMA plane's own write region --
+        // the oracle's EC_MCB spans are plane pixels, and at 4:4:4 (ss 0/0)
+        // the chroma block is full-size, so nothing halves. The old
+        // `write_w / 2` was a 4:2:0-era assumption that quartered the window
+        // (and the dumps below) at ss 0/0.
+        let (cw, ch) = (write_w >> ss_x(fctx), write_h >> ss_y(fctx));
+        if x >= cpx && x < cpx + cw && y >= cpy && y < cpy + ch && (fr < 0 || fr == idx) {
             Some((x, y, idx))
         } else {
             None
         }
     });
     if let Some((_, _, idx)) = ec_mcb {
-        eprintln!(
-            "OUR_MCB pre f={idx} cpx={cpx} cpy={cpy} cw={} ch={}",
-            write_w / 2,
-            write_h / 2
-        );
-        for r in 0..write_h / 2 {
-            let row: Vec<u16> = (0..write_w / 2).map(|c| pred_u[r * chroma_side + c]).collect();
+        let (cw, ch) = (write_w >> ss_x(fctx), write_h >> ss_y(fctx));
+        eprintln!("OUR_MCB pre f={idx} cpx={cpx} cpy={cpy} cw={cw} ch={ch}");
+        for r in 0..ch {
+            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_side + c]).collect();
             eprintln!("OUR_MCB prerow{r}: {row:?}");
         }
     }
@@ -29810,8 +29812,9 @@ pub(crate) fn obmc_run(
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
-        for r in 0..write_h / 2 {
-            let row: Vec<u16> = (0..write_w / 2).map(|c| pred_u[r * chroma_side + c]).collect();
+        let (cw, ch) = (write_w >> ss_x(fctx), write_h >> ss_y(fctx));
+        for r in 0..ch {
+            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_side + c]).collect();
             eprintln!("OUR_MCB post f={idx} row{r}: {row:?}");
         }
     }
