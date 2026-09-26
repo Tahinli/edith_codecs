@@ -30426,20 +30426,23 @@ fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
 /// 1-pixel chroma plane; the pinned fixture's chroma is 128x144.
 ///
 /// **Open gap, 4:2:0 at odd dimensions (pre-existing).** The 4:2:0 arm is
-/// left at the old `(width / 2, height / 2)` floor, which is byte-identical
-/// to what the two-way test this replaces produced -- that was the point,
-/// since no 4:2:0 stream changed shape. It is nevertheless the wrong shape
-/// for an odd-dimension 4:2:0 reference: the producer stored
+/// left at the old `(width / 2, height / 2)` floor, which is what the
+/// two-way test this replaces produced -- that was the point, since no
+/// 4:2:0 stream changed shape. It is nevertheless the wrong shape for an
+/// odd-dimension 4:2:0 reference: the producer stored
 /// `round_ss(w, 1) x round_ss(h, 1)`, so the floor arm under-declares.
-/// Measured over the `1..=128` square: the floor under-declares in
-/// 12160 of the 16256 pairs with `w >= 2` (12288 of all 16384, the extra
-/// 128 being the `w == 1` column, where the arm declares a 0-wide plane).
-/// It is a *shape* error, not a misroute: a 4:2:0 count at `w == 1` and
-/// `h >= 2` collides with neither the 4:4:4 nor the 4:2:2 count, so the
-/// length test does put it in the right arm -- the floor fallback simply
-/// cannot express `(1, round_ss(h, 1))`. It is left alone because it
-/// predates this lane, is identical to the parent, and no in-tree coverage
-/// exercises an odd-dimension 4:2:0 reference. A ceil fallback
+/// Measured over the `1..=128` square, running each 4:2:0 count through
+/// this very function: 12160 of the 16384 pairs come back smaller than the
+/// plane actually holds, 12033 of those with `w >= 2` and 127 in the
+/// `w == 1` column (at `w == 1, h == 1` the 4:4:4 arm catches the count
+/// and `(1, 1)` is exact). Under-declaration at `h == 1` is **zero** over
+/// the whole square: there the 4:2:0 count equals the 4:2:2 count, routes
+/// into the 4:2:2 arm, and lands on the correct
+/// `(round_ss(w, 1), 1)`. The `w == 1` residue is a *shape* error, not a
+/// misroute -- the floor fallback simply cannot express
+/// `(1, round_ss(h, 1))`. It is left alone because it predates this lane,
+/// is identical to the parent, and no in-tree coverage exercises an
+/// odd-dimension 4:2:0 reference. A ceil fallback
 /// (`(round_ss(w, 1), round_ss(h, 1))`) would close it, at the cost of
 /// departing from the parent on every odd-dimension 4:2:0 shape with
 /// nothing in the tree to justify the change; that call belongs to a lane

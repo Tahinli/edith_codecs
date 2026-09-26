@@ -148,19 +148,23 @@ REVERTED).
   frame produces falls outside that (the pinned fixture's chroma is
   128x144).
   *4:2:0 at odd dimensions — an open, pre-existing gap, not a clean bill.*
-  The floor arm is byte-identical to the parent, but it is the wrong shape
-  for an odd-dimension 4:2:0 reference: the producer stored
-  `round_ss(w, 1) x round_ss(h, 1)`, so the floor under-declares. Over the
-  `1..=128` square that is 12160 of the 16256 pairs with `w >= 2` (12288 of
-  all 16384; the extra 128 are the `w == 1` column, where the arm declares
-  a 0-wide plane), and it differs from the parent's floor at `h == 1` for
-  the 127 pairs with `w >= 2` — there only by *correcting* the parent,
-  which claimed zero rows. At `w == 1` and `h >= 2` the 4:2:0 count
-  collides with neither other count, so the length test puts it in the
-  right arm; the floor fallback simply cannot express
-  `(1, round_ss(h, 1))`. A ceil fallback would close the whole gap, at
-  the cost of departing from the parent on every odd-dimension 4:2:0
-  shape with no in-tree coverage to justify it. Recorded, not taken.
+  The floor arm is what the parent produced, but it is the wrong shape for
+  an odd-dimension 4:2:0 reference: the producer stored
+  `round_ss(w, 1) x round_ss(h, 1)`, so the floor under-declares. Running
+  every 4:2:0 count over the `1..=128` square through the shipping helper:
+  **12160 of the 16384 pairs** come back smaller than the plane holds —
+  **12033** of them with `w >= 2` and **127** in the `w == 1` column (at
+  `1x1` the 4:4:4 arm catches the count and `(1, 1)` is exact).
+  Under-declaration at `h == 1` is **zero**: there the 4:2:0 count equals
+  the 4:2:2 count, routes into the 4:2:2 arm and lands on the correct
+  `(round_ss(w, 1), 1)`, which is also the one place the new arm departs
+  from the parent's floor — for the 127 pairs with `w >= 2`, and there
+  only by *correcting* the parent, which claimed zero rows. The `w == 1,
+  h >= 2` residue is a shape error, not a misroute: the floor fallback
+  simply cannot express `(1, round_ss(h, 1))`. A ceil fallback would close
+  the whole gap, at the cost of departing from the parent on every
+  odd-dimension 4:2:0 shape with no in-tree coverage to justify it.
+  Recorded, not taken.
   *Gated:* `cargo test -p ec-av1 --lib -- lossless decodes_sample_exact
   444 reference_chroma` in its own target dir
   `~/.cache/cargo-target-av1422stripwrite-gate` — see below for what that
