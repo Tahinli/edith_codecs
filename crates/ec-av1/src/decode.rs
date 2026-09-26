@@ -15328,7 +15328,18 @@ fn decode_rect4_16_strip(
                 }
                 (Grid::Zero(cw * ch), Grid::Zero(cw * ch))
             } else {
-                let around = neighbours.around_mi_rect(pair_mi, pw, ph);
+                // lane-av1422ctxgather: 4:2:2's chroma above votes sample
+                // every second luma-mi cell
+                // ([`Neighbours::around_mi_422_chroma`]: at ss_x 1 one
+                // chroma 4-px column spans two luma mi columns, and the
+                // plain per-mi gather counts each column's whole-unit dc
+                // sign twice). The left extent is unsubsampled at ss_y 0,
+                // so its per-mi cells already line up one-to-one.
+                let around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                    neighbours.around_mi_422_chroma(pair_mi, pw, ph)
+                } else {
+                    neighbours.around_mi_rect(pair_mi, pw, ph)
+                };
                 // lane-av1-444: the strip's own 16x4 / 4x16 chroma at ss 0/0
                 // (`TxbSet::Chroma8`, `get_txsize_entropy_ctx(TX_16X4)` =
                 // the 8x8 set); 4:2:0 keeps the pair's 8x4 / 4x8.
@@ -23347,7 +23358,19 @@ fn read_inter_rect_chroma(
                     at_mi.1 + cu_col * (span_x / MI),
                 );
                 let cu_around = if multi {
-                    neighbours.around_mi_rect(cu_mi, span_x, span_y)
+                    // lane-av1422ctxgather: at ss (1,0) the unit's above
+                    // span covers `uw` chroma px = `2*uw` luma mi columns,
+                    // so the plain per-mi gather counts every chroma
+                    // column's whole-unit dc sign twice
+                    // ([`Neighbours::around_mi_422_chroma`]; the left
+                    // extent is 1:1 at ss_y 0). 4:2:0 keeps the per-mi
+                    // gather (both extents duplicated there, measured
+                    // elsewhere).
+                    if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                        neighbours.around_mi_422_chroma(cu_mi, span_x, span_y)
+                    } else {
+                        neighbours.around_mi_rect(cu_mi, span_x, span_y)
+                    }
                 } else {
                     around
                 };
@@ -34558,12 +34581,31 @@ fn decode_inter_block(
                 // EVEN strip's mi origin and spans both strips, so its
                 // above/left coefficient context is the pair's, not this
                 // strip's row.
+                // lane-av1422ctxgather: at 4:2:2 (ss 1,0) a HORZ strip is
+                // its own chroma reference (`is_chroma_reference`'s
+                // `!(subsampling_y)` row clause) -- pair_mi is the strip
+                // itself and the context reads the strip's own 8x4, ONE
+                // luma-mi row tall, with the 4:2:2 above sampling
+                // ([`Neighbours::around_mi_422_chroma`]). The 4:2:0 pair
+                // merge keeps the (16, 8) span and the plain per-mi gather
+                // (as do 4:4:4 and every VERT shape).
                 let around_c = match strip_chroma {
-                    Some(s) if s.has_chroma => neighbours.around_mi_rect(
-                        s.pair_mi,
-                        if s.horz { 16 } else { 8 },
-                        if s.horz { 8 } else { 16 },
-                    ),
+                    Some(s) if s.has_chroma => {
+                        let (pw, ph) = if s.horz {
+                            if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                                (16, 4)
+                            } else {
+                                (16, 8)
+                            }
+                        } else {
+                            (8, 16)
+                        };
+                        if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                            neighbours.around_mi_422_chroma(s.pair_mi, pw, ph)
+                        } else {
+                            neighbours.around_mi_rect(s.pair_mi, pw, ph)
+                        }
+                    }
                     _ => around,
                 };
                 let luma_tx_type;
@@ -36200,7 +36242,24 @@ fn decode_inter_block(
         }
     }
     if let Some((s, u_state, v_state)) = pair_chroma {
-        let (pw, ph) = if s.horz { (16usize, 8usize) } else { (8, 16) };
+        // lane-av1422ctxgather: at 4:2:2 (ss 1,0) a horz strip is its own
+        // chroma reference -- no pair merge ever happened, so the write
+        // covers the strip's own 8x4: ONE luma-mi left row (libaom's
+        // `av1_set_contexts` for the TX_8X4 at ss_y 0 stamps
+        // `tx_size_high_unit` = 1 cell). The 4:2:0 pair's two-row (16, 8)
+        // span would overwrite the NEXT row's leaf-stamped level state
+        // (measured: t422 frame 1, the strip at mi(8,4) zeroed
+        // left[9][1] under the mi(8,2) 8x8's level 5 before the mi(9,4)
+        // strip's own all_zero read it one ctx row low).
+        let (pw, ph) = if s.horz {
+            if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                (16usize, 4usize)
+            } else {
+                (16usize, 8usize)
+            }
+        } else {
+            (8, 16)
+        };
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (
             round_up_even(neighbours.mi_rows),
