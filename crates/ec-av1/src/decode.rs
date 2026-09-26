@@ -18566,8 +18566,19 @@ fn decode_block_128rect(
     let mi_rows = 2 * y.true_height.div_ceil(8);
     let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(mi_c));
     let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(mi_r));
-    // Non-lossless: one 32x32 chroma unit per mu chunk, per plane.
-    debug_assert!(lossless_frame || (chroma_w / chroma_tx, chroma_h / chroma_tx) == (nch_x, nch_y));
+    // Non-lossless: per mu chunk, the chroma units per axis are
+    // ((64 >> ss_x) / chroma_tx, (64 >> ss_y) / chroma_tx) -- one 32x32 unit
+    // per chunk at 4:2:0, TWO stacked on the tall axis at 4:2:2 (the chunk's
+    // chroma plane block is 32x64), four at 4:4:4. The old square-cut assert
+    // demanded one unit per chunk on BOTH axes, which no 4:2:2 stream can
+    // satisfy (lane-av1-422bigblock: the s2.obu witness).
+    let chunk_cw = (64usize) >> ss_x(fctx);
+    let chunk_ch = (64usize) >> ss_y(fctx);
+    debug_assert!(
+        lossless_frame
+            || (nch_x * (chunk_cw / chroma_tx), nch_y * (chunk_ch / chroma_tx))
+                == (chroma_w / chroma_tx, chroma_h / chroma_tx)
+    );
     let tpc = 64 / logical_tx;
     let zero_tu = vec![0i32; logical_tx * logical_tx];
     let zero_cu = vec![0i32; chroma_tx * chroma_tx];
@@ -18576,6 +18587,7 @@ fn decode_block_128rect(
     // The chroma context arrays are indexed in LUMA mi; every chroma unit of
     // every chunk shares this luma span (2 chroma pixels per luma unit).
     let luma_span = chroma_tx << ss_x(fctx);
+    let luma_span_h = chroma_tx << ss_y(fctx);
     for ch_row in 0..nch_y {
         for ch_col in 0..nch_x {
             for tu_row in ch_row * tpc..(ch_row + 1) * tpc {
@@ -18645,9 +18657,12 @@ fn decode_block_128rect(
                     neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
                 }
             }
-            // Transform units per axis inside this mu chunk's 32x32 chroma
-            // span: one 32x32 unit normally, 8x8 TX_4X4 units when lossless.
-            let cn = (32 / chroma_tx).max(1);
+            // Transform units per axis inside this mu chunk's chroma span
+            // -- (64 >> ss_x) x (64 >> ss_y): one 32x32 unit at 4:2:0, TWO
+            // stacked TX_32X32 at 4:2:2, four at 4:4:4; 8x8 TX_4X4 units
+            // when lossless.
+            let cn_w = (chunk_cw / chroma_tx).max(1);
+            let cn_h = (chunk_ch / chroma_tx).max(1);
             // libaom's per-chunk `unit_width/height` (plane-mi units of the
             // luma mi grid): `min(mu_blocks + col, max_blocks) >> ss`.
             let unit_w = ((ch_col + 1) * 16).min(max_w_mi) >> ss_x(fctx);
@@ -18659,25 +18674,28 @@ fn decode_block_128rect(
             // symbol order the interleaved pair used to read; a lossless
             // frame's 4x4 chroma units are where it becomes observable.
             for plane_pass in 1..=2usize {
-                for ci_row in 0..cn {
-                    for ci_col in 0..cn {
-                        if ch_col * 8 + ci_col * stepc >= unit_w
-                            || ch_row * 8 + ci_row * stepc >= unit_h
+                for ci_row in 0..cn_h {
+                    for ci_col in 0..cn_w {
+                        // The clamp strides are the CHUNK's chroma mi extent
+                        // per axis: 16 luma mi >> the axis's own ss.
+                        if ch_col * (16 >> ss_x(fctx)) + ci_col * stepc >= unit_w
+                            || ch_row * (16 >> ss_y(fctx)) + ci_row * stepc >= unit_h
                         {
                             continue;
                         }
-                        let cu_x = cpx + ch_col * 32 + ci_col * chroma_tx;
-                        let cu_y = cpy + ch_row * 32 + ci_row * chroma_tx;
+                        let cu_x = cpx + ch_col * chunk_cw + ci_col * chroma_tx;
+                        let cu_y = cpy + ch_row * chunk_ch + ci_row * chroma_tx;
                         let cu_mi = (
                             mi_r + ch_row * 16 + ci_row * ((chroma_tx << ss_y(fctx)) / 4),
                             mi_c + ch_col * 16 + ci_col * ((chroma_tx << ss_x(fctx)) / 4),
                         );
-                        let cu_r = tu_reach(
+                        let cu_r = tu_reach_rect(
                             bw,
                             bh,
                             ch_col * 64 + ci_col * luma_span,
-                            ch_row * 64 + ci_row * luma_span,
+                            ch_row * 64 + ci_row * luma_span_h,
                             luma_span,
+                            luma_span_h,
                             reach,
                             px,
                             py,
@@ -18691,7 +18709,8 @@ fn decode_block_128rect(
                             );
                             continue;
                         }
-                        let cu_around = neighbours.around_mi(cu_mi, luma_span);
+                        let cu_around =
+                            neighbours.around_mi_rect(cu_mi, luma_span, luma_span_h);
                         let buf: &mut PlaneBuf<'static> =
                             if plane_pass == 1 { &mut *u } else { &mut *v };
                         let grid = read_plane(
@@ -18705,7 +18724,13 @@ fn decode_block_128rect(
                         // reads this one's coefficient context; replayed after
                         // `record_split_luma_rect` below, which would otherwise
                         // clobber them whole-block.
-                        neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, plane_pass, &grid);
+                        neighbours.record_mi_chroma(
+                            cu_mi,
+                            luma_span,
+                            luma_span_h,
+                            plane_pass,
+                            &grid,
+                        );
                         units.push((plane_pass, cu_mi, grid));
                     }
                 }
@@ -30234,15 +30259,42 @@ impl<'p> RefPix<'p> {
                 (
                     whole_plane(&g.y, g.width, g.height),
                     {
-                        // Reference pictures carry no subsampling field. A
-                        // 4:4:4 chroma plane is luma-sized; 4:2:0 is the quarter.
-                        let full = g.u.len() == g.width * g.height;
-                        let (cw, ch) = if full { (g.width, g.height) } else { (g.width / 2, g.height / 2) };
+                        // Reference pictures carry no subsampling field -- the
+                        // plane's own shape is inferred from its length:
+                        // luma-sized is 4:4:4, `halfw x height` is 4:2:2
+                        // (ss_x 1, ss_y 0 -- the chroma plane is HALF-width
+                        // and FULL-height), `halfw x halfh` is 4:2:0. The
+                        // three lengths are pairwise distinct for every
+                        // w, h >= 1, so the guess is exact. The old
+                        // two-way guess read every 4:2:2 reference as
+                        // quarter-height: a 128x128 frame's chroma resolved
+                        // 64x64, the bottom mu-chunk row's prediction
+                        // sampled a clamped row-63 edge and the frame's
+                        // own pixels were right (the crop is ss-aware) --
+                        // only INTER prediction off the slot was wrong
+                        // (lane-av1-422bigblock: the sb128 witness's
+                        // frame-2 chroma, rows 64..127).
+                        let halfw = (g.width + 1) / 2;
+                        let halfh = (g.height + 1) / 2;
+                        let (cw, ch) = if g.u.len() == g.width * g.height {
+                            (g.width, g.height)
+                        } else if g.u.len() == halfw * g.height {
+                            (halfw, g.height)
+                        } else {
+                            (halfw, halfh)
+                        };
                         whole_plane(&g.u, cw, ch)
                     },
                     {
-                        let full = g.v.len() == g.width * g.height;
-                        let (cw, ch) = if full { (g.width, g.height) } else { (g.width / 2, g.height / 2) };
+                        let halfw = (g.width + 1) / 2;
+                        let halfh = (g.height + 1) / 2;
+                        let (cw, ch) = if g.v.len() == g.width * g.height {
+                            (g.width, g.height)
+                        } else if g.v.len() == halfw * g.height {
+                            (halfw, g.height)
+                        } else {
+                            (halfw, halfh)
+                        };
                         whole_plane(&g.v, cw, ch)
                     },
                 )
@@ -32829,7 +32881,7 @@ fn decode_inter_block(
                 pu0.true_width,
                 pu0.true_height,
                 mv_to_q4(cpx, mv0.1, ss_x(fctx)),
-                mv_to_q4(cpy, mv0.0, ss_x(fctx)),
+                mv_to_q4(cpy, mv0.0, ss_y(fctx)),
                 scale0,
                 chroma_stride,
                 chroma_buf_h,
@@ -32857,7 +32909,7 @@ fn decode_inter_block(
                 pu1.true_width,
                 pu1.true_height,
                 mv_to_q4(cpx, mv1.1, ss_x(fctx)),
-                mv_to_q4(cpy, mv1.0, ss_x(fctx)),
+                mv_to_q4(cpy, mv1.0, ss_y(fctx)),
                 scale1,
                 chroma_stride,
                 chroma_buf_h,
@@ -32907,7 +32959,7 @@ fn decode_inter_block(
                 pv0.true_width,
                 pv0.true_height,
                 mv_to_q4(cpx, mv0.1, ss_x(fctx)),
-                mv_to_q4(cpy, mv0.0, ss_x(fctx)),
+                mv_to_q4(cpy, mv0.0, ss_y(fctx)),
                 scale0,
                 chroma_stride,
                 chroma_buf_h,
@@ -32935,7 +32987,7 @@ fn decode_inter_block(
                 pv1.true_width,
                 pv1.true_height,
                 mv_to_q4(cpx, mv1.1, ss_x(fctx)),
-                mv_to_q4(cpy, mv1.0, ss_x(fctx)),
+                mv_to_q4(cpy, mv1.0, ss_y(fctx)),
                 scale1,
                 chroma_stride,
                 chroma_buf_h,
@@ -33177,18 +33229,35 @@ fn decode_inter_block(
                                 // this arm has always coded. `chroma_side`
                                 // already carries the subsampling.
                                 let cu_tx = 32usize;
-                                let chunk_chroma = chroma_side * 64 / side;
-                                let units = chunk_chroma / cu_tx;
+                                // lane-av1-422bigblock: a 64x64 mu chunk's
+                                // chroma plane block is PER-AXIS
+                                // (64 >> ss_x) x (64 >> ss_y) -- 32x64 at
+                                // ss (1,0), i.e. TWO stacked TX_32X32 units
+                                // per plane (`av1_get_max_uv_txsize` caps the
+                                // unit at 32 on each axis). The old square-cut
+                                // model walked `chroma_side`-square chunks:
+                                // twice the units the oracle codes at 4:2:2,
+                                // prediction windows indexed at the square
+                                // `chroma_side` instead of the prediction
+                                // buffer's own `chroma_stride`, and chunk
+                                // columns at 64.. of a 64-wide chroma plane.
+                                let chunk_chroma_w = (64usize) >> ss_x(fctx);
+                                let chunk_chroma_h = (64usize) >> ss_y(fctx);
+                                let units_w = chunk_chroma_w / cu_tx;
+                                let units_h = chunk_chroma_h / cu_tx;
                                 // The unit's own footprint on the LUMA mi
-                                // grid: 64 px (16 mi) at 4:2:0, 32 px (8 mi)
-                                // at ss 0/0. `around_mi` reads and
+                                // grid, per axis (32 << ss) px: 64x64 (16x16
+                                // mi) at 4:2:0, 32x32 (8x8 mi) at 4:4:4,
+                                // 64x32 (16x8 mi) at 4:2:2. `around_mi_rect`
+                                // reads and
                                 // `record_mi_chroma` stamps span exactly the
                                 // unit's own cells -- `get_txb_ctx` reads the
                                 // 8 context cells of the TX_32X32 itself, and
                                 // `av1_set_entropy_contexts` memsets the same
                                 // 8, so the unit over never sees this unit's
                                 // state and the unit below always does.
-                                let unit_luma = cu_tx * (side / chroma_side);
+                                let unit_luma_w = cu_tx << ss_x(fctx);
+                                let unit_luma_h = cu_tx << ss_y(fctx);
                                 let cu_scan = default_scan(cu_tx);
                                 if lossless(fctx) {
                                     // lane-lossless2: TX_4X4 units over this
@@ -33196,8 +33265,8 @@ fn decode_inter_block(
                                     read_inter_chroma_lossless(
                                         dec, cdfs, neighbours, u, v, su, sv,
                                         at_mi, (cpx, cpy),
-                                        (cc * chunk_chroma, cr * chunk_chroma),
-                                        (chunk_chroma, chunk_chroma),
+                                        (cc * chunk_chroma_w, cr * chunk_chroma_h),
+                                        (chunk_chroma_w, chunk_chroma_h),
                                         (write_chroma_w, write_chroma_h),
                                         chroma_side, mode_for_tx, base_q_idx,
                                         &mut u_units, &mut v_units, fctx,
@@ -33214,24 +33283,28 @@ fn decode_inter_block(
                                     // Plane-major per chunk (libaom's plane
                                     // loop is outermost inside the mu walk);
                                     // within a plane the units walk raster.
-                                    for ur in 0..units {
-                                        for uc in 0..units {
+                                    for ur in 0..units_h {
+                                        for uc in 0..units_w {
                                             let unit_mi = (
                                                 at_mi.0 + cr * 16
-                                                    + ur * (unit_luma / MI),
+                                                    + ur * (unit_luma_h / MI),
                                                 at_mi.1 + cc * 16
-                                                    + uc * (unit_luma / MI),
+                                                    + uc * (unit_luma_w / MI),
                                             );
                                             // Per unit, AFTER the earlier
                                             // units' stamps: this unit's
                                             // coefficient context must see
                                             // them.
                                             let cu_around = neighbours
-                                                .around_mi(unit_mi, unit_luma);
+                                                .around_mi_rect(
+                                                    unit_mi,
+                                                    unit_luma_w,
+                                                    unit_luma_h,
+                                                );
                                             let (cu_x, cu_y) = (
-                                                cpx + cc * chunk_chroma
+                                                cpx + cc * chunk_chroma_w
                                                     + uc * cu_tx,
-                                                cpy + cr * chunk_chroma
+                                                cpy + cr * chunk_chroma_h
                                                     + ur * cu_tx,
                                             );
                                             // `av1_get_tx_type` (blockd.h:
@@ -33262,11 +33335,16 @@ fn decode_inter_block(
                                                     },
                                                 )
                                                 .map(|(_, _, _, _, t)| t);
+                                            // The prediction buffer is
+                                            // `chroma_stride`-strided (the
+                                            // plane block's own width at
+                                            // 4:2:2), not the square
+                                            // `chroma_side`.
                                             let cu_pred = src.offset(
-                                                (cr * chunk_chroma
+                                                (cr * chunk_chroma_h
                                                     + ur * cu_tx)
-                                                    * chroma_side
-                                                    + cc * chunk_chroma
+                                                    * chroma_stride
+                                                    + cc * chunk_chroma_w
                                                     + uc * cu_tx,
                                             );
                                             let cu_grid = read_inter_plane(
@@ -33296,8 +33374,8 @@ fn decode_inter_block(
                                             // context.
                                             neighbours.record_mi_chroma(
                                                 unit_mi,
-                                                unit_luma,
-                                                unit_luma,
+                                                unit_luma_w,
+                                                unit_luma_h,
                                                 plane_idx,
                                                 &cu_grid,
                                             );
@@ -33312,11 +33390,18 @@ fn decode_inter_block(
                                                 chroma_side * chroma_side,
                                             );
                                             for rr in 0..cu_tx {
-                                                let start = (cr * chunk_chroma
+                                                // The ASSEMBLED grid stays at
+                                                // the square `chroma_side`
+                                                // stride the block tail's
+                                                // `mu_chroma_units` re-stamp
+                                                // indexes; the unit's true
+                                                // per-axis position is what
+                                                // changes.
+                                                let start = (cr * chunk_chroma_h
                                                     + ur * cu_tx
                                                     + rr)
                                                     * chroma_side
-                                                    + cc * chunk_chroma
+                                                    + cc * chunk_chroma_w
                                                     + uc * cu_tx;
                                                 dst[start..start + cu_tx]
                                                     .copy_from_slice(
@@ -34263,7 +34348,7 @@ fn decode_inter_block(
                     pu_ref.true_width,
                     pu_ref.true_height,
                     mv_to_q4(cpx, mv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv.0, ss_y(fctx)),
                     chroma_stride,
                     chroma_buf_h,
                     write_chroma_w,
@@ -34278,7 +34363,7 @@ fn decode_inter_block(
                     pv_ref.true_width,
                     pv_ref.true_height,
                     mv_to_q4(cpx, mv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv.0, ss_y(fctx)),
                     chroma_stride,
                     chroma_buf_h,
                     write_chroma_w,
@@ -34310,7 +34395,7 @@ fn decode_inter_block(
                     pu_ref.true_width,
                     pu_ref.true_height,
                     mv_to_q4(cpx, mv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv.0, ss_y(fctx)),
                     luma_scale,
                     chroma_stride,
                     chroma_buf_h,
@@ -34326,7 +34411,7 @@ fn decode_inter_block(
                     pv_ref.true_width,
                     pv_ref.true_height,
                     mv_to_q4(cpx, mv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv.0, ss_y(fctx)),
                     luma_scale,
                     chroma_stride,
                     chroma_buf_h,
@@ -34421,7 +34506,7 @@ fn decode_inter_block(
                         src.true_width,
                         src.true_height,
                         mv_to_q4(cpx, prev_mv.1, ss_x(fctx)),
-                        mv_to_q4(cpy, prev_mv.0, ss_x(fctx)),
+                        mv_to_q4(cpy, prev_mv.0, ss_y(fctx)),
                         prev_scale,
                         piece_w,
                         piece_h,
@@ -34677,18 +34762,35 @@ fn decode_inter_block(
                                 // this arm has always coded. `chroma_side`
                                 // already carries the subsampling.
                                 let cu_tx = 32usize;
-                                let chunk_chroma = chroma_side * 64 / side;
-                                let units = chunk_chroma / cu_tx;
+                                // lane-av1-422bigblock: a 64x64 mu chunk's
+                                // chroma plane block is PER-AXIS
+                                // (64 >> ss_x) x (64 >> ss_y) -- 32x64 at
+                                // ss (1,0), i.e. TWO stacked TX_32X32 units
+                                // per plane (`av1_get_max_uv_txsize` caps the
+                                // unit at 32 on each axis). The old square-cut
+                                // model walked `chroma_side`-square chunks:
+                                // twice the units the oracle codes at 4:2:2,
+                                // prediction windows indexed at the square
+                                // `chroma_side` instead of the prediction
+                                // buffer's own `chroma_stride`, and chunk
+                                // columns at 64.. of a 64-wide chroma plane.
+                                let chunk_chroma_w = (64usize) >> ss_x(fctx);
+                                let chunk_chroma_h = (64usize) >> ss_y(fctx);
+                                let units_w = chunk_chroma_w / cu_tx;
+                                let units_h = chunk_chroma_h / cu_tx;
                                 // The unit's own footprint on the LUMA mi
-                                // grid: 64 px (16 mi) at 4:2:0, 32 px (8 mi)
-                                // at ss 0/0. `around_mi` reads and
+                                // grid, per axis (32 << ss) px: 64x64 (16x16
+                                // mi) at 4:2:0, 32x32 (8x8 mi) at 4:4:4,
+                                // 64x32 (16x8 mi) at 4:2:2. `around_mi_rect`
+                                // reads and
                                 // `record_mi_chroma` stamps span exactly the
                                 // unit's own cells -- `get_txb_ctx` reads the
                                 // 8 context cells of the TX_32X32 itself, and
                                 // `av1_set_entropy_contexts` memsets the same
                                 // 8, so the unit over never sees this unit's
                                 // state and the unit below always does.
-                                let unit_luma = cu_tx * (side / chroma_side);
+                                let unit_luma_w = cu_tx << ss_x(fctx);
+                                let unit_luma_h = cu_tx << ss_y(fctx);
                                 let cu_scan = default_scan(cu_tx);
                                 if lossless(fctx) {
                                     // lane-lossless2: TX_4X4 units over this
@@ -34696,8 +34798,8 @@ fn decode_inter_block(
                                     read_inter_chroma_lossless(
                                         dec, cdfs, neighbours, u, v, su, sv,
                                         at_mi, (cpx, cpy),
-                                        (cc * chunk_chroma, cr * chunk_chroma),
-                                        (chunk_chroma, chunk_chroma),
+                                        (cc * chunk_chroma_w, cr * chunk_chroma_h),
+                                        (chunk_chroma_w, chunk_chroma_h),
                                         (write_chroma_w, write_chroma_h),
                                         chroma_side, mode_for_tx, base_q_idx,
                                         &mut u_units, &mut v_units, fctx,
@@ -34714,24 +34816,28 @@ fn decode_inter_block(
                                     // Plane-major per chunk (libaom's plane
                                     // loop is outermost inside the mu walk);
                                     // within a plane the units walk raster.
-                                    for ur in 0..units {
-                                        for uc in 0..units {
+                                    for ur in 0..units_h {
+                                        for uc in 0..units_w {
                                             let unit_mi = (
                                                 at_mi.0 + cr * 16
-                                                    + ur * (unit_luma / MI),
+                                                    + ur * (unit_luma_h / MI),
                                                 at_mi.1 + cc * 16
-                                                    + uc * (unit_luma / MI),
+                                                    + uc * (unit_luma_w / MI),
                                             );
                                             // Per unit, AFTER the earlier
                                             // units' stamps: this unit's
                                             // coefficient context must see
                                             // them.
                                             let cu_around = neighbours
-                                                .around_mi(unit_mi, unit_luma);
+                                                .around_mi_rect(
+                                                    unit_mi,
+                                                    unit_luma_w,
+                                                    unit_luma_h,
+                                                );
                                             let (cu_x, cu_y) = (
-                                                cpx + cc * chunk_chroma
+                                                cpx + cc * chunk_chroma_w
                                                     + uc * cu_tx,
-                                                cpy + cr * chunk_chroma
+                                                cpy + cr * chunk_chroma_h
                                                     + ur * cu_tx,
                                             );
                                             // `av1_get_tx_type` (blockd.h:
@@ -34762,11 +34868,16 @@ fn decode_inter_block(
                                                     },
                                                 )
                                                 .map(|(_, _, _, _, t)| t);
+                                            // The prediction buffer is
+                                            // `chroma_stride`-strided (the
+                                            // plane block's own width at
+                                            // 4:2:2), not the square
+                                            // `chroma_side`.
                                             let cu_pred = src.offset(
-                                                (cr * chunk_chroma
+                                                (cr * chunk_chroma_h
                                                     + ur * cu_tx)
-                                                    * chroma_side
-                                                    + cc * chunk_chroma
+                                                    * chroma_stride
+                                                    + cc * chunk_chroma_w
                                                     + uc * cu_tx,
                                             );
                                             let cu_grid = read_inter_plane(
@@ -34796,8 +34907,8 @@ fn decode_inter_block(
                                             // context.
                                             neighbours.record_mi_chroma(
                                                 unit_mi,
-                                                unit_luma,
-                                                unit_luma,
+                                                unit_luma_w,
+                                                unit_luma_h,
                                                 plane_idx,
                                                 &cu_grid,
                                             );
@@ -34812,11 +34923,18 @@ fn decode_inter_block(
                                                 chroma_side * chroma_side,
                                             );
                                             for rr in 0..cu_tx {
-                                                let start = (cr * chunk_chroma
+                                                // The ASSEMBLED grid stays at
+                                                // the square `chroma_side`
+                                                // stride the block tail's
+                                                // `mu_chroma_units` re-stamp
+                                                // indexes; the unit's true
+                                                // per-axis position is what
+                                                // changes.
+                                                let start = (cr * chunk_chroma_h
                                                     + ur * cu_tx
                                                     + rr)
                                                     * chroma_side
-                                                    + cc * chunk_chroma
+                                                    + cc * chunk_chroma_w
                                                     + uc * cu_tx;
                                                 dst[start..start + cu_tx]
                                                     .copy_from_slice(
@@ -39383,7 +39501,7 @@ fn decode_inter_block8(
                     pu0.true_width,
                     pu0.true_height,
                     mv_to_q4(cpx, mv0.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv0.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv0.0, ss_y(fctx)),
                     scale0,
                     chroma_w,
                     chroma_h,
@@ -39398,7 +39516,7 @@ fn decode_inter_block8(
                     pu1.true_width,
                     pu1.true_height,
                     mv_to_q4(cpx, mv1.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv1.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv1.0, ss_y(fctx)),
                     scale1,
                     chroma_w,
                     chroma_h,
@@ -39430,7 +39548,7 @@ ss_y(fctx),
                     pv0.true_width,
                     pv0.true_height,
                     mv_to_q4(cpx, mv0.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv0.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv0.0, ss_y(fctx)),
                     scale0,
                     chroma_w,
                     chroma_h,
@@ -39445,7 +39563,7 @@ ss_y(fctx),
                     pv1.true_width,
                     pv1.true_height,
                     mv_to_q4(cpx, mv1.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv1.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv1.0, ss_y(fctx)),
                     scale1,
                     chroma_w,
                     chroma_h,

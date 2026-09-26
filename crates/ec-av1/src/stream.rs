@@ -2209,6 +2209,62 @@ pub(crate) mod tests {
         let frames = decode_stream(&stream).expect("the 4:2:0 control must decode");
         assert_eq!(frames.len(), 1, "{NAME}: the 4:2:0 control decoded no frame");
     }
+    /// lane-av1-422bigblock: the two witnessed 4:2:2 big-block defects, pinned
+    /// as fixtures (`git add -f`; `fixtures/` is gitignored).
+    ///
+    /// `422_allskip_2f.obu` (62 bytes) is a 128x128 profile-2 key frame plus
+    /// its all-skip first inter frame: the pre-port decoder read phantom
+    /// coefficient units in the inter frame and then panicked in
+    /// `reconstruct_mc_rect` on a full-height 4:2:2 chroma rect. At this
+    /// lane's HEAD the block-half port's per-axis plane-block model already
+    /// has it entropy-locked (all 20 key-frame coefficient units pair
+    /// rng-for-rng with the instrumented oracle, the inter frame reads
+    /// zero, matching the oracle) and pixel-exact vs aomdec.
+    ///
+    /// `422_sb128_3f.obu` (12543 bytes) carries the f2 128x128
+    /// `PARTITION_NONE` non-skip inter block: the mu-chunk chroma walk cut
+    /// each chunk's 32x64 chroma into a `chroma_side`-square 64x64 (twice
+    /// the units the oracle codes), indexed the prediction buffer at the
+    /// square `chroma_side` instead of `chroma_stride` (the empty-slice
+    /// panic at `push_mc_rect_tx`'s densify), and the reference plane
+    /// resolution guessed every non-4:4:4 picture quarter-height, so the
+    /// bottom mu-chunk row predicted from a clamped row-63 edge. All fixed;
+    /// both witnesses decode pixel-exact vs aomdec on the lane's local
+    /// `EC_AV1_ALLOW_422_PROBE` patch-run-restore build (recipe and measured
+    /// numbers in `lanes/av1422bigblock.report.md`).
+    ///
+    /// `decode_stream` itself still refuses 4:2:2 at the sequence header --
+    /// unconditionally, per the standing family rule -- so the committed
+    /// assertion is the byte pin (fnv1a64, the same load-bearing-identity
+    /// fingerprint as the cdf-forwarding gate) plus the refusal-by-name
+    /// contract over the pinned bytes.
+    #[test]
+    fn the_pinned_422_bigblock_witnesses_are_present_and_refuse_by_name() {
+        const NAME: &str = "the_pinned_422_bigblock_witnesses_are_present_and_refuse_by_name";
+        const REFUSAL: &str = "a chroma format of 4:2:2";
+        for (file, bytes, fp) in [
+            ("422_allskip_2f.obu", 62usize, 0x7e4d69d3c728c55f_u64),
+            ("422_sb128_3f.obu", 12543, 0x5171e0aab8000da7),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(file);
+            let data = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{NAME}: pinned witness {} is missing ({e}) -- the gate cannot run",
+                    path.display()
+                )
+            });
+            assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
+            assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
+            let err = decode_stream(&data).unwrap_err().to_string();
+            assert!(
+                err.contains(REFUSAL),
+                "{NAME}: {file} must refuse by name, got: {err}"
+            );
+        }
+    }
+
 
     /// lane-av1-qmatrix: WITNESS for the lifted `using_qmatrix` refusal (the
     /// old gate `a_frame_using_quantisation_matrices_is_refused_by_name` is
