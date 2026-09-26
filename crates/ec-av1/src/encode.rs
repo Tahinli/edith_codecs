@@ -1548,7 +1548,10 @@ pub struct Picture {
     pub height: usize,
     /// The luma plane, `width * height` samples in raster order.
     pub y: Vec<u16>,
-    /// The U plane, at half the width and half the height.
+    /// The U plane: half the width, and the frame's own chroma height -- a
+    /// quarter of the luma samples at 4:2:0, half at 4:2:2, all of them at
+    /// 4:4:4. A consumer that only knows the luma size reads the chroma
+    /// format off this sample count (see `decode::ref_chroma_shape`).
     pub u: Vec<u16>,
     /// The V plane, the same shape as U.
     pub v: Vec<u16>,
