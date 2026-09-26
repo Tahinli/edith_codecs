@@ -30397,25 +30397,43 @@ fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
 
 /// A reference picture's own chroma plane shape, `(width, height)`, from its
 /// luma size and its chroma sample count. A stored reference carries no
-/// subsampling field, but the count is exact and unambiguous:
-/// `w * h` is 4:4:4, `(w / 2) * h` is 4:2:2, `(w / 2) * (h / 2)` is 4:2:0.
+/// subsampling field, so the format is read back off the count -- and the
+/// counts are the producer's own [`round_ss`] crops
+/// (`decode.rs:25806`), so the test must use `round_ss` too and not a bare
+/// halving: 4:4:4 stores `w * h`, 4:2:2 stores `round_ss(w, 1) * h` (half
+/// width CEIL, full height), 4:2:0 stores `round_ss(w, 1) * round_ss(h, 1)`.
+/// A floor test here silently misses every odd-width 4:2:2 reference and
+/// drops it into the 4:2:0 arm -- the same defect one dimension over.
 ///
 /// The two-way test this replaces ("luma-sized, else a quarter") folded 4:2:2
-/// into the 4:2:0 shape, so a 4:2:2 reference plane claimed `h / 2` rows --
-/// half the samples it actually holds. Every chroma MC reading such a plane
-/// then had its source row clamped against `true_height` (spec 7.11.3.4 /
-/// libaom's `dec_calc_subpel_params_and_extend` clamps to the reference's
-/// valid area), which folded every chroma row at or past the frame's
-/// midpoint back onto the last valid row: on the pinned t422 fixture
-/// frame 1, the 8x4 inter strip at luma (88, 208) MC-predicted chroma
-/// (88, 104) from frame 0 with mv 0 and a pure copy, yet wrote
-/// (206, 204, 202, 200) x4 rows where the reference holds
-/// (202, 204, 204, 167) / (185, 190, 190, 165) / ...
+/// into the 4:2:0 shape entirely, so a 4:2:2 reference plane claimed
+/// `h / 2` rows -- half the samples it actually holds. Every chroma MC
+/// reading such a plane then had its source row clamped against
+/// `true_height` (spec 7.11.3.4 / libaom's
+/// `dec_calc_subpel_params_and_extend` clamps to the reference's valid
+/// area), which folded every chroma row at or past the frame's midpoint
+/// back onto the last valid row: on the pinned t422 fixture frame 1, the
+/// 8x4 inter strip at luma (88, 208) MC-predicted chroma (88, 104) from
+/// frame 0 with mv 0 and a pure copy, yet wrote (206, 204, 202, 200) x4
+/// rows where the reference holds (202, 204, 204, 167) /
+/// (185, 190, 190, 165) / ...
+/// **Ambiguity, measured rather than argued away:** the inference reads a
+/// format off a length, so it is only as good as the lengths being
+/// distinct. Brute-forced against the producer's own `round_ss` crops over
+/// every `w, h` in `1..=128`, the three counts are distinct and routed
+/// correctly for **every `w >= 2 && h >= 2`**, and every misread is
+/// confined to `w == 1` or `h == 1` (a 1-row chroma plane reads as 4:2:2,
+/// a 1-column one as 4:4:4 -- the counts genuinely coincide there, so no
+/// length test can separate them). No stream this decoder accepts reaches
+/// either; the pinned fixture's chroma is 128x144. The 4:2:0 arm is
+/// deliberately left at the old `(w / 2, h / 2)`: over the same sweep,
+/// **zero** 4:2:0 shapes differ from what the old two-way test produced.
 fn ref_chroma_shape(len: usize, width: usize, height: usize) -> (usize, usize) {
+    let half_w = round_ss(width, 1);
     if len == width * height {
         (width, height)
-    } else if len == (width / 2) * height {
-        (width / 2, height)
+    } else if len == half_w * height {
+        (half_w, height)
     } else {
         (width / 2, height / 2)
     }
@@ -44553,6 +44571,53 @@ mod tests {
         let mut refs: [Option<&Picture>; 8] = [None; 8];
         refs[1] = Some(reference);
         RefPix::ready(refs)
+    }
+
+    /// lane-av1422stripwrite: the reference chroma shape is read back off the
+    /// stored plane's own sample count, so the counts the PRODUCER writes
+    /// (`round_ss` crops, `decode.rs:25806`) must route back to the shape
+    /// they came from. A floor half-width here passes every even-width case
+    /// -- the pinned fixture's 256-wide frame included -- and silently drops
+    /// every odd-width 4:2:2 reference into the 4:2:0 arm, which is the
+    /// exact defect this lane fixed, one dimension over. So the table below
+    /// is driven off `round_ss`, not off hand-written numbers, and sweeps
+    /// odd and even widths.
+    #[test]
+    fn a_reference_chroma_sample_count_routes_back_to_its_own_format() {
+        for w in [2usize, 3, 4, 5, 8, 9, 16, 17, 64, 65, 128, 129] {
+            for h in [2usize, 3, 4, 5, 8, 9, 64, 65, 144, 145] {
+                let cases = [
+                    ("4:4:4", round_ss(w, 0) * round_ss(h, 0), (w, h)),
+                    ("4:2:2", round_ss(w, 1) * round_ss(h, 0), (round_ss(w, 1), h)),
+                    (
+                        "4:2:0",
+                        round_ss(w, 1) * round_ss(h, 1),
+                        (w / 2, h / 2),
+                    ),
+                ];
+                for (name, len, want) in cases {
+                    assert_eq!(
+                        ref_chroma_shape(len, w, h),
+                        want,
+                        "{name} reference of {w}x{h} (chroma {len} samples) \
+                         must route back to its own shape"
+                    );
+                }
+            }
+        }
+    }
+
+    /// lane-av1422stripwrite: the whole point of the 4:2:2 arm is that it
+    /// claims the frame's FULL chroma height -- that is what stops every
+    /// chroma MC sourcing a row at or past the midpoint from being clamped
+    /// against `true_height`. Pinned on the t422 shape.
+    #[test]
+    fn a_422_reference_claims_the_full_chroma_height() {
+        // 256x144 luma at ss (1, 0): chroma is 128 wide and 144 rows tall.
+        let (cw, ch) = ref_chroma_shape(round_ss(256, 1) * 144, 256, 144);
+        assert_eq!((cw, ch), (128, 144));
+        // The bug's own signature: 72 rows claimed for 144 rows held.
+        assert!(ch > 144 / 2, "a 4:2:2 reference must not claim half its rows");
     }
 
     /// [`last_only`] plus `GOLDEN_FRAME` (index 4 of the name-keyed array)

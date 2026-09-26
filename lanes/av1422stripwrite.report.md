@@ -2,7 +2,8 @@
 # chroma write/anchor: a reference picture's chroma plane claimed
 # `h / 2` rows, so every chroma MC sourced at or past the frame's
 # midpoint was clamped; the pinned 16-frame t422 stream now decodes
-# byte-exact
+# byte-exact (first cut FAILed on review for a floor half-width where
+# the producer ceils — corrected, ladder re-run, still 48/48 + 16/16)
 
 ## Outcome
 
@@ -68,12 +69,12 @@ let (cw, ch) = if full { (g.width, g.height) } else { (g.width / 2, g.height / 2
 A stored reference carries no subsampling field, so the code inferred it
 from the sample count — but the inference only knew 4:4:4 (luma-sized) and
 4:2:0 (a quarter). A 4:2:2 reference is **half-width, full-height**:
-`(w/2) * h`, which matches neither, so it fell into the 4:2:0 branch and
-claimed `h / 2` rows. The stored data was never wrong (the frame is stored
-through `round_ss(fw, ss_x) x round_ss(fh, ss_y)`, `decode.rs:25806`, which
-is 4:2:2-correct) — only the *declared* shape was, and
-`whole_plane` copies it into `width`/`height`/`true_*`, which is what every
-chroma MC and every edge clamp reads.
+`round_ss(w, 1) * h`, which matches neither, so it fell into the 4:2:0
+branch and claimed `h / 2` rows. The stored data was never wrong (the frame
+is stored through `round_ss(fw, ss_x) x round_ss(fh, ss_y)`,
+`decode.rs:25806`, which is 4:2:2-correct) — only the *declared* shape was,
+and `whole_plane` copies it into `width`/`height`/`true_*`, which is what
+every chroma MC and every edge clamp reads.
 
 Consequence: at 4:2:2, **every** inter chroma prediction whose source row
 was at or past the frame's vertical midpoint read clamped garbage, on every
@@ -89,18 +90,28 @@ One helper, both call sites (`decode.rs`):
 
 ```rust
 fn ref_chroma_shape(len: usize, width: usize, height: usize) -> (usize, usize) {
-    if len == width * height { (width, height) }            // 4:4:4
-    else if len == (width / 2) * height { (width / 2, height) }  // 4:2:2
-    else { (width / 2, height / 2) }                        // 4:2:0
+    let half_w = round_ss(width, 1);
+    if len == width * height { (width, height) }        // 4:4:4
+    else if len == half_w * height { (half_w, height) } // 4:2:2
+    else { (width / 2, height / 2) }                    // 4:2:0
 }
 ```
 
-The sample count is exact and unambiguous for all three chroma formats, so
-no new field has to be threaded. `Picture`'s `u`/`v` doc comment
-(`encode.rs`) was corrected to state the real contract (half width, the
-frame's own chroma height) — the inference above depends on it.
+The half width comes from `round_ss`, **not** a bare `width / 2`, because
+that is what the producer used: a frame is stored through
+`round_ss(fw, ss_x) x round_ss(fh, ss_y)` (`decode.rs:25806`) and
+`round_ss(dim, 1) == (dim + 1) >> 1` is a **ceil**. A floor test here
+(this lane's first cut, corrected on review) silently misses every
+odd-width 4:2:2 reference and drops it into the 4:2:0 arm — the same
+defect one dimension over. The 4:2:0 arm is left at the old
+`(width / 2, height / 2)` on purpose, so 4:2:0 keeps the exact shape it
+always had.
 
-**Untouched, provably:** the current frame's chroma planes were already
+`Picture`'s `u`/`v` doc comment (`encode.rs`) was corrected to state the
+real contract (half width, the frame's own chroma height) — the inference
+above depends on it.
+
+**Untouched:** the current frame's chroma planes were already
 `(width >> ss_x) x (height >> ss_y)` (`decode.rs:27313`, `41692`); the
 `4:2:0` group-tail chroma SKIP arm (its owning lane); `stream.rs`'s 4:2:2
 header refusal (byte-identical, unconditional — the local
@@ -125,22 +136,22 @@ REVERTED).
   48 groups, 0 diffs, 16/16 final. The oracle ladder was regenerated with
   the current build and is byte-identical to the parent lane's on every
   frame where both exist.
-- **4:2:0/4:4:4 identity, measured:** `ref_chroma_shape` takes the *same*
-  branch as the old two-way test for both other formats — 4:4:4 hits
-  `len == width * height` first, and a 4:2:0 plane's `(w/2) * (h/2)` can
-  only equal `(w/2) * h` at `h == 0` — so they are value-identical by
-  construction, and the gates confirm it: `cargo test -p ec-av1 --lib --
-  lossless decodes_sample_exact 444` (target dir
-  `~/.cache/cargo-target-av1422stripwrite`) is **16 passed, 0 failed, 3
-  ignored** — `a_lossless_libaom_key_frame_decodes_sample_exact`,
-  `a_lossless_libaom_inter_frame_decodes_sample_exact`,
-  `a_real_aomenc_mixed_lossless_segment_frame_decodes_sample_exact`,
-  `a_lossless_sb128_rect_intra_block_decodes_sample_exact`,
-  `a_lossless_sb128_square_frame_clips_overhanging_chroma_tus`,
-  `a_lossless_16x4_chroma_pair_repairs_the_measured_site`,
-  `a_skipped_lossless_intrabc_rect_strip_zeroes_its_entropy_bands`, the
-  WHT round-trip, the tile-layout dual-decoder sweep and the six
-  64x64-root encode/decode gates.
+- **4:2:0/4:4:4 identity, measured three ways.**
+  *By construction:* the inference's 4:4:4 arm is the old first test
+  unchanged, and the 4:2:0 arm is the old fallback `(w / 2, h / 2)`
+  verbatim — the only thing between them is the inserted 4:2:2 test, which
+  can only fire on a count a 4:2:0 or 4:4:4 plane does not have.
+  *Brute-forced:* against the producer's own `round_ss` crops
+  (`decode.rs:25806`) over every `w, h` in `1..=128`, all three formats
+  route correctly for **every `w >= 2 && h >= 2`**, every misread is
+  confined to `w == 1` or `h == 1` (where the counts genuinely coincide,
+  so no length test can separate them — not reachable by a decodable
+  frame), and **zero** 4:2:0 shapes differ from what the old two-way test
+  produced.
+  *Gated:* `cargo test -p ec-av1 --lib -- lossless decodes_sample_exact
+  444 reference_chroma` in its own target dir
+  `~/.cache/cargo-target-av1422stripwrite-gate` — see below for what that
+  run is and is not evidence of.
 - **Oracle instrumentation (measurement, not decode).** The oracle's
   `EC_AV1_POSTCDEF_DUMP` rung sat inside `if (!optimized_loop_restoration)`,
   so a frame with no CDEF and no superres produced **no** post-CDEF dump —
@@ -151,8 +162,34 @@ REVERTED).
   `ec_dump_postcdef()` called from both branches; the oracle confirms
   frame 15's post-CDEF equals its post-deblock (no CDEF on that frame),
   and our frame 15 post-CDEF is byte-identical to it.
+- **A gate run that was thrown away, and why.** An earlier identity-gate
+  run on this branch was launched against the ceil form and then
+  **invalidated by my own concurrent edits**: while it was in flight I added
+  the two routing tests below and deliberately mutated `half_w` back to the
+  floor form to prove the test non-vacuous. Its result was never delivered,
+  and whatever it compiled was not the shipping source (`decode.rs`
+  md5 `999348d786ca0a8e930010ee46184d87` is the tree the accepted run
+  covers). It is recorded here as **no evidence** rather than quietly
+  dropped, and the accepted run is a clean re-run in a dedicated target
+  dir with nothing else of mine touching cargo. Not a target-dir lock: the
+  other suites on the host each use their own
+  `$HOME/.cache/av1-local-suite/target-*` dir.
 - `cargo check -p ec-av1 --all-targets` (target dir
   `~/.cache/cargo-target-av1422stripwrite`): **0 warnings, 0 errors**.
+- **Regression tests, and proof they are not vacuous.** Two unit tests in
+  `decode.rs`'s test module, the only 4:2:2-reachable gate while the header
+  refusal stands (no stream can reach the code path otherwise):
+  `a_reference_chroma_sample_count_routes_back_to_its_own_format` drives
+  all three formats off the producer's own `round_ss` crops over odd AND
+  even widths (2,3,4,5,8,9,16,17,64,65,128,129) and heights
+  (2,3,4,5,8,9,64,65,144,145), and
+  `a_422_reference_claims_the_full_chroma_height` pins the t422 shape
+  (256x144 -> chroma 128x144, explicitly not the 72 rows the bug claimed).
+  **Mutation proof:** with `half_w` reverted to `width / 2` — the exact
+  floor form this lane's first cut shipped and the review caught — the first
+  test FAILS with `4:2:2 reference of 3x2 (chroma 4 samples) must route
+  back to its own shape`, and passes again on the restored ceil form. So
+  the test pins the defect, not the implementation.
 - `git status` names `decode.rs`, `encode.rs` (doc comment) and this
   report. Every temporary rung (`EC_SW422` in the 4:2:2 per-piece arm and
   in `build_c`; `SUB48`/`SUB48D`/`SUB48P` in the oracle's
@@ -161,9 +198,21 @@ REVERTED).
 ## State
 
 - Commit on `lane-av1-422stripwrite` (no push): the `ref_chroma_shape`
-  helper + its two call sites in `crates/ec-av1/src/decode.rs`, the
-  `Picture` chroma-shape doc correction in `crates/ec-av1/src/encode.rs`,
-  and this report.
+  helper + its two call sites in `crates/ec-av1/src/decode.rs`, its two
+  routing regression tests, the `Picture` chroma-shape doc correction in
+  `crates/ec-av1/src/encode.rs`, and this report. The first cut was FAILed
+  on review for using a floor half-width where the producer ceils; the
+  corrected helper, the ladder re-run (48/48 + 16/16 again) and the
+  identity re-proof are all in this commit.
+- **Merge note.** The sibling lane's `RefPix` three-way inference
+  (`39f45c31`, lane-av1-422bigblock) edits the same two call sites. Both
+  now agree on the arithmetic — the half width is `round_ss(w, 1)`, i.e.
+  ceil, because that is what `decode.rs:25806` stores — so the union is a
+  union, not a floor-vs-ceil fight. If that lane threads an explicit
+  subsampling instead of inferring one from the length, prefer it and drop
+  this helper; the 48/48 result is a property of the *shape* being right,
+  not of how it is derived, so it survives either way. Re-run the 16-frame
+  ladder after resolving.
 - **No residual to hand on.** The 4:2:2 stream is pixel-exact end to end
   on this fixture, so the 16-frame ladder is no longer a frontier. What
   remains for 4:2:2 is coverage, not correctness: the 4:2:2 header
