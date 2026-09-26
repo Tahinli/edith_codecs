@@ -30420,14 +30420,30 @@ fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
 /// **Ambiguity, measured rather than argued away:** the inference reads a
 /// format off a length, so it is only as good as the lengths being
 /// distinct. Brute-forced against the producer's own `round_ss` crops over
-/// every `w, h` in `1..=128`, the three counts are distinct and routed
-/// correctly for **every `w >= 2 && h >= 2`**, and every misread is
-/// confined to `w == 1` or `h == 1` (a 1-row chroma plane reads as 4:2:2,
-/// a 1-column one as 4:4:4 -- the counts genuinely coincide there, so no
-/// length test can separate them). No stream this decoder accepts reaches
-/// either; the pinned fixture's chroma is 128x144. The 4:2:0 arm is
-/// deliberately left at the old `(w / 2, h / 2)`: over the same sweep,
-/// **zero** 4:2:0 shapes differ from what the old two-way test produced.
+/// every `w, h` in `1..=128`, the 4:4:4 and 4:2:2 counts are distinct from
+/// each other and from the 4:2:0 count, and both route correctly for
+/// **every `w >= 2 && h >= 2`**. No stream this decoder accepts reaches a
+/// 1-pixel chroma plane; the pinned fixture's chroma is 128x144.
+///
+/// **Open gap, 4:2:0 at odd dimensions (pre-existing).** The 4:2:0 arm is
+/// left at the old `(width / 2, height / 2)` floor, which is byte-identical
+/// to what the two-way test this replaces produced -- that was the point,
+/// since no 4:2:0 stream changed shape. It is nevertheless the wrong shape
+/// for an odd-dimension 4:2:0 reference: the producer stored
+/// `round_ss(w, 1) x round_ss(h, 1)`, so the floor arm under-declares.
+/// Measured over the `1..=128` square: the floor under-declares in
+/// 12160 of the 16256 pairs with `w >= 2` (12288 of all 16384, the extra
+/// 128 being the `w == 1` column, where the arm declares a 0-wide plane).
+/// It is a *shape* error, not a misroute: a 4:2:0 count at `w == 1` and
+/// `h >= 2` collides with neither the 4:4:4 nor the 4:2:2 count, so the
+/// length test does put it in the right arm -- the floor fallback simply
+/// cannot express `(1, round_ss(h, 1))`. It is left alone because it
+/// predates this lane, is identical to the parent, and no in-tree coverage
+/// exercises an odd-dimension 4:2:0 reference. A ceil fallback
+/// (`(round_ss(w, 1), round_ss(h, 1))`) would close it, at the cost of
+/// departing from the parent on every odd-dimension 4:2:0 shape with
+/// nothing in the tree to justify the change; that call belongs to a lane
+/// that can bring odd-dimension 4:2:0 fixtures with it.
 fn ref_chroma_shape(len: usize, width: usize, height: usize) -> (usize, usize) {
     let half_w = round_ss(width, 1);
     if len == width * height {
