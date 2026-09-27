@@ -8469,7 +8469,7 @@ impl Neighbours {
                 o.2 += dc_vote(left[plane].dc);
             }
         }
-        out
+                out
     }
 
     /// [`Self::around`] with independent above (`w`)/left (`h`) extents, in
@@ -25950,6 +25950,22 @@ pub fn llintra8_chroma_walk_hits() -> usize {
     LLINTRA8_CHROMA_WALK_HITS.with(|c| c.get())
 }
 
+thread_local! {
+    /// lane-av1sub8rect444: how many of `decode_intra_sub8_leaf`'s 8x4/4x8
+    /// INTRA leaves ran the lossless 4:4:4 per-unit chroma walk (two TX_4X4
+    /// units per plane, plane-major) instead of one TX_8X4/TX_4X8 rect unit
+    /// -- the shape whose unit count AND skip ctx the rect read got wrong.
+    /// A gate proving the arm fired; CHROMA_SPLIT_TX_HITS cannot attribute
+    /// its bumps to THIS leaf.
+    pub(crate) static LLSUB8RECT444_CHROMA_WALK_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`LLSUB8RECT444_CHROMA_WALK_HITS`]: lossless 4:4:4 chroma walks through a
+/// sub-8 8x4/4x8 INTRA leaf.
+pub fn llsub8rect444_chroma_walk_hits() -> usize {
+    LLSUB8RECT444_CHROMA_WALK_HITS.with(|c| c.get())
+}
+
 fn read_sb128_root(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -35915,9 +35931,20 @@ fn decode_intra_sub8_leaf(
     // No angle delta below 8x8 (`av1_use_angle_delta`), for luma or chroma.
     let angle_delta_y = 0;
     let (uv_mode, alpha) = if has_chroma {
-        // `is_cfl_allowed` is `wide <= 32 && high <= 32` -- true for this
-        // shape, so the 14-symbol CFL alphabet is the right one.
-        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        // `is_cfl_allowed` (blockd.h): away from lossless it is
+        // `wide <= 32 && high <= 32` -- true for this shape; at lossless the
+        // CHROMA plane block must be a single TX_4X4, so at 4:4:4 only the
+        // 4x4 leaf keeps the 14-symbol CFL alphabet while an 8x4/4x8 leaf
+        // reads the 13-symbol `uv_mode_no_cfl` one (the t6 frame-1 8x4 leaf
+        // desynced at its uv_mode symbol reading the CFL alphabet,
+        // lane-av1llintercdf). At 4:2:0 a sub-8 shape's chroma block is
+        // always 4x4-or-smaller, so the predicate stays true and this read
+        // is unchanged.
+        let uv_mode = if cfl_allowed_px(bw, bh, fctx) {
+            dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
+        };
         if step {
             eprintln!(
                 "EC_ISTEP mi_row={} mi_col={} name=uv_mode val={uv_mode} rng={}",
@@ -36292,6 +36319,7 @@ fn decode_intra_sub8_leaf(
     }
 
     let ac = alpha.map(|_| if chroma_444 { cfl_src_rect(px, py, bw, bh) } else { cfl_src(gpx, gpy, 8) });
+    let mut chroma_stamped_per_unit = false;
     let (u_grid, v_grid): (Grid, Grid) = if skip {
         if alpha.is_some() {
             hit!(CHROMA_SKIP_CFL_HITS);
@@ -36308,6 +36336,95 @@ fn decode_intra_sub8_leaf(
             (Grid::Zero(16), Grid::Zero(16))
         }
     } else if chroma_444 && bw != bh {
+        if lossless(fctx) {
+            // lane-av1sub8rect444: lossless codes TX_4X4 on EVERY plane
+            // (`av1_get_tx_size`, blockd.h:1383), so this leaf's 8x4/4x8
+            // chroma plane block is a 1x2/2x1 raster of TX_4X4 units per
+            // plane, PLANE-MAJOR -- the same per-unit walk
+            // [`read_intra_chroma_lossless`] runs for whole blocks and this
+            // leaf's own luma `split` runs above, not one TX_8X4/TX_4X8
+            // rect unit. The rect read was wrong twice over: its unit count
+            // left the second unit's coefficients in the bitstream, and its
+            // skip ctx fixed at above+left missed `get_txb_ctx`'s
+            // plane-block-bigger-than-transform term (libaom ctx 10+above
+            // +left, our tables' +3), where the oracle read ctx 11≡4.
+            let (mut uo, mut vo) = (Vec::new(), Vec::new());
+            for plane_idx in 1..3 {
+                for tu in 0..2usize {
+                    let (ox, oy) = if vert { (0, tu * 4) } else { (tu * 4, 0) };
+                    // libaom's `max_blocks_wide/high` clip: a unit whose
+                    // origin is past the frame edge is not coded at all
+                    // (`decode_token_recon_block`). At 4:4:4 the unit's
+                    // chroma origin is the leaf's own (px, py).
+                    if px + ox >= u.true_width || py + oy >= u.true_height {
+                        continue;
+                    }
+                    // At 4:4:4 a TX_4X4 chroma unit IS one mi cell.
+                    let tu_mi = (lmi.0 + oy / MI, lmi.1 + ox / MI);
+                    let tu_around = neighbours.around_mi(tu_mi, MI);
+                    let tu_r = tu_reach(
+                        bw,
+                        bh,
+                        ox,
+                        oy,
+                        4,
+                        reach_c,
+                        px,
+                        py,
+                        y.width,
+                        y.height, fctx,
+                    );
+                    let buf: &mut PlaneBuf<'static> =
+                        if plane_idx == 1 { &mut *u } else { &mut *v };
+                    // The plane block (8x4/4x8) is bigger than the TX_4X4
+                    // transform, so `get_txb_ctx`'s chroma ctx_offset is 10,
+                    // not 7 -- our chroma tables carry the offset-10 rows at
+                    // +3, the same `Some(3)` [`read_intra_chroma_lossless`]
+                    // derives from `blk_w > 4 || blk_h > 4`.
+                    let tu_grid = read_plane(
+                        dec,
+                        cdfs,
+                        TxbSet::Chroma4,
+                        scan4,
+                        plane_idx,
+                        tu_around[plane_idx],
+                        mode,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        tu_r,
+                        buf,
+                        px + ox,
+                        py + oy,
+                        4,
+                        TX4,
+                        base_q_idx,
+                        None,
+                        None,
+                        Some(3),
+                        smooth_neighbor_uv, fctx,
+                    )?;
+                    // The unit's own coefficient context, stamped per unit
+                    // (`av1_set_contexts`); the tail's whole-leaf chroma
+                    // stamp below is skipped for this shape.
+                    neighbours.record_mi_chroma(tu_mi, 4, 4, plane_idx, &tu_grid);
+                    hit!(CHROMA_SPLIT_TX_HITS);
+                    let dst = mu_units(
+                        if plane_idx == 1 { &mut uo } else { &mut vo },
+                        bw * bh,
+                    );
+                    for row in 0..4 {
+                        let start = (oy + row) * bw + ox;
+                        dst[start..start + 4].copy_from_slice(&tu_grid[row * 4..][..4]);
+                    }
+                }
+            }
+            chroma_stamped_per_unit = true;
+            hit!(LLSUB8RECT444_CHROMA_WALK_HITS);
+            (
+                if uo.is_empty() { Grid::Zero(bw * bh) } else { Grid::Own(uo) },
+                if vo.is_empty() { Grid::Zero(bw * bh) } else { Grid::Own(vo) },
+            )
+        } else {
         // The leaf's own TX_8X4/TX_4X8 chroma unit: it IS the chroma plane
         // block, so `get_txb_ctx` fixes the skip context at above+left.
         let ca = neighbours.around_mi_rect(lmi, bw, bh);
@@ -36346,6 +36463,7 @@ fn decode_intra_sub8_leaf(
         let ug = read_chroma(1, ca[1], alpha.zip(ac).map(|((au, _), ac)| (au, ac)))?;
         let vg = read_chroma(2, ca[2], alpha.zip(ac).map(|((_, av), ac)| (av, ac)))?;
         (ug, vg)
+        }
     } else {
         let chroma_around = neighbours.around_mi(if chroma_444 { lmi } else { group_mi }, if chroma_444 { 4 } else { 8 });
         let ug = read_plane(
@@ -36360,9 +36478,19 @@ fn decode_intra_sub8_leaf(
         )?;
         (ug, vg)
     };
+    // The 4:4:4 lossless walk above already stamped these bands PER UNIT
+    // (raster-order last writer per cell, exactly libaom's per-entry last
+    // update); the whole-leaf aggregate would clobber the two units' distinct
+    // states with one, so it runs only for the one-unit shapes (the same rule
+    // [`decode_leaf8`]'s intrabc arm and the inter 8x8 leaf obey). The walk
+    // must skip the 4:2:0 group-tail below too: it spans the GROUP's two mi
+    // rows/cols with one composed state, which would overwrite the walk's
+    // own stamps with the whole-leaf aggregate.
     if chroma_444 {
-        neighbours.record_mi_chroma(lmi, bw, bh, 1, &u_grid);
-        neighbours.record_mi_chroma(lmi, bw, bh, 2, &v_grid);
+        if !chroma_stamped_per_unit {
+            neighbours.record_mi_chroma(lmi, bw, bh, 1, &u_grid);
+            neighbours.record_mi_chroma(lmi, bw, bh, 2, &v_grid);
+        }
     } else {
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let bound_h = round_up_even(neighbours.mi_rows);

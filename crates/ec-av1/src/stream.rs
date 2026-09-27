@@ -6049,6 +6049,115 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1-444interband: the DEFAULT-partition lossless 4:4:4 pin for
+    /// the inter 16x4/4x16 strip's chroma band stamping (the pair_chroma
+    /// 4:2:0-only gate, commit d5325172). Fixture pinned into `fixtures/`:
+    /// testsrc2 128x96 yuv444p, aomenc `--profile=1 --lossless=1
+    /// --enable-palette=0 --enable-intrabc=0 --passes=1 --cpu-used=4
+    /// --limit=6 --obu` (the av1llkf.report.md recipe), 6 frames; 32487
+    /// bytes, sha256
+    /// `1e6dd4e05038c8d51e2c8d29f8c337130c4fea0aed629415535e6e53af9a2c72`.
+    ///
+    /// This is the stream whose frame 1 desynced at the 16x4 inter strip
+    /// mi(2,8) -- its U bc=0 `txb_skip` read base 0 where aom reads base 1,
+    /// because the skipped strip (1,8)'s pair-form context stamp smeared
+    /// zero over `left[2][1]`. Two pins, both measured at d5325172:
+    /// end-to-end, every sample of every frame must match the oracle
+    /// aomdec exactly (the pre-fix tree refuses mid-frame-1, so the gate
+    /// is red by refusal, not by silent pass), and the 1:4 counter delta
+    /// must show the strips decoded WITHOUT the pair rewrite firing
+    /// (`horz4=20 vert4=28 chroma_pairs=0` -- chroma_pairs > 0 on this
+    /// pairless 4:4:4 stream is the defect reappearing, the
+    /// class `pair-rewrite-at-ss0`).
+    #[test]
+    fn a_lossless_444_defaultp_inter_strip_stream_decodes_byte_exact() {
+        const NAME: &str = "a_lossless_444_defaultp_inter_strip_stream_decodes_byte_exact";
+        const FIXTURE_LEN: usize = 32487;
+        const FIXTURE_FNV: u64 = 0x5278_9f0f_ce2d_1e52;
+        const W: usize = 128;
+        const H: usize = 96;
+        const FRAMES: usize = 6;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_defaultp_inter_strip.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        let strips_before = decode::inter16_rect4_counters();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
+        });
+        let strips_after = decode::inter16_rect4_counters();
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for f in &frames {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+        // The 1:4 strips must have fired, and the 4:2:0 pair rewrite must
+        // NOT have (there are no chroma pairs at ss 0/0).
+        let (horz4, vert4, chroma_pairs) = (
+            strips_after.0 - strips_before.0,
+            strips_after.1 - strips_before.1,
+            strips_after.2 - strips_before.2,
+        );
+        assert_eq!(horz4, 20, "{NAME}: HORZ_4 strip count moved");
+        assert_eq!(vert4, 28, "{NAME}: VERT_4 strip count moved");
+        assert_eq!(
+            chroma_pairs, 0,
+            "{NAME}: chroma pairs closed on a 4:4:4 stream \
+             (class pair-rewrite-at-ss0)"
+        );
+
+        // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
+        if aomdec_path().is_file() {
+            let dir = std::env::temp_dir().join(format!("ec-av1-ll444dp-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let raw = dir.join("aomdec.raw");
+            let out = Command::new(aomdec_path())
+                .args(["--codec=av1", "--rawvideo", "-o"])
+                .arg(&raw)
+                .arg(&obu)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("aomdec failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: the oracle aomdec refused the stream: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(ref_raw.len(), W * H * 3 * FRAMES, "{NAME}: aomdec raw size");
+            for (i, f) in frames.iter().enumerate() {
+                let base = i * W * H * 3;
+                for ((plane, off), p) in [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
+                    .into_iter()
+                    .zip(["y", "u", "v"])
+                {
+                    let want = &ref_raw[base + off..base + off + W * H];
+                    let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ \
+                         (class pair-rewrite-at-ss0)"
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+        }
+    }
+
+
     /// lane-lossless128: a LOSSLESS key frame that codes a 128-axis
     /// (`BLOCK_64X128`) intra block -- the shape libaom's `read_tx_size` forces
     /// to `TX_4X4` on its very first line (`decodeframe.c:1183`), so every plane
