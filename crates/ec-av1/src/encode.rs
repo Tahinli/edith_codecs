@@ -6801,6 +6801,8 @@ fn obmc_prediction(
         side,
         side,
         side,
+        crate::decode::ss_x(fctx),
+        crate::decode::ss_y(fctx),
         side / 2,
         x,
         y,
