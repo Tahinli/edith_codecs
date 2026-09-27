@@ -20624,7 +20624,13 @@ fn sub8_leaf_chroma422(
         Reach::of_rect(leaf_shape.0, leaf_shape.1, px, py, y.width, y.height, fctx)
     };
     let chroma_around = neighbours.around_mi_422_chroma(ctx_mi, 8, 4);
-    let ac = alpha.map(|_| cfl_src_rect(px, py, 8, 4));
+    // lane-av1422sub8pix: the CfL AC signal spans the UNIT's luma footprint,
+    // anchored at the same FLOORED luma x the write/prediction anchor below
+    // uses -- `px` (the odd leaf's own luma x) steps half the span into the
+    // RIGHT neighbour group (t422 frame-1 leaf (1,23): the unit reconstructs
+    // chroma px 44..47 from luma 88..95, while a `px`-anchored source
+    // averaged luma 92..99 and every CFL unit of the group mismatched).
+    let ac = alpha.map(|_| cfl_src_rect((lmi.1 & !1) * MI, py, 8, 4));
     let grids: (Grid, Grid) = if skip {
         // A skipped chroma-reference leaf still predicts (the CfL contribution
         // survives a skip); no coefficient symbol exists.
@@ -33612,7 +33618,7 @@ fn decode_inter_block(
                 pu0.true_width,
                 pu0.true_height,
                 mv_to_q4(cpx, mv0.1, ss_x(fctx)),
-                mv_to_q4(cpy, mv0.0, ss_x(fctx)),
+                mv_to_q4(cpy, mv0.0, ss_y(fctx)),
                 scale0,
                 chroma_stride,
                 chroma_buf_h,
@@ -33640,7 +33646,7 @@ fn decode_inter_block(
                 pu1.true_width,
                 pu1.true_height,
                 mv_to_q4(cpx, mv1.1, ss_x(fctx)),
-                mv_to_q4(cpy, mv1.0, ss_x(fctx)),
+                mv_to_q4(cpy, mv1.0, ss_y(fctx)),
                 scale1,
                 chroma_stride,
                 chroma_buf_h,
@@ -33690,7 +33696,7 @@ fn decode_inter_block(
                 pv0.true_width,
                 pv0.true_height,
                 mv_to_q4(cpx, mv0.1, ss_x(fctx)),
-                mv_to_q4(cpy, mv0.0, ss_x(fctx)),
+                mv_to_q4(cpy, mv0.0, ss_y(fctx)),
                 scale0,
                 chroma_stride,
                 chroma_buf_h,
@@ -33718,7 +33724,7 @@ fn decode_inter_block(
                 pv1.true_width,
                 pv1.true_height,
                 mv_to_q4(cpx, mv1.1, ss_x(fctx)),
-                mv_to_q4(cpy, mv1.0, ss_x(fctx)),
+                mv_to_q4(cpy, mv1.0, ss_y(fctx)),
                 scale1,
                 chroma_stride,
                 chroma_buf_h,
@@ -35085,7 +35091,7 @@ fn decode_inter_block(
                     pu_ref.true_width,
                     pu_ref.true_height,
                     mv_to_q4(cpx, mv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv.0, ss_y(fctx)),
                     chroma_stride,
                     chroma_buf_h,
                     write_chroma_w,
@@ -35100,7 +35106,7 @@ fn decode_inter_block(
                     pv_ref.true_width,
                     pv_ref.true_height,
                     mv_to_q4(cpx, mv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv.0, ss_y(fctx)),
                     chroma_stride,
                     chroma_buf_h,
                     write_chroma_w,
@@ -35132,7 +35138,7 @@ fn decode_inter_block(
                     pu_ref.true_width,
                     pu_ref.true_height,
                     mv_to_q4(cpx, mv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv.0, ss_y(fctx)),
                     luma_scale,
                     chroma_stride,
                     chroma_buf_h,
@@ -35148,7 +35154,7 @@ fn decode_inter_block(
                     pv_ref.true_width,
                     pv_ref.true_height,
                     mv_to_q4(cpx, mv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv.0, ss_y(fctx)),
                     luma_scale,
                     chroma_stride,
                     chroma_buf_h,
@@ -35243,7 +35249,7 @@ fn decode_inter_block(
                         src.true_width,
                         src.true_height,
                         mv_to_q4(cpx, prev_mv.1, ss_x(fctx)),
-                        mv_to_q4(cpy, prev_mv.0, ss_x(fctx)),
+                        mv_to_q4(cpy, prev_mv.0, ss_y(fctx)),
                         prev_scale,
                         piece_w,
                         piece_h,
@@ -37876,7 +37882,9 @@ fn decode_inter_sub8_split4(
                     });
                 let mut pred_u = refill(std::mem::take(&mut out[1]), B4 * B4);
                 let mut pred_v = refill(std::mem::take(&mut out[2]), B4 * B4);
-                for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
+                for (pi, (plane, dst)) in
+                    [(sref_u, &mut pred_u), (sref_v, &mut pred_v)].into_iter().enumerate()
+                {
                     let mut buf = vec![0u16; B4 * B4];
                     // Right 2x4 half: this piece's own ref/mv/filters.
                     let mut half = vec![0u16; 2 * 4];
@@ -37908,12 +37916,24 @@ fn decode_inter_sub8_split4(
                         }
                         None => (pc_mv, pc_hf, pc_vf, (pc_ref_y, sref_u, sref_v), pc_scale),
                     };
-                    let (_, l_ref_u, _) = l_planes;
+                    // lane-av1422sub8pix: the left half predicts from the
+                    // LEFT piece's own plane of its reference -- U for the U
+                    // iteration, V for the V one. The old `l_ref_u` grab
+                    // fed the V plane's left half from the reference's U
+                    // plane (V cols 44..45 of the t422 frame-1 groups read
+                    // U samples; U was exact, V wasn't).
+                    let l_ref = if pi == 0 {
+                        let (_, u, _) = l_planes;
+                        u
+                    } else {
+                        let (_, _, v) = l_planes;
+                        v
+                    };
                     mc::predict_maybe_scaled(
-                        &l_ref_u.data,
-                        l_ref_u.width,
-                        l_ref_u.true_width,
-                        l_ref_u.true_height,
+                        &l_ref.data,
+                        l_ref.width,
+                        l_ref.true_width,
+                        l_ref.true_height,
                         mv_to_q4(unit_x, l_mv.1, ss_x(fctx)),
                         mv_to_q4(unit_y, l_mv.0, ss_y(fctx)),
                         l_scale,
@@ -40510,7 +40530,7 @@ fn decode_inter_block8(
                     pu0.true_width,
                     pu0.true_height,
                     mv_to_q4(cpx, mv0.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv0.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv0.0, ss_y(fctx)),
                     scale0,
                     chroma_w,
                     chroma_h,
@@ -40525,7 +40545,7 @@ fn decode_inter_block8(
                     pu1.true_width,
                     pu1.true_height,
                     mv_to_q4(cpx, mv1.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv1.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv1.0, ss_y(fctx)),
                     scale1,
                     chroma_w,
                     chroma_h,
@@ -40557,7 +40577,7 @@ ss_y(fctx),
                     pv0.true_width,
                     pv0.true_height,
                     mv_to_q4(cpx, mv0.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv0.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv0.0, ss_y(fctx)),
                     scale0,
                     chroma_w,
                     chroma_h,
@@ -40572,7 +40592,7 @@ ss_y(fctx),
                     pv1.true_width,
                     pv1.true_height,
                     mv_to_q4(cpx, mv1.1, ss_x(fctx)),
-                    mv_to_q4(cpy, mv1.0, ss_x(fctx)),
+                    mv_to_q4(cpy, mv1.0, ss_y(fctx)),
                     scale1,
                     chroma_w,
                     chroma_h,
