@@ -23,7 +23,12 @@
    columns at ss_x 1, so every column's whole-unit dc sign is counted
    twice). At ss (1,0) it now reads `(16, 4)` through
    [`Neighbours::around_mi_422_chroma`]; the 4:2:0 pair merge keeps the
-   (16, 8) span and the per-mi gather, as do 4:4:4 and every VERT shape.
+   (16, 8) span and the per-mi gather, as does 4:4:4. The same reroute
+   catches 4:2:2 VERT (pair span (8, 16)): its above side covers one
+   chroma column per two luma mi columns — the identical double-count —
+   so it reads through [`around_mi_422_chroma`] too, and is
+   oracle-correct there. Only the ss gate's excluded shapes (4:2:0
+   VERT/4:4:4 VERT) keep the plain gather.
 3. **The intra strip's chroma gather** (the charter's named site,
    `decode_rect4_16_strip` ~15331): the else arm's
    `around_mi_rect(pair_mi, pw, ph)` is routed through
