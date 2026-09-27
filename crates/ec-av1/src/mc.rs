@@ -2142,8 +2142,11 @@ pub(crate) fn diffwtd_mask(
 /// (64-m)*pred1) >> 6` (a plain, unrounded shift, matching the C `>>` on
 /// `int32_t`) then one final [`round2`] by [`INTER_POST_ROUND`]. `mask` is
 /// always the LUMA-resolution mask (`mask_stride` == luma block width);
-/// `subsampled` selects the 2x2-average chroma read (spec 7.11.3.14 /
-/// libaom's `subw == 1 && subh == 1` branch) vs. the direct luma read.
+/// `(subw, subh)` are the PLANE's own subsampling shifts and pick the mask
+/// read exactly as aom_dsp/blend-a64-mask.c's four `subw`/`subh` branches do:
+/// `(0, 0)` the direct luma sample, `(1, 1)` the 2x2 box average,
+/// `(1, 0)`/`(0, 1)` the `AOM_BLEND_AVG` pair average on the subsampled axis
+/// alone (4:2:2).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blend_masked_compound(
     pred0: &[i32],
@@ -2152,7 +2155,8 @@ pub(crate) fn blend_masked_compound(
     mask_stride: usize,
     w: usize,
     h: usize,
-    subsampled: bool,
+    subw: usize,
+    subh: usize,
     dst: &mut [u16],
     fctx: &crate::decode::FrameCtx,
 ) {
@@ -2162,17 +2166,30 @@ pub(crate) fn blend_masked_compound(
     let post_round = INTER_POST_ROUND - round_delta(u32::from(crate::decode::bit_depth(fctx)));
     for i in 0..h {
         for j in 0..w {
-            let m = if subsampled {
-                let idx = (2 * i) * mask_stride + 2 * j;
-                round2(
-                    i32::from(mask[idx])
-                        + i32::from(mask[idx + 1])
-                        + i32::from(mask[idx + mask_stride])
-                        + i32::from(mask[idx + mask_stride + 1]),
-                    2,
-                )
-            } else {
-                i32::from(mask[i * mask_stride + j])
+            let m: i32 = match (subw, subh) {
+                (0, 0) => i32::from(mask[i * mask_stride + j]),
+                (1, 1) => {
+                    let idx = (2 * i) * mask_stride + 2 * j;
+                    round2(
+                        i32::from(mask[idx])
+                            + i32::from(mask[idx + 1])
+                            + i32::from(mask[idx + mask_stride])
+                            + i32::from(mask[idx + mask_stride + 1]),
+                        2,
+                    )
+                }
+                // aom_blend_a64_mask_c's `subw == 1 && subh == 0` branch:
+                // `AOM_BLEND_AVG(mask[2 * j], mask[2 * j + 1])` per row.
+                (1, 0) => {
+                    let idx = i * mask_stride + 2 * j;
+                    (i32::from(mask[idx]) + i32::from(mask[idx + 1]) + 1) >> 1
+                }
+                // the `subw == 0 && subh == 1` branch: averaged down the
+                // columns instead.
+                (_sw, _sh) => {
+                    let idx = (2 * i) * mask_stride + j;
+                    (i32::from(mask[idx]) + i32::from(mask[idx + mask_stride]) + 1) >> 1
+                }
             };
             let res = (m * pred0[i * w + j] + (64 - m) * pred1[i * w + j]) >> 6;
             // `post_round` above: `INTER_POST_ROUND - round_delta` -- see

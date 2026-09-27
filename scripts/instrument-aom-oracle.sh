@@ -40,6 +40,13 @@
 #       its superres margin (lane-superres r5: hand-tracing the arithmetic
 #       could only prove our own self-consistency, not correctness against
 #       libaom).
+#   EC_AV1_POSTCDEF_DUMP=<prefix> -> <prefix>.f<N> per frame, same shape as
+#       the POSTDEBLOCK rung (full ALIGNED-buffer rows), written right after
+#       the CDEF pass and before superres/LR -- splits a final-output
+#       mismatch into "already in CDEF" vs "introduced by loop restoration"
+#       without the 16-bit-only DUMP16 rungs (lane-av1422filter: on the
+#       pinned 4:2:2 keyframe this named the 251/259-sample CDEF chroma
+#       defect whose first samples were the ticket's first final samples).
 #   EC_TRACE_MODE_STEP=1 -> per-symbol range ladder inside
 #       ec_read_intra_frame_mode_info_impl (rung 5's renamed body):
 #       "EC_ISTEP mi_row=.. mi_col=.. name=skip val=.. rng=.." after
@@ -832,3 +839,66 @@ s = s.replace(anchor, anchor + dump, 1)
 open(path, "w").write(s)
 print("decodemv rung 14 (per-entry EC_STACK) instrumented")
 PYST
+
+# --- rung 15: post-CDEF, pre-superres 8-bit row dump (lane-av1422filter) ---
+# The 8-bit mirror of rung 6 one stage later: written right after the CDEF
+# pass (the `if (do_cdef) {...}` block) and before superres/LR, so a final
+# chroma/luma mismatch splits into "already in CDEF" vs "introduced by
+# loop restoration". The *_DUMP16 family covers this stage only in 16-bit
+# builds (its 8-bit run SEGFAULTS); this rung is the 8-bit one. lane-
+# av1422filter added it to the live oracle tree by hand first, then it was
+# transcribed here (class: instrument that lives only in a build tree).
+python3 - "$F" <<'PYC'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_POSTCDEF" in s:
+    print("postcdef dump already instrumented (no-op)")
+    sys.exit(0)
+
+anchor = """      if (do_cdef) {
+        if (pbi->num_workers > 1) {
+          av1_cdef_frame_mt(cm, &pbi->dcb.xd, pbi->cdef_worker,
+                            pbi->tile_workers, &pbi->cdef_sync,
+                            pbi->num_workers, av1_cdef_init_fb_row_mt,
+                            do_extend_border_mt);
+        } else {
+          av1_cdef_frame(&pbi->common.cur_frame->buf, cm, &pbi->dcb.xd,
+                         av1_cdef_init_fb_row);
+        }
+      }
+"""
+dump = """
+      /* EC_INSTRUMENTED_POSTCDEF (8-bit twin of the POSTDEBLOCK rung:
+       * full aligned buffer, post-CDEF pre-superres/LR) */
+      {
+        const char *ec_dump = getenv("EC_AV1_POSTCDEF_DUMP");
+        if (ec_dump) {
+          static int ec_postcdef_idx = 0;
+          char ec_path[1024];
+          snprintf(ec_path, sizeof(ec_path), "%s.f%d", ec_dump,
+                   ec_postcdef_idx++);
+          FILE *ec_f = fopen(ec_path, "wb");
+          if (ec_f) {
+            const YV12_BUFFER_CONFIG *ec_b = &cm->cur_frame->buf;
+            for (int ec_r = 0; ec_r < ec_b->y_height; ++ec_r)
+              fwrite(ec_b->y_buffer + ec_r * ec_b->y_stride, 1, ec_b->y_width,
+                     ec_f);
+            if (num_planes > 1) {
+              for (int ec_r = 0; ec_r < ec_b->uv_height; ++ec_r)
+                fwrite(ec_b->u_buffer + ec_r * ec_b->uv_stride, 1,
+                       ec_b->uv_width, ec_f);
+              for (int ec_r = 0; ec_r < ec_b->uv_height; ++ec_r)
+                fwrite(ec_b->v_buffer + ec_r * ec_b->uv_stride, 1,
+                       ec_b->uv_width, ec_f);
+            }
+            fclose(ec_f);
+          }
+        }
+      }
+"""
+assert anchor in s, "do_cdef block anchor moved"
+s = s.replace(anchor, anchor + dump, 1)
+open(path, "w").write(s)
+print("postcdef dump instrumented")
+PYC
