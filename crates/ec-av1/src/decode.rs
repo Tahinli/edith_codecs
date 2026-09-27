@@ -35409,9 +35409,12 @@ fn decode_inter_block(
                 // `!(subsampling_y)` row clause) -- pair_mi is the strip
                 // itself and the context reads the strip's own 8x4, ONE
                 // luma-mi row tall, with the 4:2:2 above sampling
-                // ([`Neighbours::around_mi_422_chroma`]). The 4:2:0 pair
-                // merge keeps the (16, 8) span and the plain per-mi gather
-                // (as do 4:4:4 and every VERT shape).
+                // ([`Neighbours::around_mi_422_chroma`]) -- and the same
+                // reroute catches 4:2:2 VERT: its (8, 16) pair span's
+                // above side covers one chroma column per two luma mi
+                // columns, the identical double-count. The plain per-mi
+                // gather survives only where the ss gate excludes it:
+                // the 4:2:0 pair merge (16, 8) and every 4:4:4 shape.
                 let around_c = match strip_chroma {
                     Some(s) if s.has_chroma => {
                         let (pw, ph) = if s.horz {
