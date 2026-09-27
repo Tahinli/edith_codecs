@@ -3941,6 +3941,30 @@ pub(crate) fn reset_skipped_intrabc_chroma_arm_hits() {
     SKIPPED_INTRABC_CHROMA_ARM_HITS.with(|c| c.set(0));
 }
 
+thread_local! {
+    /// lane-av1-ibcskip2: a sub-8x8 4:4:4 leaf that is BOTH intrabc AND
+    /// `skip` -- the arm whose chroma is the bare frame copy at the DV
+    /// (libaom `av1_build_inter_predictors_sb` runs regardless of `skip`).
+    /// Before the fix this route predicted intra-DC and every one of this
+    /// fixture's 150 such cells differed from the oracle on both chroma
+    /// planes.
+    static SKIPPED_INTRABC_DV_COPY_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SKIPPED_INTRABC_DV_COPY_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn skipped_intrabc_dv_copy_hits() -> usize {
+    SKIPPED_INTRABC_DV_COPY_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`SKIPPED_INTRABC_DV_COPY_HITS`] (gate tests call this before a
+/// decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_skipped_intrabc_dv_copy_hits() {
+    SKIPPED_INTRABC_DV_COPY_HITS.with(|c| c.set(0));
+}
+
 /// Zeroes [`INTRABC_HITS`] (gate tests call this before a decode).
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_intrabc_hits() {
@@ -5340,6 +5364,13 @@ thread_local! {
     /// walked at subsampling 0/0 (one unit per mi cell -- the geometry the
     /// hardcoded 4:2:0 span mis-stepped).
     static RECT_SPLIT_LOSSLESS_CHROMA444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-ibc444rect: unskipped intrabc 8x4/4x8 leaves whose luma
+    /// coefficients a lossless frame walked as per-4x4 inter units (the walk
+    /// that replaced the single rect unit).
+    static INTRABC_RECT8_LOSSLESS_LUMA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-ibc444rect: unskipped intrabc 8x4/4x8 leaves whose chroma a
+    /// lossless 4:4:4 frame walked as per-4x4 [`TxbSet::Chroma4`] units.
+    static INTRABC_RECT8_LOSSLESS_CHROMA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
@@ -5368,6 +5399,24 @@ pub fn skip_lossless_band_reset_hits() -> usize {
 /// must see this nonzero.
 pub fn rect_split_lossless_chroma444_hits() -> usize {
     RECT_SPLIT_LOSSLESS_CHROMA444_HITS.with(|c| c.get())
+}
+
+/// How many unskipped intrabc 8x4/4x8 leaves a lossless frame walked luma as
+/// per-4x4 inter units (lane-av1-ibc444rect).
+pub fn intrabc_rect8_lossless_luma_hits() -> usize {
+    INTRABC_RECT8_LOSSLESS_LUMA_HITS.with(|c| c.get())
+}
+
+/// How many unskipped intrabc 8x4/4x8 leaves a lossless 4:4:4 frame walked
+/// chroma as per-4x4 [`TxbSet::Chroma4`] units (lane-av1-ibc444rect).
+pub fn intrabc_rect8_lossless_chroma_hits() -> usize {
+    INTRABC_RECT8_LOSSLESS_CHROMA_HITS.with(|c| c.get())
+}
+
+/// Gate-side reset for the two lane-av1-ibc444rect counters above.
+pub fn reset_ibc444rect_hits() {
+    INTRABC_RECT8_LOSSLESS_LUMA_HITS.with(|c| c.set(0));
+    INTRABC_RECT8_LOSSLESS_CHROMA_HITS.with(|c| c.set(0));
 }
 
 /// Gate-side reset for the two lane-av1-loss64 counters above.
@@ -18190,17 +18239,27 @@ fn decode_leaf8(
             mv_to_q4(px, dv_col, 0), mv_to_q4(py, dv_row, 0),
             8, 8, mc::InterpFilterKind::Bilinear, &mut yb, fctx,
         );
-        let mut ub = vec![0u16; 4 * 4];
+        // The chroma extent is THIS frame's subsampled size of the 8x8 luma
+        // leaf (`get_plane_block_size`): 4x4 at 4:2:0, 8x8 at 4:4:4. The
+        // literal 4x4 this replaces hardcoded the 4:2:0 halving -- at 4:4:4
+        // the 16-sample override fed this leaf's own 8x8 chroma reconstruct,
+        // which indexed `prediction[16]` of a 16-sample buffer
+        // (len 16, index 16 at `PlaneBuf::reconstruct`). The same buffers
+        // are windowed at stride 8 by `read_intra_chroma_lossless` (the TX4
+        // 4:4:4-lossless arm) and consumed whole by the TX8 and skip arms,
+        // so all three heal with this one sizing.
+        let (cw, ch) = (8 >> ss_x(fctx), 8 >> ss_y(fctx));
+        let mut ub = vec![0u16; cw * ch];
         mc::predict_with_filter(
             &u.data, u.width, u.true_width, u.true_height,
-            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_x(fctx)),
-            4, 4, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
+            cw, ch, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
         );
-        let mut vb = vec![0u16; 4 * 4];
+        let mut vb = vec![0u16; cw * ch];
         mc::predict_with_filter(
             &v.data, v.width, v.true_width, v.true_height,
-            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_x(fctx)),
-            4, 4, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+            mv_to_q4(cpx, dv_col, ss_x(fctx)), mv_to_q4(cpy, dv_row, ss_y(fctx)),
+            cw, ch, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
         );
         (yb, ub, vb)
     });
@@ -18932,7 +18991,10 @@ fn read_intra_mode_sub8(
 /// arm for arm at leaf scale: a skipped leaf keeps its CfL contribution, an
 /// intrabc leaf predicts a frame copy at its DV with the luma `tx_type`
 /// inherited through [`INTRABC_CHROMA_TX`] (the caller arms it right after
-/// the luma read). The chroma position, reach and entropy-context span are
+/// the luma read) -- and a SKIPPED intrabc leaf is still the DV copy, never
+/// an intra prediction (lane-av1-ibcskip2: libaom's
+/// `av1_build_inter_predictors_sb` runs for an intrabc block regardless of
+/// `skip`). The chroma position, reach and entropy-context span are
 /// the leaf's own (ss 0/0); the 4x8/8x4 unit reads the same
 /// `ChromaRect8x4` tables [`decode_rect_split`] proves for that shape.
 /// Records the leaf's own `uv_mode` map entry and chroma above/left state,
@@ -18969,7 +19031,50 @@ fn sub8_leaf_chroma444(
     } else {
         Reach::of_rect(bw, bh, px, py, y.width, y.height, fctx)
     };
-    let grids = if skip {
+    let grids = if let Some(dv) = intrabc_dv.filter(|_| skip) {
+        // lane-av1-ibcskip2: a SKIPPED intrabc leaf still predicts the frame
+        // copy at its DV -- libaom's `av1_build_inter_predictors_sb` runs for
+        // an intrabc block regardless of `skip` (only the residual read is
+        // dropped), so the reconstruction is the bare DV copy. The intra push
+        // in the next arm is the NON-intrabc route; predicting DC there
+        // decoded flat cells where this fixture's oracle copies frame bytes
+        // (class skipped-intrabc-predicts-intra,
+        // lanes/av1ibcskip2.report.md). Same armed-palette-slot route the
+        // leaf's own luma skip arm uses (`decode_leaf_split4` /
+        // `decode_leaf_rect8`); the caller already flushed the recon queue
+        // before its luma DV copy, so the source samples are current.
+        let mut ub = vec![0u16; bw * bh];
+        mc::predict_with_filter(
+            &u.data, u.width, u.true_width, u.true_height,
+            mv_to_q4(px, dv.1, 0), mv_to_q4(py, dv.0, 0),
+            bw, bh, mc::InterpFilterKind::Bilinear, &mut ub, fctx,
+        );
+        let mut vb = vec![0u16; bw * bh];
+        mc::predict_with_filter(
+            &v.data, v.width, v.true_width, v.true_height,
+            mv_to_q4(px, dv.1, 0), mv_to_q4(py, dv.0, 0),
+            bw, bh, mc::InterpFilterKind::Bilinear, &mut vb, fctx,
+        );
+        hit!(SKIPPED_INTRABC_DV_COPY_HITS);
+        let zeros = &ZERO_RESIDUAL[..bw * bh];
+        if square {
+            set_palette_pred(ub, fctx);
+            push_intra(1, px, py, 4, DC_PRED, 0, reach, zeros, None, None, smooth_neighbor_uv, fctx);
+            set_palette_pred(vb, fctx);
+            push_intra(2, px, py, 4, DC_PRED, 0, reach, zeros, None, None, smooth_neighbor_uv, fctx);
+        } else {
+            set_palette_pred(ub, fctx);
+            push_intra_rect(1, px, py, bw, bh, DC_PRED, 0, reach, zeros, None, None, smooth_neighbor_uv, fctx);
+            set_palette_pred(vb, fctx);
+            push_intra_rect(2, px, py, bw, bh, DC_PRED, 0, reach, zeros, None, None, smooth_neighbor_uv, fctx);
+        }
+        // The same arm-without-clear route the 4:2:0 tails count: a skipped
+        // leaf reads no coefficient, so the inherited chroma `tx_type` is
+        // dropped unconsumed.
+        hit!(SKIPPED_INTRABC_CHROMA_ARM_HITS);
+        fctx.intrabc_chroma_tx.with(|c| c.set(None));
+        (Grid::Zero(bw * bh), Grid::Zero(bw * bh), 4, 4)
+    } else if skip {
         let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
         if square {
             push_intra(1, px, py, 4, uv_predict_mode, 0, reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
@@ -19016,6 +19121,63 @@ fn sub8_leaf_chroma444(
             )?;
             (ug, vg, 4, 4)
         } else {
+            // lane-av1-ibc444rect: the unskipped lossless chroma walk this
+            // lane fixes (one rect unit -> per-4x4 Chroma4 units).
+            if lossless(fctx) {
+                hit!(INTRABC_RECT8_LOSSLESS_CHROMA_HITS);
+            }
+            if lossless(fctx) {
+                // lane-av1-ibc444rect: at lossless `read_tx_size` forces
+                // TX_4X4 on EVERY plane (`av1_get_tx_size`'s lossless
+                // first line), so this rect leaf's chroma is (bw/4)*(bh/4)
+                // TX_4X4 units at their own 4x4 origins -- not the single
+                // `ChromaRect8x4` rect unit the non-lossless arm below reads
+                // (`av1_get_max_uv_txsize(BLOCK_8X4)`'s rect, unreachable at
+                // lossless). Same walk the leaf's own non-intrabc lossless
+                // arm runs (lane-av1-llsub8's fix), plane-major per libaom
+                // `decode_token_recon_block`, with the intra predictor
+                // swapped for the CURRENT frame at the DV; CFL is never
+                // allowed at lossless and no alpha rides an intrabc leaf.
+                let mut out_u = Grid::Own(vec![0i32; bw * bh]);
+                let mut out_v = Grid::Own(vec![0i32; bw * bh]);
+                for (plane_idx, buf) in [(1usize, u), (2usize, v)] {
+                    for ur in 0..bh / 4usize {
+                        for uc in 0..bw / 4usize {
+                            let (umi_r, umi_c) = (lmi.0 + ur, lmi.1 + uc);
+                            let (upx, upy) = (px + uc * 4, py + ur * 4);
+                            let mut pb = vec![0u16; 16];
+                            mc::predict_with_filter(
+                                &buf.data, buf.width, buf.true_width, buf.true_height,
+                                mv_to_q4(upx, dv.1, 0), mv_to_q4(upy, dv.0, 0),
+                                4, 4, mc::InterpFilterKind::Bilinear, &mut pb, fctx,
+                            );
+                            set_palette_pred(pb, fctx);
+                            let unit_around = neighbours.around_mi_rect((umi_r, umi_c), 4, 4);
+                            let unit_reach = Reach::of(4, upx, upy, y.width, y.height, fctx);
+                            let grid = read_plane(
+                                dec, cdfs, TxbSet::Chroma4, scan4, plane_idx, unit_around[plane_idx],
+                                DC_PRED, DC_PRED, 0, unit_reach, buf, upx, upy, 4,
+                                TX4, base_q_idx, None, None, Some(3), smooth_neighbor_uv, fctx,
+                            )?;
+                            let cell = grid_unit_state(&grid, 4, 0, 0, 4, 4);
+                            if umi_r < neighbours.mi_rows {
+                                neighbours.left[umi_r][plane_idx] = cell;
+                            }
+                            if umi_c < neighbours.mi_cols {
+                                neighbours.above[umi_c][plane_idx] = cell;
+                            }
+                            let out = if plane_idx == 1 { &mut out_u } else { &mut out_v };
+                            if let Grid::Own(v) = out {
+                                for r in 0..4usize {
+                                    v[(ur * 4 + r) * bw + uc * 4..][..4]
+                                        .copy_from_slice(&grid[r * 4..][..4]);
+                                }
+                            }
+                        }
+                    }
+                }
+                (out_u, out_v, 4, 4)
+            } else {
             let scan: &[u16] = if bw > bh { &SCAN_8X4 } else { &SCAN_4X8 };
             let default_tx =
                 fctx.intrabc_chroma_tx.with(std::cell::Cell::get).unwrap_or(TxType::DctDct);
@@ -19042,6 +19204,7 @@ fn sub8_leaf_chroma444(
                 if plane_idx == 1 { out.0 = levels; } else { out.1 = levels; }
             }
             out
+            }
         };
         fctx.intrabc_chroma_tx.with(|c| c.set(None));
         pair
@@ -19681,6 +19844,11 @@ fn decode_leaf_rect8(
         neighbours.record_mode_mi(lmi.0, lmi.1, w_mi, h_mi, mode);
         let smooth_neighbor = is_smooth_mode(leaf_above) || is_smooth_mode(leaf_left);
         if let Some(dv) = intrabc {
+            // lane-av1-ibc444rect: the unskipped lossless luma walk this lane
+            // fixes (one rect unit -> per-4x4 inter units).
+            if !skip && lossless(fctx) {
+                hit!(INTRABC_RECT8_LOSSLESS_LUMA_HITS);
+            }
             // lane-av1txr: an intrabc `BLOCK_4X8`/`BLOCK_8X4` leaf. The
             // prediction is a frame copy at the DV and the residual reads the
             // INTER `LumaRect8x4` set -- but with `TxMode::Select` the leaf
@@ -19699,6 +19867,10 @@ fn decode_leaf_rect8(
             let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height, fctx);
             flush_recon(fctx, y, u, v);
             let mut luma_leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
+            // The non-var-tx band publish, deferred to AFTER the unit loop:
+            // libaom's `set_txfm_ctxs` runs at `parse_decode_block`'s tail, so
+            // a unit's own `txb_skip_ctx` read must see the PRE-block bands.
+            let mut publish = Some((bw, bh));
             if tx_select && !skip {
                 // `max_block_wide`/`max_block_high`: the frame's own mi grid,
                 // so a leaf hanging over the right/bottom edge reads no split
@@ -19721,13 +19893,34 @@ fn decode_leaf_rect8(
                     &mut luma_leaves,
                 );
                 hit!(RECT_INTRABC_VARTX_HITS);
+                publish = None;
+            } else if lossless(fctx) && !skip {
+                // lane-av1-ibc444rect: `read_tx_size`'s lossless first line
+                // (`decodeframe.c:1203`) answers TX_4X4 for EVERY plane before
+                // any tree, and a lossless frame's `TxMode` is `ONLY_4X4`
+                // (spec 6.8.20) so no var-tx tree is read either -- the leaf's
+                // coefficients are (bw/4)*(bh/4) inter TX_4X4 units at their
+                // own origins, plane-major, NOT the single rect transform the
+                // non-lossless arm reads (that one is
+                // `av1_get_max_uv_txsize(BLOCK_8X4)`'s rect, unreachable at
+                // lossless). Same unit structure the non-intrabc lossless
+                // split below walks; each unit predicts from the CURRENT
+                // frame at the DV. Measured on the lane's `e4` fixture
+                // (`ll444_ibc_rect.obu`): the single-rect read desynced the
+                // tile and tripped the lossless WHT assert `(4, 8) != (4, 4)`
+                // at `TxParams::run`.
+                for ur in 0..bh / 4usize {
+                    for uc in 0..bw / 4usize {
+                        luma_leaves.push((ur, uc, 4, 4));
+                    }
+                }
+                publish = Some((4, 4));
             } else {
                 luma_leaves.push((0, 0, bw, bh));
                 // The non-var-tx arm: a SKIPPED intrabc leaf (or a frame
                 // outside `TxMode::Select`) publishes its own rect transform
                 // (`set_txfm_ctxs`'s `skip && is_inter` branch writes the
                 // block's own pixels -- the same size here).
-                txfm_partition_update_rect(neighbours, lmi, (bw, bh), (bw, bh));
             }
             // The transform type an intrabc block's CHROMA inherits is the
             // `tx_type_map` entry at the chroma unit's co-located luma
@@ -19786,6 +19979,17 @@ fn decode_leaf_rect8(
                         )
                 };
                 let mut coding = cdfs.txb(set, DC_PRED);
+                // lane-av1-ibc444rect: `av1_read_tx_type` returns before any
+                // symbol for a lossless block (qindex == 0, decodemv.c:681)
+                // on EVERY plane and size -- the lossless units this arm now
+                // walks must not read the set's tx_type either (`read_plane`
+                // does the same for its own call sites). Measured on the
+                // lane's `ll444_ibc_rect.obu`: with the symbol read, the
+                // first unit's ladder diverged right after a matched
+                // `all_zero` (ours +4096 rng on the unused tx_type).
+                if lossless(fctx) {
+                    coding.tx_type = None;
+                }
                 let (levels, tx_type) = read_coeffs_rect(
                         dec, &mut coding, tu_scan, tw, th, skip_ctx, dc_sign_ctx(around.2),
                         TxType::DctDct,
@@ -19794,11 +19998,28 @@ fn decode_leaf_rect8(
                         chroma_tx = tx_type;
                         fctx.luma_tx_type.with(|c| c.set(tx_type));
                     }
-                let residual = dequant_and_inverse_typed_wh(
-                        &levels, tw, th, crate::decode::bit_depth(fctx), block_q_idx(fctx),
-                    plane_q_delta(0, fctx).0, plane_q_delta(0, fctx).1, tx_type,
-                        block_iqmatrix(fctx, 0, tw, th, tx_type),
-                );
+                // lane-av1-ibc444rect: the residual goes through [`TxParams`]
+                // with the frame's lossless flag, exactly like
+                // [`read_plane`]'s own dequant -- at lossless `TxParams::run`
+                // is the Walsh-Hadamard inverse on every plane, and the
+                // `dequant_and_inverse_typed_wh` shortcut the lossy var-tx
+                // callers use has no lossless flag (it would run the DCT
+                // inverse over the WHT-ordered levels). Measured on the lane
+                // fixture: the DCT route left ±1..30 sample errors on every
+                // walked leaf's luma.
+                let tx = TxParams {
+                    w: tw,
+                    h: th,
+                    bit_depth: crate::decode::bit_depth(fctx),
+                    q_idx: block_q_idx(fctx),
+                    dc_delta: plane_q_delta(0, fctx).0,
+                    ac_delta: plane_q_delta(0, fctx).1,
+                    tx_type,
+                    qm: block_iqmatrix(fctx, 0, tw, th, tx_type),
+                    stride: 0,
+                    lossless: lossless(fctx),
+                };
+                let residual = tx.run(&levels);
                     if (tw, th) == (4, 4) {
                         push_intra(0, tu_px, tu_py, 4, DC_PRED, 0, tu_reach, &residual, None, None, smooth_neighbor, fctx);
                     } else {
@@ -19815,6 +20036,11 @@ fn decode_leaf_rect8(
                     // that position.
                     neighbours.record_mi_luma(tu_mi, 4, &tu_grid);
                 }
+            }
+            // The deferred non-var-tx band publish (see `publish` above): the
+            // units' `txb_skip_ctx` reads ran against the pre-block bands.
+            if let Some((pub_w, pub_h)) = publish {
+                txfm_partition_update_rect(neighbours, lmi, (pub_w, pub_h), (bw, bh));
             }
             if single {
             let state = neighbour_state(&grid);
