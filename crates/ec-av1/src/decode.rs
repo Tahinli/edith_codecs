@@ -30993,42 +30993,17 @@ impl<'p> RefPix<'p> {
                 (
                     whole_plane(&g.y, g.width, g.height),
                     {
-                        // Reference pictures carry no subsampling field -- the
-                        // plane's own shape is inferred from its length:
-                        // luma-sized is 4:4:4, `halfw x height` is 4:2:2
-                        // (ss_x 1, ss_y 0 -- the chroma plane is HALF-width
-                        // and FULL-height), `halfw x halfh` is 4:2:0. The
-                        // three lengths are pairwise distinct for every
-                        // w, h >= 1, so the guess is exact. The old
-                        // two-way guess read every 4:2:2 reference as
-                        // quarter-height: a 128x128 frame's chroma resolved
-                        // 64x64, the bottom mu-chunk row's prediction
-                        // sampled a clamped row-63 edge and the frame's
-                        // own pixels were right (the crop is ss-aware) --
-                        // only INTER prediction off the slot was wrong
-                        // (lane-av1-422bigblock: the sb128 witness's
-                        // frame-2 chroma, rows 64..127).
-                        let halfw = (g.width + 1) / 2;
-                        let halfh = (g.height + 1) / 2;
-                        let (cw, ch) = if g.u.len() == g.width * g.height {
-                            (g.width, g.height)
-                        } else if g.u.len() == halfw * g.height {
-                            (halfw, g.height)
-                        } else {
-                            (halfw, halfh)
-                        };
+                        // No subsampling field on a stored reference: the
+                        // chroma format comes off its own sample count --
+                        // 4:4:4 `w * h`, 4:2:2 `round_ss(w, 1) * h`, 4:2:0
+                        // `round_ss(w, 1) * round_ss(h, 1)`. The helper's own
+                        // doc carries the measurement behind those three arms
+                        // and the pre-existing odd-dimension 4:2:0 gap.
+                        let (cw, ch) = ref_chroma_shape(g.u.len(), g.width, g.height);
                         whole_plane(&g.u, cw, ch)
                     },
                     {
-                        let halfw = (g.width + 1) / 2;
-                        let halfh = (g.height + 1) / 2;
-                        let (cw, ch) = if g.v.len() == g.width * g.height {
-                            (g.width, g.height)
-                        } else if g.v.len() == halfw * g.height {
-                            (halfw, g.height)
-                        } else {
-                            (halfw, halfh)
-                        };
+                        let (cw, ch) = ref_chroma_shape(g.v.len(), g.width, g.height);
                         whole_plane(&g.v, cw, ch)
                     },
                 )
@@ -31092,6 +31067,69 @@ fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+    }
+}
+
+/// A reference picture's own chroma plane shape, `(width, height)`, from its
+/// luma size and its chroma sample count. A stored reference carries no
+/// subsampling field, so the format is read back off the count -- and the
+/// counts are the producer's own [`round_ss`] crops
+/// (`decode.rs:25806`), so the test must use `round_ss` too and not a bare
+/// halving: 4:4:4 stores `w * h`, 4:2:2 stores `round_ss(w, 1) * h` (half
+/// width CEIL, full height), 4:2:0 stores `round_ss(w, 1) * round_ss(h, 1)`.
+/// A floor test here silently misses every odd-width 4:2:2 reference and
+/// drops it into the 4:2:0 arm -- the same defect one dimension over.
+///
+/// The two-way test this replaces ("luma-sized, else a quarter") folded 4:2:2
+/// into the 4:2:0 shape entirely, so a 4:2:2 reference plane claimed
+/// `h / 2` rows -- half the samples it actually holds. Every chroma MC
+/// reading such a plane then had its source row clamped against
+/// `true_height` (spec 7.11.3.4 / libaom's
+/// `dec_calc_subpel_params_and_extend` clamps to the reference's valid
+/// area), which folded every chroma row at or past the frame's midpoint
+/// back onto the last valid row: on the pinned t422 fixture frame 1, the
+/// 8x4 inter strip at luma (88, 208) MC-predicted chroma (88, 104) from
+/// frame 0 with mv 0 and a pure copy, yet wrote (206, 204, 202, 200) x4
+/// rows where the reference holds (202, 204, 204, 167) /
+/// (185, 190, 190, 165) / ...
+/// **Ambiguity, measured rather than argued away:** the inference reads a
+/// format off a length, so it is only as good as the lengths being
+/// distinct. Brute-forced against the producer's own `round_ss` crops over
+/// every `w, h` in `1..=128`, the 4:4:4 and 4:2:2 counts are distinct from
+/// each other and from the 4:2:0 count, and both route correctly for
+/// **every `w >= 2 && h >= 2`**. No stream this decoder accepts reaches a
+/// 1-pixel chroma plane; the pinned fixture's chroma is 128x144.
+///
+/// **Open gap, 4:2:0 at odd dimensions (pre-existing).** The 4:2:0 arm is
+/// left at the old `(width / 2, height / 2)` floor, which is what the
+/// two-way test this replaces produced -- that was the point, since no
+/// 4:2:0 stream changed shape. It is nevertheless the wrong shape for an
+/// odd-dimension 4:2:0 reference: the producer stored
+/// `round_ss(w, 1) x round_ss(h, 1)`, so the floor arm under-declares.
+/// Measured over the `1..=128` square, running each 4:2:0 count through
+/// this very function: 12160 of the 16384 pairs come back smaller than the
+/// plane actually holds, 12033 of those with `w >= 2` and 127 in the
+/// `w == 1` column (at `w == 1, h == 1` the 4:4:4 arm catches the count
+/// and `(1, 1)` is exact). Under-declaration at `h == 1` is **zero** over
+/// the whole square: there the 4:2:0 count equals the 4:2:2 count, routes
+/// into the 4:2:2 arm, and lands on the correct
+/// `(round_ss(w, 1), 1)`. The `w == 1` residue is a *shape* error, not a
+/// misroute -- the floor fallback simply cannot express
+/// `(1, round_ss(h, 1))`. It is left alone because it predates this lane,
+/// is identical to the parent, and no in-tree coverage exercises an
+/// odd-dimension 4:2:0 reference. A ceil fallback
+/// (`(round_ss(w, 1), round_ss(h, 1))`) would close it, at the cost of
+/// departing from the parent on every odd-dimension 4:2:0 shape with
+/// nothing in the tree to justify the change; that call belongs to a lane
+/// that can bring odd-dimension 4:2:0 fixtures with it.
+fn ref_chroma_shape(len: usize, width: usize, height: usize) -> (usize, usize) {
+    let half_w = round_ss(width, 1);
+    if len == width * height {
+        (width, height)
+    } else if len == half_w * height {
+        (half_w, height)
+    } else {
+        (width / 2, height / 2)
     }
 }
 
@@ -45725,6 +45763,53 @@ mod tests {
         let mut refs: [Option<&Picture>; 8] = [None; 8];
         refs[1] = Some(reference);
         RefPix::ready(refs)
+    }
+
+    /// lane-av1422stripwrite: the reference chroma shape is read back off the
+    /// stored plane's own sample count, so the counts the PRODUCER writes
+    /// (`round_ss` crops, `decode.rs:25806`) must route back to the shape
+    /// they came from. A floor half-width here passes every even-width case
+    /// -- the pinned fixture's 256-wide frame included -- and silently drops
+    /// every odd-width 4:2:2 reference into the 4:2:0 arm, which is the
+    /// exact defect this lane fixed, one dimension over. So the table below
+    /// is driven off `round_ss`, not off hand-written numbers, and sweeps
+    /// odd and even widths.
+    #[test]
+    fn a_reference_chroma_sample_count_routes_back_to_its_own_format() {
+        for w in [2usize, 3, 4, 5, 8, 9, 16, 17, 64, 65, 128, 129] {
+            for h in [2usize, 3, 4, 5, 8, 9, 64, 65, 144, 145] {
+                let cases = [
+                    ("4:4:4", round_ss(w, 0) * round_ss(h, 0), (w, h)),
+                    ("4:2:2", round_ss(w, 1) * round_ss(h, 0), (round_ss(w, 1), h)),
+                    (
+                        "4:2:0",
+                        round_ss(w, 1) * round_ss(h, 1),
+                        (w / 2, h / 2),
+                    ),
+                ];
+                for (name, len, want) in cases {
+                    assert_eq!(
+                        ref_chroma_shape(len, w, h),
+                        want,
+                        "{name} reference of {w}x{h} (chroma {len} samples) \
+                         must route back to its own shape"
+                    );
+                }
+            }
+        }
+    }
+
+    /// lane-av1422stripwrite: the whole point of the 4:2:2 arm is that it
+    /// claims the frame's FULL chroma height -- that is what stops every
+    /// chroma MC sourcing a row at or past the midpoint from being clamped
+    /// against `true_height`. Pinned on the t422 shape.
+    #[test]
+    fn a_422_reference_claims_the_full_chroma_height() {
+        // 256x144 luma at ss (1, 0): chroma is 128 wide and 144 rows tall.
+        let (cw, ch) = ref_chroma_shape(round_ss(256, 1) * 144, 256, 144);
+        assert_eq!((cw, ch), (128, 144));
+        // The bug's own signature: 72 rows claimed for 144 rows held.
+        assert!(ch > 144 / 2, "a 4:2:2 reference must not claim half its rows");
     }
 
     /// [`last_only`] plus `GOLDEN_FRAME` (index 4 of the name-keyed array)
