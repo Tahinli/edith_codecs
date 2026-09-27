@@ -400,7 +400,7 @@ pub(crate) struct Cdfs {
     /// The same, for a 4x4 luma transform (lane-av1tx4).
     pub txb_skip_luma_4: [[u16; 3]; 7],
     /// The all-zero flag of an 8x8 chroma transform.
-    pub txb_skip_chroma_8: [[u16; 3]; 3],
+    pub txb_skip_chroma_8: [[u16; 3]; 6],
     /// The all-zero flag of a 4x4 chroma transform.
     /// lane-lossless: SIX rows, like [`Self::txb_skip_chroma_32`] -- the last
     /// three are `get_txb_ctx`'s `+10` rows (chroma plane block bigger than
@@ -500,7 +500,7 @@ pub(crate) struct Cdfs {
     /// The same, for a 64x64 luma transform.
     pub txb_skip_luma_64: [[u16; 3]; 7],
     /// The all-zero flag of a 16x16 chroma transform.
-    pub txb_skip_chroma_16: [[u16; 3]; 3],
+    pub txb_skip_chroma_16: [[u16; 3]; 6],
     /// The all-zero flag of a 32x32 chroma transform.
     /// SIX contexts, not three: rows 0..3 are libaom's `txb_skip_ctx` 7..9
     /// (chroma transform == its plane block) and rows 3..6 its 10..12 (plane
@@ -828,9 +828,7 @@ fn reset3<const N: usize, const M: usize, const K: usize>(a: &mut [[[u16; N]; M]
 /// [`reset3`] for a table whose ALPHABET grows with its first index: the
 /// palette colour-index CDFs are `[u16; 9]` rows read as `[..=n]` with
 /// `n = idx + 2`, so their symbol counter sits at index `n`, not `N - 1`.
-fn reset_var_alphabet<const N: usize, const M: usize, const K: usize>(
-    a: &mut [[[u16; N]; M]; K],
-) {
+fn reset_var_alphabet<const N: usize, const M: usize, const K: usize>(a: &mut [[[u16; N]; M]; K]) {
     for (idx, rows) in a.iter_mut().enumerate() {
         for row in rows.iter_mut() {
             row[idx + 2] = 0;
@@ -1067,13 +1065,27 @@ impl Cdfs {
                 cdf::TXB_SKIP_LUMA_4_CTX,
                 cdf::TXB_SKIP_LUMA_4_Q3_CTX,
             ),
-            txb_skip_chroma_8: pick(
-                q_ctx,
-                cdf::TXB_SKIP_CHROMA_8_Q0,
-                cdf::TXB_SKIP_CHROMA_8_Q1,
-                cdf::TXB_SKIP_CHROMA_8,
-                cdf::TXB_SKIP_CHROMA_8_Q3,
-            ),
+            txb_skip_chroma_8: {
+                // lane-av1-422b: rows 3..6 are the `+10` chroma rows
+                // (`TXB_SKIP_CHROMA_8_BIG`) -- neutral in libaom's defaults,
+                // reached only when the plane block is larger than an 8x8
+                // transform, i.e. only at 4:2:2 today.
+                let small = pick(
+                    q_ctx,
+                    cdf::TXB_SKIP_CHROMA_8_Q0,
+                    cdf::TXB_SKIP_CHROMA_8_Q1,
+                    cdf::TXB_SKIP_CHROMA_8,
+                    cdf::TXB_SKIP_CHROMA_8_Q3,
+                );
+                [
+                    small[0],
+                    small[1],
+                    small[2],
+                    cdf::TXB_SKIP_CHROMA_8_BIG[0],
+                    cdf::TXB_SKIP_CHROMA_8_BIG[1],
+                    cdf::TXB_SKIP_CHROMA_8_BIG[2],
+                ]
+            },
             txb_skip_chroma_4: {
                 let small = pick(
                     q_ctx,
@@ -1387,13 +1399,27 @@ impl Cdfs {
                 cdf::TXB_SKIP_LUMA_64_CTX,
                 cdf::TXB_SKIP_LUMA_64_Q3_CTX,
             ),
-            txb_skip_chroma_16: pick(
-                q_ctx,
-                cdf::TXB_SKIP_CHROMA_16_Q0,
-                cdf::TXB_SKIP_CHROMA_16_Q1,
-                cdf::TXB_SKIP_CHROMA_16,
-                cdf::TXB_SKIP_CHROMA_16_Q3,
-            ),
+            txb_skip_chroma_16: {
+                // lane-av1-422b: rows 3..6 are the `+10` chroma rows
+                // (`TXB_SKIP_CHROMA_16_BIG`) -- neutral in libaom's defaults,
+                // reached only when the plane block is larger than a 16x16
+                // transform, i.e. only at 4:2:2 today.
+                let small = pick(
+                    q_ctx,
+                    cdf::TXB_SKIP_CHROMA_16_Q0,
+                    cdf::TXB_SKIP_CHROMA_16_Q1,
+                    cdf::TXB_SKIP_CHROMA_16,
+                    cdf::TXB_SKIP_CHROMA_16_Q3,
+                );
+                [
+                    small[0],
+                    small[1],
+                    small[2],
+                    cdf::TXB_SKIP_CHROMA_16_BIG[0],
+                    cdf::TXB_SKIP_CHROMA_16_BIG[1],
+                    cdf::TXB_SKIP_CHROMA_16_BIG[2],
+                ]
+            },
             txb_skip_chroma_32: {
                 let small = pick(
                     q_ctx,

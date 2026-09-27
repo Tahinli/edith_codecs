@@ -69,6 +69,22 @@
 
 ## Decision
 
+- **444 LR follow-up (review finding 2): RED, stopped and reported.** A
+  3-frame 192x160 `aomenc --profile=1 --enable-restoration=1` stream
+  (lr types per frame: `[Sgrproj,None,Switchable]` / `[None,None,Sgrproj]`
+  / `[Sgrproj,None,Switchable]`) diverges from both the instrumented aomdec
+  and ffmpeg on frames 0/1 (~26k samples/plane, maxabs 255) and matches
+  exactly on frame 2. The divergence is already fully present at
+  EC_AV1_PREFILT_DUMP (frame 0 pre: Y 6124 @ (0,128), U 9176 @ (160,64),
+  V 10196 @ (128,64)) — a pre-existing 444 RECONSTRUCTION defect, not a
+  loop-filter one and not this lane's regression: the parent commit
+  (cc3783f4, scratch worktree) measures 26673/26310/158 against the same
+  stream, so this lane's ss_y fix strictly improves 444 (frame 2 went to
+  exact, frames 0/1 shrank) but cannot pin a pixel-exact gate over a
+  stream whose reconstruction is still wrong. Named for the owning lane:
+  444 intra reconstruction around the row-64/row-128 SB boundaries (class:
+  pre-existing 444 recon; loop filters exonerated — the damage exists
+  pre-deblock and the filter stages track it 1:1).
 - The header refusal STAYS unconditional in `stream.rs` — the probe bypass
   was local-only, applied and reverted byte-identical before the commit
   (`git diff` after the revert carries only the decode.rs fix); the
@@ -77,9 +93,12 @@
   `sub8_leaf_chroma422` (parent lane's three fixes) untouched.
 - The 8-bit `EC_AV1_POSTCDEF_DUMP` rung was added to the ORACLE's source
   tree (`$HOME/.cache/aom-oracle/src/av1/decoder/decodeframe.c`, rebuilt
-  with ninja), not to this repo's `scripts/instrument-aom-oracle.sh` — the
-  script's generator should grow the same patch if the oracle is ever
-  rebuilt from scratch.
+  with ninja) and transcribed into
+  `scripts/instrument-aom-oracle.sh` as rung 15 — its generator block
+  reproduces the hand patch byte-for-byte (verified by strip-and-replay on
+  the live tree; the marker `EC_INSTRUMENTED_POSTCDEF` keeps re-runs
+  no-op), so `build-aom-oracle.sh` + the script rebuild the full ladder
+  from scratch again.
 
 ## Verification
 
