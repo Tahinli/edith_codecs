@@ -2991,10 +2991,18 @@ pub(crate) struct WaveState {
     q: std::sync::Mutex<WaveQueue>,
     cv: std::sync::Condvar,
     planes: ReconPlanes,
-    /// The two [`FrameCtx`] fields reconstruction reads (`sample_max` is
+    /// The [`FrameCtx`] fields reconstruction reads (`sample_max` is
     /// `bit_depth`'s; everything else a `reconstruct*` needs is in the op).
     bit_depth: u8,
     enable_edge_filter: bool,
+    /// lane-av1wavefront: the sequence's chroma subsampling. The replay-side
+    /// readers -- the deferred chroma builds' `mv_to_q4(.., ss_x(fctx))`
+    /// positions and `exec_intra`'s CfL AC signal -- must see the FRAME's
+    /// pair, not [`FrameCtx::new`]'s 4:2:0 default: on a 4:4:4 stream the
+    /// default halved every worker's chroma reference position and lost the
+    /// chroma planes (the 444_sb128rect witness, U 17504 / V 3 at PREFILT on
+    /// frame 1) while every 4:2:0 gate stream stayed accidentally exact.
+    subsampling: (u8, u8),
     last_col: usize,
 }
 
@@ -3147,6 +3155,9 @@ fn wave_worker(st: &WaveState, idx: usize) {
     let fctx = FrameCtx::new();
     fctx.bit_depth.set(st.bit_depth);
     fctx.enable_edge_filter.set(st.enable_edge_filter);
+    let (sx, sy) = st.subsampling;
+    fctx.subsampling_x.set(sx);
+    fctx.subsampling_y.set(sy);
     let stats = wave_stats();
     let slot = idx.min(WS_SLOTS - 1);
     loop {
@@ -3243,6 +3254,10 @@ impl<'a> WaveGuard<'a> {
             ),
             bit_depth: fctx.bit_depth.with(std::cell::Cell::get),
             enable_edge_filter: fctx.enable_edge_filter.with(std::cell::Cell::get),
+            subsampling: (
+                fctx.subsampling_x.with(std::cell::Cell::get),
+                fctx.subsampling_y.with(std::cell::Cell::get),
+            ),
             last_col: cols - 1,
         });
         let batch = crate::par::Batch::new("ec-av1-recon");
