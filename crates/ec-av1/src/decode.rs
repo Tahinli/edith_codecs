@@ -486,7 +486,15 @@ pub(crate) fn lossless_tx(px: usize, fctx: &crate::decode::FrameCtx) -> usize {
 /// picks the 13-symbol one (class `wrong-alphabet-same-value`).
 pub(crate) fn cfl_allowed_px(bw: usize, bh: usize, fctx: &crate::decode::FrameCtx) -> bool {
     if lossless(fctx) {
-        bw <= 8 && bh <= 8
+        // `is_cfl_allowed`: at lossless CfL is available only when the
+        // partition size equals the transform size -- the CHROMA plane block
+        // must be a single TX_4X4. True for an 8x8 partition at 4:2:0 (its
+        // plane block is 4x4) and for 4x4 partitions; FALSE for an 8x8
+        // partition at 4:4:4, whose plane block is 8x8 -- that partition
+        // reads the 13-symbol uv_mode CDF, and reading the CFL alphabet
+        // there desynced the tile from the leaf's own uv_mode symbol (class
+        // `wrong-alphabet-same-value`).
+        (bw >> ss_x(fctx)).max(4) == 4 && (bh >> ss_y(fctx)).max(4) == 4
     } else {
         bw <= 32 && bh <= 32
     }
@@ -5313,6 +5321,10 @@ thread_local! {
     /// entropy bands were zeroed per unit (libaom `av1_reset_entropy_context`,
     /// decodeframe.c:1262) instead of leaking the previous occupant's.
     static SKIP_LOSSLESS_BAND_RESET_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-llband: 4x4 chroma transform units a lossless HORZ/VERT strip
+    /// walked at subsampling 0/0 (one unit per mi cell -- the geometry the
+    /// hardcoded 4:2:0 span mis-stepped).
+    static RECT_SPLIT_LOSSLESS_CHROMA444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
@@ -5333,6 +5345,14 @@ pub fn chroma_edge_tu_clip_hits() -> usize {
 /// bands zeroed per unit (lane-av1-loss64).
 pub fn skip_lossless_band_reset_hits() -> usize {
     SKIP_LOSSLESS_BAND_RESET_HITS.with(|c| c.get())
+}
+
+/// How many 4x4 chroma transform units a lossless HORZ/VERT strip walked at
+/// subsampling 0/0 (lane-av1-llband). Zero means a stream never decoded the
+/// 4:4:4 lossless unit walk this counter proves -- a gate asserting the fix
+/// must see this nonzero.
+pub fn rect_split_lossless_chroma444_hits() -> usize {
+    RECT_SPLIT_LOSSLESS_CHROMA444_HITS.with(|c| c.get())
 }
 
 /// Gate-side reset for the two lane-av1-loss64 counters above.
@@ -8960,6 +8980,13 @@ impl Neighbours {
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
         let state = neighbour_state(grid);
+        if crate::envflags::env_flag!("EC_CHROMA_PUB") {
+            eprintln!(
+                "EC_CHROMA_PUB plane={plane} mi=({mi_r},{mi_c}) wh=({w_px},{h_px}) lvl={} dc={}",
+                state.level,
+                state.dc.map_or(-1, |s| i32::from(s))
+            );
+        }
         for cell in 0..(h_px / MI).min(bound_h.saturating_sub(mi_r)) {
             self.left[mi_r + cell][plane] = state;
         }
@@ -10083,6 +10110,10 @@ fn decode_rect_split(
         (4, 8) => Some((TxbSet::ChromaRect8x4, &SCAN_4X8[..])),
         _ => None,
     };
+    // A 4:4:4 64-axis strip's chroma plane block is larger than one adjusted
+    // UV transform (TX_64X32 adjusts to TX_32X32). Those sizes are tiled
+    // below; everything else still needs a single-unit table.
+    let chroma_tiled = matches!((chroma_w, chroma_h), (64, 32) | (32, 64) | (64, 16) | (16, 64));
     if !m.skip {
         if let Some(i) = match (chroma_w, chroma_h) {
             (32, 8) => Some(0),
@@ -10099,11 +10130,24 @@ fn decode_rect_split(
                 });
             }
         }
-        if chroma.is_none() {
+        if chroma.is_none() && !chroma_tiled {
             // Diagnostic for the next caller that lands here (class
             // refusal-names-a-correlate: the message names the tool, not the
             // shape); the refusal below keeps its inventory-pinned wording.
-            eprintln!("EC_RECTCHROMA_GAP luma={bw}x{bh} tx={tx_w}x{tx_h} chroma={chroma_w}x{chroma_h}");
+            // The condition is the refusal's exact precondition, so the
+            // print can never fire without the refusal (or vice versa): the
+            // four 64-axis chroma shapes are tiled below and at LOSSLESS the
+            // 4x4 walk never consults `chroma` at all -- libaom has no such
+            // transform to name a row for (`av1_get_tx_size` returns TX_4X4
+            // for every plane at lossless, blockd.h:1383; outside it
+            // `av1_get_adjusted_tx_size` collapses TX_64X32/32X64 to TX_32X32
+            // for chroma, blockd.h:1361-1367). lane-av1-ll64: the old
+            // ungated print fired on those working routes and mislabelled
+            // them a gap (one lane report cited it as a decode stop).
+            eprintln!(
+                "EC_RECTCHROMA_GAP luma={bw}x{bh} tx={tx_w}x{tx_h} \
+                 chroma={chroma_w}x{chroma_h} libaom_lossless_tx=none"
+            );
         }
     }
     // lane-rectsplit r2 (verifier finding): with both callers wired
@@ -10113,10 +10157,6 @@ fn decode_rect_split(
     // caller -- a new strip size would otherwise hit the `expect` below and
     // panic instead of refusing by name -- and so stays in
     // `refusal_inventory::REFUSALS`.
-    // A 4:4:4 64-axis strip's chroma plane block is larger than one adjusted
-    // UV transform (TX_64X32 adjusts to TX_32X32). Those sizes are tiled
-    // below; everything else still needs a single-unit table.
-    let chroma_tiled = matches!((chroma_w, chroma_h), (64, 32) | (32, 64) | (64, 16) | (16, 64));
     if !m.skip && chroma.is_none() && !chroma_tiled {
         return Err(unsupported(
             "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
@@ -10395,7 +10435,7 @@ fn decode_rect_split(
     // them with the LAST unit's state (class `override-slot-on-one-arm`: the
     // next block then read `dc_sign_ctx` 1 where libaom reads 0). They are
     // collected here and replayed after that record.
-    let mut ll_chroma_units: Vec<((usize, usize), usize, Grid)> = Vec::new();
+    let mut ll_chroma_units: Vec<((usize, usize), usize, Grid, usize, usize)> = Vec::new();
     // The chroma_tiled arm below stamps each unit's coefficient context
     // immediately (so the NEXT unit reads it), then the whole-strip
     // `record_split_luma_rect_mi` rewrites every chroma cell with ONE
@@ -10443,19 +10483,29 @@ fn decode_rect_split(
         let scan4 = default_scan(4);
         let offset = (chroma_w > 4 || chroma_h > 4).then_some(3);
         let (cw_n, ch_n) = (chroma_w / 4, chroma_h / 4);
+        // lane-av1-llband: one 4x4 chroma unit's extent in LUMA pixels -- 4
+        // chroma px scaled by the plane's own subsampling. The hardcoded 8
+        // was the 4:2:0 unit's span; at 4:4:4 a unit is 4x4 LUMA px (one mi
+        // cell), and the 8-px step made every unit past the first column/row
+        // read its `txb_skip` context at the WRONG mi (two cells over) and
+        // stamp a 2-cell span with one unit's state -- the polluted above-band
+        // cell behind a 16x8 leaf's U bc=2 unit of the 444 lossless key frame
+        // (measured: oracle `EC_DBGCTX` reads 1-cell spans at 1-mi steps;
+        // ours read `above[28..29]` where the oracle read `above[26]`).
+        let span_x = 4 << ss_x(fctx);
+        let span_y = 4 << ss_y(fctx);
         let mut last = [Grid::Zero(16), Grid::Zero(16)];
         for plane_idx in 1..=2 {
             for cu_row in 0..ch_n {
                 for cu_col in 0..cw_n {
-                    let luma_span = 8;
                     let cu_mi = (
-                        mi_r + cu_row * (luma_span / MI),
-                        mi_c + cu_col * (luma_span / MI),
+                        mi_r + cu_row * (span_y / MI),
+                        mi_c + cu_col * (span_x / MI),
                     );
-                    let cu_around = neighbours.around_mi(cu_mi, luma_span);
+                    let cu_around = neighbours.around_mi_rect(cu_mi, span_x, span_y);
                     let cu_reach = tu_reach(
                         bw, bh,
-                        cu_col * luma_span, cu_row * luma_span, luma_span,
+                        cu_col * span_x, cu_row * span_y, span_x,
                         block_reach, px, py, y.width, y.height, fctx,
                     );
                     let (cu_x, cu_y) = (cpx + cu_col * 4, cpy + cu_row * 4);
@@ -10477,8 +10527,11 @@ fn decode_rect_split(
                         }),
                         None, offset, m.smooth_neighbor_uv, fctx,
                     )?;
-                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, plane_idx, &grid);
-                    ll_chroma_units.push((cu_mi, plane_idx, grid.clone()));
+                    if span_x == 4 && span_y == 4 {
+                        hit!(RECT_SPLIT_LOSSLESS_CHROMA444_HITS);
+                    }
+                    neighbours.record_mi_chroma(cu_mi, span_x, span_y, plane_idx, &grid);
+                    ll_chroma_units.push((cu_mi, plane_idx, grid.clone(), span_x, span_y));
                     last[plane_idx - 1] = grid;
                 }
             }
@@ -10650,8 +10703,8 @@ fn decode_rect_split(
         m.uv_predict_mode,
         [&u_grid, &v_grid],
     );
-    for (cu_mi, plane, unit) in &ll_chroma_units {
-        neighbours.record_mi_chroma(*cu_mi, 8, 8, *plane, unit);
+    for (cu_mi, plane, unit, span_w, span_h) in &ll_chroma_units {
+        neighbours.record_mi_chroma(*cu_mi, *span_w, *span_h, *plane, unit);
     }
     for (cu_mi, plane, unit, span_w, span_h) in &tiled_chroma_units {
         neighbours.record_mi_chroma(*cu_mi, *span_w, *span_h, *plane, unit);
@@ -14595,9 +14648,16 @@ fn decode_rect4_16_strip(
                                     angle_delta_uv, cu_reach, &ZERO_RESIDUAL[..16], None, None,
                                     smooth_neighbor_uv, fctx,
                                 );
-                                let cu_mi = (pair_mi.0 + oy / 2, pair_mi.1 + ox / 2);
+                                let cu_mi = (
+                                    pair_mi.0 + (oy << ss_y(fctx)) / MI,
+                                    pair_mi.1 + (ox << ss_x(fctx)) / MI,
+                                );
                                 neighbours.record_mi_chroma(
-                                    cu_mi, 8, 8, plane, &ZERO_RESIDUAL[..16],
+                                    cu_mi,
+                                    4 << ss_x(fctx),
+                                    4 << ss_y(fctx),
+                                    plane,
+                                    &ZERO_RESIDUAL[..16],
                                 );
                             }
                         }
@@ -14617,7 +14677,25 @@ fn decode_rect4_16_strip(
                                 if cpx + ox >= u.true_width || cpy + oy >= u.true_height {
                                     continue;
                                 }
-                                let cu_mi = (pair_mi.0 + oy / 2, pair_mi.1 + ox / 2);
+                                // The unit's stamp is its own span: aom
+                                // `av1_set_entropy_contexts` (blockd.c:29)
+                                // memsets exactly `tx_size_wide_unit` x
+                                // `tx_size_high_unit` cells at the unit's own
+                                // `(aoff, loff)` -- for TX_4X4 ONE above cell
+                                // and ONE left cell. `(oy / 2, ox / 2)` +
+                                // `(8, 8)` is the 4:2:0 subsampled form (one
+                                // chroma cell = 8 luma px = 2 mi cells); at
+                                // 4:4:4 a unit is ONE mi cell, and the 2x2
+                                // smear let a 4-wide strip's later units
+                                // overwrite the NEXT COLUMN's above cell with
+                                // their own state -- a column aom never sees
+                                // this block write -- so the following block's
+                                // `all_zero` read the wrong `txb_skip` row
+                                // (frame-0 read #452, the llkf named gap).
+                                let cu_mi = (
+                                    pair_mi.0 + (oy << ss_y(fctx)) / MI,
+                                    pair_mi.1 + (ox << ss_x(fctx)) / MI,
+                                );
                                 // One luma-mi cell: the chroma entropy arrays
                                 // are subsampled, and our bands replicate that
                                 // one entry over the unit's two cells
@@ -14639,7 +14717,13 @@ fn decode_rect4_16_strip(
                                     cu_reach, buf, cpx + ox, cpy + oy, 4, 4, base_q_idx,
                                     None, None, offset, smooth_neighbor_uv, fctx,
                                 )?;
-                                neighbours.record_mi_chroma(cu_mi, 8, 8, plane, &cu_grid);
+                                neighbours.record_mi_chroma(
+                                    cu_mi,
+                                    4 << ss_x(fctx),
+                                    4 << ss_y(fctx),
+                                    plane,
+                                    &cu_grid,
+                                );
                                 hit!(CHROMA_SPLIT_TX_HITS);
                                 let dst = if plane == 1 { &mut uo } else { &mut vo };
                                 for row in 0..4 {
@@ -17279,9 +17363,17 @@ fn decode_block(
                     (2 * y.true_width.div_ceil(8)) as i32 - mi_c as i32 - span_mi as i32;
                 let over_h_mi =
                     (2 * y.true_height.div_ceil(8)) as i32 - mi_r as i32 - span_mi as i32;
-                let plane_px = ((span_mi * 2).max(4)) as i32;
-                let max_units_w = ((plane_px + 2 * over_w_mi.min(0)) >> 2).max(0) as usize;
-                let max_units_h = ((plane_px + 2 * over_h_mi.min(0)) >> 2).max(0) as usize;
+                // `max_block_wide/high` in chroma pixels: the plane block's
+                // own span (`side` at 4:4:4, `side / 2` at 4:2:0 -- the old
+                // hardcoded `span_mi * 2` clipped three quarters of a 4:4:4
+                // block's coded units and desynced the tile) plus the
+                // negative overhang (`mb_to_*_edge >> (3 + ss)`), whose
+                // chroma-px scale is `MI >> ss` per mi.
+                let plane_px = (((span_mi * MI) >> ss_x(fctx)).max(4)) as i32;
+                let over_w_px = over_w_mi.min(0) * (MI >> ss_x(fctx)) as i32;
+                let over_h_px = over_h_mi.min(0) * (MI >> ss_y(fctx)) as i32;
+                let max_units_w = ((plane_px + over_w_px) >> 2).max(0) as usize;
+                let max_units_h = ((plane_px + over_h_px) >> 2).max(0) as usize;
                 let unit = chroma_tx / 4; // TU side in 4x4 chroma units
                 if cu_col * unit >= max_units_w || cu_row * unit >= max_units_h {
                     hit!(CHROMA_EDGE_TU_CLIP_HITS);
@@ -17627,8 +17719,16 @@ fn decode_block_128rect(
     let mi_rows = 2 * y.true_height.div_ceil(8);
     let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(mi_c));
     let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(mi_r));
-    // Non-lossless: one 32x32 chroma unit per mu chunk, per plane.
-    debug_assert!(lossless_frame || (chroma_w / chroma_tx, chroma_h / chroma_tx) == (nch_x, nch_y));
+    // Non-lossless: per mu chunk, `(64 >> ss) / chroma_tx` chroma units per
+    // axis (one 32x32 at 4:2:0, four 32x32 at 4:4:4 — lane-av1-444sb).
+    debug_assert!(
+        lossless_frame
+            || (chroma_w / chroma_tx, chroma_h / chroma_tx)
+                == (
+                    nch_x * ((64 >> ss_x(fctx)) / chroma_tx),
+                    nch_y * ((64 >> ss_y(fctx)) / chroma_tx)
+                )
+    );
     let tpc = 64 / logical_tx;
     let zero_tu = vec![0i32; logical_tx * logical_tx];
     let zero_cu = vec![0i32; chroma_tx * chroma_tx];
@@ -17706,9 +17806,13 @@ fn decode_block_128rect(
                     neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
                 }
             }
-            // Transform units per axis inside this mu chunk's 32x32 chroma
-            // span: one 32x32 unit normally, 8x8 TX_4X4 units when lossless.
-            let cn = (32 / chroma_tx).max(1);
+            // Transform units per axis inside this mu chunk's chroma span:
+            // a 64x64 luma chunk covers `64 >> ss` chroma pixels per axis, so
+            // it holds `(64 >> ss) / chroma_tx` units — one 32x32 at 4:2:0,
+            // four at 4:4:4 (lane-av1-444sb: the hardcoded 4:2:0 span read
+            // one unit per chunk there, left six of a 128x64 block's eight
+            // 32x32 units unread and desynced the tile from that block on).
+            let cn = ((64 >> ss_x(fctx)) / chroma_tx).max(1);
             // libaom's per-chunk `unit_width/height` (plane-mi units of the
             // luma mi grid): `min(mu_blocks + col, max_blocks) >> ss`.
             let unit_w = ((ch_col + 1) * 16).min(max_w_mi) >> ss_x(fctx);
@@ -17722,13 +17826,13 @@ fn decode_block_128rect(
             for plane_pass in 1..=2usize {
                 for ci_row in 0..cn {
                     for ci_col in 0..cn {
-                        if ch_col * 8 + ci_col * stepc >= unit_w
-                            || ch_row * 8 + ci_row * stepc >= unit_h
+                        if ch_col * (16 >> ss_x(fctx)) + ci_col * stepc >= unit_w
+                            || ch_row * (16 >> ss_y(fctx)) + ci_row * stepc >= unit_h
                         {
                             continue;
                         }
-                        let cu_x = cpx + ch_col * 32 + ci_col * chroma_tx;
-                        let cu_y = cpy + ch_row * 32 + ci_row * chroma_tx;
+                        let cu_x = cpx + ch_col * (64 >> ss_x(fctx)) + ci_col * chroma_tx;
+                        let cu_y = cpy + ch_row * (64 >> ss_y(fctx)) + ci_row * chroma_tx;
                         let cu_mi = (
                             mi_r + ch_row * 16 + ci_row * ((chroma_tx << ss_y(fctx)) / 4),
                             mi_c + ch_col * 16 + ci_col * ((chroma_tx << ss_x(fctx)) / 4),
@@ -18169,12 +18273,45 @@ fn decode_leaf8(
             );
         }
         let ac = alpha.map(|_| cfl_src(px, py, 8));
+        // 4:4:4 lossless: the leaf's chroma plane block is a 2x2 raster of
+        // TX_4X4 units (`av1_get_tx_size`: lossless forces TX_4X4 on EVERY
+        // plane), so a skipped leaf predicts per unit -- each from its own
+        // edges -- like the luma `SKIP_SPLIT_TX` loop above. CfL never fires
+        // here (`is_cfl_allowed` at lossless needs plane_bsize == 4x4; this
+        // chroma plane block is 8x8), and intrabc/palette keep the
+        // whole-plane-block prediction they already run.
+        let chroma_units_444 = chroma_444
+            && lossless(fctx)
+            && intrabc_bufs.is_none()
+            && palette_uv_bufs.is_none();
         if let Some((_, ub, _)) = &intrabc_bufs {
             set_palette_pred(ub.clone(), fctx);
         } else if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
-        push_intra(1, 
+        if chroma_units_444 {
+            for cu_row in 0..2 {
+                for cu_col in 0..2 {
+                    let cu_reach = tu_reach(
+                        8, 8, cu_col * 4, cu_row * 4, 4,
+                        reach, px, py, y.width, y.height, fctx,
+                    );
+                    push_intra(1,
+                        cpx + cu_col * 4,
+                        cpy + cu_row * 4,
+                        4,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        cu_reach,
+                        &ZERO_RESIDUAL[..16],
+                        None,
+                        None,
+                        smooth_neighbor_uv, fctx,
+                    );
+                }
+            }
+        } else {
+        push_intra(1,
             cpx,
             cpy,
             csz,
@@ -18186,12 +18323,35 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv, fctx,
         );
+        }
         if let Some((_, _, vb)) = &intrabc_bufs {
             set_palette_pred(vb.clone(), fctx);
         } else if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
         }
-        push_intra(2, 
+        if chroma_units_444 {
+            for cu_row in 0..2 {
+                for cu_col in 0..2 {
+                    let cu_reach = tu_reach(
+                        8, 8, cu_col * 4, cu_row * 4, 4,
+                        reach, px, py, y.width, y.height, fctx,
+                    );
+                    push_intra(2,
+                        cpx + cu_col * 4,
+                        cpy + cu_row * 4,
+                        4,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        cu_reach,
+                        &ZERO_RESIDUAL[..16],
+                        None,
+                        None,
+                        smooth_neighbor_uv, fctx,
+                    );
+                }
+            }
+        } else {
+        push_intra(2,
             cpx,
             cpy,
             csz,
@@ -18203,6 +18363,7 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv, fctx,
         );
+        }
         luma_grid = Grid::Zero(64);
         u_grid = Grid::Zero(csz * csz);
         v_grid = Grid::Zero(csz * csz);
@@ -18416,6 +18577,28 @@ fn decode_leaf8(
         if fctx.intrabc_chroma_tx.with(std::cell::Cell::get).is_some() {
             hit!(INTRABC_TX4_CHROMA_COPY_HITS);
         }
+        if chroma_444 && lossless(fctx) {
+            // 4:4:4 lossless: the leaf's chroma plane block is a 2x2 raster
+            // of TX_4X4 units per plane, PLANE-MAJOR (`av1_get_tx_size`:
+            // lossless forces TX_4X4 on EVERY plane) -- the same walk
+            // `read_intra_chroma_lossless` runs for whole blocks. Reading one
+            // TX_8X8 unit here panicked before: the lossless inverse is the
+            // 4x4-only WHT (`TxParams::run`'s own `(w, h) == (4, 4)`
+            // invariant), and the unit count desyncs the tile either way.
+            // Per-unit `record_mi_chroma` calls stamp the neighbour bands
+            // inside, which is why the tail's whole-leaf chroma stamp below
+            // is skipped for this shape.
+            let (mut uo, mut vo) = (Vec::new(), Vec::new());
+            read_intra_chroma_lossless(
+                dec, cdfs, neighbours, u, v, leaf_mi, (px, py), (cpx, cpy),
+                8, (8, 8), (0, 0), (8, 8), 8, reach, (y.width, y.height), mode,
+                uv_predict_mode, angle_delta_uv,
+                palette_uv_bufs.as_ref().map(|(a, b)| (&a[..], &b[..])),
+                smooth_neighbor_uv, base_q_idx, &mut uo, &mut vo, fctx,
+            )?;
+            u_grid = if uo.is_empty() { Grid::Zero(64) } else { Grid::Own(uo) };
+            v_grid = if vo.is_empty() { Grid::Zero(64) } else { Grid::Own(vo) };
+        } else {
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
@@ -18466,6 +18649,7 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv, fctx,
         )?;
+        }
         // The two chroma reads above are the only consulters of this leaf's
         // armed [`INTRABC_CHROMA_TX`]; leaving it set would make the NEXT
         // leaf's chroma inherit this leaf's luma type instead of its own
@@ -18493,14 +18677,21 @@ fn decode_leaf8(
         let bound_w = round_up_even(neighbours.mi_cols);
         let u_state = neighbour_state(&u_grid);
         let v_state = neighbour_state(&v_grid);
-        for cell in 0..side_mi {
-            if cell < side_mi.min(bound_h.saturating_sub(leaf_mi.0)) {
-                neighbours.left[leaf_mi.0 + cell][1] = u_state;
-                neighbours.left[leaf_mi.0 + cell][2] = v_state;
-            }
-            if cell < side_mi.min(bound_w.saturating_sub(leaf_mi.1)) {
-                neighbours.above[leaf_mi.1 + cell][1] = u_state;
-                neighbours.above[leaf_mi.1 + cell][2] = v_state;
+        // The 4:4:4 lossless walk above already stamped these bands PER UNIT
+        // (its raster-order last writer per cell is exactly libaom's
+        // per-entry last update); this whole-leaf aggregate would clobber
+        // four distinct unit states with one, so it runs only for the shapes
+        // whose chroma really is one unit.
+        if !(chroma_444 && lossless(fctx)) {
+            for cell in 0..side_mi {
+                if cell < side_mi.min(bound_h.saturating_sub(leaf_mi.0)) {
+                    neighbours.left[leaf_mi.0 + cell][1] = u_state;
+                    neighbours.left[leaf_mi.0 + cell][2] = v_state;
+                }
+                if cell < side_mi.min(bound_w.saturating_sub(leaf_mi.1)) {
+                    neighbours.above[leaf_mi.1 + cell][1] = u_state;
+                    neighbours.above[leaf_mi.1 + cell][2] = v_state;
+                }
             }
         }
     // This leaf's own palette state into the mi-granular above/left bands
@@ -18668,7 +18859,21 @@ fn read_intra_mode_sub8(
     // desynced the tile at the very next element.
     let angle_delta_y = 0;
     let chroma = if has_chroma {
-        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        // `is_cfl_allowed` (blockd.h): at lossless CfL needs the CHROMA plane
+        // block to be a single TX_4X4 (`cfl_allowed_px`). True for this leaf
+        // at 4:2:0 (the group's plane block is 4x4) and for a 4:4:4
+        // `BLOCK_4X4` split leaf, but FALSE for a 4:4:4 `BLOCK_8X4`/`BLOCK_4X8`
+        // rect leaf, whose plane block is the rect itself -- that shape reads
+        // the 13-symbol `uv_mode_no_cfl` CDF, and reading the CFL alphabet
+        // there desynced the tile at the rect leaf's own uv_mode symbol (measured:
+        // ours consumed the 14-symbol interval where the oracle read 13, first
+        // divergence at the rect leaf mi (8,16) of `ll444.obu`; class
+        // `wrong-alphabet-same-value`, lane-av1-llsub8).
+        let uv_mode = if cfl_allowed_px(seg_w_mi * MI, seg_h_mi * MI, fctx) {
+            dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
+        };
         if trace {
             eprintln!("TRACE sub8 uv_mode value={uv_mode} rng={}", dec.debug_state().0);
         }
@@ -18736,7 +18941,7 @@ fn sub8_leaf_chroma444(
     base_q_idx: u8,
     smooth_neighbor_uv: bool,
     fctx: &crate::decode::FrameCtx,
-) -> Result<(Grid, Grid)> {
+) -> Result<(Grid, Grid, usize, usize)> {
     let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
     let (w_mi, h_mi) = (bw / MI, bh / MI);
     neighbours.record_uv_mode_mi(lmi.0, lmi.1, w_mi, h_mi, uv_predict_mode);
@@ -18764,7 +18969,7 @@ fn sub8_leaf_chroma444(
             hit!(SKIPPED_INTRABC_CHROMA_ARM_HITS);
             fctx.intrabc_chroma_tx.with(|c| c.set(None));
         }
-        (Grid::Zero(bw * bh), Grid::Zero(bw * bh))
+        (Grid::Zero(bw * bh), Grid::Zero(bw * bh), 4, 4)
     } else if let Some(dv) = intrabc_dv {
         // Frame copy at the DV; the residual still reads the ordinary chroma
         // tables with the inherited luma `tx_type` (see the 4:2:0 tails).
@@ -18794,12 +18999,12 @@ fn sub8_leaf_chroma444(
                 0, reach, v, px, py, 4, TX4, base_q_idx,
                 None, None, None, smooth_neighbor_uv, fctx,
             )?;
-            (ug, vg)
+            (ug, vg, 4, 4)
         } else {
             let scan: &[u16] = if bw > bh { &SCAN_8X4 } else { &SCAN_4X8 };
             let default_tx =
                 fctx.intrabc_chroma_tx.with(std::cell::Cell::get).unwrap_or(TxType::DctDct);
-            let mut out = (Grid::Zero(bw * bh), Grid::Zero(bw * bh));
+            let mut out = (Grid::Zero(bw * bh), Grid::Zero(bw * bh), bw, bh);
             for (plane_idx, buf) in [(1usize, ub), (2usize, vb)] {
                 let skip_ctx =
                     usize::from(around[plane_idx].0) + usize::from(around[plane_idx].1);
@@ -18839,14 +19044,62 @@ fn sub8_leaf_chroma444(
                 0, reach, v, px, py, 4, TX4, base_q_idx,
                 alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
             )?;
-            (ug, vg)
+            (ug, vg, 4, 4)
+        } else if lossless(fctx) {
+            // lane-av1-llsub8: `read_tx_size` answers TX_4X4 for EVERY plane of
+            // a lossless block, so this rect leaf's chroma is (bw/4)*(bh/4)
+            // TX_4X4 units at their own 4x4 origins -- not the single
+            // TX_8X4/TX_4X8 rect unit the non-lossless arm below reads (that
+            // one is `av1_get_max_uv_txsize(BLOCK_8X4)`'s rect transform, which
+            // lossless never reaches). Measured on `ll444.obu`'s HORZ leaf at
+            // mi (8,16): the oracle codes U units at bc 0,1 with
+            // `get_txb_ctx`'s +10 rows (`txb_skip_cdf[0][10..12]`,
+            // plane pels 32 > tx pels 16) where the rect-unit read consumed
+            // `txb_skip_cdf[1][0]` -- the tile desynced at that U unit's
+            // all_zero symbol. Walk is plane-major like libaom
+            // `decode_token_recon_block`'s plane/row/col loop; each unit adds
+            // 3 to the chroma context (Chroma4's `big` rows, the same fold
+            // [`read_plane`]'s 128x128 caller uses); CFL is never allowed at
+            // lossless, so no alpha rides along.
+            let mut out_u = Grid::Own(vec![0i32; bw * bh]);
+            let mut out_v = Grid::Own(vec![0i32; bw * bh]);
+            for (plane_idx, buf) in [(1usize, u), (2usize, v)] {
+                for ur in 0..bh / 4usize {
+                    for uc in 0..bw / 4usize {
+                        let (umi_r, umi_c) = (lmi.0 + ur, lmi.1 + uc);
+                        let (upx, upy) = (px + uc * 4, py + ur * 4);
+                        let unit_around = neighbours.around_mi_rect((umi_r, umi_c), 4, 4);
+                        let unit_reach = Reach::of(4, upx, upy, y.width, y.height, fctx);
+                        let grid = read_plane(
+                            dec, cdfs, TxbSet::Chroma4, scan4, plane_idx, unit_around[plane_idx],
+                            uv_mode, uv_predict_mode, 0, unit_reach, buf, upx, upy, 4,
+                            TX4, base_q_idx, None, None, Some(3), smooth_neighbor_uv, fctx,
+                        )?;
+                        let cell = grid_unit_state(&grid, 4, 0, 0, 4, 4);
+                        if umi_r < neighbours.mi_rows {
+                            neighbours.left[umi_r][plane_idx] = cell;
+                        }
+                        if umi_c < neighbours.mi_cols {
+                            neighbours.above[umi_c][plane_idx] = cell;
+                        }
+                        let out = if plane_idx == 1 { &mut out_u } else { &mut out_v };
+                        if let Grid::Own(v) = out {
+                            for r in 0..4usize {
+                                v[(ur * 4 + r) * bw + uc * 4..][..4]
+                                    .copy_from_slice(&grid[r * 4..][..4]);
+                            }
+                        }
+                    }
+                }
+            }
+            (out_u, out_v, 4, 4)
         } else {
             // `av1_get_max_uv_txsize(BLOCK_4X8/8X4)` at ss 0/0 is the rect
             // transform itself; its `tx_type` is mode-derived with the
             // <32 set (`decode_rect_split`'s own rule for this shape).
             let scan: &[u16] = if bw > bh { &SCAN_8X4 } else { &SCAN_4X8 };
             let default_tx = default_intra_tx_type(uv_predict_mode as u8);
-            let mut out = (Grid::Zero(bw * bh), Grid::Zero(bw * bh));
+            let mut out = (Grid::Zero(bw * bh), Grid::Zero(bw * bh), bw, bh);
             for plane_idx in 1..=2usize {
                 let skip_ctx =
                     usize::from(around[plane_idx].0) + usize::from(around[plane_idx].1);
@@ -18874,23 +19127,54 @@ fn sub8_leaf_chroma444(
         }
     };
     // libaom `av1_set_entropy_contexts` stamps above/left PER TRANSFORM UNIT:
-    // the leaf's own chroma span, not the 8x8 group's.
-    let (u_grid, v_grid) = grids;
-    let u_state = neighbour_state(&u_grid);
-    let v_state = neighbour_state(&v_grid);
-    for cell in 0..h_mi {
-        if lmi.0 + cell < neighbours.mi_rows {
-            neighbours.left[lmi.0 + cell][1] = u_state;
-            neighbours.left[lmi.0 + cell][2] = v_state;
+    // the leaf's own chroma span, not the 8x8 group's. A rect leaf's lossless
+    // units (4x4) each carry their own state -- a 4:2:0-style whole-leaf smear
+    // gave one unit's state to its neighbour's cells (lane-av1-llsub8).
+    let (u_grid, v_grid, unit_w, unit_h) = grids;
+    // One unit covers `unit_w/MI` mi columns and `unit_h/MI` mi rows (a 4x4
+    // unit: one cell each; the non-lossless rect unit: the whole leaf).
+    let (uw_cells, uh_cells) = ((unit_w / MI).max(1), (unit_h / MI).max(1));
+    for ur in 0..h_mi / uh_cells {
+        for uc in 0..w_mi / uw_cells {
+            let (x0, y0) = (uc * unit_w, ur * unit_h);
+            let us = grid_unit_state(&u_grid, bw, x0, y0, unit_w, unit_h);
+            let vs = grid_unit_state(&v_grid, bw, x0, y0, unit_w, unit_h);
+            for cell in 0..uh_cells {
+                if lmi.0 + ur * uh_cells + cell < neighbours.mi_rows {
+                    neighbours.left[lmi.0 + ur * uh_cells + cell][1] = us;
+                    neighbours.left[lmi.0 + ur * uh_cells + cell][2] = vs;
+                }
+            }
+            for cell in 0..uw_cells {
+                if lmi.1 + uc * uw_cells + cell < neighbours.mi_cols {
+                    neighbours.above[lmi.1 + uc * uw_cells + cell][1] = us;
+                    neighbours.above[lmi.1 + uc * uw_cells + cell][2] = vs;
+                }
+            }
         }
     }
-    for cell in 0..w_mi {
-        if lmi.1 + cell < neighbours.mi_cols {
-            neighbours.above[lmi.1 + cell][1] = u_state;
-            neighbours.above[lmi.1 + cell][2] = v_state;
+    Ok((u_grid, v_grid, unit_w, unit_h))
+}
+
+/// [`neighbour_state`] over one `(unit_w x unit_h)` transform unit at offset
+/// `(x0, y0)` inside a `bw`-wide assembled chroma grid -- the per-unit stamp
+/// the rect arms need when a leaf carries more than one unit.
+fn grid_unit_state(grid: &Grid, bw: usize, x0: usize, y0: usize, unit_w: usize, unit_h: usize) -> Neighbour {
+    let mut cul = 0u32;
+    let mut dc = None;
+    for r in 0..unit_h {
+        for c in 0..unit_w {
+            let v = grid[(y0 + r) * bw + x0 + c];
+            cul += v.unsigned_abs();
+            if r == 0 && c == 0 && v != 0 {
+                dc = Some(v < 0);
+            }
         }
     }
-    Ok((u_grid, v_grid))
+    if cul == 0 {
+        return Neighbour::default();
+    }
+    Neighbour { level: cul.min(7) as u8, dc }
 }
 
 
@@ -20000,6 +20284,15 @@ const CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
 const CDEF_VERY_LARGE: i32 = 0x4000;
 const CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
 const CDEF_SEC_TAPS: [i32; 2] = [2, 1];
+/// lane-av1422filter: libaom `av1_cdef_filter_fb` (cdef_block.c) remaps the
+/// luma direction before filtering CHROMA whenever `xdec != ydec` — the
+/// direction grid lives on the subsampled chroma grid, so a direction found
+/// on the 8x8 luma block means a different line there. `conv422` applies
+/// under 4:2:2 (`xdec` set), `conv440` under its mirror (not expressible in
+/// the profiles this decoder accepts, kept for fidelity). 4:2:0 and 4:4:4
+/// (`xdec == ydec`) take no remap, exactly as before this lane.
+const CDEF_DIR_CONV422: [usize; 8] = [7, 0, 2, 4, 5, 6, 6, 6];
+const CDEF_DIR_CONV440: [usize; 8] = [1, 2, 2, 2, 3, 4, 6, 0];
 
 fn cdef_msb(x: i32) -> i32 {
     31 - x.leading_zeros() as i32
@@ -24525,7 +24818,19 @@ fn cdef_band(
 
                     let t_uv = i32::from(cdef.uv_pri_strength[sidx]) << coeff_shift;
                     let uv_sec_strength = i32::from(cdef.uv_sec_strength[sidx]) << coeff_shift;
-                    let uv_dir = if t_uv != 0 { dir } else { 0 };
+                    // lane-av1422filter: the chroma direction is the luma one
+                    // remapped through `conv422`/`conv440` under asymmetric
+                    // subsampling (see [`CDEF_DIR_CONV422`]); identical to the
+                    // raw luma direction for 4:2:0 and 4:4:4.
+                    let uv_dir = if t_uv != 0 {
+                        match (ss_x(fctx), ss_y(fctx)) {
+                            (1, 0) => CDEF_DIR_CONV422[dir],
+                            (0, 1) => CDEF_DIR_CONV440[dir],
+                            _ => dir,
+                        }
+                    } else {
+                        0
+                    };
                     let enable_primary_uv = t_uv != 0;
                     let enable_secondary_uv = uv_sec_strength != 0;
                     if let Some(w) = wrote.as_deref_mut() {
@@ -24728,8 +25033,11 @@ fn pipe_run(
             let j = k - 2;
             if let Some((sy2, su2, sv2)) = snap.as_mut() {
                 snap_band(sy2.data.to_mut(), y, 0, j * 64, (j + 1) * 64, cfg.cdef_on);
-                snap_band(su2.data.to_mut(), u, 1, j * 32, (j + 1) * 32, cfg.cdef_on);
-                snap_band(sv2.data.to_mut(), v, 1, j * 32, (j + 1) * 32, cfg.cdef_on);
+                // lane-av1422filter: chroma band rows follow the frame's ss_y
+                // (4:2:2 chroma bands the luma 64-row grid, not 32).
+                let (c_lo, c_hi) = ((j * 64) >> ss_y(fctx), ((j + 1) * 64) >> ss_y(fctx));
+                snap_band(su2.data.to_mut(), u, ss_y(fctx) as u32, c_lo, c_hi, cfg.cdef_on);
+                snap_band(sv2.data.to_mut(), v, ss_y(fctx) as u32, c_lo, c_hi, cfg.cdef_on);
             }
         }
         if cfg.cdef_on && k >= 3 && k - 3 < nb {
@@ -24784,8 +25092,23 @@ fn pipe_run_lr(
     let (fw, fh) = (cfg.frame_w, cfg.frame_h);
     let dims = [
         (fw, fh, 0u32, y.width, y.data.len()),
-        (fw.div_ceil(2), fh.div_ceil(2), 1, u.width, u.data.len()),
-        (fw.div_ceil(2), fh.div_ceil(2), 1, v.width, v.data.len()),
+        // lane-av1422filter: chroma plane extents and stripe geometry follow
+        // the frame's own subsampling -- 4:2:2 chroma is full-height with
+        // luma-grid stripes (only 4:2:0 halves both).
+        (
+            round_ss(fw, ss_x(fctx)),
+            round_ss(fh, ss_y(fctx)),
+            ss_y(fctx) as u32,
+            u.width,
+            u.data.len(),
+        ),
+        (
+            round_ss(fw, ss_x(fctx)),
+            round_ss(fh, ss_y(fctx)),
+            ss_y(fctx) as u32,
+            v.width,
+            v.data.len(),
+        ),
     ];
     let mut planes: Vec<LrPlane> = Vec::new();
     for (p, &(pw, ph, ss, stride, len)) in dims.iter().enumerate() {
@@ -25559,6 +25882,21 @@ thread_local! {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn chroma_split_tx_hits() -> usize {
     CHROMA_SPLIT_TX_HITS.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// How many INTRA leaves of an inter frame's 8x8 block ran the lossless
+    /// 4:4:4 chroma walk ([`read_intra_chroma_lossless`], lane-av1-llintra8)
+    /// -- one bump per leaf, four units per plane inside it. A gate proving
+    /// the arm must see this nonzero; CHROMA_SPLIT_TX_HITS alone cannot
+    /// attribute its bumps to THIS leaf.
+    pub(crate) static LLINTRA8_CHROMA_WALK_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`LLINTRA8_CHROMA_WALK_HITS`]: lossless 4:4:4 chroma walks through an
+/// inter frame's 8x8 INTRA leaf.
+pub fn llintra8_chroma_walk_hits() -> usize {
+    LLINTRA8_CHROMA_WALK_HITS.with(|c| c.get())
 }
 
 fn read_sb128_root(
@@ -27752,8 +28090,20 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
             && lr.loop_restoration_size[p] != 0
     });
-    let deblocked =
-        lr_active.then(|| (plane_snapshot(&y, 0), plane_snapshot(&u, 1), plane_snapshot(&v, 1)));
+    let deblocked = lr_active.then(|| {
+        (
+            plane_snapshot(&y, 0),
+            // lane-av1422filter: the bands are the LR stripe-boundary context
+            // (`RESTORATION_UNIT_OFFSET >> ss_y` above/below each 64-luma-row
+            // stripe). Chroma stripes are half-height ONLY under 4:2:0; a
+            // 4:2:2 frame's chroma (ss_y = 0) stripes on the luma grid, so
+            // the hardcoded `1` saved bands at rows 26/60/92/124 where LR
+            // reads rows 54..57/118..121 -- every 4:2:2 boundary
+            // substitution read uninitialised zeros (frame-0 V (48,0)).
+            plane_snapshot(&u, ss_y(fctx) as u32),
+            plane_snapshot(&v, ss_y(fctx) as u32),
+        )
+    });
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -28391,7 +28741,13 @@ fn read_intra_chroma_lossless(
                 if cpx + ox >= u.true_width || cpy + oy >= u.true_height {
                     continue;
                 }
-                let cu_mi = (at_mi.0 + oy / 2, at_mi.1 + ox / 2);
+                // Chroma pixels per mi cell: 2 at 4:2:0, 4 at 4:4:4. At
+                // 4:2:0 a TX_4X4 chroma unit spans two mi cells and anchors
+                // at the even one; at 4:4:4 it IS one mi cell.
+                let cu_mi = (
+                    at_mi.0 + oy / (MI >> ss_y(fctx)),
+                    at_mi.1 + ox / (MI >> ss_x(fctx)),
+                );
                 // libaom's chroma entropy-context arrays are SUBSAMPLED:
                 // `get_txb_ctx` reads exactly one entry per plane for a
                 // TX_4X4 chroma unit (`a[0]`/`l[0]`). Our bands are luma-mi
@@ -28400,8 +28756,12 @@ fn read_intra_chroma_lossless(
                 // cell is past the band on a unit whose block hangs off the
                 // frame edge, which libaom still codes.
                 let cu_around = neighbours.around_mi(cu_mi, MI);
+                // The unit's origin and extent in LUMA pixels: `<< ss` at
+                // 4:2:0 (8x8 luma for a 4x4 chroma unit), identity at 4:4:4.
                 let cu_reach = tu_reach(
-                    side, side, ox * 2, oy * 2, 8, reach, px, py, frame_w, frame_h, fctx,
+                    side, side,
+                    ox << ss_x(fctx), oy << ss_y(fctx), 4 << ss_x(fctx),
+                    reach, px, py, frame_w, frame_h, fctx,
                 );
                 if let Some((ub, vb)) = palette_uv_bufs {
                     let buf = if plane_idx == 1 { ub } else { vb };
@@ -28432,7 +28792,11 @@ fn read_intra_chroma_lossless(
                     smooth_neighbor_uv,
                     fctx,
                 )?;
-                neighbours.record_mi_chroma(cu_mi, 8, 8, plane_idx, &cu_grid);
+                // The unit's own footprint on the LUMA mi grid: 8 luma px
+                // (two cells) at 4:2:0, 4 (one cell) at 4:4:4.
+                neighbours.record_mi_chroma(
+                    cu_mi, 4 << ss_x(fctx), 4 << ss_y(fctx), plane_idx, &cu_grid,
+                );
                 hit!(CHROMA_SPLIT_TX_HITS);
                 let dst = mu_units(
                     if plane_idx == 1 { &mut *u_out } else { &mut *v_out },
@@ -28499,9 +28863,13 @@ fn read_inter_chroma_lossless(
                 if cpx + ox >= u.true_width || cpy + oy >= u.true_height {
                     continue;
                 }
-                // The chroma neighbour bands are indexed in LUMA mi: 4 chroma
-                // pixels span 8 luma ones, i.e. 2 mi.
-                let cu_mi = (at_mi.0 + oy / 2, at_mi.1 + ox / 2);
+                // The chroma neighbour bands are indexed in LUMA mi: a 4-wide
+                // chroma unit spans `4 << ss` luma pixels, i.e. `4 >> ss` --
+                // 2 mi cells at 4:2:0, one at 4:4:4.
+                let cu_mi = (
+                    at_mi.0 + oy / (4 >> ss_y(fctx)),
+                    at_mi.1 + ox / (4 >> ss_x(fctx)),
+                );
                 // libaom's chroma entropy-context arrays are SUBSAMPLED:
                 // `get_txb_ctx` reads exactly one entry per plane for a
                 // TX_4X4 chroma unit (`a[0]`/`l[0]`). Our bands are luma-mi
@@ -28538,7 +28906,13 @@ fn read_inter_chroma_lossless(
                 )?
                 .0;
                 // Immediately, so the NEXT unit reads this one's context.
-                neighbours.record_mi_chroma(cu_mi, 8, 8, plane_idx, &cu_grid);
+                neighbours.record_mi_chroma(
+                    cu_mi,
+                    4 << ss_x(fctx),
+                    4 << ss_y(fctx),
+                    plane_idx,
+                    &cu_grid,
+                );
                 hit!(CHROMA_SPLIT_TX_HITS);
                 let dst = mu_units(
                     if plane_idx == 1 { &mut *u_out } else { &mut *v_out },
@@ -28552,6 +28926,39 @@ fn read_inter_chroma_lossless(
         }
     }
     Ok(())
+}
+
+/// The 8x8 inter leaf's lossless 4:4:4 chroma arm (lane-av1-llinter), shared
+/// by the single-ref and compound paths: the plane block is a 2x2 raster of
+/// TX_4X4 units (`av1_get_tx_size`: lossless returns TX_4X4 for EVERY plane,
+/// not just luma), read by the same per-unit walk the bigger inter blocks
+/// run. Returns the two block grids composed at stride 8 (`Grid::Zero` when
+/// every unit hung off the frame edge) and leaves each unit's own coefficient
+/// context stamped in the neighbour bands -- the caller's tail must not let
+/// its whole-block `record_mi` overwrite them.
+#[allow(clippy::too_many_arguments)]
+fn leaf8_inter_chroma_lossless(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    su: Pred<'_>,
+    sv: Pred<'_>,
+    at_mi: (usize, usize),
+    (cpx, cpy): (usize, usize),
+    base_q_idx: u8, fctx: &crate::decode::FrameCtx,
+) -> Result<(Grid, Grid)> {
+    let (mut uo, mut vo) = (Vec::new(), Vec::new());
+    read_inter_chroma_lossless(
+        dec, cdfs, neighbours, u, v, su, sv,
+        at_mi, (cpx, cpy), (0, 0), (8, 8), (8, 8), 8, 0,
+        base_q_idx, &mut uo, &mut vo, fctx,
+    )?;
+    Ok((
+        if uo.is_empty() { Grid::Zero(64) } else { Grid::Own(uo) },
+        if vo.is_empty() { Grid::Zero(64) } else { Grid::Own(vo) },
+    ))
 }
 
 /// Spec 5.11.25's `single_ref_p1`..`p6` tree (reachable only once `comp_mode`
@@ -29548,6 +29955,13 @@ pub(crate) fn obmc_plan(
     side: usize,
     write_w: usize,
     write_h: usize,
+    // lane-av1-llpred2: the FRAME's own subsampling pair -- the same pair the
+    // chroma window half in [`obmc_run`] shifts by. A rect strip's ss cannot
+    // be derived from a rect size over the square `chroma_side`: that ratio
+    // gave a 16x8 strip at 4:2:0 ss=(1,0) (losing its above-chroma skip) and
+    // divides by zero at 4:4:4 (`trailing_zeros(0)` = 64, a debug shift panic).
+    ss_x: usize,
+    ss_y: usize,
     chroma_side: usize,
     px: usize,
     py: usize,
@@ -29592,10 +30006,19 @@ pub(crate) fn obmc_plan(
     let overlap_above = write_h.min(64) / 2;
     let overlap_left = write_w.min(64) / 2;
     // lane-inter8 r1 / lane-scaledref r1: `av1_skip_u4x4_pred_in_obmc`
-    // (`reconinter.c` 820) returns `dir == 0` when the chroma plane's own
-    // block is BLOCK_4X4/8X4/4X8 (an 8x8, 16x8 or 8x16 luma block at 4:2:0):
-    // the ABOVE pass skips chroma entirely, the LEFT pass still blends it.
-    let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
+    // (`reconinter.c` 829) switches on the PLANE block
+    // (`get_plane_block_size`, ss-shifted): only 4x4/8x4/4x8 skip the ABOVE
+    // pass's chroma (`return dir == 0`), the LEFT pass still blends them.
+    // lane-av1-llpred: the old luma-shape list `(8,8)|(16,8)|(8,16)`
+    // hardcoded the 4:2:0 plane sizes; at 4:4:4 the plane block is the luma
+    // block itself (never 4-wide), so every one of those blocks was silently
+    // missing its above-pass chroma OBMC blend.
+    // lane-av1-llpred2: ss is the FRAME's own pair (`ss_x`/`ss_y(fctx)`, the
+    // same values [`obmc_run`]'s chroma windows shift by), never a ratio of
+    // the rect write size over the square `chroma_side` -- that ratio gave a
+    // 4:2:0 16x8 strip ss=(1,0) and dropped its above-chroma skip, and at
+    // 4:4:4 divided to zero (`trailing_zeros(0)` = 64, a debug shift panic).
+    let skip_chroma_above = obmc_skip_chroma_above(write_w, write_h, ss_x, ss_y);
     let mut above = Vec::new();
     for (off4, span4, nb, src4) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
@@ -29665,6 +30088,56 @@ pub(crate) fn obmc_plan(
         overlap_left,
         skip_chroma_above,
     })
+}
+
+/// `av1_skip_u4x4_pred_in_obmc`'s above-pass decision (libaom
+/// `reconinter.c` 829): the PLANE block (`write_w >> ss_x`, `write_h >>
+/// ss_y`) is 4x4, 8x4 or 4x8. `ss_x`/`ss_y` are the FRAME's own pair -- the
+/// same values [`obmc_run`]'s chroma windows shift by -- never a ratio over
+/// the square `chroma_side` (lane-av1-llpred2: that ratio dropped the
+/// 4:2:0 16x8/8x16 skip and shifted by 64 at 4:4:4). Pure so the check
+/// below pins the rect-strip decision without decoding a stream.
+pub(crate) fn obmc_skip_chroma_above(
+    write_w: usize,
+    write_h: usize,
+    ss_x: usize,
+    ss_y: usize,
+) -> bool {
+    matches!(
+        (write_w >> ss_x, write_h >> ss_y),
+        (4, 4) | (8, 4) | (4, 8)
+    )
+}
+
+#[cfg(test)]
+mod obmc_skip_chroma_tests {
+    use super::obmc_skip_chroma_above;
+
+    /// lane-av1-llpred2: the above-chroma skip keys off the PLANE block
+    /// under the frame's own ss pair. At 4:2:0 a 16x8/8x16 rect strip's
+    /// plane block is 8x4/4x8 and MUST still skip (the old `chroma_side`
+    /// ratio read ss=(1,0) off a 16x8 strip and made it blend); at 4:4:4
+    /// the plane block is the luma block, so only true 4-wide/high shapes
+    /// skip and the shift never leaves `usize` range (the old ratio's
+    /// `trailing_zeros(0)` = 64 panicked a debug build).
+    #[test]
+    fn rect_strips_skip_above_chroma_at_420_and_shift_never_overflows() {
+        // 4:2:0 (ss 1,1): 8x8 -> 4x4, 16x8 -> 8x4, 8x16 -> 4x8 all skip.
+        assert!(obmc_skip_chroma_above(8, 8, 1, 1));
+        assert!(obmc_skip_chroma_above(16, 8, 1, 1));
+        assert!(obmc_skip_chroma_above(8, 16, 1, 1));
+        // ... larger plane blocks blend, exactly libaom's own list.
+        assert!(!obmc_skip_chroma_above(16, 16, 1, 1));
+        assert!(!obmc_skip_chroma_above(32, 16, 1, 1));
+        assert!(!obmc_skip_chroma_above(16, 32, 1, 1));
+        // 4:4:4 (ss 0,0): the plane block is the luma block itself.
+        assert!(obmc_skip_chroma_above(4, 4, 0, 0));
+        assert!(obmc_skip_chroma_above(8, 4, 0, 0));
+        assert!(obmc_skip_chroma_above(4, 8, 0, 0));
+        assert!(!obmc_skip_chroma_above(8, 8, 0, 0));
+        assert!(!obmc_skip_chroma_above(16, 8, 0, 0));
+        assert!(!obmc_skip_chroma_above(8, 16, 0, 0));
+    }
 }
 
 /// One OBMC neighbour as the PARSE thread resolved it (lane-defer8): every
@@ -29775,9 +30248,13 @@ pub(crate) fn obmc_run(
         if !skip_chroma_above {
             // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
             // sizes only the OBMC PREDICTION buffer; the blend length is the
-            // plain half (`build_obmc_inter_pred_above`: `overlap >> ss_y`).
-            let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
-            let cw = cbw.min(write_w / 2 - cox);
+            // plain overlap (`build_obmc_inter_pred_above`:
+            // `overlap >> ss_y`) -- the PLANE's own subsampling shift, 0 at
+            // 4:4:4 (lane-av1-llpred: the old `/2` hardcoded the 4:2:0 half
+            // and half-blended every 4:4:4 OBMC block's chroma).
+            let (cbw, cbh, cox) =
+                (bw >> ss_x(fctx), overlap_above >> ss_y(fctx), ox >> ss_x(fctx));
+            let cw = cbw.min((write_w >> ss_x(fctx)) - cox);
             obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
             obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
@@ -29792,7 +30269,8 @@ pub(crate) fn obmc_run(
         let (bw, bh, oy) = (overlap_left, nb.span4 * 4, nb.off4 * 4);
         obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_y, fctx);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh.min(write_h - oy), &tmp_y);
-        let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
+        let (cbw, cbh, coy) =
+            (overlap_left >> ss_x(fctx), bh >> ss_y(fctx), oy >> ss_y(fctx));
         obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
         if let Some((_, _, idx)) = ec_mcb {
             eprintln!(
@@ -29804,7 +30282,7 @@ pub(crate) fn obmc_run(
                 eprintln!("OUR_MCB lrow{r}: {row:?}");
             }
         }
-        let ch = cbh.min(write_h / 2 - coy);
+        let ch = cbh.min((write_h >> ss_y(fctx)) - coy);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
         obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
@@ -32619,6 +33097,8 @@ fn decode_inter_block(
                     side,
                     write_w,
                     write_h,
+                    ss_x(fctx),
+                    ss_y(fctx),
                     chroma_side,
                     px,
                     py,
@@ -34147,6 +34627,89 @@ fn decode_inter_block(
                 u_grid = if uo.is_empty() { Grid::Zero(zero) } else { Grid::Own(uo) };
                 v_grid = if vo.is_empty() { Grid::Zero(zero) } else { Grid::Own(vo) };
                 mu_chroma = true;
+            } else if ss_x(fctx) == 0 && ss_y(fctx) == 0 && chroma_side > chroma_tx {
+                // lane-av1-rect128recon: at ss 0/0 the uv plane block of a
+                // 64x64 intra block inside an inter frame is 64x64 while
+                // `av1_get_max_uv_txsize` caps the unit at TX_32X32 -- FOUR
+                // plane-major TX_32X32 units (libaom
+                // `decode_token_recon_block`'s plane loop), each with its own
+                // neighbour context and `get_txb_ctx`'s offset-10 rows (+3 on
+                // the `txb_skip_chroma_32` table, lane-sb128b r3), each
+                // stamped immediately so the next unit reads it. The old arm
+                // read ONE whole-plane unit with the block-level context and
+                // no offset: three quarters of the plane's residual was never
+                // read, the unit's `txb_skip` came off the offset-7 row (444
+                // witness f2, right-half intra 64x64: U unit (0,0) ctx 0
+                // where aom reads 10), and the coded corner was even
+                // dequantized at the TX_64X64 dqDenom.
+                let mu_units_n = chroma_side / chroma_tx;
+                let mut u_acc = vec![0i32; chroma_side * chroma_side];
+                let mut v_acc = vec![0i32; chroma_side * chroma_side];
+                for plane_idx in 1..=2 {
+                    let buf: &mut PlaneBuf<'static> =
+                        if plane_idx == 1 { &mut *u } else { &mut *v };
+                    for cu_row in 0..mu_units_n {
+                        for cu_col in 0..mu_units_n {
+                            let cu_mi = (
+                                at_mi.0 + cu_row * (chroma_tx / MI),
+                                at_mi.1 + cu_col * (chroma_tx / MI),
+                            );
+                            let cu_around = neighbours.around_mi(cu_mi, chroma_tx);
+                            let cu_reach = crate::decode::tu_reach(
+                                side,
+                                side,
+                                cu_col * chroma_tx,
+                                cu_row * chroma_tx,
+                                chroma_tx,
+                                reach,
+                                px,
+                                py,
+                                y.width,
+                                y.height, fctx,
+                            );
+                            let cu_grid = read_plane(
+                                dec,
+                                cdfs,
+                                chroma_set,
+                                scan_chroma,
+                                plane_idx,
+                                cu_around[plane_idx],
+                                mode,
+                                uv_predict_mode,
+                                angle_delta_uv,
+                                cu_reach,
+                                buf,
+                                cpx + cu_col * chroma_tx,
+                                cpy + cu_row * chroma_tx,
+                                chroma_tx,
+                                chroma_tx,
+                                base_q_idx,
+                                // CfL is capped at 32x32 (`is_cfl_allowed`),
+                                // so a block this size never carries alpha.
+                                None,
+                                None,
+                                Some(3),
+                                smooth_neighbor_uv, fctx,
+                            )?;
+                            // Immediately, so the NEXT unit reads this one's
+                            // coefficient context.
+                            neighbours.record_mi_chroma(
+                                cu_mi, chroma_tx, chroma_tx, plane_idx, &cu_grid,
+                            );
+                            hit!(CHROMA_SPLIT_TX_HITS);
+                            let acc = if plane_idx == 1 { &mut u_acc } else { &mut v_acc };
+                            for rr in 0..chroma_tx {
+                                let start =
+                                    (cu_row * chroma_tx + rr) * chroma_side + cu_col * chroma_tx;
+                                acc[start..start + chroma_tx]
+                                    .copy_from_slice(&cu_grid[rr * chroma_tx..][..chroma_tx]);
+                            }
+                        }
+                    }
+                }
+                mu_chroma = true;
+                u_grid = Grid::Own(u_acc);
+                v_grid = Grid::Own(v_acc);
             } else {
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
@@ -34218,8 +34781,21 @@ fn decode_inter_block(
     // strip's own record wrote empty chroma state over those cells -- this
     // rewrite is what libaom's single `av1_set_contexts` call for the 8x4
     // (4x8) chroma unit leaves behind.
+    // lane-av1-444interband: 4:2:0 ONLY. At ss 0/0 every strip IS its own
+    // chroma reference (`is_chroma_reference`, no mi parity test), its own
+    // `record_rect_mi` above already stamps exactly the strip's 16x4 (4x16)
+    // chroma span -- libaom `av1_set_entropy_contexts`, or
+    // `av1_reset_entropy_context` for a skipped strip (decodeframe.c:1180)
+    // -- and the pair-form 16x8 (8x16) span anchored at `pair_mi` (== the
+    // strip's own mi at ss 0/0) smeared the strip's state over one extra
+    // row/col of cells: a skipped strip wrote zero over `left[r+1][1..2]`,
+    // erasing the 16x16-intra block to its left's U/V stamps, and the strip
+    // below read its chroma `txb_skip` off the wrong CDF row (t6 frame 1,
+    // U unit (2,8): our base 0 vs aom's base 1, `left[2][1]` 0 vs 23 --
+    // `INTER16_CHROMA_PAIR_HITS` fired 31x on a stream that has no pairs).
     let pair_chroma = strip_chroma
         .filter(|s| s.has_chroma)
+        .filter(|_| ss_x(fctx) == 1 && ss_y(fctx) == 1)
         .map(|s| (s, neighbour_state(&u_grid), neighbour_state(&v_grid)));
     // lane-vert46 r1: libaom stamps the chroma entropy context PER TRANSFORM
     // UNIT (`av1_set_entropy_contexts` inside `decode_reconstruct_tx`'s mu-chunk
@@ -34237,17 +34813,37 @@ fn decode_inter_block(
         let cu = if lossless(fctx) { 4usize } else { 32usize };
         let mut units = Vec::new();
         if lossless(fctx) {
-            let (rows, cols) = ((write_h / 2).div_ceil(cu), (write_w / 2).div_ceil(cu));
+            // lane-av1-llinter: a TX_4X4 chroma unit covers `4 << ss` LUMA
+            // pixels (8, x2-per-unit, at 4:2:0; 4, x1, at 4:4:4) -- the
+            // composed plane grid then holds a full cu-row per chroma row and
+            // each unit's own origin sits `(cu << ss) / MI` mi cells out.
+            // The hardcoded 4:2:0 /2-and-x2 math stamped half the plane with
+            // double spans at 4:4:4 and corrupted the next block's
+            // `txb_skip_ctx` (dodge2 frame 1, U unit mi (4,16) read row 11
+            // where the oracle reads row 10).
+            let (rows, cols) = (
+                (write_h >> ss_y(fctx)).div_ceil(cu),
+                (write_w >> ss_x(fctx)).div_ceil(cu),
+            );
             for cr in 0..rows {
                 for cc in 0..cols {
-                    let cu_mi = (at.0 + cr * (cu * 2 / MI), at.1 + cc * (cu * 2 / MI));
+                    let cu_mi = (
+                        at.0 + cr * ((cu << ss_y(fctx)) / MI),
+                        at.1 + cc * ((cu << ss_x(fctx)) / MI),
+                    );
                     for (plane, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
                         let mut unit = Vec::with_capacity(cu * cu);
                         for rr in 0..cu {
                             let start = (cr * cu + rr) * chroma_side + cc * cu;
                             unit.extend_from_slice(&grid[start..start + cu]);
                         }
-                        units.push((cu_mi, plane, Grid::Own(unit), cu * 2, cu * 2));
+                        units.push((
+                            cu_mi,
+                            plane,
+                            Grid::Own(unit),
+                            cu << ss_x(fctx),
+                            cu << ss_y(fctx),
+                        ));
                     }
                 }
             }
@@ -36314,6 +36910,23 @@ fn decode_inter_sub8_rect2(
                 push_mc_rect(2, px, py, SIDE, bw, bh, sv, &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
                 neighbours.record_mi_chroma(lmi, bw, bh, 1, &ZERO_RESIDUAL[..bw * bh]);
                 neighbours.record_mi_chroma(lmi, bw, bh, 2, &ZERO_RESIDUAL[..bw * bh]);
+            } else if lossless(fctx) && !mono(fctx) {
+                // lane-av1-llsub8b: lossless codes TX_4X4 on EVERY plane
+                // (`av1_get_tx_size`, blockd.h:1383), so this 4:4:4 piece's
+                // (8,4)/(4,8) chroma plane block is a 2x1/1x2 raster of
+                // TX_4X4 units, not the ONE TX_8X4 rect unit the lossy arm
+                // below reads -- that single rect is what tripped
+                // `TxParams::run`'s WHT assert ((8,4) != (4,4),
+                // decode.rs:2566). The walk stamps each unit's own
+                // coefficient context, so -- unlike the lossy arm -- no
+                // whole-block `record_mi_chroma` runs after it: the walk's
+                // per-unit stamps ARE the block's chroma contexts (the same
+                // rule `leaf8_inter_chroma_lossless`'s caller obeys).
+                read_inter_chroma_lossless(
+                    dec, cdfs, neighbours, u, v, su, sv,
+                    (rmi, cmi), (px, py), (0, 0), (bw, bh), (bw, bh), SIDE, 0,
+                    base_q_idx, &mut Vec::new(), &mut Vec::new(), fctx,
+                )?;
             } else {
                 let ca = neighbours.around_mi_rect(lmi, bw, bh);
                 let (ug, _) = read_inter_plane_rect(
@@ -36752,6 +37365,12 @@ fn decode_inter_block8(
     // stores `UV_DC_PRED`, exactly as [`decode_inter_block`] one level up.
     let mut uv_predict_mode = DC_PRED;
     let (luma_grid, u_grid, v_grid);
+    // lane-av1-llinter: set when a lossless 4:4:4 leaf's chroma went through
+    // the per-unit walk (`read_inter_chroma_lossless`) -- the walk stamps each
+    // TX_4X4 unit's own coefficient context, so the tail's whole-block
+    // `record_mi` gets its chroma half saved/restored around, exactly like
+    // `saved_luma_ctx` does for a `split8` luma.
+    let mut chroma_stamped_per_unit = false;
     let mut compound_ctx8: Option<(i8, i8, u8, u8)> = None;
     // lane-inter8 r1: this leaf's own resolved references, handed back so the
     // NEXT leaf of the same 16x16 can use them as its real above/left
@@ -37361,42 +37980,52 @@ fn decode_inter_block8(
                         split8, fctx,
                     )?;
                     luma_grid = grid8;
-                    u_grid = read_inter_plane(
-                        dec,
-                        cdfs,
-                        chroma_set,
-                        chroma_scan,
-                        1,
-                        around[1],
-                        mode_for_tx,
-                        u,
-                        cpx,
-                        cpy,
-                        chroma_side,
-                        base_q_idx,
-                        su,
-                        Some(luma_tx_type),
-                        None, fctx,
-                    )?
-                    .0;
-                    v_grid = read_inter_plane(
-                        dec,
-                        cdfs,
-                        chroma_set,
-                        chroma_scan,
-                        2,
-                        around[2],
-                        mode_for_tx,
-                        v,
-                        cpx,
-                        cpy,
-                        chroma_side,
-                        base_q_idx,
-                        sv,
-                        Some(luma_tx_type),
-                        None, fctx,
-                    )?
-                    .0;
+                    if chroma_side == 8 && lossless(fctx) && !mono(fctx) {
+                        let (ug, vg) = leaf8_inter_chroma_lossless(
+                            dec, cdfs, neighbours, u, v, su, sv,
+                            leaf_mi, (cpx, cpy), base_q_idx, fctx,
+                        )?;
+                        u_grid = ug;
+                        v_grid = vg;
+                        chroma_stamped_per_unit = true;
+                    } else {
+                        u_grid = read_inter_plane(
+                            dec,
+                            cdfs,
+                            chroma_set,
+                            chroma_scan,
+                            1,
+                            around[1],
+                            mode_for_tx,
+                            u,
+                            cpx,
+                            cpy,
+                            chroma_side,
+                            base_q_idx,
+                            su,
+                            Some(luma_tx_type),
+                            None, fctx,
+                        )?
+                        .0;
+                        v_grid = read_inter_plane(
+                            dec,
+                            cdfs,
+                            chroma_set,
+                            chroma_scan,
+                            2,
+                            around[2],
+                            mode_for_tx,
+                            v,
+                            cpx,
+                            cpy,
+                            chroma_side,
+                            base_q_idx,
+                            sv,
+                            Some(luma_tx_type),
+                            None, fctx,
+                        )?
+                        .0;
+                    }
                 }
                 // lane-inter8 r2: the COMPOUND leaf used to return here
                 // WITHOUT the end-of-function `record_mi`/`fill_lf_grid` the
@@ -37452,7 +38081,32 @@ fn decode_inter_block8(
                 palette_record8.2,
                 palette_record8.3,
             );
+                let saved_chroma_ctx = chroma_stamped_per_unit.then(|| {
+                    (
+                        [
+                            [neighbours.left[leaf_mi.0][1], neighbours.left[leaf_mi.0][2]],
+                            [neighbours.left[leaf_mi.0 + 1][1], neighbours.left[leaf_mi.0 + 1][2]],
+                        ],
+                        [
+                            [neighbours.above[leaf_mi.1][1], neighbours.above[leaf_mi.1][2]],
+                            [neighbours.above[leaf_mi.1 + 1][1], neighbours.above[leaf_mi.1 + 1][2]],
+                        ],
+                    )
+                });
                 neighbours.record_mi(leaf_mi, 8, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
+                if let Some((left, above)) = saved_chroma_ctx {
+                    // The walk's per-unit stamps are the block's real chroma
+                    // coefficient contexts (`av1_set_contexts` per TX_4X4
+                    // unit); put them back over `record_mi`'s composed state.
+                    for (cell, uv) in left.into_iter().enumerate() {
+                        neighbours.left[leaf_mi.0 + cell][1] = uv[0];
+                        neighbours.left[leaf_mi.0 + cell][2] = uv[1];
+                    }
+                    for (cell, uv) in above.into_iter().enumerate() {
+                        neighbours.above[leaf_mi.1 + cell][1] = uv[0];
+                        neighbours.above[leaf_mi.1 + cell][2] = uv[1];
+                    }
+                }
                 if let Some((left, above)) = saved_luma_ctx {
                     for (cell, state) in left.into_iter().enumerate() {
                         neighbours.left[leaf_mi.0 + cell][0] = state;
@@ -37882,6 +38536,8 @@ fn decode_inter_block8(
                 SIDE,
                 SIDE,
                 SIDE,
+                ss_x(fctx),
+                ss_y(fctx),
                 chroma_side,
                 px,
                 py,
@@ -38074,42 +38730,52 @@ fn decode_inter_block8(
                 split8, fctx,
             )?;
             luma_grid = grid8;
-            u_grid = read_inter_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                chroma_scan,
-                1,
-                around[1],
-                mode_for_tx,
-                u,
-                cpx,
-                cpy,
-                chroma_side,
-                base_q_idx,
-                su,
-                Some(luma_tx_type),
-                None, fctx,
-            )?
-            .0;
-            v_grid = read_inter_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                chroma_scan,
-                2,
-                around[2],
-                mode_for_tx,
-                v,
-                cpx,
-                cpy,
-                chroma_side,
-                base_q_idx,
-                sv,
-                Some(luma_tx_type),
-                None, fctx,
-            )?
-            .0;
+            if chroma_side == 8 && lossless(fctx) && !mono(fctx) {
+                let (ug, vg) = leaf8_inter_chroma_lossless(
+                    dec, cdfs, neighbours, u, v, su, sv,
+                    leaf_mi, (cpx, cpy), base_q_idx, fctx,
+                )?;
+                u_grid = ug;
+                v_grid = vg;
+                chroma_stamped_per_unit = true;
+            } else {
+                u_grid = read_inter_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    chroma_scan,
+                    1,
+                    around[1],
+                    mode_for_tx,
+                    u,
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    base_q_idx,
+                    su,
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?
+                .0;
+                v_grid = read_inter_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    chroma_scan,
+                    2,
+                    around[2],
+                    mode_for_tx,
+                    v,
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    base_q_idx,
+                    sv,
+                    Some(luma_tx_type),
+                    None, fctx,
+                )?
+                .0;
+            }
         }
     } else {
         let mode = dec.symbol(&mut cdfs.y_mode[SIZE_GROUP_8]);
@@ -38160,10 +38826,22 @@ fn decode_inter_block8(
         // but `DC_PRED` was refused here, which is what blocked the low-cq
         // CDEF arms and the 10-bit gates.
         let has_chroma = !mono(fctx);
+        // lane-av1-llintra8: `read_intra_mode_uv` (decodemv.c:145) picks the
+        // uv CDF row by `is_cfl_allowed` (cfl.h:23) -- at LOSSLESS that is
+        // "the chroma plane block is BLOCK_4X4" (cfl.h:29), for this
+        // BLOCK_8X8 leaf only at 4:2:0. The 4:4:4 lossless leaf reads the
+        // 13-symbol `uv_mode_no_cfl` alphabet; the unconditional CFL row
+        // consumed a different partition than aomdec at the leaf's own
+        // uv_mode symbol (class wrong-alphabet-same-value) and desynced
+        // every stream that reached the leaf's lossless chroma walk below.
+        // 4:2:0 and every non-lossless partition keep the CFL row
+        // (`cfl_allowed_px` answers true exactly as before).
         let uv_mode = if !has_chroma {
             DC_PRED
-        } else {
+        } else if cfl_allowed_px(SIDE, SIDE, fctx) {
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
             eprintln!(
@@ -38573,6 +39251,33 @@ fn decode_inter_block8(
             )?
             };
             let ac = alpha.map(|_| cfl_src(px, py, SIDE));
+            if chroma_side == 8 && lossless(fctx) && !mono(fctx) {
+                // lane-av1-llintra8: lossless codes TX_4X4 on EVERY plane
+                // (`av1_get_tx_size`, blockd.h:1383), so this intra leaf's 8x8
+                // chroma plane block is a 2x2 raster of TX_4X4 units per
+                // plane, plane-major -- the same per-unit walk the >=16x16
+                // intra-in-inter block runs, not one TX_8X8 unit (whose WHT
+                // hits `TxParams::run`'s `(8, 8) != (4, 4)` lossless assert).
+                // The walk stamps each unit's own coefficient context
+                // (`record_mi_chroma` inside it), so the tail's whole-block
+                // `record_mi` gets its chroma half saved/restored around --
+                // the same rule the INTER arms'
+                // `leaf8_inter_chroma_lossless` obeys. 4:2:0 keeps its single
+                // TX_4X4 unit in the `else` below.
+                let (mut uo, mut vo) = (Vec::new(), Vec::new());
+                read_intra_chroma_lossless(
+                    dec, cdfs, neighbours, u, v, leaf_mi, (px, py), (cpx, cpy),
+                    SIDE, (chroma_side, chroma_side), (0, 0),
+                    (chroma_side, chroma_side), chroma_side, reach,
+                    (y.width, y.height), mode, uv_predict_mode, angle_delta_uv,
+                    palette_uv_bufs.as_ref().map(|(a, b)| (&a[..], &b[..])),
+                    smooth_neighbor_uv, base_q_idx, &mut uo, &mut vo, fctx,
+                )?;
+                u_grid = if uo.is_empty() { Grid::Zero(64) } else { Grid::Own(uo) };
+                v_grid = if vo.is_empty() { Grid::Zero(64) } else { Grid::Own(vo) };
+                chroma_stamped_per_unit = true;
+                hit!(LLINTRA8_CHROMA_WALK_HITS);
+            } else {
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
@@ -38623,6 +39328,7 @@ fn decode_inter_block8(
                 None,
                 smooth_neighbor_uv, fctx,
             )?;
+            }
         }
     }
     // lane-txselect: a split leaf's plane-0 neighbour context is per 4x4
@@ -38666,7 +39372,32 @@ fn decode_inter_block8(
         palette_record8.2,
         palette_record8.3,
     );
+    let saved_chroma_ctx = chroma_stamped_per_unit.then(|| {
+        (
+            [
+                [neighbours.left[leaf_mi.0][1], neighbours.left[leaf_mi.0][2]],
+                [neighbours.left[leaf_mi.0 + 1][1], neighbours.left[leaf_mi.0 + 1][2]],
+            ],
+            [
+                [neighbours.above[leaf_mi.1][1], neighbours.above[leaf_mi.1][2]],
+                [neighbours.above[leaf_mi.1 + 1][1], neighbours.above[leaf_mi.1 + 1][2]],
+            ],
+        )
+    });
     neighbours.record_mi(leaf_mi, 8, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
+    if let Some((left, above)) = saved_chroma_ctx {
+        // The walk's per-unit stamps are the block's real chroma coefficient
+        // contexts (`av1_set_contexts` per TX_4X4 unit); put them back over
+        // `record_mi`'s one composed state.
+        for (cell, uv) in left.into_iter().enumerate() {
+            neighbours.left[leaf_mi.0 + cell][1] = uv[0];
+            neighbours.left[leaf_mi.0 + cell][2] = uv[1];
+        }
+        for (cell, uv) in above.into_iter().enumerate() {
+            neighbours.above[leaf_mi.1 + cell][1] = uv[0];
+            neighbours.above[leaf_mi.1 + cell][2] = uv[1];
+        }
+    }
     // lane-uv8 r1: this leaf never stamped a mode band at all, so the block
     // below/right of it read whatever block last wrote the coarse [`SUB`]
     // slot -- now that an intra leaf here can code a smooth/directional
@@ -41811,7 +42542,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             (false, None) => None,
         }
     } else {
-        lr_active.then(|| (plane_snapshot(&y, 0), plane_snapshot(&u, 1), plane_snapshot(&v, 1)))
+        // lane-av1422filter: chroma band geometry follows the frame's own
+        // ss_y (see the keyframe path's note) -- 4:2:2 stripes full-height.
+        lr_active.then(|| {
+            (
+                plane_snapshot(&y, 0),
+                plane_snapshot(&u, ss_y(fctx) as u32),
+                plane_snapshot(&v, ss_y(fctx) as u32),
+            )
+        })
     };
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
