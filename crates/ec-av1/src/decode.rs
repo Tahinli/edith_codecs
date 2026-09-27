@@ -4515,6 +4515,23 @@ pub(crate) fn affine_gm_hits() -> usize {
     AFFINE_GM_HITS.with(|c| c.get())
 }
 
+// lane-av1gwarp12: how many 16x16+ blocks built their SINGLE-reference
+// prediction through `crate::warp::global_warp_params` with a FOUR-parameter
+// (`ROTZOOM`) model. Vanilla aomenc pins its global-motion search to ROTZOOM
+// (`global_motion_facade.c:24`), so this is the only >TRANSLATION single-ref
+// global-warp arm a real aomenc stream can reach (AFFINE needs the widened
+// side build and its own counter, [`AFFINE_GM_HITS`]).
+thread_local! {
+    static ROTZOOM_GM_WARP_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`ROTZOOM_GM_WARP_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn rotzoom_gm_warp_hits() -> usize {
+    ROTZOOM_GM_WARP_HITS.with(|c| c.get())
+}
+
 // lane-t900 r9: rect blocks whose warp-sample top-right probe answers
 // differently at the block's WIDTH than at libaom's
 // `AOMMAX(xd->width, xd->height)` -- each one is a `num_proj_ref` that could
@@ -34731,6 +34748,12 @@ fn decode_inter_block(
                 warp_params = crate::warp::global_warp_params(gm_ref.params);
                 if warp_params.is_some() && gm_ref.model == ec_av1_syntax::WarpModel::Affine {
                     hit!(AFFINE_GM_HITS);
+                }
+                // lane-av1gwarp12: the ROTZOOM sibling -- the only
+                // >TRANSLATION model vanilla aomenc can emit for a single-ref
+                // global-motion block (encoder search pinned to ROTZOOM).
+                if warp_params.is_some() && gm_ref.model == ec_av1_syntax::WarpModel::Rotzoom {
+                    hit!(ROTZOOM_GM_WARP_HITS);
                 }
             }
             // lane-av112bitw: a local `WARPED_CAUSAL` projection (set above)

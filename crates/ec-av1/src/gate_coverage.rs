@@ -119,15 +119,50 @@ enum On {
 /// only a gate that spells an on-value at that bit depth retires an entry.
 #[cfg(test)]
 const DEFAULT_ON_TOOLS: &[(&str, &[&str], &str, On)] = &[
-    ("enable-tx-size-search", &["enable-tx-size-search"], "1", On::NonZero),
-    ("enable-directional-intra", &["enable-directional-intra"], "1", On::NonZero),
-    ("enable-smooth-interintra", &["enable-smooth-interintra"], "1", On::NonZero),
-    ("enable-interintra-wedge", &["enable-interintra-wedge"], "1", On::NonZero),
-    ("enable-diff-wtd-comp", &["enable-diff-wtd-comp"], "1", On::NonZero),
-    ("enable-onesided-comp", &["enable-onesided-comp"], "1", On::NonZero),
+    (
+        "enable-tx-size-search",
+        &["enable-tx-size-search"],
+        "1",
+        On::NonZero,
+    ),
+    (
+        "enable-directional-intra",
+        &["enable-directional-intra"],
+        "1",
+        On::NonZero,
+    ),
+    (
+        "enable-smooth-interintra",
+        &["enable-smooth-interintra"],
+        "1",
+        On::NonZero,
+    ),
+    (
+        "enable-interintra-wedge",
+        &["enable-interintra-wedge"],
+        "1",
+        On::NonZero,
+    ),
+    (
+        "enable-diff-wtd-comp",
+        &["enable-diff-wtd-comp"],
+        "1",
+        On::NonZero,
+    ),
+    (
+        "enable-onesided-comp",
+        &["enable-onesided-comp"],
+        "1",
+        On::NonZero,
+    ),
     ("enable-fwd-kf", &["enable-fwd-kf"], "0", On::NonZero),
     ("deblocking", &["loopfilter-control"], "1", On::NonZero),
-    ("multi-tile", &["tile-columns", "tile-rows"], "0", On::NonZero),
+    (
+        "multi-tile",
+        &["tile-columns", "tile-rows"],
+        "0",
+        On::NonZero,
+    ),
     ("intrabc-search", &["cpu-used"], "0", On::AtMost(2)),
 ];
 
@@ -167,10 +202,14 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
         "enable-flip-idtx",
         "never spelled; the flip/identity transform types are unproven by a real stream",
     ),
-    (
-        "enable-global-motion",
-        "off in 5 gates, on in none at 8 bits; lane-gm owns the global-warp prediction that is still missing",
-    ),
+    // `enable-global-motion` LEFT this list on 2026-09-25 (lane-av1gwarp12 r2):
+    // `a_real_affine_global_motion_stream_decodes_pixel_exact` loops
+    // `for depth in [8u32, 10u32]` passing `--enable-global-motion=1` and
+    // pixel-compares both depths, so the 8-bit hole has been closed since
+    // lane-gmaffine r1 -- the entry survived because no suite ran a tree
+    // containing both the gate and this test until the ROTZOOM suite.
+    // The 12-bit ROTZOOM gate rides the high-depth bucket via `encode_12bit(`
+    // in `is_ten_bit`, so it plays no part in this retirement.
     (
         "enable-rect-tx",
         "never spelled; rect transforms reach the decoder only through partition shape, never through a gate that names the tool",
@@ -178,7 +217,8 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
 ];
 
 #[cfg(test)]
-const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit compound-global-warp gate closed `enable-global-motion`
+const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
+    // lane-cwarp's 10-bit compound-global-warp gate closed `enable-global-motion`
     // and `enable-dist-wtd-comp` at 10 bits without deleting their entries here,
     // so this list was already stale (and this test already red) at main 9c35ecc;
     // lane-tiles r11's multi-tile 10-bit gates then closed `enable-ab-partitions`,
@@ -240,8 +280,8 @@ const NEVER_ON_10BIT: &[(&str, &str)] = &[];
 #[cfg(test)]
 mod tests {
     use super::{
-        ALIASES, DEFAULT_ON_TOOLS, NEVER_EXERCISED, NEVER_EXERCISED_8BIT, NEVER_EXERCISED_10BIT,
-        NEVER_ON_10BIT, NEVER_ON_8BIT, On, TOOL_UNIVERSE,
+        On, ALIASES, DEFAULT_ON_TOOLS, NEVER_EXERCISED, NEVER_EXERCISED_10BIT,
+        NEVER_EXERCISED_8BIT, NEVER_ON_10BIT, NEVER_ON_8BIT, TOOL_UNIVERSE,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -438,11 +478,19 @@ mod tests {
     }
 
     fn is_ten_bit(body: &str) -> bool {
+        // The lists pin two buckets, 8-bit and high-bit-depth; 12-bit gates
+        // count in the high-depth bucket (lane-av1gwarp12's ROTZOOM gate was
+        // the first 12-bit gate to positively enable a listed tool, and the
+        // 10-bit-only spellings mis-filed it as 8-bit).
         body.contains("encode_10bit_gradients")
             || body.contains("ten_bit_tool_gate(")
             || body.contains("--bit-depth=10")
             || body.contains("--input-bit-depth=10")
             || body.contains("yuv420p10le")
+            || body.contains("encode_12bit(")
+            || body.contains("--bit-depth=12")
+            || body.contains("--input-bit-depth=12")
+            || body.contains("yuv420p12le")
     }
 
     /// Flags a gate positively enables (`=1`), at gates of the given depth.
@@ -534,7 +582,9 @@ mod tests {
     }
 
     /// [`DEFAULT_ON_TOOLS`] per depth: `tool -> (off in N gates, on in N, defaulted in N)`.
-    fn default_on_settings(ten_bit: bool) -> (usize, BTreeMap<&'static str, (usize, usize, usize)>) {
+    fn default_on_settings(
+        ten_bit: bool,
+    ) -> (usize, BTreeMap<&'static str, (usize, usize, usize)>) {
         let gates: Vec<&str> = gate_bodies()
             .into_iter()
             .filter(|b| covers_depth(b, ten_bit))
