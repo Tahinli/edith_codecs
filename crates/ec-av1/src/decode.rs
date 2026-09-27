@@ -25137,6 +25137,16 @@ fn pipe_run_lr(
             if lp.next == r_lo {
                 continue;
             }
+            if r_lo == 0 {
+                // lane-av1lrflush: RU row 0 just entered this plane's
+                // processed range -- the band release flushed the frame's
+                // first restoration row through the pipeline. Process-global
+                // (not a `thread_local!` gate counter): the witnessing gate
+                // decodes on its own thread while this bump fires on a
+                // filter-pool worker, and frame 0's whole-frame LR runs on
+                // the gate's thread and must not satisfy the delta.
+                LR_PIPELINE_ROW0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let (src, deb) = match lp.p {
                 0 => (&y.data, &sy2.data),
                 1 => (&u.data, &su2.data),
@@ -25261,6 +25271,32 @@ fn wave_rows_complete(fctx: &crate::decode::FrameCtx) -> usize {
 /// whole-frame path instead (`EC_AV1_WAVE_STATS`).
 static PIPE_FRAMES: AtomicU64 = AtomicU64::new(0);
 static PIPE_WHOLE: AtomicU64 = AtomicU64::new(0);
+
+/// lane-av1lrflush: frames that CONSTRUCTED the filter pipeline, counted
+/// unconditionally. Read by gates through [`pipeline_taken_frames`] as a
+/// before/after delta -- the non-vacuity witness that a "pipelined" gate arm
+/// really ran `pipe_run`/`pipe_run_lr` rather than silently falling back to
+/// the whole-frame path.
+static PIPELINE_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of [`PIPELINE_TAKEN`], for a gate's own before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn pipeline_taken_frames() -> u64 {
+    PIPELINE_TAKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// lane-av1lrflush: RU-row-0 flushes the pipeline actually performed, one per
+/// LR-active plane whose first restoration unit row enters `pipe_run_lr`'s
+/// processed range. Process-global on purpose -- the filter-pool worker bumps
+/// it, the gate's thread reads it -- unlike the `thread_local!` gate counters,
+/// which a gate's own thread can satisfy from the whole-frame path alone.
+static LR_PIPELINE_ROW0: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of [`LR_PIPELINE_ROW0`], for a gate's before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lr_pipeline_row0_flushes() -> u64 {
+    LR_PIPELINE_ROW0.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Whether this frame's filters may run per superblock row. Everything that
 /// reads the picture out of band order, or the pipeline's own inputs out of
@@ -39934,6 +39970,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let snap_on = pipe_on && (cdef_on || lr_active);
     let mut pipe_snap = snap_on.then(|| (snap_alloc(&y), snap_alloc(&u), snap_alloc(&v)));
     let mut pipe = pipe_on.then(|| {
+        // lane-av1lrflush: counted unconditionally (unlike `PIPE_FRAMES`
+        // below, which is `EC_AV1_WAVE_STATS`-gated) so a gate can prove a
+        // pipelined arm actually took the pipeline even when
+        // `filter_threads()`'s once-per-process env read was already cached
+        // by an earlier test in the same binary.
+        PIPELINE_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if wave_stats() {
             PIPE_FRAMES.fetch_add(1, Relaxed);
         }
