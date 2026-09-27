@@ -8687,6 +8687,22 @@ impl Neighbours {
                 o.2 += dc_vote(left[plane].dc);
             }
         }
+        if crate::envflags::env_flag!("EC_DCDUMP") {
+            // lane-av1422mi24: same dump [`Self::around_mi_rect`] prints, so
+            // a rerouted 4:2:2 chroma gather stays visible under EC_DCDUMP=1.
+            // The above rows are the SAMPLED (every-second) cells.
+            for (plane, o) in out.iter().enumerate() {
+                let vote = o.2;
+                let ab: Vec<String> = (0..above_mi)
+                    .step_by(2)
+                    .map(|k| format!("{:?}/{}", self.above[mi_c + k][plane].dc, self.above[mi_c + k][plane].level))
+                    .collect();
+                let lf: Vec<String> = (0..left_mi)
+                    .map(|k| format!("{:?}/{}", self.left[mi_r + k][plane].dc, self.left[mi_r + k][plane].level))
+                    .collect();
+                eprintln!("EC_DCDUMP422 mi=({mi_r},{mi_c}) plane={plane} wh=({w},{h}) vote={vote} above=[{}] left=[{}]", ab.join(","), lf.join(","));
+            }
+        }
         out
     }
 
@@ -10879,7 +10895,16 @@ fn decode_rect_split(
                     // rule) -- the plain rect walk samples one chroma cell
                     // twice at ss_x 1. Every pre-existing shape keeps its own
                     // walk.
-                    let cu_around = if chroma_422_oob {
+                    // lane-av1422mi24: the plain rect walk's double-count
+                    // hits EVERY unit shape at ss (1,0), not just the (4, 8)
+                    // one -- the (8, 8) unit of a 16x8 intra-in-inter strip
+                    // read its above dc votes twice and its U dc_sign one
+                    // ctx row high (t422 frame 1). Route every ss (1,0)
+                    // unit through the every-second-above-cell sampling;
+                    // 4:2:0/4:4:4 keep the plain walk verbatim.
+                    let cu_around = if chroma_422_oob
+                        || (ss_x(fctx) == 1 && ss_y(fctx) == 0)
+                    {
                         neighbours.around_mi_422_chroma(cu_mi, luma_span_x, luma_span_y)
                     } else {
                         neighbours.around_mi_rect(cu_mi, luma_span_x, luma_span_y)
@@ -10968,7 +10993,19 @@ fn decode_rect_split(
         } else {
             default_intra_tx_type(m.uv_predict_mode as u8)
         };
-        let around = neighbours.around_mi_rect(at_mi, bw, bh);
+        // lane-av1422mi24: at ss (1,0) the chroma above span is `bw >> 1`
+        // chroma cells spread over `bw` luma mi columns -- the per-mi gather
+        // counts every chroma column's whole-unit dc sign twice (the t422
+        // frame-1 mi(26,60) intra-in-inter strip's U dc_sign read one ctx
+        // row high). Luma keeps the per-mi gather; the two chroma planes
+        // take [`Neighbours::around_mi_422_chroma`]'s every-second
+        // above-cell sampling, like every other 4:2:2 chroma gather.
+        let mut around = neighbours.around_mi_rect(at_mi, bw, bh);
+        if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+            let c = neighbours.around_mi_422_chroma(at_mi, bw, bh);
+            around[1] = c[1];
+            around[2] = c[2];
+        }
         let mut grids: Vec<Grid> = Vec::with_capacity(2);
         for plane_idx in 1..=2 {
             let skip_ctx =
@@ -11972,7 +12009,21 @@ fn decode_intrabc_rect(
         match leaves.as_ref() {
             None => {
                 // One whole-block rectangular transform unit.
-                let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+                // lane-av1422mi24: at ss (1,0) the chroma above span is
+                // `bw >> 1` chroma cells spread over `bw` luma mi columns --
+                // the per-mi gather counts every chroma column's whole-unit
+                // dc sign twice (t422 frame 1, the mi(26,60) intra-in-inter
+                // strip's U dc_sign read ctx 1 where the oracle's cell sum
+                // is 0 -> ctx 0). Luma keeps the per-mi gather; the two
+                // chroma planes take
+                // [`Neighbours::around_mi_422_chroma`]'s every-second
+                // above-cell sampling, like every other 4:2:2 chroma gather.
+                let mut around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+                if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                    let c = neighbours.around_mi_422_chroma((mi_r, mi_c), bw, bh);
+                    around[1] = c[1];
+                    around[2] = c[2];
+                }
                 let (grid, tx_type) = read_inter_plane_rect(
                     dec,
                     cdfs,
@@ -12097,7 +12148,15 @@ fn decode_intrabc_rect(
                 // `av1_get_tx_type`'s chroma lookup lands on the colocated
                 // LUMA unit, which for a split block is the top-left one.
                 luma_tx_type = first_tx_type;
-                let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+                // lane-av1422mi24: same 4:2:2 chroma gather rule as the
+                // `None` arm above -- the per-mi rect gather double-counts
+                // each chroma column's whole-unit dc sign at ss (1,0).
+                let mut around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+                if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                    let c = neighbours.around_mi_422_chroma((mi_r, mi_c), bw, bh);
+                    around[1] = c[1];
+                    around[2] = c[2];
+                }
                 let (ug, _) = read_inter_plane_rect(
                     dec,
                     cdfs,
@@ -15483,7 +15542,18 @@ fn decode_rect4_16_strip(
                 }
                 (Grid::Zero(cw * ch), Grid::Zero(cw * ch))
             } else {
-                let around = neighbours.around_mi_rect(pair_mi, pw, ph);
+                // lane-av1422ctxgather: 4:2:2's chroma above votes sample
+                // every second luma-mi cell
+                // ([`Neighbours::around_mi_422_chroma`]: at ss_x 1 one
+                // chroma 4-px column spans two luma mi columns, and the
+                // plain per-mi gather counts each column's whole-unit dc
+                // sign twice). The left extent is unsubsampled at ss_y 0,
+                // so its per-mi cells already line up one-to-one.
+                let around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                    neighbours.around_mi_422_chroma(pair_mi, pw, ph)
+                } else {
+                    neighbours.around_mi_rect(pair_mi, pw, ph)
+                };
                 // lane-av1-444: the strip's own 16x4 / 4x16 chroma at ss 0/0
                 // (`TxbSet::Chroma8`, `get_txsize_entropy_ctx(TX_16X4)` =
                 // the 8x8 set); 4:2:0 keeps the pair's 8x4 / 4x8.
@@ -23879,7 +23949,19 @@ fn read_inter_rect_chroma(
                     at_mi.1 + cu_col * (span_x / MI),
                 );
                 let cu_around = if multi {
-                    neighbours.around_mi_rect(cu_mi, span_x, span_y)
+                    // lane-av1422ctxgather: at ss (1,0) the unit's above
+                    // span covers `uw` chroma px = `2*uw` luma mi columns,
+                    // so the plain per-mi gather counts every chroma
+                    // column's whole-unit dc sign twice
+                    // ([`Neighbours::around_mi_422_chroma`]; the left
+                    // extent is 1:1 at ss_y 0). 4:2:0 keeps the per-mi
+                    // gather (both extents duplicated there, measured
+                    // elsewhere).
+                    if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                        neighbours.around_mi_422_chroma(cu_mi, span_x, span_y)
+                    } else {
+                        neighbours.around_mi_rect(cu_mi, span_x, span_y)
+                    }
                 } else {
                     around
                 };
@@ -33763,7 +33845,39 @@ fn decode_inter_block(
                 // OWN width above and height left -- reading `side` cells both
                 // ways indexes past the tile's last mi row for a bottom strip.
                 let around = if rect_tu {
-                    neighbours.around_mi_rect(at_mi, write_w, write_h)
+                    // lane-av1422mi24: at ss (1,0) the rect strip's chroma
+                    // above span is `write_w >> 1` chroma cells spread over
+                    // `write_w` luma mi columns -- the per-mi gather counts
+                    // every chroma column's whole-unit dc sign twice (the
+                    // t422 frame-1 mi(26,60) strip's U dc_sign read one row
+                    // high). Luma keeps the per-mi extents; chroma takes
+                    // [`Neighbours::around_mi_422_chroma`]'s every-second-
+                    // above-cell sampling.
+                    let mut a = neighbours.around_mi_rect(at_mi, write_w, write_h);
+                    if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                        let c = neighbours.around_mi_422_chroma(at_mi, write_w, write_h);
+                        a[1] = c[1];
+                        a[2] = c[2];
+                    }
+                    a
+                } else if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                    // lane-av1422mi24: at ss (1,0) a square block's chroma
+                    // plane block is (side/2, side) -- `side` chroma 4-px
+                    // above cells spread over `side` luma mi columns, one
+                    // chroma column per PAIR of luma mi cells. The plain
+                    // per-mi gather samples every second chroma column, and
+                    // its dc-vote sum lands one sign row off (t422 frame 1,
+                    // mi(24,56) U dc_sign: ours read dc_sign_cdf[0] where
+                    // the oracle read row 1). Luma keeps the per-mi gather
+                    // verbatim; only the two chroma planes take
+                    // [`Neighbours::around_mi_422_chroma`]'s every-second-
+                    // above-cell sampling (the same measured rule the strip
+                    // and chunk arms already run).
+                    let mut a = neighbours.around_mi(at, side);
+                    let c = neighbours.around_mi_422_chroma(at, write_w, write_h);
+                    a[1] = c[1];
+                    a[2] = c[2];
+                    a
                 } else {
                     neighbours.around_mi(at, side)
                 };
@@ -35258,7 +35372,25 @@ fn decode_inter_block(
                 // OWN width above and height left -- reading `side` cells both
                 // ways indexes past the tile's last mi row for a bottom strip.
                 let around = if rect_tu {
-                    neighbours.around_mi_rect(at_mi, write_w, write_h)
+                    // lane-av1422mi24: same 4:2:2 rect-strip chroma gather
+                    // rule as the single-TU path above -- luma per-mi,
+                    // chroma every-second above cell.
+                    let mut a = neighbours.around_mi_rect(at_mi, write_w, write_h);
+                    if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                        let c = neighbours.around_mi_422_chroma(at_mi, write_w, write_h);
+                        a[1] = c[1];
+                        a[2] = c[2];
+                    }
+                    a
+                } else if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                    // lane-av1422mi24: same 4:2:2 square-block chroma gather
+                    // rule as the single-TU path above -- luma per-mi, chroma
+                    // every-second above cell.
+                    let mut a = neighbours.around_mi(at, side);
+                    let c = neighbours.around_mi_422_chroma(at, write_w, write_h);
+                    a[1] = c[1];
+                    a[2] = c[2];
+                    a
                 } else {
                     neighbours.around_mi(at, side)
                 };
@@ -35266,12 +35398,31 @@ fn decode_inter_block(
                 // EVEN strip's mi origin and spans both strips, so its
                 // above/left coefficient context is the pair's, not this
                 // strip's row.
+                // lane-av1422ctxgather: at 4:2:2 (ss 1,0) a HORZ strip is
+                // its own chroma reference (`is_chroma_reference`'s
+                // `!(subsampling_y)` row clause) -- pair_mi is the strip
+                // itself and the context reads the strip's own 8x4, ONE
+                // luma-mi row tall, with the 4:2:2 above sampling
+                // ([`Neighbours::around_mi_422_chroma`]). The 4:2:0 pair
+                // merge keeps the (16, 8) span and the plain per-mi gather
+                // (as do 4:4:4 and every VERT shape).
                 let around_c = match strip_chroma {
-                    Some(s) if s.has_chroma => neighbours.around_mi_rect(
-                        s.pair_mi,
-                        if s.horz { 16 } else { 8 },
-                        if s.horz { 8 } else { 16 },
-                    ),
+                    Some(s) if s.has_chroma => {
+                        let (pw, ph) = if s.horz {
+                            if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                                (16, 4)
+                            } else {
+                                (16, 8)
+                            }
+                        } else {
+                            (8, 16)
+                        };
+                        if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                            neighbours.around_mi_422_chroma(s.pair_mi, pw, ph)
+                        } else {
+                            neighbours.around_mi_rect(s.pair_mi, pw, ph)
+                        }
+                    }
                     _ => around,
                 };
                 let luma_tx_type;
@@ -37024,7 +37175,24 @@ fn decode_inter_block(
         }
     }
     if let Some((s, u_state, v_state)) = pair_chroma {
-        let (pw, ph) = if s.horz { (16usize, 8usize) } else { (8, 16) };
+        // lane-av1422ctxgather: at 4:2:2 (ss 1,0) a horz strip is its own
+        // chroma reference -- no pair merge ever happened, so the write
+        // covers the strip's own 8x4: ONE luma-mi left row (libaom's
+        // `av1_set_contexts` for the TX_8X4 at ss_y 0 stamps
+        // `tx_size_high_unit` = 1 cell). The 4:2:0 pair's two-row (16, 8)
+        // span would overwrite the NEXT row's leaf-stamped level state
+        // (measured: t422 frame 1, the strip at mi(8,4) zeroed
+        // left[9][1] under the mi(8,2) 8x8's level 5 before the mi(9,4)
+        // strip's own all_zero read it one ctx row low).
+        let (pw, ph) = if s.horz {
+            if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                (16usize, 4usize)
+            } else {
+                (16usize, 8usize)
+            }
+        } else {
+            (8, 16)
+        };
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (
             round_up_even(neighbours.mi_rows),
