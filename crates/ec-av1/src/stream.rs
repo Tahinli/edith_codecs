@@ -9779,6 +9779,54 @@ pub(crate) mod tests {
         y4m
     }
 
+    /// lane-av1gwarp12 fixture: rotating + uniformly zooming mandelbrot as a
+    /// C420p12 y4m. Rotation composed with a UNIFORM scale is a similarity
+    /// transform -- exactly the family a 4-parameter ROTZOOM global model
+    /// expresses (the affine gate needs the anisotropic stretch to force
+    /// 6 parameters; this lane needs the model vanilla aomenc actually
+    /// searches, ROTZOOM).
+    fn y4m_12bit_rotzoom_gm_source(frames: usize) -> Vec<u8> {
+        const W: usize = 128;
+        const H: usize = 128;
+        let source = format!(
+            "mandelbrot=size=192x192:rate=25,rotate=a=0.12*t:c=black,\
+             scale=w='ceil(192*(1+0.04*n)/2)*2':h='ceil(192*(1+0.04*n)/2)*2':eval=frame,\
+             crop={W}:{H}"
+        );
+        let duration = (frames as f64 / 25.0).to_string();
+        let ff_args: Vec<&str> = vec![
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &source,
+            "-pix_fmt",
+            "yuv420p12le",
+            // y4m has no official 12-bit tag, same as the 10-bit gate.
+            "-strict",
+            "-1",
+            "-t",
+            &duration,
+            "-f",
+            "yuv4mpegpipe",
+            "-",
+        ];
+        let out = Command::new("ffmpeg")
+            .args(&ff_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
     /// The 12-bit coding recipe shared by the witness gates (cpu-used=0 so
     /// every search runs; explicit CDEF/restoration ON). Warp/global-motion
     /// are deliberately NOT spelled here: this aomenc honours the LAST
@@ -21424,6 +21472,99 @@ pub(crate) mod tests {
             );
             eprintln!("{NAME}: {depth}-bit, {frame_count} frames pixel-exact, affine_gm_hits={hits}");
         }
+    }
+
+    /// lane-av1gwarp12: the SINGLE-reference GLOBAL-warp witness at 12 bits
+    /// -- the open half lane-av112bitw recorded (engagement 0 on every prior
+    /// 12-bit content). The decode path is the same `warp_affine` with
+    /// `warp_round_0(12)` the local-warp witness proved, fed by
+    /// `global_warp_params(gm_ref.params)` at `decode_inter_block`'s
+    /// single-ref arm -- but composition had no stream: the travelling-box
+    /// source fits only TRANSLATION global models (excluded by
+    /// `is_global_mv_block`), and the rotating mandelbrot reached the global
+    /// models only on compound blocks. This recipe closes it: rotation +
+    /// uniform zoom (a similarity transform, ROTZOOM's exact family), the
+    /// compound tools off so a global model can only ride a single-reference
+    /// GLOBALMV block, and partitions pinned to 32 so the 8x8 leaf arm is
+    /// structurally out of the stream. Vanilla aomenc pins its gm search to
+    /// ROTZOOM (`global_motion_facade.c:24`), so every >TRANSLATION model a
+    /// real aomenc emits is ROTZOOM; AFFINE needs the widened side build
+    /// (`a_real_affine_global_motion_stream_decodes_pixel_exact`).
+    ///
+    /// Non-vacuous by construction: `rotzoom_gm_warp_hits()` hard-asserts a
+    /// 16x16+ block was really predicted through the global warp with a
+    /// ROTZOOM model, the zero `compound_warp_hits` delta keeps the
+    /// single-reference premise honest, and every plane of every frame
+    /// compares against ffmpeg.
+    #[test]
+    fn a_real_rotzoom_global_warp_12bit_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_rotzoom_global_warp_12bit_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        const W: usize = 128;
+        const H: usize = 128;
+        const FRAMES: usize = 16;
+        let y4m = y4m_12bit_rotzoom_gm_source(FRAMES);
+        let stream = encode_12bit(
+            &y4m,
+            FRAMES,
+            &[
+                "--enable-global-motion=1",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-ref-frame-mvs=0",
+                "--min-partition-size=32",
+                "--max-partition-size=32",
+            ],
+        );
+        assert_12bit_sequence_header(&stream, NAME);
+        let (before_rotzoom, before_affine, before_selected, before_compound) = (
+            decode::rotzoom_gm_warp_hits(),
+            decode::affine_gm_hits(),
+            decode::warp_selected_hits(),
+            decode::compound_warp_hits(),
+        );
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: decode_stream refused a real 12-bit global-warp stream: {e}")
+        });
+        assert_eq!(frames.len(), FRAMES);
+        let (delta_rotzoom, delta_affine, delta_selected) = (
+            decode::rotzoom_gm_warp_hits() - before_rotzoom,
+            decode::affine_gm_hits() - before_affine,
+            decode::warp_selected_hits() - before_selected,
+        );
+        eprintln!(
+            "{NAME}: gm_warp_engagement rotzoom(single-ref global warp)={delta_rotzoom} \
+             affine={delta_affine} selected_local_warp={delta_selected}"
+        );
+        assert!(
+            delta_rotzoom > 0,
+            "{NAME}: decoded but no single-reference ROTZOOM global-warp block fired -- \
+             the 12-bit single-ref global-warp path is unexercised and the pixel \
+             compare would prove nothing"
+        );
+        assert_eq!(
+            decode::compound_warp_hits() - before_compound,
+            0,
+            "{NAME}: a compound warp block ran -- the single-reference premise is gone"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, W, H, FRAMES);
+        for (i, (ours, reference)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, reference.y, "{NAME} frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, reference.u, "{NAME} frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, reference.v, "{NAME} frame {i} V vs ffmpeg");
+        }
+        eprintln!("{NAME}: {FRAMES} frames pixel-exact vs ffmpeg, rotzoom_gm_warp_hits={delta_rotzoom}");
     }
 
     /// lane-gmaffine r1: the two 8x8-LEAF motion gates. `decode_inter_block8`
