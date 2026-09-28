@@ -392,6 +392,55 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 16 — the unblock was NOT completed, and a build hazard was found
+
+No code change; `aomdec` restored to its committed shape
+(`grep -cE 'MODECTX|bitpos'` = 0, 744 `name=mode` lines again, 4:2:0
+control byte-exact).
+
+**What happened.** The instruction was to extend the KNOWN-FIRING
+`EC_ISTEP name=mode` print with `above_mi->mode` / `left_mi->mode`
+rather than add a sibling `getenv` rung. That edit was made, the string
+confirmed in the binary — and the rebuilt `aomdec` then emitted **zero**
+`name=mode` lines, i.e. the instrumented decode stopped producing the
+rungs entirely. Reverting the print and rebuilding restored 744 lines.
+**The oracle-side context is therefore still unmeasured**, and this lane
+does not report a value it did not read.
+
+**The build hazard, which is the durable finding here.** `ninja` in
+`~/.cache/aom-oracle/build` does **not** reliably rebuild after a source
+edit: repeatedly it reported only `[1/1] Updating version info if
+necessary.` and left the binary stale, with the binary's mtime older
+than the source's. A `touch` on the edited source is required before
+`ninja aomdec`, and the result must be confirmed by running the binary
+and checking a known-firing rung — not by `strings` alone.
+
+**This bears directly on round 15.** Round 15 concluded that a
+`MODECTX` rung "does not fire" because it was placed immediately above
+`mbmi->mode = read_intra_mode(...)` in the same function as a rung that
+fires 744 times. Given this build behaviour, that conclusion is unsafe:
+the rung may not have been compiled at the moment it was tested, or the
+binary may have been in the same partial state seen this round. Round
+15's own evidence (`strings` finding the format string in the binary)
+argues it was compiled, so the mystery is unresolved — but the
+conclusion "the oracle does not print it" should be treated as
+UNVERIFIED, not as a property of the decoder.
+
+**Standing state of the mode-context question.** Ours is measured:
+mi(64,24), `above_mode=0 left_mode=6 above_ctx=0 left_ctx=4`, `mode=1`
+against the oracle's `mode=6`. The oracle's `above_mi->mode` /
+`left_mi->mode` are still unknown, so **the band-match verdict is not
+answered** and the lane-rectx r5 override is neither confirmed nor ruled
+out. Main's step 4 (the CDF-drift question) is likewise untouched: if
+the bands turn out to MATCH the cells, the next thing to check is
+whether the `kf_y_mode` table state itself drifted at an earlier read,
+and the ladder is now trustworthy enough to answer that.
+
+**Unblock, restated with the build caveat.** `touch
+~/.cache/aom-oracle/src/av1/decoder/decodemv.c`, rebuild, then verify
+the binary still emits its 744 `name=mode` lines BEFORE reading any
+extended field. Then compare against mi(63,24) / mi(64,23) on our side.
+
 ### Round 15 — the mode context: OUR side measured, the ORACLE side would not print
 
 Both prints reverted; `aomdec` rebuilt to its committed shape
@@ -407,7 +456,8 @@ MODECTXM mi=(64,24) above_mode=0 left_mode=6 above_ctx=0 left_ctx=4
 ```
 
 **The oracle side could not be measured, and this lane will not guess
-past that.** A `MODECTX` rung placed immediately above
+past that — see round 16, which found the likely reason and leaves the
+conclusion UNVERIFIED.** A `MODECTX` rung placed immediately above
 `mbmi->mode = read_intra_mode(r, get_y_mode_cdf(ec_ctx, above_mi,
 left_mi))` in `decodemv.c:936`, rebuilt, with its format string
 confirmed present in the binary and the env var set, emits nothing —
