@@ -8953,24 +8953,17 @@ impl Neighbours {
         // mi(5,15): left neighbour SMOOTH_V at mi(5,14), read at mi(4,13)).
         let snap_y = (1usize << ss_y(fctx)) - 1;
         let snap_x = (1usize << ss_x(fctx)) - 1;
-        // `set_mi_row_col` (libaom `av1_common_int.h:1395-1412`) puts the two
-        // chroma references at `base_mi[-stride + ss_x]` and
-        // `base_mi[ss_y*stride - 1]`, with `base_mi` the block's own mi already
-        // de-offset by `(mi_row & ss_y)` / `(mi_col & ss_x)`. The snap above IS
-        // that de-offsetting, so the references are
-        // `(snapped_r + ss_y - 1, snapped_c + ss_x)` and
-        // `(snapped_r, snapped_c - 1)` -- NOT `(snapped_r - 1, snapped_c)` /
-        // `(snapped_r, snapped_c - 1)` as this used to read them. At 4:4:4
-        // both shifts vanish; at 4:2:0 and 4:2:2 the above reference sits one
-        // mi column further right (one chroma column spans two luma mi
-        // columns, so the chroma edge reaches into the right-hand luma block)
-        // and the left reference one mi row further up.
+        // The snap IS libaom's `base_mi` de-offsetting (`set_mi_row_col`,
+        // `av1_common_int.h:1395-1412`): `base_mi` is the block's own mi moved
+        // by `-(mi_row & ss_y) * stride - (mi_col & ss_x)`. The helper applies
+        // the two chroma-reference offsets on top of it -- see its own comment
+        // for which axis each one moves.
         self.smooth_uv_neighbour_unsnapped(
             mi_r & !snap_y,
             mi_c & !snap_x,
             r,
             c,
-            (ss_x(fctx), ss_y(fctx)),
+            ss_x(fctx),
         )
     }
 
@@ -8985,7 +8978,7 @@ impl Neighbours {
         mi_c: usize,
         r: usize,
         c: usize,
-        (ss_x, ss_y): (usize, usize),
+        ss_x: usize,
     ) -> bool {
         // lane-mtfix r1: availability is TILE-relative on BOTH axes and on the
         // coarse fallback too. `above_uv_mode` is a frame-wide [`SUB`]-grid
@@ -9018,7 +9011,24 @@ impl Neighbours {
         // identity on the values this already read (measured: the 4:2:0
         // control stream is byte-exact with them folded in), and at 4:4:4
         // `ss_x == 0` does the same -- so only 4:2:2 takes the new column.
-        let above_mi = (mi_r.saturating_sub(1), mi_c);
+        // `set_mi_row_col` (libaom `av1_common_int.h:1395-1412`), with `mi_r`/
+        // `mi_c` already de-offset by the caller's `(mi_row & ss_y)` /
+        // `(mi_col & ss_x)` snap, i.e. already libaom's `base_mi`:
+        //   chroma_above_mi = base_mi[-stride + ss_x]
+        //   chroma_left_mi  = base_mi[ss_y*stride - 1]
+        // The second offset is `ss_y` ROWS down and one COLUMN left; at every
+        // subsampling `ss_y*stride - 1` lands on `base_mi`'s OWN row (the row
+        // term is at most `stride - 1` elements, so its row delta is 0), so
+        // the left read is `(mi_r, mi_c - 1)` -- unchanged. The first offset
+        // is one row up and `ss_x` columns right, and the `ss_x` COLUMN was
+        // what this dropped: one chroma column spans two luma mi columns, so
+        // the chroma edge reaches into the right-hand luma block and that is
+        // where its reference lives.
+        //
+        // Measured: the column term is right at EVERY subsampling -- the
+        // 4:2:0 control is byte-exact with it folded in, and 4:4:4 is
+        // untouched because `ss_x == 0` there.
+        let above_mi = (mi_r.saturating_sub(1), mi_c + ss_x);
         let left_mi = (mi_r, mi_c.saturating_sub(1));
         let above = match self.uv_mode_col.get(above_mi.1) {
             _ if have_above && let Some(m) = cell(&self.uv_mode_grid, above_mi.0, above_mi.1) => m,
@@ -15505,7 +15515,7 @@ fn decode_rect4_16_strip(
             // directional chroma strip, moving 4 samples by 1.
             let smooth_neighbor_uv =
                 neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c, fctx);
-            if smooth_neighbor_uv != neighbours.smooth_uv_neighbour_unsnapped(lmi.0, lmi.1, r, c, (ss_x(fctx), ss_y(fctx)))
+            if smooth_neighbor_uv != neighbours.smooth_uv_neighbour_unsnapped(lmi.0, lmi.1, r, c, ss_x(fctx))
             {
                 hit!(RECT4_16_UV_PAIR_FILT_HITS);
             }
