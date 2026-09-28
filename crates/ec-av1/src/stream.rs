@@ -2399,8 +2399,15 @@ pub(crate) mod tests {
              gate exists for (a 64x64 mu chunk's chroma plane block is \
              (64 >> ss_x) x (64 >> ss_y), not `chroma_side` square)"
         );
-        // Both sites, the read walk and the replay: each declares the pair
-        // once and each takes its steps on the per-axis halves.
+        // The per-axis chunk extent, declared once at the mu-chunk read walk
+        // and once at the `mu_chroma` replay -- the two de-square-cut sites.
+        //
+        // The replay must ALSO enumerate every unit inside a chunk, not just
+        // its first: counting mu CHUNKS in `rows`/`cols` and then stepping the
+        // mi origin and reading the grid per UNIT only agrees when a chunk
+        // holds exactly one unit (4:2:0). At 4:2:2 and 4:4:4 a chunk holds two
+        // or four, so the per-unit body alone left the rest of the chunk with
+        // the composed-grid smearing the replay exists to undo.
         for name in [
             "let chunk_chroma_w = (64usize) >> ss_x(fctx);",
             "let chunk_chroma_h = (64usize) >> ss_y(fctx);",
@@ -2411,6 +2418,20 @@ pub(crate) mod tests {
                 "{NAME}: `{name}` must appear at BOTH de-square-cut sites in \
                  decode_intrabc_128rect (the mu-chunk read walk and the mu_chroma \
                  context replay), found {}",
+                body.matches(name).count()
+            );
+        }
+        for name in [
+            "let (ur, uc) = (chunk_chroma_h / cu, chunk_chroma_w / cu);",
+            "for kr in 0..ur {",
+            "for kc in 0..uc {",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{NAME}: `{name}` must appear exactly once in \
+                 decode_intrabc_128rect -- the mu_chroma replay must walk chunk \
+                 THEN unit (decode_inter_block's `mu_chroma_units` shape), found {}",
                 body.matches(name).count()
             );
         }
