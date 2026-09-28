@@ -392,6 +392,52 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 9 — CORRECTION to round 8, and where the desync actually starts
+
+**Round 8's central claim was wrong and is retracted here.** It read the
+oracle's `PARTB bsize=9` as `BLOCK_64X32`. The real enum
+(`enums.h:100-115`) is
+`0 BLOCK_4X4, 1 BLOCK_4X8, 2 BLOCK_8X4, 3 BLOCK_8X8, 4 BLOCK_8X16,
+5 BLOCK_16X8, 6 BLOCK_16X16, 7 BLOCK_16X32, 8 BLOCK_32X16, 9 BLOCK_32X32,
+10 BLOCK_32X64, 11 BLOCK_64X32, 12 BLOCK_64X64, 13 BLOCK_64X128,
+14 BLOCK_128X64, 15 BLOCK_128X128`. So `bsize=9` is **BLOCK_32X32** —
+the SAME block size we decode. The oracle is not walking a 64x32 where we
+walk a 32x32; both are at BLOCK_32X32. Round 8 also mis-called `bsize=15`
+a 64x16 (it is BLOCK_128X128, the superblock root) and `bsize=12` — it is
+BLOCK_64X64, not BLOCK_128X64. The rest of round 8 stands: the
+partition reads pair, bottom-edge truncation is ruled out, and the
+oracle's lineage is `15 (128X128) -> 12 (64X64) -> 12 (64X64) ->
+9 (32X32) -> 9 (32X32)`.
+
+**What round 9 establishes, with the enum right this time.** At
+mi(64,24) both decoders are on a 32x32 block and read the same tx_size
+row at the same context:
+
+```
+oracle  EC_TXCTXB mi=64,24 bsize=9 maxw=32 maxh=32 abv=32 lft=16 above=1 left=0 ctx=1
+ours    EC_ISTEP mi_row=64 mi_col=24 name=tx_depth val=2 ctx=1
+```
+
+`bsize_to_tx_size_cat(BLOCK_32X32)` is 2, and our `max_tx == 32` arm
+reads `tx_size_cat2[ctx]` with `ctx = 1` — the same CDF row the oracle
+uses, at the same bit position (the -14 constant still holds). So the
+tx_size lookup is NOT the divergence either.
+
+**Where the desync actually starts.** The reader state already differs at
+mi(64,24)'s FIRST symbol (`skip`, oracle rng 39524 against ours 40716),
+and the coefficient ladder pairs through unit 2427. So the window is the
+reads between unit 2427's block and mi(64,24)'s `skip` — the same
+narrow "between two units" window round 6 characterised, now at its
+second occurrence. Both this window and round 6's were closed by pairing
+per transform unit; this one is still open.
+
+**Corrected summary of what is known at mi(64,24):** same bsize, same
+tx context, same CDF row, same bit position — and still a different
+outcome (oracle one 32x32 luma TU, us 8x8 leaves), with the reader
+already out of step at the block's first read. The structural difference
+is real and downstream; the DESYNC is upstream of it and is the thing
+still to find.
+
 ### Round 8 — the partition reads PAIR; the block size entering them does not
 
 Rungs added and reverted on both sides (ours `EC_TRACE`, the oracle a `PARTB`
@@ -418,15 +464,12 @@ At mi(64,32) the oracle is at bit 92356 and we are at 93518 — **1162 bits
 later**. The gap opens in the block that FOLLOWS mi(64,24): the oracle
 spends 33 bits there (92323 -> 92356) and we spend ~1183.
 
-**So the named divergence is the BLOCK SIZE entering the partition
-read, not the partition symbol.** The oracle reads the partition for a
-`BLOCK_64X32` (its enum 9) and lands `PARTITION_NONE` on a 64x32 leaf,
-coded as one 32x32 luma TU plus 16x32 chroma (TU 2428). We read a
-partition at the same bit position with the same value, and land on a
-32x32 SQUARE — the `EC_IMODE ... fn=sq side=32` of round 7, coded as 8x8
-leaves. Same position, same symbol, different bsize in, different block
-out: the bsize is decided one or more levels ABOVE mi(64,24), in the
-HORZ/SPLIT walk that produced the child.
+**RETRACTED — see round 9 below.** This section read the oracle's `bsize=9`
+as `BLOCK_64X32` and concluded the block size entering the read was the
+divergence. With the real enum (`enums.h:100-115`) `bsize=9` is
+`BLOCK_32X32`, the same size we decode, and that conclusion is wrong.
+What survives from round 8: the partition reads pair, and bottom-edge
+truncation is ruled out.
 
 **What is left to do, and why it is not another step here.** Tracing the
 bsize lineage from the SB root down to mi(64,24) on both sides — the
