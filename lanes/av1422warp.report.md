@@ -1401,6 +1401,72 @@ baseline.
 
 Not pinned, no gate, refusal untouched.
 
+## Round 24 — the instrument works, and it MOVES the divergence to a different block
+
+`c355c204` (instrument, no behaviour change; identity re-proved) on this
+side, `35d97e5` in the oracle tree.
+
+**`EC_SYMR` now carries `mi` on every read**, on both sides: ours a
+thread-local the three mode readers set at entry, the oracle two globals
+`ec_symr_mi_row/col` its mode-info reader publishes. Same-line fields.
+Identity after the edit: 4:2:0 control byte-exact, 4:4:4 witness
+byte-identical to the pre-lane build, both pinned 422 witnesses
+pixel-exact.
+
+`mi` is a LABEL for attribution and is deliberately **not** part of the
+divergence criterion — the oracle publishes it one read later than we do,
+so requiring equality reports a spurious divergence at read 5.
+
+### It moves the answer
+
+With the read naming its own block, the same divergence lands somewhere
+**completely different** from rounds 22-23:
+
+```
+first DECODED-STATE divergence at seq=107517
+  oracle mi=(64,56) pre=(val=45039, rng=61960, bit=3129) cdf0=24278 n=2 s=1 -> 45863
+  ours   mi=(64,56) pre=(val=45039, rng=61960, bit=3144) cdf0=6401  n=8 s=3 -> 45500
+                                                (as 32768- : 26367)
+  [107513] n=2 s=0  | n=2 s=0     (pair)
+  [107514] n=3 s=1  | n=3 s=1     (pair)
+  [107515] n=3 s=0  | n=3 s=0     (pair)
+  [107516] n=2 s=1  | n=2 s=1     (pair)
+  [107517] n=2 s=1  | n=8 s=3     <-- DIVERGES
+  [107518] n=2 s=1  | n=10 s=0
+  [107519] n=8 s=3  | n=2 s=0
+```
+
+**The block is the 32x32 intra block at mi(64,56)** — the frame's
+bottom-right corner at 4:2:2 (mi 64 of 72 rows, mi_col 56 of 64). Not the
+4x4 leaf at mi(24,57) that rounds 22 and 23 named: that attribution came
+from correlating the read stream against a SEPARATE trace, which is
+precisely the failure mode the mi label removes. Rounds 22-23's
+"the leaf reads no chroma syntax" and its odd-column theory are
+**withdrawn twice over** and should not be revisited.
+
+**The mode-info reads at mi(64,56) pair exactly** — skip 0, cdef 0, dq,
+mode 3, angle_y -2, uv_mode 8, angle_uv -1, and both sides report the
+same block size (ours `fn=sq side=32`, the oracle's `bsize=9` =
+`BLOCK_32X32`). So the divergence is in the block's **COEFFICIENT** reads,
+not its mode info and not its size: the oracle reads `n=2, n=2, n=8`
+where this decoder reads `n=8, n=10, n=2` from the identical pre-state.
+The `n=8`/`n=10` alphabets are transform-type sized, and at 4:2:2 this
+block's chroma is a 16x32 rect, so the leading candidates are the
+rect transform-type set (`av1_get_tx_type` over a rect plane block) and
+an eob/tx_type ordering difference for the rect chroma unit.
+
+### Handoff
+
+The instrument is now trustworthy end to end: same-line fields, mi on
+both sides, oracle tree snapshotted, and the divergence criterion
+excludes the label. The next step is to attribute reads 107517-107519 to
+symbols — with `EC_COEFF_STEP`'s `tag=` alongside (both sides emit it and
+it now lines up read-for-read against the same mi) — and read the
+transform-type set libaom selects for a 16x32 chroma plane block at
+4:2:2 against the one this decoder selects.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
