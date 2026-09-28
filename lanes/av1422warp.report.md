@@ -392,6 +392,56 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 15 — the mode context: OUR side measured, the ORACLE side would not print
+
+Both prints reverted; `aomdec` rebuilt to its committed shape
+(`MODECTX` = 0).
+
+**Our side, at mi(64,24), from the square `read_intra_mode`** (the path
+this block actually takes — the `read_intra_mode_rect` site does not
+fire for it, and neither does `read_intra_mode_sub8`):
+
+```
+MODECTXM mi=(64,24) above_mode=0 left_mode=6 above_ctx=0 left_ctx=4
+            -> mode val=1        (oracle: mode val=6)
+```
+
+**The oracle side could not be measured, and this lane will not guess
+past that.** A `MODECTX` rung placed immediately above
+`mbmi->mode = read_intra_mode(r, get_y_mode_cdf(ec_ctx, above_mi,
+left_mi))` in `decodemv.c:936`, rebuilt, with its format string
+confirmed present in the binary and the env var set, emits nothing —
+while the `EC_ISTEP name=mode` print three lines below it in the SAME
+function fires 744 times, so the code provably runs. One occurrence of
+the site in the source, in `ec_read_intra_frame_mode_info_impl`. Not
+resolved.
+
+**What is established.** The divergence is the
+`kf_y_mode[above_ctx][left_ctx]` row: same block, same bit position,
+different symbol VALUE (1 against 6). Our square reader takes
+`above_mode` / `left_mode` from the **coarse** `above_mode[c]` /
+`left_mode[r]` bands, whereas the rect path goes through
+`modes_above_left_mi` (the mi-exact map, lane-rectx r5's override) and
+libaom's `get_y_mode_cdf` uses `xd->above_mbmi` = `mi[-mi_stride]` =
+mi(63,24) and `xd->left_mbmi` = `mi[-1]` = mi(64,23). So there is a
+concrete question — does the square path's coarse band hold what
+mi(63,24) / mi(64,23) hold — and this lane did not get to answer it.
+
+**A coincidence recorded as a lead, not a claim.** Our `left_mode=6`
+at mi(64,24) is the same number the oracle DECODES as that block's
+mode. That is what a neighbour-cell mix-up would look like, and it is
+the shape Main predicted (the rect intra-mode path's own unsnapped
+lookup). It is one data point and is not evidence.
+
+**Unblock, and it is short.** Print `above_mi->mode` / `left_mi->mode`
+from the `EC_ISTEP name=mode` site itself — the print that is known to
+fire — rather than from a sibling `getenv` rung, and compare against
+mi(63,24) / mi(64,23) on our side. If the square path's coarse bands
+differ from those cells, the fix is lane-rectx r5's mi-exact override
+applied to the square `read_intra_mode` path, the same way the rect
+path already has it — the same neighbour-context family as the
+`around_mi_422_chroma` and dc-sign fixes, and the third instance of it.
+
 ### Round 14 — the ladder walked: the first-delta read is the LUMA `mode` at mi(64,24)
 
 Ladder rebuilt with the round-13 emission fix on both sides (position
