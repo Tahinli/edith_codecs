@@ -1530,6 +1530,57 @@ Two open items, and the first is now the smaller one:
 
 Not pinned, no gate, refusal untouched.
 
+## Round 26 — coverage attempted, and it is NOT achieved: the gap is bigger than var-tx
+
+Oracle rung added and snapshotted (`79e2986`): an `EC_VARTX` print on the
+`txfm_partition` read at `decodeframe.c:1058`, carrying mi, row, col, ctx,
+alphabet size, selected value and bit position. Validated at 1384 firings
+on a1.obu. This decoder's `read_var_tx_size` already printed
+`EC_ISTEP name=txfm_split`, so both sides now cover the var-tx phase.
+
+**And the coverage check FAILS, which is the result.** Enumerating every
+rung of any kind on both sides across reads 107495-107770:
+
+```
+OURS    (9 rungs)   first at 107533: EC_MM   mi_row=32 mi_col=0 w=64 h=64 ...
+                    107537 txfm_split mi(32,0)  ctx=0
+                    107539 txfm_split mi(32,8)  ctx=3
+                    107762 EC_MM   mi_row=48 mi_col=0
+ORACLE  (1 rung)    107751 EC_VARTX mi=(38,14) row=0 col=0 ctx=18 n=2 s=0 bitpos=3314
+```
+
+So reads **107493-107532 on ours and 107493-107751 on the oracle's are
+untagged on BOTH sides** — the `n=8` (ours) and the `n=2, n=2` (the
+oracle) that diverge at 107517 all sit inside that gap. It is not the
+transform-type read: the var-tx rung fires 1384 times on the oracle's and
+still nowhere near 107517. By the shape of the gap it is the
+**inter-block mode-info and MV read path**, which neither side tags.
+
+**The one thing this does establish about the divergence's direction:**
+by read 107751 the oracle is at `mi(38,14)` while this decoder is at
+`mi(32,0)`, and the oracle's bit position there is 3314 against our
+3129 at the divergence — the oracle is roughly 230 reads and 185 bits
+AHEAD. So this is not "one side reads an extra symbol"; the two decoders
+are in **different blocks** by then, and the untagged gap is where they
+part company.
+
+**Not claimed:** any symbol name for 107517-107519, and any tx-set
+comparison. Main's step 1 made coverage a precondition for step 2, and
+the precondition is not met, so step 2 is not attempted.
+
+**Handoff — the next instrument is the inter-mode/MV path, on both
+sides**: tag the per-block inter mode-info reads (libaom
+`read_inter_block_mode_info`: `is_inter`-dependent `y_mode`,
+`uv_mode`, `skip_mode`, `interintra`, `comp_mode`, `motion_mode`) and
+`read_mv_component`. With those, reads 107493-107532 stop being a gap
+and the `n=8` / `n=2,n=2` get names; the `n=8` alphabet on our side is
+the size a `y_mode` CDF would carry and the oracle's two `n=2` are
+partition-sized, which is what makes "different block" the reading to
+test first. Note the mi label will need the same treatment there — the
+inter path's mi is not published by the intra mode reader.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
