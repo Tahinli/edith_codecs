@@ -1,3 +1,5 @@
+/home/tahinli/Documents/Code/Rust/edith_codecs/crates/ec-av1/src/stream.rs:
+
 //! The stream-level entry point a real decoder needs: walk a raw AV1 OBU
 //! stream (`Encoded::stream`, or any low-overhead-format bitstream this
 //! crate's own writers produce) via [`ec_av1_syntax::Av1Parser`] and dispatch
@@ -28,12 +30,9 @@ use ec_core::{Error, Result};
 
 use crate::cdf_state::Cdfs;
 use crate::decode;
-use crate::decode::{
-    decode_inter_frame_tile_with_cdfs, decode_key_frame_tile_with_cdfs,
-    q_ctx_of,
-};
 #[cfg(test)]
 use crate::decode::decode_key_frame_tile_lr;
+use crate::decode::{decode_inter_frame_tile_with_cdfs, decode_key_frame_tile_with_cdfs, q_ctx_of};
 use crate::encode::Picture;
 
 /// lane-midcut r1: `EC_AV1_NO_GRAIN=1` skips film grain synthesis at output, so a
@@ -217,6 +216,22 @@ pub fn intrabc_128rect_hits() -> usize {
     crate::decode::intrabc_128rect_hits()
 }
 
+/// lane-av1-ibc128chunk: chroma transform units the 128-root intrabc strip's
+/// mu-chunk walk read, one per `read_inter_plane` chroma call. At 4:2:2 a
+/// 64x64 mu chunk's chroma plane block is 32x64 and holds TWO STACKED
+/// TX_32X32 units per plane; the square-cut walk this gate witnesses read
+/// one. Measured on the pinned witness: 8 before, 48 after.
+pub fn intrabc_128rect_chroma_chunk_hits() -> usize {
+    crate::decode::intrabc_128rect_chroma_chunk_hits()
+}
+
+/// lane-av1-ibc128chunk: the 128-root intrabc strip's per-axis chroma chunk
+/// extents as `(64 >> ss_x) << 8 | (64 >> ss_y)` on the last chunk walked --
+/// 32|32 at 4:2:0, 32|64 at 4:2:2, 64|64 at 4:4:4.
+pub fn intrabc_128rect_chunk_shape() -> usize {
+    crate::decode::intrabc_128rect_chunk_shape()
+}
+
 /// Blocks reconstructed with intra block copy at an 8x8 LEAF specifically
 /// (lane-kf900 r7's shape); [`crate::decode::intrabc_hits`] counts every shape.
 pub fn leaf8_intrabc_hits() -> usize {
@@ -384,16 +399,19 @@ struct Reorder {
 }
 
 impl Reorder {
-    fn push(&mut self, seq: usize, picture: std::sync::Arc<Picture>, decode_idx: usize, shown: bool) {
+    fn push(
+        &mut self,
+        seq: usize,
+        picture: std::sync::Arc<Picture>,
+        decode_idx: usize,
+        shown: bool,
+    ) {
         self.pending.insert(seq, (picture, decode_idx, shown));
     }
 
     /// Emits every queued picture whose turn has come. An `Err` from `sink`
     /// aborts the decode, unchanged, exactly as the serial path did.
-    fn drain(
-        &mut self,
-        sink: &mut impl FnMut(&Picture, usize, bool) -> Result<()>,
-    ) -> Result<()> {
+    fn drain(&mut self, sink: &mut impl FnMut(&Picture, usize, bool) -> Result<()>) -> Result<()> {
         while let Some((picture, decode_idx, shown)) = self.pending.remove(&self.next) {
             self.next += 1;
             sink(&picture, decode_idx, shown)?;
@@ -411,8 +429,7 @@ impl Reorder {
 /// inline. (lane-thread2 counted only LEAF frames, the only ones it could
 /// dispatch; lane-thread3 dispatches every non-key, non-`show_existing_frame`
 /// frame, hence the rename.)
-static FRAMES_DISPATCHED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static FRAMES_DISPATCHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Reads [`FRAMES_DISPATCHED`].
 pub fn frames_dispatched() -> usize {
@@ -724,12 +741,12 @@ pub fn decode_stream_with_threads(
                 let capped = in_flight_shows >= in_flight_cap;
                 while in_flight_shows >= in_flight_cap {
                     collect_one(
-                    &rx,
-                    &mut in_flight_decodes,
-                    &mut in_flight_shows,
-                    &mut reorder,
-                    &mut sink,
-                )?;
+                        &rx,
+                        &mut in_flight_decodes,
+                        &mut in_flight_shows,
+                        &mut reorder,
+                        &mut sink,
+                    )?;
                 }
                 if capped {
                     crate::timeline::cap_wait("show", cap_t0, crate::timeline::now());
@@ -803,7 +820,8 @@ pub fn decode_stream_with_threads(
                     &picture,
                     &header.film_grain,
                     mc_identity,
-                    bit_depth as u32, fctx,
+                    bit_depth as u32,
+                    fctx,
                 ))
             } else {
                 picture
@@ -1214,8 +1232,7 @@ pub fn decode_stream_with_threads(
             final_dump.as_deref(),
             None,
         )?;
-        let motion_field =
-            motion_field.expect("the inline path passes no stage-1 sink");
+        let motion_field = motion_field.expect("the inline path passes no stage-1 sink");
         pictures_decoded += 1;
         // lane-pool1: one allocation, then every slot store and the output
         // itself are refcount bumps instead of plane copies.
@@ -1271,7 +1288,8 @@ pub fn decode_stream_with_threads(
                     &picture,
                     &header.film_grain,
                     mc_identity,
-                    bit_depth as u32, fctx,
+                    bit_depth as u32,
+                    fctx,
                 ))
             } else {
                 picture
@@ -1303,8 +1321,6 @@ pub fn decode_stream_with_threads(
     crate::timeline::dump();
     Ok(())
 }
-
-
 
 /// lane-thread2: the sequence-header bits a single frame's decode needs,
 /// read once on the parsing thread so that [`decode_frame`] never touches the
@@ -1394,8 +1410,8 @@ impl<'a> RefSnapshot<'a> {
         // spec 7.9's own driver, `av1_setup_motion_field`: only run when
         // this frame's header asks for it, and never for a key frame (which
         // codes no inter block at all).
-        let tpl_field = (header.frame_type != FrameType::Key && header.use_ref_frame_mvs).then(
-            || {
+        let tpl_field =
+            (header.frame_type != FrameType::Key && header.use_ref_frame_mvs).then(|| {
                 crate::motion_field::setup_motion_field(
                     motion_field_slots,
                     header.ref_frame_idx,
@@ -1404,8 +1420,7 @@ impl<'a> RefSnapshot<'a> {
                     header.mi_rows as usize,
                     header.mi_cols as usize,
                 )
-            },
-        );
+            });
         if std::env::var_os("EC_TPL").is_some() {
             eprintln!(
                 "EC_TPL order_hint={} use_ref_frame_mvs={} cells={}",
@@ -1520,7 +1535,8 @@ fn decode_frame(
         header.segmentation,
         header.mi_rows as usize,
         header.mi_cols as usize,
-        snap.prev_seg_map.as_deref(), fctx,
+        snap.prev_seg_map.as_deref(),
+        fctx,
     );
     // lane-superres stage 2/3: `use_superres` adds/removes no per-block
     // symbol (spec 7.16's upscaling is a pixel-domain post-process
@@ -1833,8 +1849,13 @@ fn decode_frame(
     // the LR unit grid in upscaled coordinates. Cleared (0, 8) on an
     // unscaled frame so a later frame never inherits it.
     crate::decode::set_superres(
-        if header.use_superres { header.upscaled_width } else { 0 },
-        u32::from(header.superres_denom), fctx,
+        if header.use_superres {
+            header.upscaled_width
+        } else {
+            0
+        },
+        u32::from(header.superres_denom),
+        fctx,
     );
     // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
     let enable_masked_compound = seq.enable_masked_compound;
@@ -1942,7 +1963,8 @@ fn decode_frame(
             header.reduced_tx_set,
             header.allow_screen_content_tools,
             header.allow_intrabc,
-            header.delta, fctx,
+            header.delta,
+            fctx,
         )?;
         // A key frame codes no inter blocks -- its own saved motion
         // field has no cells set, matching libaom's own "intra frame
@@ -2219,9 +2241,8 @@ pub(crate) mod tests {
                 crate::encode::key_frame_headers_colour(64, 64, 100, color).unwrap();
             seq.seq_profile = profile;
             let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
-            stream.extend_from_slice(
-                &crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap(),
-            );
+            stream
+                .extend_from_slice(&crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap());
             let err = decode_stream(&stream).unwrap_err().to_string();
             assert!(
                 err.contains(REFUSAL),
@@ -2233,7 +2254,11 @@ pub(crate) mod tests {
         let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
         stream.extend_from_slice(&crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap());
         let frames = decode_stream(&stream).expect("the 4:2:0 control must decode");
-        assert_eq!(frames.len(), 1, "{NAME}: the 4:2:0 control decoded no frame");
+        assert_eq!(
+            frames.len(),
+            1,
+            "{NAME}: the 4:2:0 control decoded no frame"
+        );
     }
     /// lane-av1-422bigblock: the two witnessed 4:2:2 big-block defects, pinned
     /// as fixtures (`git add -f`; `fixtures/` is gitignored).
@@ -2291,6 +2316,193 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1-ibc128chunk: the WITNESS for the 128-root intrabc strip's
+    /// de-square-cut mu-chunk chroma walk, and the byte pin for it.
+    ///
+    /// `decode_intrabc_128rect` cut each mu chunk's chroma plane block with
+    /// `chunk_chroma = cside * 64 / side` -- a `chroma_side`-SQUARE chunk,
+    /// i.e. the 4:2:0 count on BOTH axes (the same defect lane-av1-422bigblock
+    /// fixed, and witnessed, in `decode_inter_block` and
+    /// `decode_block_128rect`; this copy was deferred there as unwitnessed).
+    /// At 4:2:2 a 64x64 mu chunk's chroma plane block is 32x64, so it holds
+    /// TWO STACKED TX_32X32 units per plane: the square-cut walk read one per
+    /// plane per chunk, left the chunk's lower 32 chroma rows with no
+    /// residual at all, and stamped each unit's entropy context over a
+    /// 16x16-mi luma span instead of 16x8.
+    ///
+    /// Measured red-before on the pinned witness (parent `a7d22aec`, via the
+    /// local `EC_AV1_ALLOW_422_PROBE` patch-run-restore build): 8 chroma
+    /// units stamped over the stream's two reached blocks and frames 0 and 3
+    /// diverge from `aomdec` (45135 / 44540 of 245760 samples each), the
+    /// first difference at Y sample 98368 -- frame 0, row 256, col 64, the
+    /// top-left corner of the first 128x64 intrabc block at mi(64,0). The
+    /// red build then lost 4 of the stream's 6 intrabc blocks to the desync.
+    /// Green-after, same fixture: 48 chroma units stamped, all 6 blocks
+    /// decoded, and ALL FIVE frames byte-identical to `aomdec --rawvideo`.
+    ///
+    /// Committed code refuses 4:2:2 at the sequence header, so the decode
+    /// assertions above are probe-measured and reproducible from the lane
+    /// report's recipe; what this gate can assert in committed code is the
+    /// byte pin, the refusal-by-name contract, and -- in the arm below --
+    /// that the per-axis walk is still spelled per-axis in the source.
+    #[test]
+    fn the_pinned_422_intrabc_sb128_strip_witnesses_refuse_by_name() {
+        const NAME: &str = "the_pinned_422_intrabc_sb128_strip_witnesses_refuse_by_name";
+        const REFUSAL: &str = "a chroma format of 4:2:2";
+        for (file, bytes, fp) in [
+            (
+                "422_intrabc_sb128_strip.obu",
+                1672usize,
+                0x50f5cfc576e4cd00_u64,
+            ),
+            (
+                "422_intrabc_sb128_strip_notxsearch.obu",
+                1675,
+                0xd4936f252ff8cff0,
+            ),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(file);
+            let data = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{NAME}: pinned witness {} is missing ({e}) -- the gate cannot run",
+                    path.display()
+                )
+            });
+            assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
+            assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
+            let err = decode_stream(&data).unwrap_err().to_string();
+            assert!(
+                err.contains(REFUSAL),
+                "{NAME}: {file} must refuse by name, got: {err}"
+            );
+        }
+    }
+
+    /// lane-av1-ibc128chunk: the SOURCE-SCAN arm of the witness gate above.
+    ///
+    /// The decode-level half of the red/green evidence cannot run in
+    /// committed code (the 4:2:2 refusal stands), so this arm pins the thing
+    /// that would silently bring the defect back: the square-cut
+    /// `chunk_chroma = cside * 64 / side` expression, and the per-axis
+    /// replacements that replaced it at BOTH sites in
+    /// [`decode_intrabc_128rect`] -- the mu-chunk read walk and the
+    /// `mu_chroma` per-unit context replay. It also pins the per-axis
+    /// counters' accessors so the arms stay reachable, and the walk's own
+    /// per-axis extent, derived here from the same `64 >> ss` form the
+    /// witnesses measured (4:2:0 = one TX_32X32 per plane per chunk,
+    /// 4:2:2 = two stacked, 4:4:4 = four).
+    #[test]
+    fn the_intrabc_128rect_chroma_chunk_walk_stays_per_axis() {
+        const NAME: &str = "the_intrabc_128rect_chroma_chunk_walk_stays_per_axis";
+        let src = include_str!("decode.rs");
+        let body = src
+            .split_once("fn decode_intrabc_128rect(")
+            .expect("decode_intrabc_128rect must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("decode_intrabc_128rect must be a top-level fn")
+            .0;
+        // Scan CODE only: the fix's own comments quote the old expression to
+        // say what it was, and a prose mention must not read as a
+        // reintroduction (nor mask one).
+        let stripped: Vec<&str> = body
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
+            .collect();
+        let code = stripped.join("\n");
+        let body = code.as_str();
+        assert_eq!(
+            body.matches("cside * 64 / side").count(),
+            0,
+            "{NAME}: the square-cut `cside * 64 / side` chunk extent is BACK in \
+             decode_intrabc_128rect -- that expression is the 4:2:2 defect this \
+             gate exists for (a 64x64 mu chunk's chroma plane block is \
+             (64 >> ss_x) x (64 >> ss_y), not `chroma_side` square)"
+        );
+        // The per-axis chunk extent, declared once at the mu-chunk read walk
+        // and once at the `mu_chroma` replay -- the two de-square-cut sites.
+        //
+        // The replay must ALSO enumerate every unit inside a chunk, not just
+        // its first: counting mu CHUNKS in `rows`/`cols` and then stepping the
+        // mi origin and reading the grid per UNIT only agrees when a chunk
+        // holds exactly one unit (4:2:0). At 4:2:2 and 4:4:4 a chunk holds two
+        // or four, so the per-unit body alone left the rest of the chunk with
+        // the composed-grid smearing the replay exists to undo.
+        for name in [
+            "let chunk_chroma_w = (64usize) >> ss_x(fctx);",
+            "let chunk_chroma_h = (64usize) >> ss_y(fctx);",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                2,
+                "{NAME}: `{name}` must appear at BOTH de-square-cut sites in \
+                 decode_intrabc_128rect (the mu-chunk read walk and the mu_chroma \
+                 context replay), found {}",
+                body.matches(name).count()
+            );
+        }
+        for name in [
+            "let (ur, uc) = (chunk_chroma_h / cu, chunk_chroma_w / cu);",
+            "for kr in 0..ur {",
+            "for kc in 0..uc {",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{NAME}: `{name}` must appear exactly once in \
+                 decode_intrabc_128rect -- the mu_chroma replay must walk chunk \
+                 THEN unit (decode_inter_block's `mu_chroma_units` shape), found {}",
+                body.matches(name).count()
+            );
+        }
+        for name in [
+            "let unit_luma_w = cu_tx << ss_x(fctx);",
+            "let unit_luma_h = cu_tx << ss_y(fctx);",
+            "let (cw, ch) = (bw >> ss_x(fctx), bh >> ss_y(fctx));",
+            "let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));",
+            "neighbours.around_mi_rect(unit_mi, unit_luma_w, unit_luma_h)",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{NAME}: `{name}` must appear exactly once in \
+                 decode_intrabc_128rect, found {}",
+                body.matches(name).count()
+            );
+        }
+        // The replay's own unit luma span is the lossless/lossy `cu << ss` form
+        // (site 2 spells it separately from the read walk's `cu_tx << ss`).
+        for name in [
+            "let unit_luma_w = cu << ss_x(fctx);",
+            "let unit_luma_h = cu << ss_y(fctx);",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{NAME}: `{name}` must appear exactly once in \
+                 decode_intrabc_128rect, found {}",
+                body.matches(name).count()
+            );
+        }
+        // The per-axis chunk extent the geometry demands, spelled out here so
+        // the scan and the witnesses cannot disagree about it.
+        let per_axis_units = |ss_x: u32, ss_y: u32| (64 >> ss_x) / 32 * (64 >> ss_y) / 32;
+        assert_eq!(per_axis_units(1, 1), 1, "{NAME}: 4:2:0 must stay one unit");
+        assert_eq!(per_axis_units(1, 0), 2, "{NAME}: 4:2:2 must be two units");
+        assert_eq!(per_axis_units(0, 0), 4, "{NAME}: 4:4:4 must be four units");
+        // The counters the probe arms read must stay exported.
+        for name in [
+            "pub fn intrabc_128rect_chroma_chunk_hits()",
+            "pub fn intrabc_128rect_chunk_shape()",
+        ] {
+            assert!(
+                src.contains(name),
+                "{NAME}: the accessor `{name}` must stay in decode.rs"
+            );
+        }
+    }
 
     /// lane-av1-qmatrix: WITNESS for the lifted `using_qmatrix` refusal (the
     /// old gate `a_frame_using_quantisation_matrices_is_refused_by_name` is
@@ -2376,7 +2588,12 @@ pub(crate) mod tests {
             .collect();
             args.push(format!("--limit={FRAMES}"));
             args.extend(extra.iter().map(|s| (*s).to_owned()));
-            args.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
+            args.extend([
+                "--obu".to_owned(),
+                "-o".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+            ]);
             let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
@@ -2393,13 +2610,23 @@ pub(crate) mod tests {
                 decode_stream(stream).unwrap_or_else(|e| panic!("{NAME}: {label} decode: {e}"));
             assert_eq!(got.len(), want.len(), "{NAME}: {label} frame count");
             for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-                for (plane, (gp, wp)) in
-                    [(&g.y, &w.y), (&g.u, &w.u), (&g.v, &w.v)].into_iter().enumerate()
+                for (plane, (gp, wp)) in [(&g.y, &w.y), (&g.u, &w.u), (&g.v, &w.v)]
+                    .into_iter()
+                    .enumerate()
                 {
-                    assert_eq!(gp, wp,
+                    assert_eq!(
+                        gp,
+                        wp,
                         "{NAME}: {label} frame {i} plane {plane} differs from ffmpeg (first mismatching sample: got {}, want {})",
-                        gp.iter().zip(wp.iter()).find(|(a, b)| a != b).map_or(0, |(a, _)| *a),
-                        gp.iter().zip(wp.iter()).find(|(a, b)| a != b).map_or(0, |(_, b)| *b));
+                        gp.iter()
+                            .zip(wp.iter())
+                            .find(|(a, b)| a != b)
+                            .map_or(0, |(a, _)| *a),
+                        gp.iter()
+                            .zip(wp.iter())
+                            .find(|(a, b)| a != b)
+                            .map_or(0, |(_, b)| *b)
+                    );
                 }
             }
         };
@@ -2417,7 +2644,10 @@ pub(crate) mod tests {
             "{NAME}: the qm-off control decoded no frame"
         );
         for (using, y, u, v) in qm_headers(&control_stream) {
-            assert!(!using, "{NAME}: the control's frame header set using_qmatrix");
+            assert!(
+                !using,
+                "{NAME}: the control's frame header set using_qmatrix"
+            );
             assert_eq!(
                 (y, u, v),
                 (0, 0, 0),
@@ -2579,7 +2809,7 @@ pub(crate) mod tests {
     /// never reports this refusal for any of them.
     #[test]
     fn a_frame_obu_that_parses_always_carries_at_least_one_tile() {
-    let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str = "a frame OBU with no tile group";
         let picture = test_card(64, 64);
         let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
@@ -2635,9 +2865,8 @@ pub(crate) mod tests {
     /// first, a middle and the last segment id.
     #[test]
     fn a_frame_whose_segmentation_overrides_a_block_mode_is_refused_by_name() {
-    let fctx = &crate::decode::FrameCtx::new();
-        const REFUSAL: &str =
-            "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV";
+        let fctx = &crate::decode::FrameCtx::new();
+        const REFUSAL: &str = "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV";
         let picture = test_card(64, 64);
         let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
@@ -2688,15 +2917,31 @@ pub(crate) mod tests {
         let src = format!("{source}=size={width}x{height}:rate=25");
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", &src, "-t", &duration, "-pix_fmt", "yuv420p",
-                "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &src,
+                "-t",
+                &duration,
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .expect("ffmpeg failed to run");
-        assert!(y4m.status.success(), "ffmpeg refused the {width}x{height} fixture");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg refused the {width}x{height} fixture"
+        );
         let limit = format!("--limit={frames}");
         let mut args: Vec<String> = [
             "--codec=av1",
@@ -2712,10 +2957,18 @@ pub(crate) mod tests {
         .collect();
         args.push(limit);
         args.extend(extra.iter().map(|s| (*s).to_owned()));
-        args.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args(&args), &y4m.stdout);
-        assert!(out.status.success(), "aomenc refused {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        args.extend([
+            "--obu".to_owned(),
+            "-o".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+        ]);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "aomenc refused {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let stream = out.stdout;
         let result = match decode_stream(&stream) {
             Ok(pictures) => Ok(pictures.len()),
@@ -2740,15 +2993,31 @@ pub(crate) mod tests {
         let src = format!("{source}=size={width}x{height}:rate=25");
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", &src, "-t", &duration, "-pix_fmt", "yuv420p",
-                "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &src,
+                "-t",
+                &duration,
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .expect("ffmpeg failed to run");
-        assert!(y4m.status.success(), "ffmpeg refused the {width}x{height} fixture");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg refused the {width}x{height} fixture"
+        );
         let limit = format!("--limit={frames}");
         let mut args: Vec<String> = [
             "--codec=av1",
@@ -2764,9 +3033,18 @@ pub(crate) mod tests {
         .collect();
         args.push(limit);
         args.extend(extra.iter().map(|s| (*s).to_owned()));
-        args.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
+        args.extend([
+            "--obu".to_owned(),
+            "-o".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+        ]);
         let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
-        assert!(out.status.success(), "aomenc refused {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "aomenc refused {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         out.stdout
     }
 
@@ -2787,17 +3065,34 @@ pub(crate) mod tests {
         let src = format!("{source}=size={width}x{height}:rate=25");
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", &src, "-t", &duration, "-pix_fmt", "yuv420p",
-                "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &src,
+                "-t",
+                &duration,
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .expect("ffmpeg failed to run");
-        assert!(y4m.status.success(), "ffmpeg refused the {width}x{height} fixture");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg refused the {width}x{height} fixture"
+        );
         let limit = format!("--limit={frames}");
-        let fpf = std::env::temp_dir().join(format!("ec-av1-segldapass-{}.fpf", std::process::id()));
+        let fpf =
+            std::env::temp_dir().join(format!("ec-av1-segldapass-{}.fpf", std::process::id()));
         let mut base: Vec<String> = [
             "--codec=av1",
             "--passes=2",
@@ -2814,15 +3109,33 @@ pub(crate) mod tests {
         base.extend(extra.iter().map(|s| (*s).to_owned()));
         let mut pass1 = base.clone();
         pass1.extend(["--pass=1".to_owned(), format!("--fpf={}", fpf.display())]);
-        pass1.extend(["--obu".to_owned(), "-o".to_owned(), "/dev/null".to_owned(), "-".to_owned()]);
+        pass1.extend([
+            "--obu".to_owned(),
+            "-o".to_owned(),
+            "/dev/null".to_owned(),
+            "-".to_owned(),
+        ]);
         let out1 = run_with_stdin(Command::new(aomenc_path()).args(&pass1), &y4m.stdout);
-        assert!(out1.status.success(), "aomenc pass 1 refused {pass1:?}: {}", String::from_utf8_lossy(&out1.stderr));
+        assert!(
+            out1.status.success(),
+            "aomenc pass 1 refused {pass1:?}: {}",
+            String::from_utf8_lossy(&out1.stderr)
+        );
         let mut pass2 = base;
         pass2.extend(["--pass=2".to_owned(), format!("--fpf={}", fpf.display())]);
-        pass2.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
+        pass2.extend([
+            "--obu".to_owned(),
+            "-o".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+        ]);
         let out2 = run_with_stdin(Command::new(aomenc_path()).args(&pass2), &y4m.stdout);
         let _ = std::fs::remove_file(&fpf);
-        assert!(out2.status.success(), "aomenc pass 2 refused {pass2:?}: {}", String::from_utf8_lossy(&out2.stderr));
+        assert!(
+            out2.status.success(),
+            "aomenc pass 2 refused {pass2:?}: {}",
+            String::from_utf8_lossy(&out2.stderr)
+        );
         out2.stdout
     }
 
@@ -2921,15 +3234,36 @@ pub(crate) mod tests {
         let arms: [(&str, &[&str]); 3] = [
             (
                 "testsrc2=size=256x192:rate=25",
-                &["--end-usage=q", "--cq-level=0", "--aq-mode=1", "--good", "--cpu-used=3", "--sb-size=64"],
+                &[
+                    "--end-usage=q",
+                    "--cq-level=0",
+                    "--aq-mode=1",
+                    "--good",
+                    "--cpu-used=3",
+                    "--sb-size=64",
+                ],
             ),
             (
                 "testsrc2=size=256x192:rate=25",
-                &["--end-usage=q", "--cq-level=0", "--aq-mode=1", "--good", "--cpu-used=5", "--sb-size=64"],
+                &[
+                    "--end-usage=q",
+                    "--cq-level=0",
+                    "--aq-mode=1",
+                    "--good",
+                    "--cpu-used=5",
+                    "--sb-size=64",
+                ],
             ),
             (
                 "gradients=size=256x192:rate=25",
-                &["--end-usage=q", "--cq-level=0", "--aq-mode=1", "--good", "--cpu-used=6", "--sb-size=64"],
+                &[
+                    "--end-usage=q",
+                    "--cq-level=0",
+                    "--aq-mode=1",
+                    "--good",
+                    "--cpu-used=6",
+                    "--sb-size=64",
+                ],
             ),
         ];
         let mut mixed_arms = 0usize;
@@ -2939,8 +3273,21 @@ pub(crate) mod tests {
         for (src, extra) in &arms {
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.16", "-pix_fmt",
-                    "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    *src,
+                    "-t",
+                    "0.16",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -2949,14 +3296,21 @@ pub(crate) mod tests {
                 .expect("ffmpeg failed to run");
             assert!(y4m.status.success(), "{NAME}: ffmpeg failed for {src}");
             let limit = format!("--limit={FRAMES}");
-            let mut args: Vec<String> = ["--codec=av1", "--passes=1", "--threads=1", "--obu", "-o", "-", "-"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect();
+            let mut args: Vec<String> = [
+                "--codec=av1",
+                "--passes=1",
+                "--threads=1",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
             args.insert(1, limit);
             args.extend(extra.iter().map(|s| (*s).to_owned()));
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused {args:?}: {}",
@@ -2986,8 +3340,9 @@ pub(crate) mod tests {
             // WHT-unit delta proves the per-segment lossless reconstruction
             // really ran inside a frame that is NOT `CodedLossless`.
             let before = crate::decode::lossless_wht_units();
-            let ours = decode_stream(&stream)
-                .unwrap_or_else(|e| panic!("{NAME}: a mixed-lossless frame decodes after the per-segment lift: {e}"));
+            let ours = decode_stream(&stream).unwrap_or_else(|e| {
+                panic!("{NAME}: a mixed-lossless frame decodes after the per-segment lift: {e}")
+            });
             let wht_units = crate::decode::lossless_wht_units() - before;
             let refs = ffmpeg_decode_sequence(&stream, WIDTH, HEIGHT, FRAMES);
             assert_eq!(ours.len(), FRAMES, "{NAME}: frame count");
@@ -2997,10 +3352,16 @@ pub(crate) mod tests {
                     .enumerate()
                 {
                     let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
-                    assert_eq!(bad, 0, "{NAME}: arm {extra:?} frame {i} plane {plane}: {bad} samples differ");
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: arm {extra:?} frame {i} plane {plane}: {bad} samples differ"
+                    );
                 }
             }
-            assert!(wht_units > 0, "{NAME}: arm {extra:?} reconstructed no Walsh-Hadamard unit -- the mixed census is lying or the lossless path never ran");
+            assert!(
+                wht_units > 0,
+                "{NAME}: arm {extra:?} reconstructed no Walsh-Hadamard unit -- the mixed census is lying or the lossless path never ran"
+            );
             mixed_arms += 1;
             eprintln!(
                 "{NAME}: arm {extra:?}: {mixed} mixed frame(s), {FRAMES} frames sample-exact vs ffmpeg, {wht_units} WHT units"
@@ -3035,15 +3396,29 @@ pub(crate) mod tests {
             eprintln!("SKIP a_segmentation_census_over_real_aq_streams: no aomenc");
             return;
         }
-        const REFUSAL: &str =
-            "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV";
+        const REFUSAL: &str = "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV";
         let recipes: [(&str, Vec<&str>); 6] = [
             ("baseline", vec!["--cpu-used=4", "--cq-level=40"]),
-            ("aq-mode=1", vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=40"]),
-            ("aq-mode=2", vec!["--cpu-used=4", "--aq-mode=2", "--cq-level=40"]),
-            ("aq-mode=3", vec!["--cpu-used=4", "--aq-mode=3", "--cq-level=40"]),
-            ("aq-mode=3 cq10", vec!["--cpu-used=4", "--aq-mode=3", "--cq-level=10"]),
-            ("deltaq-mode=1", vec!["--cpu-used=4", "--deltaq-mode=1", "--cq-level=40"]),
+            (
+                "aq-mode=1",
+                vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=40"],
+            ),
+            (
+                "aq-mode=2",
+                vec!["--cpu-used=4", "--aq-mode=2", "--cq-level=40"],
+            ),
+            (
+                "aq-mode=3",
+                vec!["--cpu-used=4", "--aq-mode=3", "--cq-level=40"],
+            ),
+            (
+                "aq-mode=3 cq10",
+                vec!["--cpu-used=4", "--aq-mode=3", "--cq-level=10"],
+            ),
+            (
+                "deltaq-mode=1",
+                vec!["--cpu-used=4", "--deltaq-mode=1", "--cq-level=40"],
+            ),
         ];
         // Arrival, not intent (class knob-never-reached-the-tool): a recipe
         // whose stream is byte-for-byte the baseline's changed nothing, and a
@@ -3090,7 +3465,11 @@ pub(crate) mod tests {
             "SEGCENSUS: {} recipes, {decoded} decoded, {refused} refused for other reasons",
             recipes.len()
         );
-        assert_eq!(decoded, recipes.len(), "every recipe must decode; {refused} refused");
+        assert_eq!(
+            decoded,
+            recipes.len(),
+            "every recipe must decode; {refused} refused"
+        );
         assert!(
             segment_symbols > 0,
             "no recipe coded a single segment_id symbol -- segmentation never arrived, so \
@@ -3116,21 +3495,39 @@ pub(crate) mod tests {
                 "mandelbrot",
                 192,
                 128,
-                vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=45", "--lag-in-frames=16", "--auto-alt-ref=1"],
+                vec![
+                    "--cpu-used=4",
+                    "--aq-mode=1",
+                    "--cq-level=45",
+                    "--lag-in-frames=16",
+                    "--auto-alt-ref=1",
+                ],
             ),
             (
                 "aq-mode=1 lag16 screen",
                 "testsrc2",
                 256,
                 192,
-                vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=45", "--lag-in-frames=16", "--auto-alt-ref=1"],
+                vec![
+                    "--cpu-used=4",
+                    "--aq-mode=1",
+                    "--cq-level=45",
+                    "--lag-in-frames=16",
+                    "--auto-alt-ref=1",
+                ],
             ),
             (
                 "aq-mode=1 lag16 cq63 high_q",
                 "mandelbrot",
                 192,
                 128,
-                vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=63", "--lag-in-frames=16", "--auto-alt-ref=1"],
+                vec![
+                    "--cpu-used=4",
+                    "--aq-mode=1",
+                    "--cq-level=63",
+                    "--lag-in-frames=16",
+                    "--auto-alt-ref=1",
+                ],
             ),
             // `--aq-mode=2 lag16` (complexity AQ over an alt-ref group) was
             // measured 2026-09-24: it encodes and decodes cleanly but codes
@@ -3167,7 +3564,13 @@ pub(crate) mod tests {
                 192,
                 128,
                 40,
-                &["--cpu-used=4", "--aq-mode=1", "--cq-level=45", "--lag-in-frames=16", "--auto-alt-ref=1"],
+                &[
+                    "--cpu-used=4",
+                    "--aq-mode=1",
+                    "--cq-level=45",
+                    "--lag-in-frames=16",
+                    "--auto-alt-ref=1",
+                ],
             );
             let (enabled, umap, inherited, alt_q, frames_per_feature) =
                 segmentation_feature_census(&stream);
@@ -3239,7 +3642,8 @@ pub(crate) mod tests {
     /// `SEG_LVL_ALT_Q`, and an inheritance-heavy shape).
     #[test]
     fn a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact() {
-        const NAME: &str = "a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact";
+        const NAME: &str =
+            "a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact";
         if !have_aomenc() {
             eprintln!("SKIP {NAME}: no aomenc");
             return;
@@ -3350,8 +3754,18 @@ pub(crate) mod tests {
             "--enable-intrabc=0",
         ];
         let recipes: [(&str, usize, usize, Vec<&str>); 2] = [
-            ("obmc dual cq40", 192, 128, [vec!["--cq-level=40"], base.clone()].concat()),
-            ("obmc dual cq20", 192, 128, [vec!["--cq-level=20"], base.clone()].concat()),
+            (
+                "obmc dual cq40",
+                192,
+                128,
+                [vec!["--cq-level=40"], base.clone()].concat(),
+            ),
+            (
+                "obmc dual cq20",
+                192,
+                128,
+                [vec!["--cq-level=20"], base.clone()].concat(),
+            ),
         ];
         let mut reads = 0usize;
         let mut decoded = 0usize;
@@ -3372,7 +3786,9 @@ pub(crate) mod tests {
                 }
                 Err(e) => {
                     assert!(
-                        !e.contains("an OBMC neighbour whose switchable interp filter was never recorded"),
+                        !e.contains(
+                            "an OBMC neighbour whose switchable interp filter was never recorded"
+                        ),
                         "{name}: a real OBMC stream reached the unrecorded-filter refusal -- \
                          a publication site is missing: {e}"
                     );
@@ -3380,7 +3796,10 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert!(decoded > 0, "no OBMC recipe decoded -- the witness is vacuous");
+        assert!(
+            decoded > 0,
+            "no OBMC recipe decoded -- the witness is vacuous"
+        );
         assert!(
             reads > 0,
             "every OBMC blend took the fixed-filter path: the band was never read, so this \
@@ -3417,12 +3836,62 @@ pub(crate) mod tests {
             "--enable-intrabc=0",
         ];
         let recipes: [(&str, usize, usize, Vec<&str>); 6] = [
-            ("denom12 320x180 cq32", 320, 180, vec!["--cpu-used=4", "--superres-mode=1", "--superres-denominator=12", "--cq-level=32"]),
-            ("denom12 320x180 cq50", 320, 180, vec!["--cpu-used=4", "--superres-mode=1", "--superres-denominator=12", "--cq-level=50"]),
-            ("denom16 320x180 cq32", 320, 180, vec!["--cpu-used=4", "--superres-mode=1", "--superres-denominator=16", "--cq-level=32"]),
-            ("denom10 192x128 cq32", 192, 128, vec!["--cpu-used=4", "--superres-mode=1", "--superres-denominator=10", "--cq-level=32"]),
-            ("auto 320x180 cq50", 320, 180, vec!["--cpu-used=4", "--superres-mode=3", "--cq-level=50"]),
-            ("auto 192x128 cq50", 192, 128, vec!["--cpu-used=4", "--superres-mode=3", "--cq-level=50"]),
+            (
+                "denom12 320x180 cq32",
+                320,
+                180,
+                vec![
+                    "--cpu-used=4",
+                    "--superres-mode=1",
+                    "--superres-denominator=12",
+                    "--cq-level=32",
+                ],
+            ),
+            (
+                "denom12 320x180 cq50",
+                320,
+                180,
+                vec![
+                    "--cpu-used=4",
+                    "--superres-mode=1",
+                    "--superres-denominator=12",
+                    "--cq-level=50",
+                ],
+            ),
+            (
+                "denom16 320x180 cq32",
+                320,
+                180,
+                vec![
+                    "--cpu-used=4",
+                    "--superres-mode=1",
+                    "--superres-denominator=16",
+                    "--cq-level=32",
+                ],
+            ),
+            (
+                "denom10 192x128 cq32",
+                192,
+                128,
+                vec![
+                    "--cpu-used=4",
+                    "--superres-mode=1",
+                    "--superres-denominator=10",
+                    "--cq-level=32",
+                ],
+            ),
+            (
+                "auto 320x180 cq50",
+                320,
+                180,
+                vec!["--cpu-used=4", "--superres-mode=3", "--cq-level=50"],
+            ),
+            (
+                "auto 192x128 cq50",
+                192,
+                128,
+                vec!["--cpu-used=4", "--superres-mode=3", "--cq-level=50"],
+            ),
         ];
         let (mut decoded, mut warp, mut sub8, mut leaf8) = (0, 0, 0, 0);
         // lane-t900 r36 (class [[gate-blind-to-feature]]): unknown refusal
@@ -3475,7 +3944,10 @@ pub(crate) mod tests {
         // front of them: whichever partition path a scaled frame takes, the
         // leaf guard is reached first. Lifting the leaf gap is what makes the
         // other two measurable, so this gate pins the ORDER, not just a count.
-        assert!(decoded > 0, "no superres recipe decoded -- the census is vacuous");
+        assert!(
+            decoded > 0,
+            "no superres recipe decoded -- the census is vacuous"
+        );
         // lane-t900 r28: all three scaled refusals are LIFTED, so the census
         // now pins the opposite shape -- every fixed-denominator recipe must
         // DECODE, and none of the three strings may come back.
@@ -3484,7 +3956,10 @@ pub(crate) mod tests {
             (0, 0, 0),
             "a scaled-reference refusal came back (warp {warp}, sub8 {sub8}, leaf8 {leaf8})"
         );
-        assert!(decoded > 0, "no superres recipe decoded -- the census is vacuous");
+        assert!(
+            decoded > 0,
+            "no superres recipe decoded -- the census is vacuous"
+        );
     }
 
     /// lane-t900 r25, negative gate: a `show_existing_frame` header naming a
@@ -3536,7 +4011,10 @@ pub(crate) mod tests {
                 err.contains(REFUSAL),
                 "slot {slot}: expected {REFUSAL:?}, got: {err}"
             );
-            assert_eq!(shown, 0, "slot {slot}: an empty slot was output as a picture");
+            assert_eq!(
+                shown, 0,
+                "slot {slot}: an empty slot was output as a picture"
+            );
         }
     }
 
@@ -3554,7 +4032,7 @@ pub(crate) mod tests {
     /// tile is decoded.
     #[test]
     fn an_inter_frame_opening_a_stream_is_refused_by_name() {
-    let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str = "an inter frame with no key frame before it";
         let picture = test_card(64, 64);
         let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
@@ -3581,7 +4059,10 @@ pub(crate) mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains(REFUSAL), "expected {REFUSAL:?}, got: {err}");
-        assert_eq!(shown, 0, "an inter frame with no reference produced a picture");
+        assert_eq!(
+            shown, 0,
+            "an inter frame with no reference produced a picture"
+        );
     }
 
     /// lane-t900 r26, negative gate: an inter frame whose own coded size is
@@ -3600,7 +4081,7 @@ pub(crate) mod tests {
     /// fires on the reference's dimensions before a tile symbol is read.
     #[test]
     fn an_inter_frame_shorter_than_its_reference_is_refused_by_name() {
-    let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str =
             "a reference picture whose height does not match this frame's own true size";
         let picture = test_card(64, 64);
@@ -3630,7 +4111,10 @@ pub(crate) mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains(REFUSAL), "expected {REFUSAL:?}, got: {err}");
-        assert_eq!(shown, 1, "expected the key frame alone, got {shown} pictures");
+        assert_eq!(
+            shown, 1,
+            "expected the key frame alone, got {shown} pictures"
+        );
     }
 
     /// lane-t900 r26, negative gate: an inter frame naming a
@@ -3652,7 +4136,7 @@ pub(crate) mod tests {
     /// before the reference pictures are looked up.
     #[test]
     fn an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name() {
-    let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str =
             "a frame naming primary_ref_frame at a reference slot with no saved CDF state";
         // The invariant above, read off the source: every line that stores a
@@ -3708,8 +4192,14 @@ pub(crate) mod tests {
             })
             .unwrap_err()
             .to_string();
-            assert!(err.contains(REFUSAL), "slot {slot}: expected {REFUSAL:?}, got: {err}");
-            assert_eq!(shown, 0, "slot {slot}: a frame with no CDF state produced a picture");
+            assert!(
+                err.contains(REFUSAL),
+                "slot {slot}: expected {REFUSAL:?}, got: {err}"
+            );
+            assert_eq!(
+                shown, 0,
+                "slot {slot}: a frame with no CDF state produced a picture"
+            );
         }
     }
 
@@ -3756,7 +4246,9 @@ pub(crate) mod tests {
                     continue;
                 };
                 let mut parser = Av1Parser::new();
-                parser.parse_obu(&crate::sequence::sequence_header_obu(&seq).unwrap()).unwrap();
+                parser
+                    .parse_obu(&crate::sequence::sequence_header_obu(&seq).unwrap())
+                    .unwrap();
                 let obu = parser.parse_obu(&stream).unwrap();
                 let ObuKind::Frame(parsed, _) = &obu.kind else {
                     panic!("{w}x{h}: the written frame OBU did not parse as one");
@@ -3804,11 +4296,28 @@ pub(crate) mod tests {
     ) -> ([usize; 6], usize, usize) {
         let duration = format!("{}", frames as f64 / 25.0);
         let source = format!("mandelbrot=size={width}x{height}:rate=25");
-        let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+        let pix_fmt = if bit_depth == 10 {
+            "yuv420p10le"
+        } else {
+            "yuv420p"
+        };
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration, "-pix_fmt",
-                pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-t",
+                &duration,
+                "-pix_fmt",
+                pix_fmt,
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -3824,34 +4333,58 @@ pub(crate) mod tests {
         let input_depth_arg = format!("--input-bit-depth={bit_depth}");
         let cq_arg = format!("--cq-level={cq}");
         let limit_arg = format!("--limit={frames}");
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
-                "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg,
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                &cq_arg,
                 // cpu-used >= 1 keeps libaom on 64x64 superblocks at these
                 // sizes (`av1_select_sb_size`).
-                "--cpu-used=4", "--threads=1", "--row-mt=0", "--kf-max-dist=9999",
+                "--cpu-used=4",
+                "--threads=1",
+                "--row-mt=0",
+                "--kf-max-dist=9999",
                 &limit_arg,
                 // decode order == display order, so the compare below covers
                 // every frame the stream carries (class gate-blind-to-hidden-frames).
-                "--lag-in-frames=0", &depth_arg, &input_depth_arg,
+                "--lag-in-frames=0",
+                &depth_arg,
+                &input_depth_arg,
                 // Rect partitions stay ON: the frame-edge strip is a FORCED
                 // (gathered) HORZ/VERT, but with rect coding off the encoder
                 // answers that gathered symbol SPLIT every time and no edge
                 // strip ever fires (lane-oddh r2's finding, re-measured r1).
-                "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                "--enable-1to4-partitions=0", "--min-partition-size=8",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=8",
                 "--max-partition-size=64",
                 // Other lanes' open gaps this recipe must not trip.
-                "--enable-palette=0", "--enable-intrabc=0", "--enable-warped-motion=0",
-                "--enable-obmc=0", "--enable-masked-comp=0", "--enable-interintra-comp=0",
-                "--enable-onesided-comp=0", "--enable-interintra-wedge=0",
-                "--enable-smooth-interintra=0", "--enable-ref-frame-mvs=0",
-                "--enable-angle-delta=0", "--enable-cfl-intra=0",
-                "--enable-directional-intra=0", "--enable-smooth-intra=0",
-                "--enable-paeth-intra=0", "--enable-filter-intra=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-ref-frame-mvs=0",
+                "--enable-angle-delta=0",
+                "--enable-cfl-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-filter-intra=0",
                 "--enable-tx-size-search=0",
-                "--obu", "-o", "-", "-",
-            ]), &y4m.stdout);
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "aomenc refused: {}",
@@ -4000,24 +4533,55 @@ pub(crate) mod tests {
         let (width, height) = (64usize, 72usize);
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i",
-                "mandelbrot=size=64x72:rate=25:start_x=-0.6:start_y=-0.4", "-t", "0.04",
-                "-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "mandelbrot=size=64x72:rate=25:start_x=-0.6:start_y=-0.4",
+                "-t",
+                "0.04",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .expect("ffmpeg failed to run");
-        assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
-                "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
-                "--cpu-used=0", "--sb-size=128", "--min-partition-size=16",
-                "--kf-max-dist=0", "--limit=1",
-                "--threads=1", "--row-mt=0", "--obu", "-o", "-", "-",
-            ]), &y4m.stdout);
-        assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=32",
+                "--cpu-used=0",
+                "--sb-size=128",
+                "--min-partition-size=16",
+                "--kf-max-dist=0",
+                "--limit=1",
+                "--threads=1",
+                "--row-mt=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]),
+            &y4m.stdout,
+        );
+        assert!(
+            out.status.success(),
+            "aomenc refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let stream = out.stdout;
 
         // The knob actually arrived: this stream's sequence header codes
@@ -4035,19 +4599,19 @@ pub(crate) mod tests {
                 break;
             }
         }
-        assert!(sb128, "aomenc ignored --sb-size=128: this stream is 64x64-superblock");
+        assert!(
+            sb128,
+            "aomenc ignored --sb-size=128: this stream is 64x64-superblock"
+        );
 
         let _guard = lock_gate_counters();
-        let before = crate::decode::part128_symbols()
-            + crate::decode::part128_gathered_symbols();
-        let (frames, hidden) =
-            decode_all_frames_vs_oracle(&stream, "sb128-oddh-64x72");
+        let before = crate::decode::part128_symbols() + crate::decode::part128_gathered_symbols();
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, "sb128-oddh-64x72");
         assert!(frames > 0, "no frames decoded for {width}x{height}");
         // The 128 root actually READ a partition symbol here: at mi_rows=18
         // `has_rows` is true, so BLOCK_128X128 is not a forced split.
-        let part128 = crate::decode::part128_symbols()
-            + crate::decode::part128_gathered_symbols()
-            - before;
+        let part128 =
+            crate::decode::part128_symbols() + crate::decode::part128_gathered_symbols() - before;
         assert!(
             part128 > 0,
             "{width}x{height} decoded without reading a single BLOCK_128X128 \
@@ -4099,7 +4663,8 @@ pub(crate) mod tests {
                 encoded.screen,
                 // ... and its own `allow_intrabc` (stale-header class).
                 encoded.allow_intrabc,
-                &encoded.loop_restoration, fctx,
+                &encoded.loop_restoration,
+                fctx,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
@@ -4142,7 +4707,7 @@ pub(crate) mod tests {
 
     #[test]
     fn decode_stream_round_trips_a_gop() {
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         gop_round_trips(128, 64, fctx);
     }
 
@@ -4150,7 +4715,7 @@ pub(crate) mod tests {
     /// the inter frame's 16x16-leaf split path is exercised too.
     #[test]
     fn decode_stream_round_trips_an_odd_size_gop() {
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         gop_round_trips(216, 96, fctx);
     }
 
@@ -4162,9 +4727,11 @@ pub(crate) mod tests {
     /// decode indices non-decreasing, and an `Err` from the sink aborting.
     #[test]
     fn streaming_decode_matches_the_collecting_one() {
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let pictures: Vec<_> = (0..4).map(|i| panned_test_card(128, 64, i * 3)).collect();
-        let stream = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap().stream;
+        let stream = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx)
+            .unwrap()
+            .stream;
         let collected = decode_stream(&stream).unwrap();
 
         let mut shown = Vec::new();
@@ -4179,8 +4746,15 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(shown.len(), collected.len(), "callback count vs shown frames");
-        assert!(live >= shown.len(), "every shown picture is also a callback");
+        assert_eq!(
+            shown.len(),
+            collected.len(),
+            "callback count vs shown frames"
+        );
+        assert!(
+            live >= shown.len(),
+            "every shown picture is also a callback"
+        );
         assert!(
             idxs.windows(2).all(|w| w[0] <= w[1]),
             "decode indices out of order: {idxs:?}"
@@ -4301,9 +4875,18 @@ pub(crate) mod tests {
                 Pic {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
-                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
+                    y: out.stdout[base..base + luma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    u: out.stdout[base + luma..base + luma + chroma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
                 }
             })
             .collect()
@@ -4352,8 +4935,17 @@ pub(crate) mod tests {
     ) -> Vec<Pic> {
         let out = run_with_stdin(
             Command::new("ffmpeg").args([
-                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt",
-                "yuv420p10le", "-",
+                "-v",
+                "error",
+                "-f",
+                "obu",
+                "-i",
+                "-",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-",
             ]),
             stream,
         );
@@ -4419,10 +5011,27 @@ pub(crate) mod tests {
         let (width, height) = (384usize, 152usize);
         let out = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
                 "smptebars=s=384x152:r=12,drawgrid=w=8:h=8:t=1:c=black",
-                "-frames:v", "4", "-c:v", "libsvtav1", "-preset", "8", "-crf", "30",
-                "-svtav1-params", "lp=1:screen-content-mode=1", "-g", "12", "-f", "obu", "-",
+                "-frames:v",
+                "4",
+                "-c:v",
+                "libsvtav1",
+                "-preset",
+                "8",
+                "-crf",
+                "30",
+                "-svtav1-params",
+                "lp=1:screen-content-mode=1",
+                "-g",
+                "12",
+                "-f",
+                "obu",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -4511,7 +5120,7 @@ pub(crate) mod tests {
     /// independent decoder, not just this crate checking its own tile path.
     #[test]
     fn decode_stream_agrees_with_ffmpeg_on_a_gop() {
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP decode_stream_agrees_with_ffmpeg_on_a_gop: no ffmpeg");
             return;
@@ -4539,9 +5148,18 @@ pub(crate) mod tests {
             // decoder-side one.
             for (i, (frame, want)) in encoded.frames.iter().zip(&ffmpeg_frames).enumerate() {
                 let rec = &frame.reconstruction;
-                assert_eq!(rec.y, want.y, "{width}x{height} frame {i} luma: reconstruction vs ffmpeg");
-                assert_eq!(rec.u, want.u, "{width}x{height} frame {i} U: reconstruction vs ffmpeg");
-                assert_eq!(rec.v, want.v, "{width}x{height} frame {i} V: reconstruction vs ffmpeg");
+                assert_eq!(
+                    rec.y, want.y,
+                    "{width}x{height} frame {i} luma: reconstruction vs ffmpeg"
+                );
+                assert_eq!(
+                    rec.u, want.u,
+                    "{width}x{height} frame {i} U: reconstruction vs ffmpeg"
+                );
+                assert_eq!(
+                    rec.v, want.v,
+                    "{width}x{height} frame {i} V: reconstruction vs ffmpeg"
+                );
             }
         }
     }
@@ -4567,7 +5185,9 @@ pub(crate) mod tests {
     fn a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg() {
         let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
-            eprintln!("SKIP a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg: no ffmpeg");
+            eprintln!(
+                "SKIP a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg: no ffmpeg"
+            );
             return;
         }
         const FRAMES: usize = 4;
@@ -4600,9 +5220,18 @@ pub(crate) mod tests {
                 }
                 for (i, (frame, want)) in encoded.frames.iter().zip(&ffmpeg_frames).enumerate() {
                     let rec = &frame.reconstruction;
-                    assert_eq!(rec.y, want.y, "{width}x{height} frame {i} luma: recon vs ffmpeg");
-                    assert_eq!(rec.u, want.u, "{width}x{height} frame {i} U: recon vs ffmpeg");
-                    assert_eq!(rec.v, want.v, "{width}x{height} frame {i} V: recon vs ffmpeg");
+                    assert_eq!(
+                        rec.y, want.y,
+                        "{width}x{height} frame {i} luma: recon vs ffmpeg"
+                    );
+                    assert_eq!(
+                        rec.u, want.u,
+                        "{width}x{height} frame {i} U: recon vs ffmpeg"
+                    );
+                    assert_eq!(
+                        rec.v, want.v,
+                        "{width}x{height} frame {i} V: recon vs ffmpeg"
+                    );
                 }
             }
         }
@@ -4660,18 +5289,40 @@ pub(crate) mod tests {
             let decoded = decode_stream(&encoded.stream)
                 .unwrap_or_else(|e| panic!("{width}x{height}: our decoder refused: {e}"));
             let ffmpeg_frames = ffmpeg_decode_sequence(&encoded.stream, width, height, FRAMES);
-            assert_eq!(ffmpeg_frames.len(), FRAMES, "{width}x{height}: ffmpeg frame count");
+            assert_eq!(
+                ffmpeg_frames.len(),
+                FRAMES,
+                "{width}x{height}: ffmpeg frame count"
+            );
             assert_eq!(decoded.len(), FRAMES, "{width}x{height}: frame count");
             for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{width}x{height} frame {i} luma: ours vs ffmpeg");
-                assert_eq!(got.u, want.u, "{width}x{height} frame {i} U: ours vs ffmpeg");
-                assert_eq!(got.v, want.v, "{width}x{height} frame {i} V: ours vs ffmpeg");
+                assert_eq!(
+                    got.y, want.y,
+                    "{width}x{height} frame {i} luma: ours vs ffmpeg"
+                );
+                assert_eq!(
+                    got.u, want.u,
+                    "{width}x{height} frame {i} U: ours vs ffmpeg"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{width}x{height} frame {i} V: ours vs ffmpeg"
+                );
             }
             for (i, (frame, want)) in encoded.frames.iter().zip(&ffmpeg_frames).enumerate() {
                 let rec = &frame.reconstruction;
-                assert_eq!(rec.y, want.y, "{width}x{height} frame {i} luma: recon vs ffmpeg");
-                assert_eq!(rec.u, want.u, "{width}x{height} frame {i} U: recon vs ffmpeg");
-                assert_eq!(rec.v, want.v, "{width}x{height} frame {i} V: recon vs ffmpeg");
+                assert_eq!(
+                    rec.y, want.y,
+                    "{width}x{height} frame {i} luma: recon vs ffmpeg"
+                );
+                assert_eq!(
+                    rec.u, want.u,
+                    "{width}x{height} frame {i} U: recon vs ffmpeg"
+                );
+                assert_eq!(
+                    rec.v, want.v,
+                    "{width}x{height} frame {i} V: recon vs ffmpeg"
+                );
             }
         }
     }
@@ -4704,7 +5355,7 @@ pub(crate) mod tests {
     /// with itself would prove nothing.
     #[test]
     fn a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg() {
-    let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg: no ffmpeg"
@@ -4855,7 +5506,9 @@ pub(crate) mod tests {
             hash_color(seed, 2),
             hash_color(seed, 3),
         );
-        format!("gradients=size={width}x{height}:c0={c0}:c1={c1}:c2={c2}:c3={c3}:seed={seed}:{tail}")
+        format!(
+            "gradients=size={width}x{height}:c0={c0}:c1={c1}:c2={c2}:c3={c3}:seed={seed}:{tail}"
+        )
     }
 
     /// The determinism guard: same seed twice must byte-match ffmpeg's own
@@ -4870,7 +5523,16 @@ pub(crate) mod tests {
         fn render_hash(lavfi: &str) -> Vec<u8> {
             let out = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", lavfi, "-frames:v", "1", "-f", "rawvideo",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    lavfi,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
                     "-",
                 ])
                 .stdin(Stdio::null())
@@ -5088,7 +5750,17 @@ pub(crate) mod tests {
             .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
             .arg(&src)
             .args(["-an", "-threads", "1", "-g", "16", "-c:v", "libaom-av1"])
-            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "35", "-f", "obu", "-"])
+            .args([
+                "-cpu-used",
+                "6",
+                "-b:v",
+                "0",
+                "-crf",
+                "35",
+                "-f",
+                "obu",
+                "-",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -5178,18 +5850,37 @@ pub(crate) mod tests {
         let load = Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-i"])
             .arg(&clip)
-            .args(["-frames:v", &frames.to_string(), "-vf", "crop=1920:1024:960:568"])
+            .args([
+                "-frames:v",
+                &frames.to_string(),
+                "-vf",
+                "crop=1920:1024:960:568",
+            ])
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .arg(&src)
             .output()
             .expect("ffmpeg failed to run");
-        assert!(load.status.success(), "{NAME}: {}", String::from_utf8_lossy(&load.stderr));
+        assert!(
+            load.status.success(),
+            "{NAME}: {}",
+            String::from_utf8_lossy(&load.stderr)
+        );
         let out = Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
             .arg(&src)
             .args(["-an", "-threads", "1", "-g", "12", "-c:v", "libaom-av1"])
-            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "45", "-f", "obu", "-"])
+            .args([
+                "-cpu-used",
+                "6",
+                "-b:v",
+                "0",
+                "-crf",
+                "45",
+                "-f",
+                "obu",
+                "-",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -5307,7 +5998,10 @@ pub(crate) mod tests {
                 lossless += 1;
             }
         }
-        assert_eq!(lossless, frames, "{NAME} went blind: libaom coded no lossless key frame at -crf 0");
+        assert_eq!(
+            lossless, frames,
+            "{NAME} went blind: libaom coded no lossless key frame at -crf 0"
+        );
         let ours = decode_stream(&stream).expect("a lossless key-frame stream decodes");
         let refs = ffmpeg_decode_sequence(&stream, w, h, frames);
         assert_eq!(ours.len(), frames, "{NAME}: frame count");
@@ -5317,7 +6011,10 @@ pub(crate) mod tests {
                 .enumerate()
             {
                 let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
-                assert_eq!(bad, 0, "{NAME}: frame {i} plane {plane}: {bad} samples differ");
+                assert_eq!(
+                    bad, 0,
+                    "{NAME}: frame {i} plane {plane}: {bad} samples differ"
+                );
             }
         }
     }
@@ -5380,7 +6077,11 @@ pub(crate) mod tests {
                     for col in 0..w {
                         let v = if screen {
                             if row % 7 == 0 && col % 3 == 0 {
-                                if (col / 3 + row + f) % 2 == 1 { 16 } else { 235 }
+                                if (col / 3 + row + f) % 2 == 1 {
+                                    16
+                                } else {
+                                    235
+                                }
                             } else {
                                 PAL[((col + 4 * f) / 16 + row / 16) % PAL.len()]
                             }
@@ -5405,10 +6106,16 @@ pub(crate) mod tests {
                     }
                 }
             }
-            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix = if depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
-            let src = std::env::temp_dir()
-                .join(format!("ec-av1-lossless2-{}-{w}x{h}-{depth}.yuv", std::process::id()));
+            let src = std::env::temp_dir().join(format!(
+                "ec-av1-lossless2-{}-{w}x{h}-{depth}.yuv",
+                std::process::id()
+            ));
             std::fs::write(&src, &raw).expect("raw source");
             let mut cmd = Command::new("ffmpeg");
             cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix])
@@ -5456,7 +6163,10 @@ pub(crate) mod tests {
                     inters += 1;
                 }
             }
-            assert!(lossless >= frames, "{NAME} [{tag}] went blind: {lossless} lossless frames");
+            assert!(
+                lossless >= frames,
+                "{NAME} [{tag}] went blind: {lossless} lossless frames"
+            );
             assert!(
                 screen || inters > 0,
                 "{NAME} [{tag}] went blind: no inter frame at gop {gop}"
@@ -5475,7 +6185,10 @@ pub(crate) mod tests {
                     .enumerate()
                 {
                     let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
-                    assert_eq!(bad, 0, "{NAME} [{tag}]: frame {i} plane {plane}: {bad} samples differ");
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME} [{tag}]: frame {i} plane {plane}: {bad} samples differ"
+                    );
                 }
             }
         }
@@ -5521,7 +6234,10 @@ pub(crate) mod tests {
                 lossless = h.lossless.iter().all(|&l| l);
             }
         }
-        assert!(lossless, "{NAME} went blind: the pinned frame is not lossless");
+        assert!(
+            lossless,
+            "{NAME} went blind: the pinned frame is not lossless"
+        );
         let before = crate::decode::rect_split_lossless_chroma444_hits();
         let ours = decode_stream(&stream).expect("a 444 lossless key-frame stream decodes");
         assert_eq!(ours.len(), 1, "{NAME}: frame count");
@@ -5531,7 +6247,9 @@ pub(crate) mod tests {
              as 4x4 units at subsampling 0/0"
         );
         let refs = Command::new("ffmpeg")
-            .args(["-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv444p", "-"])
+            .args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv444p", "-",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -5542,7 +6260,11 @@ pub(crate) mod tests {
                 child.wait_with_output()
             })
             .expect("ffmpeg 444 decode failed");
-        assert!(refs.status.success(), "{}", String::from_utf8_lossy(&refs.stderr));
+        assert!(
+            refs.status.success(),
+            "{}",
+            String::from_utf8_lossy(&refs.stderr)
+        );
         let frame = &ours[0];
         let planes = [
             (&frame.y, frame.width * frame.height),
@@ -5552,7 +6274,11 @@ pub(crate) mod tests {
         let mut off = 0usize;
         for (plane, (g, len)) in planes.iter().enumerate() {
             let raw = &refs.stdout[off..off + len];
-            let bad = g.iter().zip(raw.iter()).filter(|&(&a, &b)| a != u16::from(b)).count();
+            let bad = g
+                .iter()
+                .zip(raw.iter())
+                .filter(|&(&a, &b)| a != u16::from(b))
+                .count();
             assert_eq!(bad, 0, "{NAME}: plane {plane}: {bad} samples differ");
             off += len;
         }
@@ -5592,9 +6318,18 @@ pub(crate) mod tests {
                 Pic {
                     width,
                     height,
-                    y: out.stdout[base..base + plane].iter().map(|&v| u16::from(v)).collect(),
-                    u: out.stdout[base + plane..base + 2 * plane].iter().map(|&v| u16::from(v)).collect(),
-                    v: out.stdout[base + 2 * plane..base + 3 * plane].iter().map(|&v| u16::from(v)).collect(),
+                    y: out.stdout[base..base + plane]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    u: out.stdout[base + plane..base + 2 * plane]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    v: out.stdout[base + 2 * plane..base + 3 * plane]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
                 }
             })
             .collect()
@@ -5641,9 +6376,8 @@ pub(crate) mod tests {
 
         let _guard = lock_gate_counters();
         let before = crate::decode::chroma_split_tx_hits();
-        let frames = decode_stream(&stream).unwrap_or_else(|e| {
-            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
-        });
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
         let hits = crate::decode::chroma_split_tx_hits();
         assert!(
             hits > before,
@@ -5685,12 +6419,22 @@ pub(crate) mod tests {
                     .zip(["y", "u", "v"])
                 {
                     let want = &ref_raw[base + off..base + off + W * H];
-                    let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
-                    assert_eq!(bad, 0, "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ");
+                    let bad = plane
+                        .iter()
+                        .zip(want)
+                        .filter(|&(&a, &b)| a as u8 != b)
+                        .count();
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ"
+                    );
                 }
             }
         } else {
-            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
         }
 
         // ffmpeg's decoder: same frames, full-resolution chroma.
@@ -5702,7 +6446,10 @@ pub(crate) mod tests {
                     .enumerate()
                 {
                     let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
-                    assert_eq!(bad, 0, "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ");
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ"
+                    );
                 }
             }
         } else {
@@ -5760,9 +6507,8 @@ pub(crate) mod tests {
         assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
 
         let _guard = lock_gate_counters();
-        let frames = decode_stream(&stream).unwrap_or_else(|e| {
-            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
-        });
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
         assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
         for f in &frames {
             assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
@@ -5798,7 +6544,11 @@ pub(crate) mod tests {
                     .zip(["y", "u", "v"])
                 {
                     let want = &ref_raw[base + off..base + off + W * H];
-                    let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                    let bad = plane
+                        .iter()
+                        .zip(want)
+                        .filter(|&(&a, &b)| a as u8 != b)
+                        .count();
                     assert_eq!(
                         bad, 0,
                         "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ \
@@ -5807,7 +6557,10 @@ pub(crate) mod tests {
                 }
             }
         } else {
-            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
         }
 
         // ffmpeg's decoder: same frames, full-resolution chroma.
@@ -5819,7 +6572,10 @@ pub(crate) mod tests {
                     .enumerate()
                 {
                     let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
-                    assert_eq!(bad, 0, "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ");
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ"
+                    );
                 }
             }
         } else {
@@ -5878,9 +6634,8 @@ pub(crate) mod tests {
         let _guard = lock_gate_counters();
         let before = crate::decode::intra_sb128_hits();
         let before_replay = crate::decode::sb128rect_chroma_replay_hits();
-        let frames = decode_stream(&stream).unwrap_or_else(|e| {
-            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
-        });
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
         let (horz, vert, _) = crate::decode::intra_sb128_hits();
         assert!(
             horz - before.0 + (vert - before.1) > 0,
@@ -5937,8 +6692,7 @@ pub(crate) mod tests {
 
         // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
         if aomdec_path().is_file() {
-            let dir =
-                std::env::temp_dir().join(format!("ec-av1-444sb-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("ec-av1-444sb-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
             let raw = dir.join("aomdec.raw");
@@ -5961,14 +6715,16 @@ pub(crate) mod tests {
             assert_eq!(ref_raw.len(), W * H * 3 * FRAMES, "{NAME}: aomdec raw size");
             for (i, f) in frames.iter().enumerate().take(3) {
                 let base = i * W * H * 3;
-                for ((plane, off), p) in
-                    [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
-                        .into_iter()
-                        .zip(["y", "u", "v"])
+                for ((plane, off), p) in [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
+                    .into_iter()
+                    .zip(["y", "u", "v"])
                 {
                     let want = &ref_raw[base + off..base + off + W * H];
-                    let bad =
-                        plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                    let bad = plane
+                        .iter()
+                        .zip(want)
+                        .filter(|&(&a, &b)| a as u8 != b)
+                        .count();
                     assert_eq!(
                         bad, 0,
                         "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ \
@@ -5977,7 +6733,10 @@ pub(crate) mod tests {
                 }
             }
         } else {
-            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
         }
 
         // ffmpeg's decoder: same frames, full-resolution chroma. Same
@@ -5985,10 +6744,9 @@ pub(crate) mod tests {
         if have_ffmpeg() {
             let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
             for (i, (got, want)) in frames.iter().zip(refs.iter()).enumerate().take(3) {
-                for (p, (g, r)) in
-                    [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
-                        .iter()
-                        .enumerate()
+                for (p, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                    .iter()
+                    .enumerate()
                 {
                     let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
                     assert_eq!(
@@ -6050,8 +6808,8 @@ pub(crate) mod tests {
         assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
 
         let _guard = lock_gate_counters();
-        let serial = decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{NAME}: serial decode failed: {e}"));
+        let serial =
+            decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: serial decode failed: {e}"));
         assert_eq!(serial.len(), FRAMES, "{NAME}: frame count");
 
         let pipe_before = crate::decode::pipeline_taken_frames();
@@ -6087,8 +6845,9 @@ pub(crate) mod tests {
         // frame -- including frame 2, the 128-root-rect inter frame the
         // r2 defect named.
         for (i, (s, p)) in serial.iter().zip(piped.iter()).enumerate() {
-            for (pl, (a, b)) in
-                [(&s.y, &p.y), (&s.u, &p.u), (&s.v, &p.v)].into_iter().enumerate()
+            for (pl, (a, b)) in [(&s.y, &p.y), (&s.u, &p.u), (&s.v, &p.v)]
+                .into_iter()
+                .enumerate()
             {
                 assert_eq!(
                     a, b,
@@ -6123,13 +6882,16 @@ pub(crate) mod tests {
             assert_eq!(ref_raw.len(), W * H * 3 * FRAMES, "{NAME}: aomdec raw size");
             for (i, f) in piped.iter().enumerate().take(2) {
                 let base = i * W * H * 3;
-                for ((plane, off), p) in
-                    [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
-                        .into_iter()
-                        .zip(["y", "u", "v"])
+                for ((plane, off), p) in [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
+                    .into_iter()
+                    .zip(["y", "u", "v"])
                 {
                     let want = &ref_raw[base + off..base + off + W * H];
-                    let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                    let bad = plane
+                        .iter()
+                        .zip(want)
+                        .filter(|&(&a, &b)| a as u8 != b)
+                        .count();
                     assert_eq!(
                         bad, 0,
                         "{NAME}: aomdec frame {i} plane {p} THROUGH THE PIPELINE: \
@@ -6138,15 +6900,17 @@ pub(crate) mod tests {
                 }
             }
         } else {
-            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
         }
         if have_ffmpeg() {
             let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
             for (i, (got, want)) in piped.iter().zip(refs.iter()).enumerate().take(2) {
-                for (p, (g, r)) in
-                    [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
-                        .iter()
-                        .enumerate()
+                for (p, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                    .iter()
+                    .enumerate()
                 {
                     let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
                     assert_eq!(
@@ -6203,9 +6967,8 @@ pub(crate) mod tests {
 
         let _guard = lock_gate_counters();
         let strips_before = decode::inter16_rect4_counters();
-        let frames = decode_stream(&stream).unwrap_or_else(|e| {
-            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
-        });
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
         let strips_after = decode::inter16_rect4_counters();
         assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
         for f in &frames {
@@ -6256,7 +7019,11 @@ pub(crate) mod tests {
                     .zip(["y", "u", "v"])
                 {
                     let want = &ref_raw[base + off..base + off + W * H];
-                    let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                    let bad = plane
+                        .iter()
+                        .zip(want)
+                        .filter(|&(&a, &b)| a as u8 != b)
+                        .count();
                     assert_eq!(
                         bad, 0,
                         "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ \
@@ -6265,7 +7032,10 @@ pub(crate) mod tests {
                 }
             }
         } else {
-            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
         }
     }
 
@@ -6335,8 +7105,8 @@ pub(crate) mod tests {
         const W: usize = 320;
         const H: usize = 256;
         const FRAMES: usize = 3;
-        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/444_leaf8_oob.obu");
+        let obu =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/444_leaf8_oob.obu");
         let stream = std::fs::read(&obu).unwrap_or_else(|e| {
             panic!(
                 "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
@@ -6349,9 +7119,8 @@ pub(crate) mod tests {
 
         let _guard = lock_gate_counters();
         crate::decode::reset_leaf8_intrabc_hits();
-        let frames = decode_stream(&stream).unwrap_or_else(|e| {
-            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
-        });
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
         assert!(
             crate::decode::leaf8_intrabc_hits() > 0,
             "{NAME}: gate is vacuous -- no intrabc 8x8 leaf was decoded, so the arm \
@@ -6391,7 +7160,10 @@ pub(crate) mod tests {
                 "{NAME}: aomdec raw fingerprint moved"
             );
         } else {
-            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
         }
     }
     /// lane-lossless128: a LOSSLESS key frame that codes a 128-axis
@@ -6457,7 +7229,8 @@ pub(crate) mod tests {
              arm never ran (class gate-blind-to-feature)"
         );
         assert_eq!(
-            after_replay.1, before_replay.1,
+            after_replay.1,
+            before_replay.1,
             "{NAME}: the tail replay stamped {} unit(s) over a height that was not the \
              unit's own luma height (4:2:2 spans leaked into an admitted stream)",
             after_replay.1 - before_replay.1
@@ -6501,31 +7274,51 @@ pub(crate) mod tests {
         let out = ff
             .args(["-v", "error", "-f", "lavfi", "-i"])
             .arg(format!("testsrc2=s={width}x{height}:r=25"))
-            .args(["-frames:v", "1", "-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-"])
+            .args([
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .expect("ffmpeg failed to run");
-        assert!(out.status.success(), "ffmpeg failed for testsrc2 {width}x{height}");
+        assert!(
+            out.status.success(),
+            "ffmpeg failed for testsrc2 {width}x{height}"
+        );
         let y4m = out.stdout;
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args(["--codec=av1", "--bit-depth=8", "--input-bit-depth=8"])
-            .args([
-                "--passes=1",
-                "--cpu-used=0",
-                "--lag-in-frames=0",
-                "--kf-max-dist=1",
-                "--limit=1",
-                "--threads=1",
-                "--tile-columns=0",
-                "--lossless=1",
-                "--sb-size=128",
-                "--enable-1to4-partitions=1",
-            ])
-            .args(extra)
-            .args(["--obu", "-o", "-", "-"]), &y4m);
-        assert!(out.status.success(), "aomenc failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = run_with_stdin(
+            Command::new(aomenc_path())
+                .args(["--codec=av1", "--bit-depth=8", "--input-bit-depth=8"])
+                .args([
+                    "--passes=1",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=1",
+                    "--limit=1",
+                    "--threads=1",
+                    "--tile-columns=0",
+                    "--lossless=1",
+                    "--sb-size=128",
+                    "--enable-1to4-partitions=1",
+                ])
+                .args(extra)
+                .args(["--obu", "-o", "-", "-"]),
+            &y4m,
+        );
+        assert!(
+            out.status.success(),
+            "aomenc failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         out.stdout
     }
 
@@ -6561,14 +7354,18 @@ pub(crate) mod tests {
         // overhanging 64x64 blocks and both desynced at byte 41120 pre-fix.
         let arms: [&[&str]; 2] = [
             &["--min-partition-size=4"],
-            &["--min-partition-size=4", "--enable-1to4-partitions=0", "--enable-rect-partitions=0"],
+            &[
+                "--min-partition-size=4",
+                "--enable-1to4-partitions=0",
+                "--enable-rect-partitions=0",
+            ],
         ];
         let mut clips_total = 0usize;
         for (arm, extra) in arms.iter().enumerate() {
             let stream = lossless_sb128_testsrc2(320, 240, extra);
             crate::decode::reset_loss64_hits();
-            let ours = decode_stream(&stream)
-                .unwrap_or_else(|e| panic!("{NAME}: arm {arm} decodes: {e}"));
+            let ours =
+                decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: arm {arm} decodes: {e}"));
             let clips = crate::decode::chroma_edge_tu_clip_hits();
             assert!(
                 clips > 0,
@@ -6578,12 +7375,19 @@ pub(crate) mod tests {
             clips_total += clips;
             let refs = ffmpeg_decode_sequence(&stream, 320, 240, 1);
             assert_eq!(ours.len(), 1, "{NAME}: arm {arm} frame count");
-            for (plane, (g, r)) in [(&ours[0].y, &refs[0].y), (&ours[0].u, &refs[0].u), (&ours[0].v, &refs[0].v)]
-                .iter()
-                .enumerate()
+            for (plane, (g, r)) in [
+                (&ours[0].y, &refs[0].y),
+                (&ours[0].u, &refs[0].u),
+                (&ours[0].v, &refs[0].v),
+            ]
+            .iter()
+            .enumerate()
             {
                 let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
-                assert_eq!(bad, 0, "{NAME}: arm {arm} plane {plane}: {bad} samples differ from ffmpeg");
+                assert_eq!(
+                    bad, 0,
+                    "{NAME}: arm {arm} plane {plane}: {bad} samples differ from ffmpeg"
+                );
             }
         }
         eprintln!("{NAME}: 2 arms full-frame exact, {clips_total} chroma units clipped");
@@ -6625,8 +7429,7 @@ pub(crate) mod tests {
         let stream = lossless_sb128_testsrc2(320, 242, &["--min-partition-size=4"]);
         crate::decode::reset_loss64_hits();
         crate::decode::reset_skipped_intrabc_chroma_arm_hits();
-        let ours = decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{NAME}: decodes: {e}"));
+        let ours = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: decodes: {e}"));
         let resets = crate::decode::skip_lossless_band_reset_hits();
         let intrabc_skips = crate::decode::skipped_intrabc_chroma_arm_hits();
         assert!(
@@ -6641,12 +7444,19 @@ pub(crate) mod tests {
         );
         let refs = ffmpeg_decode_sequence(&stream, 320, 242, 1);
         assert_eq!(ours.len(), 1, "{NAME}: frame count");
-        for (plane, (g, r)) in [(&ours[0].y, &refs[0].y), (&ours[0].u, &refs[0].u), (&ours[0].v, &refs[0].v)]
-            .iter()
-            .enumerate()
+        for (plane, (g, r)) in [
+            (&ours[0].y, &refs[0].y),
+            (&ours[0].u, &refs[0].u),
+            (&ours[0].v, &refs[0].v),
+        ]
+        .iter()
+        .enumerate()
         {
             let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
-            assert_eq!(bad, 0, "{NAME}: plane {plane}: {bad} samples differ from ffmpeg");
+            assert_eq!(
+                bad, 0,
+                "{NAME}: plane {plane}: {bad} samples differ from ffmpeg"
+            );
         }
         eprintln!(
             "{NAME}: full-frame exact, {resets} band resets, \
@@ -6702,8 +7512,10 @@ pub(crate) mod tests {
         crate::decode::reset_ibc444rect_hits();
         crate::decode::reset_skipped_intrabc_dv_copy_hits();
         let frames = decode_stream(&stream).unwrap_or_else(|e| {
-            panic!("{NAME}: the fixture must decode to completion (the leaf8 \
-                    chroma buffers were fixed upstream): {e}")
+            panic!(
+                "{NAME}: the fixture must decode to completion (the leaf8 \
+                    chroma buffers were fixed upstream): {e}"
+            )
         });
         assert_eq!(frames.len(), 1, "{NAME}: shown frame count");
         let luma = crate::decode::intrabc_rect8_lossless_luma_hits();
@@ -6749,11 +7561,17 @@ pub(crate) mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(ref_raw.len(), W * H * 3, "{NAME}: aomdec raw size");
             let f = &frames[0];
-            for (plane, off, p) in
-                [(&f.y, 0usize, "Y"), (&f.u, W * H, "U"), (&f.v, 2 * W * H, "V")]
-            {
+            for (plane, off, p) in [
+                (&f.y, 0usize, "Y"),
+                (&f.u, W * H, "U"),
+                (&f.v, 2 * W * H, "V"),
+            ] {
                 let want = &ref_raw[off..off + W * H];
-                let bad = plane.iter().zip(want).filter(|&(&a, &b)| a as u8 != b).count();
+                let bad = plane
+                    .iter()
+                    .zip(want)
+                    .filter(|&(&a, &b)| a as u8 != b)
+                    .count();
                 assert_eq!(
                     bad, 0,
                     "{NAME}: aomdec plane {p}: {bad} samples differ -- a \
@@ -6762,7 +7580,10 @@ pub(crate) mod tests {
                 );
             }
         } else {
-            eprintln!("SKIP {NAME} aomdec arm: no oracle aomdec at {}", aomdec_path().display());
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
         }
         eprintln!(
             "{NAME}: frame sample-exact vs oracle aomdec; {luma}+{chroma} rect \
@@ -6835,7 +7656,17 @@ pub(crate) mod tests {
             .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
             .arg(&src)
             .args(["-an", "-threads", "1", "-g", "12", "-c:v", "libaom-av1"])
-            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "35", "-f", "obu", "-"])
+            .args([
+                "-cpu-used",
+                "6",
+                "-b:v",
+                "0",
+                "-crf",
+                "35",
+                "-f",
+                "obu",
+                "-",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -7188,8 +8019,7 @@ pub(crate) mod tests {
         }
         let mut arm: Vec<&str> = vec!["--arnr-maxframes=0"];
         arm.extend_from_slice(args);
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args(&arm), &y4m);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&arm), &y4m);
         assert!(
             out.status.success(),
             "{name} HIDDEN-ARM: aomenc refused its own recipe plus --arnr-maxframes=0: {}",
@@ -7206,10 +8036,12 @@ pub(crate) mod tests {
                 eprintln!("{name} HIDDEN-ARM: skipped on a named refusal: {msg}");
                 None
             }
-            Ok(_) => Some(decode_all_frames_vs_oracle(&stream, &format!("{name}-arnr0"))),
+            Ok(_) => Some(decode_all_frames_vs_oracle(
+                &stream,
+                &format!("{name}-arnr0"),
+            )),
         }
     }
-
 
     /// The repo's first hidden-frame pixel gate. Every other aomenc gate
     /// here compares `decode_stream`'s output against `ffmpeg -f obu`, and
@@ -7242,11 +8074,28 @@ pub(crate) mod tests {
             let (width, height, frames) = (64usize, 64usize, 40usize);
             let duration = frames as f64 / 25.0;
             let source = format!("testsrc2=size={width}x{height}:duration={duration}:rate=25");
-            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix_fmt = if bit_depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                    "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-t",
+                    &duration.to_string(),
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -7260,8 +8109,8 @@ pub(crate) mod tests {
             );
             let depth_arg = format!("--bit-depth={bit_depth}");
             let input_depth_arg = format!("--input-bit-depth={bit_depth}");
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     // lane-defon r1: the repo's only gate that decodes hidden
                     // frames is also the only place a FORWARD KEYFRAME can be
                     // proven -- a KEY frame with `show_frame == 0`, which is
@@ -7320,7 +8169,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the {bit_depth}-bit fixture: {}",
@@ -7415,8 +8266,8 @@ pub(crate) mod tests {
             "ffmpeg refused to generate the y4m fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -7445,7 +8296,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m.stdout);
+            ]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -7557,8 +8410,8 @@ pub(crate) mod tests {
             "smptebars must render byte-identical across two runs"
         );
         let y4m = y4m_a;
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -7589,7 +8442,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m);
+            ]),
+            &y4m,
+        );
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -7650,18 +8505,30 @@ pub(crate) mod tests {
         }
         let (width, height) = (64usize, 64usize);
         for depth in [8usize, 10] {
-            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix_fmt = if depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let render = || {
                 Command::new("ffmpeg")
                     .args([
-                        "-v", "error",
-                        "-f", "lavfi",
-                        "-i", "smptebars=size=64x64:rate=25",
-                        "-vf", "hue=s=0",
-                        "-pix_fmt", pix_fmt,
-                        "-strict", "-1",
-                        "-t", "0.04",
-                        "-f", "yuv4mpegpipe",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "smptebars=size=64x64:rate=25",
+                        "-vf",
+                        "hue=s=0",
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-t",
+                        "0.04",
+                        "-f",
+                        "yuv4mpegpipe",
                         "-",
                     ])
                     .stdin(Stdio::null())
@@ -7680,40 +8547,43 @@ pub(crate) mod tests {
             let y4m = y4m_a;
             let depth_arg = format!("--bit-depth={depth}");
             let input_depth_arg = format!("--input-bit-depth={depth}");
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
-                    "--codec=av1",
-                    "--passes=1",
-                    "--end-usage=q",
-                    "--cq-level=30",
-                    "--cpu-used=0",
-                    "--threads=1",
-                    "--row-mt=0",
-                    "--sb-size=64",
-                    "--tune-content=screen",
-                    "--enable-palette=1",
-                    "--enable-intrabc=0",
-                    "--enable-rect-partitions=0",
-                    "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=0",
-                    "--min-partition-size=32",
-                    "--max-partition-size=32",
-                    "--enable-filter-intra=0",
-                    "--enable-smooth-intra=0",
-                    "--enable-paeth-intra=0",
-                    "--enable-directional-intra=0",
-                    "--enable-angle-delta=0",
-                    "--enable-cfl-intra=0",
-                    "--enable-cdef=0",
-                    "--enable-restoration=0",
-                    "--enable-tx-size-search=0",
-                    "--loopfilter-control=0",
-                    "--limit=1",
-                ])
-                // Per-arm overrides go AFTER the base recipe: aomenc keeps the
-                // LAST occurrence of a repeated flag.
-                .args([&depth_arg, &input_depth_arg])
-                .args(["--obu", "-o", "-", "-"]), &y4m);
+            let out = run_with_stdin(
+                Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cq-level=30",
+                        "--cpu-used=0",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        "--tune-content=screen",
+                        "--enable-palette=1",
+                        "--enable-intrabc=0",
+                        "--enable-rect-partitions=0",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--min-partition-size=32",
+                        "--max-partition-size=32",
+                        "--enable-filter-intra=0",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-cfl-intra=0",
+                        "--enable-cdef=0",
+                        "--enable-restoration=0",
+                        "--enable-tx-size-search=0",
+                        "--loopfilter-control=0",
+                        "--limit=1",
+                    ])
+                    // Per-arm overrides go AFTER the base recipe: aomenc keeps the
+                    // LAST occurrence of a repeated flag.
+                    .args([&depth_arg, &input_depth_arg])
+                    .args(["--obu", "-o", "-", "-"]),
+                &y4m,
+            );
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the {depth}-bit fixture: {}",
@@ -7734,7 +8604,10 @@ pub(crate) mod tests {
             } else {
                 ffmpeg_decode_sequence(&stream, width, height, 1)
             };
-            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma at {depth}-bit");
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma at {depth}-bit"
+            );
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U at {depth}-bit");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V at {depth}-bit");
         }
@@ -7785,14 +8658,30 @@ pub(crate) mod tests {
                     for txs in [0usize, 1] {
                         for tiles in [0usize, 1] {
                             let arm = format!("{src}-{depth}bit-cq{cq}-txs{txs}-tc{tiles}");
-                            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                            let pix_fmt = if depth == 10 {
+                                "yuv420p10le"
+                            } else {
+                                "yuv420p"
+                            };
                             let size = format!("{src}=size={width}x{height}:rate=25");
                             let render = || {
                                 let out = Command::new("ffmpeg")
                                     .args([
-                                        "-v", "error", "-f", "lavfi", "-i", &size, "-t", "0.04",
-                                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f",
-                                        "yuv4mpegpipe", "-",
+                                        "-v",
+                                        "error",
+                                        "-f",
+                                        "lavfi",
+                                        "-i",
+                                        &size,
+                                        "-t",
+                                        "0.04",
+                                        "-pix_fmt",
+                                        pix_fmt,
+                                        "-strict",
+                                        "-1",
+                                        "-f",
+                                        "yuv4mpegpipe",
+                                        "-",
                                     ])
                                     .stdin(Stdio::null())
                                     .stdout(Stdio::piped())
@@ -7814,29 +8703,38 @@ pub(crate) mod tests {
                             let cq_arg = format!("--cq-level={cq}");
                             let txs_arg = format!("--enable-tx-size-search={txs}");
                             let tiles_arg = format!("--tile-columns={tiles}");
-                            let out = run_with_stdin(Command::new(aomenc_path())
-                                .args([
-                                    "--codec=av1",
-                                    "--passes=1",
-                                    "--end-usage=q",
-                                    "--cpu-used=0",
-                                    "--threads=1",
-                                    "--row-mt=0",
-                                    "--lag-in-frames=0",
-                                    "--limit=1",
-                                    "--sb-size=64",
-                                    "--tune-content=screen",
-                                    "--enable-palette=1",
-                                    "--enable-intrabc=0",
-                                    "--min-partition-size=8",
-                                    "--enable-cdef=0",
-                                    "--enable-restoration=0",
-                                    "--loopfilter-control=0",
-                                ])
-                                // aomenc keeps the LAST occurrence of a repeated flag,
-                                // so per-arm overrides go after the base recipe.
-                                .args([&depth_arg, &input_depth_arg, &cq_arg, &txs_arg, &tiles_arg])
-                                .args(["--obu", "-o", "-", "-"]), &y4m);
+                            let out = run_with_stdin(
+                                Command::new(aomenc_path())
+                                    .args([
+                                        "--codec=av1",
+                                        "--passes=1",
+                                        "--end-usage=q",
+                                        "--cpu-used=0",
+                                        "--threads=1",
+                                        "--row-mt=0",
+                                        "--lag-in-frames=0",
+                                        "--limit=1",
+                                        "--sb-size=64",
+                                        "--tune-content=screen",
+                                        "--enable-palette=1",
+                                        "--enable-intrabc=0",
+                                        "--min-partition-size=8",
+                                        "--enable-cdef=0",
+                                        "--enable-restoration=0",
+                                        "--loopfilter-control=0",
+                                    ])
+                                    // aomenc keeps the LAST occurrence of a repeated flag,
+                                    // so per-arm overrides go after the base recipe.
+                                    .args([
+                                        &depth_arg,
+                                        &input_depth_arg,
+                                        &cq_arg,
+                                        &txs_arg,
+                                        &tiles_arg,
+                                    ])
+                                    .args(["--obu", "-o", "-", "-"]),
+                                &y4m,
+                            );
                             assert!(
                                 out.status.success(),
                                 "{NAME}: aomenc refused {arm}: {}",
@@ -7954,7 +8852,10 @@ pub(crate) mod tests {
             out_of_scope_mismatch, 0,
             "{NAME}: an out-of-scope arm mismatched ffmpeg -- a defect, never a skip"
         );
-        assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+        assert!(
+            frames_compared > 0,
+            "{NAME}: no frame was compared pixel-exact"
+        );
     }
 
     /// lane-kf900 r5, the gate for the rect-strip `use_intrabc` read.
@@ -8011,19 +8912,101 @@ pub(crate) mod tests {
             // Reconstruction is ported now, so the arm decodes pixel-exact and
             // the `rect_total` assert below keeps it from quietly falling back
             // to an ordinary-intra decode of the same block.
-            ("testsrc2-cq50-txs0", TS, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
-            ("smptebars-cq40-txs0", SB, &["--cq-level=40", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
-            ("smptebars-cq45-txs0", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
-            ("smptebars-cq45-txs1", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
-            ("smptebars-cq50-txs1", SB, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
-            ("smptebars-cq55-txs0", SB, &["--cq-level=55", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
-            ("testsrc2-cq63-txs1", TS, &["--cq-level=63", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
+            (
+                "testsrc2-cq50-txs0",
+                TS,
+                &[
+                    "--cq-level=50",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=0",
+                ],
+                false,
+                true,
+            ),
+            (
+                "smptebars-cq40-txs0",
+                SB,
+                &[
+                    "--cq-level=40",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=0",
+                ],
+                false,
+                false,
+            ),
+            (
+                "smptebars-cq45-txs0",
+                SB,
+                &[
+                    "--cq-level=45",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=0",
+                ],
+                false,
+                true,
+            ),
+            (
+                "smptebars-cq45-txs1",
+                SB,
+                &[
+                    "--cq-level=45",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=1",
+                ],
+                false,
+                false,
+            ),
+            (
+                "smptebars-cq50-txs1",
+                SB,
+                &[
+                    "--cq-level=50",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=1",
+                ],
+                false,
+                false,
+            ),
+            (
+                "smptebars-cq55-txs0",
+                SB,
+                &[
+                    "--cq-level=55",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=0",
+                ],
+                false,
+                false,
+            ),
+            (
+                "testsrc2-cq63-txs1",
+                TS,
+                &[
+                    "--cq-level=63",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=1",
+                ],
+                false,
+                false,
+            ),
             // lane-kf900 r7: the 8x8-LEAF intrabc arm. Rect and 1:4
             // partitions off (so no rect strip refuses first), palette on,
             // `TxMode::Largest`: aomenc puts exactly one `use_intrabc` block
             // on a `BLOCK_8X8` leaf here, the shape `decode_leaf8` decoded as
             // ordinary intra before this round.
-            ("testsrc2-cq55-leaf8", TS, &["--cq-level=55", "--enable-palette=1", "--enable-tx-size-search=0", "--enable-rect-partitions=0", "--enable-1to4-partitions=0"], false, false),
+            (
+                "testsrc2-cq55-leaf8",
+                TS,
+                &[
+                    "--cq-level=55",
+                    "--enable-palette=1",
+                    "--enable-tx-size-search=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-1to4-partitions=0",
+                ],
+                false,
+                false,
+            ),
         ];
         let (mut reads_total, mut refused, mut frames_compared) = (0usize, 0u32, 0usize);
         let (mut blocks_total, mut fired_arms, mut out_of_scope, mut out_of_scope_mismatch) =
@@ -8034,8 +9017,21 @@ pub(crate) mod tests {
             let render = || {
                 let out = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.2", "-pix_fmt",
-                        "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        *src,
+                        "-t",
+                        "0.2",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -8047,36 +9043,42 @@ pub(crate) mod tests {
             };
             let y4m_a = render();
             let y4m_b = render();
-            assert_eq!(y4m_a, y4m_b, "{NAME}: {arm} must render byte-identical across two runs");
+            assert_eq!(
+                y4m_a, y4m_b,
+                "{NAME}: {arm} must render byte-identical across two runs"
+            );
             let y4m = y4m_a;
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
-                    "--codec=av1",
-                    "--bit-depth=8",
-                    "--input-bit-depth=8",
-                    "--passes=1",
-                    "--end-usage=q",
-                    "--cpu-used=0",
-                    "--lag-in-frames=0",
-                    "--kf-max-dist=1",
-                    "--limit=1",
-                    "--threads=1",
-                    "--tile-columns=0",
-                    "--enable-rect-partitions=1",
-                    "--enable-1to4-partitions=1",
-                    "--min-partition-size=8",
-                    "--max-partition-size=32",
-                    "--sb-size=64",
-                    // `allow_screen_content_tools` (and with it the frame
-                    // header's `allow_intrabc` bit) comes from here.
-                    "--tune-content=screen",
-                    // Spelled so `gate_coverage` counts the tool as exercised
-                    // rather than defaulted (class `tool-disabled-in-every-gate`).
-                    "--enable-intrabc=1",
-                ])
-                // aomenc keeps the LAST occurrence of a repeated flag.
-                .args(*extra)
-                .args(["--obu", "-o", "-", "-"]), &y4m);
+            let out = run_with_stdin(
+                Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--bit-depth=8",
+                        "--input-bit-depth=8",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cpu-used=0",
+                        "--lag-in-frames=0",
+                        "--kf-max-dist=1",
+                        "--limit=1",
+                        "--threads=1",
+                        "--tile-columns=0",
+                        "--enable-rect-partitions=1",
+                        "--enable-1to4-partitions=1",
+                        "--min-partition-size=8",
+                        "--max-partition-size=32",
+                        "--sb-size=64",
+                        // `allow_screen_content_tools` (and with it the frame
+                        // header's `allow_intrabc` bit) comes from here.
+                        "--tune-content=screen",
+                        // Spelled so `gate_coverage` counts the tool as exercised
+                        // rather than defaulted (class `tool-disabled-in-every-gate`).
+                        "--enable-intrabc=1",
+                    ])
+                    // aomenc keeps the LAST occurrence of a repeated flag.
+                    .args(*extra)
+                    .args(["--obu", "-o", "-", "-"]),
+                &y4m,
+            );
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused {arm}: {}",
@@ -8123,8 +9125,13 @@ pub(crate) mod tests {
                          reconstruction is not ported, it must refuse by name"
                     );
                     assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
-                    let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
-                    assert_eq!(frames.len(), ffmpeg_frames.len(), "{NAME}: {arm} frame count");
+                    let ffmpeg_frames =
+                        ffmpeg_decode_sequence(&stream, width, height, frames.len());
+                    assert_eq!(
+                        frames.len(),
+                        ffmpeg_frames.len(),
+                        "{NAME}: {arm} frame count"
+                    );
                     // EVERY frame is compared; an arm whose decode never hit an
                     // intrabc block proves nothing about the DV/prediction path,
                     // so it is counted OUT OF SCOPE -- but a mismatch there is
@@ -8158,7 +9165,10 @@ pub(crate) mod tests {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    assert!(msg.contains("unsupported"), "{NAME}: {arm} decode failed: {e}");
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME}: {arm} decode failed: {e}"
+                    );
                     assert!(
                         *expect_refusal,
                         "{NAME}: {arm} was expected to decode, it refused: {e}"
@@ -8181,7 +9191,10 @@ pub(crate) mod tests {
         eprintln!(
             "{NAME}: {rect_total} intrabc block(s) on a HORZ/VERT rect strip              (decode_intrabc_rect)"
         );
-        assert!(reads_total > 0, "{NAME}: gate is vacuous -- no arm read the symbol");
+        assert!(
+            reads_total > 0,
+            "{NAME}: gate is vacuous -- no arm read the symbol"
+        );
         assert!(
             leaf8_total > 0,
             "{NAME}: no arm decoded an intrabc block at an 8x8 leaf -- lane-kf900 r7's fix              is untested"
@@ -8200,7 +9213,10 @@ pub(crate) mod tests {
         // still refuse by name, but no arm HERE reaches that shape; it stays
         // pinned by `refusal_inventory`'s own gate.
         assert_eq!(refused, 0, "{NAME}: an arm still refuses by name");
-        assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+        assert!(
+            frames_compared > 0,
+            "{NAME}: no frame was compared pixel-exact"
+        );
         assert_eq!(
             out_of_scope_mismatch, 0,
             "{NAME}: an arm without an intrabc block still mismatched ffmpeg"
@@ -8226,22 +9242,55 @@ pub(crate) mod tests {
         let (width, height) = (640usize, 480usize);
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x480:r=25", "-frames:v", "1",
-                "-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=640x480:r=25",
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .output()
             .expect("ffmpeg")
             .stdout;
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
-                "--codec=av1", "--bit-depth=8", "--input-bit-depth=8", "--passes=1",
-                "--end-usage=q", "--cpu-used=0", "--lag-in-frames=0", "--kf-max-dist=1",
-                "--limit=1", "--threads=1", "--tile-columns=0",
-                "--enable-rect-partitions=1", "--enable-1to4-partitions=1",
-                "--min-partition-size=4", "--max-partition-size=64", "--sb-size=64",
-                "--tune-content=screen", "--enable-intrabc=1", "--cq-level=60",
-                "--enable-palette=1", "--enable-tx-size-search=0", "--obu", "-o", "-", "-",
-            ]), &y4m);
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
+                "--codec=av1",
+                "--bit-depth=8",
+                "--input-bit-depth=8",
+                "--passes=1",
+                "--end-usage=q",
+                "--cpu-used=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=1",
+                "--limit=1",
+                "--threads=1",
+                "--tile-columns=0",
+                "--enable-rect-partitions=1",
+                "--enable-1to4-partitions=1",
+                "--min-partition-size=4",
+                "--max-partition-size=64",
+                "--sb-size=64",
+                "--tune-content=screen",
+                "--enable-intrabc=1",
+                "--cq-level=60",
+                "--enable-palette=1",
+                "--enable-tx-size-search=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]),
+            &y4m,
+        );
         assert!(out.status.success(), "{NAME}: aomenc failed");
         crate::decode::reset_rect4_16_pair_hits();
         let frames = decode_stream(&out.stdout).unwrap_or_else(|e| panic!("{NAME}: {e}"));
@@ -8274,19 +9323,46 @@ pub(crate) mod tests {
         let (width, height) = (320usize, 240usize);
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=25", "-frames:v", "1",
-                "-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:r=25",
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .output()
             .expect("ffmpeg")
             .stdout;
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
-                "--codec=av1", "--cpu-used=0", "--lossless=1", "--sb-size=128",
-                "--lag-in-frames=0", "--kf-max-dist=1", "--limit=1", "--threads=1",
-                "--passes=1", "--enable-1to4-partitions=1", "--min-partition-size=4",
-                "--enable-rect-partitions=1", "--obu", "-o", "-", "-",
-            ]), &y4m);
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
+                "--codec=av1",
+                "--cpu-used=0",
+                "--lossless=1",
+                "--sb-size=128",
+                "--lag-in-frames=0",
+                "--kf-max-dist=1",
+                "--limit=1",
+                "--threads=1",
+                "--passes=1",
+                "--enable-1to4-partitions=1",
+                "--min-partition-size=4",
+                "--enable-rect-partitions=1",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]),
+            &y4m,
+        );
         assert!(out.status.success(), "{NAME}: aomenc failed");
         crate::decode::reset_rect4_16_pair_hits();
         let frames = decode_stream(&out.stdout).unwrap_or_else(|e| panic!("{NAME}: {e}"));
@@ -8302,11 +9378,22 @@ pub(crate) mod tests {
             "{NAME}: luma rows 0-127 (the measured col-108 site) diverged"
         );
         let chroma_rows = 64 * (width / 2);
-        assert_eq!(&frames[0].u[..chroma_rows], &refs[0].u[..chroma_rows], "{NAME}: u");
-        assert_eq!(&frames[0].v[..chroma_rows], &refs[0].v[..chroma_rows], "{NAME}: v");
+        assert_eq!(
+            &frames[0].u[..chroma_rows],
+            &refs[0].u[..chroma_rows],
+            "{NAME}: u"
+        );
+        assert_eq!(
+            &frames[0].v[..chroma_rows],
+            &refs[0].v[..chroma_rows],
+            "{NAME}: v"
+        );
         // The col-108 byte specifically, so a shift of the old site still fails
         // even if some other prefix sample happens to match.
-        assert_eq!(frames[0].y[108], refs[0].y[108], "{NAME}: measured byte 108");
+        assert_eq!(
+            frames[0].y[108], refs[0].y[108],
+            "{NAME}: measured byte 108"
+        );
     }
     /// lane-av1-intrabc r4: the reviewer's unblock witness for the rect-strip
     /// reconstruction -- a CODED `use_intrabc` block (so its residual reader
@@ -8356,13 +9443,49 @@ pub(crate) mod tests {
         let arms: [(&str, &str, usize, usize, &[&str], u8, bool); 3] = [
             // HORZ (16x8) coded strip -- the shape the in-gate witness above
             // already reconstructs, pinned here with its own orientation counter.
-            ("horz-coded-256-cq45-pal0-txs0", TS256, 256, 192, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"], 0, false),
+            (
+                "horz-coded-256-cq45-pal0-txs0",
+                TS256,
+                256,
+                192,
+                &[
+                    "--cq-level=45",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=0",
+                ],
+                0,
+                false,
+            ),
             // VERT (8x16) coded strip AND the DV-predictor regression stream.
-            ("vert-coded-512-cq45-pal1-txs0", TS512, 512, 384, &["--cq-level=45", "--enable-palette=1", "--enable-tx-size-search=0"], 1, false),
+            (
+                "vert-coded-512-cq45-pal1-txs0",
+                TS512,
+                512,
+                384,
+                &[
+                    "--cq-level=45",
+                    "--enable-palette=1",
+                    "--enable-tx-size-search=0",
+                ],
+                1,
+                false,
+            ),
             // The `TX_MODE_SELECT` (stream A) shape: `--enable-tx-size-search=1`
             // makes the frame code `tx_mode == Select`, so the intrabc block's
             // transform size comes off the INTER var-tx tree.
-            ("txmode-select-256-cq45-pal0-txs1", TS256, 256, 192, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=1"], 0, true),
+            (
+                "txmode-select-256-cq45-pal0-txs1",
+                TS256,
+                256,
+                192,
+                &[
+                    "--cq-level=45",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=1",
+                ],
+                0,
+                true,
+            ),
         ];
         let mut coded_total = [0usize; 2];
         let mut frames_compared = 0usize;
@@ -8370,8 +9493,21 @@ pub(crate) mod tests {
             let render = || {
                 let out = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.2", "-pix_fmt",
-                        "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        *src,
+                        "-t",
+                        "0.2",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -8382,30 +9518,33 @@ pub(crate) mod tests {
                 out.stdout
             };
             let y4m = render();
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
-                    "--codec=av1",
-                    "--bit-depth=8",
-                    "--input-bit-depth=8",
-                    "--passes=1",
-                    "--end-usage=q",
-                    "--cpu-used=0",
-                    "--lag-in-frames=0",
-                    "--kf-max-dist=1",
-                    "--limit=1",
-                    "--threads=1",
-                    "--tile-columns=0",
-                    "--enable-rect-partitions=1",
-                    "--enable-1to4-partitions=1",
-                    "--min-partition-size=8",
-                    "--max-partition-size=32",
-                    "--sb-size=64",
-                    "--tune-content=screen",
-                    "--enable-intrabc=1",
-                ])
-                // aomenc keeps the LAST occurrence of a repeated flag.
-                .args(*extra)
-                .args(["--obu", "-o", "-", "-"]), &y4m);
+            let out = run_with_stdin(
+                Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--bit-depth=8",
+                        "--input-bit-depth=8",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cpu-used=0",
+                        "--lag-in-frames=0",
+                        "--kf-max-dist=1",
+                        "--limit=1",
+                        "--threads=1",
+                        "--tile-columns=0",
+                        "--enable-rect-partitions=1",
+                        "--enable-1to4-partitions=1",
+                        "--min-partition-size=8",
+                        "--max-partition-size=32",
+                        "--sb-size=64",
+                        "--tune-content=screen",
+                        "--enable-intrabc=1",
+                    ])
+                    // aomenc keeps the LAST occurrence of a repeated flag.
+                    .args(*extra)
+                    .args(["--obu", "-o", "-", "-"]),
+                &y4m,
+            );
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused {arm}: {}",
@@ -8422,8 +9561,8 @@ pub(crate) mod tests {
                 );
             }
             crate::decode::reset_intrabc_rect_hits();
-            let frames = decode_stream(&stream)
-                .unwrap_or_else(|e| panic!("{NAME}: {arm} refused: {e}"));
+            let frames =
+                decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {arm} refused: {e}"));
             assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
             let coded = crate::decode::intrabc_rect_coded_hits();
             coded_total[0] += coded[0];
@@ -8456,7 +9595,10 @@ pub(crate) mod tests {
             coded_total[0],
             coded_total[1]
         );
-        assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+        assert!(
+            frames_compared > 0,
+            "{NAME}: no frame was compared pixel-exact"
+        );
 
         // lane-av1-intrabc r5: the SKIPPED VERT 2:1 strip -- the arm the
         // reviewer's sweep panicked on (a skipped 8x32 strip passed a
@@ -8472,15 +9614,48 @@ pub(crate) mod tests {
         // process-wide knob.
         let _par_lock = lock_gate_counters();
         let skip_arms: [(&str, &str, usize, usize, &[&str]); 2] = [
-            ("vert-skip-512-cq30-pal0-txs0", TS512, 512, 384, &["--cq-level=30", "--enable-palette=0", "--enable-tx-size-search=0"]),
-            ("vert-skip-512-cq30-pal1-txs0", TS512, 512, 384, &["--cq-level=30", "--enable-palette=1", "--enable-tx-size-search=0"]),
+            (
+                "vert-skip-512-cq30-pal0-txs0",
+                TS512,
+                512,
+                384,
+                &[
+                    "--cq-level=30",
+                    "--enable-palette=0",
+                    "--enable-tx-size-search=0",
+                ],
+            ),
+            (
+                "vert-skip-512-cq30-pal1-txs0",
+                TS512,
+                512,
+                384,
+                &[
+                    "--cq-level=30",
+                    "--enable-palette=1",
+                    "--enable-tx-size-search=0",
+                ],
+            ),
         ];
         for (arm, src, width, height, extra) in &skip_arms {
             let y4m = {
                 let out = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.2", "-pix_fmt",
-                        "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        *src,
+                        "-t",
+                        "0.2",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -8490,18 +9665,33 @@ pub(crate) mod tests {
                 assert!(out.status.success(), "{NAME}: ffmpeg failed for {arm}");
                 out.stdout
             };
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
-                    "--codec=av1", "--bit-depth=8", "--input-bit-depth=8", "--passes=1",
-                    "--end-usage=q", "--cpu-used=0", "--lag-in-frames=0", "--kf-max-dist=1",
-                    "--limit=1", "--threads=1", "--tile-columns=0",
-                    "--enable-rect-partitions=1", "--enable-1to4-partitions=1",
-                    "--min-partition-size=8", "--max-partition-size=32", "--sb-size=64",
-                    "--tune-content=screen", "--enable-intrabc=1",
-                ])
-                // aomenc keeps the LAST occurrence of a repeated flag.
-                .args(*extra)
-                .args(["--obu", "-o", "-", "-"]), &y4m);
+            let out = run_with_stdin(
+                Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--bit-depth=8",
+                        "--input-bit-depth=8",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cpu-used=0",
+                        "--lag-in-frames=0",
+                        "--kf-max-dist=1",
+                        "--limit=1",
+                        "--threads=1",
+                        "--tile-columns=0",
+                        "--enable-rect-partitions=1",
+                        "--enable-1to4-partitions=1",
+                        "--min-partition-size=8",
+                        "--max-partition-size=32",
+                        "--sb-size=64",
+                        "--tune-content=screen",
+                        "--enable-intrabc=1",
+                    ])
+                    // aomenc keeps the LAST occurrence of a repeated flag.
+                    .args(*extra)
+                    .args(["--obu", "-o", "-", "-"]),
+                &y4m,
+            );
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused {arm}: {}",
@@ -8567,7 +9757,13 @@ pub(crate) mod tests {
     /// the content intra block copy exists for; `square_only` turns the rect
     /// and 1:4 partitions off so an intrabc block lands on a SQUARE block
     /// instead of stopping on the rect-strip intrabc refusal first.
-    fn screen_intrabc_stream(src: &str, cq: &str, txs: &str, tiled: bool, square_only: bool) -> Vec<u8> {
+    fn screen_intrabc_stream(
+        src: &str,
+        cq: &str,
+        txs: &str,
+        tiled: bool,
+        square_only: bool,
+    ) -> Vec<u8> {
         screen_intrabc_stream_with(src, cq, txs, tiled, square_only, &[])
     }
 
@@ -8600,14 +9796,26 @@ pub(crate) mod tests {
         extra: &[&str],
     ) -> Vec<u8> {
         assert!(depth == 8 || depth == 10, "unsupported bit depth {depth}");
-        let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+        let pix_fmt = if depth == 10 {
+            "yuv420p10le"
+        } else {
+            "yuv420p"
+        };
         let mut ff = Command::new("ffmpeg");
         ff.args(["-v", "error", "-f", "lavfi", "-i", src, "-t", "0.2"]);
         if tiled {
             ff.args(["-vf", "tile=2x2"]);
         }
         let out = ff
-            .args(["-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-"])
+            .args([
+                "-pix_fmt",
+                pix_fmt,
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -8615,34 +9823,43 @@ pub(crate) mod tests {
             .expect("ffmpeg failed to run");
         assert!(out.status.success(), "ffmpeg failed for {src}");
         let y4m = out.stdout;
-        let enc = run_with_stdin(Command::new(aomenc_path())
-            .args(["--codec=av1"])
-            .args([format!("--bit-depth={depth}"), format!("--input-bit-depth={depth}")])
-            .args([
-                "--passes=1",
-                "--end-usage=q",
-                "--cpu-used=0",
-                "--lag-in-frames=0",
-                "--kf-max-dist=1",
-                "--limit=1",
-                "--threads=1",
-                "--tile-columns=0",
-                "--min-partition-size=8",
-                "--max-partition-size=32",
-                "--sb-size=64",
-                "--tune-content=screen",
-                "--enable-intrabc=1",
-                "--enable-palette=0",
-            ])
-            .args([format!("--cq-level={cq}"), format!("--enable-tx-size-search={txs}")])
-            // aomenc keeps the LAST occurrence of a repeated flag.
-            .args(if square_only {
-                &["--enable-rect-partitions=0", "--enable-1to4-partitions=0"][..]
-            } else {
-                &[][..]
-            })
-            .args(extra)
-            .args(["--obu", "-o", "-", "-"]), &y4m);
+        let enc = run_with_stdin(
+            Command::new(aomenc_path())
+                .args(["--codec=av1"])
+                .args([
+                    format!("--bit-depth={depth}"),
+                    format!("--input-bit-depth={depth}"),
+                ])
+                .args([
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=1",
+                    "--limit=1",
+                    "--threads=1",
+                    "--tile-columns=0",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--sb-size=64",
+                    "--tune-content=screen",
+                    "--enable-intrabc=1",
+                    "--enable-palette=0",
+                ])
+                .args([
+                    format!("--cq-level={cq}"),
+                    format!("--enable-tx-size-search={txs}"),
+                ])
+                // aomenc keeps the LAST occurrence of a repeated flag.
+                .args(if square_only {
+                    &["--enable-rect-partitions=0", "--enable-1to4-partitions=0"][..]
+                } else {
+                    &[][..]
+                })
+                .args(extra)
+                .args(["--obu", "-o", "-", "-"]),
+            &y4m,
+        );
         assert!(
             enc.status.success(),
             "aomenc refused {src} cq={cq}: {}",
@@ -8749,9 +9966,7 @@ pub(crate) mod tests {
                     assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
                     for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
                         assert!(
-                            ours.y == ref_frame.y
-                                && ours.u == ref_frame.u
-                                && ours.v == ref_frame.v,
+                            ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
                             "{NAME}: {arm} frame {i} does not match ffmpeg"
                         );
                         frames_compared += 1;
@@ -8849,7 +10064,14 @@ pub(crate) mod tests {
                 "128+80*sin((X+3*N)/17)+50*sin(Y/29)+30*sin((X+Y)/13)",
                 false,
             ),
-            (3, 384, 320, "32", "128+90*sin((X+2*N)/37)+30*sin(Y/29)", true),
+            (
+                3,
+                384,
+                320,
+                "32",
+                "128+90*sin((X+2*N)/37)+30*sin(Y/29)",
+                true,
+            ),
         ];
         let mut engaged_arms = 0u32;
         let mut vert_arms = 0u32;
@@ -9011,12 +10233,15 @@ pub(crate) mod tests {
         let _guard = lock_gate_counters();
         crate::decode::reset_leaf8_intrabc_hits();
         crate::decode::reset_intrabc_tx4_chroma_copy_hits();
-        let frames = decode_stream(&stream).unwrap_or_else(|e| {
-            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
-        });
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
         assert_eq!(frames.len(), 1, "{NAME}: frame count");
         let frame = &frames[0];
-        assert_eq!((frame.width, frame.height), (640, 360), "{NAME}: dimensions");
+        assert_eq!(
+            (frame.width, frame.height),
+            (640, 360),
+            "{NAME}: dimensions"
+        );
 
         // Non-vacuity, both halves: the leaf shape must be reached at all,
         // and its chroma route must have consulted the ARMED slot (pre-r2
@@ -9073,7 +10298,11 @@ pub(crate) mod tests {
             raw.extend(plane.iter().map(|&s| s as u8));
         }
         assert_eq!(raw.len(), RAW_LEN, "{NAME}: raw size");
-        assert_eq!(fnv1a64(&raw), RAW_FNV, "{NAME}: full-frame fingerprint moved");
+        assert_eq!(
+            fnv1a64(&raw),
+            RAW_FNV,
+            "{NAME}: full-frame fingerprint moved"
+        );
     }
 
     /// lane-t900 r33, CENSUS for "a sub-8x8 leaf that uses intrabc".
@@ -9087,7 +10316,8 @@ pub(crate) mod tests {
     /// firing 0 times (class `gate-blind-to-feature`).
     #[test]
     fn a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal() {
-        const NAME: &str = "a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal";
+        const NAME: &str =
+            "a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal";
         if !have_ffmpeg() || !have_aomenc() {
             eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
             return;
@@ -9134,14 +10364,15 @@ pub(crate) mod tests {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    assert!(msg.contains("unsupported"), "{NAME}: {arm} decode failed: {e}");
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME}: {arm} decode failed: {e}"
+                    );
                     if msg.contains("a sub-8x8 leaf that uses intrabc") {
                         reached += 1;
                     }
                     sub8_total += crate::decode::sub8_split_hits() - sub8_before;
-                    eprintln!(
-                        "{NAME}: {arm} intrabc_frames={intrabc_frames} REFUSED: {e}"
-                    );
+                    eprintln!("{NAME}: {arm} intrabc_frames={intrabc_frames} REFUSED: {e}");
                 }
             }
         }
@@ -9208,7 +10439,10 @@ pub(crate) mod tests {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    assert!(msg.contains("unsupported"), "{NAME}: {arm} decode failed: {e}");
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME}: {arm} decode failed: {e}"
+                    );
                     vartx_total += crate::decode::intrabc_vartx_hits();
                     if msg.contains("mixed leaf transform sizes") {
                         reached += 1;
@@ -9259,7 +10493,8 @@ pub(crate) mod tests {
     /// tighten this gate to a full pixel-exact assert.
     #[test]
     fn a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal() {
-        const NAME: &str = "a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal";
+        const NAME: &str =
+            "a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal";
         if !have_ffmpeg() || !have_aomenc() {
             eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
             return;
@@ -9453,9 +10688,7 @@ pub(crate) mod tests {
                     assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
                     for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
                         assert!(
-                            ours.y == ref_frame.y
-                                && ours.u == ref_frame.u
-                                && ours.v == ref_frame.v,
+                            ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
                             "{NAME}: {arm} frame {i} does not match ffmpeg"
                         );
                         frames_compared += 1;
@@ -9468,7 +10701,10 @@ pub(crate) mod tests {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    assert!(msg.contains("unsupported"), "{NAME}: {arm} decode failed: {e}");
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME}: {arm} decode failed: {e}"
+                    );
                     if msg.contains("an intrabc block under TxMode::Select") {
                         refused_tx_select += 1;
                         assert!(
@@ -9507,7 +10743,10 @@ pub(crate) mod tests {
             "{NAME}: lane-t900 r32 lifted this refusal -- an intrabc block now reads the \
              INTER tx-size syntax, so no arm may reach it again"
         );
-        assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+        assert!(
+            frames_compared > 0,
+            "{NAME}: no frame was compared pixel-exact"
+        );
     }
 
     /// lane-t900 r31, the WAITING witness for the capability
@@ -9538,7 +10777,8 @@ pub(crate) mod tests {
         }
         let (width, height) = (256usize, 192usize);
         for cq in ["30", "45"] {
-            let stream = screen_intrabc_stream("smptebars=size=128x96:rate=25", cq, "1", true, true);
+            let stream =
+                screen_intrabc_stream("smptebars=size=128x96:rate=25", cq, "1", true, true);
             let (select, premise) = tx_select_and_intrabc_frames(&stream);
             assert!(
                 select > 0 && premise > 0,
@@ -9548,9 +10788,14 @@ pub(crate) mod tests {
             crate::decode::reset_intrabc_hits();
             crate::decode::reset_intrabc_vartx_hits();
             let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: cq={cq}: {e}"));
-            let (blocks, vartx) =
-                (crate::decode::intrabc_hits(), crate::decode::intrabc_vartx_hits());
-            assert!(blocks > 0, "{NAME}: cq={cq} no longer decodes an intrabc block");
+            let (blocks, vartx) = (
+                crate::decode::intrabc_hits(),
+                crate::decode::intrabc_vartx_hits(),
+            );
+            assert!(
+                blocks > 0,
+                "{NAME}: cq={cq} no longer decodes an intrabc block"
+            );
             // r31 recorded cq=45's intrabc blocks as ALL skip; that was read
             // off the desynced decode. With the tx-size read corrected both
             // arms carry unskipped ones (cq30 1 of 16, cq45 3 of 10), so both
@@ -9617,7 +10862,10 @@ pub(crate) mod tests {
             );
             headers += 1;
         }
-        assert!(headers >= 3, "{NAME}: only {headers} frame headers in the fixture");
+        assert!(
+            headers >= 3,
+            "{NAME}: only {headers} frame headers in the fixture"
+        );
         let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {e}"));
         let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
         assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
@@ -9683,14 +10931,42 @@ pub(crate) mod tests {
             "--enable-intrabc=1",
             "--enable-tx-size-search=1",
         ];
-        let cq40: Vec<&str> = screen_txs.iter().copied().chain(["--cq-level=40"]).collect();
-        let cq55: Vec<&str> = screen_txs.iter().copied().chain(["--cq-level=55"]).collect();
+        let cq40: Vec<&str> = screen_txs
+            .iter()
+            .copied()
+            .chain(["--cq-level=40"])
+            .collect();
+        let cq55: Vec<&str> = screen_txs
+            .iter()
+            .copied()
+            .chain(["--cq-level=55"])
+            .collect();
         let arms: [(&str, String, &[&str]); 5] = [
-            ("testsrc2-pinned", "testsrc2=s=256x192:r=25".to_string(), &[]),
-            ("testsrc2-screen", "testsrc2=s=256x192:r=25".to_string(), screen),
-            ("smptebars-screen", "smptebars=size=256x192:rate=25".to_string(), screen),
-            ("smptebars-screen-txs-cq40", "smptebars=size=256x192:rate=25".to_string(), &cq40),
-            ("smptebars-screen-txs-cq55", "smptebars=size=256x192:rate=25".to_string(), &cq55),
+            (
+                "testsrc2-pinned",
+                "testsrc2=s=256x192:r=25".to_string(),
+                &[],
+            ),
+            (
+                "testsrc2-screen",
+                "testsrc2=s=256x192:r=25".to_string(),
+                screen,
+            ),
+            (
+                "smptebars-screen",
+                "smptebars=size=256x192:rate=25".to_string(),
+                screen,
+            ),
+            (
+                "smptebars-screen-txs-cq40",
+                "smptebars=size=256x192:rate=25".to_string(),
+                &cq40,
+            ),
+            (
+                "smptebars-screen-txs-cq55",
+                "smptebars=size=256x192:rate=25".to_string(),
+                &cq55,
+            ),
         ];
         let (mut fired_arms, mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32, 0u32);
         let mut refused = 0u32;
@@ -9698,12 +10974,29 @@ pub(crate) mod tests {
         let mut frames_compared = 0usize;
         for (arm, src, extra) in &arms {
             for depth in [8usize, 10] {
-                let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let render = || {
                     let out = Command::new("ffmpeg")
                         .args([
-                            "-v", "error", "-f", "lavfi", "-i", src.as_str(), "-t", "0.2",
-                            "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                            "-v",
+                            "error",
+                            "-f",
+                            "lavfi",
+                            "-i",
+                            src.as_str(),
+                            "-t",
+                            "0.2",
+                            "-pix_fmt",
+                            pix_fmt,
+                            "-strict",
+                            "-1",
+                            "-f",
+                            "yuv4mpegpipe",
+                            "-",
                         ])
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
@@ -9722,35 +11015,42 @@ pub(crate) mod tests {
                 let y4m = y4m_a;
                 let depth_arg = format!("--bit-depth={depth}");
                 let in_depth_arg = format!("--input-bit-depth={depth}");
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(["--codec=av1"])
-                    .args([&depth_arg, &in_depth_arg])
-                    .args([
-                        "--passes=1",
-                        "--end-usage=q",
-                        "--cq-level=59",
-                        "--cpu-used=0",
-                        "--lag-in-frames=0",
-                        "--kf-max-dist=1",
-                        "--limit=1",
-                        "--threads=1",
-                        "--tile-columns=0",
-                        "--enable-tx-size-search=1",
-                        "--min-partition-size=8",
-                        "--enable-rect-partitions=1",
-                    ])
-                    // Per-arm overrides go AFTER the base recipe: aomenc keeps
-                    // the LAST occurrence of a repeated flag.
-                    .args(*extra)
-                    // The 8-bit twin of the pinned recipe picks a 128-root
-                    // HORZ partition, which this decoder still refuses by name
-                    // ("a 128x128 superblock HORZ/VERT or AB partition") --
-                    // an open refusal of another lane, unrelated to palette.
-                    // Pinning the superblock to 64 keeps the 8-bit arm on the
-                    // shape this gate is about; the 10-bit arms are the
-                    // untouched pinned recipe.
-                    .args(if depth == 8 { &["--sb-size=64"][..] } else { &[][..] })
-                    .args(["--obu", "-o", "-", "-"]), &y4m);
+                let out = run_with_stdin(
+                    Command::new(aomenc_path())
+                        .args(["--codec=av1"])
+                        .args([&depth_arg, &in_depth_arg])
+                        .args([
+                            "--passes=1",
+                            "--end-usage=q",
+                            "--cq-level=59",
+                            "--cpu-used=0",
+                            "--lag-in-frames=0",
+                            "--kf-max-dist=1",
+                            "--limit=1",
+                            "--threads=1",
+                            "--tile-columns=0",
+                            "--enable-tx-size-search=1",
+                            "--min-partition-size=8",
+                            "--enable-rect-partitions=1",
+                        ])
+                        // Per-arm overrides go AFTER the base recipe: aomenc keeps
+                        // the LAST occurrence of a repeated flag.
+                        .args(*extra)
+                        // The 8-bit twin of the pinned recipe picks a 128-root
+                        // HORZ partition, which this decoder still refuses by name
+                        // ("a 128x128 superblock HORZ/VERT or AB partition") --
+                        // an open refusal of another lane, unrelated to palette.
+                        // Pinning the superblock to 64 keeps the 8-bit arm on the
+                        // shape this gate is about; the 10-bit arms are the
+                        // untouched pinned recipe.
+                        .args(if depth == 8 {
+                            &["--sb-size=64"][..]
+                        } else {
+                            &[][..]
+                        })
+                        .args(["--obu", "-o", "-", "-"]),
+                    &y4m,
+                );
                 assert!(
                     out.status.success(),
                     "{NAME}: aomenc refused {arm} at {depth}-bit: {}",
@@ -9782,7 +11082,10 @@ pub(crate) mod tests {
                     ffmpeg_frames.len(),
                     "{NAME}: {arm} at {depth}-bit -- frame count"
                 );
-                assert!(!frames.is_empty(), "{NAME}: {arm} at {depth}-bit decoded no frame");
+                assert!(
+                    !frames.is_empty(),
+                    "{NAME}: {arm} at {depth}-bit decoded no frame"
+                );
                 // EVERY decode-order frame, all three planes.
                 let mut exact = true;
                 for (i, (ours, theirs)) in frames.iter().zip(ffmpeg_frames.iter()).enumerate() {
@@ -9879,9 +11182,16 @@ pub(crate) mod tests {
                 for i in 0..W as i64 {
                     let g = (i * 190) / W as i64 + (j * 150) / H as i64;
                     let mut v = (g * 12
-                        + if (i * 5 + j * 3 + t as i64) % 7 < 3 { 90 } else { 220 }
-                        + if (60..110).contains(&i) && (70..110).contains(&j) { 640 } else { 0 })
-                        as f64;
+                        + if (i * 5 + j * 3 + t as i64) % 7 < 3 {
+                            90
+                        } else {
+                            220
+                        }
+                        + if (60..110).contains(&i) && (70..110).contains(&j) {
+                            640
+                        } else {
+                            0
+                        }) as f64;
                     let c = cov(ax, bx, i) * cov(ay, by, j);
                     if c > 0.0 {
                         v = v * (1.0 - c) + 3500.0 * c;
@@ -10005,18 +11315,34 @@ pub(crate) mod tests {
             let obu = probe.parse_obu(&stream[pos..]).unwrap();
             pos += obu.total_size;
         }
-        let seq = probe.sequence_header().expect("stream has a sequence header OBU");
+        let seq = probe
+            .sequence_header()
+            .expect("stream has a sequence header OBU");
         assert_eq!(
             seq.color_config.bit_depth, 12,
             "{name}: aomenc did not actually write a 12-bit sequence header"
         );
     }
 
-    fn ffmpeg_decode_sequence_12bit(stream: &[u8], width: usize, height: usize, frames: usize) -> Vec<Pic> {
+    fn ffmpeg_decode_sequence_12bit(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Pic> {
         let out = run_with_stdin(
             Command::new("ffmpeg").args([
-                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt",
-                "yuv420p12le", "-",
+                "-v",
+                "error",
+                "-f",
+                "obu",
+                "-i",
+                "-",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p12le",
+                "-",
             ]),
             stream,
         );
@@ -10079,10 +11405,10 @@ pub(crate) mod tests {
         );
         assert_12bit_sequence_header(&stream, NAME);
         let before_cdef = decode::cdef_idx_hits();
-        let before_lr =
-            crate::restoration::wiener_hits() + crate::restoration::sgrproj_hits();
-        let frames = decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{NAME}: decode_stream refused a real 12-bit key frame: {e}"));
+        let before_lr = crate::restoration::wiener_hits() + crate::restoration::sgrproj_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: decode_stream refused a real 12-bit key frame: {e}")
+        });
         assert_eq!(frames.len(), 1);
         assert!(
             decode::cdef_idx_hits() > before_cdef,
@@ -10093,7 +11419,10 @@ pub(crate) mod tests {
             "{NAME}: no loop restoration unit was decoded -- LR is not exercised"
         );
         let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 1);
-        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg (12-bit key)");
+        assert_eq!(
+            frames[0].y, ffmpeg_frames[0].y,
+            "luma vs ffmpeg (12-bit key)"
+        );
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (12-bit key)");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (12-bit key)");
     }
@@ -10127,8 +11456,9 @@ pub(crate) mod tests {
         assert_12bit_sequence_header(&stream, NAME);
         let before_subpel = crate::mc::mc_subpel_hits();
         let before_compound = decode::compound_mode_hits();
-        let frames = decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{NAME}: decode_stream refused a real 12-bit inter stream: {e}"));
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: decode_stream refused a real 12-bit inter stream: {e}")
+        });
         assert_eq!(frames.len(), 2);
         assert!(
             crate::mc::mc_subpel_hits() > before_subpel,
@@ -10141,7 +11471,10 @@ pub(crate) mod tests {
         );
         let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 2);
         for (i, (ours, reference)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-            assert_eq!(ours.y, reference.y, "frame {i} luma vs ffmpeg (12-bit inter)");
+            assert_eq!(
+                ours.y, reference.y,
+                "frame {i} luma vs ffmpeg (12-bit inter)"
+            );
             assert_eq!(ours.u, reference.u, "frame {i} U vs ffmpeg (12-bit inter)");
             assert_eq!(ours.v, reference.v, "frame {i} V vs ffmpeg (12-bit inter)");
         }
@@ -10205,7 +11538,10 @@ pub(crate) mod tests {
         );
         let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 6);
         for (i, (ours, reference)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-            assert_eq!(ours.y, reference.y, "frame {i} luma vs ffmpeg (12-bit warp)");
+            assert_eq!(
+                ours.y, reference.y,
+                "frame {i} luma vs ffmpeg (12-bit warp)"
+            );
             assert_eq!(ours.u, reference.u, "frame {i} U vs ffmpeg (12-bit warp)");
             assert_eq!(ours.v, reference.v, "frame {i} V vs ffmpeg (12-bit warp)");
         }
@@ -10237,7 +11573,10 @@ pub(crate) mod tests {
         let y4m = y4m_12bit_subpel_source(6);
         for (arm, extra) in [
             ("dist-wtd", &["--enable-warped-motion=0"][..]),
-            ("plain-masked", &["--enable-warped-motion=0", "--enable-dist-wtd-comp=0"][..]),
+            (
+                "plain-masked",
+                &["--enable-warped-motion=0", "--enable-dist-wtd-comp=0"][..],
+            ),
         ] {
             let stream = encode_12bit(&y4m, 6, &extra);
             assert_12bit_sequence_header(&stream, NAME);
@@ -10258,12 +11597,24 @@ pub(crate) mod tests {
             eprintln!(
                 "{NAME} [{arm}]: compound blocks={comp} masked={masked} diffwtd={diffwtd} wedge={wedge}"
             );
-            assert!(comp > 0, "{NAME} [{arm}]: no compound mode symbol was read -- the compound path is unexercised");
-            assert!(masked > 0, "{NAME} [{arm}]: no masked compound block ran -- the masked combine is unexercised");
-            assert!(diffwtd > 0, "{NAME} [{arm}]: no diffwtd blend ran -- the diffwtd combine is unexercised");
+            assert!(
+                comp > 0,
+                "{NAME} [{arm}]: no compound mode symbol was read -- the compound path is unexercised"
+            );
+            assert!(
+                masked > 0,
+                "{NAME} [{arm}]: no masked compound block ran -- the masked combine is unexercised"
+            );
+            assert!(
+                diffwtd > 0,
+                "{NAME} [{arm}]: no diffwtd blend ran -- the diffwtd combine is unexercised"
+            );
             let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 6);
             for (i, (ours, reference)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(ours.y, reference.y, "{NAME} [{arm}] frame {i} luma vs ffmpeg");
+                assert_eq!(
+                    ours.y, reference.y,
+                    "{NAME} [{arm}] frame {i} luma vs ffmpeg"
+                );
                 assert_eq!(ours.u, reference.u, "{NAME} [{arm}] frame {i} U vs ffmpeg");
                 assert_eq!(ours.v, reference.v, "{NAME} [{arm}] frame {i} V vs ffmpeg");
             }
@@ -10345,8 +11696,9 @@ pub(crate) mod tests {
         }
         assert_eq!(grain_frames, 2, "{NAME}: expected grain on both frames");
         let before = crate::film_grain::grain_hits();
-        let frames = decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{NAME}: decode_stream refused a real 12-bit grain stream: {e}"));
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: decode_stream refused a real 12-bit grain stream: {e}")
+        });
         assert_eq!(frames.len(), 2);
         assert!(
             crate::film_grain::grain_hits() > before,
@@ -10354,11 +11706,23 @@ pub(crate) mod tests {
         );
         let ffmpeg_frames = ffmpeg_decode_sequence_12bit(&stream, 160, 128, 2);
         for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-            assert_eq!(ours.y, theirs.y, "{NAME}: luma vs ffmpeg (12-bit grain, frame {i})");
-            assert_eq!(ours.u, theirs.u, "{NAME}: U vs ffmpeg (12-bit grain, frame {i})");
-            assert_eq!(ours.v, theirs.v, "{NAME}: V vs ffmpeg (12-bit grain, frame {i})");
+            assert_eq!(
+                ours.y, theirs.y,
+                "{NAME}: luma vs ffmpeg (12-bit grain, frame {i})"
+            );
+            assert_eq!(
+                ours.u, theirs.u,
+                "{NAME}: U vs ffmpeg (12-bit grain, frame {i})"
+            );
+            assert_eq!(
+                ours.v, theirs.v,
+                "{NAME}: V vs ffmpeg (12-bit grain, frame {i})"
+            );
         }
-        eprintln!("{NAME}: byte-exact, grain_hits={}", crate::film_grain::grain_hits());
+        eprintln!(
+            "{NAME}: byte-exact, grain_hits={}",
+            crate::film_grain::grain_hits()
+        );
     }
 
     /// The 12-bit screen-content refusal: a real `--tune-content=screen
@@ -10379,9 +11743,21 @@ pub(crate) mod tests {
         }
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", "smptebars=s=128x128:r=25",
-                "-pix_fmt", "yuv420p12le", "-strict", "-1", "-frames:v", "2",
-                "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "smptebars=s=128x128:r=25",
+                "-pix_fmt",
+                "yuv420p12le",
+                "-strict",
+                "-1",
+                "-frames:v",
+                "2",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -10396,7 +11772,11 @@ pub(crate) mod tests {
         let stream = encode_12bit(
             &y4m.stdout,
             1,
-            &["--tune-content=screen", "--enable-palette=1", "--enable-intrabc=1"],
+            &[
+                "--tune-content=screen",
+                "--enable-palette=1",
+                "--enable-intrabc=1",
+            ],
         );
         let err = decode_stream(&stream).unwrap_err().to_string();
         assert!(
@@ -10447,8 +11827,8 @@ pub(crate) mod tests {
             "ffmpeg failed to render the 10-bit fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -10464,7 +11844,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m.stdout);
+            ]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "aomenc refused the 10-bit fixture: {}",
@@ -10543,8 +11925,8 @@ pub(crate) mod tests {
             "ffmpeg failed to render the 10-bit fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                 // occurrence, so overrides go before the base list).
                 "--loopfilter-control=1",
@@ -10586,7 +11968,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m.stdout);
+            ]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "aomenc refused the 10-bit fixture: {}",
@@ -10738,7 +12122,10 @@ pub(crate) mod tests {
         assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
-        eprintln!("{NAME}: pixel-exact, grain_hits={}", crate::film_grain::grain_hits());
+        eprintln!(
+            "{NAME}: pixel-exact, grain_hits={}",
+            crate::film_grain::grain_hits()
+        );
     }
 
     /// lane-t900 r29: `fixtures/superres_kf_cdef_lr_64x64.obu` is a real
@@ -10857,9 +12244,18 @@ pub(crate) mod tests {
             assert!(!one.is_empty(), "{NAME}: {fixture} decoded nothing");
             assert_eq!(one.len(), four.len(), "{NAME}: {fixture} frame count");
             for (i, (a, b)) in one.iter().zip(four.iter()).enumerate() {
-                assert_eq!(a.y, b.y, "{NAME}: {fixture} frame {i} luma differs at 4 recon threads");
-                assert_eq!(a.u, b.u, "{NAME}: {fixture} frame {i} U differs at 4 recon threads");
-                assert_eq!(a.v, b.v, "{NAME}: {fixture} frame {i} V differs at 4 recon threads");
+                assert_eq!(
+                    a.y, b.y,
+                    "{NAME}: {fixture} frame {i} luma differs at 4 recon threads"
+                );
+                assert_eq!(
+                    a.u, b.u,
+                    "{NAME}: {fixture} frame {i} U differs at 4 recon threads"
+                );
+                assert_eq!(
+                    a.v, b.v,
+                    "{NAME}: {fixture} frame {i} V differs at 4 recon threads"
+                );
             }
         }
     }
@@ -10900,7 +12296,11 @@ pub(crate) mod tests {
         }
         crate::par::set_filter_threads(1);
         crate::par::set_recon_threads(1);
-        assert!(frames[0] > 1, "{NAME}: the fixture decoded {} frames, so nothing was threaded", frames[0]);
+        assert!(
+            frames[0] > 1,
+            "{NAME}: the fixture decoded {} frames, so nothing was threaded",
+            frames[0]
+        );
         // 4 frame workers x (recon 2 + filter 4) plus the two in-flight
         // slots `stream.rs` allows over the thread count, with room for the
         // show jobs -- 1038 was three orders past this.
@@ -10915,7 +12315,8 @@ pub(crate) mod tests {
         assert!(
             counts[1] <= counts[0] + 4,
             "{NAME}: a second decode of the same stream grew the pool from {} to {} threads",
-            counts[0], counts[1]
+            counts[0],
+            counts[1]
         );
     }
 
@@ -10956,19 +12357,37 @@ pub(crate) mod tests {
                 }
             };
             crate::par::set_filter_threads(1);
-            assert!(after.0 > before.0, "{NAME}: {fixture} deblocked no edge at all");
+            assert!(
+                after.0 > before.0,
+                "{NAME}: {fixture} deblocked no edge at all"
+            );
             if wants_lr {
-                assert!(after.1 > before.1, "{NAME}: {fixture} ran no restoration unit");
+                assert!(
+                    after.1 > before.1,
+                    "{NAME}: {fixture} ran no restoration unit"
+                );
             }
             if wants_grain {
-                assert!(after.2 > before.2, "{NAME}: {fixture} applied no film grain");
+                assert!(
+                    after.2 > before.2,
+                    "{NAME}: {fixture} applied no film grain"
+                );
             }
             assert_eq!(one.len(), four.len(), "{NAME}: {fixture} frame count");
             assert!(!one.is_empty(), "{NAME}: {fixture} decoded nothing");
             for (i, (a, b)) in one.iter().zip(four.iter()).enumerate() {
-                assert_eq!(a.y, b.y, "{NAME}: {fixture} frame {i} luma differs at 4 filter threads");
-                assert_eq!(a.u, b.u, "{NAME}: {fixture} frame {i} U differs at 4 filter threads");
-                assert_eq!(a.v, b.v, "{NAME}: {fixture} frame {i} V differs at 4 filter threads");
+                assert_eq!(
+                    a.y, b.y,
+                    "{NAME}: {fixture} frame {i} luma differs at 4 filter threads"
+                );
+                assert_eq!(
+                    a.u, b.u,
+                    "{NAME}: {fixture} frame {i} U differs at 4 filter threads"
+                );
+                assert_eq!(
+                    a.v, b.v,
+                    "{NAME}: {fixture} frame {i} V differs at 4 filter threads"
+                );
             }
         }
     }
@@ -11044,8 +12463,8 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/hg_head_key_frame.obu");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/hg_head_key_frame.obu");
         let stream = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
         let (width, height) = (3840usize, 1608usize);
@@ -11181,7 +12600,7 @@ pub(crate) mod tests {
     /// `EC_PREDOUT`), so this gate pins what is proven and no more.
     #[test]
     fn a_10bit_key_frame_with_skipped_8x8_intra_leaves_that_split_their_transform_decodes_luma_exact()
-    {
+     {
         const NAME: &str = "a_10bit_key_frame_with_skipped_8x8_intra_leaves_that_split_their_transform_decodes_luma_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -11481,7 +12900,10 @@ pub(crate) mod tests {
                 ("filter_intra_hits", decode::filter_intra_hits),
                 ("smooth_pred_hits", crate::intra::smooth_pred_hits),
                 ("paeth_pred_hits", crate::intra::paeth_pred_hits),
-                ("intra_edge_filter_hits", crate::intra::intra_edge_filter_hits),
+                (
+                    "intra_edge_filter_hits",
+                    crate::intra::intra_edge_filter_hits,
+                ),
             ],
         );
     }
@@ -11552,7 +12974,9 @@ pub(crate) mod tests {
     /// out of this gate rather than papered over, and reported as open.
     const OBMC_PAIR_SEEDS: [u32; 5] = [43, 46, 47, 65, 66];
 
-    const LR_SEEDS: [u32; 16] = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+    const LR_SEEDS: [u32; 16] = [
+        42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
+    ];
 
     /// Wiener + SGR + switchable loop-restoration firings, summed.
     fn ten_bit_lr_hits() -> usize {
@@ -11589,8 +13013,11 @@ pub(crate) mod tests {
         // own `--sb-size=64` (aomenc keeps the LAST occurrence of a repeated
         // flag, measured 2026-09-02); `--max-partition-size=32` keeps the 128
         // root on SPLIT, the only 128-root partition decoded today.
-        for (width, height, cq) in [(256usize, 152usize, "15"), (384, 216, "15"), (256, 152, "25")]
-        {
+        for (width, height, cq) in [
+            (256usize, 152usize, "15"),
+            (384, 216, "15"),
+            (256, 152, "25"),
+        ] {
             ten_bit_tool_gate(
                 &format!("{NAME} {width}x{height} cq{cq}"),
                 width,
@@ -11621,7 +13048,10 @@ pub(crate) mod tests {
                 &[
                     ("lr_hits", ten_bit_lr_hits),
                     ("lr_stripe0_hits", crate::restoration::lr_stripe0_hits),
-                    ("lr_last_stripe_hits", crate::restoration::lr_last_stripe_hits),
+                    (
+                        "lr_last_stripe_hits",
+                        crate::restoration::lr_last_stripe_hits,
+                    ),
                 ],
             );
         }
@@ -11703,7 +13133,8 @@ pub(crate) mod tests {
     /// next to an OBMC block cannot stand in for it.
     #[test]
     fn a_real_aomenc_10bit_obmc_over_1to4_strip_neighbours_decodes_pixel_exact() {
-        const NAME: &str = "a_real_aomenc_10bit_obmc_over_1to4_strip_neighbours_decodes_pixel_exact";
+        const NAME: &str =
+            "a_real_aomenc_10bit_obmc_over_1to4_strip_neighbours_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -11858,8 +13289,7 @@ pub(crate) mod tests {
         ]);
         args.extend_from_slice(extra);
         args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args(&args), &y4m.stdout);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
         assert!(
             out.status.success(),
             "{name}: aomenc refused the 10-bit fixture: {}",
@@ -11922,8 +13352,8 @@ pub(crate) mod tests {
             "testsrc2 must render byte-identical across two runs"
         );
         let y4m = y4m_a;
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -11949,7 +13379,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m);
+            ]),
+            &y4m,
+        );
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -12016,8 +13448,19 @@ pub(crate) mod tests {
                     let source = format!("{src_name}=size={width}x{height}:rate=25");
                     let y4m = Command::new("ffmpeg")
                         .args([
-                            "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p",
-                            "-t", "0.04", "-f", "yuv4mpegpipe", "-",
+                            "-v",
+                            "error",
+                            "-f",
+                            "lavfi",
+                            "-i",
+                            &source,
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-t",
+                            "0.04",
+                            "-f",
+                            "yuv4mpegpipe",
+                            "-",
                         ])
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
@@ -12030,8 +13473,8 @@ pub(crate) mod tests {
                         String::from_utf8_lossy(&y4m.stderr)
                     );
                     let cq_arg = format!("--cq-level={cq}");
-                    let out = run_with_stdin(Command::new(aomenc_path())
-                        .args([
+                    let out = run_with_stdin(
+                        Command::new(aomenc_path()).args([
                             "--codec=av1",
                             "--passes=1",
                             "--end-usage=q",
@@ -12047,7 +13490,9 @@ pub(crate) mod tests {
                             "-o",
                             "-",
                             "-",
-                        ]), &y4m.stdout);
+                        ]),
+                        &y4m.stdout,
+                    );
                     assert!(
                         out.status.success(),
                         "aomenc refused the fixture ({source} cq={cq}): {}",
@@ -12085,9 +13530,11 @@ pub(crate) mod tests {
                     }
                     let frame_count = frames.len();
                     let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
-                    if frames.iter().zip(&ffmpeg_frames).any(|(got, want)| {
-                        got.y != want.y || got.u != want.u || got.v != want.v
-                    }) && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
+                    if frames
+                        .iter()
+                        .zip(&ffmpeg_frames)
+                        .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v)
+                        && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
                     {
                         std::fs::write(&path, &stream).expect("writing pinned stream");
                         eprintln!(
@@ -12172,8 +13619,19 @@ pub(crate) mod tests {
                     let source = format!("{src_name}=size={width}x{height}:rate=25");
                     let y4m = Command::new("ffmpeg")
                         .args([
-                            "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p",
-                            "-t", "0.04", "-f", "yuv4mpegpipe", "-",
+                            "-v",
+                            "error",
+                            "-f",
+                            "lavfi",
+                            "-i",
+                            &source,
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-t",
+                            "0.04",
+                            "-f",
+                            "yuv4mpegpipe",
+                            "-",
                         ])
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
@@ -12186,8 +13644,8 @@ pub(crate) mod tests {
                         String::from_utf8_lossy(&y4m.stderr)
                     );
                     let cq_arg = format!("--cq-level={cq}");
-                    let out = run_with_stdin(Command::new(aomenc_path())
-                        .args([
+                    let out = run_with_stdin(
+                        Command::new(aomenc_path()).args([
                             "--codec=av1",
                             "--passes=1",
                             "--end-usage=q",
@@ -12203,7 +13661,9 @@ pub(crate) mod tests {
                             "-o",
                             "-",
                             "-",
-                        ]), &y4m.stdout);
+                        ]),
+                        &y4m.stdout,
+                    );
                     assert!(
                         out.status.success(),
                         "aomenc refused the fixture ({source} cq={cq}): {}",
@@ -12238,9 +13698,11 @@ pub(crate) mod tests {
                     }
                     let frame_count = frames.len();
                     let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
-                    if frames.iter().zip(&ffmpeg_frames).any(|(got, want)| {
-                        got.y != want.y || got.u != want.u || got.v != want.v
-                    }) && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
+                    if frames
+                        .iter()
+                        .zip(&ffmpeg_frames)
+                        .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v)
+                        && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
                     {
                         std::fs::write(&path, &stream).expect("writing pinned stream");
                         eprintln!(
@@ -12331,8 +13793,8 @@ pub(crate) mod tests {
             "ffmpeg fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                 // occurrence, so overrides go before the base list).
                 "--loopfilter-control=1",
@@ -12363,7 +13825,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m.stdout);
+            ]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -12470,8 +13934,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -12510,7 +13974,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -12619,7 +14085,8 @@ pub(crate) mod tests {
     }
 
     fn intra_rect_in_inter_gate(bit_depth: u32) {
-        const NAME: &str = "a_real_aomenc_inter_sequence_with_an_intra_rect_strip_decodes_pixel_exact";
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_an_intra_rect_strip_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -12661,7 +14128,11 @@ pub(crate) mod tests {
                     "-vf",
                     "hue=s=0",
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     "-strict",
                     "-1",
                     "-t",
@@ -12698,77 +14169,80 @@ pub(crate) mod tests {
             // walks it too, so "no rect strip fired" cannot be an artefact of
             // one cq.
             let cq = format!("--cq-level={}", [30u32, 20, 12][(attempt / 5) as usize % 3]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(depth_args)
-                .arg(&cpu)
-                .arg(&cq)
-                .args([
-                    // class [[aomenc-first-flag-wins]]: every flag is spelled
-                    // exactly ONCE in this recipe, so there is no override to
-                    // order. These four are what this gate is about.
-                    "--enable-rect-partitions=1",
-                    // MEASURED (r1): the charter's `--min-partition-size=8`
-                    // makes 24/24 attempts stop at a sub-16 AB-partition
-                    // refusal ("a HORZ_A/HORZ_B/VERT_A partition below 16x16",
-                    // "a coded (non-skip) HORZ_B/VERT_B rect strip below
-                    // 16x16") before any intra rect strip is reached -- those
-                    // are other lanes' surfaces. 16 keeps the 16x8/8x16 shape
-                    // reachable (a 16x16 block's own HORZ/VERT children).
-                    "--min-partition-size=16",
-                    "--max-partition-size=64",
-                    // MEASURED (r1): with tx-size search ON, 24/24 attempts stop at
-                    // the SQUARE intra-in-inter arm's own refusal ("an intra
-                    // block in an inter frame whose tx_depth splits its luma
-                    // transform (round 1)", read_block_tx_size) long before a
-                    // rect strip is reached -- that arm is another lane's
-                    // surface. OFF, no tx-depth symbol is coded at all and
-                    // every rect strip here is the unsplit single-transform
-                    // case. The SPLIT rect arm (`depth_to_tx_wh` +
-                    // decode_rect_split's per-unit walk) is wired but stays
-                    // UNGATED on this path until that square refusal lifts.
-                    "--enable-tx-size-search=0",
-                    "--codec=av1",
-                    "--passes=1",
-                    "--end-usage=q",
-                    "--lag-in-frames=0",
-                    "--auto-alt-ref=0",
-                    // One key frame at the head: the frames after the cut must
-                    // stay INTER frames carrying intra blocks, not become a
-                    // new key frame.
-                    "--kf-min-dist=1000",
-                    "--kf-max-dist=1000",
-                    "--threads=1",
-                    "--row-mt=0",
-                    "--enable-order-hint=0",
-                    "--enable-warped-motion=0",
-                    "--enable-obmc=0",
-                    "--enable-masked-comp=0",
-                    "--enable-interintra-comp=0",
-                    "--enable-dist-wtd-comp=0",
-                    "--enable-diff-wtd-comp=0",
-                    "--enable-onesided-comp=0",
-                    "--enable-interintra-wedge=0",
-                    "--enable-smooth-interintra=0",
-                    "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=0",
-                    // The intra-in-inter arm reads no `use_filter_intra`
-                    // symbol (square OR rect) -- lane-fiinter owns that read.
-                    "--enable-filter-intra=0",
-                    "--enable-smooth-intra=0",
-                    "--enable-paeth-intra=0",
-                    "--enable-directional-intra=0",
-                    "--enable-angle-delta=0",
-                    "--enable-cdef=0",
-                    "--enable-restoration=0",
-                    "--enable-palette=0",
-                    "--enable-intrabc=0",
-                    "--enable-cfl-intra=0",
-                    "--enable-ref-frame-mvs=0",
-                    "--obu",
-                    "-o",
-                    "-",
-                    "-",
-                ]), &y4m.stdout);
+            let out = run_with_stdin(
+                Command::new(aomenc_path())
+                    .args(depth_args)
+                    .arg(&cpu)
+                    .arg(&cq)
+                    .args([
+                        // class [[aomenc-first-flag-wins]]: every flag is spelled
+                        // exactly ONCE in this recipe, so there is no override to
+                        // order. These four are what this gate is about.
+                        "--enable-rect-partitions=1",
+                        // MEASURED (r1): the charter's `--min-partition-size=8`
+                        // makes 24/24 attempts stop at a sub-16 AB-partition
+                        // refusal ("a HORZ_A/HORZ_B/VERT_A partition below 16x16",
+                        // "a coded (non-skip) HORZ_B/VERT_B rect strip below
+                        // 16x16") before any intra rect strip is reached -- those
+                        // are other lanes' surfaces. 16 keeps the 16x8/8x16 shape
+                        // reachable (a 16x16 block's own HORZ/VERT children).
+                        "--min-partition-size=16",
+                        "--max-partition-size=64",
+                        // MEASURED (r1): with tx-size search ON, 24/24 attempts stop at
+                        // the SQUARE intra-in-inter arm's own refusal ("an intra
+                        // block in an inter frame whose tx_depth splits its luma
+                        // transform (round 1)", read_block_tx_size) long before a
+                        // rect strip is reached -- that arm is another lane's
+                        // surface. OFF, no tx-depth symbol is coded at all and
+                        // every rect strip here is the unsplit single-transform
+                        // case. The SPLIT rect arm (`depth_to_tx_wh` +
+                        // decode_rect_split's per-unit walk) is wired but stays
+                        // UNGATED on this path until that square refusal lifts.
+                        "--enable-tx-size-search=0",
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--lag-in-frames=0",
+                        "--auto-alt-ref=0",
+                        // One key frame at the head: the frames after the cut must
+                        // stay INTER frames carrying intra blocks, not become a
+                        // new key frame.
+                        "--kf-min-dist=1000",
+                        "--kf-max-dist=1000",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--enable-order-hint=0",
+                        "--enable-warped-motion=0",
+                        "--enable-obmc=0",
+                        "--enable-masked-comp=0",
+                        "--enable-interintra-comp=0",
+                        "--enable-dist-wtd-comp=0",
+                        "--enable-diff-wtd-comp=0",
+                        "--enable-onesided-comp=0",
+                        "--enable-interintra-wedge=0",
+                        "--enable-smooth-interintra=0",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        // The intra-in-inter arm reads no `use_filter_intra`
+                        // symbol (square OR rect) -- lane-fiinter owns that read.
+                        "--enable-filter-intra=0",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-cdef=0",
+                        "--enable-restoration=0",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-cfl-intra=0",
+                        "--enable-ref-frame-mvs=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -12807,7 +14281,9 @@ pub(crate) mod tests {
             eprintln!(
                 "intrarect gate {bit_depth}-bit seed={seed} {cpu} {cq}: intra rect strips in inter frames \
                  64-level={} 32-level={} 16-level={}, key-frame rect strips this stream={}",
-                delta[0], delta[1], delta[2],
+                delta[0],
+                delta[1],
+                delta[2],
                 decode::rect_partition_hits() - kf_rect_before
             );
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
@@ -12946,7 +14422,11 @@ pub(crate) mod tests {
                     "-vf",
                     "hue=s=0",
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     // y4m carries no official 10-bit tag; ffmpeg writes one
                     // only under `-strict -1` (a no-op at 8 bit).
                     "-strict",
@@ -12974,9 +14454,8 @@ pub(crate) mod tests {
             } else {
                 &[]
             };
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(depth_args)
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args(depth_args).args([
                     // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                     // occurrence, so overrides go before the base list).
                     "--enable-tx-size-search=1",
@@ -13025,7 +14504,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -13195,7 +14676,11 @@ pub(crate) mod tests {
                     "-vf",
                     "hue=s=0",
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     "-strict",
                     "-1",
                     "-t",
@@ -13221,9 +14706,8 @@ pub(crate) mod tests {
             } else {
                 &[]
             };
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(depth_args)
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args(depth_args).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -13277,7 +14761,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -13440,7 +14926,11 @@ pub(crate) mod tests {
                     "-vf",
                     "hue=s=0",
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     "-strict",
                     "-1",
                     "-t",
@@ -13466,9 +14956,8 @@ pub(crate) mod tests {
             } else {
                 &[]
             };
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(depth_args)
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args(depth_args).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -13522,7 +15011,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -13560,9 +15051,7 @@ pub(crate) mod tests {
                 ffmpeg_decode_sequence(&stream, width, height, frame_count)
             };
             assert_eq!(frames.len(), frame_count);
-            eprintln!(
-                "{name} seed={seed}: filter-intra blocks inside inter frames = {fired}"
-            );
+            eprintln!("{name} seed={seed}: filter-intra blocks inside inter frames = {fired}");
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 for (plane, (g, w)) in [
                     ("Y", (&got.y, &want.y)),
@@ -13638,7 +15127,10 @@ pub(crate) mod tests {
     fn angle_delta_in_inter_gate(bit_depth: u32, min_partition: &str) {
         let name = format!("angle_delta_in_inter_gate({bit_depth}, min={min_partition})");
         let leaf8 = min_partition.ends_with('8');
-        assert!(!leaf8, "the 8x8-leaf arm keeps its refusal; see the module note");
+        assert!(
+            !leaf8,
+            "the 8x8-leaf arm keeps its refusal; see the module note"
+        );
         if !have_ffmpeg() {
             eprintln!("SKIP {name}: no ffmpeg");
             return;
@@ -13682,7 +15174,11 @@ pub(crate) mod tests {
                     "-vf",
                     "hue=s=0",
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     "-strict",
                     "-1",
                     "-t",
@@ -13717,9 +15213,8 @@ pub(crate) mod tests {
             } else {
                 &[]
             };
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(depth_args)
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args(depth_args).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -13773,7 +15268,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -13884,7 +15381,8 @@ pub(crate) mod tests {
 
     /// The 10-bit arm (both of the user's films are `yuv420p10le`).
     #[test]
-    fn a_real_aomenc_10bit_inter_sequence_with_a_non_dc_chroma_8x8_intra_leaf_decodes_pixel_exact() {
+    fn a_real_aomenc_10bit_inter_sequence_with_a_non_dc_chroma_8x8_intra_leaf_decodes_pixel_exact()
+    {
         uv_mode_in_inter8_gate(10, 1);
     }
 
@@ -13937,7 +15435,11 @@ pub(crate) mod tests {
                     "-i",
                     &source,
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     "-strict",
                     "-1",
                     "-t",
@@ -14062,11 +15564,7 @@ pub(crate) mod tests {
             // only for an attempt that decoded to the end and is pixel-
             // compared below.
             let fired = (now.0 - before.0, now.1 - before.1, now.2 - before.2);
-            totals = (
-                totals.0 + fired.0,
-                totals.1 + fired.1,
-                totals.2 + fired.2,
-            );
+            totals = (totals.0 + fired.0, totals.1 + fired.1, totals.2 + fired.2);
             // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
             // is ALWAYS pixel-compared; the counter only decides whether the
             // attempt counts as firing.
@@ -14141,7 +15639,6 @@ pub(crate) mod tests {
         );
     }
 
-
     /// lane-leaf8tx r1: the refusal this round lifts on an INTRA 8x8 leaf
     /// inside an INTER frame -- a nonzero luma `angle_delta_y` on it
     /// (`--enable-angle-delta=1`,
@@ -14197,7 +15694,11 @@ pub(crate) mod tests {
                     "-i",
                     &source,
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     "-strict",
                     "-1",
                     "-t",
@@ -14486,8 +15987,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -14516,7 +16017,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -14608,8 +16111,19 @@ pub(crate) mod tests {
             );
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-t",
-                    "0.04", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -14621,8 +16135,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -14649,7 +16163,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -14766,8 +16282,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                     // occurrence, so overrides go before the base list).
                     "--enable-directional-intra=1",
@@ -14809,7 +16325,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -14993,8 +16511,7 @@ pub(crate) mod tests {
             args.insert(1, "--input-bit-depth=10".to_string());
             args.insert(1, "--bit-depth=10".to_string());
         }
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args(&args), &y4m.stdout);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
         assert!(
             out.status.success(),
             "{name}: aomenc refused the fixture: {}",
@@ -15007,7 +16524,10 @@ pub(crate) mod tests {
             Err(e) => {
                 let pin = std::env::temp_dir().join(format!("{name}-refused.obu"));
                 let _ = std::fs::write(&pin, &stream);
-                panic!("{name}: decode_stream refused a real aomenc stream: {e} (pinned at {})", pin.display());
+                panic!(
+                    "{name}: decode_stream refused a real aomenc stream: {e} (pinned at {})",
+                    pin.display()
+                );
             }
         };
         assert!(
@@ -15024,7 +16544,10 @@ pub(crate) mod tests {
             if got.y != want.y || got.u != want.u || got.v != want.v {
                 let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
                 let _ = std::fs::write(&pin, &stream);
-                panic!("{name}: frame {i} mismatch vs ffmpeg -- stream pinned at {}", pin.display());
+                panic!(
+                    "{name}: frame {i} mismatch vs ffmpeg -- stream pinned at {}",
+                    pin.display()
+                );
             }
         }
     }
@@ -15129,8 +16652,7 @@ pub(crate) mod tests {
     // zero differences.
     #[test]
     fn a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact";
+        const NAME: &str = "a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact";
         if !have_ffmpeg() || !have_aomenc() {
             eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
             return;
@@ -15318,8 +16840,7 @@ pub(crate) mod tests {
                 args.insert(1, "--input-bit-depth=10".to_string());
                 args.insert(1, "--bit-depth=10".to_string());
             }
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{name}: aomenc refused the fixture: {}",
@@ -15460,11 +16981,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{geq}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -15480,20 +17018,37 @@ pub(crate) mod tests {
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
-                    "--enable-tx-size-search=0", "--lag-in-frames=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--enable-tx-size-search=0",
+                    "--lag-in-frames=0",
                     // Per-arm overrides go LAST: aomenc keeps the last
                     // occurrence of a repeated --enable-* flag.
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=1", "--min-partition-size=32",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1",
+                    "--min-partition-size=32",
                     "--max-partition-size=64",
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -15541,9 +17096,18 @@ pub(crate) mod tests {
                     continue;
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
                 }
                 horz_proved += horz;
                 vert_proved += vert;
@@ -15597,9 +17161,9 @@ pub(crate) mod tests {
     /// SKIPped), attempts that carried no rectangular var-tx leaf counted
     /// separately and still required pixel-exact.
     #[test]
-    fn real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal() {
-        const NAME: &str =
-            "real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal";
+    fn real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal()
+     {
+        const NAME: &str = "real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -15637,8 +17201,11 @@ pub(crate) mod tests {
                 // transform SPLITS -- 384x256, per-16-column band motion,
                 // cq 32 (16x32 leaves) and cq 38 (32x16 leaves).
                 let firing = attempt >= 16;
-                let (width, height) =
-                    if firing { (384usize, 256usize) } else { (192usize, 128usize) };
+                let (width, height) = if firing {
+                    (384usize, 256usize)
+                } else {
+                    (192usize, 128usize)
+                };
                 let vertical = attempt % 2 == 1;
                 // lane-vartxsplit r2, MEASURED against the oracle
                 // (`EC_VARTX` histogram, ~40 aomenc runs): at cq 10 this
@@ -15688,24 +17255,37 @@ pub(crate) mod tests {
                     // inside this gate's attempt list.
                     "128+90*sin((X+N*3)/6)*sin(Y/2)+50*sin((X*Y)/37)".to_string()
                 } else if vertical {
-                    format!(
-                        "128+60*sin((Y+N*({sp}+9*mod(floor(X/16),2)))/7)+25*sin(X/11)"
-                    )
+                    format!("128+60*sin((Y+N*({sp}+9*mod(floor(X/16),2)))/7)+25*sin(X/11)")
                 } else {
-                    format!(
-                        "128+60*sin((X+N*({sp}+9*mod(floor(Y/16),2)))/7)+25*sin(Y/11)"
-                    )
+                    format!("128+60*sin((X+N*({sp}+9*mod(floor(Y/16),2)))/7)+25*sin(Y/11)")
                 };
                 let duration = frame_count as f64 / 25.0;
                 let source = format!(
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{geq}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -15723,22 +17303,44 @@ pub(crate) mod tests {
                 // A rectangular var-tx LEAF needs a block whose max rectangular
                 // transform can split: `--min-partition-size=8` is what lets
                 // aomenc's RD reach one (measured); at 16 it never did.
-                let min_part =
-                    if firing { "--min-partition-size=8" } else { "--min-partition-size=16" };
+                let min_part = if firing {
+                    "--min-partition-size=8"
+                } else {
+                    "--min-partition-size=16"
+                };
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
                     "--lag-in-frames=0",
                     // Per-arm overrides go LAST: aomenc keeps the last
                     // occurrence of a repeated --enable-* flag.
-                    "--enable-tx64=1", "--enable-rect-partitions=1",
-                    "--enable-ab-partitions=0", "--enable-1to4-partitions=1",
-                    "--enable-dual-filter=0", "--enable-obmc=0",
+                    "--enable-tx64=1",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1",
+                    "--enable-dual-filter=0",
+                    "--enable-obmc=0",
                     "--enable-tx-size-search=1",
-                    min_part, "--max-partition-size=64",
-                    "--obu", "-o", "-", "-",
+                    min_part,
+                    "--max-partition-size=64",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
                 let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
@@ -15798,9 +17400,18 @@ pub(crate) mod tests {
                     continue;
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
                 }
                 leaf_32x16 += h32;
                 leaf_16x32 += v32;
@@ -15926,11 +17537,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{geq}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -15946,25 +17574,43 @@ pub(crate) mod tests {
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
                     "--lag-in-frames=0",
                     // Per-arm overrides go LAST: aomenc keeps the last
                     // occurrence of a repeated --enable-* flag.
-                    "--enable-tx64=0", "--enable-rect-partitions=1",
-                    "--enable-ab-partitions=0", "--enable-1to4-partitions=1",
+                    "--enable-tx64=0",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1",
                     "--enable-tx-size-search=1",
-                    "--enable-dual-filter=0", "--enable-obmc=0",
+                    "--enable-dual-filter=0",
+                    "--enable-obmc=0",
                     // aomenc's min-partition-size bounds the SMALLER side of a
                     // 1:4 strip, so 32x8 needs 8 (memory
                     // aomenc-min-partition-bounds-smaller-side).
-                    "--min-partition-size=8", "--max-partition-size=32",
-                    "--obu", "-o", "-", "-",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -16023,9 +17669,18 @@ pub(crate) mod tests {
                     continue;
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
                 }
                 proved_32x8 += h;
                 proved_8x32 += v;
@@ -16135,11 +17790,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{geq}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -16155,18 +17827,35 @@ pub(crate) mod tests {
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
-                    "--enable-tx-size-search=0", "--lag-in-frames=0",
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=1", "--min-partition-size=32",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--enable-tx-size-search=0",
+                    "--lag-in-frames=0",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1",
+                    "--min-partition-size=32",
                     "--max-partition-size=64",
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -16202,9 +17891,18 @@ pub(crate) mod tests {
                     carried_none += 1;
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})"
+                    );
                 }
                 if hits > 0 {
                     matched += 1;
@@ -16277,12 +17975,32 @@ pub(crate) mod tests {
                     "mandelbrot=size={width}x{height}:start_scale={start_scale}:\
                      end_scale=0.004:end_pts=8:rate=25"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-vf", "hue=s=0",
-                        "-t", &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
-                        "-f", "yuv4mpegpipe", "-strict", "-1", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-vf",
+                        "hue=s=0",
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-strict",
+                        "-1",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -16298,26 +18016,53 @@ pub(crate) mod tests {
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=1",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--lag-in-frames=0", "--auto-alt-ref=0",
-                    "--kf-min-dist=1000", "--kf-max-dist=1000",
-                    "--enable-rect-partitions=0", "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=0", "--min-partition-size=16",
-                    "--max-partition-size=64", "--enable-tx-size-search=0",
-                    "--enable-order-hint=0", "--enable-warped-motion=0", "--enable-obmc=0",
-                    "--enable-masked-comp=0", "--enable-interintra-comp=0",
-                    "--enable-dist-wtd-comp=0", "--enable-diff-wtd-comp=0",
-                    "--enable-onesided-comp=0", "--enable-interintra-wedge=0",
-                    "--enable-smooth-interintra=0", "--enable-filter-intra=0",
-                    "--enable-smooth-intra=0", "--enable-paeth-intra=0",
-                    "--enable-directional-intra=0", "--enable-angle-delta=0",
-                    "--enable-cdef=0", "--enable-restoration=0", "--enable-palette=0",
-                    "--enable-intrabc=0", "--enable-cfl-intra=0", "--enable-ref-frame-mvs=0",
-                    "--obu", "-o", "-", "-",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=1",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-min-dist=1000",
+                    "--kf-max-dist=1000",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=16",
+                    "--max-partition-size=64",
+                    "--enable-tx-size-search=0",
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -16350,9 +18095,18 @@ pub(crate) mod tests {
                     carried_none += 1;
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})"
+                    );
                 }
                 if hits > 0 {
                     matched += 1;
@@ -16397,7 +18151,10 @@ pub(crate) mod tests {
             "a_pinned_rect_stream_with_a_64x64_intra_block_in_an_inter_frame_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_aomenc() {
-            eprintln!("SKIP {NAME}: no aomenc/aomdec oracle at {}", aomenc_path().display());
+            eprintln!(
+                "SKIP {NAME}: no aomenc/aomdec oracle at {}",
+                aomenc_path().display()
+            );
             return;
         }
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -16407,7 +18164,10 @@ pub(crate) mod tests {
         let before = crate::decode::nocfl_uv_mode_hits();
         let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
         let hits = crate::decode::nocfl_uv_mode_hits() - before;
-        assert_eq!(frames, 6, "{NAME}: expected 6 decode-order frames ({hidden} hidden)");
+        assert_eq!(
+            frames, 6,
+            "{NAME}: expected 6 decode-order frames ({hidden} hidden)"
+        );
         assert!(
             hits > 0,
             "{NAME}: no 64-axis intra block read the no-CFL uv_mode alphabet -- the fixture no \
@@ -16476,11 +18236,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='128+58*sin((X+N*3)/6)+18*sin(Y/23)',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -16496,21 +18273,37 @@ pub(crate) mod tests {
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let tx_arg = format!("--enable-tx-size-search={tx_search}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=34", "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=34",
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
                     "--lag-in-frames=0",
                     // Per-arm overrides go LAST (aomenc keeps the last
                     // occurrence of a repeated --enable-* flag).
                     &tx_arg,
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=0", "--min-partition-size=16",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=16",
                     "--max-partition-size=32",
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -16540,9 +18333,18 @@ pub(crate) mod tests {
                 };
                 assert_eq!(frames.len(), frame_count);
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)"
+                    );
                 }
                 compared += 1;
                 tmv_proved += tmv;
@@ -16603,11 +18405,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='128+58*sin((X+N*3)/6)+18*sin((Y+N*2)/23)',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -16623,22 +18442,43 @@ pub(crate) mod tests {
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let cq_arg = format!("--cq-level={}", if attempt == 0 { 34 } else { 45 });
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=0", "--min-partition-size=16",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=16",
                     "--max-partition-size=32",
                     // Per-arm/feature overrides go LAST (aomenc keeps the LAST
                     // occurrence of a repeated --enable-* flag).
-                    "--enable-order-hint=1", "--enable-ref-frame-mvs=1",
-                    "--enable-fwd-kf=1", "--fwd-kf-dist=8", "--kf-max-dist=1000",
-                    "--lag-in-frames=16", "--auto-alt-ref=1", "--arnr-maxframes=0",
-                    "--obu", "-o", "-", "-",
+                    "--enable-order-hint=1",
+                    "--enable-ref-frame-mvs=1",
+                    "--enable-fwd-kf=1",
+                    "--fwd-kf-dist=8",
+                    "--kf-max-dist=1000",
+                    "--lag-in-frames=16",
+                    "--auto-alt-ref=1",
+                    "--arnr-maxframes=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -16750,11 +18590,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{lum}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -16771,28 +18628,47 @@ pub(crate) mod tests {
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let tx_arg = format!("--enable-tx-size-search={tx_search}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
                     "--lag-in-frames=0",
                     // Per-arm overrides go LAST: aomenc keeps the last
                     // occurrence of a repeated --enable-* flag.
                     &tx_arg,
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=0", "--min-partition-size=16",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=16",
                     "--max-partition-size=32",
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
                     String::from_utf8_lossy(&out.stderr)
                 );
                 let stream = out.stdout;
-                let before = (decode::rect_inter_tu_hits(), decode::rect_inter_txsplit_hits());
+                let before = (
+                    decode::rect_inter_tu_hits(),
+                    decode::rect_inter_txsplit_hits(),
+                );
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
                         let msg = e.to_string();
@@ -16807,7 +18683,10 @@ pub(crate) mod tests {
                     }
                     Ok(frames) => frames,
                 };
-                let after = (decode::rect_inter_tu_hits(), decode::rect_inter_txsplit_hits());
+                let after = (
+                    decode::rect_inter_tu_hits(),
+                    decode::rect_inter_txsplit_hits(),
+                );
                 let (tu, split) = (after.0 - before.0, after.1 - before.1);
                 let ffmpeg_frames = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
@@ -16831,9 +18710,18 @@ pub(crate) mod tests {
                     continue;
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})"
+                    );
                 }
                 tu_proved += tu;
                 split_proved += split;
@@ -16931,12 +18819,23 @@ pub(crate) mod tests {
                 // (14,3)/(20,3)/(32,9), 10-bit (12,3)/(16,3); the rest of the
                 // eight are non-firing neighbours kept so a schedule that
                 // stops firing shows up as out-of-scope, not as a silent pass.
-                const HORZ_SCHEDULE: [(u32, u32); 8] =
-                    [(14, 3), (20, 3), (32, 9), (12, 3), (16, 3), (12, 9), (14, 9), (26, 3)];
+                const HORZ_SCHEDULE: [(u32, u32); 8] = [
+                    (14, 3),
+                    (20, 3),
+                    (32, 9),
+                    (12, 3),
+                    (16, 3),
+                    (12, 9),
+                    (14, 9),
+                    (26, 3),
+                ];
                 let (cq, sp) = if attempt >= 16 {
                     HORZ_SCHEDULE[(attempt - 16) as usize]
                 } else {
-                    ([12, 14][(attempt % 2) as usize], 3 + ((attempt % 8) / 2) * 3)
+                    (
+                        [12, 14][(attempt % 2) as usize],
+                        3 + ((attempt % 8) / 2) * 3,
+                    )
                 };
                 let duration = frame_count as f64 / 25.0;
                 let source = if attempt >= 16 {
@@ -16950,11 +18849,28 @@ pub(crate) mod tests {
                          geq=lum='128+58*sin((X+N*{sp})/6)+18*sin(Y/23)',format=yuv420p"
                     )
                 };
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -16970,20 +18886,38 @@ pub(crate) mod tests {
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
-                    "--lag-in-frames=0", "--enable-obmc=0", "--enable-tx-size-search=1",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    "--enable-obmc=0",
+                    "--enable-tx-size-search=1",
                     // Per-arm overrides last (aomenc keeps the LAST occurrence).
-                    "--enable-rect-partitions=0", "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=0", "--min-partition-size=4",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=4",
                     "--max-partition-size=16",
                     &rect_arg,
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "{NAME}: aomenc refused the fixture: {}",
@@ -17040,8 +18974,14 @@ pub(crate) mod tests {
                         "luma frame {i} ({bit_depth}-bit attempt {attempt}, {groups} sub-8x8 \
                          inter split groups)"
                     );
-                    assert_eq!(got.u, want.u, "U frame {i} ({bit_depth}-bit attempt {attempt})");
-                    assert_eq!(got.v, want.v, "V frame {i} ({bit_depth}-bit attempt {attempt})");
+                    assert_eq!(
+                        got.u, want.u,
+                        "U frame {i} ({bit_depth}-bit attempt {attempt})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "V frame {i} ({bit_depth}-bit attempt {attempt})"
+                    );
                 }
                 fired += 1;
                 if rect_groups > 0 {
@@ -17146,7 +19086,11 @@ pub(crate) mod tests {
             // every pre-filter frame bit-exact, so the arm is a gate now.
             let mut obmc_leaf_proved = 0usize;
             for attempt in 0..32u32 {
-                let obmc_arg = if attempt >= 16 { "--enable-obmc=1" } else { "--enable-obmc=0" };
+                let obmc_arg = if attempt >= 16 {
+                    "--enable-obmc=1"
+                } else {
+                    "--enable-obmc=0"
+                };
                 let attempt = attempt % 16;
                 // Two sources (a translating textured ramp, and testsrc2's
                 // natural motion) x two quantisers x two tx-size-search arms x
@@ -17178,11 +19122,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{lum}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -17199,29 +19160,48 @@ pub(crate) mod tests {
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let tx_arg = format!("--enable-tx-size-search={tx_search}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
                     "--lag-in-frames=0",
                     // Per-arm overrides go LAST: aomenc keeps the last
                     // occurrence of a repeated --enable-* flag.
                     &tx_arg,
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=0", "--min-partition-size=8",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=8",
                     "--max-partition-size=16",
                     obmc_arg,
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
                     String::from_utf8_lossy(&out.stderr)
                 );
                 let stream = out.stdout;
-                let before = (decode::rect_inter_tu_hits(), decode::rect_inter_txsplit_hits());
+                let before = (
+                    decode::rect_inter_tu_hits(),
+                    decode::rect_inter_txsplit_hits(),
+                );
                 let before_obmc_leaf = decode::obmc_rect_leaf_hits();
                 let before_leaf = (
                     decode::inter_leaf16_horz_hits(),
@@ -17242,7 +19222,10 @@ pub(crate) mod tests {
                     }
                     Ok(frames) => frames,
                 };
-                let after = (decode::rect_inter_tu_hits(), decode::rect_inter_txsplit_hits());
+                let after = (
+                    decode::rect_inter_tu_hits(),
+                    decode::rect_inter_txsplit_hits(),
+                );
                 let (tu, split) = (after.0 - before.0, after.1 - before.1);
                 let obmc_leaf = decode::obmc_rect_leaf_hits() - before_obmc_leaf;
                 let (horz, vert, splits16) = (
@@ -17296,9 +19279,18 @@ pub(crate) mod tests {
                     }
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})"
+                    );
                 }
                 tu_proved += tu;
                 obmc_leaf_proved += obmc_leaf;
@@ -17345,7 +19337,6 @@ pub(crate) mod tests {
              residual on a 16-level leaf -- the residual half of the claim is unproven"
         );
     }
-
 
     #[test]
     // lane-inter16ab r1: the 16x16-level AB partitions on an INTER frame --
@@ -17426,11 +19417,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{lum}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -17448,21 +19456,39 @@ pub(crate) mod tests {
                 let tx_arg = format!("--enable-tx-size-search={tx_search}");
                 let tile_arg = format!("--tile-columns={tile_cols}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
-                    "--lag-in-frames=0", "--kf-max-dist=9999", &tile_arg,
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=9999",
+                    &tile_arg,
                     // Per-arm overrides go LAST: aomenc keeps the last
                     // occurrence of a repeated --enable-* flag.
                     &tx_arg,
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=1",
-                    "--enable-1to4-partitions=0", "--min-partition-size=8",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=1",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=8",
                     "--max-partition-size=16",
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -17485,8 +19511,7 @@ pub(crate) mod tests {
                     Ok(frames) => frames,
                 };
                 let after = decode::ab16_inter_hits_by_arm();
-                let fired: Vec<usize> =
-                    (0..4).map(|a| after[a] - before[a]).collect();
+                let fired: Vec<usize> = (0..4).map(|a| after[a] - before[a]).collect();
                 let ffmpeg_frames = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
                 } else {
@@ -17510,8 +19535,9 @@ pub(crate) mod tests {
                 }
                 if mismatched {
                     for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                        let bad: Vec<usize> =
-                            (0..got.y.len()).filter(|&k| got.y[k] != want.y[k]).collect();
+                        let bad: Vec<usize> = (0..got.y.len())
+                            .filter(|&k| got.y[k] != want.y[k])
+                            .collect();
                         if !bad.is_empty() {
                             eprintln!(
                                 "{NAME}: attempt {attempt} {bit_depth}-bit frame {i}: {} luma \
@@ -17528,9 +19554,18 @@ pub(crate) mod tests {
                     }
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
                 }
                 for a in 0..4 {
                     if fired[a] > 0 {
@@ -17558,8 +19593,6 @@ pub(crate) mod tests {
              (HORZ_A/HORZ_B/VERT_A/VERT_B={arms_total:?}) -- the unfired arm(s) are unproven"
         );
     }
-
-
 
     #[test]
     // lane-inter16ab r2: the 16x16-level 1:4 partitions on an INTER frame --
@@ -17654,11 +19687,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{lum}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -17676,21 +19726,39 @@ pub(crate) mod tests {
                 let tx_arg = format!("--enable-tx-size-search={tx_search}");
                 let tile_arg = format!("--tile-columns={tile_cols}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
-                    "--lag-in-frames=0", "--kf-max-dist=9999", &tile_arg,
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=9999",
+                    &tile_arg,
                     // Per-arm overrides go LAST: aomenc keeps the last
                     // occurrence of a repeated --enable-* flag.
                     &tx_arg,
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=1",
-                    "--enable-1to4-partitions=1", "--min-partition-size=4",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=1",
+                    "--enable-1to4-partitions=1",
+                    "--min-partition-size=4",
                     "--max-partition-size=16",
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -17762,8 +19830,9 @@ pub(crate) mod tests {
                 }
                 if mismatched {
                     for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                        let bad: Vec<usize> =
-                            (0..got.y.len()).filter(|&k| got.y[k] != want.y[k]).collect();
+                        let bad: Vec<usize> = (0..got.y.len())
+                            .filter(|&k| got.y[k] != want.y[k])
+                            .collect();
                         if !bad.is_empty() {
                             eprintln!(
                                 "{NAME}: attempt {attempt} {bit_depth}-bit frame {i}: {} luma \
@@ -17780,9 +19849,18 @@ pub(crate) mod tests {
                     }
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
                 }
                 for a in 0..5 {
                     if fired[a] > 0 {
@@ -17882,7 +19960,6 @@ pub(crate) mod tests {
         );
     }
 
-
     #[test]
     // Un-ignored 2026-09-04: the intra 16x4/4x16-in-inter refusal this recipe stopped at is gone and every arm now decodes pixel-exact.
     // lane-intra16x4 r1: an INTRA-coded 16x4 / 4x16 strip inside an INTER
@@ -17902,9 +19979,9 @@ pub(crate) mod tests {
     // predict -- a per-frame-random bright bar sweeping the frame (HORZ_4
     // strips) and a `X*Y` product sinusoid under temporal noise (VERT_4).
     // Both sources hash identically twice (report).
-    fn a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact";
+    fn a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact()
+    {
+        const NAME: &str = "a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -17988,11 +20065,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{lum}',format=yuv420p{noise}"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -18009,21 +20103,40 @@ pub(crate) mod tests {
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
-                    "--lag-in-frames=0", "--kf-max-dist=9999", "--tile-columns=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=9999",
+                    "--tile-columns=0",
                     // Per-arm overrides go LAST (aomenc keeps the last
                     // occurrence of a repeated --enable-* flag).
-                    "--enable-tx-size-search=1", "--enable-rect-partitions=1",
-                    "--enable-ab-partitions=1", "--enable-1to4-partitions=1",
+                    "--enable-tx-size-search=1",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=1",
+                    "--enable-1to4-partitions=1",
                     "--enable-intra-edge-filter=1",
-                    &min_part_arg, "--max-partition-size=16",
-                    "--obu", "-o", "-", "-",
+                    &min_part_arg,
+                    "--max-partition-size=16",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -18090,8 +20203,9 @@ pub(crate) mod tests {
                 }
                 if mismatched {
                     for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                        let bad: Vec<usize> =
-                            (0..got.y.len()).filter(|&k| got.y[k] != want.y[k]).collect();
+                        let bad: Vec<usize> = (0..got.y.len())
+                            .filter(|&k| got.y[k] != want.y[k])
+                            .collect();
                         if !bad.is_empty() {
                             eprintln!(
                                 "{NAME}: attempt {attempt} {bit_depth}-bit frame {i}: {} luma \
@@ -18168,7 +20282,10 @@ pub(crate) mod tests {
         );
         for (a, what) in [
             (0usize, "intra 16x4 strips (PARTITION_HORZ_4)"),
-            (2, "chroma-reference (odd) intra strips carrying the pair's 8x4/4x8 chroma"),
+            (
+                2,
+                "chroma-reference (odd) intra strips carrying the pair's 8x4/4x8 chroma",
+            ),
         ] {
             assert!(
                 arms_total[a] > 0,
@@ -18177,7 +20294,6 @@ pub(crate) mod tests {
             );
         }
     }
-
 
     #[test]
     // lane-sbab r1: the SUPERBLOCK-level (64x64) AB partitions on an INTER
@@ -18245,11 +20361,28 @@ pub(crate) mod tests {
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
                      geq=lum='{lum}',format=yuv420p"
                 );
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -18266,20 +20399,38 @@ pub(crate) mod tests {
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let tile_arg = format!("--tile-columns={tile_cols}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
-                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
-                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
-                    "--lag-in-frames=0", "--kf-max-dist=9999", &tile_arg,
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=9999",
+                    &tile_arg,
                     // Per-arm overrides go LAST: aomenc keeps the last
                     // occurrence of a repeated --enable-* flag.
-                    "--enable-rect-partitions=1", "--enable-ab-partitions=1",
-                    "--enable-1to4-partitions=0", "--min-partition-size=32",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=1",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=32",
                     "--max-partition-size=64",
-                    "--obu", "-o", "-", "-",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -18326,8 +20477,9 @@ pub(crate) mod tests {
                 }
                 if mismatched {
                     for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                        let bad: Vec<usize> =
-                            (0..got.y.len()).filter(|&k| got.y[k] != want.y[k]).collect();
+                        let bad: Vec<usize> = (0..got.y.len())
+                            .filter(|&k| got.y[k] != want.y[k])
+                            .collect();
                         if !bad.is_empty() {
                             eprintln!(
                                 "{NAME}: attempt {attempt} {bit_depth}-bit frame {i}: {} luma \
@@ -18344,9 +20496,18 @@ pub(crate) mod tests {
                     }
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})"
+                    );
                 }
                 for a in 0..4 {
                     if fired[a] > 0 {
@@ -18395,13 +20556,7 @@ pub(crate) mod tests {
         let y4m = Command::new("ffmpeg")
             .args(["-v", "error", "-f", "lavfi", "-i"])
             .arg(&source)
-            .args([
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "yuv4mpegpipe",
-                "-",
-            ])
+            .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -18412,8 +20567,8 @@ pub(crate) mod tests {
             "ffmpeg fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 // lane-defon r1: explicit on-value (aomenc keeps the FIRST
                 // occurrence, so overrides go before the base list).
                 "--loopfilter-control=1",
@@ -18465,7 +20620,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m.stdout);
+            ]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -18500,7 +20657,10 @@ pub(crate) mod tests {
             if !ok {
                 let pin = std::env::temp_dir().join("ec-av1-deblocking-gate-fail.obu");
                 let _ = std::fs::write(&pin, &stream);
-                panic!("frame {i} mismatch vs ffmpeg -- stream pinned at {}", pin.display());
+                panic!(
+                    "frame {i} mismatch vs ffmpeg -- stream pinned at {}",
+                    pin.display()
+                );
             }
         }
     }
@@ -18587,8 +20747,8 @@ pub(crate) mod tests {
                 "y4m fixture length mismatch (seed {seed})"
             );
             let y4m_hash = fnv1a64(&y4m.stdout);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -18651,7 +20811,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -18914,8 +21076,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -18992,7 +21154,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19176,8 +21340,7 @@ pub(crate) mod tests {
             let tail = args.split_off(args.len() - 3);
             args.extend_from_slice(extra_args);
             args.extend_from_slice(&tail);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19369,8 +21532,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19432,32 +21594,41 @@ pub(crate) mod tests {
                         .zip(&ffmpeg_frames)
                         .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
                     if mismatched {
-                        let pin = std::env::temp_dir().join("ec-av1-reference-select-gate-fail.obu");
+                        let pin =
+                            std::env::temp_dir().join("ec-av1-reference-select-gate-fail.obu");
                         let _ = std::fs::write(&pin, &stream);
                         if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
                             std::fs::write(&path, &stream).expect("writing pinned stream");
-                            eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                            eprintln!(
+                                "EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}"
+                            );
                         }
                         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                             assert_eq!(
-                                got.y, want.y,
+                                got.y,
+                                want.y,
                                 "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- stream pinned at {}",
                                 pin.display()
                             );
                             assert_eq!(
-                                got.u, want.u,
+                                got.u,
+                                want.u,
                                 "{NAME} frame {i} U vs ffmpeg (seed {seed}) -- stream pinned at {}",
                                 pin.display()
                             );
                             assert_eq!(
-                                got.v, want.v,
+                                got.v,
+                                want.v,
                                 "{NAME} frame {i} V vs ffmpeg (seed {seed}) -- stream pinned at {}",
                                 pin.display()
                             );
                         }
                     } else {
                         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                            assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                            assert_eq!(
+                                got.y, want.y,
+                                "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                            );
                             assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                             assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
                         }
@@ -19475,7 +21646,8 @@ pub(crate) mod tests {
                     // libaom's temporal alt-ref filter absorbs this recipe's hidden
                     // frames, so the compare above is vacuous -- re-encode the same
                     // fixture with --arnr-maxframes=0 and compare THOSE.
-                    if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                    if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args)
+                    {
                         eprintln!(
                             "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
                              decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
@@ -19599,8 +21771,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19642,17 +21813,20 @@ pub(crate) mod tests {
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                     assert_eq!(
-                        got.y, want.y,
+                        got.y,
+                        want.y,
                         "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- stream pinned at {}",
                         pin.display()
                     );
                     assert_eq!(
-                        got.u, want.u,
+                        got.u,
+                        want.u,
                         "{NAME} frame {i} U vs ffmpeg (seed {seed}) -- stream pinned at {}",
                         pin.display()
                     );
                     assert_eq!(
-                        got.v, want.v,
+                        got.v,
+                        want.v,
                         "{NAME} frame {i} V vs ffmpeg (seed {seed}) -- stream pinned at {}",
                         pin.display()
                     );
@@ -19789,8 +21963,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -19830,7 +22003,10 @@ pub(crate) mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -19992,8 +22168,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -20035,7 +22210,10 @@ pub(crate) mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -20178,8 +22356,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -20215,7 +22392,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -20335,8 +22515,7 @@ pub(crate) mod tests {
             "-",
             "-",
         ];
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args(&args), &y4m.stdout);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -20346,8 +22525,7 @@ pub(crate) mod tests {
         if let Ok(path) = std::env::var("EC_SUPERRES_STREAM_DUMP") {
             std::fs::write(path, &stream).expect("dump stream");
         }
-        let frames =
-            decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
+        let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
         assert_eq!(frames.len(), frame_count);
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
@@ -20469,8 +22647,7 @@ pub(crate) mod tests {
             "-",
             "-",
         ];
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args(&args), &y4m.stdout);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -20480,8 +22657,7 @@ pub(crate) mod tests {
         if let Ok(path) = std::env::var("EC_SUPERRES_INTER_STREAM_DUMP") {
             std::fs::write(&path, &stream).expect("dump stream");
         }
-        let frames =
-            decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
+        let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
         assert_eq!(frames.len(), frame_count);
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
@@ -20538,12 +22714,27 @@ pub(crate) mod tests {
         // off, so a mismatch can only be the lifted paths (the same scoping
         // the r10 key+inter superres gate uses).
         let common: [&str; 21] = [
-            "--codec=av1", "--passes=1", "--end-usage=q", "--threads=1", "--row-mt=0",
-            "--kf-max-dist=9999", "--lag-in-frames=0", "--auto-alt-ref=0", "--cpu-used=0",
-            "--sb-size=64", "--superres-mode=1", "--superres-denominator=12",
-            "--superres-kf-denominator=12", "--enable-obmc=0", "--enable-masked-comp=0",
-            "--enable-interintra-comp=0", "--enable-tx-size-search=0", "--enable-cdef=0",
-            "--enable-restoration=0", "--enable-palette=0", "--enable-intrabc=0",
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--threads=1",
+            "--row-mt=0",
+            "--kf-max-dist=9999",
+            "--lag-in-frames=0",
+            "--auto-alt-ref=0",
+            "--cpu-used=0",
+            "--sb-size=64",
+            "--superres-mode=1",
+            "--superres-denominator=12",
+            "--superres-kf-denominator=12",
+            "--enable-obmc=0",
+            "--enable-masked-comp=0",
+            "--enable-interintra-comp=0",
+            "--enable-tx-size-search=0",
+            "--enable-cdef=0",
+            "--enable-restoration=0",
+            "--enable-palette=0",
+            "--enable-intrabc=0",
         ];
         struct Arm {
             name: &'static str,
@@ -20581,8 +22772,21 @@ pub(crate) mod tests {
             let src = format!("mandelbrot=size={width}x{height}:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &src, "-t", &duration, "-pix_fmt",
-                    "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &src,
+                    "-t",
+                    &duration,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -20596,8 +22800,7 @@ pub(crate) mod tests {
             args.push(arm.cq);
             args.extend_from_slice(&arm.extra);
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME} {}: aomenc refused the recipe: {}",
@@ -20613,7 +22816,11 @@ pub(crate) mod tests {
             assert_eq!(frames.len(), arm.frames, "{NAME} {}", arm.name);
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, arm.frames);
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} {} frame {i} luma vs ffmpeg", arm.name);
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} {} frame {i} luma vs ffmpeg",
+                    arm.name
+                );
                 assert_eq!(got.u, want.u, "{NAME} {} frame {i} U vs ffmpeg", arm.name);
                 assert_eq!(got.v, want.v, "{NAME} {} frame {i} V vs ffmpeg", arm.name);
             }
@@ -20628,7 +22835,11 @@ pub(crate) mod tests {
                 arm.name, arm.frames
             );
             if arm.name == "sub8+leaf8" {
-                assert!(leaf8 > 0 && sub8 > 0, "{NAME} {}: the lifted paths never ran (leaf8={leaf8} sub8={sub8})", arm.name);
+                assert!(
+                    leaf8 > 0 && sub8 > 0,
+                    "{NAME} {}: the lifted paths never ran (leaf8={leaf8} sub8={sub8})",
+                    arm.name
+                );
             } else {
                 assert!(
                     warp > 0,
@@ -20743,8 +22954,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -20785,7 +22995,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -20823,8 +23036,7 @@ pub(crate) mod tests {
                     "--min-partition-size=8",
                     "--max-partition-size=64",
                 ]);
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&rect_args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&rect_args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "{NAME} RECT-ARM: aomenc refused its own recipe plus the rect overrides: {}",
@@ -20895,9 +23107,9 @@ pub(crate) mod tests {
     /// naming a scaled reference is a hard failure: those are exactly the
     /// strings this round lifts. Other named capabilities skip that seed.
     #[test]
-    fn a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact()
-    {
-        const NAME: &str = "a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact";
+    fn a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -20921,8 +23133,17 @@ pub(crate) mod tests {
                 gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -20935,7 +23156,11 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let on = |name: &str| {
-                if std::env::var(name).as_deref() == Ok("0") { "0" } else { "1" }
+                if std::env::var(name).as_deref() == Ok("0") {
+                    "0"
+                } else {
+                    "1"
+                }
             };
             // lane-scaledref r2: warp is ON. A warp-capable frame header
             // under a scaled reference is exactly the case r1 got wrong
@@ -20957,7 +23182,11 @@ pub(crate) mod tests {
             let interintra = format!("--enable-interintra-comp={}", on("EC_SCALEDREF_II"));
             let lag = format!(
                 "--lag-in-frames={}",
-                if on("EC_SCALEDREF_COMP") == "0" { "0" } else { "25" }
+                if on("EC_SCALEDREF_COMP") == "0" {
+                    "0"
+                } else {
+                    "25"
+                }
             );
             let alt_ref = format!("--auto-alt-ref={}", on("EC_SCALEDREF_COMP"));
             let args: Vec<&str> = vec![
@@ -21018,8 +23247,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -21057,7 +23285,10 @@ pub(crate) mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -21099,11 +23330,23 @@ pub(crate) mod tests {
              suppressed by a scaled reference -- the warp arm proves nothing"
         );
         for (hits, what) in [
-            (crate::decode::scaled_compound_hits(), "compound with a scaled reference"),
-            (crate::decode::scaled_obmc_hits(), "OBMC with a scaled reference"),
-            (crate::decode::scaled_interintra_hits(), "interintra with a scaled reference"),
+            (
+                crate::decode::scaled_compound_hits(),
+                "compound with a scaled reference",
+            ),
+            (
+                crate::decode::scaled_obmc_hits(),
+                "OBMC with a scaled reference",
+            ),
+            (
+                crate::decode::scaled_interintra_hits(),
+                "interintra with a scaled reference",
+            ),
         ] {
-            assert!(hits > 0, "{NAME}: {matched} matches but zero blocks took {what}");
+            assert!(
+                hits > 0,
+                "{NAME}: {matched} matches but zero blocks took {what}"
+            );
         }
     }
 
@@ -21173,7 +23416,10 @@ pub(crate) mod tests {
                 "--enable-ref-frame-mvs=0",
             ],
             &[42, 43, 44, 45, 46, 47, 48, 49],
-            &[("uni_comp_hits", crate::decode::uni_comp_hits as fn() -> usize)],
+            &[(
+                "uni_comp_hits",
+                crate::decode::uni_comp_hits as fn() -> usize,
+            )],
         );
     }
 
@@ -21239,7 +23485,10 @@ pub(crate) mod tests {
             &[42, 43, 44, 45, 46, 47, 48, 49],
             &[
                 ("wii_hits", crate::decode::wii_hits as fn() -> usize),
-                ("interintra_hits", crate::decode::interintra_hits as fn() -> usize),
+                (
+                    "interintra_hits",
+                    crate::decode::interintra_hits as fn() -> usize,
+                ),
             ],
         );
     }
@@ -21354,8 +23603,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -21391,7 +23639,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -21502,9 +23753,14 @@ pub(crate) mod tests {
                 "mandelbrot=size=96x96:rate=25,rotate=a=0.12*t:c=black,\
                  scale=w='ceil(96*(1+0.03*n)/2)*2':h=96:eval=frame,crop={width}:{height}"
             );
-            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
-            let mut ff_args: Vec<&str> =
-                vec!["-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt];
+            let pix_fmt = if depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
+            let mut ff_args: Vec<&str> = vec![
+                "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt,
+            ];
             // y4m has no official 10-bit tag, same as the 10-bit gate above.
             if depth == 10 {
                 ff_args.extend(["-strict", "-1"]);
@@ -21596,7 +23852,9 @@ pub(crate) mod tests {
                 "{NAME} ({depth}-bit): decoded pixel-exact but no block was predicted through a \
                  6-parameter global-motion warp -- the AFFINE path is unexercised"
             );
-            eprintln!("{NAME}: {depth}-bit, {frame_count} frames pixel-exact, affine_gm_hits={hits}");
+            eprintln!(
+                "{NAME}: {depth}-bit, {frame_count} frames pixel-exact, affine_gm_hits={hits}"
+            );
         }
     }
 
@@ -21690,7 +23948,9 @@ pub(crate) mod tests {
             assert_eq!(ours.u, reference.u, "{NAME} frame {i} U vs ffmpeg");
             assert_eq!(ours.v, reference.v, "{NAME} frame {i} V vs ffmpeg");
         }
-        eprintln!("{NAME}: {FRAMES} frames pixel-exact vs ffmpeg, rotzoom_gm_warp_hits={delta_rotzoom}");
+        eprintln!(
+            "{NAME}: {FRAMES} frames pixel-exact vs ffmpeg, rotzoom_gm_warp_hits={delta_rotzoom}"
+        );
     }
 
     /// lane-gmaffine r1: the two 8x8-LEAF motion gates. `decode_inter_block8`
@@ -21708,11 +23968,7 @@ pub(crate) mod tests {
     /// motion the encoder can actually model), and the hit counters
     /// (`globalmv_hits_8` / `warp_hits_8`) are 8x8-leaf-specific: a
     /// 16x16-leaf GLOBALMV or warp cannot satisfy them.
-    fn run_8x8_leaf_motion_gate(
-        name: &str,
-        global_motion: bool,
-        counter: fn() -> usize,
-    ) {
+    fn run_8x8_leaf_motion_gate(name: &str, global_motion: bool, counter: fn() -> usize) {
         // 72x64: `decode_inter_block8` is reached ONLY through the
         // true-edge-straddling 16x16 path (an interior 16x16
         // PARTITION_SPLIT is still refused by name), so the frame is 8
@@ -21732,134 +23988,140 @@ pub(crate) mod tests {
         let mut fired_any = [false; 2];
         let mut notes: Vec<String> = Vec::new();
         for (di, depth) in [8u32, 10u32].into_iter().enumerate() {
-          for cq in [32u32, 45, 55] {
-            let cq_arg = format!("--cq-level={cq}");
-            let max_part_arg = format!(
-                "--max-partition-size={}",
-                std::env::var("EC_8X8_MAXPART").unwrap_or_else(|_| "8".into())
-            );
-            let source = format!(
-                "mandelbrot=size=96x96:rate=25,rotate=a=0.12*t:c=black,\
+            for cq in [32u32, 45, 55] {
+                let cq_arg = format!("--cq-level={cq}");
+                let max_part_arg = format!(
+                    "--max-partition-size={}",
+                    std::env::var("EC_8X8_MAXPART").unwrap_or_else(|_| "8".into())
+                );
+                let source = format!(
+                    "mandelbrot=size=96x96:rate=25,rotate=a=0.12*t:c=black,\
                  scale=w='ceil(96*(1+0.03*n)/2)*2':h=96:eval=frame,crop={width}:{height}"
-            );
-            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
-            let mut ff_args: Vec<&str> =
-                vec!["-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt];
-            if depth == 10 {
-                ff_args.extend(["-strict", "-1"]);
-            }
-            let duration_arg = duration.to_string();
-            ff_args.extend(["-t", &duration_arg, "-f", "yuv4mpegpipe", "-"]);
-            let y4m = Command::new("ffmpeg")
-                .args(&ff_args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("ffmpeg failed to run");
-            assert!(
-                y4m.status.success(),
-                "ffmpeg fixture: {}",
-                String::from_utf8_lossy(&y4m.stderr)
-            );
-            let bit_depth = format!("--bit-depth={depth}");
-            let input_bit_depth = format!("--input-bit-depth={depth}");
-            let gm_arg = format!("--enable-global-motion={}", u8::from(global_motion));
-            let warp_arg = format!("--enable-warped-motion={}", u8::from(!global_motion));
-            let args: Vec<&str> = vec![
-                "--codec=av1",
-                "--passes=1",
-                "--end-usage=q",
-                &cq_arg,
-                "--cpu-used=0",
-                "--kf-max-dist=1000",
-                "--threads=1",
-                "--row-mt=0",
-                "--auto-alt-ref=0",
-                "--lag-in-frames=0",
-                "--enable-fwd-kf=0",
-                "--enable-order-hint=1",
-                &gm_arg,
-                &warp_arg,
-                "--enable-obmc=0",
-                "--tune-content=default",
-                "--enable-masked-comp=0",
-                "--enable-interintra-comp=0",
-                "--enable-onesided-comp=0",
-                "--enable-rect-partitions=0",
-                "--enable-ab-partitions=0",
-                "--enable-1to4-partitions=0",
-                "--enable-filter-intra=0",
-                "--enable-smooth-intra=0",
-                "--enable-paeth-intra=0",
-                "--enable-directional-intra=0",
-                "--enable-angle-delta=0",
-                "--enable-tx-size-search=0",
-                "--enable-cdef=0",
-                "--enable-restoration=0",
-                &max_part_arg,
-                "--min-partition-size=8",
-                "--enable-palette=0",
-                "--enable-intrabc=0",
-                "--enable-cfl-intra=0",
-                "--enable-ref-frame-mvs=0",
-                &bit_depth,
-                &input_bit_depth,
-                "--obu",
-                "-o",
-                "-",
-                "-",
-            ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
-            assert!(
-                out.status.success(),
-                "aomenc refused the fixture: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let stream = out.stdout;
-            let before = counter();
-            let frames = match decode_stream(&stream) {
-                Ok(f) => f,
-                Err(e) => {
-                    let msg = e.to_string();
-                    assert!(
-                        msg.contains("unsupported"),
-                        "{name} ({depth}-bit, cq {cq}) failed outright: {msg}"
-                    );
-                    notes.push(format!("{depth}-bit cq {cq}: {msg}"));
+                );
+                let pix_fmt = if depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
+                let mut ff_args: Vec<&str> = vec![
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt,
+                ];
+                if depth == 10 {
+                    ff_args.extend(["-strict", "-1"]);
+                }
+                let duration_arg = duration.to_string();
+                ff_args.extend(["-t", &duration_arg, "-f", "yuv4mpegpipe", "-"]);
+                let y4m = Command::new("ffmpeg")
+                    .args(&ff_args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let bit_depth = format!("--bit-depth={depth}");
+                let input_bit_depth = format!("--input-bit-depth={depth}");
+                let gm_arg = format!("--enable-global-motion={}", u8::from(global_motion));
+                let warp_arg = format!("--enable-warped-motion={}", u8::from(!global_motion));
+                let args: Vec<&str> = vec![
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--auto-alt-ref=0",
+                    "--lag-in-frames=0",
+                    "--enable-fwd-kf=0",
+                    "--enable-order-hint=1",
+                    &gm_arg,
+                    &warp_arg,
+                    "--enable-obmc=0",
+                    "--tune-content=default",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    &max_part_arg,
+                    "--min-partition-size=8",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    &bit_depth,
+                    &input_bit_depth,
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ];
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = counter();
+                let frames = match decode_stream(&stream) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{name} ({depth}-bit, cq {cq}) failed outright: {msg}"
+                        );
+                        notes.push(format!("{depth}-bit cq {cq}: {msg}"));
+                        continue;
+                    }
+                };
+                let ffmpeg_frames = if depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let hits = counter() - before;
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{name} {depth}-bit frame {i} luma vs ffmpeg");
+                    assert_eq!(got.u, want.u, "{name} {depth}-bit frame {i} U vs ffmpeg");
+                    assert_eq!(got.v, want.v, "{name} {depth}-bit frame {i} V vs ffmpeg");
+                }
+                if hits == 0 {
+                    notes.push(format!(
+                        "{depth}-bit cq {cq}: {frame_count} frames pixel-exact but 0 8x8-leaf hits"
+                    ));
                     continue;
                 }
-            };
-            let ffmpeg_frames = if depth == 10 {
-                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
-            } else {
-                ffmpeg_decode_sequence(&stream, width, height, frame_count)
-            };
-            assert_eq!(frames.len(), frame_count);
-            let hits = counter() - before;
-            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{name} {depth}-bit frame {i} luma vs ffmpeg");
-                assert_eq!(got.u, want.u, "{name} {depth}-bit frame {i} U vs ffmpeg");
-                assert_eq!(got.v, want.v, "{name} {depth}-bit frame {i} V vs ffmpeg");
+                fired_any[di] = true;
+                eprintln!(
+                    "{name}: {depth}-bit cq {cq}, {frame_count} frames pixel-exact, 8x8 hits={hits}"
+                );
             }
-            if hits == 0 {
-                notes.push(format!(
-                    "{depth}-bit cq {cq}: {frame_count} frames pixel-exact but 0 8x8-leaf hits"
-                ));
-                continue;
-            }
-            fired_any[di] = true;
-            eprintln!(
-                "{name}: {depth}-bit cq {cq}, {frame_count} frames pixel-exact, 8x8 hits={hits}"
-            );
-          }
         }
         assert!(
             fired_any[0] && fired_any[1],
             "{name}: no attempt both decoded pixel-exact and fired the 8x8 leaf \
              (8-bit fired {}, 10-bit fired {}):\n{}",
-            fired_any[0], fired_any[1], notes.join("\n")
+            fired_any[0],
+            fired_any[1],
+            notes.join("\n")
         );
     }
 
@@ -21955,8 +24217,8 @@ pub(crate) mod tests {
             "ffmpeg fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 "--threads=1",
                 "--row-mt=0",
                 "--sb-size=64",
@@ -21968,7 +24230,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m.stdout);
+            ]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "aomenc refused the fixture: {}",
@@ -22063,10 +24327,14 @@ pub(crate) mod tests {
             .stderr(Stdio::piped())
             .output()
             .expect("ffmpeg failed to run");
-        assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
         let encode = || {
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -22092,7 +24360,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -22102,7 +24372,11 @@ pub(crate) mod tests {
         };
         // The fixture rule: an encoder output is only a pin if it reproduces.
         let stream = encode();
-        assert_eq!(stream, encode(), "{NAME}: aomenc output is not reproducible for this recipe");
+        assert_eq!(
+            stream,
+            encode(),
+            "{NAME}: aomenc output is not reproducible for this recipe"
+        );
         let before = crate::decode::rect_leaf_coeff_hits();
         let frames = decode_stream(&stream)
             .unwrap_or_else(|e| panic!("{NAME}: decode failed, not a pixel mismatch: {e}"));
@@ -22114,9 +24388,16 @@ pub(crate) mod tests {
         );
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
         assert_eq!(frames.len(), 1, "{NAME}: expected one key frame");
-        assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg frame count"
+        );
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-            assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg ({fired} coded rect leaves)");
+            assert_eq!(
+                got.y, want.y,
+                "{NAME} frame {i} luma vs ffmpeg ({fired} coded rect leaves)"
+            );
             assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg");
             assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg");
         }
@@ -22139,8 +24420,7 @@ pub(crate) mod tests {
     /// override again fails the counter as well as the pixels.
     #[test]
     fn a_real_aomenc_stream_whose_square_block_reads_a_sub16_neighbours_mode_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_stream_whose_square_block_reads_a_sub16_neighbours_mode_decodes_pixel_exact";
+        const NAME: &str = "a_real_aomenc_stream_whose_square_block_reads_a_sub16_neighbours_mode_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -22153,16 +24433,32 @@ pub(crate) mod tests {
         let (width, height) = (64usize, 64usize);
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
                 &format!("rgbtestsrc=size={width}x{height}"),
-                "-pix_fmt", "yuv420p", "-t", "1", "-vframes", "1", "-f", "yuv4mpegpipe", "-",
+                "-pix_fmt",
+                "yuv420p",
+                "-t",
+                "1",
+                "-vframes",
+                "1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .expect("ffmpeg failed to run");
-        assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
         // Two swept cells of the r4 sweep that decoded to completion with
         // WRONG pixels (1714 and 1650 bytes): `--reduced-tx-type-set` and
         // `--enable-filter-intra` are the two axes that move which block sizes
@@ -22170,19 +24466,34 @@ pub(crate) mod tests {
         let mut total_overrides = 0usize;
         for (rtx, filter_intra) in [("1", "0"), ("0", "1")] {
             let encode = || {
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args([
-                        "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
-                        "--cpu-used=4", "--threads=1", "--row-mt=0", "--sb-size=64",
-                        "--kf-max-dist=0", "--enable-rect-partitions=1",
-                        "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
-                        "--enable-tx-size-search=0", "--enable-cdef=0",
+                let out = run_with_stdin(
+                    Command::new(aomenc_path()).args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cq-level=32",
+                        "--cpu-used=4",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        "--kf-max-dist=0",
+                        "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-tx-size-search=0",
+                        "--enable-cdef=0",
                         "--enable-restoration=0",
                         &format!("--enable-filter-intra={filter_intra}"),
                         &format!("--reduced-tx-type-set={rtx}"),
-                        "--min-partition-size=8", "--max-partition-size=32",
-                        "--obu", "-o", "-", "-",
-                    ]), &y4m.stdout);
+                        "--min-partition-size=8",
+                        "--max-partition-size=32",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ]),
+                    &y4m.stdout,
+                );
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -22205,7 +24516,11 @@ pub(crate) mod tests {
             let overrides = crate::decode::mode_mi_override_hits() - before;
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
             assert_eq!(frames.len(), 1, "{NAME}: expected one key frame");
-            assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+            assert_eq!(
+                ffmpeg_frames.len(),
+                frames.len(),
+                "{NAME}: ffmpeg frame count"
+            );
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 assert_eq!(
                     got.y, want.y,
@@ -22249,7 +24564,7 @@ pub(crate) mod tests {
     /// on an attempt that decoded AND is pixel-compared.
     #[test]
     fn a_real_aomenc_stream_whose_chroma_edge_filter_reads_a_sub16_neighbours_uv_mode_decodes_pixel_exact()
-    {
+     {
         const NAME: &str = "a_real_aomenc_stream_whose_chroma_edge_filter_reads_a_sub16_neighbours_uv_mode_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
@@ -22265,13 +24580,30 @@ pub(crate) mod tests {
         // 8-bit arm = the r5 residue cell ("mandfi161"); 10-bit arm = its
         // twin through the same recipe at `--bit-depth=10`.
         for depth in [8usize, 10] {
-            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix = if depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
                     &format!("mandelbrot=size={width}x{height}:start_x=-0.6"),
-                    "-pix_fmt", pix, "-strict", "-1", "-t", "1", "-vframes", "1",
-                    "-f", "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "1",
+                    "-vframes",
+                    "1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -22284,19 +24616,34 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let encode = || {
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args([
-                        "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=16",
-                        "--cpu-used=4", "--threads=1", "--row-mt=0", "--sb-size=64",
-                        "--kf-max-dist=0", "--enable-rect-partitions=1",
-                        "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
-                        "--enable-tx-size-search=0", "--enable-filter-intra=1",
-                        "--reduced-tx-type-set=1", "--min-partition-size=8",
+                let out = run_with_stdin(
+                    Command::new(aomenc_path()).args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cq-level=16",
+                        "--cpu-used=4",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        "--kf-max-dist=0",
+                        "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-tx-size-search=0",
+                        "--enable-filter-intra=1",
+                        "--reduced-tx-type-set=1",
+                        "--min-partition-size=8",
                         "--max-partition-size=32",
                         &format!("--input-bit-depth={depth}"),
                         &format!("--bit-depth={depth}"),
-                        "--obu", "-o", "-", "-",
-                    ]), &y4m.stdout);
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ]),
+                    &y4m.stdout,
+                );
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture (depth={depth}): {}",
@@ -22340,10 +24687,21 @@ pub(crate) mod tests {
             } else {
                 ffmpeg_decode_sequence(&stream, width, height, frames.len())
             };
-            assert_eq!(frames.len(), 1, "{NAME}: expected one key frame (depth={depth})");
-            assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+            assert_eq!(
+                frames.len(),
+                1,
+                "{NAME}: expected one key frame (depth={depth})"
+            );
+            assert_eq!(
+                ffmpeg_frames.len(),
+                frames.len(),
+                "{NAME}: ffmpeg frame count"
+            );
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (depth={depth})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (depth={depth})"
+                );
                 assert_eq!(
                     got.u, want.u,
                     "{NAME} frame {i} U vs ffmpeg (depth={depth}, {cfl_blocks} CFL blocks, \
@@ -22421,16 +24779,33 @@ pub(crate) mod tests {
         let mut compared = 0usize;
         let (width, height) = (256usize, 256usize);
         for depth in [8usize, 10] {
-            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix = if depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
                     &format!(
                         "mandelbrot=size={width}x{height},\
                          noise=alls=20:allf=t+u:all_seed=7"
                     ),
-                    "-pix_fmt", pix, "-strict", "-1", "-t", "1", "-vframes", "1",
-                    "-f", "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "1",
+                    "-vframes",
+                    "1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -22443,20 +24818,36 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let encode = || {
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args([
-                        "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=52",
-                        "--cpu-used=0", "--threads=1", "--row-mt=0", "--sb-size=128",
-                        "--kf-max-dist=0", "--enable-rect-partitions=1",
-                        "--enable-ab-partitions=0", "--enable-1to4-partitions=1",
-                        "--enable-cfl-intra=1", "--enable-tx-size-search=0",
-                        "--enable-filter-intra=0", "--enable-intra-edge-filter=1",
-                        "--reduced-tx-type-set=1", "--min-partition-size=4",
+                let out = run_with_stdin(
+                    Command::new(aomenc_path()).args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cq-level=52",
+                        "--cpu-used=0",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=128",
+                        "--kf-max-dist=0",
+                        "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=1",
+                        "--enable-cfl-intra=1",
+                        "--enable-tx-size-search=0",
+                        "--enable-filter-intra=0",
+                        "--enable-intra-edge-filter=1",
+                        "--reduced-tx-type-set=1",
+                        "--min-partition-size=4",
                         "--max-partition-size=32",
                         &format!("--input-bit-depth={depth}"),
                         &format!("--bit-depth={depth}"),
-                        "--obu", "-o", "-", "-",
-                    ]), &y4m.stdout);
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ]),
+                    &y4m.stdout,
+                );
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture (depth={depth}): {}",
@@ -22492,7 +24883,11 @@ pub(crate) mod tests {
             } else {
                 ffmpeg_decode_sequence(&stream, width, height, frames.len())
             };
-            assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+            assert_eq!(
+                ffmpeg_frames.len(),
+                frames.len(),
+                "{NAME}: ffmpeg frame count"
+            );
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma (depth={depth})");
                 assert_eq!(
@@ -22584,16 +24979,64 @@ pub(crate) mod tests {
         // in the failing superblock, i.e. a base tile defect this lane
         // neither introduced nor owns (reproducer pinned in the r1 report).
         let attempts = [
-            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 22, ten_bit: false, tile_cols: 0, tx_size_search: false },
-            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 20, ten_bit: false, tile_cols: 0, tx_size_search: false },
-            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 50, ten_bit: false, tile_cols: 0, tx_size_search: false },
-            Attempt { src: "mandelbrot=size=64x64:start_x=-1.0", w: 64, h: 64, cq: 14, ten_bit: false, tile_cols: 0, tx_size_search: false },
+            Attempt {
+                src: "yuvtestsrc=size=64x64",
+                w: 64,
+                h: 64,
+                cq: 22,
+                ten_bit: false,
+                tile_cols: 0,
+                tx_size_search: false,
+            },
+            Attempt {
+                src: "rgbtestsrc=size=64x64",
+                w: 64,
+                h: 64,
+                cq: 20,
+                ten_bit: false,
+                tile_cols: 0,
+                tx_size_search: false,
+            },
+            Attempt {
+                src: "rgbtestsrc=size=64x64",
+                w: 64,
+                h: 64,
+                cq: 50,
+                ten_bit: false,
+                tile_cols: 0,
+                tx_size_search: false,
+            },
+            Attempt {
+                src: "mandelbrot=size=64x64:start_x=-1.0",
+                w: 64,
+                h: 64,
+                cq: 14,
+                ten_bit: false,
+                tile_cols: 0,
+                tx_size_search: false,
+            },
             // 10-bit: the only two cells of the sweep that are exact at this
             // depth (HORZ_A and VERT_A); the 10-bit HORZ_B/VERT_B cells all
             // trip the base chroma defect the r1 report pins, so those two
             // arms are proven 8-bit only.
-            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 30, ten_bit: true, tile_cols: 0, tx_size_search: false },
-            Attempt { src: "mandelbrot=size=64x64:start_x=0.4", w: 64, h: 64, cq: 30, ten_bit: true, tile_cols: 0, tx_size_search: false },
+            Attempt {
+                src: "yuvtestsrc=size=64x64",
+                w: 64,
+                h: 64,
+                cq: 30,
+                ten_bit: true,
+                tile_cols: 0,
+                tx_size_search: false,
+            },
+            Attempt {
+                src: "mandelbrot=size=64x64:start_x=0.4",
+                w: 64,
+                h: 64,
+                cq: 30,
+                ten_bit: true,
+                tile_cols: 0,
+                tx_size_search: false,
+            },
             // `--enable-tx-size-search` at aomenc's default: an 8x8 square of
             // a VERT_A/VERT_B resolves to a 2x2 grid of TX4 units, which is
             // the reach lookup that had no table row and panicked (r2). These
@@ -22602,29 +25045,82 @@ pub(crate) mod tests {
             // message is tolerated, a panic or a pixel mismatch is not, and
             // at least one of them must reach a TX4 unit inside a vertical AB
             // partition.
-            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 55, ten_bit: false, tile_cols: 0, tx_size_search: true },
-            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 22, ten_bit: false, tile_cols: 0, tx_size_search: true },
-            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 20, ten_bit: false, tile_cols: 0, tx_size_search: true },
-            Attempt { src: "mandelbrot=size=64x64:start_x=-1.0", w: 64, h: 64, cq: 14, ten_bit: false, tile_cols: 0, tx_size_search: true },
+            Attempt {
+                src: "yuvtestsrc=size=64x64",
+                w: 64,
+                h: 64,
+                cq: 55,
+                ten_bit: false,
+                tile_cols: 0,
+                tx_size_search: true,
+            },
+            Attempt {
+                src: "yuvtestsrc=size=64x64",
+                w: 64,
+                h: 64,
+                cq: 22,
+                ten_bit: false,
+                tile_cols: 0,
+                tx_size_search: true,
+            },
+            Attempt {
+                src: "rgbtestsrc=size=64x64",
+                w: 64,
+                h: 64,
+                cq: 20,
+                ten_bit: false,
+                tile_cols: 0,
+                tx_size_search: true,
+            },
+            Attempt {
+                src: "mandelbrot=size=64x64:start_x=-1.0",
+                w: 64,
+                h: 64,
+                cq: 14,
+                ten_bit: false,
+                tile_cols: 0,
+                tx_size_search: true,
+            },
         ];
         let mut arms = [0usize; 4];
         let mut compared = 0usize;
         let mut tx4_reached = 0usize;
         let mut tx4_compared = 0usize;
         for a in &attempts {
-            let desc =
-                format!("{} cq={} {}bit tiles={}", a.src, a.cq, if a.ten_bit { 10 } else { 8 }, a.tile_cols);
+            let desc = format!(
+                "{} cq={} {}bit tiles={}",
+                a.src,
+                a.cq,
+                if a.ten_bit { 10 } else { 8 },
+                a.tile_cols
+            );
             let mut ff: Vec<String> = vec![
-                "-v".into(), "error".into(), "-f".into(), "lavfi".into(), "-i".into(), a.src.into(),
+                "-v".into(),
+                "error".into(),
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                a.src.into(),
                 "-pix_fmt".into(),
-                if a.ten_bit { "yuv420p10le".into() } else { "yuv420p".into() },
+                if a.ten_bit {
+                    "yuv420p10le".into()
+                } else {
+                    "yuv420p".into()
+                },
             ];
             if a.ten_bit {
                 ff.push("-strict".into());
                 ff.push("-1".into());
             }
-            ff.extend(["-t".into(), "1".into(), "-vframes".into(), "1".into(),
-                       "-f".into(), "yuv4mpegpipe".into(), "-".into()]);
+            ff.extend([
+                "-t".into(),
+                "1".into(),
+                "-vframes".into(),
+                "1".into(),
+                "-f".into(),
+                "yuv4mpegpipe".into(),
+                "-".into(),
+            ]);
             let y4m = Command::new("ffmpeg")
                 .args(&ff)
                 .stdin(Stdio::null())
@@ -22632,21 +25128,33 @@ pub(crate) mod tests {
                 .stderr(Stdio::piped())
                 .output()
                 .expect("ffmpeg failed to run");
-            assert!(y4m.status.success(), "ffmpeg fixture {desc}: {}", String::from_utf8_lossy(&y4m.stderr));
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture {desc}: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
             let encode = || {
                 let mut args: Vec<String> = vec![
-                    "--codec=av1".into(), "--passes=1".into(), "--end-usage=q".into(),
-                    format!("--cq-level={}", a.cq), "--cpu-used=4".into(), "--threads=1".into(),
-                    "--row-mt=0".into(), "--sb-size=64".into(), "--kf-max-dist=0".into(),
+                    "--codec=av1".into(),
+                    "--passes=1".into(),
+                    "--end-usage=q".into(),
+                    format!("--cq-level={}", a.cq),
+                    "--cpu-used=4".into(),
+                    "--threads=1".into(),
+                    "--row-mt=0".into(),
+                    "--sb-size=64".into(),
+                    "--kf-max-dist=0".into(),
                     "--limit=1".into(),
-                    "--enable-rect-partitions=1".into(), "--enable-ab-partitions=1".into(),
+                    "--enable-rect-partitions=1".into(),
+                    "--enable-ab-partitions=1".into(),
                     "--enable-1to4-partitions=0".into(),
                     format!("--enable-tx-size-search={}", u8::from(a.tx_size_search)),
                     // Filter intra ON a rect strip is a separate, still-refused
                     // predictor; this gate is about the AB partition wiring.
                     "--enable-filter-intra=0".into(),
                     "--reduced-tx-type-set=1".into(),
-                    "--min-partition-size=8".into(), "--max-partition-size=16".into(),
+                    "--min-partition-size=8".into(),
+                    "--max-partition-size=16".into(),
                     format!("--tile-columns={}", a.tile_cols),
                 ];
                 if a.ten_bit {
@@ -22654,14 +25162,24 @@ pub(crate) mod tests {
                     args.push("--bit-depth=10".into());
                 }
                 args.extend(["--obu".into(), "-o".into(), "-".into(), "-".into()]);
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
-                assert!(out.status.success(), "aomenc refused {desc}: {}", String::from_utf8_lossy(&out.stderr));
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+                assert!(
+                    out.status.success(),
+                    "aomenc refused {desc}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
                 out.stdout
             };
             let stream = encode();
-            assert!(!stream.is_empty(), "{NAME}: {desc}: aomenc wrote an empty stream");
-            assert_eq!(stream, encode(), "{NAME}: {desc}: aomenc output is not reproducible");
+            assert!(
+                !stream.is_empty(),
+                "{NAME}: {desc}: aomenc wrote an empty stream"
+            );
+            assert_eq!(
+                stream,
+                encode(),
+                "{NAME}: {desc}: aomenc output is not reproducible"
+            );
             let before = crate::decode::ab16_hits_by_arm();
             let tx4_before = crate::decode::vert_ab_tx4_hits();
             let decoded = decode_stream(&stream);
@@ -22692,7 +25210,11 @@ pub(crate) mod tests {
             } else {
                 ffmpeg_decode_sequence(&stream, a.w, a.h, frames.len())
             };
-            assert_eq!(want.len(), frames.len(), "{NAME}: {desc}: ffmpeg frame count");
+            assert_eq!(
+                want.len(),
+                frames.len(),
+                "{NAME}: {desc}: ffmpeg frame count"
+            );
             for (i, (got, w)) in frames.iter().zip(&want).enumerate() {
                 assert_eq!(got.y, w.y, "{NAME}: {desc} frame {i} luma vs ffmpeg");
                 assert_eq!(got.u, w.u, "{NAME}: {desc} frame {i} U vs ffmpeg");
@@ -22726,7 +25248,9 @@ pub(crate) mod tests {
         // counter-from-refused-stream). The full pixel compare is the stronger
         // claim and replaces it; the lookup's VALUES stay pinned against libaom
         // in `of_tu_keeps_the_ordinary_answer_and_uses_the_block_row_under_vert_ab`.
-        eprintln!("{NAME}: vert-AB TX4 units reached across tx-size-search attempts: {tx4_reached}");
+        eprintln!(
+            "{NAME}: vert-AB TX4 units reached across tx-size-search attempts: {tx4_reached}"
+        );
         let _ = tx4_reached;
         assert_eq!(
             tx4_compared,
@@ -22737,10 +25261,15 @@ pub(crate) mod tests {
              `of_tu_keeps_the_ordinary_answer_and_uses_the_block_row_under_vert_ab`"
         );
         for (i, arm) in ["HORZ_A", "HORZ_B", "VERT_A", "VERT_B"].iter().enumerate() {
-            assert!(arms[i] > 0, "{NAME}: PARTITION_{arm} at 16x16 never fired across {compared} \
-                                  compared streams -- the gate proves nothing about that arm (arms={arms:?})");
+            assert!(
+                arms[i] > 0,
+                "{NAME}: PARTITION_{arm} at 16x16 never fired across {compared} \
+                                  compared streams -- the gate proves nothing about that arm (arms={arms:?})"
+            );
         }
-        eprintln!("{NAME}: pixel-exact on {compared} streams, ab16 arms(HORZ_A,HORZ_B,VERT_A,VERT_B)={arms:?}");
+        eprintln!(
+            "{NAME}: pixel-exact on {compared} streams, ab16 arms(HORZ_A,HORZ_B,VERT_A,VERT_B)={arms:?}"
+        );
     }
 
     #[test]
@@ -22761,41 +25290,85 @@ pub(crate) mod tests {
         for start_x in srcs {
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
                     &start_x,
-                    "-pix_fmt", "yuv420p", "-t", "1", "-vframes", "1", "-f", "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "1",
+                    "-vframes",
+                    "1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
-                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-                .output().expect("ffmpeg");
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg");
             assert!(y4m.status.success());
-            let (width, height) = if start_x.contains("128x128") { (128usize, 128usize) } else { (64usize, 64usize) };
+            let (width, height) = if start_x.contains("128x128") {
+                (128usize, 128usize)
+            } else {
+                (64usize, 64usize)
+            };
             for cq in [16u32, 20, 24, 28, 32, 40, 50] {
                 for rtx in ["0", "1"] {
-                    let out = run_with_stdin(Command::new(aomenc_path())
-                        .args([
-                            "--codec=av1", "--passes=1", "--end-usage=q",
-                            &format!("--cq-level={cq}"), "--cpu-used=4", "--threads=1",
-                            "--row-mt=0", "--sb-size=64", "--kf-max-dist=0",
-                            "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                            "--enable-1to4-partitions=0", "--enable-tx-size-search=0",
-                            "--enable-cdef=0", "--enable-restoration=0",
+                    let out = run_with_stdin(
+                        Command::new(aomenc_path()).args([
+                            "--codec=av1",
+                            "--passes=1",
+                            "--end-usage=q",
+                            &format!("--cq-level={cq}"),
+                            "--cpu-used=4",
+                            "--threads=1",
+                            "--row-mt=0",
+                            "--sb-size=64",
+                            "--kf-max-dist=0",
+                            "--enable-rect-partitions=1",
+                            "--enable-ab-partitions=0",
+                            "--enable-1to4-partitions=0",
+                            "--enable-tx-size-search=0",
+                            "--enable-cdef=0",
+                            "--enable-restoration=0",
                             &format!("--reduced-tx-type-set={rtx}"),
-                            "--min-partition-size=8", "--max-partition-size=32",
-                            "--obu", "-o", "-", "-",
-                        ]), &y4m.stdout);
+                            "--min-partition-size=8",
+                            "--max-partition-size=32",
+                            "--obu",
+                            "-o",
+                            "-",
+                            "-",
+                        ]),
+                        &y4m.stdout,
+                    );
                     assert!(out.status.success());
                     let stream = out.stdout;
                     let before = crate::decode::rect_leaf_coeff_hits();
                     let res = decode_stream(&stream);
                     let fired = crate::decode::rect_leaf_coeff_hits() - before;
                     match res {
-                        Err(e) => eprintln!("x={start_x} cq={cq} rtx={rtx} fired={fired} REFUSED {e}"),
+                        Err(e) => {
+                            eprintln!("x={start_x} cq={cq} rtx={rtx} fired={fired} REFUSED {e}")
+                        }
                         Ok(frames) => {
                             let want = ffmpeg_decode_sequence(&stream, width, height, frames.len());
-                            let bad = frames.iter().zip(&want)
-                                .filter(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v).count();
-                            eprintln!("x={start_x} cq={cq} rtx={rtx} fired={fired} frames={} mismatched={bad}", frames.len());
-                            if bad == 0 { continue; }
+                            let bad = frames
+                                .iter()
+                                .zip(&want)
+                                .filter(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v)
+                                .count();
+                            eprintln!(
+                                "x={start_x} cq={cq} rtx={rtx} fired={fired} frames={} mismatched={bad}",
+                                frames.len()
+                            );
+                            if bad == 0 {
+                                continue;
+                            }
                             let (g, w) = (&frames[0], &want[0]);
                             for br in 0..height / 8 {
                                 let mut line = String::new();
@@ -22945,8 +25518,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -22984,7 +25556,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -23151,8 +25726,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -23192,7 +25766,10 @@ pub(crate) mod tests {
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -23342,8 +25919,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture (seed {seed}): {}",
@@ -23501,7 +26077,11 @@ pub(crate) mod tests {
     fn run_compound_global_warp_gate(name: &str, bd: u32, min_part: u32, leaf8_assert: bool) {
         let _gate_lock = lock_gate_counters();
         assert!(have_ffmpeg(), "{name}: ffmpeg required");
-        assert!(have_aomenc(), "{name}: no aomenc at {}", aomenc_path().display());
+        assert!(
+            have_aomenc(),
+            "{name}: no aomenc at {}",
+            aomenc_path().display()
+        );
         let (width, height, frame_count) = (64usize, 64usize, 24usize);
         let before = crate::decode::compound_warp_hits();
         let before8 = crate::decode::compound_warp_hits_8();
@@ -23529,9 +26109,21 @@ pub(crate) mod tests {
                 };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t",
-                        &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
-                        "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -23544,8 +26136,10 @@ pub(crate) mod tests {
                     String::from_utf8_lossy(&y4m.stderr)
                 );
                 let cq_arg = format!("--cq-level={cq}");
-                let (in_depth_arg, depth_arg) =
-                    (format!("--input-bit-depth={bd}"), format!("--bit-depth={bd}"));
+                let (in_depth_arg, depth_arg) = (
+                    format!("--input-bit-depth={bd}"),
+                    format!("--bit-depth={bd}"),
+                );
                 let mut args: Vec<&str> = vec![
                     "--codec=av1",
                     "--passes=1",
@@ -23592,14 +26186,10 @@ pub(crate) mod tests {
                 let min_part_arg = format!("--min-partition-size={min_part}");
                 args.push(min_part_arg.as_str());
                 if bd != 8 {
-                    args.extend_from_slice(&[
-                        in_depth_arg.as_str(),
-                        depth_arg.as_str(),
-                    ]);
+                    args.extend_from_slice(&[in_depth_arg.as_str(), depth_arg.as_str()]);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -23666,7 +26256,10 @@ pub(crate) mod tests {
                  ({matched} matches, {named_refusals} refusals of {attempts}) -- gate vacuous"
             );
         }
-        assert!(matched > 0, "{name}: every attempt refused -- no pixel comparison ran");
+        assert!(
+            matched > 0,
+            "{name}: every attempt refused -- no pixel comparison ran"
+        );
     }
 
     /// lane-fimv r1 (class `wrong-alphabet-same-value`): libaom
@@ -23691,7 +26284,11 @@ pub(crate) mod tests {
     fn run_fimv_motion_mode_gate(name: &str, ten_bit: bool) {
         let _gate_lock = lock_gate_counters();
         assert!(have_ffmpeg(), "{name}: ffmpeg required");
-        assert!(have_aomenc(), "{name}: no aomenc at {}", aomenc_path().display());
+        assert!(
+            have_aomenc(),
+            "{name}: no aomenc at {}",
+            aomenc_path().display()
+        );
         let (width, height, frame_count) = (64usize, 64usize, 20usize);
         let fimv_frames_before = crate::decode::fimv_frame_hits();
         let alphabet_before = crate::decode::fimv_alphabet_hits();
@@ -23723,9 +26320,21 @@ pub(crate) mod tests {
                 let pix_fmt = if ten_bit { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t",
-                        &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
-                        "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -23791,8 +26400,7 @@ pub(crate) mod tests {
                     args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -23828,9 +26436,18 @@ pub(crate) mod tests {
                     eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (cq {cq}) to {path}");
                 }
                 for (i, (got, want)) in frames.iter().zip(&want).enumerate() {
-                    assert_eq!(got.y, want.y, "{name} frame {i} luma vs ffmpeg (cq {cq} step {step})");
-                    assert_eq!(got.u, want.u, "{name} frame {i} U vs ffmpeg (cq {cq} step {step})");
-                    assert_eq!(got.v, want.v, "{name} frame {i} V vs ffmpeg (cq {cq} step {step})");
+                    assert_eq!(
+                        got.y, want.y,
+                        "{name} frame {i} luma vs ffmpeg (cq {cq} step {step})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{name} frame {i} U vs ffmpeg (cq {cq} step {step})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{name} frame {i} V vs ffmpeg (cq {cq} step {step})"
+                    );
                 }
                 assert!(
                     crate::decode::fimv_frame_hits() > attempt_fimv_before,
@@ -23855,7 +26472,10 @@ pub(crate) mod tests {
              force_integer_mv frames={fimv_frames}, forced-2-symbol blocks={alphabet}\n{}",
             refusals.join("\n")
         );
-        assert!(matched > 0, "{name}: every attempt refused -- no pixel comparison ran");
+        assert!(
+            matched > 0,
+            "{name}: every attempt refused -- no pixel comparison ran"
+        );
         assert!(
             fimv_frames > 0,
             "{name}: no decoded frame header had force_integer_mv=1 \
@@ -23872,7 +26492,10 @@ pub(crate) mod tests {
     /// 8-bit arm of [`run_fimv_motion_mode_gate`].
     #[test]
     fn a_real_force_integer_mv_warp_stream_decodes_pixel_exact() {
-        run_fimv_motion_mode_gate("a_real_force_integer_mv_warp_stream_decodes_pixel_exact", false);
+        run_fimv_motion_mode_gate(
+            "a_real_force_integer_mv_warp_stream_decodes_pixel_exact",
+            false,
+        );
     }
 
     /// 10-bit arm of [`run_fimv_motion_mode_gate`] -- both of his films are
@@ -23972,7 +26595,11 @@ pub(crate) mod tests {
     fn run_diffwtd_inferred_64x64_gate(name: &str, ten_bit: bool) {
         let _gate_lock = lock_gate_counters();
         assert!(have_ffmpeg(), "{name}: ffmpeg required");
-        assert!(have_aomenc(), "{name}: no aomenc at {}", aomenc_path().display());
+        assert!(
+            have_aomenc(),
+            "{name}: no aomenc at {}",
+            aomenc_path().display()
+        );
         let (width, height, frame_count) = (128usize, 128usize, 16usize);
         let mut matched = 0u32;
         let mut named_refusals = 0u32;
@@ -23998,9 +26625,21 @@ pub(crate) mod tests {
                 let pix_fmt = if ten_bit { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t",
-                        &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
-                        "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -24066,8 +26705,7 @@ pub(crate) mod tests {
                     args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -24123,7 +26761,10 @@ pub(crate) mod tests {
             "{name}: {matched}/{attempts} pixel-exact, {named_refusals} named refusals, \
              diffwtd_inferred_hits (decoded+compared attempts only)={fired}"
         );
-        assert!(matched > 0, "{name}: every attempt refused ({refusals:?}) -- no pixel compare ran");
+        assert!(
+            matched > 0,
+            "{name}: every attempt refused ({refusals:?}) -- no pixel compare ran"
+        );
         assert!(
             fired > 0,
             "{name}: no inferred-DIFFWTD 64x64 block fired on a compared attempt \
@@ -24274,8 +26915,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -24325,7 +26965,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -24392,7 +27035,6 @@ pub(crate) mod tests {
         );
     }
 
-
     /// lane-inter16ab r5: `COMPOUND_WEDGE` on a RECTANGULAR inter block --
     /// the shapes `av1_wedge_params_lookup` gives the `hgtw`/`hltw`
     /// codebooks (8x16/16x32/8x32 and 16x8/32x16/32x8), which this decoder
@@ -24441,12 +27083,30 @@ pub(crate) mod tests {
                         sx = -0.6 + 0.01 * (a as f64),
                         sy = -0.4 + 0.01 * (a as f64)
                     );
-                    let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                    let pix_fmt = if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    };
                     let y4m = Command::new("ffmpeg")
                         .args([
-                            "-v", "error", "-f", "lavfi", "-i", &source, "-t",
-                            &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
-                            "-f", "yuv4mpegpipe", "-strict", "-1", "-",
+                            "-v",
+                            "error",
+                            "-f",
+                            "lavfi",
+                            "-i",
+                            &source,
+                            "-t",
+                            &duration.to_string(),
+                            "-pix_fmt",
+                            pix_fmt,
+                            "-strict",
+                            "-1",
+                            "-f",
+                            "yuv4mpegpipe",
+                            "-strict",
+                            "-1",
+                            "-",
                         ])
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
@@ -24462,20 +27122,41 @@ pub(crate) mod tests {
                     let depth_arg = format!("--bit-depth={bit_depth}");
                     let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                     let args: Vec<&str> = vec![
-                        "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
-                        &depth_arg, &input_depth_arg,
-                        "--kf-max-dist=1000", "--threads=1", "--row-mt=0", "--auto-alt-ref=1",
-                        "--lag-in-frames=16", "--enable-fwd-kf=0", "--enable-order-hint=1",
-                        "--enable-warped-motion=1", "--enable-global-motion=0",
-                        "--enable-obmc=1", "--enable-diff-wtd-comp=1",
-                        "--enable-interintra-comp=1", "--enable-onesided-comp=0",
-                        "--enable-interintra-wedge=1", "--enable-smooth-interintra=1",
-                        "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
-                        "--enable-filter-intra=0", "--enable-smooth-intra=0",
-                        "--enable-paeth-intra=0", "--enable-directional-intra=0",
-                        "--enable-angle-delta=0", "--enable-tx-size-search=0",
-                        "--enable-cdef=0", "--enable-restoration=0", "--enable-palette=0",
-                        "--enable-intrabc=0", "--enable-cfl-intra=0",
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        &cq_arg,
+                        "--cpu-used=0",
+                        &depth_arg,
+                        &input_depth_arg,
+                        "--kf-max-dist=1000",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--auto-alt-ref=1",
+                        "--lag-in-frames=16",
+                        "--enable-fwd-kf=0",
+                        "--enable-order-hint=1",
+                        "--enable-warped-motion=1",
+                        "--enable-global-motion=0",
+                        "--enable-obmc=1",
+                        "--enable-diff-wtd-comp=1",
+                        "--enable-interintra-comp=1",
+                        "--enable-onesided-comp=0",
+                        "--enable-interintra-wedge=1",
+                        "--enable-smooth-interintra=1",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-filter-intra=0",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-tx-size-search=0",
+                        "--enable-cdef=0",
+                        "--enable-restoration=0",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-cfl-intra=0",
                         "--enable-ref-frame-mvs=0",
                         // Per-arm overrides LAST (aomenc keeps the last
                         // occurrence of a repeated --enable-* flag): masked
@@ -24483,13 +27164,17 @@ pub(crate) mod tests {
                         // comp_group_idx==1 slot goes to wedge/diffwtd, and
                         // rectangular partitions ON at 16/32 -- the shapes
                         // the hgtw/hltw codebooks exist for.
-                        "--enable-masked-comp=1", "--enable-dist-wtd-comp=0",
+                        "--enable-masked-comp=1",
+                        "--enable-dist-wtd-comp=0",
                         "--enable-rect-partitions=1",
-                        "--min-partition-size=16", "--max-partition-size=32",
-                        "--obu", "-o", "-", "-",
+                        "--min-partition-size=16",
+                        "--max-partition-size=32",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
                     ];
-                    let out = run_with_stdin(Command::new(aomenc_path())
-                        .args(&args), &y4m.stdout);
+                    let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                     assert!(
                         out.status.success(),
                         "aomenc refused the fixture: {}",
@@ -24517,8 +27202,7 @@ pub(crate) mod tests {
                         Ok(frames) => frames,
                     };
                     let after = crate::stream::rect_wedge_hits();
-                    let fired: Vec<usize> =
-                        (0..6).map(|k| after[k] - before[k]).collect();
+                    let fired: Vec<usize> = (0..6).map(|k| after[k] - before[k]).collect();
                     let ffmpeg_frames = if bit_depth == 10 {
                         ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
                     } else {
@@ -24540,9 +27224,18 @@ pub(crate) mod tests {
                         continue;
                     }
                     for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                        assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})");
-                        assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})");
-                        assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})");
+                        assert_eq!(
+                            got.y, want.y,
+                            "{NAME} frame {i} luma vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})"
+                        );
+                        assert_eq!(
+                            got.u, want.u,
+                            "{NAME} frame {i} U vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})"
+                        );
+                        assert_eq!(
+                            got.v, want.v,
+                            "{NAME} frame {i} V vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})"
+                        );
                     }
                     // class gate-blind-to-hidden-frames: the shown-frame
                     // compare above cannot see the alt-ref frames this
@@ -24581,7 +27274,6 @@ pub(crate) mod tests {
              {named_refusals} refusals out of {attempts}) -- the recipe proved nothing"
         );
     }
-
 
     /// lane-lr r3: proves stage 1/2's exit criterion -- a real
     /// `--enable-restoration=1` aomenc stream must survive the whole
@@ -24644,8 +27336,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -24687,7 +27379,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -24715,9 +27409,18 @@ pub(crate) mod tests {
                         );
                     }
                     for (i, (pic, refpic)) in pics.iter().zip(reference.iter()).enumerate() {
-                        assert_eq!(pic.y, refpic.y, "{NAME}: luma mismatch (seed {seed} frame {i})");
-                        assert_eq!(pic.u, refpic.u, "{NAME}: U mismatch (seed {seed} frame {i})");
-                        assert_eq!(pic.v, refpic.v, "{NAME}: V mismatch (seed {seed} frame {i})");
+                        assert_eq!(
+                            pic.y, refpic.y,
+                            "{NAME}: luma mismatch (seed {seed} frame {i})"
+                        );
+                        assert_eq!(
+                            pic.u, refpic.u,
+                            "{NAME}: U mismatch (seed {seed} frame {i})"
+                        );
+                        assert_eq!(
+                            pic.v, refpic.v,
+                            "{NAME}: V mismatch (seed {seed} frame {i})"
+                        );
                     }
                     lr_refusals += 1; // reused below as "attempts that actually exercised LR pixels"
                 }
@@ -24941,8 +27644,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -24977,7 +27679,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -25083,11 +27788,28 @@ pub(crate) mod tests {
                         // aomenc stop reading after the first one and the
                         // y4m write then dies on a broken pipe.
                         let dur = format!("{}", frames as f64 / 25.0);
-                        let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                        let pix_fmt = if bit_depth == 10 {
+                            "yuv420p10le"
+                        } else {
+                            "yuv420p"
+                        };
                         let y4m = Command::new("ffmpeg")
                             .args([
-                                "-v", "error", "-f", "lavfi", "-i", &source, "-t", &dur,
-                                "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                                "-v",
+                                "error",
+                                "-f",
+                                "lavfi",
+                                "-i",
+                                &source,
+                                "-t",
+                                &dur,
+                                "-pix_fmt",
+                                pix_fmt,
+                                "-strict",
+                                "-1",
+                                "-f",
+                                "yuv4mpegpipe",
+                                "-",
                             ])
                             .stdin(Stdio::null())
                             .stdout(Stdio::piped())
@@ -25103,19 +27825,27 @@ pub(crate) mod tests {
                         let depth_arg = format!("--bit-depth={bit_depth}");
                         let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                         let cq_arg = format!("--cq-level={cq}");
-                        let out = run_with_stdin(Command::new(aomenc_path())
-                            .args([
-                                "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg,
+                        let out = run_with_stdin(
+                            Command::new(aomenc_path()).args([
+                                "--codec=av1",
+                                "--passes=1",
+                                "--end-usage=q",
+                                &cq_arg,
                                 // cpu-used >= 1 keeps libaom on 64x64
                                 // superblocks at these sizes
                                 // (`av1_select_sb_size`).
-                                "--cpu-used=4", "--threads=1", "--row-mt=0",
+                                "--cpu-used=4",
+                                "--threads=1",
+                                "--row-mt=0",
                                 // --lag-in-frames=0: no hidden alt-ref, so
                                 // decode order == display order and the
                                 // compare below covers every frame the stream
                                 // carries (class gate-blind-to-hidden-frames).
-                                kf_arg, limit_arg, "--lag-in-frames=0",
-                                &depth_arg, &input_depth_arg,
+                                kf_arg,
+                                limit_arg,
+                                "--lag-in-frames=0",
+                                &depth_arg,
+                                &input_depth_arg,
                                 // Other lanes' named refusals this recipe must
                                 // not trip. The both-cut corner is FORCED down
                                 // to 8x8 leaves, which is exactly where the
@@ -25128,20 +27858,35 @@ pub(crate) mod tests {
                                 // inter-frame leaf" and "an 8x8 intra leaf in
                                 // an inter frame whose tx_depth splits it into
                                 // 4x4 transform units".
-                                "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                                "--enable-rect-partitions=0",
+                                "--enable-ab-partitions=0",
                                 "--enable-1to4-partitions=0",
-                                "--min-partition-size=8", "--max-partition-size=64",
-                                "--enable-palette=0", "--enable-intrabc=0",
-                                "--enable-warped-motion=0", "--enable-obmc=0",
-                                "--enable-masked-comp=0", "--enable-interintra-comp=0",
-                                "--enable-onesided-comp=0", "--enable-interintra-wedge=0",
-                                "--enable-smooth-interintra=0", "--enable-ref-frame-mvs=0",
-                                "--enable-angle-delta=0", "--enable-cfl-intra=0",
-                                "--enable-directional-intra=0", "--enable-smooth-intra=0",
-                                "--enable-paeth-intra=0", "--enable-filter-intra=0",
+                                "--min-partition-size=8",
+                                "--max-partition-size=64",
+                                "--enable-palette=0",
+                                "--enable-intrabc=0",
+                                "--enable-warped-motion=0",
+                                "--enable-obmc=0",
+                                "--enable-masked-comp=0",
+                                "--enable-interintra-comp=0",
+                                "--enable-onesided-comp=0",
+                                "--enable-interintra-wedge=0",
+                                "--enable-smooth-interintra=0",
+                                "--enable-ref-frame-mvs=0",
+                                "--enable-angle-delta=0",
+                                "--enable-cfl-intra=0",
+                                "--enable-directional-intra=0",
+                                "--enable-smooth-intra=0",
+                                "--enable-paeth-intra=0",
+                                "--enable-filter-intra=0",
                                 "--enable-tx-size-search=0",
-                                "--obu", "-o", "-", "-",
-                            ]), &y4m.stdout);
+                                "--obu",
+                                "-o",
+                                "-",
+                                "-",
+                            ]),
+                            &y4m.stdout,
+                        );
                         assert!(
                             out.status.success(),
                             "aomenc refused: {}",
@@ -25190,8 +27935,9 @@ pub(crate) mod tests {
                              frame count"
                         );
                         for (i, (ours, theirs)) in decoded.iter().zip(&reference).enumerate() {
-                            let nd =
-                                |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+                            let nd = |a: &[u16], b: &[u16]| {
+                                a.iter().zip(b).filter(|(x, y)| x != y).count()
+                            };
                             // Where a mismatch lands is the whole diagnosis
                             // here (corner block vs elsewhere), so print the
                             // luma bounding box before the assert kills the run.
@@ -25200,7 +27946,8 @@ pub(crate) mod tests {
                                     (usize::MAX, usize::MAX, 0usize, 0usize);
                                 for row in 0..height {
                                     for col in 0..width {
-                                        if ours.y[row * width + col] != theirs.y[row * width + col] {
+                                        if ours.y[row * width + col] != theirs.y[row * width + col]
+                                        {
                                             r0 = r0.min(row);
                                             c0 = c0.min(col);
                                             r1 = r1.max(row);
@@ -25310,30 +28057,60 @@ pub(crate) mod tests {
                 );
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
-                        "yuv420p", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        "0.04",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .output()
                     .expect("ffmpeg failed to run");
-                assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
                 let max_part = width.max(height).min(64).next_power_of_two();
                 let min_part = width.min(height).next_power_of_two().max(8).min(max_part);
                 let max_part_arg = format!("--max-partition-size={max_part}");
                 let min_part_arg = format!("--min-partition-size={min_part}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
-                    "--cpu-used=4", "--kf-max-dist=0", "--limit=1", "--threads=1",
-                    "--row-mt=0", "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=32",
+                    "--cpu-used=4",
+                    "--kf-max-dist=0",
+                    "--limit=1",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
                     "--enable-1to4-partitions=0",
-                    &max_part_arg, &min_part_arg,
-                    "--obu", "-o", "-", "-",
+                    &max_part_arg,
+                    &min_part_arg,
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
-                assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+                assert!(
+                    out.status.success(),
+                    "aomenc refused: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
                 let stream = out.stdout;
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
@@ -25436,8 +28213,19 @@ pub(crate) mod tests {
         );
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt", "yuv420p",
-                "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-t",
+                "0.04",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -25446,15 +28234,27 @@ pub(crate) mod tests {
             .expect("ffmpeg failed to run");
         assert!(y4m.status.success());
         let args: Vec<&str> = vec![
-            "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32", "--cpu-used=4",
-            "--kf-max-dist=0", "--limit=1", "--threads=1", "--row-mt=0",
-            "--enable-rect-partitions=0", "--enable-ab-partitions=0",
-            "--enable-1to4-partitions=0", "--max-partition-size=32", "--min-partition-size=32",
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=32",
+            "--cpu-used=4",
+            "--kf-max-dist=0",
+            "--limit=1",
+            "--threads=1",
+            "--row-mt=0",
+            "--enable-rect-partitions=0",
+            "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0",
+            "--max-partition-size=32",
+            "--min-partition-size=32",
             "--enable-filter-intra=0",
-            "--obu", "-o", "-", "-",
+            "--obu",
+            "-o",
+            "-",
+            "-",
         ];
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args(&args), &y4m.stdout);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
         assert!(out.status.success());
         let stream = out.stdout;
         let frames = decode_stream(&stream).expect("decode");
@@ -25532,9 +28332,9 @@ pub(crate) mod tests {
                 // below it, blending the wrong OBMC prediction there.
                 "rect-flake-3",
             ]
-                .iter()
-                .map(|n| format!("{fixtures}/{n}.obu"))
-                .collect(),
+            .iter()
+            .map(|n| format!("{fixtures}/{n}.obu"))
+            .collect(),
         };
         for path in paths {
             eprintln!("pin: {path}");
@@ -25783,8 +28583,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -25910,7 +28709,11 @@ pub(crate) mod tests {
                     "-i",
                     &source,
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     "-strict",
                     "-1",
                     "-t",
@@ -26302,8 +29105,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -26334,7 +29137,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             if !out.status.success() {
                 refusals.push(format!(
                     "cq={cq} period={period}: aomenc itself refused the fixture"
@@ -26424,16 +29229,39 @@ pub(crate) mod tests {
         let mut fired = 0u32;
         let mut cdef_fired = 0u32;
         let mut leaf_fired = 0u32;
-        for (depth, cq, sp) in [(8u32, 8u32, 3u32), (8, 10, 3), (8, 12, 6), (10, 8, 3), (10, 12, 6)] {
-            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+        for (depth, cq, sp) in [
+            (8u32, 8u32, 3u32),
+            (8, 10, 3),
+            (8, 12, 6),
+            (10, 8, 3),
+            (10, 12, 6),
+        ] {
+            let pix = if depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let src = format!(
                 "color=c=gray:s={width}x{height}:d=0.24:r=25,format=gray,\
                  geq=lum='128+58*sin((X+N*{sp})/6)+18*sin(Y/23)',format=yuv420p"
             );
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &src, "-t", "0.24", "-pix_fmt", pix,
-                    "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &src,
+                    "-t",
+                    "0.24",
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -26445,8 +29273,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -26479,7 +29307,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture (depth={depth} cq={cq})"
@@ -26589,15 +29419,32 @@ pub(crate) mod tests {
             (10, 24, src_a),
             (8, 24, src_a),
         ] {
-            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix = if depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let src = format!(
                 "color=c=gray:s={width}x{height}:d=0.24:r=25,format=gray,\
                  geq=lum='{lum}',format=yuv420p"
             );
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &src, "-t", "0.24", "-pix_fmt", pix,
-                    "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &src,
+                    "-t",
+                    "0.24",
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -26609,8 +29456,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -26643,7 +29490,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture (depth={depth} cq={cq})"
@@ -26730,10 +29579,7 @@ pub(crate) mod tests {
             return;
         }
         if !have_aomenc() {
-            let msg = format!(
-                "no aomenc at {}",
-                aomenc_path().display()
-            );
+            let msg = format!("no aomenc at {}", aomenc_path().display());
             assert!(
                 std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
                 "EC_AV1_REQUIRE_AOMENC is set but {msg}"
@@ -26768,138 +29614,141 @@ pub(crate) mod tests {
             (128usize, 64usize, &["--tile-columns=1"][..]),
             (64usize, 128usize, &["--tile-rows=1"][..]),
         ] {
-        let mut refusals = Vec::new();
-        let mut fired_runs = 0u32;
-        for attempt in 0..40u32 {
-            let seed = 100 + attempt;
-            let cq = 6 + (attempt % 4) * 2;
-            let y4m = Command::new("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    &gradients_source(seed, width, height, "rate=25"),
-                    "-vf",
-                    // `noise` without `all_seed` re-renders differently on
-                    // every run (seeded-fixture-not-reproducible); pinning it
-                    // makes (seed, cq) name one exact stream.
-                    &format!("noise=alls=40:allf=t:all_seed={seed},format=yuv420p"),
-                    "-t",
-                    "0.04",
-                    "-f",
-                    "yuv4mpegpipe",
-                    "-",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("ffmpeg failed to run");
-            assert!(
-                y4m.status.success(),
-                "ffmpeg fixture: {}",
-                String::from_utf8_lossy(&y4m.stderr)
-            );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
-                    "--codec=av1",
-                    "--passes=1",
-                    "--end-usage=q",
-                    &format!("--cq-level={cq}"),
-                    "--cpu-used=0",
-                    "--threads=1",
-                    "--row-mt=0",
-                    "--sb-size=64",
-                    "--min-partition-size=4",
-                    "--max-partition-size=8",
-                    // Below 8x8 only PARTITION_NONE/SPLIT are decodable (HORZ/VERT
-                    // need a real rectangular transform, see the module doc above);
-                    // disabling rect partitions entirely -- not just AB -- keeps
-                    // aomenc from picking the still-refused HORZ/VERT arms almost
-                    // every attempt (round 2 measured ~90% HORZ/VERT-below-8x8
-                    // refusals with --enable-ab-partitions=0 alone).
-                    "--enable-rect-partitions=0",
-                    "--enable-ab-partitions=0",
-                    "--enable-1to4-partitions=1",
-                    "--enable-palette=0",
-                    "--enable-intrabc=0",
-                    "--enable-restoration=0",
-                    "--enable-cdef=0",
-                    "--loopfilter-control=0",
-                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in
-                    // mvstack; this is a key-frame-only fixture, but keep it off for
-                    // safety against a run that emits a second frame.
-                    "--enable-ref-frame-mvs=0",
-                    "--limit=1",
-                    "--obu",
-                    "-o",
-                    "-",
-                    "-",
-                ])
-                .args(tile_args), &y4m.stdout);
-            if !out.status.success() {
-                refusals.push(format!(
-                    "seed={seed} cq={cq}: aomenc itself refused the fixture"
-                ));
-                continue;
-            }
-            let stream = out.stdout;
-            let before = decode::sub8_split_hits();
-            let tiles_before = decode::tile_hits();
-            let frames = match decode_stream(&stream) {
-                Ok(frames) => frames,
-                Err(e) => {
-                    // Only a named refusal ("unsupported: ...") is a skip
-                    // reason; any other decode error is this decoder failing.
-                    let msg = e.to_string();
-                    assert!(
-                        msg.starts_with("unsupported: "),
-                        "decode error that is not a named refusal \
-                         (seed={seed} cq={cq} tiles={tile_args:?}): {msg}"
-                    );
-                    refusals.push(format!("seed={seed} cq={cq}: {msg}"));
+            let mut refusals = Vec::new();
+            let mut fired_runs = 0u32;
+            for attempt in 0..40u32 {
+                let seed = 100 + attempt;
+                let cq = 6 + (attempt % 4) * 2;
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &gradients_source(seed, width, height, "rate=25"),
+                        "-vf",
+                        // `noise` without `all_seed` re-renders differently on
+                        // every run (seeded-fixture-not-reproducible); pinning it
+                        // makes (seed, cq) name one exact stream.
+                        &format!("noise=alls=40:allf=t:all_seed={seed},format=yuv420p"),
+                        "-t",
+                        "0.04",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let out = run_with_stdin(
+                    Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1",
+                            "--passes=1",
+                            "--end-usage=q",
+                            &format!("--cq-level={cq}"),
+                            "--cpu-used=0",
+                            "--threads=1",
+                            "--row-mt=0",
+                            "--sb-size=64",
+                            "--min-partition-size=4",
+                            "--max-partition-size=8",
+                            // Below 8x8 only PARTITION_NONE/SPLIT are decodable (HORZ/VERT
+                            // need a real rectangular transform, see the module doc above);
+                            // disabling rect partitions entirely -- not just AB -- keeps
+                            // aomenc from picking the still-refused HORZ/VERT arms almost
+                            // every attempt (round 2 measured ~90% HORZ/VERT-below-8x8
+                            // refusals with --enable-ab-partitions=0 alone).
+                            "--enable-rect-partitions=0",
+                            "--enable-ab-partitions=0",
+                            "--enable-1to4-partitions=1",
+                            "--enable-palette=0",
+                            "--enable-intrabc=0",
+                            "--enable-restoration=0",
+                            "--enable-cdef=0",
+                            "--loopfilter-control=0",
+                            // use_ref_frame_mvs (temporal MV projection) is unimplemented in
+                            // mvstack; this is a key-frame-only fixture, but keep it off for
+                            // safety against a run that emits a second frame.
+                            "--enable-ref-frame-mvs=0",
+                            "--limit=1",
+                            "--obu",
+                            "-o",
+                            "-",
+                            "-",
+                        ])
+                        .args(tile_args),
+                    &y4m.stdout,
+                );
+                if !out.status.success() {
+                    refusals.push(format!(
+                        "seed={seed} cq={cq}: aomenc itself refused the fixture"
+                    ));
                     continue;
                 }
-            };
-            // gate-blind-to-feature: a tile arm must actually decode more
-            // than one tile, not merely carry `tile_info.cols > 1`.
-            assert!(
-                tile_args.is_empty() || decode::tile_hits() - tiles_before >= 2,
-                "tiles={tile_args:?} decoded only {} tile(s) (seed={seed} cq={cq})",
-                decode::tile_hits() - tiles_before
-            );
-            if decode::sub8_split_hits() == before {
-                refusals.push(format!(
+                let stream = out.stdout;
+                let before = decode::sub8_split_hits();
+                let tiles_before = decode::tile_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        // Only a named refusal ("unsupported: ...") is a skip
+                        // reason; any other decode error is this decoder failing.
+                        let msg = e.to_string();
+                        assert!(
+                            msg.starts_with("unsupported: "),
+                            "decode error that is not a named refusal \
+                         (seed={seed} cq={cq} tiles={tile_args:?}): {msg}"
+                        );
+                        refusals.push(format!("seed={seed} cq={cq}: {msg}"));
+                        continue;
+                    }
+                };
+                // gate-blind-to-feature: a tile arm must actually decode more
+                // than one tile, not merely carry `tile_info.cols > 1`.
+                assert!(
+                    tile_args.is_empty() || decode::tile_hits() - tiles_before >= 2,
+                    "tiles={tile_args:?} decoded only {} tile(s) (seed={seed} cq={cq})",
+                    decode::tile_hits() - tiles_before
+                );
+                if decode::sub8_split_hits() == before {
+                    refusals.push(format!(
                     "seed={seed} cq={cq}: decoded, but no block read a real PARTITION_SPLIT below 8x8"
                 ));
-                continue;
+                    continue;
+                }
+                let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+                assert_eq!(
+                    frames[0].y, ffmpeg_frames[0].y,
+                    "luma vs ffmpeg (seed={seed} cq={cq})"
+                );
+                assert_eq!(
+                    frames[0].u, ffmpeg_frames[0].u,
+                    "U vs ffmpeg (seed={seed} cq={cq})"
+                );
+                assert_eq!(
+                    frames[0].v, ffmpeg_frames[0].v,
+                    "V vs ffmpeg (seed={seed} cq={cq})"
+                );
+                fired_runs += 1;
+                if fired_runs >= 4 {
+                    break;
+                }
             }
-            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(
-                frames[0].y, ffmpeg_frames[0].y,
-                "luma vs ffmpeg (seed={seed} cq={cq})"
-            );
-            assert_eq!(
-                frames[0].u, ffmpeg_frames[0].u,
-                "U vs ffmpeg (seed={seed} cq={cq})"
-            );
-            assert_eq!(
-                frames[0].v, ffmpeg_frames[0].v,
-                "V vs ffmpeg (seed={seed} cq={cq})"
-            );
-            fired_runs += 1;
-            if fired_runs >= 4 {
-                break;
-            }
-        }
-        assert!(
-            fired_runs >= 4,
-            "fewer than 4 firing+pixel-exact runs out of 40 attempts \
+            assert!(
+                fired_runs >= 4,
+                "fewer than 4 firing+pixel-exact runs out of 40 attempts \
              ({width}x{height} tiles={tile_args:?}):\n{}",
-            refusals.join("\n")
-        );
+                refusals.join("\n")
+            );
         }
     }
 
@@ -26986,47 +29835,50 @@ pub(crate) mod tests {
                     "ffmpeg fixture: {}",
                     String::from_utf8_lossy(&y4m.stderr)
                 );
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args([
-                        "--codec=av1",
-                        "--passes=1",
-                        "--end-usage=q",
-                        &format!("--cq-level={cq}"),
-                        "--cpu-used=0",
-                        "--threads=1",
-                        "--row-mt=0",
-                        "--sb-size=64",
-                        "--min-partition-size=4",
-                        "--max-partition-size=8",
-                        // The tool under test: rect partitions ON, at a size
-                        // where the only rect shapes are 4x8 and 8x4.
-                        "--enable-rect-partitions=1",
-                        "--enable-ab-partitions=0",
-                        "--enable-1to4-partitions=0",
-                        "--enable-palette=0",
-                        "--enable-intrabc=0",
-                        "--enable-restoration=0",
-                        "--enable-cdef=0",
-                        "--loopfilter-control=0",
-                        "--enable-ref-frame-mvs=0",
-                        // Filter intra on a 4x8/8x4 leaf is refused by name
-                        // (`predict_filter_intra` is square-only in this
-                        // decoder, the same refusal the 16x16-level strips
-                        // carry); with it on, that refusal -- not this
-                        // lane's path -- is what most attempts hit.
-                        "--enable-filter-intra=0",
-                        "--limit=1",
-                        "--obu",
-                        "-o",
-                        "-",
-                        "-",
-                    ])
-                    .args(if bit_depth == 10 {
-                        &["--input-bit-depth=10", "--bit-depth=10"][..]
-                    } else {
-                        &[][..]
-                    })
-                    .args(tile_args), &y4m.stdout);
+                let out = run_with_stdin(
+                    Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1",
+                            "--passes=1",
+                            "--end-usage=q",
+                            &format!("--cq-level={cq}"),
+                            "--cpu-used=0",
+                            "--threads=1",
+                            "--row-mt=0",
+                            "--sb-size=64",
+                            "--min-partition-size=4",
+                            "--max-partition-size=8",
+                            // The tool under test: rect partitions ON, at a size
+                            // where the only rect shapes are 4x8 and 8x4.
+                            "--enable-rect-partitions=1",
+                            "--enable-ab-partitions=0",
+                            "--enable-1to4-partitions=0",
+                            "--enable-palette=0",
+                            "--enable-intrabc=0",
+                            "--enable-restoration=0",
+                            "--enable-cdef=0",
+                            "--loopfilter-control=0",
+                            "--enable-ref-frame-mvs=0",
+                            // Filter intra on a 4x8/8x4 leaf is refused by name
+                            // (`predict_filter_intra` is square-only in this
+                            // decoder, the same refusal the 16x16-level strips
+                            // carry); with it on, that refusal -- not this
+                            // lane's path -- is what most attempts hit.
+                            "--enable-filter-intra=0",
+                            "--limit=1",
+                            "--obu",
+                            "-o",
+                            "-",
+                            "-",
+                        ])
+                        .args(if bit_depth == 10 {
+                            &["--input-bit-depth=10", "--bit-depth=10"][..]
+                        } else {
+                            &[][..]
+                        })
+                        .args(tile_args),
+                    &y4m.stdout,
+                );
                 if !out.status.success() {
                     refusals.push(format!(
                         "seed={seed} cq={cq}: aomenc itself refused the fixture"
@@ -27148,14 +30000,28 @@ pub(crate) mod tests {
             for attempt in 0..80u32 {
                 let seed = 300 + attempt;
                 let cq = 6 + (attempt % 8) * 6;
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
                         &format!("testsrc2=size={width}x{height}:rate=25"),
                         "-vf",
                         &format!("noise=alls=40:allf=t:all_seed={seed},format={pix_fmt}"),
-                        "-strict", "-1", "-t", "0.04", "-f", "yuv4mpegpipe", "-",
+                        "-strict",
+                        "-1",
+                        "-t",
+                        "0.04",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -27167,42 +30033,45 @@ pub(crate) mod tests {
                     "ffmpeg fixture: {}",
                     String::from_utf8_lossy(&y4m.stderr)
                 );
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args([
-                        "--codec=av1",
-                        "--passes=1",
-                        "--end-usage=q",
-                        &format!("--cq-level={cq}"),
-                        "--cpu-used=0",
-                        "--threads=1",
-                        "--row-mt=0",
-                        "--sb-size=64",
-                        "--min-partition-size=4",
-                        "--max-partition-size=8",
-                        "--enable-rect-partitions=1",
-                        "--enable-ab-partitions=0",
-                        "--enable-1to4-partitions=0",
-                        "--enable-palette=0",
-                        "--enable-intrabc=0",
-                        "--enable-restoration=0",
-                        "--enable-cdef=0",
-                        "--loopfilter-control=0",
-                        "--enable-ref-frame-mvs=0",
-                        // The tools under test, first occurrence in the
-                        // command line (aomenc keeps the first).
-                        "--enable-filter-intra=1",
-                        &format!("--enable-tx-size-search={tx_search}"),
-                        "--limit=1",
-                        "--obu",
-                        "-o",
-                        "-",
-                        "-",
-                    ])
-                    .args(if bit_depth == 10 {
-                        &["--input-bit-depth=10", "--bit-depth=10"][..]
-                    } else {
-                        &[][..]
-                    }), &y4m.stdout);
+                let out = run_with_stdin(
+                    Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1",
+                            "--passes=1",
+                            "--end-usage=q",
+                            &format!("--cq-level={cq}"),
+                            "--cpu-used=0",
+                            "--threads=1",
+                            "--row-mt=0",
+                            "--sb-size=64",
+                            "--min-partition-size=4",
+                            "--max-partition-size=8",
+                            "--enable-rect-partitions=1",
+                            "--enable-ab-partitions=0",
+                            "--enable-1to4-partitions=0",
+                            "--enable-palette=0",
+                            "--enable-intrabc=0",
+                            "--enable-restoration=0",
+                            "--enable-cdef=0",
+                            "--loopfilter-control=0",
+                            "--enable-ref-frame-mvs=0",
+                            // The tools under test, first occurrence in the
+                            // command line (aomenc keeps the first).
+                            "--enable-filter-intra=1",
+                            &format!("--enable-tx-size-search={tx_search}"),
+                            "--limit=1",
+                            "--obu",
+                            "-o",
+                            "-",
+                            "-",
+                        ])
+                        .args(if bit_depth == 10 {
+                            &["--input-bit-depth=10", "--bit-depth=10"][..]
+                        } else {
+                            &[][..]
+                        }),
+                    &y4m.stdout,
+                );
                 if !out.status.success() {
                     refusals.push(format!("seed={seed} cq={cq}: aomenc itself refused"));
                     continue;
@@ -27378,52 +30247,55 @@ pub(crate) mod tests {
                     "ffmpeg fixture: {}",
                     String::from_utf8_lossy(&y4m.stderr)
                 );
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args([
-                        "--codec=av1",
-                        "--passes=1",
-                        "--end-usage=q",
-                        &format!("--cq-level={cq}"),
-                        "--cpu-used=0",
-                        "--threads=1",
-                        "--row-mt=0",
-                        "--sb-size=64",
-                        // The tool under test: 16x8/8x16 strips, predicted by
-                        // a mode that reads beyond the block.
-                        // aomenc bounds a RECT shape by its smaller side, so
-                        // `--min-partition-size=16` yields no 16x8 at all
-                        // (measured: 0 strips in 40 attempts); 8 is the
-                        // smallest value that lets a 16x16 split HORZ/VERT.
-                        "--min-partition-size=8",
-                        "--max-partition-size=16",
-                        // Largest transform per block: a split (depth-1) rect
-                        // strip is a named refusal of another lane, and it
-                        // ate every attempt while it was on.
-                        "--enable-tx-size-search=0",
-                        "--enable-rect-partitions=1",
-                        "--enable-directional-intra=1",
-                        "--enable-smooth-intra=0",
-                        "--enable-paeth-intra=0",
-                        "--enable-filter-intra=0",
-                        "--enable-ab-partitions=0",
-                        "--enable-1to4-partitions=0",
-                        "--enable-palette=0",
-                        "--enable-intrabc=0",
-                        "--enable-restoration=0",
-                        "--enable-cdef=0",
-                        "--loopfilter-control=0",
-                        "--enable-ref-frame-mvs=0",
-                        "--limit=1",
-                        "--obu",
-                        "-o",
-                        "-",
-                        "-",
-                    ])
-                    .args(if bit_depth == 10 {
-                        &["--input-bit-depth=10", "--bit-depth=10"][..]
-                    } else {
-                        &[][..]
-                    }), &y4m.stdout);
+                let out = run_with_stdin(
+                    Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1",
+                            "--passes=1",
+                            "--end-usage=q",
+                            &format!("--cq-level={cq}"),
+                            "--cpu-used=0",
+                            "--threads=1",
+                            "--row-mt=0",
+                            "--sb-size=64",
+                            // The tool under test: 16x8/8x16 strips, predicted by
+                            // a mode that reads beyond the block.
+                            // aomenc bounds a RECT shape by its smaller side, so
+                            // `--min-partition-size=16` yields no 16x8 at all
+                            // (measured: 0 strips in 40 attempts); 8 is the
+                            // smallest value that lets a 16x16 split HORZ/VERT.
+                            "--min-partition-size=8",
+                            "--max-partition-size=16",
+                            // Largest transform per block: a split (depth-1) rect
+                            // strip is a named refusal of another lane, and it
+                            // ate every attempt while it was on.
+                            "--enable-tx-size-search=0",
+                            "--enable-rect-partitions=1",
+                            "--enable-directional-intra=1",
+                            "--enable-smooth-intra=0",
+                            "--enable-paeth-intra=0",
+                            "--enable-filter-intra=0",
+                            "--enable-ab-partitions=0",
+                            "--enable-1to4-partitions=0",
+                            "--enable-palette=0",
+                            "--enable-intrabc=0",
+                            "--enable-restoration=0",
+                            "--enable-cdef=0",
+                            "--loopfilter-control=0",
+                            "--enable-ref-frame-mvs=0",
+                            "--limit=1",
+                            "--obu",
+                            "-o",
+                            "-",
+                            "-",
+                        ])
+                        .args(if bit_depth == 10 {
+                            &["--input-bit-depth=10", "--bit-depth=10"][..]
+                        } else {
+                            &[][..]
+                        }),
+                    &y4m.stdout,
+                );
                 if !out.status.success() {
                     refusals.push(format!(
                         "seed={seed} cq={cq}: aomenc itself refused the fixture"
@@ -27702,7 +30574,7 @@ pub(crate) mod tests {
     /// the real proof).
     #[test]
     fn a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact() {
-    let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::new();
         const NAME: &str = "a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -27749,8 +30621,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -27797,7 +30669,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -27878,7 +30752,8 @@ pub(crate) mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
-                header.delta, fctx,
+                header.delta,
+                fctx,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -27900,9 +30775,18 @@ pub(crate) mod tests {
             );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                picture.y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             mode_edge_leaks += crate::decode::mode_tile_edge_coarse_leaks() - before_edge;
             matched += 1;
         }
@@ -27942,7 +30826,7 @@ pub(crate) mod tests {
     /// already proved -- this gate is what actually proves it either way.
     #[test]
     fn a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact() {
-    let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::new();
         const NAME: &str = "a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -27982,8 +30866,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -28020,7 +30904,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28089,7 +30975,8 @@ pub(crate) mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
-                header.delta, fctx,
+                header.delta,
+                fctx,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -28111,9 +30998,18 @@ pub(crate) mod tests {
             );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                picture.y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -28150,8 +31046,17 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -28163,8 +31068,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -28197,7 +31102,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28225,12 +31132,25 @@ pub(crate) mod tests {
                 "{NAME}: tile_hits delta was {hits}, expected >1 -- both tile rows must actually \
                  decode, not just tile 0 (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -28254,7 +31174,7 @@ pub(crate) mod tests {
     /// 2-column case's boundary-that-is-also-the-frame-edge.
     #[test]
     fn a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact() {
-    let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::new();
         const NAME: &str = "a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -28272,8 +31192,17 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -28285,8 +31214,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -28319,7 +31248,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28388,7 +31319,8 @@ pub(crate) mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
-                header.delta, fctx,
+                header.delta,
+                fctx,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -28410,9 +31342,18 @@ pub(crate) mod tests {
             );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                picture.y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -28462,8 +31403,17 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -28475,8 +31425,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -28509,7 +31459,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28555,12 +31507,25 @@ pub(crate) mod tests {
                 "{NAME}: tile_hits delta was {hits}, expected >2 -- all four tile rows must \
                  actually decode, not just a subset (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -28592,7 +31557,8 @@ pub(crate) mod tests {
     /// comment used to describe are gone from `decode_stream`.
     #[test]
     fn a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream() {
-        const NAME: &str = "a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream";
+        const NAME: &str =
+            "a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -28609,8 +31575,17 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -28622,8 +31597,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -28657,7 +31632,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28685,12 +31662,25 @@ pub(crate) mod tests {
                 "{NAME}: tile_hits delta was {hits}, expected >1 -- both tiles must actually \
                  decode, not just tile 0 (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -28827,8 +31817,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -28863,7 +31852,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -28955,11 +31947,28 @@ pub(crate) mod tests {
                 sx = -0.6 + 0.005 * (attempt as f64),
                 sy = -0.4 + 0.005 * (attempt as f64)
             );
-            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix_fmt = if bit_depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                    "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-t",
+                    &duration.to_string(),
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -28972,7 +31981,10 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let depth_args: Vec<String> = if bit_depth == 10 {
-                vec!["--input-bit-depth=10".to_owned(), "--bit-depth=10".to_owned()]
+                vec![
+                    "--input-bit-depth=10".to_owned(),
+                    "--bit-depth=10".to_owned(),
+                ]
             } else {
                 Vec::new()
             };
@@ -29023,8 +32035,7 @@ pub(crate) mod tests {
             args.extend(rate_args.iter().copied());
             args.extend(depth_args.iter().map(String::as_str));
             args.extend(["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -29038,7 +32049,9 @@ pub(crate) mod tests {
                 let mut probe = Av1Parser::new();
                 let mut pos = 0usize;
                 while pos < stream.len() {
-                    let obu = probe.parse_obu(&stream[pos..]).expect("parsing the gate stream");
+                    let obu = probe
+                        .parse_obu(&stream[pos..])
+                        .expect("parsing the gate stream");
                     pos += obu.total_size;
                     match &obu.kind {
                         ObuKind::Frame(h, _) => {
@@ -29056,7 +32069,9 @@ pub(crate) mod tests {
                 }
             }
             if seg_frames == 0 {
-                eprintln!("seed {seed}: aomenc wrote no segmentation-enabled frame, skipping attempt");
+                eprintln!(
+                    "seed {seed}: aomenc wrote no segmentation-enabled frame, skipping attempt"
+                );
                 continue;
             }
             let frames = match decode_stream(&stream) {
@@ -29091,7 +32106,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{name} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{name} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{name} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{name} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -29214,8 +32232,17 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.08:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -29227,8 +32254,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -29276,7 +32303,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -29327,11 +32356,18 @@ pub(crate) mod tests {
                 "{NAME}: tile_hits delta was {hits}, expected > {frames} -- both tiles of both \
                  frames must actually decode (seed {seed})"
             );
-            assert_eq!(pictures.len(), frames, "{NAME}: expected {frames} pictures (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                frames,
+                "{NAME}: expected {frames} pictures (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames);
             for (i, (got, want)) in pictures.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME}: seed {seed} frame {i} luma vs ffmpeg");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME}: seed {seed} frame {i} luma vs ffmpeg"
+                );
                 assert_eq!(got.u, want.u, "{NAME}: seed {seed} frame {i} U vs ffmpeg");
                 assert_eq!(got.v, want.v, "{NAME}: seed {seed} frame {i} V vs ffmpeg");
             }
@@ -29383,8 +32419,17 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -29396,8 +32441,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -29432,7 +32477,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -29473,12 +32520,25 @@ pub(crate) mod tests {
                 hits > 0,
                 "{NAME}: tile_hits delta was {hits}, expected >0 (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -29541,8 +32601,17 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -29554,8 +32623,8 @@ pub(crate) mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -29589,7 +32658,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -29642,12 +32713,25 @@ pub(crate) mod tests {
                 hits > 0,
                 "{NAME}: tile_hits delta was {hits}, expected >0 (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -29723,8 +32807,7 @@ pub(crate) mod tests {
             let mut args = base.clone();
             args.extend_from_slice(extra);
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -29823,7 +32906,10 @@ pub(crate) mod tests {
             };
             assert_eq!(frames.len(), 1);
             for (i, (got, want)) in frames.iter().zip(&want).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -29881,10 +32967,21 @@ pub(crate) mod tests {
             let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
             let out = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
                     &gradients_source(seed, width, height, "duration=0.04:rate=25"),
-                    "-pix_fmt", pix, "-strict", "-1", "-t", "0.04",
-                    "-f", "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -29912,8 +33009,13 @@ pub(crate) mod tests {
         for (seed, cq, width, height, ten_bit) in arms {
             let y4m = render(seed, width, height, ten_bit);
             let mut args: Vec<&str> = vec![
-                "--codec=av1", "--passes=1", "--end-usage=q", cq,
-                "--cpu-used=0", "--threads=1", "--row-mt=0",
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                cq,
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
                 "--sb-size=128",
                 "--enable-rect-partitions=0",
                 "--enable-ab-partitions=0",
@@ -29930,8 +33032,7 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -29967,7 +33068,8 @@ pub(crate) mod tests {
                     let n = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
                     let first = a.iter().zip(b.iter()).position(|(x, y)| x != y);
                     assert_eq!(
-                        n, 0,
+                        n,
+                        0,
                         "{NAME} frame {i} {name} vs ffmpeg (seed {seed}): {n} differ, first row {} col {} ours {:?} ffmpeg {:?}",
                         first.unwrap_or(0) / w,
                         first.unwrap_or(0) % w,
@@ -30012,8 +33114,7 @@ pub(crate) mod tests {
     /// (hidden alt-refs included) against the instrumented aomdec.
     #[test]
     fn a_real_aomenc_sb128_gathered_edge_horz_partition_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_sb128_gathered_edge_horz_partition_decodes_pixel_exact";
+        const NAME: &str = "a_real_aomenc_sb128_gathered_edge_horz_partition_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -30059,10 +33160,21 @@ pub(crate) mod tests {
             };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
                     &source,
-                    "-pix_fmt", pix, "-strict", "-1", "-t", "0.2",
-                    "-f", "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.2",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -30075,20 +33187,29 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let mut args: Vec<&str> = vec![
-                "--codec=av1", "--passes=1", "--end-usage=q", cq,
-                "--cpu-used=0", "--threads=1", "--row-mt=0",
-                "--sb-size=128", "--min-partition-size=64",
-                "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                "--enable-1to4-partitions=0", "--enable-palette=0",
-                "--enable-intrabc=0", "--enable-tx-size-search=0",
-                "--deltaq-mode=0", "--limit=5",
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                cq,
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=128",
+                "--min-partition-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-tx-size-search=0",
+                "--deltaq-mode=0",
+                "--limit=5",
             ];
             if ten_bit {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -30245,12 +33366,22 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let mut args: Vec<&str> = vec![
-                "--codec=av1", "--passes=1", "--end-usage=q", cq,
-                "--cpu-used=0", "--threads=1", "--row-mt=0",
-                "--sb-size=128", "--min-partition-size=64",
-                "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                "--enable-1to4-partitions=0", "--enable-palette=0",
-                "--enable-intrabc=0", "--deltaq-mode=0", "--limit=5",
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                cq,
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=128",
+                "--min-partition-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--deltaq-mode=0",
+                "--limit=5",
                 // EVERY frame a key frame: this gate exists for the INTRA
                 // 128x64/64x128 block, and a mixed stream lands on other
                 // lanes' inter gaps (sub-8 leaves, rect inter residual)
@@ -30270,8 +33401,7 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -30297,8 +33427,7 @@ pub(crate) mod tests {
             assert!(frames > 0, "{NAME}: no frames decoded at {width}x{height}");
             let after = intra_sb128_counters();
             let (horz, vert_hits) = (after.0 - before.0, after.1 - before.1);
-            let depth: Vec<usize> =
-                (0..3).map(|i| after.2[i] - before.2[i]).collect();
+            let depth: Vec<usize> = (0..3).map(|i| after.2[i] - before.2[i]).collect();
             eprintln!(
                 "{NAME}: arm {tag} cq {cq} {width}x{height} {}bit {} txsearch={}: \
                  {frames} frames pixel-exact ({hidden} hidden), \
@@ -30382,7 +33511,11 @@ pub(crate) mod tests {
             let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
                     // Same DETERMINISTIC sinusoid source that made aomenc pick
                     // the AB shapes in the r8 sweep (lavfi `gradients` ignores
                     // its seed and is not reproducible -- never use it here).
@@ -30391,8 +33524,15 @@ pub(crate) mod tests {
                          geq=lum='128+80*sin((X+3*N)/17)+50*sin(Y/29)+30*sin((X+Y)/13)':\
                          cb='128+30*sin(X/23)':cr='128+30*sin((Y+N)/19)'"
                     ),
-                    "-pix_fmt", pix, "-strict", "-1", "-t", "0.2",
-                    "-f", "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.2",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -30405,22 +33545,35 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let mut args: Vec<&str> = vec![
-                "--codec=av1", "--passes=1", "--end-usage=q", cq,
-                "--cpu-used=0", "--threads=1", "--row-mt=0",
-                "--sb-size=128", "--min-partition-size=64",
-                "--enable-rect-partitions=1", "--enable-ab-partitions=1",
-                "--enable-1to4-partitions=0", "--enable-palette=0",
-                "--enable-intrabc=0", "--deltaq-mode=0", "--limit=5",
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                cq,
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=128",
+                "--min-partition-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=1",
+                "--enable-1to4-partitions=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--deltaq-mode=0",
+                "--limit=5",
             ];
             // AOMENC FLAG PRECEDENCE: last occurrence wins, so the per-arm
             // key-frame cadence goes AFTER the base recipe.
-            args.push(if inter { "--kf-max-dist=100" } else { "--kf-max-dist=1" });
+            args.push(if inter {
+                "--kf-max-dist=100"
+            } else {
+                "--kf-max-dist=1"
+            });
             if ten_bit {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -30439,10 +33592,8 @@ pub(crate) mod tests {
                 eprintln!("{NAME}: arm {tag} {width}x{height} refusal: {msg}");
                 continue;
             }
-            let (frames, hidden) = decode_all_frames_vs_oracle(
-                &stream,
-                &format!("sb128c-ab-{tag}-{width}x{height}"),
-            );
+            let (frames, hidden) =
+                decode_all_frames_vs_oracle(&stream, &format!("sb128c-ab-{tag}-{width}x{height}"));
             assert!(frames > 0, "{NAME}: no frames decoded at {width}x{height}");
             let after = sb128_ab_counters();
             let ab: Vec<usize> = (0..4).map(|i| after[i] - before[i]).collect();
@@ -30510,27 +33661,54 @@ pub(crate) mod tests {
         let (width, height) = (256usize, 192usize);
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
                 &format!(
                     "{},noise=all_seed=53:alls=12:allf=t",
                     gradients_source(53, width, height, "duration=0.32:rate=25")
                 ),
-                "-pix_fmt", "yuv420p", "-t", "0.32", "-f", "yuv4mpegpipe", "-",
+                "-pix_fmt",
+                "yuv420p",
+                "-t",
+                "0.32",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .output()
             .expect("ffmpeg");
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
-                "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=40",
-                "--cpu-used=2", "--threads=1", "--row-mt=0", "--sb-size=64",
-                "--max-partition-size=64", "--min-partition-size=32",
-                "--enable-rect-partitions=0", "--enable-ab-partitions=0",
-                "--enable-1to4-partitions=0", "--enable-palette=0",
-                "--enable-intrabc=0", "--enable-tx-size-search=0",
-                "--deltaq-mode=0", "--limit=8", "--obu", "-o", "-", "-",
-            ]), &y4m.stdout);
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=40",
+                "--cpu-used=2",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--max-partition-size=64",
+                "--min-partition-size=32",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-tx-size-search=0",
+                "--deltaq-mode=0",
+                "--limit=8",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]),
+            &y4m.stdout,
+        );
         assert!(out.status.success());
         let (frames, hidden) = decode_all_frames_vs_oracle(&out.stdout, "sb128-control-64");
         eprintln!("control sb64: {frames} frames exact ({hidden} hidden)");
@@ -30628,8 +33806,7 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -30726,7 +33903,9 @@ pub(crate) mod tests {
         }
         let (width, height) = (256usize, 256usize);
         let mut intra128_total = 0usize;
-        for (ten_bit, tx_search, seed) in [(false, false, 61u32), (true, false, 61), (false, true, 62)] {
+        for (ten_bit, tx_search, seed) in
+            [(false, false, 61u32), (true, false, 61), (false, true, 62)]
+        {
             let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
             let y4m = Command::new("ffmpeg")
                 .args([
@@ -30789,8 +33968,7 @@ pub(crate) mod tests {
                 args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
             }
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture: {}",
@@ -30823,7 +34001,11 @@ pub(crate) mod tests {
             );
             let (frames, hidden) = decode_all_frames_vs_oracle(
                 &stream,
-                &format!("sb128c-inter-none-{}-{}", if ten_bit { 10 } else { 8 }, tx_search),
+                &format!(
+                    "sb128c-inter-none-{}-{}",
+                    if ten_bit { 10 } else { 8 },
+                    tx_search
+                ),
             );
             let (none128, chroma_units, intra128) = (
                 crate::decode::inter_sb128_none_hits() - before.0,
@@ -30962,16 +34144,16 @@ pub(crate) mod tests {
             "{NAME}: the encoder did not write a 128x128-superblock 8-bit sequence header -- \
              the flags never arrived"
         );
-        let before = (crate::decode::inter_sb128_none_hits(), crate::decode::chroma_split_tx_hits());
+        let before = (
+            crate::decode::inter_sb128_none_hits(),
+            crate::decode::chroma_split_tx_hits(),
+        );
         let (frames, hidden) = decode_all_frames_vs_oracle(&stream, "av1444128-128none-mu-chroma");
         let (none128, chroma_units) = (
             crate::decode::inter_sb128_none_hits() - before.0,
             crate::decode::chroma_split_tx_hits() - before.1,
         );
-        assert!(
-            frames >= 11,
-            "{NAME}: only {frames} decode-order frames"
-        );
+        assert!(frames >= 11, "{NAME}: only {frames} decode-order frames");
         assert!(
             none128 >= 8,
             "{NAME}: only {none128} inter 128x128 PARTITION_NONE roots -- the recipe stopped \
@@ -31075,8 +34257,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -31118,7 +34299,10 @@ pub(crate) mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -31226,10 +34410,7 @@ pub(crate) mod tests {
     /// vacuous for this defect.
     #[test]
     fn a_frame_edge_straddling_band_decodes_pixel_exact() {
-        edge32_gate(
-            "a_frame_edge_straddling_band_decodes_pixel_exact",
-            false,
-        );
+        edge32_gate("a_frame_edge_straddling_band_decodes_pixel_exact", false);
     }
 
     fn edge32_gate(name: &str, flat_band: bool) {
@@ -31326,8 +34507,16 @@ pub(crate) mod tests {
                 // never fired. `noise` on top keeps screen-content detection
                 // (and its palette-strip refusal) off.
                 let (cw, ch) = (
-                    if flat_band && width % 64 != 0 { width - 16 } else { width },
-                    if flat_band && height % 64 != 0 { height - 16 } else { height },
+                    if flat_band && width % 64 != 0 {
+                        width - 16
+                    } else {
+                        width
+                    },
+                    if flat_band && height % 64 != 0 {
+                        height - 16
+                    } else {
+                        height
+                    },
                 );
                 let pad = if flat_band {
                     format!("pad={width}:{height}:0:0:gray,")
@@ -31341,8 +34530,21 @@ pub(crate) mod tests {
                 let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix, "-strict",
-                        "-1", "-t", &format!("{duration}"), "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-pix_fmt",
+                        pix,
+                        "-strict",
+                        "-1",
+                        "-t",
+                        &format!("{duration}"),
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -31391,8 +34593,7 @@ pub(crate) mod tests {
                     args.push(&tile_arg);
                 }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "{name}: aomenc refused the fixture: {}",
@@ -31431,8 +34632,7 @@ pub(crate) mod tests {
                     }
                 };
                 let after = crate::decode::edge32_hits();
-                let delta: Vec<usize> =
-                    (0..8).map(|i| after[i] - before[i]).collect();
+                let delta: Vec<usize> = (0..8).map(|i| after[i] - before[i]).collect();
                 let reference = if ten_bit {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len())
                 } else {
@@ -31598,21 +34798,36 @@ pub(crate) mod tests {
             let mut args = base_args.clone();
             args.extend_from_slice(extra);
             args.extend_from_slice(&["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            assert!(!out.stdout.is_empty(), "{NAME}: aomenc wrote an empty stream");
+            assert!(
+                !out.stdout.is_empty(),
+                "{NAME}: aomenc wrote an empty stream"
+            );
             out.stdout
         };
         let render = |source: &str, pix_fmt: &str| -> Vec<u8> {
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", source, "-t", "0.04", "-pix_fmt", pix_fmt,
-                    "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    source,
+                    "-t",
+                    "0.04",
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -31640,7 +34855,11 @@ pub(crate) mod tests {
             let seed = 42 + attempt;
             // Two quantisers per seed: the coarse one keeps most blocks on
             // one transform, the fine one is what actually splits them.
-            let cq = if attempt % 2 == 0 { "--cq-level=20" } else { "--cq-level=40" };
+            let cq = if attempt % 2 == 0 {
+                "--cq-level=20"
+            } else {
+                "--cq-level=40"
+            };
             let y4m = render(
                 &gradients_source(seed, width, height, "duration=0.04:rate=25"),
                 "yuv420p",
@@ -31661,9 +34880,18 @@ pub(crate) mod tests {
             };
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(frames.len(), 1, "{NAME}: expected one frame (seed {seed})");
-            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME} luma vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME} U vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME} V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "{NAME} luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].u, ffmpeg_frames[0].u,
+                "{NAME} U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].v, ffmpeg_frames[0].v,
+                "{NAME} V vs ffmpeg (seed {seed})"
+            );
             firing += crate::decode::sq_chroma_tx_hits() - before;
             matched += 1;
         }
@@ -31674,7 +34902,10 @@ pub(crate) mod tests {
             &gradients_source(42, width, height, "duration=0.04:rate=25"),
             "yuv420p10le",
         );
-        let stream10 = encode(&y4m10, &["--cq-level=20", "--input-bit-depth=10", "--bit-depth=10"]);
+        let stream10 = encode(
+            &y4m10,
+            &["--cq-level=20", "--input-bit-depth=10", "--bit-depth=10"],
+        );
         let mut probe = Av1Parser::new();
         let mut pos = 0usize;
         while pos < stream10.len() && probe.sequence_header().is_none() {
@@ -31696,7 +34927,10 @@ pub(crate) mod tests {
             Err(e) => panic!("{NAME}: decode_stream refused the 10-bit stream: {e}"),
         };
         let ffmpeg10 = ffmpeg_decode_sequence_10bit(&stream10, width, height, 1);
-        assert_eq!(frames10[0].y, ffmpeg10[0].y, "{NAME} luma vs ffmpeg (10-bit)");
+        assert_eq!(
+            frames10[0].y, ffmpeg10[0].y,
+            "{NAME} luma vs ffmpeg (10-bit)"
+        );
         assert_eq!(frames10[0].u, ffmpeg10[0].u, "{NAME} U vs ffmpeg (10-bit)");
         assert_eq!(frames10[0].v, ffmpeg10[0].v, "{NAME} V vs ffmpeg (10-bit)");
         let firing10 = crate::decode::sq_chroma_tx_hits() - before10;
@@ -31734,7 +34968,8 @@ pub(crate) mod tests {
     /// tool skips.
     #[test]
     fn a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact() {
-        const NAME: &str = "a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact";
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -31767,7 +35002,12 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source,
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
                     // REAL chroma (lane-sqchroma r1 dropped the `hue=s=0`
                     // guard this recipe carried): the "PRE-EXISTING square-path
                     // chroma defect" that guard named does not reproduce at
@@ -31776,8 +35016,11 @@ pub(crate) mod tests {
                     // `--enable-rect-partitions=0`, and this gate is green with
                     // the filter gone. Its own gate is
                     // `a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact`.
-                    "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -31817,15 +35060,17 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stream = out.stdout;
-            assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            assert!(
+                !stream.is_empty(),
+                "{NAME}: aomenc wrote an empty stream (seed {seed})"
+            );
             let attempt_before = crate::decode::rect_split_tx_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
@@ -31876,9 +35121,18 @@ pub(crate) mod tests {
                     diffs.len(),
                 );
             }
-            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             compared_hits += crate::decode::rect_split_tx_hits() - attempt_before;
             matched += 1;
         }
@@ -31964,14 +35218,33 @@ pub(crate) mod tests {
                 "geq=lum='128+80*sin(2*PI*Y/{period})':cb='128+60*sin(2*PI*X/{period})':cr=128,\
                  noise=alls=6:allf=t"
             );
-            let cq = if attempt % 4 < 2 { "--cq-level=20" } else { "--cq-level=40" };
+            let cq = if attempt % 4 < 2 {
+                "--cq-level=20"
+            } else {
+                "--cq-level=40"
+            };
             let y4m = Command::new("ffmpeg")
                 .args([
                     // `-strict -1`: y4m calls 10-bit an unofficial pixel
                     // format and refuses to write the header otherwise (no-op
                     // at 8 bit).
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-vf", &filter, "-t", "0.04",
-                    "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-vf",
+                    &filter,
+                    "-t",
+                    "0.04",
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -32027,15 +35300,17 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stream = out.stdout;
-            assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            assert!(
+                !stream.is_empty(),
+                "{NAME}: aomenc wrote an empty stream (seed {seed})"
+            );
             if ten_bit {
                 let mut probe = Av1Parser::new();
                 let mut pos = 0usize;
@@ -32193,18 +35468,30 @@ pub(crate) mod tests {
             let seed = 42 + attempt;
             // Diagnosis knob: which content makes RD pick a HORZ/VERT strip
             // AND filter intra on it is a search (see this round's report).
-            let source = match std::env::var("EC_RECTSPLIT_SRC").unwrap_or_default().as_str() {
+            let source = match std::env::var("EC_RECTSPLIT_SRC")
+                .unwrap_or_default()
+                .as_str()
+            {
                 "bars" => format!("smptebars=size={width}x{height}:duration=0.04:rate=25"),
                 "src2" => format!("testsrc2=size={width}x{height}:duration=0.04:rate=25"),
                 _ => gradients_source(seed, width, height, "duration=0.04:rate=25"),
             };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source,
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
                     // Real chroma: the `hue=s=0` guard gate (a) carried is
                     // gone (lane-sqchroma r1 -- the square-path chroma defect
                     // it named does not reproduce at HEAD).
-                    "-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -32282,15 +35569,17 @@ pub(crate) mod tests {
                     other => panic!("unknown EC_RECTSPLIT_OFF entry {other}"),
                 });
             }
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stream = out.stdout;
-            assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            assert!(
+                !stream.is_empty(),
+                "{NAME}: aomenc wrote an empty stream (seed {seed})"
+            );
             let attempt_before = crate::decode::filter_intra_rect_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
@@ -32335,9 +35624,18 @@ pub(crate) mod tests {
                     diffs.len(),
                 );
             }
-            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             compared_hits += crate::decode::filter_intra_rect_hits() - attempt_before;
             matched += 1;
         }
@@ -32464,8 +35762,8 @@ pub(crate) mod tests {
         // sub-16 strip with a SPLIT transform) is ported, so the pinned
         // stream is now a full pixel compare -- what the doc above said this
         // test should become the round that ceiling lifted.
-        let frames = decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{NAME}: decode refused: {e}"));
+        let frames =
+            decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: decode refused: {e}"));
         let hits = crate::decode::filter_intra_rect_sub16_hits() - before;
         // TWO now, not the one the truncated decode used to see: the frame
         // no longer stops at the first filter-intra strip, so the second one
@@ -32570,8 +35868,17 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -32624,15 +35931,17 @@ pub(crate) mod tests {
                     other => panic!("unknown EC_FISTRIP_OFF entry {other}"),
                 });
             }
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stream = out.stdout;
-            assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            assert!(
+                !stream.is_empty(),
+                "{NAME}: aomenc wrote an empty stream (seed {seed})"
+            );
             let attempt_before = crate::decode::filter_intra_rect_sub16_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
@@ -32654,9 +35963,18 @@ pub(crate) mod tests {
             };
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(frames.len(), 1, "{NAME}: expected one frame (seed {seed})");
-            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             compared_hits += crate::decode::filter_intra_rect_sub16_hits() - attempt_before;
             matched += 1;
         }
@@ -32715,7 +36033,8 @@ pub(crate) mod tests {
     ///    seeds 43 and 50 are pixel-exact.
     #[test]
     fn a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact() {
-        const NAME: &str = "a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact";
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -32748,7 +36067,12 @@ pub(crate) mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source,
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
                     // REAL chroma (lane-sqchroma r1 dropped the `hue=s=0`
                     // guard this recipe carried): the "PRE-EXISTING square-path
                     // chroma defect" that guard named does not reproduce at
@@ -32757,8 +36081,11 @@ pub(crate) mod tests {
                     // `--enable-rect-partitions=0`, and this gate is green with
                     // the filter gone. Its own gate is
                     // `a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact`.
-                    "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -32798,15 +36125,17 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stream = out.stdout;
-            assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            assert!(
+                !stream.is_empty(),
+                "{NAME}: aomenc wrote an empty stream (seed {seed})"
+            );
             let attempt_before = crate::decode::rect_split_sb_interior_tu_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
@@ -32857,9 +36186,18 @@ pub(crate) mod tests {
                     diffs.len(),
                 );
             }
-            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                frames[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             compared_hits += crate::decode::rect_split_sb_interior_tu_hits() - attempt_before;
             matched += 1;
         }
@@ -32964,8 +36302,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -33007,7 +36344,10 @@ pub(crate) mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -33106,9 +36446,8 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a rect64 dequant call with CURRENT_Q_IDX != base_q_idx -- class gate-blind-to-feature"]
     fn a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact()
-    {
-        const NAME: &str =
-            "a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact";
+     {
+        const NAME: &str = "a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -33179,8 +36518,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -33213,7 +36551,10 @@ pub(crate) mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -33364,8 +36705,17 @@ pub(crate) mod tests {
             };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -33404,8 +36754,7 @@ pub(crate) mod tests {
                 "-",
                 "-",
             ];
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -33469,7 +36818,10 @@ pub(crate) mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -33599,11 +36951,28 @@ pub(crate) mod tests {
                     )
                 };
                 let cq_level = format!("--cq-level={}", 24 + (attempt % 4) * 8);
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -33655,8 +37024,7 @@ pub(crate) mod tests {
                     "-",
                     "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -33849,11 +37217,28 @@ pub(crate) mod tests {
                 } else {
                     format!("--cq-level={}", if attempt % 4 < 2 { 32 } else { 63 })
                 };
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -33899,8 +37284,7 @@ pub(crate) mod tests {
                     "-",
                     "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -34081,7 +37465,8 @@ pub(crate) mod tests {
         for bit_depth in [8u32, 10u32] {
             let mut named_refusals = 0u32;
             let mut matched = 0u32;
-            let (mut fi_horz_proved, mut fi_vert_proved, mut strips_proved) = (0usize, 0usize, 0usize);
+            let (mut fi_horz_proved, mut fi_vert_proved, mut strips_proved) =
+                (0usize, 0usize, 0usize);
             let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
             for attempt in 0..n_attempts {
                 let seed = 42 + attempt;
@@ -34102,13 +37487,32 @@ pub(crate) mod tests {
                 // lane-band63: 63 joins the rotation -- filter intra ON at a
                 // near-max quantiser is exactly the configuration the stale
                 // cq-63 premise blamed, and it decodes exact.
-                let cq_level =
-                    format!("--cq-level={}", [32, 45, 55, 63][(attempt / 2 % 4) as usize]);
-                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let cq_level = format!(
+                    "--cq-level={}",
+                    [32, 45, 55, 63][(attempt / 2 % 4) as usize]
+                );
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        &duration.to_string(),
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -34163,8 +37567,7 @@ pub(crate) mod tests {
                     "-",
                     "-",
                 ];
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args(&args), &y4m.stdout);
+                let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -34336,13 +37739,30 @@ pub(crate) mod tests {
             let duration = frame_count as f64 / 25.0;
             let source = match source_override {
                 Some(src) => format!("{src}=size={width}x{height}:duration={duration}:rate=25"),
-                None => gradients_source(seed, width, height, &format!("duration={duration}:rate=25")),
+                None => {
+                    gradients_source(seed, width, height, &format!("duration={duration}:rate=25"))
+                }
             };
-            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix_fmt = if bit_depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt, "-strict",
-                    "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -34358,7 +37778,10 @@ pub(crate) mod tests {
             let rows = format!("--tile-rows={tile_rows_log2}");
             let limit = format!("--limit={frame_count}");
             let depth_args: Vec<String> = if bit_depth == 10 {
-                vec!["--input-bit-depth=10".to_owned(), "--bit-depth=10".to_owned()]
+                vec![
+                    "--input-bit-depth=10".to_owned(),
+                    "--bit-depth=10".to_owned(),
+                ]
             } else {
                 Vec::new()
             };
@@ -34398,8 +37821,7 @@ pub(crate) mod tests {
             args.extend(extra.iter().copied());
             args.extend(depth_args.iter().map(String::as_str));
             args.extend(["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -34415,7 +37837,9 @@ pub(crate) mod tests {
                 let mut pos = 0usize;
                 let mut checked = false;
                 while pos < stream.len() {
-                    let obu = probe.parse_obu(&stream[pos..]).expect("parsing the gate stream");
+                    let obu = probe
+                        .parse_obu(&stream[pos..])
+                        .expect("parsing the gate stream");
                     pos += obu.total_size;
                     let header = match &obu.kind {
                         ObuKind::Frame(h, _) => h,
@@ -34461,7 +37885,10 @@ pub(crate) mod tests {
                     );
                     checked = true;
                 }
-                assert!(checked, "{name}: no frame header in the stream (seed {seed})");
+                assert!(
+                    checked,
+                    "{name}: no frame header in the stream (seed {seed})"
+                );
             }
 
             let before = crate::decode::tile_hits();
@@ -34501,7 +37928,10 @@ pub(crate) mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{name} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{name} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{name} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{name} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -34683,12 +38113,19 @@ pub(crate) mod tests {
             0,
             8,
             1,
-            &["--enable-palette=1", "--tune-content=screen", "--cq-level=30", "--enable-tx-size-search=0", "--max-partition-size=32",
+            &[
+                "--enable-palette=1",
+                "--tune-content=screen",
+                "--cq-level=30",
+                "--enable-tx-size-search=0",
+                "--max-partition-size=32",
                 // Screen content + rect strips is a separate, pre-existing
                 // refusal ("palette syntax is consumed for square blocks
                 // only"); this arm owns the palette CACHE at a tile edge, so
                 // it takes the square-only path the other palette gates take.
-                "--enable-rect-partitions=0", "--enable-ab-partitions=0"],
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+            ],
             true,
             Some("smptebars"),
         );
@@ -34738,7 +38175,7 @@ pub(crate) mod tests {
     /// scan-weights-cross-axis).
     #[test]
     fn a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact()
-    {
+     {
         const NAME: &str = "a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact";
         // No seed is excluded any more: seed 46's cq-32 mismatch was the
         // per-transform-unit reach (lane-band46 / palette2 r12), and the pin
@@ -34780,7 +38217,14 @@ pub(crate) mod tests {
         // counter-from-refused-stream: only attempts that compared exact
         // count).
         let mut depth1_decoded = 0usize;
-        for (bit_depth, cq) in [(8u32, 45u32), (8, 32), (8, 60), (10, 45), (10, 32), (10, 60)] {
+        for (bit_depth, cq) in [
+            (8u32, 45u32),
+            (8, 32),
+            (8, 60),
+            (10, 45),
+            (10, 32),
+            (10, 60),
+        ] {
             for attempt in 0..n_attempts {
                 let seed = 42 + attempt;
                 if EXCLUDED_SEEDS.contains(&seed) {
@@ -34842,9 +38286,11 @@ pub(crate) mod tests {
                     // silently dropped -- selection is on "the stream carries
                     // the feature", never on "the stream decoded correctly".
                     out_of_scope += 1;
-                    if frames.iter().zip(&reference).any(|(g, w)| {
-                        g.y != w.y || g.u != w.u || g.v != w.v
-                    }) {
+                    if frames
+                        .iter()
+                        .zip(&reference)
+                        .any(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v)
+                    {
                         out_of_scope_mismatch += 1;
                         eprintln!(
                             "{NAME}: {bit_depth}-bit cq {cq} seed {seed} MISMATCHES with zero \
@@ -34943,7 +38389,11 @@ pub(crate) mod tests {
     ) -> Vec<u8> {
         const NAME: &str = "rectchroma_stream";
         let seed = 42 + attempt;
-        let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+        let pix_fmt = if bit_depth == 10 {
+            "yuv420p10le"
+        } else {
+            "yuv420p"
+        };
         // `gradients_source`, the content the sibling split-transform
         // superblock gate uses. A band/noise `geq` fixture was tried
         // first (r1) and gave 12/12 pixel-exact streams carrying ZERO
@@ -34955,14 +38405,25 @@ pub(crate) mod tests {
         let source = if attempt % 2 == 0 {
             format!("color=c=black:size={width}x{height}:duration=0.04:rate=25,{bands}")
         } else {
-            format!(
-                "color=c=black:size={height}x{width}:duration=0.04:rate=25,{bands},transpose=1"
-            )
+            format!("color=c=black:size={height}x{width}:duration=0.04:rate=25,{bands},transpose=1")
         };
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
-                pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-t",
+                "0.04",
+                "-pix_fmt",
+                pix_fmt,
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -34977,8 +38438,8 @@ pub(crate) mod tests {
         let cq_arg = format!("--cq-level={cq}");
         let depth_arg = format!("--bit-depth={bit_depth}");
         let input_depth_arg = format!("--input-bit-depth={bit_depth}");
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -35016,7 +38477,9 @@ pub(crate) mod tests {
                 "-o",
                 "-",
                 "-",
-            ]), &y4m.stdout);
+            ]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "{NAME}: aomenc refused the fixture: {}",
@@ -35054,13 +38517,21 @@ pub(crate) mod tests {
             };
             assert_eq!(frames.len(), reference.len(), "{NAME}: frame count");
             for (i, (got, want)) in frames.iter().zip(&reference).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma ({bit_depth}-bit seed 46)");
-                assert_eq!(got.u, want.u, "{NAME} frame {i} U ({bit_depth}-bit seed 46)");
-                assert_eq!(got.v, want.v, "{NAME} frame {i} V ({bit_depth}-bit seed 46)");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma ({bit_depth}-bit seed 46)"
+                );
+                assert_eq!(
+                    got.u, want.u,
+                    "{NAME} frame {i} U ({bit_depth}-bit seed 46)"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{NAME} frame {i} V ({bit_depth}-bit seed 46)"
+                );
             }
         }
     }
-
 
     /// lane-band46 r1: a real `aomenc` band stream whose 16x16 (and 8x8)
     /// intra blocks SPLIT their transform, so every unit but the first
@@ -35099,7 +38570,11 @@ pub(crate) mod tests {
         let mut fixed_tus_10bit = 0usize;
         let mut seed46_compared = [false; 2];
         for (di, bit_depth) in [8u32, 10].into_iter().enumerate() {
-            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix_fmt = if bit_depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             for seed in 42u32..=51 {
                 // Byte-identical recipe to the 1:4-strip sibling gate, whose
                 // seed-46 attempt is what exposed this defect (that gate
@@ -35117,8 +38592,21 @@ pub(crate) mod tests {
                 };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
-                        pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        "0.04",
+                        "-pix_fmt",
+                        pix_fmt,
+                        "-strict",
+                        "-1",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -35132,8 +38620,8 @@ pub(crate) mod tests {
                 );
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
-                let out = run_with_stdin(Command::new(aomenc_path())
-                    .args([
+                let out = run_with_stdin(
+                    Command::new(aomenc_path()).args([
                         "--codec=av1",
                         "--passes=1",
                         "--end-usage=q",
@@ -35162,7 +38650,9 @@ pub(crate) mod tests {
                         "-o",
                         "-",
                         "-",
-                    ]), &y4m.stdout);
+                    ]),
+                    &y4m.stdout,
+                );
                 assert!(
                     out.status.success(),
                     "{NAME}: aomenc refused the fixture: {}",
@@ -35228,7 +38718,8 @@ pub(crate) mod tests {
         assert!(
             seed46_compared[0] && seed46_compared[1],
             "{NAME}: seed 46 was not compared on both depths (8-bit {}, 10-bit {})",
-            seed46_compared[0], seed46_compared[1]
+            seed46_compared[0],
+            seed46_compared[1]
         );
         assert!(
             fixed_tus > 0,
@@ -35298,107 +38789,142 @@ pub(crate) mod tests {
             // resolves to TX_4X4 -- whose txfm context this round fixed --
             // was unreachable by construction. The second arm turns it on.
             for tx_search in [0usize, 1] {
-            for depth in [8usize, 10] {
-                let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
-                let y4m = Command::new("ffmpeg")
-                    .args([
-                        "-v", "error", "-f", "lavfi", "-i",
-                        &if flat {
-                            format!("color=c=gray:size={width}x{height}")
-                        } else {
-                            format!("mandelbrot=size={width}x{height}:start_x=-0.6")
-                        },
-                        "-pix_fmt", pix, "-strict", "-1", "-t", "1", "-vframes", "1",
-                        "-f", "yuv4mpegpipe", "-",
-                    ])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .expect("ffmpeg failed to run");
-                assert!(
-                    y4m.status.success(),
-                    "{NAME}: ffmpeg fixture ({width}x{height}, depth={depth}): {}",
-                    String::from_utf8_lossy(&y4m.stderr)
-                );
-                let encode = || {
-                    let out = run_with_stdin(Command::new(aomenc_path())
+                for depth in [8usize, 10] {
+                    let pix = if depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    };
+                    let y4m = Command::new("ffmpeg")
                         .args([
-                            "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
-                            "--cpu-used=3", "--threads=1", "--row-mt=0", "--sb-size=64",
-                            "--kf-max-dist=0", "--enable-rect-partitions=1",
-                            "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
-                            &format!("--enable-tx-size-search={tx_search}"),
-                            "--reduced-tx-type-set=1",
-                            "--min-partition-size=8", "--max-partition-size=64",
-                            &format!("--input-bit-depth={depth}"),
-                            &format!("--bit-depth={depth}"),
-                            "--obu", "-o", "-", "-",
-                        ]), &y4m.stdout);
+                            "-v",
+                            "error",
+                            "-f",
+                            "lavfi",
+                            "-i",
+                            &if flat {
+                                format!("color=c=gray:size={width}x{height}")
+                            } else {
+                                format!("mandelbrot=size={width}x{height}:start_x=-0.6")
+                            },
+                            "-pix_fmt",
+                            pix,
+                            "-strict",
+                            "-1",
+                            "-t",
+                            "1",
+                            "-vframes",
+                            "1",
+                            "-f",
+                            "yuv4mpegpipe",
+                            "-",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("ffmpeg failed to run");
                     assert!(
-                        out.status.success(),
-                        "aomenc refused the fixture ({width}x{height}, depth={depth}): {}",
-                        String::from_utf8_lossy(&out.stderr)
+                        y4m.status.success(),
+                        "{NAME}: ffmpeg fixture ({width}x{height}, depth={depth}): {}",
+                        String::from_utf8_lossy(&y4m.stderr)
                     );
-                    out.stdout
-                };
-                let stream = encode();
-                assert_eq!(
-                    stream,
-                    encode(),
-                    "{NAME}: aomenc output is not reproducible ({width}x{height}, depth={depth})"
-                );
-                crate::decode::reset_edge_part_hits();
-                crate::decode::reset_skip_split_tx_hits();
-                let frames = match decode_stream(&stream) {
-                    Ok(frames) => frames,
-                    Err(e) => {
-                        let msg = e.to_string();
+                    let encode = || {
+                        let out = run_with_stdin(
+                            Command::new(aomenc_path()).args([
+                                "--codec=av1",
+                                "--passes=1",
+                                "--end-usage=q",
+                                "--cq-level=32",
+                                "--cpu-used=3",
+                                "--threads=1",
+                                "--row-mt=0",
+                                "--sb-size=64",
+                                "--kf-max-dist=0",
+                                "--enable-rect-partitions=1",
+                                "--enable-ab-partitions=0",
+                                "--enable-1to4-partitions=0",
+                                &format!("--enable-tx-size-search={tx_search}"),
+                                "--reduced-tx-type-set=1",
+                                "--min-partition-size=8",
+                                "--max-partition-size=64",
+                                &format!("--input-bit-depth={depth}"),
+                                &format!("--bit-depth={depth}"),
+                                "--obu",
+                                "-o",
+                                "-",
+                                "-",
+                            ]),
+                            &y4m.stdout,
+                        );
                         assert!(
-                            msg.contains("unsupported"),
-                            "{NAME}: decode failed ({width}x{height}, depth={depth}): {msg}"
+                            out.status.success(),
+                            "aomenc refused the fixture ({width}x{height}, depth={depth}): {}",
+                            String::from_utf8_lossy(&out.stderr)
                         );
-                        eprintln!(
-                            "{NAME}: {width}x{height} depth={depth} arm refused (not compared): {msg}"
-                        );
-                        continue;
-                    }
-                };
-                let hits = crate::decode::edge_part_hits();
-                let skip_split_tx = crate::decode::skip_split_tx_hits();
-                let ffmpeg_frames = if depth == 10 {
-                    ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
-                } else {
-                    ffmpeg_decode_sequence(&stream, width, height, frames.len())
-                };
-                assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
-                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                        out.stdout
+                    };
+                    let stream = encode();
                     assert_eq!(
-                        got.y, want.y,
-                        "{NAME} frame {i} luma vs ffmpeg ({width}x{height}, depth={depth}, \
+                        stream,
+                        encode(),
+                        "{NAME}: aomenc output is not reproducible ({width}x{height}, depth={depth})"
+                    );
+                    crate::decode::reset_edge_part_hits();
+                    crate::decode::reset_skip_split_tx_hits();
+                    let frames = match decode_stream(&stream) {
+                        Ok(frames) => frames,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            assert!(
+                                msg.contains("unsupported"),
+                                "{NAME}: decode failed ({width}x{height}, depth={depth}): {msg}"
+                            );
+                            eprintln!(
+                                "{NAME}: {width}x{height} depth={depth} arm refused (not compared): {msg}"
+                            );
+                            continue;
+                        }
+                    };
+                    let hits = crate::decode::edge_part_hits();
+                    let skip_split_tx = crate::decode::skip_split_tx_hits();
+                    let ffmpeg_frames = if depth == 10 {
+                        ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+                    } else {
+                        ffmpeg_decode_sequence(&stream, width, height, frames.len())
+                    };
+                    assert_eq!(
+                        ffmpeg_frames.len(),
+                        frames.len(),
+                        "{NAME}: ffmpeg frame count"
+                    );
+                    for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                        assert_eq!(
+                            got.y, want.y,
+                            "{NAME} frame {i} luma vs ffmpeg ({width}x{height}, depth={depth}, \
                          edge bits horz/split 64-level {}/{}, sub-level {}/{})",
-                        hits[0], hits[1], hits[2], hits[3]
-                    );
-                    assert_eq!(
-                        got.u, want.u,
-                        "{NAME} frame {i} U vs ffmpeg ({width}x{height}, depth={depth})"
-                    );
-                    assert_eq!(
-                        got.v, want.v,
-                        "{NAME} frame {i} V vs ffmpeg ({width}x{height}, depth={depth})"
-                    );
-                }
-                compared += 1;
-                edge_horz_total += hits[0];
-                edge_sub_total += hits[2];
-                skip_split_tx_total += skip_split_tx;
-                eprintln!(
-                    "{NAME}: pixel-exact {width}x{height} at {depth}-bit tx_search={tx_search}, \
+                            hits[0], hits[1], hits[2], hits[3]
+                        );
+                        assert_eq!(
+                            got.u, want.u,
+                            "{NAME} frame {i} U vs ffmpeg ({width}x{height}, depth={depth})"
+                        );
+                        assert_eq!(
+                            got.v, want.v,
+                            "{NAME} frame {i} V vs ffmpeg ({width}x{height}, depth={depth})"
+                        );
+                    }
+                    compared += 1;
+                    edge_horz_total += hits[0];
+                    edge_sub_total += hits[2];
+                    skip_split_tx_total += skip_split_tx;
+                    eprintln!(
+                        "{NAME}: pixel-exact {width}x{height} at {depth}-bit tx_search={tx_search}, \
                      edge bits 64-level horz/vert={} split={} sub-level horz/vert={} split={}, \
                      skipped 8x8 leaves with TX_4X4 {skip_split_tx}",
-                    hits[0], hits[1], hits[2], hits[3]
-                );
-            }
+                        hits[0], hits[1], hits[2], hits[3]
+                    );
+                }
             }
         }
         assert!(
@@ -35423,7 +38949,9 @@ pub(crate) mod tests {
         // that arm is asserted by the pinned film fixture
         // `the_hunger_games_ss600_key_frame_skipped_split_tx_decodes_pixel_exact`
         // instead; this counter is reported, not gated.
-        eprintln!("{NAME}: {skip_split_tx_total} skipped 8x8 TX_4X4 leaves across compared attempts");
+        eprintln!(
+            "{NAME}: {skip_split_tx_total} skipped 8x8 TX_4X4 leaves across compared attempts"
+        );
     }
 
     /// lane-rectchroma2 r1, the defect this gate exists for: our inter path
@@ -35472,13 +39000,28 @@ pub(crate) mod tests {
             .enumerate()
         {
             for (di, depth) in [8usize, 10].into_iter().enumerate() {
-                let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let pix = if depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
                         &format!("mandelbrot=size={width}x{height}:rate=25"),
-                        "-pix_fmt", pix, "-strict", "-1", "-vframes", &FRAMES.to_string(),
-                        "-f", "yuv4mpegpipe", "-",
+                        "-pix_fmt",
+                        pix,
+                        "-strict",
+                        "-1",
+                        "-vframes",
+                        &FRAMES.to_string(),
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -35492,31 +39035,52 @@ pub(crate) mod tests {
                 );
                 for cq in [20usize, 32, 45] {
                     let encode = || {
-                        let out = run_with_stdin(Command::new(aomenc_path())
-                            .args([
-                                "--codec=av1", "--passes=1", "--end-usage=q",
+                        let out = run_with_stdin(
+                            Command::new(aomenc_path()).args([
+                                "--codec=av1",
+                                "--passes=1",
+                                "--end-usage=q",
                                 &format!("--cq-level={cq}"),
-                                "--cpu-used=4", "--threads=1", "--row-mt=0",
-                                "--kf-max-dist=9999", &format!("--limit={FRAMES}"),
+                                "--cpu-used=4",
+                                "--threads=1",
+                                "--row-mt=0",
+                                "--kf-max-dist=9999",
+                                &format!("--limit={FRAMES}"),
                                 "--lag-in-frames=0",
                                 &format!("--bit-depth={depth}"),
                                 &format!("--input-bit-depth={depth}"),
                                 // Rect partitions ON is the whole point; every
                                 // other tool below is another lane's open gap
                                 // that would refuse before a pixel compare.
-                                "--enable-rect-partitions=1", "--enable-ab-partitions=0",
-                                "--enable-1to4-partitions=0", "--min-partition-size=8",
-                                "--max-partition-size=64", "--enable-palette=0",
-                                "--enable-intrabc=0", "--enable-warped-motion=0",
-                                "--enable-obmc=0", "--enable-masked-comp=0",
-                                "--enable-interintra-comp=0", "--enable-onesided-comp=0",
-                                "--enable-interintra-wedge=0", "--enable-smooth-interintra=0",
-                                "--enable-ref-frame-mvs=0", "--enable-angle-delta=0",
-                                "--enable-cfl-intra=0", "--enable-directional-intra=0",
-                                "--enable-smooth-intra=0", "--enable-paeth-intra=0",
-                                "--enable-filter-intra=0", "--enable-tx-size-search=0",
-                                "--obu", "-o", "-", "-",
-                            ]), &y4m.stdout);
+                                "--enable-rect-partitions=1",
+                                "--enable-ab-partitions=0",
+                                "--enable-1to4-partitions=0",
+                                "--min-partition-size=8",
+                                "--max-partition-size=64",
+                                "--enable-palette=0",
+                                "--enable-intrabc=0",
+                                "--enable-warped-motion=0",
+                                "--enable-obmc=0",
+                                "--enable-masked-comp=0",
+                                "--enable-interintra-comp=0",
+                                "--enable-onesided-comp=0",
+                                "--enable-interintra-wedge=0",
+                                "--enable-smooth-interintra=0",
+                                "--enable-ref-frame-mvs=0",
+                                "--enable-angle-delta=0",
+                                "--enable-cfl-intra=0",
+                                "--enable-directional-intra=0",
+                                "--enable-smooth-intra=0",
+                                "--enable-paeth-intra=0",
+                                "--enable-filter-intra=0",
+                                "--enable-tx-size-search=0",
+                                "--obu",
+                                "-o",
+                                "-",
+                                "-",
+                            ]),
+                            &y4m.stdout,
+                        );
                         assert!(
                             out.status.success(),
                             "aomenc refused the fixture ({width}x{height}, depth={depth}, \
@@ -35603,15 +39167,16 @@ pub(crate) mod tests {
             narrow_by_depth[0] > 0 && narrow_by_depth[1] > 0,
             "{NAME}: no rect-chroma narrow kernel fired at 8-bit ({}) or 10-bit ({}) -- the \
              recipe lost the shape this gate pins",
-            narrow_by_depth[0], narrow_by_depth[1]
+            narrow_by_depth[0],
+            narrow_by_depth[1]
         );
         assert!(
             narrow_by_shape[0] > 0 && narrow_by_shape[1] > 0,
             "{NAME}: the shape fired in only one orientation (192x128 {}, 128x192 {})",
-            narrow_by_shape[0], narrow_by_shape[1]
+            narrow_by_shape[0],
+            narrow_by_shape[1]
         );
     }
-
 
     /// lane-intra14 r1's decisive gate: a real aomenc INTER sequence with
     /// `--enable-1to4-partitions=1`, whose fast-zooming content makes aomenc
@@ -35712,9 +39277,29 @@ pub(crate) mod tests {
             );
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-vf", "hue=s=0", "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
-                    "-strict", "-1", "-t", "0.32", "-f", "yuv4mpegpipe", "-strict", "-1", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-vf",
+                    "hue=s=0",
+                    "-pix_fmt",
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.32",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -35737,82 +39322,89 @@ pub(crate) mod tests {
             let cpu = format!("--cpu-used={}", 1 + attempt % 4);
             // The higher the quantiser the more 1:4 intra strips inside inter
             // frames, so the sweep walks cq 63 first.
-            let cq = format!("--cq-level={}", [63u32, 55, 45, 35][(attempt / 4) as usize % 4]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(depth_args)
-                .arg(&cpu)
-                .arg(&cq)
-                .args([
-                    // Every flag spelled exactly once (class
-                    // [[aomenc-last-flag-wins]]). These are what the gate is
-                    // about: 1:4 partitions ON, min size 16 so the 16x16-level
-                    // 1:4 (refused elsewhere) is out of reach.
-                    "--enable-rect-partitions=1",
-                    "--enable-1to4-partitions=1",
-                    // MEASURED (r1): at `--min-partition-size=16` aomenc codes
-                    // 16x16-level 1:4 partitions (16x4/4x16 strips), which the
-                    // inter partition path refuses by name (another lane's
-                    // surface) in 12/40 attempts. 32 keeps this gate's two
-                    // reachable levels -- the 32-level 32x8/8x32 and the
-                    // superblock-level 64x16/16x64 -- and nothing else.
-                    "--min-partition-size=32",
-                    "--max-partition-size=64",
-                    // MEASURED (r1): with tx-size search ON, 8/40 attempts stop
-                    // at the 2:1 strip's own split-tx refusal (merge-cross-product,
-                    // another lane's surface) before a 1:4 strip is reached.
-                    "--enable-tx-size-search=0",
-                    "--enable-filter-intra=1",
-                    "--enable-intra-edge-filter=1",
-                    "--codec=av1",
-                    "--passes=1",
-                    "--end-usage=q",
-                    "--lag-in-frames=0",
-                    "--auto-alt-ref=0",
-                    "--kf-min-dist=1000",
-                    "--kf-max-dist=1000",
-                    "--threads=1",
-                    "--row-mt=0",
-                    "--enable-order-hint=0",
-                    "--enable-warped-motion=0",
-                    "--enable-obmc=0",
-                    "--enable-masked-comp=0",
-                    "--enable-interintra-comp=0",
-                    "--enable-dist-wtd-comp=0",
-                    "--enable-diff-wtd-comp=0",
-                    "--enable-onesided-comp=0",
-                    "--enable-interintra-wedge=0",
-                    "--enable-smooth-interintra=0",
-                    "--enable-ab-partitions=0",
-                    "--enable-smooth-intra=0",
-                    "--enable-paeth-intra=0",
-                    "--enable-directional-intra=0",
-                    "--enable-angle-delta=0",
-                    "--enable-cdef=0",
-                    "--enable-restoration=0",
-                    // Ledger dead-end (lane-r14): a NEW gate spelling
-                    // `--enable-cfl-intra=1` retires that tool from
-                    // `NEVER_EXERCISED_8BIT` on the flag alone while no CfL
-                    // hit counter exists to assert -- so it stays 0 here.
-                    // Palette stays 0 for the same class of reason: this arm
-                    // refuses a screen-content frame whole, so a palette flag
-                    // would buy no coverage.
-                    "--enable-palette=0",
-                    "--enable-intrabc=0",
-                    "--enable-cfl-intra=0",
-                    "--enable-ref-frame-mvs=0",
-                    "--obu",
-                    "-o",
-                    "-",
-                    "-",
-                ]), &y4m.stdout);
+            let cq = format!(
+                "--cq-level={}",
+                [63u32, 55, 45, 35][(attempt / 4) as usize % 4]
+            );
+            let out = run_with_stdin(
+                Command::new(aomenc_path())
+                    .args(depth_args)
+                    .arg(&cpu)
+                    .arg(&cq)
+                    .args([
+                        // Every flag spelled exactly once (class
+                        // [[aomenc-last-flag-wins]]). These are what the gate is
+                        // about: 1:4 partitions ON, min size 16 so the 16x16-level
+                        // 1:4 (refused elsewhere) is out of reach.
+                        "--enable-rect-partitions=1",
+                        "--enable-1to4-partitions=1",
+                        // MEASURED (r1): at `--min-partition-size=16` aomenc codes
+                        // 16x16-level 1:4 partitions (16x4/4x16 strips), which the
+                        // inter partition path refuses by name (another lane's
+                        // surface) in 12/40 attempts. 32 keeps this gate's two
+                        // reachable levels -- the 32-level 32x8/8x32 and the
+                        // superblock-level 64x16/16x64 -- and nothing else.
+                        "--min-partition-size=32",
+                        "--max-partition-size=64",
+                        // MEASURED (r1): with tx-size search ON, 8/40 attempts stop
+                        // at the 2:1 strip's own split-tx refusal (merge-cross-product,
+                        // another lane's surface) before a 1:4 strip is reached.
+                        "--enable-tx-size-search=0",
+                        "--enable-filter-intra=1",
+                        "--enable-intra-edge-filter=1",
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--lag-in-frames=0",
+                        "--auto-alt-ref=0",
+                        "--kf-min-dist=1000",
+                        "--kf-max-dist=1000",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--enable-order-hint=0",
+                        "--enable-warped-motion=0",
+                        "--enable-obmc=0",
+                        "--enable-masked-comp=0",
+                        "--enable-interintra-comp=0",
+                        "--enable-dist-wtd-comp=0",
+                        "--enable-diff-wtd-comp=0",
+                        "--enable-onesided-comp=0",
+                        "--enable-interintra-wedge=0",
+                        "--enable-smooth-interintra=0",
+                        "--enable-ab-partitions=0",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-cdef=0",
+                        "--enable-restoration=0",
+                        // Ledger dead-end (lane-r14): a NEW gate spelling
+                        // `--enable-cfl-intra=1` retires that tool from
+                        // `NEVER_EXERCISED_8BIT` on the flag alone while no CfL
+                        // hit counter exists to assert -- so it stays 0 here.
+                        // Palette stays 0 for the same class of reason: this arm
+                        // refuses a screen-content frame whole, so a palette flag
+                        // would buy no coverage.
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-cfl-intra=0",
+                        "--enable-ref-frame-mvs=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
             let stream = out.stdout;
-            let before: Vec<usize> =
-                (0..4).map(decode::intra_rect4_strip_in_inter_hits).collect();
+            let before: Vec<usize> = (0..4)
+                .map(decode::intra_rect4_strip_in_inter_hits)
+                .collect();
             let frames = match decode_stream(&stream) {
                 Ok(frames) => frames,
                 Err(e) => {
@@ -35993,7 +39585,11 @@ pub(crate) mod tests {
                     "-vf",
                     "hue=s=0",
                     "-pix_fmt",
-                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    if bit_depth == 10 {
+                        "yuv420p10le"
+                    } else {
+                        "yuv420p"
+                    },
                     "-strict",
                     "-1",
                     "-t",
@@ -36021,9 +39617,8 @@ pub(crate) mod tests {
             };
             let cq_arg = format!("--cq-level={cq}");
             let cpu_arg = format!("--cpu-used={cpu}");
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(depth_args)
-                .args([
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args(depth_args).args([
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -36070,7 +39665,9 @@ pub(crate) mod tests {
                     "-o",
                     "-",
                     "-",
-                ]), &y4m.stdout);
+                ]),
+                &y4m.stdout,
+            );
             assert!(
                 out.status.success(),
                 "aomenc refused the fixture: {}",
@@ -36137,7 +39734,10 @@ pub(crate) mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed} cq {cq})");
+                assert_eq!(
+                    got.y, want.y,
+                    "frame {i} luma vs ffmpeg (seed {seed} cq {cq})"
+                );
                 assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed} cq {cq})");
                 assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed} cq {cq})");
             }
@@ -36158,7 +39758,10 @@ pub(crate) mod tests {
             uncounted_exact,
             refusals.len() - uncounted_exact as usize,
         );
-        eprintln!("{name}: split strips seen depth1={} depth2={}", seen[1], seen[2]);
+        eprintln!(
+            "{name}: split strips seen depth1={} depth2={}",
+            seen[1], seen[2]
+        );
         assert!(
             seen[1] + seen[2] != 0,
             "{name} never observed a split-transform intra strip in an inter frame:\n{}",
@@ -36217,46 +39820,66 @@ pub(crate) mod tests {
         let (width, height, frame_count) = (256usize, 192usize, 10usize);
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=256x192:r=25", "-t", "0.4",
-                "-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=256x192:r=25",
+                "-t",
+                "0.4",
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .expect("ffmpeg failed to run");
-        assert!(y4m.status.success(), "{name}: ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+        assert!(
+            y4m.status.success(),
+            "{name}: ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
         // The source stays 8-bit for both arms: `--bit-depth=10
         // --input-bit-depth=8` is the recipe that was measured to reach the
         // refusal, and the arm's point is the coded syntax, not the input.
         let depth_arg = format!("--bit-depth={bit_depth}");
         let cq_arg = format!("--cq-level={}", if bit_depth == 10 { 45 } else { 40 });
-        let out = run_with_stdin(Command::new(aomenc_path())
-            .args([
-                "--codec=av1",
-                "--passes=1",
-                "--end-usage=q",
-                "--cpu-used=0",
-                "--lag-in-frames=0",
-                "--kf-max-dist=30",
-                "--limit=10",
-                "--threads=1",
-                "--tile-columns=0",
-                "--enable-rect-partitions=1",
-                "--enable-1to4-partitions=1",
-                "--min-partition-size=8",
-                "--sb-size=64",
-                "--input-bit-depth=8",
-                // `allow_screen_content_tools` in every frame header comes
-                // from here; the two searches below stay off so the KEY frame
-                // does not stop on a palette/intrabc RECONSTRUCTION refusal
-                // before an inter frame exists.
-                "--tune-content=screen",
-                "--enable-palette=0",
-                "--enable-intrabc=0",
-            ])
-            .args([&depth_arg, &cq_arg])
-            .args(["--obu", "-o", "-", "-"]), &y4m.stdout);
+        let out = run_with_stdin(
+            Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=30",
+                    "--limit=10",
+                    "--threads=1",
+                    "--tile-columns=0",
+                    "--enable-rect-partitions=1",
+                    "--enable-1to4-partitions=1",
+                    "--min-partition-size=8",
+                    "--sb-size=64",
+                    "--input-bit-depth=8",
+                    // `allow_screen_content_tools` in every frame header comes
+                    // from here; the two searches below stay off so the KEY frame
+                    // does not stop on a palette/intrabc RECONSTRUCTION refusal
+                    // before an inter frame exists.
+                    "--tune-content=screen",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                ])
+                .args([&depth_arg, &cq_arg])
+                .args(["--obu", "-o", "-", "-"]),
+            &y4m.stdout,
+        );
         assert!(
             out.status.success(),
             "{name}: aomenc refused the fixture: {}",
@@ -36268,7 +39891,10 @@ pub(crate) mod tests {
             panic!("{name}: decode failed -- the case this gate exists for: {e}")
         });
         let strips = decode::intra_rect_in_inter_screen_hits();
-        eprintln!("{name}: {} frames, {strips} rect intra strip(s) read the palette syntax", frames.len());
+        eprintln!(
+            "{name}: {} frames, {strips} rect intra strip(s) read the palette syntax",
+            frames.len()
+        );
         assert_eq!(frames.len(), frame_count, "{name}: frame count");
         let ffmpeg_frames = if bit_depth == 10 {
             ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
@@ -36342,7 +39968,8 @@ pub(crate) mod tests {
             Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
         };
         let now = intra_rect4_in_inter_counters();
-        let fired = (now.0 - before.0) + (now.1 - before.1) + (now.2 - before.2) + (now.3 - before.3);
+        let fired =
+            (now.0 - before.0) + (now.1 - before.1) + (now.2 - before.2) + (now.3 - before.3);
         assert!(
             fired > 0,
             "{NAME}: zero intra 1:4 strips in an inter frame (64x16/16x64/32x8/8x32 = \
@@ -36358,7 +39985,11 @@ pub(crate) mod tests {
         // 18524160 bytes, one 3840x1608 10-bit frame, so the second is a
         // no-show frame and `frames.len() == 2` was never true. The compare is
         // not vacuous: ffmpeg's own frame count is asserted equal to ours.
-        assert_eq!(frames.len(), 1, "{NAME}: one shown frame (the second frame OBU is a no-show)");
+        assert_eq!(
+            frames.len(),
+            1,
+            "{NAME}: one shown frame (the second frame OBU is a no-show)"
+        );
         assert_eq!((frames[0].width, frames[0].height), (width, height));
         let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
         assert_eq!(
@@ -36373,7 +40004,9 @@ pub(crate) mod tests {
             assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
             assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
         }
-        eprintln!("{NAME}: {fired} intra 1:4 strips in an inter frame, the shown frame pixel-exact");
+        eprintln!(
+            "{NAME}: {fired} intra 1:4 strips in an inter frame, the shown frame pixel-exact"
+        );
     }
 
     /// lane-sub8x4 r3 / lane-wit16x4 r1: the FILM witness for the un-split
@@ -36540,7 +40173,10 @@ pub(crate) mod tests {
                 assert_eq!(a.2.u, b.2.u, "{NAME}: {fixture} sink {i} U");
                 assert_eq!(a.2.v, b.2.v, "{NAME}: {fixture} sink {i} V");
             }
-            eprintln!("{NAME}: {fixture} {} sink calls identical, {dispatched} decoded on workers", serial.len());
+            eprintln!(
+                "{NAME}: {fixture} {} sink calls identical, {dispatched} decoded on workers",
+                serial.len()
+            );
         }
     }
 
@@ -36574,8 +40210,8 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/hg_arf_witness.obu");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/hg_arf_witness.obu");
         let stream = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
         let (width, height) = (3840usize, 1608usize);
@@ -36822,7 +40458,8 @@ pub(crate) mod tests {
     ///
     #[test]
     fn a_128_superblock_stream_whose_skipped_blocks_are_var_tx_decodes_pixel_exact() {
-        const NAME: &str = "a_128_superblock_stream_whose_skipped_blocks_are_var_tx_decodes_pixel_exact";
+        const NAME: &str =
+            "a_128_superblock_stream_whose_skipped_blocks_are_var_tx_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -36918,8 +40555,7 @@ pub(crate) mod tests {
     /// byte-exact against ffmpeg (class `counter-from-refused-stream`).
     #[test]
     fn an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact() {
-        const NAME: &str =
-            "an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact";
+        const NAME: &str = "an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -37037,7 +40673,11 @@ pub(crate) mod tests {
         assert_eq!(frames.len(), 15, "{NAME}: 15 shown frames");
         assert_eq!((frames[0].width, frames[0].height), (width, height));
         let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
-        assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: frame count vs ffmpeg");
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: frame count vs ffmpeg"
+        );
         for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
             assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
@@ -37077,8 +40717,7 @@ pub(crate) mod tests {
     /// different range).
     #[test]
     fn a_real_aomenc_screen_stream_with_palette_blocks_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_screen_stream_with_palette_blocks_decodes_pixel_exact";
+        const NAME: &str = "a_real_aomenc_screen_stream_with_palette_blocks_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -37115,9 +40754,18 @@ pub(crate) mod tests {
                 "{NAME} [{fixture}]: frame count"
             );
             for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(ours.y, theirs.y, "{NAME} [{fixture}]: frame {i} luma vs ffmpeg");
-                assert_eq!(ours.u, theirs.u, "{NAME} [{fixture}]: frame {i} U vs ffmpeg");
-                assert_eq!(ours.v, theirs.v, "{NAME} [{fixture}]: frame {i} V vs ffmpeg");
+                assert_eq!(
+                    ours.y, theirs.y,
+                    "{NAME} [{fixture}]: frame {i} luma vs ffmpeg"
+                );
+                assert_eq!(
+                    ours.u, theirs.u,
+                    "{NAME} [{fixture}]: frame {i} U vs ffmpeg"
+                );
+                assert_eq!(
+                    ours.v, theirs.v,
+                    "{NAME} [{fixture}]: frame {i} V vs ffmpeg"
+                );
             }
             eprintln!(
                 "{NAME} [{fixture}]: 15 frames pixel-exact on every plane; \
@@ -37251,8 +40899,7 @@ pub(crate) mod tests {
     /// 0 refusals.
     #[test]
     fn a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable() {
-        const NAME: &str =
-            "a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable";
+        const NAME: &str = "a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable";
         const REFUSAL: &str =
             "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding";
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
@@ -37330,8 +40977,7 @@ pub(crate) mod tests {
     #[test]
     fn a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable()
     {
-        const NAME: &str =
-            "a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable";
+        const NAME: &str = "a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable";
         const REFUSAL: &str = "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition";
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let before = crate::decode::intra16x4_in_inter_hits();
@@ -37473,7 +41119,6 @@ pub(crate) mod tests {
         );
     }
 
-
     /// lane-t900 r11: the frame-edge MV clamp witness.
     ///
     /// `crates/ec-av1/fixtures/hg_head_mvclamp_witness.obu` (72158 bytes,
@@ -37564,7 +41209,8 @@ pub(crate) mod tests {
     /// rests on a stream that never carried its shape.
     #[test]
     fn a_real_aomenc_inter_sequence_with_intra_sub8x8_leaves_decodes_pixel_exact() {
-        const NAME: &str = "a_real_aomenc_inter_sequence_with_intra_sub8x8_leaves_decodes_pixel_exact";
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_intra_sub8x8_leaves_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -37582,7 +41228,11 @@ pub(crate) mod tests {
         // One arm's stream, byte for byte: the lavfi source (a moving 24-row
         // random band over `128+50*sin(x/7)`) feeds aomenc through a pipe.
         let encode = |depth: u32, cq: u32, width: usize, height: usize, tiles: bool| -> Vec<u8> {
-            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let pix = if depth == 10 {
+                "yuv420p10le"
+            } else {
+                "yuv420p"
+            };
             let source = format!(
                 "color=c=gray:s={width}x{height}:d=0.24:r=25,format=gray,\
                  geq=lum='if(lt(mod(Y+N*37\\,{height})\\,24)\\,random(N*100+X+Y)*255\\,128+50*sin(X/7))',\
@@ -37590,8 +41240,21 @@ pub(crate) mod tests {
             );
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.24", "-pix_fmt", pix,
-                    "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-t",
+                    "0.24",
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -37633,10 +41296,13 @@ pub(crate) mod tests {
                 args.push("--input-bit-depth=10");
             }
             // AOMENC FLAG PRECEDENCE (COMMON): the per-arm override goes last.
-            args.push(if tiles { "--tile-columns=1" } else { "--tile-columns=0" });
+            args.push(if tiles {
+                "--tile-columns=1"
+            } else {
+                "--tile-columns=0"
+            });
             args.extend(["--obu", "-o", "-", "-"]);
-            let out = run_with_stdin(Command::new(aomenc_path())
-                .args(&args), &y4m.stdout);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
             assert!(
                 out.status.success(),
                 "{NAME}: aomenc refused the fixture (depth={depth} cq={cq} {width}x{height}): {}",
@@ -37672,7 +41338,8 @@ pub(crate) mod tests {
                 // stream before any measurement rests on it.
                 let again = encode(depth, cq, width, height, tiles);
                 assert_eq!(
-                    stream, again,
+                    stream,
+                    again,
                     "{NAME}: the fixture recipe is not reproducible ({arm}, {} vs {} bytes)",
                     stream.len(),
                     again.len()
@@ -37693,7 +41360,12 @@ pub(crate) mod tests {
                     continue;
                 }
             };
-            assert_eq!(frames.len(), FRAMES, "{NAME}: {arm} decoded {} frames", frames.len());
+            assert_eq!(
+                frames.len(),
+                FRAMES,
+                "{NAME}: {arm} decoded {} frames",
+                frames.len()
+            );
             assert!(
                 !tiles || decode::tile_hits() - tiles_before >= 2,
                 "{NAME}: {arm} decoded only {} tile(s)",
@@ -37749,7 +41421,6 @@ pub(crate) mod tests {
         );
     }
 
-
     /// lane-thread1: every per-frame/per-stream decode state now lives in
     /// [`crate::decode::FrameCtx`], not in a `thread_local!`. A static that
     /// comes back would silently re-break frame-parallel decoding (a worker
@@ -37758,14 +41429,43 @@ pub(crate) mod tests {
     #[test]
     fn no_per_frame_state_is_thread_local_any_more() {
         const MOVED: [&str; 38] = [
-            "SB128", "CDEF_BITS", "BIT_DEPTH", "SUPERRES", "CDEF_TRANSMITTED", "CDEF_SB_COLS",
-            "CDEF_IDX_GRID", "DELTA_Q_PRESENT", "DELTA_Q_RES", "CURRENT_Q_IDX", "QUANT_DELTAS",
-            "DELTA_LF_PRESENT", "DELTA_LF_RES", "DELTA_LF_MULTI", "CURRENT_DELTA_LF", "SEG",
-            "SEG_IDS", "PREV_SEG_IDS", "SEG_MI_DIMS", "ABOVE_SEG_PRED", "LEFT_SEG_PRED",
-            "CUR_SEGMENT_ID", "SEG_TILE_ORIGIN", "TX_SELECT_INTER", "REDUCED_TX_SET_INTER",
-            "ENABLE_FILTER_INTRA_INTER", "PALETTE_PRED", "INTRABC_MI_GRID", "INTRABC_DV",
-            "LUMA_TX_TYPE", "INTRABC_CHROMA_TX", "INTRA_IN_INTER_MODE", "INTER_STRIP_CHROMA",
-            "INTER_LAST_MC", "ENABLE_EDGE_FILTER", "LAST_FRAME_WIDE_MARGIN", "REACH_SB_PX",
+            "SB128",
+            "CDEF_BITS",
+            "BIT_DEPTH",
+            "SUPERRES",
+            "CDEF_TRANSMITTED",
+            "CDEF_SB_COLS",
+            "CDEF_IDX_GRID",
+            "DELTA_Q_PRESENT",
+            "DELTA_Q_RES",
+            "CURRENT_Q_IDX",
+            "QUANT_DELTAS",
+            "DELTA_LF_PRESENT",
+            "DELTA_LF_RES",
+            "DELTA_LF_MULTI",
+            "CURRENT_DELTA_LF",
+            "SEG",
+            "SEG_IDS",
+            "PREV_SEG_IDS",
+            "SEG_MI_DIMS",
+            "ABOVE_SEG_PRED",
+            "LEFT_SEG_PRED",
+            "CUR_SEGMENT_ID",
+            "SEG_TILE_ORIGIN",
+            "TX_SELECT_INTER",
+            "REDUCED_TX_SET_INTER",
+            "ENABLE_FILTER_INTRA_INTER",
+            "PALETTE_PRED",
+            "INTRABC_MI_GRID",
+            "INTRABC_DV",
+            "LUMA_TX_TYPE",
+            "INTRABC_CHROMA_TX",
+            "INTRA_IN_INTER_MODE",
+            "INTER_STRIP_CHROMA",
+            "INTER_LAST_MC",
+            "ENABLE_EDGE_FILTER",
+            "LAST_FRAME_WIDE_MARGIN",
+            "REACH_SB_PX",
             "GRAIN_BIT_DEPTH",
         ];
         let sources = [
@@ -37796,7 +41496,6 @@ pub(crate) mod tests {
             "the scratch pools and gate hit counters are still thread_local by design"
         );
     }
-
 
     /// lane-d792: a frame whose height the superblock grid CUTS, decoded
     /// against ffmpeg on every ladder point of BOTH reference encoders.
@@ -37843,13 +41542,41 @@ pub(crate) mod tests {
                 let flat = format!("color=c=gray:s={half}x{h}:r=25:d=1");
                 let busy = format!("{flat},noise=alls=80:all_seed=7:allf=t+u");
                 let args: Vec<String> = [
-                    "-v", "error", "-f", "lavfi", "-i", &flat, "-f", "lavfi", "-i", &busy,
-                    "-filter_complex", "[0:v][1:v]hstack=inputs=2,format=yuv420p",
-                    "-frames:v", &FRAMES.to_string(), "-pix_fmt", "yuv420p", "-an",
-                    "-threads", "1", "-g", &FRAMES.to_string(), "-c:v", "libaom-av1",
-                    "-cpu-used", "6", "-b:v", "0", "-crf", crf,
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &flat,
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &busy,
+                    "-filter_complex",
+                    "[0:v][1:v]hstack=inputs=2,format=yuv420p",
+                    "-frames:v",
+                    &FRAMES.to_string(),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-an",
+                    "-threads",
+                    "1",
+                    "-g",
+                    &FRAMES.to_string(),
+                    "-c:v",
+                    "libaom-av1",
+                    "-cpu-used",
+                    "6",
+                    "-b:v",
+                    "0",
+                    "-crf",
+                    crf,
                     // libaom's activity segmentation, i.e. `SEG_LVL_ALT_Q`.
-                    "-aq-mode", "1", "-f", "obu", "-",
+                    "-aq-mode",
+                    "1",
+                    "-f",
+                    "obu",
+                    "-",
                 ]
                 .iter()
                 .map(|s| (*s).to_string())
@@ -37864,7 +41591,10 @@ pub(crate) mod tests {
                 if !out.status.success() {
                     eprintln!(
                         "SKIP {NAME}: ffmpeg cannot encode the segmented {w}x{h} recipe ({})",
-                        String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+                        String::from_utf8_lossy(&out.stderr)
+                            .lines()
+                            .last()
+                            .unwrap_or("")
                     );
                     continue;
                 }
@@ -37882,7 +41612,11 @@ pub(crate) mod tests {
                      would pass with the rect dequant defect back in ({} segment ids seen)",
                     crate::decode::segment_ids_seen()
                 );
-                assert_eq!(got.len(), want.len(), "{NAME}: segmented {w}x{h} frame count");
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "{NAME}: segmented {w}x{h} frame count"
+                );
                 for (f, (o, r)) in got.iter().zip(&want).enumerate() {
                     for (plane, a, b) in [("Y", &o.y, &r.y), ("U", &o.u, &r.u), ("V", &o.v, &r.v)] {
                         if let Some(i) = a.iter().zip(b.iter()).position(|(x, y)| x != y) {
@@ -37898,9 +41632,7 @@ pub(crate) mod tests {
                         }
                     }
                 }
-                eprintln!(
-                    "{NAME}: segmented {w}x{h} crf {crf} exact, block q span {lo}..{hi}"
-                );
+                eprintln!("{NAME}: segmented {w}x{h} crf {crf} exact, block q span {lo}..{hi}");
                 checked += 1;
             }
         }
@@ -37954,9 +41686,18 @@ pub(crate) mod tests {
                             // `-aq-mode 1`: libaom's activity segmentation,
                             // i.e. `SEG_LVL_ALT_Q` -- the feature the rect
                             // dequant path used to drop.
-                            ["-cpu-used", "6", "-b:v", "0", "-crf", point, "-aq-mode", "1"]
-                                .iter()
-                                .map(|s| (*s).to_string()),
+                            [
+                                "-cpu-used",
+                                "6",
+                                "-b:v",
+                                "0",
+                                "-crf",
+                                point,
+                                "-aq-mode",
+                                "1",
+                            ]
+                            .iter()
+                            .map(|s| (*s).to_string()),
                         );
                     }
                     args.extend(["-f", "obu", "-"].iter().map(|s| (*s).to_string()));
@@ -37970,7 +41711,10 @@ pub(crate) mod tests {
                     if !out.status.success() {
                         eprintln!(
                             "SKIP {NAME}: ffmpeg cannot encode {w}x{h} with {encoder} ({})",
-                            String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+                            String::from_utf8_lossy(&out.stderr)
+                                .lines()
+                                .last()
+                                .unwrap_or("")
                         );
                         continue;
                     }
@@ -38005,7 +41749,10 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert!(checked > 0, "{NAME}: neither reference encoder was available");
+        assert!(
+            checked > 0,
+            "{NAME}: neither reference encoder was available"
+        );
         eprintln!("{NAME}: {checked} straddling reference points decoded sample-exact");
     }
 
@@ -38038,13 +41785,36 @@ pub(crate) mod tests {
         }
         const FRAMES: usize = 4;
         let (w, h) = (384usize, 152usize);
-        let src = format!(
-            "color=c=gray:s={w}x{h}:r=25,noise=alls=80:all_seed=7:allf=t+u"
-        );
+        let src = format!("color=c=gray:s={w}x{h}:r=25,noise=alls=80:all_seed=7:allf=t+u");
         let args: Vec<String> = [
-            "-v", "error", "-f", "lavfi", "-i", &src, "-frames:v", "4", "-pix_fmt", "yuv420p",
-            "-an", "-threads", "1", "-g", "4", "-c:v", "libaom-av1", "-cpu-used", "2", "-b:v",
-            "0", "-crf", "5", "-aq-mode", "1", "-f", "obu", "-",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &src,
+            "-frames:v",
+            "4",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            "-threads",
+            "1",
+            "-g",
+            "4",
+            "-c:v",
+            "libaom-av1",
+            "-cpu-used",
+            "2",
+            "-b:v",
+            "0",
+            "-crf",
+            "5",
+            "-aq-mode",
+            "1",
+            "-f",
+            "obu",
+            "-",
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -38059,7 +41829,10 @@ pub(crate) mod tests {
         if !out.status.success() {
             eprintln!(
                 "SKIP {NAME}: ffmpeg cannot encode with libaom-av1 ({})",
-                String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("")
             );
             return;
         }
@@ -38095,5 +41868,4 @@ pub(crate) mod tests {
             crate::decode::segment_ids_seen()
         );
     }
-
 }
