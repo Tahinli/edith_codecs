@@ -392,6 +392,58 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 19 — the tail pairing FAILED; the poisoning read is NOT named
+
+All instrumentation reverted; `aomdec` restored (zero stray strings,
+2995 `EC_COEFF_STEP` lines, 4:2:0 control byte-exact). Build discipline
+followed: touch before ninja, rung verified before use.
+
+**What was set up.** Same-line bit positions on every coefficient rung
+on both sides — 13 sites here, 11 in the oracle's `decodetxb.c` — and
+verified (75970 rung lines with the field live). So round 18's
+instrument is reproducible and the walk is no longer blocked by
+emission.
+
+**What failed, and why this lane stops here.** Pairing the mi(68,16)
+tail by bit position does not work, and the failure is structural:
+
+```
+  O bit=92304 all_zero  plane=2   |  M bit=92331 eob
+  O bit=92315 all_zero  plane=0   |  M bit=92332 base
+  O bit=92316 all_zero  plane=1   |  M bit=92332 after_bases
+  O bit=92316 tx_type   plane=1   |  M bit=92333 sign_rect
+```
+
+The two rung streams have **different granularity**: this decoder
+prints one line per transform unit with a different tag set, the oracle
+one line per coefficient step with another. Bit-position inference
+inside a single unit's tail therefore pairs UNRELATED reads. The 1:1
+correspondence that made rounds 10 and 14 work came from the
+`all_zero` ANCHOR — one per transform unit, on both sides. **Inside a
+unit there is no such anchor**, and this round had none.
+
+**Consequence for the earlier attributions, stated precisely.** The
+round-10 "3 bits short" and the round-14 window were taken at
+`all_zero` granularity, which IS reliable, and their conclusion (the
+first-delta read is the luma mode at mi(64,24)) stands. Anything finer
+than one transform unit was never established.
+
+**A lead withdrawn.** The round-18 "the oracle emits a `tx_type` step
+at mi(68,16) where our rungs emit none" is NOT evidence. Our
+`tag=tx_type` prints sit at two sites; the oracle's print is per plane.
+The 2080-against-1033 count difference is rung coverage, and the
+absence of a line here is an instrumentation gap. Withdrawn.
+
+**The instrument that would close it.** A per-READ trace emitted from
+the symbol decoder ITSELF on both sides — our `SymbolDecoder::symbol`
+and `literal`, libaom's `aom_read_symbol` — carrying an explicit read
+SEQUENCE NUMBER alongside (row, decoded value, post-read rng, bit
+position). With a shared counter the two streams are 1:1 **by
+construction** rather than by bit-position inference, and the first
+read whose rng diverges names the poisoner directly, inside whatever
+block it falls. That is a real round of work and it is not a
+continuation of this one.
+
 ### Round 18 — the table did NOT drift; the coder state already had
 
 All instrumentation reverted; `aomdec` restored (744 `name=mode` lines,
