@@ -183,13 +183,29 @@ exactly on all 1536 chroma units.
   sha256 `4cadce41e1f89675…`) decodes **byte-exact** — the 128 root is still
   necessary, and the fix does not touch it.
 * **Gate**: `a_lossless_444_128_root_lossless_stream_reads_chunks_chunk_major`,
-  pin `fixtures/ll444_128root_lossless.obu` (63429 B, sha256 `bbffb979…`,
-  fnv1a64 `0xf07d47fcfd512658`). Non-vacuous: it asserts `mu_chunk_order_hits`
-  rose, and pins the first-difference position at `>= 90272`.
-* **Mutation (red-before)**: rewriting the chunk key back to a block raster
-  (`(col/16)*1000 + c`) turns the gate **RED**; reverting turns it green.
+  pins `fixtures/ll444_128root_lossless.obu` (63429 B, sha256 `bbffb979…`,
+  fnv1a64 `0xf07d47fcfd512658`) and
+  `fixtures/ll444_minp64_128root_control.obu` (61494 B, sha256
+  `4cadce41e1f89675…`, fnv1a64 `0xf6f5a3cbefc7eb10`).
+  Three assertions, **all exact, none a floor on wrong output** (an earlier
+  draft asserted `first-diff >= 90272`; that shape asserts our output is
+  still wrong and would fail the day the residual lands — it was cut):
 
-### 9f. NOT fixed — the residual, and what it is not
+  | # | assertion | value | why it is discriminating |
+  |---|---|---|---|
+  | 1 | `mu_chunk_order_hits()` rose by | **5** | counts blocks where the sort **permuted** the list, not where it ran — a no-op ordering reads 0, so a gate cannot be armed by merely executing the arm |
+  | 2 | `mu_chunk_walks()` rose by | **20** | 4 mu chunks × 5 inter frames — libaom's own per-chunk count; the 16x redundancy would read 320 |
+  | 3 | `mu_chunk_walk_units()` rose by | **7680** | 1536 chroma TX_4X4 units per inter frame × 5 — the oracle's exact count (pre-fix: 122880) |
+  | 4 | control arm vs `aomdec --rawvideo` | **byte-exact** | straight exactness on the `--max-partition-size=64` stream |
+
+  Assertions 2 and 3 are the structural parity this fix established, read
+  straight off libaom's walk, so they stay true when the stream becomes
+  byte-exact.
+* **Mutation (red-before)**: rewriting the chunk key back to a block raster
+  (`(col/16)*1000 + c`) turns the gate **RED** at assertion 1; reverting turns
+  it green. Both runs executed on the committed tree.
+
+### 9f. OPEN — the residual, handed on (not fixed by this lane)
 
 **The fixture is still not byte-exact.** One defect remains, and it is a
 *different* one, below the chunk-order bug this lane fixed:
@@ -205,8 +221,22 @@ exactly on all 1536 chroma units.
   from an identical CDF row at 2572 — the fork is at the coefficient decode,
   not at context selection.
 
-That is the next thing to chase, and it needs its own EC_SYMR pass anchored
-at unit 2572. §7's plan is superseded: **the band is fine, the order was not.**
+**Type/extent is EXCLUDED** (Levent-2, on my pinned bytes, both rungs, no
+re-encode): every unit either side published agrees at TX_4X4 / DCT_DCT, no
+exception anywhere in the stream. So there is no inherited-`tx_type` or
+chroma-extent term in this defect — it is a coefficient READ / consumption
+difference. Their caveat, which I accept: the oracle's `idct.c` rung
+early-returns on `eob == 0`, so it is structurally blind at unit 2572 itself
+(the oracle publishes it as cul_level 0). The strong direction holds — no
+type or extent disagrees anywhere — but 2572 specifically needs a rung that
+does not early-return (`EC_COEFF_STEP`, or the oracle's `decodetxb.c`
+sequence), not `idct.c`.
+
+Next step for whoever takes it: re-anchor `EC_SYMR` at unit 2572, and check
+the coefficient-read side. Handed to `agent://Kaan-2` with the byte and the
+fact that the chroma unit COUNTS now match the oracle exactly, so the
+residual is a per-unit VALUE, not an ordering one. §7's plan is superseded:
+**the band is fine, the order was the bug, and this residual is neither.**
 
 ### 9g. Interaction with H1
 
