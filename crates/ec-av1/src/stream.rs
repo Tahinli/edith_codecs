@@ -2293,16 +2293,28 @@ pub(crate) mod tests {
     /// `d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95`:
     ///
     /// ```text
-    /// ffmpeg -f lavfi -i "mandelbrot=size=256x288:rate=24:maxiter=220:
-    ///          start_scale=3:end_scale=0.35:end_pts=300:rotate=a=0.10"
+    /// ffmpeg -f lavfi -i "mandelbrot=size=256x288:rate=24:maxiter=220:start_scale=3:end_scale=0.35:end_pts=300,rotate=a=0.10*t:c=none:ow=256:oh=288" \
     ///        -frames:v 24 -pix_fmt yuv422p -f yuv4mpegpipe src422.y4m
     /// aomenc --codec=av1 --profile=2 --input-bit-depth=8 --limit=16
     ///        --width=256 --height=288 --lag-in-frames=25 --auto-alt-ref=1
-    ///        --enable-global-motion=1 --cq-level=24 --cpu-used=0
+    ///        --enable-global-motion=1 --pass=1
+    ///        --cq-level=24 --cpu-used=0
     ///        --threads=4 --kf-min-dist=0 --kf-max-dist=999999 \
-    ///        -n ffp --pass=2 --fpf=src422.y4m -o a1.webm
+    ///        src422.y4m -o a1.webm
     /// ffmpeg -i a1.webm -c copy -f obu -y a1.obu
     /// ```
+    ///
+    /// CORRECTED by lane-av1422lrless (reviewer P2). This doc previously
+    /// carried a different ffmpeg filter (`rotate=a=0.10`, no `*t`, no
+    /// `:c=none:ow/oh`) and a `-n ffp --pass=2 --fpf=...` two-pass line.
+    /// **Neither produced these bytes.** Re-encoding from the recorded
+    /// source `src422.y4m` (sha256
+    /// `4d35eaf65d1a5541b3177e1183644c163b3868d8f141bed0ce9fdf833280ba9f`)
+    /// was measured three ways: the two-pass form gives 38774 bytes
+    /// (`e93c4ed7...`), and only adding `--pass=1` reproduces these 38845
+    /// bytes byte for byte (`d78e2afb...`). `aomenc` DEFAULTS to two-pass,
+    /// so the flag has to be stated to get back the pinned stream. The
+    /// recipe above is the one that was actually run.
     ///
     /// Measured on a patch-run-restore build (the `EC_AV1_ALLOW_422_PROBE`
     /// bypass applied for the run, reverted after -- it is deliberately NOT
@@ -2359,6 +2371,86 @@ pub(crate) mod tests {
             "{NAME}: {FILE} must refuse by name, got: {err}"
         );
     }
+    /// lane-av1422lrless: the LR-OFF half of the 4:2:2 coverage pair.
+    ///
+    /// This is `422_residual_compound_warp_16f.obu`'s recipe with EXACTLY
+    /// ONE flag changed, `--enable-restoration=0`, and that is a measured
+    /// claim rather than an assertion: both arms were re-encoded from the
+    /// same source `src422.y4m` (sha256
+    /// `4d35eaf65d1a5541b3177e1183644c163b3868d8f141bed0ce9fdf833280ba9f`)
+    /// with the same aomenc invocation, and the LR-on arm reproduces the
+    /// committed 38845 bytes byte for byte. So the pair is controlled, and
+    /// the corners code is the only thing that can differ between their
+    /// decodes: with restoration off, every plane's `frame_restoration_type`
+    /// is `RESTORE_NONE`, so `read_lr` skips each plane and never computes a
+    /// range. The LR-on stream exercises the range; this one proves the skip
+    /// is the skip.
+    ///
+    /// ```text
+    /// aomenc --codec=av1 --profile=2 --input-bit-depth=8 --limit=16
+    ///        --width=256 --height=288 --lag-in-frames=25 --auto-alt-ref=1
+    ///        --enable-global-motion=1 --pass=1 --enable-restoration=0
+    ///        --cq-level=24 --cpu-used=0
+    ///        --threads=4 --kf-min-dist=0 --kf-max-dist=999999 \
+    ///        src422.y4m -o a3.webm
+    /// ffmpeg -i a3.webm -c copy -f obu -y a3.obu
+    /// ```
+    ///
+    /// 38538 bytes, sha256
+    /// `8bed368f7ec4bca772137c6a9c2af89e1b2767ed5f937b91bd9e72ec60aeb42f`.
+    ///
+    /// Measured on a patch-run-restore build (the `EC_AV1_ALLOW_422_PROBE`
+    /// bypass applied for the run, reverted after -- deliberately not
+    /// committed, and the refusal asserted below is what this tree ships):
+    ///
+    /// - all 16 frames pixel-exact against `aomdec --rawvideo`, 2359296
+    ///   bytes each, sha256 `1cf47bc9e06a6e286452dfe4ffe457a85b6badd25
+    ///   657dfd36af48262e8eb2464` on both sides;
+    /// - the entropy stream pairs **244756-for-244756** against the
+    ///   instrumented oracle with no divergence anywhere -- a different
+    ///   read count from the LR-on sibling's 246735, which is the corners
+    ///   skip showing up in the symbol stream, so the two arms really are
+    ///   on different paths;
+    /// - **loop restoration is proved off, not inferred from the flag**:
+    ///   all five LR counters read zero where the LR-on sibling reads
+    ///   `lr_wiener` 22, `lr_sgrproj` 10, `lr_stripe0` 26, `lr_last_stripe`
+    ///   28;
+    /// - and it carries MORE of the coverage than its sibling, which is
+    ///   what rescues the thin leg of the lift argument: **top-half
+    ///   compound 11** against the sibling's 3, and top-half warp 5 against
+    ///   3. Frame-globally compound_warp 25, compound_warp_8 15, rotzoom
+    ///   global-warp 77, cdef_idx 39, part128_split 95. The stronger arm is
+    ///   the one where `read_lr` does nothing at all, so the engagement is
+    ///   not an artefact of the code under test.
+    ///
+    /// Same scope as its siblings, for the same reason: with the header
+    /// refusal standing no committed test can decode a 4:2:2 stream,
+    /// because the bypass that would allow it must never be committed.
+    #[test]
+    fn the_pinned_422_lr_off_witness_is_present_and_refuses_by_name() {
+        const NAME: &str = "the_pinned_422_lr_off_witness_is_present_and_refuses_by_name";
+        const REFUSAL: &str = "a chroma format of 4:2:2";
+        const FILE: &str = "422_residual_compound_warp_nolr_16f.obu";
+        const BYTES: usize = 38538;
+        const FP: u64 = 0x4b8ff761701e2bef;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(FILE);
+        let data = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned witness {} is missing ({e}) -- the gate cannot run",
+                path.display()
+            )
+        });
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FP, "{NAME}: {FILE} bytes drifted");
+        let err = decode_stream(&data).unwrap_err().to_string();
+        assert!(
+            err.contains(REFUSAL),
+            "{NAME}: {FILE} must refuse by name, got: {err}"
+        );
+    }
+
 
 
     /// lane-av1-qmatrix: WITNESS for the lifted `using_qmatrix` refusal (the
