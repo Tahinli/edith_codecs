@@ -467,7 +467,7 @@ impl<'a> SymbolDecoder<'a> {
             eprintln!(
                 "EC_SYMR ph={} cdf={} mi=({},{}) pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
                 SYMR_PHASE.with(std::cell::Cell::get),
-                SYMR_PHASE.with(std::cell::Cell::get),
+                SYMR_CDF.with(std::cell::Cell::get),
                 SYMR_MI.with(std::cell::Cell::get).0,
                 SYMR_MI.with(std::cell::Cell::get).1,
                 pre_value,
