@@ -1808,6 +1808,81 @@ tag now one-shot, the two extra reads name themselves on the next pass.
 
 Not pinned, no gate, refusal untouched.
 
+## Round 31 — the two reads are NAMED: `decodeframe.c:1722`, `wiener_restore_cdf`
+
+`37656c2f` (round 30's instrument, still current) and oracle snapshots
+`662b6f0` / `9bb526a`. No behaviour change; identity re-proved.
+
+### The instrument that finally worked
+
+Two candidates were tried and **rejected on evidence**:
+`__builtin_return_address(0)` is defeated by inlining and identical-code
+folding — five distinct reads resolved to ONE address, and rebuilding
+with `-fno-ipa-icf` did **not** separate them — and `addr2line` without
+`-g` has no line info at all.
+
+What works is a **macro capturing `__FILE__`/`__LINE__` at the expansion**,
+which is exact by construction and survives both. `aom_read_symbol` now
+reports `site=file:line` for every read. This is the instrument nine
+rounds of pairing needed and did not have.
+
+### The named reads
+
+```
+decodemv.c:1031  n=4   mv_fr
+decodemv.c:1642  n=2   (interintra follow-up)
+decodemv.c:172   n=4
+decodemv.c:1654  n=2   wedge_interintra
+decodemv.c:1232  n=3
+decodemv.c:1232  n=3
+decodeframe.c:1722 n=2 s=1     pairs
+decodeframe.c:1722 n=2 s=1     <-- MISSING
+decodeframe.c:1722 n=2 s=1     <-- MISSING
+decodeframe.c:1268 n=8 / n=10  the next block's modes
+```
+
+`decodeframe.c:1722` is `wiener_restore_cdf` inside `read_restoration_type`
+— the per-plane loop-restoration read-back. **The oracle reads it three
+times at this superblock; this decoder reads it once.** That is the whole
+divergence: this decoder is missing two loop-restoration unit reads.
+
+### Two candidates checked and RULED OUT against libaom
+
+1. **Chroma LR unit size.** `decodeframe.c:1584-1593` uses
+   `s = AOMMIN(subsampling_x, subsampling_y)` and shifts by
+   `aom_rb_read_bit(rb) * s` only when `s && !chroma_none`. At 4:2:2
+   `s == 0`, so chroma takes the luma size unshifted — which is exactly
+   what `ec-av1-syntax/src/frame.rs:1636` does. **Our code matches.** A
+   plausible-looking "fix" here (`>> (subsampling_x + subsampling_y)`,
+   the reading I started from) would break 4:2:0 and 4:4:4.
+2. **`count_units`.** `restoration.rs:467` is character-for-character
+   `av1_lr_count_units` (`restoration.c:63`): same half-up rounding, same
+   `.max(1)`. **Matches.**
+
+### What is left, and it is small
+
+`restoration.rs:519-524` — the per-superblock unit range:
+
+```rust
+let mi_size = if plane == 0 { 4 } else { 4 >> ss_x(fctx) };
+let rcol0 = ceil_div(mi_col * num_x, denom_x);
+let rrow0 = ceil_div(mi_row * mi_size, unit_size);
+```
+
+`mi_size` is the only 4:2:2-sensitive term (2 at 4:2:2, 2 at 4:2:0, 4 at
+4:4:4), and this range is what decides how many `read_lr_unit` calls a
+superblock makes per plane. libaom's equivalent bounds come from
+`av1_loop_restoration_corners_in_sb`, which mixes the superres `denom_x`
+path differently for the row axis than this does. **That is the next
+thing to check, and it is a read, not a rewrite.**
+
+**Handoff:** compare `restoration.rs:519-524` line by line against
+`av1_loop_restoration_corners_in_sb` (`restoration.c`), with the 4:2:2
+`ss_y == 0` case in view. The oracle now names every read, so a correct
+fix is provable in one run: the sequence diff must go flat.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
