@@ -392,6 +392,66 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 18 — the table did NOT drift; the coder state already had
+
+All instrumentation reverted; `aomdec` restored (744 `name=mode` lines,
+zero stray strings), 4:2:0 control byte-exact. Build discipline
+followed: touch before ninja, known-firing rung verified before any new
+field was read.
+
+**1. The `kf_y_mode` row immediately BEFORE the mi(64,24) read is
+IDENTICAL on both sides.** (Our storage is `32768 - cdf`; converted, the
+twelve entries are the same twelve numbers to the digit:)
+
+```
+oracle  20236, 19127, 17626, 16471, 13708, 11379, 9074, 7617, 6502, 1079, 805, 127
+ours    20236, 19127, 17626, 16471, 13708, 11379, 9074, 7617, 6502, 1079, 805, 127
+```
+
+**So the table-state verdict is CLEAN — it did not drift.** That kills
+the round-17 hypothesis and answers Main's step 2 negatively: there is
+no read whose adaptation update differs.
+
+**2. But the range coder is ALREADY in a different state at that
+read**, at the same bit position (the constant -14):
+
+```
+oracle  KFPRE rng=39524  dif=833299967  bitpos=92323
+ours    KFPRE rng=40716  val=24467       bitpos=92337
+```
+
+Same CDF row, same bit position, different `rng` — therefore a
+different decoded value (1 against 6) and a different bit cost (4 bits
+against 5). The decode itself is innocent; the STATE is the defect.
+
+**3. mi(64,24) is the FIRST such block.** Across all 742 mode reads
+common to both traces, every block before it agrees in BOTH its decoded
+mode and its post-read `rng`; mi(64,24) is the first that differs, and
+the 18 after it are downstream. Its very first read (`skip`) is already
+divergent, so the cause is in the PREVIOUS block's tail (mi(68,16)) or
+in mi(64,24)'s own pre-mode reads.
+
+**This is the round-6 dc-sign shape, one level up.** Every read in that
+window consumes the SAME BITS on both sides, and the bit delta is
+constant — but a symbol read from a different CDF row (or the same value
+decoded from a different row) consumes the same bits and leaves a
+different `rng`. The ladder cannot see it; only a state comparison can,
+and this is the first place the state comparison has been run.
+
+**4. Prime suspect, with its evidence and its limits.** The ladder's
+window shows the oracle emitting a `tx_type` step at mi(68,16) where our
+rungs emit none. But the raw counts are oracle 2080 `tx_type` reads to
+our 1033 across the frame, and that is a RUNG-COVERAGE difference (our
+`tag=tx_type` prints sit at two of several sites), **not** evidence of a
+missing read. Recorded as a lead, not a finding.
+
+**Unblock.** Pair, bit-position-anchored, the pre-read CDF ROW and the
+decoded VALUE for every read in the mi(68,16) tail — the same
+instrument that produced this verdict, applied one block earlier. The
+first read whose row or value differs names the root. With the
+instrument now proven (it produced a clean, digit-exact table match and
+a clean state mismatch), that run is mechanical.
+
 ### Round 17 — MEASURED: the bands MATCH, and round 15's mystery is solved
 
 Build discipline first: `touch` before `ninja`, and the known-firing rung
