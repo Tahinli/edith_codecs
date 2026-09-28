@@ -2671,7 +2671,6 @@ pub(crate) mod tests {
         );
     }
 
-
     /// lane-av1-qmatrix: WITNESS for the lifted `using_qmatrix` refusal (the
     /// old gate `a_frame_using_quantisation_matrices_is_refused_by_name` is
     /// its mirror image -- its own panic said "flip this gate to a witness"
@@ -42034,6 +42033,68 @@ pub(crate) mod tests {
             "{NAME}: {FRAMES} frames sample-exact, {} segment_id symbols, {} distinct ids",
             crate::decode::segment_id_hits(),
             crate::decode::segment_ids_seen()
+        );
+    }
+
+    /// lane-av1leftref: the left chroma reference's `+ss_y` ROW term
+    /// (libaom `av1_common_int.h:1400-1401`, `chroma_left_mi =
+    /// base_mi[ss_y * mi_stride - 1]` -- one mi row DOWN at 4:2:0 and 4:4:0,
+    /// on its own row at 4:2:2 and 4:4:4). This decoder read its own row at
+    /// every subsampling until this lane.
+    ///
+    /// The read is only observable when the two cells hold DIFFERENT blocks --
+    /// a left neighbour at most 1 mi tall. Measured over every committed
+    /// fixture and ~1000 swept aomenc encodes (report table), that never
+    /// happens on a decode-path read: `uv_mode_grid` runs down a left mi
+    /// column always have EVEN length, because libaom only starts a block on
+    /// an odd mi row with an 8-px strip, and the 4-px `HORZ_4` strips aomenc
+    /// does pick all land inside one mi row. So the term is a proven no-op on
+    /// today's material, and this gate pins BOTH halves of that statement:
+    /// the arm runs thousands of times, and it never changes an answer.
+    ///
+    /// A non-zero DIFF bucket is not a failure here -- it is the first stream
+    /// that witnesses the term, and the exactness arms below are what then
+    /// decide whether the shipped read is the one that matches the oracle.
+    #[test]
+    fn a_4to20_key_frame_takes_the_left_chroma_reference_read_its_libaom_row() {
+        const NAME: &str = "a_4to20_key_frame_takes_the_left_chroma_reference_read_its_libaom_row";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        // 3840x1608 10-bit key frame, the densest 4:2:0 intra leaf mix in the
+        // fixture set and the stream that carries the most `+ss_y` reads.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/hg_kf900.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        let before = crate::decode::uv_left_ss_y_reads();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let reads = crate::decode::uv_left_ss_y_reads() - before;
+        let mode_diff = crate::decode::uv_left_ss_y_mode_diff_hits();
+        let smooth_diff = crate::decode::uv_left_ss_y_smooth_diff_hits();
+        assert!(
+            reads > 1000,
+            "{NAME}: only {reads} chroma edge-filter reads took the `+ss_y` left \
+             reference -- the arm this test pins is barely exercised, so the gate \
+             proves little"
+        );
+        assert_eq!(frames.len(), 1, "{NAME}: one key frame");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        // The term is unreachable on this stream, so luma and BOTH chroma
+        // planes must come out byte-identical to ffmpeg's decode. Luma alone
+        // (what the kf900 gate asserts) would not notice a chroma edge-filter
+        // type moving.
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
+        eprintln!(
+            "{NAME}: {reads} left-reference reads, +ss_y changed the mode {mode_diff} \
+             and the smooth boolean {smooth_diff} times, all three planes pixel-exact"
         );
     }
 }
