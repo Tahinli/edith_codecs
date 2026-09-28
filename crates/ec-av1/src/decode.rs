@@ -33539,6 +33539,7 @@ fn decode_inter_block(
                 && enable_masked_compound
                 && is_any_masked_compound_used_here(write_w, write_h)
             {
+                crate::msac::SymbolDecoder::set_symr_cdf("comp_group_idx");
                 dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
             } else {
                 0
@@ -33831,6 +33832,7 @@ fn decode_inter_block(
                     ref_order_hints[(ref0 - LAST_FRAME) as usize],
                     ref_order_hints[(ref1 - LAST_FRAME) as usize],
                 );
+                crate::msac::SymbolDecoder::set_symr_cdf("compound_idx");
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
                 if crate::envflags::env_flag!("EC_TRACE_MODE") {
                     eprintln!(
@@ -34998,6 +35000,7 @@ fn decode_inter_block(
                 // TRUE footprint -- a 16x8 strip is group 1, a 32x16 strip
                 // group 2, not their square `side`'s 2/3.
                 let bsize_group = size_group_wh(write_w, write_h);
+                crate::msac::SymbolDecoder::set_symr_cdf("interintra");
                 let interintra = dec.symbol(&mut cdfs.interintra[bsize_group]) == 1;
                 if interintra {
                     // lane-interintra r1 (decodemv.c 1540-1555): interintra_mode,
@@ -40691,6 +40694,7 @@ fn decode_inter_block8(
                     && enable_masked_compound
                     && is_any_masked_compound_used_here(SIDE, SIDE)
                 {
+                    crate::msac::SymbolDecoder::set_symr_cdf("comp_group_idx");
                     dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
                 } else {
                     0
@@ -40747,6 +40751,7 @@ fn decode_inter_block8(
                         ref_order_hints[(ref0 - LAST_FRAME) as usize],
                         ref_order_hints[(ref1 - LAST_FRAME) as usize],
                     );
+                    crate::msac::SymbolDecoder::set_symr_cdf("compound_idx");
                     let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
                     if idx == 1 {
                         (8, 8, 1u8)
@@ -41498,6 +41503,7 @@ ss_y(fctx),
         let mut interintra_mode: Option<u8> = None;
         let mut wedge_mask: Option<(&'static [u8], usize)> = None;
         if enable_interintra_compound && !skip_mode {
+            crate::msac::SymbolDecoder::set_symr_cdf("interintra");
             let interintra = dec.symbol(&mut cdfs.interintra[SIZE_GROUP_8]) == 1;
             if interintra {
                 // lane-interintra r1: same read pair as the 16/32 site;

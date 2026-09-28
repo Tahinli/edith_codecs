@@ -335,6 +335,12 @@ thread_local! {
     /// the inter path; without a phase its reads are unattributable.
     pub(crate) static SYMR_PHASE: std::cell::Cell<&'static str> =
         const { std::cell::Cell::new("") };
+    /// The CDF TABLE NAME for the read about to be made, mirroring the
+    /// oracle's `ec_symr_cdf_tag`. `cdf0` alone cannot identify a table --
+    /// two rows can share a first entry -- so this is what turns "two
+    /// 2-symbol reads" into a named pair.
+    pub(crate) static SYMR_CDF: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("") };
 }
 
 impl<'a> SymbolDecoder<'a> {
@@ -413,6 +419,10 @@ impl<'a> SymbolDecoder<'a> {
 
     /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
     ///
+    pub(crate) fn set_symr_cdf(t: &'static str) {
+        SYMR_CDF.with(|c| c.set(t));
+    }
+
     pub(crate) fn set_symr_phase(p: &'static str) {
         SYMR_PHASE.with(|c| c.set(p));
     }
@@ -455,7 +465,8 @@ impl<'a> SymbolDecoder<'a> {
         }
         if symr {
             eprintln!(
-                "EC_SYMR ph={} mi=({},{}) pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
+                "EC_SYMR ph={} cdf={} mi=({},{}) pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
+                SYMR_PHASE.with(std::cell::Cell::get),
                 SYMR_PHASE.with(std::cell::Cell::get),
                 SYMR_MI.with(std::cell::Cell::get).0,
                 SYMR_MI.with(std::cell::Cell::get).1,
