@@ -260,6 +260,15 @@ pub fn intra128_lossless_counters() -> usize {
     crate::decode::intra128_lossless_hits()
 }
 
+/// lane-av1-128rectspan: chroma transform units re-stamped by
+/// `decode_block_128rect`'s end-of-block replay, and how many of those
+/// replays stamped a height that was not the unit's own (the 4:2:2 signature
+/// -- zero on every stream this decoder admits, since 4:2:2 is refused by
+/// name at the sequence header).
+pub fn sb128rect_chroma_replay_counters() -> (usize, usize) {
+    crate::decode::sb128rect_chroma_replay_hits()
+}
+
 /// lane-sb128c r9: the four AB shapes at the 128 root, in `PARTITION_HORZ_A`,
 /// `_HORZ_B`, `_VERT_A`, `_VERT_B` order (key and inter tile paths share the
 /// counter -- it is bumped where the root symbol resolves).
@@ -5868,6 +5877,7 @@ pub(crate) mod tests {
 
         let _guard = lock_gate_counters();
         let before = crate::decode::intra_sb128_hits();
+        let before_replay = crate::decode::sb128rect_chroma_replay_hits();
         let frames = decode_stream(&stream).unwrap_or_else(|e| {
             panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
         });
@@ -5876,6 +5886,35 @@ pub(crate) mod tests {
             horz - before.0 + (vert - before.1) > 0,
             "{NAME}: this stream coded NO 128-axis intra block -- the fixed body \
              never ran (class gate-blind-to-feature)"
+        );
+        // lane-av1-128rectspan: the block-level `record_split_luma_rect`
+        // above clobbers the per-unit chroma contexts, so every coded unit
+        // replays its own state after it -- the arm the span fix sits on.
+        // The delta keeps THAT arm non-vacuous (a 128-root rect stream that
+        // stopped replaying reads 0), and the mismatch half is the 4:2:2
+        // signature: this stream is 4:4:4 (ss 0,0), where the unit's luma
+        // width and height are equal, so a replay that stamped one axis with
+        // the other's span would still read 0 here -- the counter is what
+        // names the day 4:2:2 (ss 1,0, refused by name at the sequence
+        // header) is admitted, rather than letting the 8-row spill below the
+        // block corrupt the next block's `txb_skip` silently.
+        let after_replay = crate::decode::sb128rect_chroma_replay_hits();
+        assert!(
+            after_replay.0 > before_replay.0,
+            "{NAME}: no 128-root rect block replayed a chroma unit's own mi state -- the \
+             replay arm never ran (class gate-blind-to-feature)"
+        );
+        assert_eq!(
+            after_replay.1,
+            before_replay.1,
+            "{NAME}: the tail replay stamped {} unit(s) over a height that was not the \
+             unit's own luma height (4:2:2 spans leaked into an admitted stream)",
+            after_replay.1 - before_replay.1
+        );
+        eprintln!(
+            "{NAME}: replayed {} chroma unit(s), {} span mismatch(es)",
+            after_replay.0 - before_replay.0,
+            after_replay.1 - before_replay.1
         );
         assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
         for f in &frames {
@@ -6382,9 +6421,12 @@ pub(crate) mod tests {
     #[test]
     fn a_lossless_sb128_rect_intra_block_decodes_sample_exact() {
         const NAME: &str = "a_lossless_sb128_rect_intra_block_decodes_sample_exact";
-        if !have_ffmpeg() {
-            eprintln!("SKIP {NAME}: no ffmpeg");
-            return;
+        // The pixel arm needs ffmpeg; the decode and its counter deltas do
+        // not, so a box without ffmpeg still proves the shape was reached
+        // (class `gate-skips-on-its-own-failure`) -- the skip is still named.
+        let ffmpeg = have_ffmpeg();
+        if !ffmpeg {
+            eprintln!("SKIP {NAME}: no ffmpeg -- the ffmpeg pixel arm only");
         }
         let (w, h, frames) = (320usize, 256usize, 4usize);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6392,6 +6434,7 @@ pub(crate) mod tests {
         let stream = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
         let before = crate::decode::intra128_lossless_hits();
+        let before_replay = crate::decode::sb128rect_chroma_replay_hits();
         let ours = decode_stream(&stream)
             .unwrap_or_else(|e| panic!("{NAME}: a lossless 128-axis key frame decodes: {e}"));
         let hits = crate::decode::intra128_lossless_hits() - before;
@@ -6400,6 +6443,33 @@ pub(crate) mod tests {
             "{NAME}: this stream coded NO lossless 128-axis intra block -- the fixed body \
              was never reached (class gate-blind-to-feature)"
         );
+        // lane-av1-128rectspan: the 4:2:0 twin of the 4:4:4 gate's replay
+        // assertion. This stream codes the 64x128 block at mi(0,64) with
+        // TX_4X4 chroma units, so the end-of-block replay re-stamps each of
+        // them over its own luma-mi rows -- the arm the span fix sits on, on
+        // the OTHER admitted ss (1,1). The mismatch half is the 4:2:2
+        // signature and reads 0 here because 4:2:2 is refused by name at the
+        // sequence header; it is the tripwire for the day it is not.
+        let after_replay = crate::decode::sb128rect_chroma_replay_hits();
+        assert!(
+            after_replay.0 > before_replay.0,
+            "{NAME}: no 128-axis block replayed a chroma unit's own mi state -- the replay \
+             arm never ran (class gate-blind-to-feature)"
+        );
+        assert_eq!(
+            after_replay.1, before_replay.1,
+            "{NAME}: the tail replay stamped {} unit(s) over a height that was not the \
+             unit's own luma height (4:2:2 spans leaked into an admitted stream)",
+            after_replay.1 - before_replay.1
+        );
+        eprintln!(
+            "{NAME}: replayed {} chroma unit(s), {} span mismatch(es)",
+            after_replay.0 - before_replay.0,
+            after_replay.1 - before_replay.1
+        );
+        if !ffmpeg {
+            return;
+        }
         let refs = ffmpeg_decode_sequence(&stream, w, h, frames);
         assert_eq!(ours.len(), frames, "{NAME}: decode-order frame count");
         for (i, (got, want)) in ours.iter().zip(refs.iter()).enumerate() {
