@@ -13703,16 +13703,7 @@ fn decode_intrabc_128rect(
                             // covering its own quadrant (all of this chunk's
                             // leaves are read by now).
                             let unit_rel_mi = (unit_mi.0 - mi_r, unit_mi.1 - mi_c);
-                            let covering = leaf_tx_types
-                                .iter()
-                                .copied()
-                                .find(|&(lr, lc, lw, lh, _)| {
-                                    lr <= unit_rel_mi.0
-                                        && unit_rel_mi.0 < lr + lh / MI
-                                        && lc <= unit_rel_mi.1
-                                        && unit_rel_mi.1 < lc + lw / MI
-                                })
-                                .map(|(_, _, _, _, t)| t);
+                            let covering = covering_leaf_tx_type(&leaf_tx_types, unit_rel_mi);
                             // The prediction window is the block's own square
                             // `cside` buffer with the unit's true per-axis
                             // position inside it.
@@ -37598,6 +37589,70 @@ const fn sub16_to_mi(t: (usize, usize)) -> (usize, usize) {
     (t.0 * (SUB / MI), t.1 * (SUB / MI))
 }
 
+/// The luma transform leaf a chroma unit inherits its `tx_type` from
+/// (libaom `av1_get_tx_type`, `blockd.h:1287-1297`): an INTER block's chroma
+/// unit never codes a `tx_type` symbol of its own, so the type is read out
+/// of `xd->tx_type_map` at the chroma unit's own position scaled back to luma
+/// (`blk_row << ss_y`, `blk_col << ss_x`). `leaves` is the block's coded
+/// transform tree in decode order, `(row, col, tw, th, tx_type)` with
+/// `(row, col)` in MI relative to the block and `(tw, th)` in PIXELS;
+/// `rel_mi` is the chroma unit's own luma-relative top-left MI cell. One
+/// function serves the 128x128 mu-chunk tail and the 64x64 arms alike -- the
+/// lookup is the same rule, so a second inline copy would be a second
+/// convention.
+///
+/// A leaf that coded nothing resolves to `DctDct` here exactly as libaom's
+/// `decodetxb.c:199-203` stamps `DCT_DCT` into that leaf's map cell on the
+/// `all_zero` path: a chroma unit over a SKIPPED luma quadrant must NOT
+/// inherit the block-level (top-left leaf) type.
+fn covering_leaf_tx_type(
+    leaves: &[(usize, usize, usize, usize, TxType)],
+    rel_mi: (usize, usize),
+) -> Option<TxType> {
+    leaves
+        .iter()
+        .copied()
+        // leaf (row, col) are mi but (tw, th) are px (the rect leaf path
+        // divides by MI too)
+        .find(|&(lr, lc, lw, lh, _)| {
+            lr <= rel_mi.0 && rel_mi.0 < lr + lh / MI && lc <= rel_mi.1 && rel_mi.1 < lc + lw / MI
+        })
+        .map(|(_, _, _, _, t)| t)
+}
+
+thread_local! {
+    /// lane-av1444chr: how many chroma units resolved their `tx_type` from the
+    /// luma leaf covering their OWN quadrant instead of the block-level
+    /// (`first_tx_type`) one -- the route this lane corrected.
+    /// `CHROMA_SPLIT_TX_HITS` cannot attribute its bumps to it: every split
+    /// chroma unit bumps that one.
+    pub(crate) static CHROMA_QUAD_LEAF_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Of those, how many resolved a type that DIFFERS from the block-level one
+    /// -- the exact condition lane-av1444chr measured wrong: over a luma leaf
+    /// that coded nothing the map cell is `DCT_DCT` while the top-left leaf's
+    /// is `IDTX`. A gate proving the corrected route fired is NOT enough on
+    /// its own (a block whose four leaves agree changes zero pixels); this is
+    /// the number that says the route changed an answer.
+    pub(crate) static CHROMA_QUAD_LEAF_TX_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`CHROMA_QUAD_LEAF_TX_HITS`]: chroma units that took their type from the
+/// covering luma leaf.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_quad_leaf_tx_hits() -> usize {
+    CHROMA_QUAD_LEAF_TX_HITS.with(std::cell::Cell::get)
+}
+
+/// [`CHROMA_QUAD_LEAF_TX_DIFF_HITS`]: chroma units whose covering leaf's type
+/// differs from the block-level one.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_quad_leaf_tx_diff_hits() -> usize {
+    CHROMA_QUAD_LEAF_TX_DIFF_HITS.with(std::cell::Cell::get)
+}
+
 fn decode_inter_block(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -39189,12 +39244,13 @@ fn decode_inter_block(
                         if idx == 0 {
                             first_tx_type = tu_tx_type;
                         }
-                        // lane-av1-444-128: the per-unit chroma inheritance in
-                        // the chunk tail resolves each unit's own tx_type from
-                        // the luma leaf covering its quadrant.
-                        if side > 64 {
-                            leaf_tx_types.push((row, col, tw, th, tu_tx_type));
-                        }
+                        // lane-av1444chr: EVERY luma leaf's coded type, at
+                        // every block size (see the single-reference twin
+                        // below) -- the chroma units resolve their own
+                        // quadrant's leaf, and a leaf that coded NOTHING is
+                        // `DctDct` exactly as libaom's `decodetxb.c:199-203`
+                        // stamps `DCT_DCT` into that leaf's map cell.
+                        leaf_tx_types.push((row, col, tw, th, tu_tx_type));
                         neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
                         // lane-sb128c r1: libaom's `decode_token_recon_block`
                         // walks 64x64 "mu" chunks (`mu_blocks_wide/high =
@@ -39315,19 +39371,8 @@ fn decode_inter_block(
                                             // leaves are read by now).
                                             let unit_rel_mi =
                                                 (unit_mi.0 - at_mi.0, unit_mi.1 - at_mi.1);
-                                            let covering = leaf_tx_types
-                                                .iter()
-                                                .copied()
-                                                // leaf (row, col) are mi but
-                                                // (tw, th) are px (the rect
-                                                // leaf path divides by MI too)
-                                                .find(|&(lr, lc, lw, lh, _)| {
-                                                    lr <= unit_rel_mi.0
-                                                        && unit_rel_mi.0 < lr + lh / MI
-                                                        && lc <= unit_rel_mi.1
-                                                        && unit_rel_mi.1 < lc + lw / MI
-                                                })
-                                                .map(|(_, _, _, _, t)| t);
+                                            let covering =
+                                                covering_leaf_tx_type(&leaf_tx_types, unit_rel_mi);
                                             // The prediction buffer is
                                             // `chroma_stride`-strided (the
                                             // plane block's own width at
@@ -39559,6 +39604,19 @@ fn decode_inter_block(
                             for cc in 0..mu_units_n {
                                 let cu_mi = (rmi + cr * (cu_tx / MI), cmi + cc * (cu_tx / MI));
                                 let cu_around = neighbours.around_mi(cu_mi, cu_tx);
+                                // Per-quadrant inheritance, as in the
+                                // single-reference twin: the covering luma
+                                // leaf's OWN coded type, `DctDct` where that
+                                // leaf coded nothing.
+                                let cu_rel_mi = (cr * (cu_tx / MI), cc * (cu_tx / MI));
+                                let cu_tx_type = covering_leaf_tx_type(&leaf_tx_types, cu_rel_mi)
+                                    .unwrap_or(luma_tx_type);
+                                if covering_leaf_tx_type(&leaf_tx_types, cu_rel_mi).is_some() {
+                                    hit!(CHROMA_QUAD_LEAF_TX_HITS);
+                                    if cu_tx_type != luma_tx_type {
+                                        hit!(CHROMA_QUAD_LEAF_TX_DIFF_HITS);
+                                    }
+                                }
                                 let cu_grid = read_inter_plane(
                                     dec,
                                     cdfs,
@@ -39573,7 +39631,7 @@ fn decode_inter_block(
                                     cu_tx,
                                     base_q_idx,
                                     src.offset(cr * cu_tx * chroma_side + cc * cu_tx),
-                                    Some(luma_tx_type),
+                                    Some(cu_tx_type),
                                     Some(3),
                                     fctx,
                                 )?
@@ -40929,12 +40987,19 @@ fn decode_inter_block(
                         if idx == 0 {
                             first_tx_type = tu_tx_type;
                         }
-                        // lane-av1-444-128: the per-unit chroma inheritance in
-                        // the chunk tail resolves each unit's own tx_type from
-                        // the luma leaf covering its quadrant.
-                        if side > 64 {
-                            leaf_tx_types.push((row, col, tw, th, tu_tx_type));
-                        }
+                        // lane-av1444chr: EVERY luma leaf's coded type, at
+                        // every block size -- the chroma units below resolve
+                        // their own quadrant's leaf, and at 64x64 that is
+                        // this very loop's leaves (`av1_get_tx_type`,
+                        // blockd.h:1287-1297, scales the CHROMA 4x4 position
+                        // back to luma). It used to be collected only for
+                        // `side > 64`, so the 64x64 four-unit arm below had
+                        // nothing to resolve from and handed all four units
+                        // the block-level (top-left leaf) type. A leaf that
+                        // coded NOTHING is `DctDct` here exactly as libaom's
+                        // `decodetxb.c:199-203` stamps `DCT_DCT` into that
+                        // leaf's map cell on the `all_zero` path.
+                        leaf_tx_types.push((row, col, tw, th, tu_tx_type));
                         neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
                         // lane-sb128c r1: libaom's `decode_token_recon_block`
                         // walks 64x64 "mu" chunks (`mu_blocks_wide/high =
@@ -41055,19 +41120,8 @@ fn decode_inter_block(
                                             // leaves are read by now).
                                             let unit_rel_mi =
                                                 (unit_mi.0 - at_mi.0, unit_mi.1 - at_mi.1);
-                                            let covering = leaf_tx_types
-                                                .iter()
-                                                .copied()
-                                                // leaf (row, col) are mi but
-                                                // (tw, th) are px (the rect
-                                                // leaf path divides by MI too)
-                                                .find(|&(lr, lc, lw, lh, _)| {
-                                                    lr <= unit_rel_mi.0
-                                                        && unit_rel_mi.0 < lr + lh / MI
-                                                        && lc <= unit_rel_mi.1
-                                                        && unit_rel_mi.1 < lc + lw / MI
-                                                })
-                                                .map(|(_, _, _, _, t)| t);
+                                            let covering =
+                                                covering_leaf_tx_type(&leaf_tx_types, unit_rel_mi);
                                             // The prediction buffer is
                                             // `chroma_stride`-strided (the
                                             // plane block's own width at
@@ -41305,6 +41359,28 @@ fn decode_inter_block(
                             for cc in 0..mu_units_n {
                                 let cu_mi = (rmi + cr * (cu_tx / MI), cmi + cc * (cu_tx / MI));
                                 let cu_around = neighbours.around_mi(cu_mi, cu_tx);
+                                // `av1_get_tx_type` (blockd.h:1287-1297): an
+                                // inter block's chroma unit never codes a
+                                // `tx_type`; it reads the map cell at its OWN
+                                // position scaled back to luma
+                                // (`blk_row << ss_y`, `blk_col << ss_x`),
+                                // which is the coded type of the luma leaf
+                                // covering this unit's top-left mi cell --
+                                // `DctDct` when that leaf coded nothing
+                                // (`decodetxb.c:199-203`). The block-level
+                                // `luma_tx_type` is only the TOP-LEFT leaf's
+                                // type, so handing it to all four units
+                                // mistyped every unit sitting over a skipped
+                                // or differently-typed luma quadrant.
+                                let cu_rel_mi = (cr * (cu_tx / MI), cc * (cu_tx / MI));
+                                let cu_tx_type = covering_leaf_tx_type(&leaf_tx_types, cu_rel_mi)
+                                    .unwrap_or(luma_tx_type);
+                                if covering_leaf_tx_type(&leaf_tx_types, cu_rel_mi).is_some() {
+                                    hit!(CHROMA_QUAD_LEAF_TX_HITS);
+                                    if cu_tx_type != luma_tx_type {
+                                        hit!(CHROMA_QUAD_LEAF_TX_DIFF_HITS);
+                                    }
+                                }
                                 let cu_grid = read_inter_plane(
                                     dec,
                                     cdfs,
@@ -41319,7 +41395,7 @@ fn decode_inter_block(
                                     cu_tx,
                                     base_q_idx,
                                     src.offset(cr * cu_tx * chroma_side + cc * cu_tx),
-                                    Some(luma_tx_type),
+                                    Some(cu_tx_type),
                                     Some(3),
                                     fctx,
                                 )?
