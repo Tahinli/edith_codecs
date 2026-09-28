@@ -2140,7 +2140,7 @@ made in the same round that fixed the bug the stream was built to find.
 
 ## State
 
-48 commits on `lane-av1422warp`, no push. Worktree clean; the
+48 commits on `lane-av1422warp` (this correction inclusive), no push. Worktree clean; the
 `EC_AV1_ALLOW_422_PROBE` bypass is reverted and in no commit. All temporary
 instrumentation was removed except what is documented above as a permanent
 gate counter or as the `EC_SYMR` trace.
