@@ -118,7 +118,7 @@ with edge-filter strength 1 the prediction reproduces the oracle exactly (row0
 `132,150,157,148`, col0 `132,140,147,154,159,157,155,149`); with strength 0 it
 reproduces ours (`135,147,172,145`). The oracle printed `ft=1`, we computed 0.
 
-## Defect 3 — NOT fixed, HANDOFF with paired dumps
+## Defect 3 — PARTIALLY FIXED (`abae108a`), hand-off continues
 
 **The first version of this section mis-attributed the class** (it called this
 transform-size selection for a twice-as-tall plane block). Paired traces refute
@@ -339,8 +339,35 @@ variant, so a 4:2:2 RECT block votes over the luma unit counts.
 
 That is the same neighbour-read family as the `smooth_uv` fix, in the same file,
 for the same reason: a per-axis shape correction that was applied to some paths
-and not to the rect one. **This lane ran out of budget before landing the fix**;
-it is handed off here with the evidence above.
+and not to the rect one. ****LANDED in `abae108a`.** `decode_leaf_rect`'s
+`around_mi_rect` call was the one 4:2:2 chroma gather in the file still
+ungated; it now mirrors the sibling gate (`chroma_422`, which that arm
+already computes for its scan selection), luma keeping the per-mi gather:
+
+```
+before  EC_DCDUMP    mi=(48,28) plane=2 wh=(16,8) vote=0
+        above=[None/6,None/6,Some(false)/7,Some(false)/7]   FOUR cells
+after   EC_DCDUMP422 mi=(48,28) plane=2 wh=(16,8) vote=-1
+        above=[None/6,Some(false)/7]                        TWO cells
+```
+
+Red/green: the bit offset is a clean constant through coefficient unit
+1418 and turned 6 bits at 1419; after the fix unit 1418 pairs and the
+first divergence moves to **2427**. Frame-0 coefficient units 1959 →
+2680 (oracle 2512). Whole stream, 16 frames vs `aomdec --rawvideo`:
+**1619115 → 1380482** differing samples, still 0/16 exact.
+
+Identity, four ways, all unchanged: 4:2:0 control `a420.obu`
+byte-identical to aomdec; 4:4:4 `444_sb128rect_lr_witness.obu`
+byte-identical to the pre-lane build; pinned `422_allskip_2f.obu` and
+`422_sb128_3f.obu` still pixel-exact. The gate is ss (1,0), so the sampler
+is not reached at 4:2:0 or 4:4:4 at all.
+
+**Hand-off, new class.** The new first divergence is at coefficient unit
+2427 / TU 2428, mi(64,24), where the oracle codes a **32x32** luma TU and
+we code **8x8** leaves. That is block/partition structure, not a neighbour
+vote — a different class from this fix — so it is reported rather than
+chased. `a1.obu` stays unpinned and no gate is written.
 
 **On the scan-table finding (Main's caution): checked, and the caution does not
 explain it.** Unit 1418 is mi(48,28) plane 2 and it PAIRED on both sides as 8x8
