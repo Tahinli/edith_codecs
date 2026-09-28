@@ -392,6 +392,68 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 14 — the ladder walked: the first-delta read is the LUMA `mode` at mi(64,24)
+
+Ladder rebuilt with the round-13 emission fix on both sides (position
+appended before the format string's `\n`; 14 `EC_ISTEP` + 11
+`EC_COEFF_STEP` sites in the oracle, 18 coefficient + 2 mode-macro sites
+here), then reverted (`grep -c bitpos` = 0, `MODECTX` = 0).
+
+Instrument note, earned the hard way twice already: our `EC_ISTEP`
+positions come from the `istep!` macro and our `EC_COEFF_STEP` from the
+per-rung prints, and a strict index walk between the two sides breaks
+immediately because the two rung SETS differ per path (the oracle emits
+a `tx_type` step this decoder's rect reader has no print for). The
+ladder is therefore walked on the **all_zero anchors** — the rung both
+sides emit once per transform unit — and the delta map is read off the
+bit positions in between.
+
+**The delta map.** Constant **-14** (ours 14 bits ahead) for every
+transform unit from 0 to 2427, changing to **-11** at unit 2428. Inside
+that window, with `+14` folded in and every oracle read checked for a
+counterpart on our side:
+
+```
+  92321  all_zero  plane=2   OK
+  92323  skip       mi(64,24)  OK
+  92323  cdef       mi(64,24)  OK
+  92323  dq         mi(64,24)  OK
+  92327  mode       mi(64,24)  <-- first read with NO counterpart
+  92330  angle_y    mi(64,24)  (re-paired, shifted)
+  ...
+  92339  all_zero   <-- delta now -11
+```
+
+**The named read is the luma `mode` symbol of mi(64,24).** Oracle
+`mode val=6`, ours `mode val=1`. Cost: the oracle's read spans 92323 →
+92327 (4 bits), ours 92337 → 92342 (5 bits). Every read before it pairs
+exactly at +14; the deviation begins at this one and persists to the
+window's end, which is where the -14 → -11 step in the unit ladder
+comes from. The same block then carries the round-7 structural
+consequence: one 32x32 luma TU (oracle) against 8x8 leaves (ours).
+
+**What is not yet named, stated plainly.** Same block size and same
+bit position at the read, different symbol VALUE — so the divergence is
+in the mode CDF ROW, i.e. the `kf_y_mode[above_ctx][left_ctx]` context.
+This lane tried to print that context on both sides and did not get a
+paired measurement: our block reaches `read_intra_mode_rect`, not the
+square `read_intra_mode` the print was placed in, and the oracle-side
+`MODECTX` rung did not fire under its env var in the time available.
+Both prints are reverted. **No fix is claimed.**
+
+**Unblock.** Print the mode context at mi(64,24) on both sides — ours
+from `read_intra_mode_rect` (the path that block actually takes), the
+oracle's `get_y_mode_cdf(ec_ctx, above_mi, left_mi)` — and compare
+`above_mode` / `left_mode` at mi(64,24). The unit ladder is now a
+trustworthy instrument, so once the context is paired the fix follows
+directly and the ladder re-run confirms it.
+
+**Credit where it is due.** Round 13's instrument correction — moving
+the bit position onto the same physical line as its read — is what made
+this round possible. Rounds 11 and 12 both reported findings that were
+artefacts of that placement; without the fix this window would have
+been "analysed" a third time and reached a third wrong conclusion.
+
 ### Round 13 — SETTLED: the oracle DOES consume them, and our reads match exactly
 
 **Outcome (a).** The rung emission is fixed — the bit position is now
