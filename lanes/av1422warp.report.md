@@ -392,6 +392,55 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 8 — the partition reads PAIR; the block size entering them does not
+
+Rungs added and reverted on both sides (ours `EC_TRACE`, the oracle a `PARTB`
+print in `ec_read_partition_impl` with `has_rows`/`has_cols`/`ctx`/bit
+position/value; `aomdec` rebuilt, `grep -c PARTB` = 0).
+
+Bottom-edge truncation is **ruled out**: libaom recomputes
+`has_rows = (mi_row + hbs) < mi_rows` with the CURRENT bsize's `hbs`
+(`decodeframe.c:1292`), and so does ours, per level — both go
+`has_rows=0` at the SB and the 64 level and `has_rows=1` from the 64x32
+level down. The edge arithmetic agrees at every level of SB row 64.
+
+**The partition reads themselves are identical.** Bit positions carry the
+same constant −14 right through, and the values agree:
+
+```
+        oracle                                          ours
+mi=64,16 bsize=9 ctx=8  bitpos=92247  value=1     92261  value=1
+mi=64,24 bsize=9 ctx=10 bitpos=92321  value=0     92335  value=0
+mi=64,32 bsize=9 ctx=9  bitpos=92356  value=3    93518  value=2   <- DIVERGED
+```
+
+At mi(64,32) the oracle is at bit 92356 and we are at 93518 — **1162 bits
+later**. The gap opens in the block that FOLLOWS mi(64,24): the oracle
+spends 33 bits there (92323 -> 92356) and we spend ~1183.
+
+**So the named divergence is the BLOCK SIZE entering the partition
+read, not the partition symbol.** The oracle reads the partition for a
+`BLOCK_64X32` (its enum 9) and lands `PARTITION_NONE` on a 64x32 leaf,
+coded as one 32x32 luma TU plus 16x32 chroma (TU 2428). We read a
+partition at the same bit position with the same value, and land on a
+32x32 SQUARE — the `EC_IMODE ... fn=sq side=32` of round 7, coded as 8x8
+leaves. Same position, same symbol, different bsize in, different block
+out: the bsize is decided one or more levels ABOVE mi(64,24), in the
+HORZ/SPLIT walk that produced the child.
+
+**What is left to do, and why it is not another step here.** Tracing the
+bsize lineage from the SB root down to mi(64,24) on both sides — the
+`PARTB bsize=` field at each level of SB row 64, which the oracle's rung
+prints and ours does not — is a further instrumentation round, not a
+continuation of this one. The oracle's own trace already shows the shape
+to chase (`mi=64,0 bsize=15 -> bsize=12 -> mi=64,16 bsize=12 -> bsize=9`
+with `has_rows` flipping 0 -> 1 at the 64x32 level), and the question is
+which of those levels our decoder resolves to a different bsize.
+
+**Scan table, still open.** Unchanged and not yet re-checked: it cannot
+be re-checked until the partition tree is right, since the tiling it was
+observed under is decided by the same walk.
+
 **Why this round stops here rather than continuing.** The partition rungs
 this lane has — ours `EC_TRACE_PART`, the oracle's `AOMMB` — do not fire
 for these blocks at all, and the bit-position rungs used in rounds 5-6 are
