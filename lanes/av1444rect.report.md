@@ -394,7 +394,39 @@ it is consumed.** Both candidates this lane chased were that mistake, just not
 at the site — one had a per-plane extent that was not at the fork at all, the
 other fired 4800 msac bits away.
 
-## 8. Method notes for the next lane
+## 8. Independence check (Huseyin-2's ablation, lane-av1444edge)
+
+Recorded here because it is evidence ABOUT this lane's fix, though the
+measurement is Huseyin-2's and not mine.
+
+The two 4:4:4 cells the chroma-format sweep left unassigned — D1 "4:4:4
+superres 8-bit" and D2 "4:4:4 odd coded dims 130x122" — localize to
+`4e151813`'s class (the hardcoded `ox*2, oy*2, 8` 4:2:0 luma footprint in
+`decode_rect4_16_strip`'s `tu_reach`), **not** to this lane's `around_c` arm.
+Their 4-arm ablation, 4/4 decode-order frames byte-exact vs aomdec:
+
+| build | D2 (130x122) | D1 (superres) |
+|---|---|---|
+| base + `f92776ba` (this lane) alone | DIVERGENT — f3 9203 samples, first Y(100,32) | DIVERGENT — f2 25296, first Y(192,0) |
+| base + `4e151813` alone | EXACT 4/4 | EXACT 4/4 |
+| base + both | EXACT 4/4 | EXACT 4/4 |
+
+So `f92776ba` and `4e151813` are independent and **merge order does not couple
+them**. Worth stating explicitly: this lane's fix does not reach those two
+cells, and their fix does not substitute for it. Neither is a case of the same
+root being fixed twice.
+
+Their method note, worth carrying: the first wrong SYMBOL is invisible in the
+`EC_MODE` ladder because that print carries no `bsize`. What localizes those
+cells is the per-superblock decode-order pixel map of the pre-filter dump — the
+first wrong superblock in decode order is the one whose above-neighbour context
+then forks the NEXT block's `ref0`. On sr444 f2 that is SBcol2/SBrow0, first
+wrong pixel (128,48) = mi(12,32) with the mode identical on both sides, and the
+`ref0` fork (LAST vs our GOLDEN) lands on the very next block, mi(13,32). A
+pixel error cannot cause a mode fork, so the same bsize/footprint error has to
+feed both.
+
+## 9. Method notes for the next lane
 
 - **A route counter is not proof a fix bites.** This lane learned it the hard
   way: a counter can fire identically before and after a change that changes
