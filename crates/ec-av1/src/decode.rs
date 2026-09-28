@@ -13540,7 +13540,18 @@ fn decode_intrabc_128rect(
         // top-left sample is outside the frame codes nothing.
         let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(mi_c));
         let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(mi_r));
-        for (idx, &(row, col, tw, th)) in leaves.iter().enumerate() {
+        // lane-av1h5: chunk-major token order at 128 (see the 128x128 arm).
+        let order: Vec<usize> = if side > 64 {
+            hit!(MU_CHUNK_ORDER_HITS);
+            let nchunk = (side / 64).max(1);
+            let mut o: Vec<usize> = (0..leaves.len()).collect();
+            o.sort_by_key(|&i| ((leaves[i].0 / 16) * nchunk + (leaves[i].1 / 16), i));
+            o
+        } else {
+            (0..leaves.len()).collect()
+        };
+        for (pos, &idx) in order.iter().enumerate() {
+            let (row, col, tw, th) = leaves[idx];
             debug_assert_eq!(
                 tw, th,
                 "a square TX_64X64 tree root only yields square leaves"
@@ -13578,8 +13589,8 @@ fn decode_intrabc_128rect(
             // are done, its chroma is read immediately (the inter 128 path's
             // interleave).
             let chunk = (row / 16, col / 16);
-            let done = idx + 1 == leaves.len()
-                || (leaves[idx + 1].0 / 16, leaves[idx + 1].1 / 16) != chunk;
+            let done = pos + 1 == order.len()
+                || (leaves[order[pos + 1]].0 / 16, leaves[order[pos + 1]].1 / 16) != chunk;
             if done {
                 let (cr, cc) = chunk;
                 // `av1_get_max_uv_txsize(BLOCK_128X64)` = TX_32X32: one
@@ -19579,6 +19590,7 @@ impl PlaneBuf<'_> {
 /// Reads one plane's transform block, reconstructs it into `plane` at
 /// `(x, y)`/`side`, and records what it leaves behind in `neighbours`.
 #[allow(clippy::too_many_arguments)]
+
 fn read_plane(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -19631,7 +19643,9 @@ fn read_plane(
         // `combine_entropy_contexts(above, left)` plus 7, or plus 10 when the
         // plane block is bigger than the transform. Our chroma tables hold the
         // offset-7 rows first, so the caller adds 3 for the bigger-block case
-        // (only a 128x128 block's TX_32X32 chroma units, lane-sb128b r3).
+        // (every chroma unit of a plane block above TX_4X4 -- lane-sb128b r3,
+        // and lane-av1h5 measured the 4:4:4 lossless 128 root's TX_4X4 chroma
+        // units reading the offset-10 rows too, against aomdec's `EC_DBGCTX`).
         usize::from(around.0) + usize::from(around.1) + luma_skip_ctx.unwrap_or(0)
     };
     // spec 5.11.47/libaom `av1_read_tx_type`: a filter-intra luma block's
@@ -32095,6 +32109,21 @@ thread_local! {
     pub(crate) static CHROMA_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// lane-av1h5: how many blocks took the CHUNK-MAJOR token order -- a
+    /// block above 64 whose leaf walk was reordered into libaom's 64x64 "mu"
+    /// chunks (`decode_token_recon_block`'s plane loop is INSIDE the chunk
+    /// loop). One bump per such block. Below 64 a block IS one chunk and the
+    /// orders coincide, so the arm stays at 0 there.
+    pub(crate) static MU_CHUNK_ORDER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`MU_CHUNK_ORDER_HITS`], for a gate's own before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn mu_chunk_order_hits() -> usize {
+    MU_CHUNK_ORDER_HITS.with(std::cell::Cell::get)
+}
+
 /// [`CHROMA_SPLIT_TX_HITS`], for a gate's own before/after delta.
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn chroma_split_tx_hits() -> usize {
@@ -39130,7 +39159,24 @@ fn decode_inter_block(
                     // own slice of the block's motion-compensated predictor.
                     let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
                     let mut first_tx_type = TxType::DctDct;
-                    for (idx, &(row, col, tw, th)) in leaves.iter().enumerate() {
+                    // lane-av1h5: libaom's `decode_token_recon_block` walks
+                    // 64x64 "mu" chunks with the PLANE loop inside, so at 128
+                    // the token order is CHUNK-major; the transform tree hands
+                    // us a BLOCK-wide raster whose chunk members are not
+                    // contiguous. Below 128 a block IS one chunk.
+                    let mu_order = |leaves: &Vec<(usize, usize, usize, usize)>, side: usize| {
+                        if side <= 64 {
+                            return (0..leaves.len()).collect::<Vec<usize>>();
+                        }
+                        let nchunk = side / 64;
+                        let mut o: Vec<usize> = (0..leaves.len()).collect();
+                        o.sort_by_key(|&i| ((leaves[i].0 / 16) * nchunk + (leaves[i].1 / 16), i));
+                        o
+                    };
+                    let order = mu_order(leaves, side);
+                        hit!(MU_CHUNK_ORDER_HITS);
+                    for (pos, &idx) in order.iter().enumerate() {
+                        let (row, col, tw, th) = leaves[idx];
                         let tu_mi = (at_mi.0 + row, at_mi.1 + col);
                         let (tu_px, tu_py) = (px + col * MI, py + row * MI);
                         let (tu_grid, tu_tx_type) = if tw == th {
@@ -39206,8 +39252,9 @@ fn decode_inter_block(
                         // is a single chunk and this never fires.
                         if side > 64 {
                             let chunk = (row / 16, col / 16);
-                            let done = idx + 1 == leaves.len()
-                                || (leaves[idx + 1].0 / 16, leaves[idx + 1].1 / 16) != chunk;
+                            let done = pos + 1 == order.len()
+                                || (leaves[order[pos + 1]].0 / 16, leaves[order[pos + 1]].1 / 16)
+                                    != chunk;
                             if done {
                                 let (cr, cc) = chunk;
                                 // `av1_get_max_uv_txsize(BLOCK_128X128)` =
@@ -40870,7 +40917,33 @@ fn decode_inter_block(
                     // own slice of the block's motion-compensated predictor.
                     let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
                     let mut first_tx_type = TxType::DctDct;
-                    for (idx, &(row, col, tw, th)) in leaves.iter().enumerate() {
+                    // lane-av1h5: libaom's `decode_token_recon_block` walks the
+                    // block in 64x64 "mu" CHUNKS and codes EVERY PLANE of a
+                    // chunk before the next one starts, so at 128 the token
+                    // order is CHUNK-major. The transform tree hands us a
+                    // BLOCK-wide raster (32 mi across here), whose chunk
+                    // members are not contiguous: `leaves` 0..15 are chunk
+                    // (0,0) row 0, but chunk (0,0) rows 1..15 are leaves
+                    // 32..47, 64..79, ... Walking it as given closed the
+                    // "chunk" every 16 leaves and coded each chunk's chroma
+                    // sixteen times -- 64 chroma walks per 128 root where
+                    // libaom codes 4 (measured against aomdec's `EC_DBGCTX`:
+                    // 24576 chroma units per inter frame vs 1536). Below 128 a
+                    // block IS one chunk and the two orders coincide.
+                    let nchunk = (side / 64).max(1);
+                    let order: Vec<usize> = if side > 64 {
+                        hit!(MU_CHUNK_ORDER_HITS);
+                        let mut o: Vec<usize> = (0..leaves.len()).collect();
+                        o.sort_by_key(|&i| {
+                            let (r, c) = (leaves[i].0, leaves[i].1);
+                            ((r / 16) * nchunk + (c / 16), i)
+                        });
+                        o
+                    } else {
+                        (0..leaves.len()).collect()
+                    };
+                    for (pos, &idx) in order.iter().enumerate() {
+                        let (row, col, tw, th) = leaves[idx];
                         let tu_mi = (at_mi.0 + row, at_mi.1 + col);
                         let (tu_px, tu_py) = (px + col * MI, py + row * MI);
                         let (tu_grid, tu_tx_type) = if tw == th {
@@ -40946,8 +41019,9 @@ fn decode_inter_block(
                         // is a single chunk and this never fires.
                         if side > 64 {
                             let chunk = (row / 16, col / 16);
-                            let done = idx + 1 == leaves.len()
-                                || (leaves[idx + 1].0 / 16, leaves[idx + 1].1 / 16) != chunk;
+                            let done = pos + 1 == order.len()
+                                || (leaves[order[pos + 1]].0 / 16, leaves[order[pos + 1]].1 / 16)
+                                    != chunk;
                             if done {
                                 let (cr, cc) = chunk;
                                 // `av1_get_max_uv_txsize(BLOCK_128X128)` =
@@ -41828,7 +41902,18 @@ fn decode_inter_block(
         let mut v_units: Vec<i32> = Vec::new();
         if let Some(leaves) = vartx_leaves.as_ref() {
             let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
-            for (idx, &(row, col, tx_px, _)) in leaves.iter().enumerate() {
+            // lane-av1h5: chunk-major token order at 128 (see the 128x128 arm).
+            let order: Vec<usize> = if side > 64 {
+                hit!(MU_CHUNK_ORDER_HITS);
+                let nchunk = (side / 64).max(1);
+                let mut o: Vec<usize> = (0..leaves.len()).collect();
+                o.sort_by_key(|&i| ((leaves[i].0 / 16) * nchunk + (leaves[i].1 / 16), i));
+                o
+            } else {
+                (0..leaves.len()).collect()
+            };
+            for (pos, &idx) in order.iter().enumerate() {
+                let (row, col, tx_px, _) = leaves[idx];
                 let tu_mi = (at_mi.0 + row, at_mi.1 + col);
                 let (tu_px, tu_py) = (px + col * MI, py + row * MI);
                 // A transform unit inside a block is not a block at that
@@ -41901,8 +41986,9 @@ fn decode_inter_block(
                 neighbours.record_mi_luma(tu_mi, tx_px, &tu_grid);
                 if side > 64 {
                     let chunk = (row / 16, col / 16);
-                    let done = idx + 1 == leaves.len()
-                        || (leaves[idx + 1].0 / 16, leaves[idx + 1].1 / 16) != chunk;
+                    let done = pos + 1 == order.len()
+                        || (leaves[order[pos + 1]].0 / 16, leaves[order[pos + 1]].1 / 16)
+                            != chunk;
                     if !done {
                         continue;
                     }
