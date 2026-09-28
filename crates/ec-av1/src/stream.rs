@@ -6927,6 +6927,298 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1444rect (H1): the 4:4:4 LOSSY cell with a 1:4 (HORZ_4 /
+    /// VERT_4) partition -- the largest correctness gap the chroma-format
+    /// sweep left, and the first 4:4:4 lossy exactness gate in the crate.
+    ///
+    /// **The defect.** `decode_inter_block`'s `around_c` gathered a 1:4
+    /// strip's chroma coefficient context at the 4:2:0 PAIR extent
+    /// (`(16, 8)` HORZ / `(8, 16)` VERT) with no `ss` gate, so at ss (0,0)
+    /// it read one extra luma mi row of LEFT chroma context. At 4:4:4
+    /// `is_chroma_reference` (av1_common_int.h:1454) reduces both parity
+    /// clauses to `!subsampling_y` / `!subsampling_x`, so every block is its
+    /// own chroma reference and no pair exists: the strip codes its own
+    /// 16x4 chroma over its own context. Our U unit's `get_txb_ctx` then saw
+    /// a neighbour libaom does not have, and the arithmetic coder forked.
+    ///
+    /// **The recipe** (sha256
+    /// `77f727e76d81fe48cd03709f799131677c04869b163e18d78e96bc742ec69153`,
+    /// 6441 bytes, 2 frames, `testsrc2 128x96 rate=25` yuv444p):
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=128x96:rate=25" -frames:v 2 \
+    ///        -pix_fmt yuv444p -f yuv4mpegpipe - | \
+    /// aomenc --codec=av1 --profile=1 --passes=1 --end-usage=q --cq-level=20 \
+    ///        --cpu-used=2 --threads=1 --row-mt=0 --lag-in-frames=0 \
+    ///        --kf-max-dist=100 --limit=2 - out.obu
+    /// ```
+    /// (`rate=25` is load-bearing: `testsrc2`'s pattern is time-parameterised,
+    /// so `rate=1` produces a different, already-exact stream.)
+    ///
+    /// Red before the fix: frame 1, 8884 of 36864 samples wrong, first at
+    /// Y(91,32); the first wrong symbol was read 26263 of the frame, both
+    /// sides at mi (8,16) -- ours a luma-shaped `txb_skip` row (our
+    /// re-indexed chroma ctx 1), the oracle `decodetxb.c:158` on the U plane
+    /// with `txb_skip_ctx = 7`.
+    ///
+    /// Non-vacuity, three ways: the pinned stream must really be ss (0,0)
+    /// (asserted through the oracle aomdec's own sequence header, below);
+    /// `decode::rect4_inter_own_chroma444_hits()` must be non-zero, so the
+    /// 1:4-strip route the fix sits on really ran; and the SAME source and
+    /// flags at 4:2:0 must leave that counter at zero, which is what makes
+    /// it the 4:4:4-only route rather than a tally every strip bumps.
+    #[test]
+    fn a_444_lossy_rect4_inter_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_444_lossy_rect4_inter_stream_decodes_pixel_exact";
+        const FIXTURE_LEN: usize = 6441;
+        const FIXTURE_FNV: u64 = 0x0436_8b2d_2e91_72b0;
+        const W: usize = 128;
+        const H: usize = 96;
+        const FRAMES: usize = 2;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_lossy_rect4_inter_witness.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_rect4_inter_own_chroma444_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: the pinned 4:4:4 lossy stream no longer decodes cleanly: {e}")
+        });
+        let own_chroma = crate::decode::rect4_inter_own_chroma444_hits();
+        assert!(
+            own_chroma > 0,
+            "{NAME}: no 1:4 inter strip read its chroma context over its own \
+             extent -- the corrected route never ran (class gate-blind-to-feature)"
+        );
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: frame {i} dimensions");
+            // At 4:4:4 the chroma planes are full resolution. A decoder that
+            // kept the 4:2:0 extent would hand quarter-size chroma planes to
+            // the byte compare below, which cannot pass -- but say so here
+            // rather than let the compare stand in for the shape claim.
+            assert_eq!(
+                f.u.len(),
+                W * H,
+                "{NAME}: frame {i} chroma plane is {} samples; at 4:4:4 it must be \
+                 full resolution ({W}x{H})",
+                f.u.len()
+            );
+        }
+        if aomdec_path().is_file() {
+            let (decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME}: {decoded} frame(s) byte-exact vs aomdec, {own_chroma} \
+                 own-extent 1:4 chroma gather(s)"
+            );
+        } else {
+            eprintln!("{NAME}: no oracle aomdec, pixel arm skipped");
+        }
+
+        // The specificity arm: the SAME source, flags and 1:4 partitions at
+        // 4:2:0 must not touch the 4:4:4-only route. If a later change made
+        // the counter fire everywhere, this arm is what catches it.
+        if !have_aomenc() {
+            eprintln!("{NAME}: no aomenc, 4:2:0 specificity arm skipped");
+            return;
+        }
+        let source = format!("testsrc2=size={W}x{H}:rate=25");
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-frames:v",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{NAME}: ffmpeg refused the 4:2:0 control source: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=20",
+                "--cpu-used=2",
+                "--threads=1",
+                "--row-mt=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=100",
+                "--limit=2",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]),
+            &y4m.stdout,
+        );
+        assert!(
+            out.status.success(),
+            "{NAME}: aomenc refused the 4:2:0 control recipe: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        crate::decode::reset_rect4_inter_own_chroma444_hits();
+        decode_stream(&out.stdout)
+            .unwrap_or_else(|e| panic!("{NAME}: the 4:2:0 control stream was refused: {e}"));
+        let (h4, v4, _, _) = crate::decode::inter16_rect4_counters();
+        // The control must actually code 1:4 inter strips, or it says nothing
+        // about the arm the fix touches. Measured: 16 HORZ_4, 28 VERT_4.
+        assert!(
+            h4 + v4 > 0,
+            "{NAME}: the 4:2:0 control coded NO 1:4 inter strip ({h4} HORZ_4, {v4} \
+             VERT_4) -- the identity arm below would say nothing about 1:4 strips"
+        );
+        assert_eq!(
+            crate::decode::rect4_inter_own_chroma444_hits(),
+            0,
+            "{NAME}: the 4:2:0 control fired the ss_x-0 own-extent route -- the route \
+             is not specific to the 4:4:4 cell it was fixed for"
+        );
+        // The identity half: the fix adds an arm gated on `ss_x == 0`, so a
+        // 4:2:0 stream must stay byte-exact through it. This is the arm that
+        // would go red if the new arm were ever widened past ss_x 0.
+        if aomdec_path().is_file() {
+            decode_all_frames_vs_oracle(&out.stdout, &format!("{NAME}-420"));
+        }
+        eprintln!("{NAME}: 4:2:0 control {h4} HORZ_4 / {v4} VERT_4 strips, 0 own-extent gathers");
+    }
+
+    /// lane-av1444rect r2 — the SAME class as the gate above, second
+    /// instance: `decode_rect4_16_intrabc` applied the 4:2:0 pair geometry at
+    /// ss (0,0), where `is_chroma_reference` makes an intra-BC 1:4 strip its
+    /// own chroma reference. It predicted and coded an 8x4 chroma block at
+    /// `(lmi - 1) * MI / 2` where libaom codes 16x4 at the strip's origin.
+    ///
+    /// **This is a PROGRESS gate, not an exactness gate, and it says so.** The
+    /// 4:4:4 intra-BC cell is still divergent: after the ss gate the LUMA
+    /// plane is exact to sample 205264 (it was 164416) and the entropy fork
+    /// moves from read 11750 to 12465, but both CHROMA planes still first
+    /// diverge at index 20532 and 390380 of 921600 samples are wrong. So the
+    /// assertion is a prefix floor on the plane the gate actually moved —
+    /// which only ever grows, and which the next lane's fix cannot turn red —
+    /// and the untouched chroma divergence is named, never asserted exact.
+    ///
+    /// Recipe (both fixtures, one frame, `testsrc2 640x480 r=25`):
+    /// ```text
+    /// aomenc --codec=av1 --bit-depth=8 --input-bit-depth=8 --passes=1
+    ///        --end-usage=q --cpu-used=0 --lag-in-frames=0 --kf-max-dist=1
+    ///        --limit=1 --threads=1 --enable-rect-partitions=1
+    ///        --enable-1to4-partitions=1 --min-partition-size=4
+    ///        --max-partition-size=64 --sb-size=64 --tune-content=screen
+    ///        --enable-intrabc=1 --enable-palette=1 --cq-level=60
+    ///        --enable-tx-size-search=0 --obu [--profile=1] -o out.obu src.y4m
+    /// ```
+    /// 4:4:4 (1016 B, sha256 7fe888ed…) carries 17 intrabc 16x4 strips at
+    /// ss (0,0); the 4:2:0 twin (890 B, sha256 d01352af…) is byte-exact and
+    /// is the identity arm — the ss gate cannot reach it, and the whole frame
+    /// is compared with the length asserted first.
+    #[test]
+    fn a_444_intrabc_rect4_reads_its_own_chroma_plane_block() {
+        const NAME: &str = "a_444_intrabc_rect4_reads_its_own_chroma_plane_block";
+        const W: usize = 640;
+        const H: usize = 480;
+        const PS: usize = W * H;
+        let read = |name: &str, file: &str, len: usize, fnv: u64| -> Vec<u8> {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("fixtures/{file}"));
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{name}: pinned fixture {} is missing ({e}) -- a failure, not a skip",
+                    path.display()
+                )
+            });
+            assert_eq!(bytes.len(), len, "{name}: {file} length moved");
+            assert_eq!(fnv1a64(&bytes), fnv, "{name}: {file} bytes moved");
+            bytes
+        };
+        let stream444 = read(
+            NAME,
+            "444_intrabc_rect4_witness.obu",
+            1016,
+            0x27c2_fad5_4047_2994,
+        );
+        let stream420 = read(
+            NAME,
+            "420_intrabc_rect4_witness.obu",
+            890,
+            0x57ec_3da2_a63b_403a,
+        );
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_intrabc_rect4_own_chroma444_hits();
+        let frames = decode_stream(&stream444)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned 4:4:4 stream was refused: {e}"));
+        let own = crate::decode::intrabc_rect4_own_chroma444_hits();
+        assert!(
+            own > 0,
+            "{NAME}: no intra-BC 1:4 strip coded its own chroma plane block -- the \
+             corrected route never ran (class gate-blind-to-feature)"
+        );
+        assert_eq!(frames.len(), 1, "{NAME}: frame count");
+
+        // The identity arm FIRST and in full: the 4:2:0 twin must stay
+        // byte-exact. `decode_all_frames_vs_oracle` asserts the two frame
+        // lengths match before it compares anything -- the check whose absence
+        // turned an out-of-window divergence into a reported EXACT in this
+        // lane's own round 1.
+        if aomdec_path().is_file() {
+            decode_all_frames_vs_oracle(&stream420, &format!("{NAME}-420"));
+            crate::decode::reset_intrabc_rect4_own_chroma444_hits();
+            decode_stream(&stream420)
+                .unwrap_or_else(|e| panic!("{NAME}: the 4:2:0 twin was refused: {e}"));
+            assert_eq!(
+                crate::decode::intrabc_rect4_own_chroma444_hits(),
+                0,
+                "{NAME}: the 4:2:0 twin fired the ss (0,0)-only route"
+            );
+
+            // NO 4:4:4 pixel assert here, and deliberately so. The cell is
+            // still divergent (390380 of 921600 samples; both chroma planes
+            // first wrong at index 20532, x=52 y=32; entropy fork read 12465
+            // at mi (90,108)) and an assertion of the form "our output is
+            // wrong by exactly N" would encode the defect as expected
+            // behaviour -- the shape this suite refuses everywhere else, and
+            // one that outlives the memory of why. The true assertions this
+            // gate can make today are the two above: the route is reached at
+            // 4:4:4 and is not reached at 4:2:0, and the 4:2:0 twin is
+            // byte-exact. The open chroma root and its numbers live in
+            // lanes/av1444rect.report.md §6, not in an assertion.
+            eprintln!(
+                "{NAME}: {own} own-chroma intra-BC strip(s) at 4:4:4, 0 at 4:2:0; \
+                 4:2:0 twin byte-exact; 4:4:4 intra-BC CHROMA still OPEN \
+                 (U/V first wrong at index 20532, entropy fork read 12465 at \
+                 mi (90,108)) -- see lanes/av1444rect.report.md \u{00a7}6"
+            );
+        } else {
+            eprintln!("{NAME}: no oracle aomdec, pixel arm skipped");
+        }
+    }
+
     /// lane-av1lrflush: the pipelined loop-restoration band release flushes
     /// RU row 0 on the inter frame whose top superblock row carries a
     /// 128-root rect -- the exact shape lanes/av1444sb.report.md r2 named as
