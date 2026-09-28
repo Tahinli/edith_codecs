@@ -244,16 +244,67 @@ one frame/block" rule) rather than to the whole step stream. The 6-bit magnitude
 says the target is very close — the same unit's tail, or the mode reads between
 two units.
 
+### The per-TU window bisect (run; the read is NAMED)
+
+Extending `bitpos` to EVERY `EC_COEFF_STEP` rung on both sides and pairing
+inside the single transform unit at index 1418 (its own coordinates, per the
+`ec-av1-oracle-trace-pairing` rule) enumerates the window completely. Both
+instrumentations are reverted again (oracle `aomdec` rebuilt, `grep -c bitpos` =
+0).
+
+**The window, 27 oracle reads against 28 of ours** (the extra one is a duplicate
+PRINT of the same read, at the same bit, not a second read). Through the whole
+base/br/Golomb loop the two sides are IDENTICAL — same tags, same order, same
+values, same bit positions under the constant -14:
+
+```
+  O 0 bit=56469 all_zero plane=2 ... all_zero=0 rng=42420
+  O 1 bit=56469 tx_type plane=2 txtype=0 txsize=1
+  O 2 bit=56475 eob eob=8
+  O 3..26  base/br/after_bases/sign/post_golomb  (c = 7,6,5,4,3,2,1,0)
+  M 0 bit=56483 all_zero plane=0 ctx=2 entry=45064 all_zero=0 rng=42420
+  M 1..21  eob/base/br/after_bases  (c = 7,6,5,4,3,2,1,0)
+```
+
+**The divergence is the first SIGN read.** Both decode the same value (1), but
+from a different CDF row:
+
+```
+oracle  O 15  tag=sign c=0 sign=1 dcctx=1  rng=35769  bit=56491
+ours    M 22  tag=sign_rect pos=0 sign=1 dcctx=0 rng=52678 bit=56506
+```
+
+`dcctx` — the DC sign context — is **1 on the oracle and 0 on ours**. Same symbol
+value, different row, so the range coder leaves in a different state and every
+later bit in the window shifts; that is the 6-bit excess, and it is why the
+`rng` pairing that looked "identical through the base loop" turns over exactly at
+the sign pass.
+
+libaom takes that context from `txb_ctx->dc_sign_ctx` (`decodetxb.c:366`), which
+is a **3-symbol read from `dc_sign_cdf_extra[plane_type]` taken once per
+transform block** — a CDF that no `EC_COEFF_STEP` rung prints on either side, so
+this lane could not pair that symbol and cannot say whether our value is wrong or
+merely reflects an already-drifted `dc_sign_cdf_extra` adaptation state.
+
+**Second, separate finding, worth its own look:** our scan table maps scan
+indices to different raster positions than the oracle's for this unit — oracle
+`c1 -> pos 8`, `c2 -> pos 1`; ours `c1 -> pos 1`, `c2 -> pos 8` (and
+`c3 -> pos 2` vs ours `pos 16`, `c6 -> pos 24` vs ours `pos 3`). The coefficient
+VALUES match by scan index on both sides, so this does not by itself move a bit,
+but it places coefficients in the wrong cells and would corrupt the transform
+independently of the entropy question.
+
 ### Unblock
 
-The bit-position bisect below has been run and narrows this to a **6-bit**
-excess consumed between unit 1418's and unit 1419's `txb_skip` reads. Continue
-by restricting the per-coefficient step pairing to a SINGLE transform unit at a
-time — the whole-stream pairing does not work, because the two readers traverse
-a unit's coefficients in different orders. The 4:2:2-only constructs in that
-window remain the candidates: the chroma-reference bookkeeping for the shared
-mi(50,27) column, and whatever the 4:2:2 block tail reads after the shared
-chroma. Fixtures and dumps are in
+The per-TU window bisect below has been run and NAMES the read: the **DC sign
+context** at the sign pass of unit 1418, `dcctx` 1 (oracle) against 0 (ours),
+taken in libaom from `txb_ctx->dc_sign_ctx` — a 3-symbol read from
+`dc_sign_cdf_extra[plane_type]` per transform block. Next step: add a rung for
+that symbol on BOTH sides (it is the one read in the unit that no
+`EC_COEFF_STEP` print covers) and pair it, which should say outright whether our
+value is wrong or merely drifted. The scan-table disagreement found in the same
+window (values match by scan index, positions do not) is a second, independent
+lead to keep open. Fixtures and dumps are in
 `~/.cache/av1422warp/` (`a1_f0.obu`, `f0.opred`, `f0.mpred`, `f0.ocoeff`,
 `f0.mcoeff`, `f0.ostep`, `f0.step`, `f0.otx`); the probe bypass
 (`EC_AV1_ALLOW_422_PROBE`) is reverted and in no commit.
