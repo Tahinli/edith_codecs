@@ -9,8 +9,8 @@ The charter asked for a pixel-exact 4:2:2 stream with real residuals, compound
 and warped motion above the vertical midpoint. **The stream is not pixel-exact**,
 so it is NOT pinned and no coverage gate was written — a gate over a non-exact
 stream is a false claim. What it bought is two real 4:2:2 defects fixed (one a
-decode-blocking panic) and a third localized to one site for its owner. The
-sequence-header refusal **stays**.
+decode-blocking panic) and a third localized to a single desync window and handed
+off with paired dumps. The sequence-header refusal **stays**.
 
 | commit | defect | before | after |
 |---|---|---|---|
@@ -118,29 +118,99 @@ with edge-filter strength 1 the prediction reproduces the oracle exactly (row0
 `132,150,157,148`, col0 `132,140,147,154,159,157,155,149`); with strength 0 it
 reproduces ours (`135,147,172,145`). The oracle printed `ft=1`, we computed 0.
 
-## Defect 3 — NOT fixed, for its owning lane
+## Defect 3 — NOT fixed, HANDOFF with paired dumps
 
-After `a9611ea2` the first 1419 TUs of frame 0 pair exactly on prediction sum;
-index 1419 is the first divergence and it is a shape difference, not a value one:
+**The first version of this section mis-attributed the class** (it called this
+transform-size selection for a twice-as-tall plane block). Paired traces refute
+that: see "What the class actually is" below.
+
+### The measurement, on a clean single-frame stream
+
+`a1.obu`'s frame 0 cut at the second OBU temporal delimiter, `a1_f0.obu`
+(11802 B, decodes 1 frame on both sides). With both sides frame-scoped, two
+independent pairings agree on the same boundary:
+
+- **coefficient ladder** (`EC_TRACE_COEFF`, oracle `EC_COEFF_STEP` vs ours, paired
+  on `all_zero` + post-read `rng`): units pair exactly through **1418**; unit
+  **1419** is the first mismatch. Oracle 2512 units, ours 1959.
+- **prediction ladder** (`EC_PREDOUT8` vs `OUR_PRED`, paired on sum + shape):
+  same boundary, index **1419**.
 
 ```
-1418 O (48,28,plane 2,'8x8', 9024)  M ('8x8', 9024)   <- matches
-1419 O (50,28,plane 0,'8x8', 5715)  M ('4x4', 1424)   <- oracle codes ONE TX_8X8
-1420 O (50,28,plane 1,'4x8', 3370)  M ('4x4', 1344)   <- luma TU first, chroma follows
-1421 O (50,28,plane 2,'4x8', 2513)  M ('4x4', 1488)
+1413 O mi(50,26) plane 0 '8x8' 5799   M '8x8' 5799   <- mi(50,26) block is FINE
+1414 O mi(50,26) plane 1 '4x8' 3784   M '4x8' 3784
+1415 O mi(50,26) plane 2 '4x8' 2468   M '4x8' 2468
+1416 O mi(48,28) plane 0 '16x8' 16683 M '16x8' 16683
+1417 O mi(48,28) plane 1 '8x8' 5504   M '8x8' 5504
+1418 O mi(48,28) plane 2 '8x8' 9024   M '8x8' 9024
+1419 O mi(50,28) plane 0 '8x8' 5715   M '4x4' 1424   <- FIRST divergence
+1420 O mi(50,28) plane 1 '4x8' 3370   M '4x4' 1344
+1421 O mi(50,28) plane 2 '4x8' 2513   M '4x4' 1488
 ```
 
-Class: 4:2:2 transform-size selection for a luma block whose plane block is twice
-as tall — the luma max transform at mi(50,28) is TX_8X8 for the oracle and TX_4X4
-for us, and the chroma units follow. This is the family
-`lanes/av1422bigblock.report.md` already fingerprinted as "sub-8/odd-strip 4:2:2
-chroma under the 128-rect intra path (the `ss_size_lookup` BLOCK_INVALID
-family)" — a known class with a known owner, not a new one. Unblock: one look at
-the 4:2:2 `max_txsize_rect_lookup` / chroma-tx derivation for an 8x8 luma block
-whose plane block is 4x8.
+Our unit 1419 averages 89.0 and the oracle's 89.3 over the same 8x8 footprint, so
+the luma CONTENT agrees; only the tiling differs (one TX_8X8 vs four TX_4X4).
 
-Our decoder also emits 3450 `OUR_PRED` lines where the oracle emits 2662
-`EC_PREDOUT8` — same per-block unit-count family, worth the same lane's look.
+### What the class actually is: a MODE desync at mi(50,28)
+
+`EC_TRACE_MODE_STEP` exists on BOTH sides and is directly comparable:
+
+```
+oracle mi(50,28): skip 35588  cdef 35588  dq 35588  mode val=0 41524
+                  angle_y 0 41524  uv_mode val=4 60976  angle_uv val=3 50488
+                  use_filter_intra val=1 38616   filter_intra_mode val=3 35858
+ours   mi(50,28): skip 52484  cdef 52484  dq 52484  mode val=0 61324
+                  angle_y 0 61324  uv_mode val=13 54978 angle_uv val=0 41424
+                  use_filter_intra val=0 39456    (no filter_intra_mode read)
+```
+
+Same mi, same luma `mode` value (0), but **`uv_mode` 4 (oracle) vs 13 (ours)** and
+a different `use_filter_intra` bit. The reader is already at a different state
+when mi(50,28)'s `skip` is read, so the divergence is at or before it — this is an
+ENTROPY desync, not a transform-size choice. The transform-shape difference is
+downstream damage, not the defect.
+
+What is **ruled out** for the desync:
+
+- Not the tx_size lookup. Both sides read `tx_size_cdf[0]` at `ctx = 2` for the
+  same 8x8 block (oracle `EC_TXCTXB mi=50,26 ... maxw=8 maxh=8 ctx=2`; ours
+  `read_tx_size mi=(50,26) side=8 max_tx=8 ctx=2`), and `bsize_to_tx_size_cat`
+  gives cat 0 for both BLOCK_8X8 and BLOCK_16X8 (`blockd.h:1344`, depth table
+  index 1 and 3 both map to 0). Same row, same alphabet (2 symbols).
+- Not `get_tx_size_context`. `pred_common.h:348-384` is `above + left` with the
+  inter-neighbour override — the form `tx_size_context_txfm` already implements;
+  both compute ctx 2 here.
+- Not the frame header. `read_tx_mode` (`decodeframe.c:139`) and our
+  `crates/ec-av1-syntax/src/frame.rs:1039` are the same function, and the header
+  parses identically (the block modes before this point pair).
+- Not the chroma sharing. mi(50,26) is even, so it owns the 4:2:2 chroma block and
+  mi(50,27) shares it; all three of mi(50,26)'s units pair, and the oracle's
+  `EC_IMODE` shows no block at mi(50,27).
+
+**So: one symbol is consumed or skipped between mi(50,26)'s last unit and
+mi(50,28)'s `skip`, and this lane did not identify which.** The oracle's
+`EC_ISTEP` has no `tx_depth` print at all (it goes `angle_uv` straight to the
+next block's `skip` at every site, including mi(48,26) and mi(48,28) where both
+sides demonstrably stay aligned) — that is a rung-coverage gap, NOT evidence of
+a missing read, and the `EC_ISTEP` line ORDER is not comparable between the two
+builds (the oracle's trace jumps back from mi(50,26) to mi(48,28)), so the
+step-by-step pairing cannot be used to bracket the extra read either.
+
+### Unblock
+
+Bisect the bit position directly, not through the 16-bit `rng` the rungs print
+(it collides and the two traces interleave differently). Concretely: add an
+`EC_BITPOS` rung to the oracle's `aom_read_symbol`/header read and to ours,
+then diff the two symbol sequences between mi(50,26)'s last chroma unit and
+mi(50,28)'s `skip`. The 4:2:2-only constructs in that window are the candidates:
+the chroma-reference bookkeeping for the shared mi(50,27) column, and whatever
+the 4:2:2 block tail reads after the shared chroma. Fixtures and dumps are in
+`~/.cache/av1422warp/` (`a1_f0.obu`, `f0.opred`, `f0.mpred`, `f0.ocoeff`,
+`f0.mcoeff`, `f0.ostep`, `f0.step`, `f0.otx`); the probe bypass
+(`EC_AV1_ALLOW_422_PROBE`) is reverted and in no commit.
+
+This is a 4:2:2-only entropy desync; no 4:2:0 or 4:4:4 evidence points at it, and
+both controls stayed byte-exact throughout.
 
 ## Two refuted hypotheses — do not re-chase
 
