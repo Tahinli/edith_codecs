@@ -1883,6 +1883,112 @@ fix is provable in one run: the sequence diff must go flat.
 
 Not pinned, no gate, refusal untouched.
 
+## Round 32 — FIXED. The stream pairs bit-for-bit; the witness is pinned
+
+`af3285d5`. The 4:2:2 header refusal is **unchanged and unconditional**.
+
+### Round 31's hand-off was one of two errors, and they cancelled
+
+Round 31 pointed at `restoration.rs:519-524`. It was right that the row
+term was wrong, and it was **half** the story.
+
+1. **`read_lr` derived the ROW corners from the COLUMN axis.** libaom's
+   `av1_loop_restoration_corners_in_sb` (`restoration.c:1303-1338`) steps
+   rows by `MI_SIZE >> subsampling_y` and columns by
+   `MI_SIZE >> subsampling_x` — the axes are not symmetric. This decoder
+   had one `mi_size = 4 >> subsampling_x` for both, on a base of 4 where
+   libaom's `MI_SIZE` is 8. At 4:2:2 (`ss_x` 1, `ss_y` 0) the row range
+   came out 4x too small, so `rrow0 == rrow1`: an empty range, zero
+   `read_lr_unit` calls, wherever libaom reads a chroma unit. **Those were
+   the two missing `wiener_restore_cdf` reads.**
+
+2. **The superblock extent was 2x too large.** `read_sb128_root` passed
+   `SB_MI * 2` for the 128x128 superblock, and the two 64px call sites
+   carried the same half-mi convention (`sb_r * SB_MI`, extent `SB_MI`).
+
+**`4 * 32 == 8 * 16`: the two errors cancelled exactly at 4:2:0.** That is
+why 4:2:0 and 4:4:4 decoded byte-exact while carrying the bug, and why
+the 4:2:0 evidence was never evidence of correctness here. At 4:2:2 the
+cancellation breaks, because the row term stops following the column axis.
+No amount of 4:2:0 testing could have found this.
+
+A third, smaller correction: the `read_lr` call is the **one** consumer
+that turns a superblock's mode-info origin into *absolute* frame space
+(it divides by the restoration-unit size, a real pixel count), and it was
+handed `(sb_r & !1) * SB_MI` — twice the true mi row, since `sb_r` indexes
+64px superblocks. The partition decode is self-consistent with that value
+(relative offsets only), which is why the 128 path decoded correctly
+everywhere else. The origin is corrected **only** where it is converted
+to absolute frame space; the partition path is untouched.
+
+### Evidence
+
+| check | result |
+|---|---|
+| entropy pairing vs instrumented oracle | **246735 reads each side, no divergence anywhere** |
+| 16 frames vs `aomdec --rawvideo` | **pixel-exact**, 2359296 bytes, sha256 `4bfc2395…aeb203` both sides |
+| 4:2:0 control | byte-exact |
+| 4:4:4 LR witness | byte-identical to its pre-lane decode |
+| both previously pinned 4:2:2 witnesses | pixel-exact |
+| LR gate family | 12/12 |
+| battery: 420/444/inter/superres/cdef | 118 passed, 0 failed, 7 ignored |
+
+The pairing result is the strong one: not "past the window", but **no
+divergence in the whole stream**.
+
+After the first two edits, two committed 4:2:0/4:4:4 LR gates **failed**.
+That is how the 64px call sites' half-mi convention surfaced; fixing them
+is part of this change, not a follow-up.
+
+### Pinned witness and gate
+
+`crates/ec-av1/fixtures/422_residual_compound_warp_16f.obu` — 38845 bytes,
+sha256 `d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95`,
+fnv1a64 `0x0e73a51e2cc0c424`. Gate
+`the_pinned_422_residual_compound_warp_witness_is_present_and_refuses_by_name`.
+
+The gate is **pin + refuse-by-name**, the established 4:2:2 pattern: with
+the header refusal standing, no committed test *can* decode a 4:2:2
+stream, because the bypass that would allow it must never be committed.
+The exactness and engagement figures live in the gate's doc comment with
+the encode recipe. Mutation-proven both ways: a flipped fixture byte
+panics `bytes drifted`; a wrong refusal string panics `must refuse by
+name`.
+
+### Engagement, above the vertical midpoint
+
+Every pre-existing warp counter is frame-global, so this adds
+`top_half_warp_hits` and `top_half_compound_hits` (permanent gate
+counters; the throwaway dump and its example wiring were removed):
+
+- **top-half warp 248**, **top-half compound 3**
+- frame-globally: compound_warp 25, compound_warp_8 18, rotzoom_gm_warp
+  84, lr_wiener 22, lr_sgrproj 10, cdef_idx 53, part128_split 95
+
+The loop-restoration numbers are load-bearing twice: decoding this stream
+is what exposed the corner bug, and the fix is what made the sequence
+pair.
+
+### Refusal-lift assessment — exactness bar MET, coverage NOT yet
+
+Not lifting, and here is the honest gap rather than a clean bill:
+
+- 16 frames of **one** 256x288 stream from **one** encoder recipe;
+- top-half **compound is 3 blocks** — thin, even though top-half warp is
+  ample at 248;
+- the code path whose bug we just fixed is *128x128 SB + loop restoration
+  + non-4:2:0*. **4:2:2 with loop restoration OFF is still untested**,
+  and it is a different range computation again (`av1_lr_count_units` over
+  a full-height chroma plane with no units to place).
+
+The old lift-blocker asked for a second 4:2:2 fixture with real residuals,
+compound and warped motion above the vertical midpoint. This is that
+fixture and it is exact. But one more exact stream is not the same as the
+format being covered. **Recommendation: keep the refusal; charter the
+LR-off 4:2:2 witness next**, then re-assess.
+
+Not lifting. Refusal untouched. Nothing pushed.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
