@@ -394,37 +394,71 @@ it is consumed.** Both candidates this lane chased were that mistake, just not
 at the site — one had a per-plane extent that was not at the fork at all, the
 other fired 4800 msac bits away.
 
-## 8. Independence check (Huseyin-2's ablation, lane-av1444edge)
+## 8. Scope confirmation (Huseyin-2's ablation — FIRST VERSION RETRACTED)
 
-Recorded here because it is evidence ABOUT this lane's fix, though the
-measurement is Huseyin-2's and not mine.
+**This section was published wrong and is corrected here.** The first version
+of it recorded a four-arm ablation in which `4e151813` alone was EXACT 4/4 on
+both of Huseyin-2's cells, concluding the two fixes were independent and that
+this lane's fix did not reach them. That arm never ran: the tree was reset with
+`git checkout -- <files>`, which restores from the INDEX, and the index still
+held both cherry-picks — so that arm silently re-measured the both-commits
+tree, and cargo saw byte-identical sources so it did not even relink. The
+conclusion was a phantom. **The claim "this lane's fix does not reach those two
+cells" is retracted; the opposite is true.**
 
-The two 4:4:4 cells the chroma-format sweep left unassigned — D1 "4:4:4
-superres 8-bit" and D2 "4:4:4 odd coded dims 130x122" — localize to
-`4e151813`'s class (the hardcoded `ox*2, oy*2, 8` 4:2:0 luma footprint in
-`decode_rect4_16_strip`'s `tu_reach`), **not** to this lane's `around_c` arm.
-Their 4-arm ablation, 4/4 decode-order frames byte-exact vs aomdec:
+The corrected 2x2, re-run by Huseyin-2 with `git reset --hard 4155c7c7` and a
+verified rebuild (binary mtime printed) at every arm, on their pinned fixtures,
+4/4 decode-order frames vs aomdec:
 
-| build | D2 (130x122) | D1 (superres) |
+| arm | odd444_130x122 | sr444 (256x128) |
 |---|---|---|
-| base + `f92776ba` (this lane) alone | DIVERGENT — f3 9203 samples, first Y(100,32) | DIVERGENT — f2 25296, first Y(192,0) |
-| base + `4e151813` alone | EXACT 4/4 | EXACT 4/4 |
-| base + both | EXACT 4/4 | EXACT 4/4 |
+| base | DIVERGENT f3 11521 | DIVERGENT f2 25296 + f3 51108 |
+| base + rung + `4e151813` | DIVERGENT f3 11521 | DIVERGENT f2 25296 + f3 51108 — byte-identical to base |
+| base + rung + `f92776ba` (this lane) | **EXACT 4/4** | **EXACT 4/4** |
+| base + rung + `4e151813` + `f92776ba` | EXACT 4/4 | EXACT 4/4 |
 
-So `f92776ba` and `4e151813` are independent and **merge order does not couple
-them**. Worth stating explicitly: this lane's fix does not reach those two
-cells, and their fix does not substitute for it. Neither is a case of the same
-root being fixed twice.
+Three consequences, all of which enlarge this lane's scope rather than narrow
+it:
 
-Their method note, worth carrying: the first wrong SYMBOL is invisible in the
-`EC_MODE` ladder because that print carries no `bsize`. What localizes those
-cells is the per-superblock decode-order pixel map of the pre-filter dump — the
-first wrong superblock in decode order is the one whose above-neighbour context
-then forks the NEXT block's `ref0`. On sr444 f2 that is SBcol2/SBrow0, first
-wrong pixel (128,48) = mi(12,32) with the mode identical on both sides, and the
-`ref0` fork (LAST vs our GOLDEN) lands on the very next block, mi(13,32). A
-pixel error cannot cause a mode fork, so the same bsize/footprint error has to
-feed both.
+1. **Both cells are this class, and `f92776ba` alone fixes them.** `4e151813`
+   contributes nothing to either: the divergence counts are identical to base
+   with and without it, because its two `tu_reach` call sites both sit inside
+   `decode_rect4_16_strip`'s `if lossless_pair {` arm while both cells are
+   4:4:4 LOSSY cq-20 on the `} else if skip {` path at `decode.rs:17579`.
+2. **`f92776ba` does not depend on `4e151813`.** It applies and goes green on
+   `4155c7c7` on its own, so merge order is free and nothing else is a
+   prerequisite.
+3. **Red-before on both cells**, with the counter left in place: mutating the
+   `Some(_) if ss_x(fctx) == 0 => around` arm back to the 4:2:0 pair extent
+   `(16, 8)` gives sr444 76404 samples with first wrong Y(192,0) — the sweep's
+   exact number — and odd444_130x122 9203 samples, first wrong Y(100,32) on
+   frame 3.
+
+So the 4:4:4 lossy class now has two more independent witnesses at geometries
+and depths this lane's 128x96 gate does not cover (130x122, a partial-frame
+right edge; 256x128, with CDEF and LR live on the last two frames). One
+correction to the sweep's own matrix, from Huseyin-2's report: its "4:4:4
+superres" cell turns out not to be a superres cell at all, and that one is
+EXACT.
+
+**Method notes carried over** (still valid; the retraction was in the ablation,
+not in the instrumentation):
+
+- The first wrong SYMBOL is invisible in the `EC_MODE` ladder because that
+  print carries no `bsize`. What localizes these cells is the per-superblock
+  decode-order pixel map of the pre-filter dump — the first wrong superblock in
+  decode order is the one whose above-neighbour context then forks the NEXT
+  block's `ref0`. On sr444 f2 that is SBcol2/SBrow0, first wrong pixel (128,48)
+  = mi(12,32) with the mode identical on both sides, and the `ref0` fork (LAST
+  vs our GOLDEN) lands on the very next block, mi(13,32). A pixel error cannot
+  cause a mode fork, so the same bsize/footprint error has to feed both.
+- **`git checkout -- <files>` does not reset a tree to a commit.** It restores
+  from the INDEX, so any staged cherry-pick survives it and the "arm" measures
+  the tree you thought you had removed. A per-arm ablation needs
+  `git reset --hard <base>` and a rebuild whose binary mtime is printed, or it
+  measures nothing. This bit me twice in one session: here, and earlier when a
+  temporary trace landed in the main checkout instead of the lane worktree
+  because the edit tool resolved a relative path against the workspace root.
 
 ## 9. Method notes for the next lane
 
