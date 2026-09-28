@@ -392,6 +392,63 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 10 — the second window: 3 bits, and they are in the MODE reads
+
+`EC_COEFF_STEP bitpos` re-added on both sides (18 rungs here, 11 in the
+oracle's `decodetxb.c`), `aomdec` rebuilt, all reverted again
+(`grep -c bitpos` = 0).
+
+The bit delta is the same constant **-14** for every coefficient unit
+from 0 through 2427, and changes at **2428**: the oracle consumes 18
+bits across that unit, we consume 15. **We are 3 bits short** — the
+mirror image of round 6, where we were 6 bits long.
+
+The window, enumerated (both units are all_zero=1 skips, so no
+coefficient reads fall inside it):
+
+```
+oracle  92321  all_zero plane=2 ctx=8  all_zero=1 rng=60208
+        92339  all_zero plane=0 ctx=0  all_zero=1 rng=38996     (+18 bits)
+ours    92335  all_zero plane=0 ctx=1  all_zero=1 rng=61576
+        92350  all_zero side=8 ctx=3   all_zero=0 rng=48464     (+15 bits)
+```
+
+**What this does and does not establish.** It establishes the MAGNITUDE
+and the SIDE: 3 bits, consumed by block-mode reads, not by any
+coefficient read — the `EC_COEFF_STEP` stream shows only the two skip
+units, so the three bits live in the mode/mode-preface reads
+(`skip`, `cdef`, `delta_q`, `mode`, `angle_delta`, `uv_mode`,
+`angle_delta_uv`, `use_filter_intra`, `filter_intra_mode`) that no rung
+on either side currently carries a bit position for.
+
+**A trap recorded, per the round-8 lesson.** The unit INDEX pairing is
+only valid while the bit delta is constant, and it stops being a safe
+guide at exactly this point: our decoder emits 2680 coefficient units
+against the oracle's 2512, and a skipped unit's `txb_skip` read can
+cost as few as one bit, so extra skip units can coexist with a constant
+bit delta. Note in the window above that the oracle's unit 2427 is
+`plane=2` and ours is `plane=0` — the indices no longer name the same
+block even though the bit positions still agree. **Pair bit positions,
+never unit indices, from here on.**
+
+**Enum discipline applied to what IS printed here.** `plane=0/1/2` is
+libaom's `PLANE_TYPE_Y/U/V` ordering and matches ours; `side=8` on our
+line is the square `reconstruct`'s side, i.e. an 8x8 transform unit;
+`ctx` on both is the `txb_skip` context, not a tx_size context (the
+tx_size context is the separately printed `EC_TXCTXB`/`tx_depth ctx`).
+Nothing in this window is claimed to be a bsize, a partition, or a
+tx_size category, so no enum lookup is needed to read it.
+
+**Unblock.** Add a bit position to the MODE rung on both sides — the
+`EC_ISTEP` line ours already prints per symbol, and the oracle's
+equivalent in `decodeframe.c`'s intra mode-info read — and pair the eight
+mode reads across this window. Three bits across seven or eight reads is
+a single short read (most plausibly a `filter_intra_mode` or a
+`use_filter_intra` the oracle takes and we do not, or a cfL alpha read
+present on one side only), and a per-symbol bit position will name it
+directly. That is another instrumentation round and is left unscheduled
+here.
+
 ### Round 9 — CORRECTION to round 8, and where the desync actually starts
 
 **Round 8's central claim was wrong and is retracted here.** It read the
