@@ -71,118 +71,155 @@ for a chroma unit; the symbols happen to survive three reads and then diverge.
 Nothing here is reconstruction arithmetic — the two decoders are reading
 different probability distributions from the same bit position.
 
-## 5. Where the row selection goes wrong (the handoff)
 
-libaom, `get_txb_ctx_general` (`av1/common/txb_common.h:353-359`), chroma arm:
+---
 
-```c
-const int ctx_base = get_entropy_context(tx_size, a, l);
-const int ctx_offset = (num_pels_log2_lookup[plane_bsize] >
-                        num_pels_log2_lookup[txsize_to_bsize[tx_size]]) ? 10 : 7;
-txb_ctx->txb_skip_ctx = ctx_base + ctx_offset;
-```
+## 9. RESOLUTION (lane-av1h5 r2, commit `8a91ee14`)
 
-Two rows of the port's chroma table matter and the oracle census says both
-fire. `EC_DBGCTX` on the oracle, whole stream, 9216 chroma units:
+### 9a. The handoff's suspect site is REFUTED, not fixed
 
-```
-off=7   520 units      off=10   8696 units
-```
+§5 named `read_plane`'s chroma band (`decode.rs:19627-19636`) and pointed at
+`luma_skip_ctx`. I instrumented the band selection on our side (a
+`EC_DBGCTX`-shaped rung printing `plane`, `tx`, `above0`, `left0`, `base`,
+`off`, `ctx`) and diffed it against the oracle's own `EC_DBGCTX` for all
+**9216** chroma units of the stream.
 
-and at the fork site itself (`mi=0,0`, the first inter block) every chroma unit
-is `tx=0` (TX_4X4 — lossless forces it) with **`off=7`**:
+**The band is correct at 100% of them.** After the port's `+7` reindex
+(our rows 0..2 are libaom's 7..9, our 3..5 are libaom's 10..12):
 
 ```
-EC_DBGCTX mi=0,0 plane=1 tx=0 above0=0 left0=0 base=0 off=7 ctx=7 cellsA=0, cellsL=0,
-EC_DBGCTX mi=0,0 plane=2 tx=0 above0=0 left0=0 base=0 off=7 ctx=7 cellsA=0, cellsL=0,
+compared=9216  off/ctx diffs=0
 ```
 
-`read_plane` (`decode.rs:19627-19636`) picks the band like this:
+Frame 0 (1536 units) matches the oracle unit-for-unit. Frames 1–5 are
+**100% `off=10`** on both sides — the 520 `off=7` units in the oracle census
+are all frame 0 (measured with `--limit=1/2/3`: 1536 / 3072 / 4608). §5's
+"at the fork site every chroma unit is tx=0 with off=7" was a grep that
+matched frame 0's `mi=0,0` lines, which recur in every frame.
 
-```rust
-let skip_ctx = if plane_idx == 0 {
-    luma_skip_ctx.unwrap_or(0)
-} else {
-    usize::from(around.0) + usize::from(around.1) + luma_skip_ctx.unwrap_or(0)
-};
-```
+So the offset term was never wrong, and no `+3` was missing. **Do not touch
+`read_plane`'s band.** (Its doc comment, which scoped the `+3` to "a 128x128
+block's TX_32X32 chroma units", is now corrected: the 4:4:4 lossless 128
+root's TX_4X4 chroma units read the offset-10 rows too.)
 
-and `luma_skip_ctx` / `luma_skip_ctx_rect` (`decode.rs:9361-9411`) return the
-**luma** formula `SKIP_CONTEXTS[top][left]` — a value that is being used here
-as the chroma **offset band**. Its own doc comment says the `+3` that reaches
-the offset-10 rows applies "only [to] a 128x128 block's TX_32X32 chroma units,
-lane-sb128b r3". **H5 is a 128x128 root with TX_4X4 units**, i.e. exactly the
-combination that comment does not cover, and it is the only committed-free cell
-where a 128-root meets lossless. That is where to look first: whether the
-offset-10 band is being selected (or the offset-7 band) for a 128-root's
-lossless chroma units, and whether `ctx_base` should be
-`get_entropy_context` rather than the luma `SKIP_CONTEXTS` table.
+### 9b. The real defect: the token order at a 128 root is chunk-major
 
-Note the port's table is **reindexed**: our chroma rows 0..2 stand for libaom's
-7..9 and our 3..5 for libaom's 10..12, so a raw `ctx` comparison between the
-two traces is meaningless without that `+7`. Verified on the first two
-coefficient units of the stream (ours `ctx=0` ↔ oracle `ctx=7`).
-
-## 6. Is this Levent's H1 class?
-
-**No — different site, different trigger.** H1 is 4:4:4 **lossy** + a **rect**
-partition, and its fork is a unit-ordering bug: the rect walk emits a second
-luma unit where the oracle moves to the chroma plane (the `EC_COEFF_STEP`
-`plane=0` label on our side is a label bug there). H5 is 4:4:4 **lossless** +
-a **square 128 root**, and its fork is a single wrong `txb_skip` CDF row inside
-one unit — the unit walk itself is aligned (the `all_zero` reads pair up with
-identical `rng` on both sides for the whole prefix). Same broad neighbourhood
-(4:4:4 chroma coefficient context), different defect. Notified
-`agent://Levent-2` so it is not fixed twice.
-
-### 6b. The H1/H5 split is formula-halves, and the arms are disjoint
-
-`Levent-2`'s H1 root cause (confirmed to me directly): the 1:4-pair chroma
-gather runs at the 4:2:0 PAIR extent (16x8 / 8x16), where
-`is_chroma_reference` reduces both parity clauses to `!ss_y` / `!ss_x`, so the
-strip is its own chroma reference and the gather reads one extra luma mi row of
-LEFT context. Their `ctx_base` came out 1 (0 above + 1 left) where the oracle
-read offset-7 row 7 (= `ctx_base` 0). Pinned fixture 6441 B,
-sha256 `77f727e7...`, now byte-exact on their branch.
-
-The two lanes split ONE formula along its two terms:
+Our chroma stream diverged from the oracle's at unit **1539** with the band
+right and `ctx_base` wrong — a left-context that had not been published yet.
+Instrumenting the walk that produces it (`read_inter_chroma_lossless`) with
+its caller, region and unit geometry:
 
 ```
-txb_skip_ctx = get_entropy_context(tx_size, a, l)      <-- H1: the ctx_base term
-              + (plane_bsize > tx block ? 10 : 7)      <-- H5: the BAND/OFFSET term
+EC_DBGCTX walk n=1536 at_mi=(0,0) org=(0,0)  reg=(64,64) blk=(128,128) true=(128,96)
+EC_DBGCTX walk n=2049 at_mi=(0,0) org=(64,0) reg=(64,64) blk=(128,128) true=(128,96)
+EC_DBGCTX walk n=2562 at_mi=(0,0) org=(0,0)  reg=(64,64) blk=(128,128) true=(128,96)   <-- again
 ```
 
-**The arms are structurally disjoint, not merely different.** Levent's fix is
-the match arm `Some(_) if ss_x(fctx) == 0 => around` inside `match
-strip_chroma`, and `strip_chroma` is `Some` only from the single setter
-(`decode.rs:50852`) that the `PARTITION_HORZ_4` / `VERT_4` 16x4 / 4x16
-`inter_piece` loop runs. A `BLOCK_128X128` unsplit root never reaches that
-loop, so `mi(0,0)` on this 128-root stream cannot move through Levent's gate.
-They are re-running this exact recipe (63429 B, sha256 `bbffb979...`) against
-base and their tip to turn that argument into a measured "unchanged".
+320 walk calls for 5 inter frames — **64 per frame, where libaom codes 4** —
+and each `chunkdone` showed `leaves=1024` (the full 32x32 mi block, not the
+frame's 32x24) firing every 16 leaves:
 
-**Caveat for whoever measures:** H5 was characterized on a tree that does NOT
-contain Levent's fix. The `--max-partition-size=64` control being byte-exact
-proves the 128 root is necessary, but on its own it says nothing about the
-`ctx_base` half at that root. Take the re-measurement above as the authority.
+```
+chunkdone idx=15  chunk=(0,0) at=(0,15,4,4)  next=Some((0,16,4,4))
+chunkdone idx=31  chunk=(0,1) at=(0,31,4,4)  next=Some((1,0,4,4))
+chunkdone idx=47  chunk=(0,0) at=(1,15,4,4)  next=Some((1,16,4,4))   <-- back to (0,0)
+```
 
-## 7. What a follow-up lane should do, in order
+Ground truth, `decodeframe.c:972-1006`: `decode_token_recon_block` walks
+`for (row…) for (col…) { for (plane…) { for (blk_row…) for (blk_col…) } }` —
+the **plane loop is inside the chunk loop**, and `blk_row`/`blk_col` restart
+at the chunk origin. The chunk grid is `mu_blocks_wide = mi_size_wide[BLOCK_64X64] = 16` mi
+per axis, i.e. **16 mi across, not 32**.
 
-1. Instrument the band selection in `read_plane` (a one-line
-   `EC_DBGCTX`-shaped rung on our side: plane, tx_size, plane_bsize, the chosen
-   offset) and diff it against the oracle's `EC_DBGCTX` for the first inter
-   block. That single run should name the wrong term.
-2. Fix one class: the 128-root lossless chroma band. Do **not** touch the rect
-   unit walk (H1's territory).
-3. Re-run the two arms of §2. Both must be byte-exact.
-4. Then arm a gate: the recipe above at `--cpu-used=0`, `ss (0,0)` + 10-bit
-   header assert, plus a counter on the corrected route so the gate is not
-   blind, and a mutation proof (flip the band back → the gate must go red on
-   the first inter frame, byte 74769).
-5. Re-measure the committed 4:4:4 / 4:2:0 pins afterwards.
+Our var-tx leaf list is a BLOCK-wide raster (32 leaves across at 128), so a
+chunk's members are **not contiguous**: leaves 0..15 are chunk (0,0) row 0,
+but chunk (0,0) rows 1..15 are leaves 32..47, 64..79, … A chunk test
+`(leaves[idx+1].0/16, leaves[idx+1].1/16) != (row/16, col/16)` therefore
+closed the chunk every **sixteen** leaves, and each of the four chunks' chroma
+was coded sixteen times — 24576 chroma units per inter frame against the
+oracle's 1536.
 
-## 8. State
+Below 64 a block IS one chunk, so the two orders coincide and every committed
+pin passed. **This is the only committed cell where an unsplit BLOCK_128X128
+root meets lossless.**
 
-No commit. `~/.cache/wt/av1h5` carries no source edits — the work was
-measurement only (EC_SYMR / EC_TRACE_COEFF / EC_DBGCTX traces, all env-gated
-and pre-existing). No `EC_AV1_ALLOW_422_PROBE` bypass was applied or needed.
+### 9c. The fix and the class sweep
+
+`grep "row / 16, col / 16"` finds **four** sites carrying the test. All four
+now sort the leaf walk chunk-major at `side > 64` and take the successor from
+that order:
+
+| site | arm |
+|---|---|
+| `decode.rs:13543` | inter 128x64 / 64x128 (compound/intrabc rect) |
+| `decode.rs:39268` | intra 128 |
+| `decode.rs:40932` | inter 128x128 (**the H5 cell**) |
+| `decode.rs:41952` | inter vartx 128 |
+
+The order key is `(row/16)*nchunk + (col/16)`, ties broken by the original
+index, so within a chunk the leaves keep the tree's own raster — which is what
+libaom's per-chunk `blk_row`/`blk_col` walk is.
+
+### 9d. Measured, on the pinned fixture vs `aomdec`
+
+| | before | after | oracle |
+|---|---|---|---|
+| chroma walks / inter frame | 64 | **4** | 4 |
+| chroma units / inter frame | 24576 | **1536** | 1536 |
+| chroma units, whole stream | 124416 | **9216** | 9216 |
+| first `skip_ctx` divergence | unit 1539 | unit 2573 | — |
+| first differing pixel byte | 74769 | **90272** | — |
+| oracle plane sequence / frame | — | 256,256,256,256,128,128,128,128 ×2 | same |
+
+Frame 0 is unaffected (it splits, no 128 root) and still matches the oracle
+exactly on all 1536 chroma units.
+
+### 9e. Verification
+
+* **Identity**: `lossless_444` 6/6, `sb128` 12/12 (1 pre-existing `#[ignore]`),
+  `420` 2/2, `vartx` 3/3, `a_real_aomenc_tiny_frame_size_sweep`,
+  `a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg` all pass.
+* **Control arm**: the same recipe at `--max-partition-size=64` (61494 B,
+  sha256 `4cadce41e1f89675…`) decodes **byte-exact** — the 128 root is still
+  necessary, and the fix does not touch it.
+* **Gate**: `a_lossless_444_128_root_lossless_stream_reads_chunks_chunk_major`,
+  pin `fixtures/ll444_128root_lossless.obu` (63429 B, sha256 `bbffb979…`,
+  fnv1a64 `0xf07d47fcfd512658`). Non-vacuous: it asserts `mu_chunk_order_hits`
+  rose, and pins the first-difference position at `>= 90272`.
+* **Mutation (red-before)**: rewriting the chunk key back to a block raster
+  (`(col/16)*1000 + c`) turns the gate **RED**; reverting turns it green.
+
+### 9f. NOT fixed — the residual, and what it is not
+
+**The fixture is still not byte-exact.** One defect remains, and it is a
+*different* one, below the chunk-order bug this lane fixed:
+
+* first difference: **byte 90272** = decode-order frame 1, sample 4136 →
+  **Y(32, 40)** (was Y(4, 8)).
+* first chroma `skip_ctx` divergence: global unit **2573** — frame 1, plane 1,
+  the clipped lower chunk row.
+* It is **not** a band/offset error (off matches at every unit) and **not**
+  the `ctx_base`/left-context gather: at unit 2572 both sides read the SAME
+  `skip_ctx` (11) and the oracle's unit 2572 publishes level 0 while ours
+  publishes non-zero. So the two decoders decode *different coefficients*
+  from an identical CDF row at 2572 — the fork is at the coefficient decode,
+  not at context selection.
+
+That is the next thing to chase, and it needs its own EC_SYMR pass anchored
+at unit 2572. §7's plan is superseded: **the band is fine, the order was not.**
+
+### 9g. Interaction with H1
+
+Untouched and unaffected: `strip_chroma` is still `Some` only from the
+PARTITION_HORZ_4 / VERT_4 setter, which an unsplit BLOCK_128X128 root never
+enters. This lane's change is the leaf-walk ORDER at `side > 64`; it touches
+no `strip_chroma` site and no chroma-context predicate, so it cannot double-fix
+Levent-2's arm. Their stream should be unaffected — `agent://Levent-2` was
+notified.
+
+### 9h. State
+
+Branch `lane-av1h5`, two commits on top of `4155c7c7`:
+`11954074` (report as handed over, incl. §6b) and `8a91ee14` (the fix, the
+gate, the pin). Nothing pushed. All instrumentation was env-gated and has been
+removed from the commit; no `EC_AV1_ALLOW_422_PROBE` bypass was used or needed.
