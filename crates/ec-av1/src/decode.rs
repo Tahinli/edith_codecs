@@ -31472,7 +31472,10 @@ fn overlappable_above(
             // The pair merge: the walk snaps back to the pair's even column
             // and the ODD half (the chroma-carrying one) is the neighbour for
             // both -- a 4-wide 1:4 strip is never an OBMC source on its own.
-            col &= !1;
+            // lane-av1422warp r25: as in `overlappable_left`, snapping down
+            // lands on `mi_col - 1` at an ODD `mi_col` and the offsets below
+            // underflow (debug-build panic; `usize::MAX` in release). Clamp.
+            col = (col & !1).max(mi_col);
             src = col + 1;
             nb = grid.get(mi_row - 1, src);
             step = 2;
@@ -31525,7 +31528,13 @@ fn overlappable_left(
             // The pair merge, left-column mirror: a 4-TALL neighbour (a 16x4
             // strip) is half of a chroma pair and the pair's SECOND row is the
             // neighbour for both.
-            row &= !1;
+            // lane-av1422warp r25: `row &= !1` rounds DOWN, so at an ODD
+            // `mi_row` it lands on `mi_row - 1` and the `row - mi_row`
+            // offsets below underflow -- `usize::MAX` in release, and a
+            // debug-build panic ("attempt to subtract with overflow",
+            // `overlappable_left` called from `decode_inter_block`) with
+            // EC_TRACE_MODE_STEP set. Clamp: the offset can never be negative.
+            row = (row & !1).max(mi_row);
             src = row + 1;
             nb = grid.get(src, mi_col - 1);
             step = 2;
