@@ -294,6 +294,62 @@ VALUES match by scan index on both sides, so this does not by itself move a bit,
 but it places coefficients in the wrong cells and would corrupt the transform
 independently of the entropy question.
 
+### The dc-sign verdict: the VALUE is wrong, and the input is the rect path
+
+Rung on both sides: ours is the existing `EC_DCDUMP` (which prints the vote and
+every sampled neighbour cell), the oracle's is a new `DCSIGN` print in
+`get_txb_ctx_general` reading `txb_ctx->dc_sign_ctx`, its `dc_sign` sum, and the
+individual `a[]`/`l[]` sign fields over `txb_w_unit`/`txb_h_unit`. Both reverted
+(oracle `aomdec` rebuilt, `grep -c DCSIGN` = 0).
+
+**First, a wrong turn worth recording: our `dc_sign_ctx` table is CORRECT.**
+libaom's `dc_sign_contexts` is 65 entries read at `dc_sign + 32`; extracted
+programmatically it is `dc_sign < 0 -> 1`, `== 0 -> 0`, `> 0 -> 2`, which is
+exactly what [`dc_sign_ctx`]'s `signum` buckets compute. A hand count of that
+table literal suggests a different mapping and would have sent the next lane
+after a non-bug; the table is fine.
+
+**The vote differs.** libaom's own print at the neighbouring units is shaped
+`dc_sign=-4 ctx=1 above=[-1,-1,-1,-1] left=[0,0,0,0,0,0,0,0]` — and the symbol
+ladder showed the oracle resolving ctx **1** where we resolve **0**, i.e.
+libaom's `dc_sign` is negative and ours is 0.
+
+**The input, from our own `EC_DCDUMP` at the block in question:**
+
+```
+EC_DCDUMP mi=(48,28) plane=2 wh=(16,8) vote=0
+  above=[None/6, None/6, Some(false)/7, Some(false)/7]   <- FOUR cells
+  left =[Some(true)/7, Some(true)/7]                     <- TWO cells
+```
+
+`wh=(16,8)` is the block's LUMA footprint, so the rect path summed the vote over
+**4 above + 2 left** cells. The unit actually being decoded is the 8x8 V CHROMA
+transform, whose own `txb_w_unit`/`txb_h_unit` are **2 and 2** — libaom reads two
+above cells, not four. Dropping two above cells can drop a negative contribution
+and turn a negative vote into exactly the 0 we produce.
+
+**So: the 4:2:2 chroma correction exists but is not wired into this path.**
+[`around_mi_422_chroma`] — the function whose own comment says "libaom
+`get_txb_ctx_general` reads its above votes over `txb_w_unit` CHROMA 4-px cells,
+and at ss_x 1 one chroma cell spans TWO luma mi columns... Sampling every second
+above cell counts each chroma column once, which IS libaom's sum" — is reached
+1653 times on this stream, but NOT for this block: mi(48,28) prints
+`EC_DCDUMP`, not `EC_DCDUMP422`. The **rect** path (`around_mi_rect`) has no 4:2:2
+variant, so a 4:2:2 RECT block votes over the luma unit counts.
+
+That is the same neighbour-read family as the `smooth_uv` fix, in the same file,
+for the same reason: a per-axis shape correction that was applied to some paths
+and not to the rect one. **This lane ran out of budget before landing the fix**;
+it is handed off here with the evidence above.
+
+**On the scan-table finding (Main's caution): checked, and the caution does not
+explain it.** Unit 1418 is mi(48,28) plane 2 and it PAIRED on both sides as 8x8
+with an identical prediction sum (9024) — the tiling divergence (TX_4X4 vs
+TX_8X8) is at unit 1419, the NEXT unit. So unit 1418 is 8x8 on both sides and a
+"different scan table by design because the tx size differs" explanation does not
+apply to it. The finding stands, though it may still be downstream of something
+else; it is second priority to the vote.
+
 ### Unblock
 
 The per-TU window bisect below has been run and NAMES the read: the **DC sign
