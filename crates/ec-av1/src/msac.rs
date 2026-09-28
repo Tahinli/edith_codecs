@@ -335,10 +335,16 @@ thread_local! {
     /// the inter path; without a phase its reads are unattributable.
     pub(crate) static SYMR_PHASE: std::cell::Cell<&'static str> =
         const { std::cell::Cell::new("") };
-    /// The CDF TABLE NAME for the read about to be made, mirroring the
-    /// oracle's `ec_symr_cdf_tag`. `cdf0` alone cannot identify a table --
-    /// two rows can share a first entry -- so this is what turns "two
-    /// 2-symbol reads" into a named pair.
+    /// The CDF TABLE NAME for the NEXT read, mirroring the oracle's
+    /// `ec_symr_cdf_tag`. `cdf0` alone cannot identify a table -- two rows
+    /// can share a first entry -- so this is what turns "two 2-symbol reads"
+    /// into a named pair.
+    ///
+    /// ONE-SHOT, consumed by the next `symbol()`. Round 30: it used to be
+    /// sticky, so every read after a tagged one carried that tag -- which is
+    /// how an 8-symbol read came to be labelled `interintra`, a 2-symbol
+    /// table. An EMPTY `cdf=` therefore means "no table set for this read",
+    /// never "the previous read's table".
     pub(crate) static SYMR_CDF: std::cell::Cell<&'static str> =
         const { std::cell::Cell::new("") };
 }
@@ -467,7 +473,7 @@ impl<'a> SymbolDecoder<'a> {
             eprintln!(
                 "EC_SYMR ph={} cdf={} mi=({},{}) pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
                 SYMR_PHASE.with(std::cell::Cell::get),
-                SYMR_CDF.with(std::cell::Cell::get),
+                SYMR_CDF.with(|c| c.replace("")),
                 SYMR_MI.with(std::cell::Cell::get).0,
                 SYMR_MI.with(std::cell::Cell::get).1,
                 pre_value,

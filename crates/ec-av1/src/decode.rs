@@ -10078,6 +10078,7 @@ fn read_intra_mode_rect(
     // frame's `read_intra_frame_mode_info` (decodemv.c:1065 `read_intra_mode`
     // off `kf_y_mode_cdf[above][left]`).
     let mode = if let Some((size_group, _)) = inter {
+        crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
         dec.symbol(&mut cdfs.y_mode[size_group])
     } else {
         let above_ctx = INTRA_MODE_CTX[above_mode];
@@ -10102,8 +10103,10 @@ fn read_intra_mode_rect(
     let uv_mode = if !has_chroma {
         DC_PRED
     } else if cfl {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     istep!("uv_mode", uv_mode as i32);
@@ -11781,6 +11784,7 @@ fn decode_intra_rect_in_inter(
         }
         return Ok(());
     }
+    crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
     let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
     // lane-t900 r1: this arm read six mode symbols with no ladder rung of its
     // own, so a cross-decoder bisection could only see the block's first
@@ -11819,8 +11823,10 @@ fn decode_intra_rect_in_inter(
     let uv_mode = if !has_chroma {
         DC_PRED
     } else if cfl_allowed {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     if step_trace {
@@ -16696,8 +16702,10 @@ fn read_intra_mode(
     let uv_mode = if !has_chroma {
         DC_PRED
     } else if cfl {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     if trace {
@@ -20417,8 +20425,10 @@ fn read_intra_mode_sub8(
         // divergence at the rect leaf mi (8,16) of `ll444.obu`; class
         // `wrong-alphabet-same-value`, lane-av1-llsub8).
         let uv_mode = if cfl_allowed_px(seg_w_mi * MI, seg_h_mi * MI, fctx) {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if trace {
@@ -35187,6 +35197,7 @@ fn decode_inter_block(
                     hit!(FIMV_ALPHABET_HITS);
                 }
                 if warp_eligible {
+                    crate::msac::SymbolDecoder::set_symr_cdf("motion_mode");
                     let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
                     match mode {
                         0 => {}
@@ -36520,6 +36531,7 @@ fn decode_inter_block(
             );
             return Ok(());
         }
+        crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
         let mode = dec.symbol(&mut cdfs.y_mode[size_group_wh(write_w, write_h)]);
         if crate::envflags::env_flag!("EC_IIS") {
             eprintln!(
@@ -36573,8 +36585,10 @@ fn decode_inter_block(
         let uv_mode = if !has_chroma {
             DC_PRED
         } else if cfl_allowed {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if (9..=12).contains(&uv_mode) {
@@ -38679,6 +38693,7 @@ fn decode_intra_sub8_leaf(
     let step = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     // `size_group_lookup[BLOCK_8X4] == size_group_lookup[BLOCK_4X8] == 0`
     // (libaom common_data.h:61).
+    crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
     let mode = dec.symbol(&mut cdfs.y_mode[0]);
     if step {
         eprintln!(
@@ -38701,8 +38716,10 @@ fn decode_intra_sub8_leaf(
         // always 4x4-or-smaller, so the predicate stays true and this read
         // is unchanged.
         let uv_mode = if cfl_allowed_px(bw, bh, fctx) {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if step {
@@ -41597,6 +41614,7 @@ ss_y(fctx),
                 hit!(FIMV_ALPHABET_HITS);
             }
             if warp_eligible {
+                crate::msac::SymbolDecoder::set_symr_cdf("motion_mode");
                 let mode = dec.symbol(&mut cdfs.motion_mode[0]);
                 match mode {
                     0 => {}
@@ -42080,6 +42098,7 @@ ss_y(fctx),
             }
         }
     } else {
+        crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
         let mode = dec.symbol(&mut cdfs.y_mode[SIZE_GROUP_8]);
         if mode >= 13 {
             return Err(unsupported(
@@ -42141,8 +42160,10 @@ ss_y(fctx),
         let uv_mode = if !has_chroma {
             DC_PRED
         } else if cfl_allowed_px(SIDE, SIDE, fctx) {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
@@ -47231,6 +47252,7 @@ mod tests {
             DC_PRED,
             &mut cdfs.kf_y_mode[INTRA_MODE_CTX[DC_PRED]][INTRA_MODE_CTX[DC_PRED]],
         );
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         enc.symbol(DC_PRED, &mut cdfs.uv_mode_no_cfl[DC_PRED]);
         let data = enc.finish();
         let decoded = decode_key_frame_tile(
