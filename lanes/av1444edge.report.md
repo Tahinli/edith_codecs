@@ -360,3 +360,124 @@ after all subagents land.
 - **Main** — `dc35d607` is standalone, measurement-only, and mergeable
   now. The matrix row `4:4:4 / superres / 8-bit` should read exact (§6).
   Open item: the real 4:4:4 superres cell is exact but ungated.
+
+---
+
+## 10. Appendix — the mode fork re-verified, and the per-arm commands
+
+### 10a. The `mi(13,32)` ref0 fork does NOT survive the H1 fix
+
+§3 reported a mode fork at `mi(13,32)` — the oracle reads
+`ref0 = LAST (1)`, we read `GOLDEN (4)` — landing on the block right
+after the first wrong pixel, and flagged it as residue worth a lane of
+its own if it survived. Re-measured on a clean two-arm pair, one commit
+apart, with `4e151813` provably absent from both:
+
+| decode-order frame | oracle entries | arm A (base + rung) | arm B (base + rung + `f92776ba`) |
+|---|---|---|---|
+| 1 | 279 | 279 | 279 |
+| 2 | 299 | **226** | **299** |
+| 3 | 361 | **40** | **361** |
+
+| arm | semantic ladder diffs (mi, ref0, ref1, mv0), frames 1 / 2 / 3 | `mi(13,32)` idx175 |
+|---|---|---|
+| A — base + rung | 0 / **51** / **40** | AOM `ref0=1 mv0=(-32,0)` vs OUR `ref0=4 mv0=(-32,0)` — DIFF |
+| B — base + rung + `f92776ba` | 0 / **0** / **0** | AOM `ref0=1 mv0=(-32,0)` vs OUR `ref0=1 mv0=(-32,0)` — **SAME** |
+
+**The fork is gone, and it is the same defect.** Zero semantic ladder
+diffs in all three frames, and the entry counts now equal the oracle's
+exactly (arm A lost 73 entries in frame 2 and 321 in frame 3; arm B
+loses none). This is §3's causality argument confirmed rather than
+asserted: a wrong pixel cannot cause a mode fork, so one bsize/footprint
+error had to feed both symptoms — and if that is right, one fix must
+remove both. It does. A residual fork here would have refuted the
+argument and pointed at a second defect; there is none. **Dropped, no
+separate lane.**
+
+**The one residual ladder difference is a print asymmetry, not a fork.**
+Arm B still shows 2 (frame 2) and 12 (frame 3) entries where the
+`stack` field differs. Every one is a compound block (`ref1` set, e.g.
+`ref0=1 ref1=4`, `ref0=4 ref1=7`) whose OUR line prints no `stack=`
+field at all — the compound arm's `EC_MODE_VAL` format omits it. All
+semantic fields, and on most entries `rng`, match. Same family as
+`compare-range-not-tell`: a field that is not a cross-decoder invariant
+must not be compared as one.
+
+### 10b. The ancestry guard is wrong for a cherry-picked commit
+
+The guard I ran in 10a, `git merge-base --is-ancestor f92776ba HEAD`,
+returns **False on an arm that has the fix**, because a cherry-pick
+mints a new sha. Had I trusted it as a presence check it would have
+reported arm B as "fix absent" — a third check in this session that
+returns a plausible number instead of the fact, and the second inside
+this lane alone. The correct guard over cherry-picks is **patch-id
+equivalence**:
+
+```text
+f92776ba: is-ancestor=False  patch-id=bcead47eb734ca4f  local equivalent: 38b34494  PRESENT
+4e151813: is-ancestor=False  patch-id=5c19bac8add27bbb  local equivalent: None     absent
+dc35d607: is-ancestor=False  patch-id=285286bb3506199b  local equivalent: e362bfda  PRESENT
+```
+
+`is-ancestor` remains a valid EXCLUDE check for a commit that is a true
+ancestor; it is not a valid INCLUDE check after a cherry-pick. The
+`rust-oracle-gate-verification` entry was corrected.
+
+### 10c. The per-arm commands, verbatim
+
+Throw-away worktree, one `CARGO_TARGET_DIR` per arm, arms exactly one
+commit apart. A reviewer can paste this and get the same numbers.
+
+```bash
+WT=~/.cache/wt/av1444fork
+cd /home/tahinli/Documents/Code/Rust/edith_codecs
+git worktree add -f --detach "$WT" 4155c7c7
+
+arm () {                     # arm <label> <tag> <commit>...
+  tag=$1; shift
+  git -C "$WT" reset --hard 4155c7c7      # per-arm reset, never `checkout --`
+  git -C "$WT" clean -fdq
+  for c in "$@"; do git -C "$WT" cherry-pick -x "$c"; done
+  git -C "$WT" log --oneline -1
+  for c in f92776ba 4e151813; do         # presence/absence by PATCH-ID
+    p=$(git -C "$WT" show "$c" | git patch-id --stable | cut -d' ' -f1)
+    hit=$(git -C "$WT" log --format=%H | while read -r h; do
+            q=$(git -C "$WT" show "$h" | git patch-id --stable | cut -d' ' -f1)
+            [ "$q" = "$p" ] && { echo "$h"; break; }; done)
+    echo "$c present=${hit:-no}"
+  done
+  td=~/.cache/cargo-target-$tag
+  ( cd "$WT" && CARGO_TARGET_DIR="$td" \
+      cargo build -p ec-av1 --example decode_probe --features gate-counters )
+  stat -c '%y' "$td/debug/examples/decode_probe"    # the 0.0s-build tell
+  ( cd "$WT" && EC_TRACE_MODE=1 EC_AV1_FINAL_DUMP=/tmp/$tag \
+      "$td/debug/examples/decode_probe" ~/.cache/av1444edge/sr444.obu 2>/tmp/$tag.our )
+  for k in 1 2 3 4; do                             # oracle, per frame
+    EC_TRACE_MODE=1 ~/.cache/aom-oracle/build/aomdec --codec=av1 --limit=$k -o /dev/null ~/.cache/av1444edge/sr444.obu 2>/tmp/$tag.aom$k
+  done
+}
+
+arm A_base_plus_rung                A dc35d607
+arm B_base_plus_rung_plus_f92776ba  B dc35d607 f92776ba
+```
+
+Compare by splitting OUR's `EC_MODE_VAL` lines on the `EC_PICT idx=`
+markers (one per decode-order frame, printed before that frame's dump),
+the ORACLE's on cumulative `aomdec --limit=k` counts, then field by
+field per entry. Observed:
+
+```text
+arm A  entries oracle/ours 1,2,3:  279/279  299/226  361/40
+arm A  SEMANTIC diffs (mi/ref0/ref1/mv0) frame 2 = 51, frame 3 = 40
+arm B  entries oracle/ours 1,2,3:  279/279  299/299  361/361
+arm B  SEMANTIC diffs frame 2 = 0, frame 3 = 0
+arm B  residual stack-field diffs: frame 2 = 2, frame 3 = 12; every one a
+       compound block whose OUR line omits the field
+```
+
+Pixel cross-check on the same two arms, so the ladder verdict is not
+taken on trust: arm B is 4/4 decode-order frames byte-exact vs aomdec on
+both fixtures (§7); arm A is 11521 and 76404 samples off (§1).
+
+Cleanup: `git worktree remove --force ~/.cache/wt/av1444fork` and
+`rm -rf ~/.cache/cargo-target-forkA ~/.cache/cargo-target-forkB`.
