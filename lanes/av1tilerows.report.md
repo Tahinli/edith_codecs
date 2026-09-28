@@ -186,13 +186,99 @@ introduced here, and neither is a tile-row defect):
 
 ## 7. Hygiene
 
-- No temporary instrumentation added: the diagnosis used existing env-gated
-  rungs only (`EC_SYMR`, `EC_TRACE` on the oracle). Nothing to remove —
-  `git diff` touches `decode.rs` (the two reach calls + comments), `stream.rs`
-  (the gate) and the pinned fixture.
+- The H4 diagnosis added no instrumentation: it used existing env-gated rungs
+  only (`EC_SYMR`, `EC_TRACE` on the oracle).
+- The §8 class sweep DID add one temporary env-gated counter
+  (`EC_TMP_SB128CHROMA`, at the `decode.rs:41930` arm) to prove 4:4:4
+  reachability. It is **removed** — `grep -c EC_TMP_SB128CHROMA
+  crates/ec-av1/src/decode.rs` is 0 at HEAD and `git status` is clean against
+  the lane commit.
+- `git diff` for the fix itself touches `decode.rs` (the two reach calls +
+  comments), `stream.rs` (the gate) and the pinned fixture. Nothing else.
 - No formatters run.
 - Local runs used `EC_NOMEMGUARD=1`: the repo's `scripts/memguard-runner.sh`
   transient-scope wrapper collided with stale `run-p*.scope` units on this box
   ("Unit run-p…scope was already loaded"), which aborts `cargo test` before any
   test runs. That is an environment artefact, not a test failure — every gate
   above was run with the wrapper bypassed.
+
+## 8. Class sweep — is the class closed repo-wide?
+
+Enumerated **every** production call site of `tu_reach`, `tu_reach_rect` and
+`Reach::of_tu` (excluding the two wrapper bodies at `decode.rs:1593`/`1622` and
+`encode.rs:16024`/`16031`/`16180`, which are inside `mod tests`). Result:
+**32 production sites — 27 ss-aware, 4 4:2:2-only, 1 remaining hardcoded
+4:2:0-shaped site.** `Reach` is referenced by no crate outside
+`crates/ec-av1/src/{decode,encode}.rs`, and no site sits behind a feature or
+`cfg` other than `#[cfg(test)]`.
+
+Three correct conventions exist, and no fourth:
+
+- **A — canonical ss shift** `ox << ss_x(fctx), oy << ss_y(fctx), 4 << ss_x(fctx)`:
+  17401, 17488 (fixed here), 35359 (the reference form).
+- **B — hoisted per-axis luma-span locals** (`span_x = 4 << ss_x`,
+  `luma_span_x = chroma_tx << ss_x`, …): 11610, 20401, 20660, 21021, 21618,
+  42370, 42497. Semantically identical to A.
+- **C — 4:4:4-gated identity literal** (a bare `4` / `chroma_tx`, no shift):
+  22235, 22288, 42249, 44605. Each sits under a guard that *names*
+  `ss_x == 0 && ss_y == 0` (or `chroma_444`), so the literal IS the identity
+  and the guard is load-bearing. Correct as written, but these are the four
+  sites that would break first if a 4:2:0/4:2:2 sibling arm were ever added
+  beside them — flagged, not changed.
+
+All remaining luma sites pass pure luma pixel offsets and are SS_AWARE by
+construction. The 4 HARDCODED_422_ONLY sites (15514, 15782, 17567, 17650) are
+guarded by `chroma422_rect32 = … && ss_x == 1 && ss_y == 0` (15417) and
+`chroma422_pair16 = … && ss_x == 1` (17341) — 4:2:2, refused by name at
+`stream.rs:1749`, and unreachable at 4:4:4. Their `(0, unit_row*8, 8, 8)` is
+exactly the ss(1,0) luma footprint of a 4x8 chroma unit.
+
+### The one remaining member: `decode.rs:41934` — reachable at 4:4:4, NOT fixed here
+
+```rust
+if side > 64 {                       // plain geometry, not a subsampling test
+    let cu_tx = 32usize;             // a CHROMA extent, the 4:2:0 answer
+    let luma_span = cu_tx * 2;       // 4:2:0 luma scale -- THE CLASS
+    let (cu_x, cu_y) = (cpx + cc * cu_tx, cpy + cr * cu_tx);
+    let cu_reach = crate::decode::tu_reach(side, side, cc * luma_span, cr * luma_span, luma_span, …);
+```
+
+**Reachability PROVED by counter, not by argument.** A temporary env-gated
+counter (added, measured, removed — `grep EC_TMP_SB128CHROMA` is 0 at HEAD)
+fired **32 times at `ss=(0,0) side=128`** on a 4:4:4 lossy
+`--sb-size=128 --cq-level=20` stream. 4:4:4 is admitted; only
+`subsampling_x != subsampling_y` is refused. No committed 4:4:4 fixture fires
+it (`444_sb128rect_lr_witness`, `444_leaf8_oob`, and all three `ll444_*` pins
+each fire **0**), so this arm has **no 4:4:4 coverage at all**.
+
+**Why it is not patched.** I could not build a witness, and I will not ship an
+unvalidated change into a path with zero coverage:
+
+1. The only recipes that fire the arm are also broken by the **pre-existing H1
+   entropy fork** — 31272 wrong from frame 3, and byte-identical between base
+   `4155c7c7` and this lane's tip, so it is not mine. A reach delta is invisible
+   under that much damage: A/B-ing `luma_span = cu_tx << ss_x(fctx)` against
+   `cu_tx * 2` gave **byte-identical output on every frame**.
+2. Every recipe that IS pixel-exact at 4:4:4 refuses to fire the arm
+   (`--enable-rect-partitions=0` and `--enable-1to4-partitions=0` both give 0
+   fires across six cq/geometry variants, all exact).
+3. `luma_span` is not the whole defect. Per `blockd.h:1372`,
+   `av1_get_max_uv_txsize(BLOCK_128X128, 0, 0)` is
+   `max_txsize_rect_lookup[BLOCK_128X128]` = `TX_64X64` (adjusted → itself),
+   **not** the `TX_32X32` the comment assumes: at 4:2:0 the plane block is
+   halved to `BLOCK_64X64` first. So at 4:4:4 `cu_tx` should be 64 and
+   `cu_x = cpx + cc * cu_tx` should be `cc * 64`, not `cc * 32` — the arm
+   addresses the wrong chroma region entirely, independently of the reach
+   argument. Patching only `luma_span` would be a **half fix**: it would change
+   the reach answer in an arm whose unit geometry is still 4:2:0-shaped, with
+   no gate able to catch the difference.
+
+**Recommendation.** Fix H1 first; this site then becomes witnessable and
+should be repaired as a unit (`cu_tx = 32 << ss_x(fctx)`, `luma_span =
+cu_tx << ss_x(fctx)`, and the per-chunk chroma origin with it), with the same
+`<< 1 == * 2` 4:2:0 identity argument. The 4:2:0 identity is not in question —
+`32 << 1 == 64` — so the repair is provably a no-op for the only format with
+committed coverage on this path.
+
+**Net class status: the class is closed except for this one site, which is
+proven reachable and documented rather than silently changed.**
