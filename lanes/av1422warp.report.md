@@ -1741,6 +1741,73 @@ Everything needed is now in place and verified.
 
 Not pinned, no gate, refusal untouched.
 
+## Round 30 — the tag WAS sticky; Main's suspicion confirmed, and round 28's attribution is retracted
+
+`37656c2f` (instrument, no behaviour change; identity re-proved) and oracle
+snapshot `662b6f0`.
+
+### Sticky-tag verdict: CONFIRMED, and it invalidates round 28
+
+The `cdf` tag was set at a read site and **carried by every later read**.
+That is exactly how an 8-symbol read came to be labelled `interintra`, a
+2-symbol table — the anomaly round 28 saw and could not explain. The tag is
+now **one-shot**: `SymbolDecoder::symbol` consumes it, so an empty `cdf=`
+means "no table set for this read", never the previous read's table.
+
+**Consequence: round 28's "the two missing reads are interintra" is
+RETRACTED.** It rested entirely on the sticky label.
+
+### Remaining inter reads tagged, both sides
+
+`y_mode`, `uv_mode`, `motion_mode`, `skip_mode`, `comp_group_idx`,
+`compound_idx`, `interintra` (plus `mv_sign`, `mv_class` on the oracle).
+Verified sparse, which is the check that matters: comp_group_idx 947,
+interintra 945, uv_mode 895, motion_mode 736, compound_idx 726, y_mode 293,
+everything else empty. A sticky tag would have inflated these.
+
+### The window, with the label now trustworthy
+
+```
+  [107512] O -  n= 4 s=1 | M -  n= 4 s=1
+  [107513] O -  n= 2 s=0 | M -  n= 2 s=0
+  [107514] O -  n= 3 s=1 | M -  n= 3 s=1
+  [107515] O -  n= 3 s=0 | M -  n= 3 s=0
+  [107516] O -  n= 2 s=1 | M -  n= 2 s=1     pair
+->[107517] O -  n= 2 s=1 | M -  n= 8 s=3     DIVERGES
+  [107518] O -  n= 2 s=1 | M -  n=10 s=0
+  [107519] O -  n= 8 s=3 | M -  n= 2 s=0
+```
+
+**What this now says.** The two extra 2-symbol reads are at sites that
+carry NO table tag on either side — and the neighbouring `n=3` pair is
+`mv_class` (MV_CLASSES is 3) with the `n=10` matching `class0_cdf`
+(CLASS0_SIZE is 10). So the window is inside libaom's
+**`read_mv_component`**, not the mode-info reads: the oracle reads two extra
+2-symbol MV sub-reads per component that this decoder does not, and the
+`n=8`/`n=10` pair that follows is the matching `y_mode`/`class0` read.
+
+That is a real narrowing — from "two unnamed reads somewhere in the
+inter path" to "two extra sub-reads inside the MV-component read" — and it
+moves the defect OUT of the mode-info path that rounds 27-29 were chasing,
+including the `interintra` gate theory, which is now irrelevant to this
+window.
+
+### Not closed
+
+Which two MV sub-reads. `read_mv_component` (`decodemv.c:1000`) reads, in
+order: `sign_cdf` (2), `classes_cdf` (MV_CLASSES), then under `class0`
+`class0_cdf` (CLASS0_SIZE), else `class0_to_fr`/`hp`/`bits`. The two extra
+n=2 reads are consistent with a `bit`/`hp`/`fr` sub-read this decoder skips
+under a condition libaom does not take at this block — but naming WHICH
+needs the sub-read sites tagged at their own granularity, not the
+component.
+
+**Handoff.** Tag `read_mv_component`'s sub-reads individually on both sides
+(`mv_sign`, `mv_class`, `mv_class0`, `mv_fr`, `mv_hp`, `mv_bit`). With the
+tag now one-shot, the two extra reads name themselves on the next pass.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
