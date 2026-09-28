@@ -3523,6 +3523,15 @@ pub(crate) mod tests {
                         bad, 0,
                         "{NAME}: arm {extra:?} frame {i} plane {plane}: {bad} samples differ"
                     );
+                    assert_eq!(
+                        g.len(),
+                        r.len(),
+                        "{NAME}: arm {extra:?} frame {i} plane {plane}: ours has {} samples, \
+                         ffmpeg's has {} -- a short plane would zip-truncate the compare above \
+                         and hide a chroma-span defect",
+                        g.len(),
+                        r.len()
+                    );
                 }
             }
             assert!(
@@ -6043,6 +6052,14 @@ pub(crate) mod tests {
                      ({int_mv_inter} force_integer_mv inter frames in this stream)",
                     first.unwrap()
                 );
+                assert_eq!(
+                    l.len(),
+                    r.len(),
+                    "frame {i} plane {plane}: ours has {} samples, ffmpeg's has {} -- a short \
+                     plane would zip-truncate the compare above and hide a chroma-span defect",
+                    l.len(),
+                    r.len()
+                );
             }
         }
     }
@@ -6147,6 +6164,14 @@ pub(crate) mod tests {
                     "frame {i} plane {plane} differs from ffmpeg at sample {}",
                     first.unwrap()
                 );
+                assert_eq!(
+                    l.len(),
+                    r.len(),
+                    "frame {i} plane {plane}: ours has {} samples, ffmpeg's has {} -- a short \
+                     plane would zip-truncate the compare above and hide a chroma-span defect",
+                    l.len(),
+                    r.len()
+                );
             }
         }
     }
@@ -6250,6 +6275,15 @@ pub(crate) mod tests {
                 assert_eq!(
                     bad, 0,
                     "{NAME}: frame {i} plane {plane}: {bad} samples differ"
+                );
+                assert_eq!(
+                    g.len(),
+                    r.len(),
+                    "{NAME}: frame {i} plane {plane}: ours has {} samples, ffmpeg's has {} -- a \
+                     short plane would zip-truncate the compare above and hide a chroma-span \
+                     defect",
+                    g.len(),
+                    r.len()
                 );
             }
         }
@@ -6424,6 +6458,15 @@ pub(crate) mod tests {
                     assert_eq!(
                         bad, 0,
                         "{NAME} [{tag}]: frame {i} plane {plane}: {bad} samples differ"
+                    );
+                    assert_eq!(
+                        g.len(),
+                        r.len(),
+                        "{NAME} [{tag}]: frame {i} plane {plane}: ours has {} samples, ffmpeg's has \
+                         {} -- a short plane would zip-truncate the compare above and hide a \
+                         chroma-span defect",
+                        g.len(),
+                        r.len()
                     );
                 }
             }
@@ -6664,6 +6707,15 @@ pub(crate) mod tests {
                         bad, 0,
                         "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ"
                     );
+                    assert_eq!(
+                        plane.len(),
+                        want.len(),
+                        "{NAME}: aomdec frame {i} plane {p}: ours has {} samples, the oracle's \
+                         has {} -- a short plane would zip-truncate the compare above and hide \
+                         a chroma-span defect",
+                        plane.len(),
+                        want.len()
+                    );
                 }
             }
         } else {
@@ -6685,6 +6737,15 @@ pub(crate) mod tests {
                     assert_eq!(
                         bad, 0,
                         "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ"
+                    );
+                    assert_eq!(
+                        g.len(),
+                        r.len(),
+                        "{NAME}: ffmpeg frame {i} plane {p}: ours has {} samples, ffmpeg's has {} \
+                         -- a short plane would zip-truncate the compare above and hide a \
+                         chroma-span defect",
+                        g.len(),
+                        r.len()
                     );
                 }
             }
@@ -6899,6 +6960,15 @@ pub(crate) mod tests {
                         "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ \
                          (class obmc-ss-blind-chroma-above)"
                     );
+                    assert_eq!(
+                        plane.len(),
+                        want.len(),
+                        "{NAME}: aomdec frame {i} plane {p}: ours has {} samples, the oracle's \
+                         has {} -- a short plane would zip-truncate the compare above and hide \
+                         a chroma-span defect",
+                        plane.len(),
+                        want.len()
+                    );
                 }
             }
         } else {
@@ -6920,6 +6990,15 @@ pub(crate) mod tests {
                     assert_eq!(
                         bad, 0,
                         "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ"
+                    );
+                    assert_eq!(
+                        g.len(),
+                        r.len(),
+                        "{NAME}: ffmpeg frame {i} plane {p}: ours has {} samples, ffmpeg's has {} \
+                         -- a short plane would zip-truncate the compare above and hide a \
+                         chroma-span defect",
+                        g.len(),
+                        r.len()
                     );
                 }
             }
@@ -7075,6 +7154,15 @@ pub(crate) mod tests {
                         "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ \
                          (class 444-128rect-chroma-span)"
                     );
+                    assert_eq!(
+                        plane.len(),
+                        want.len(),
+                        "{NAME}: aomdec frame {i} plane {p}: ours has {} samples, the oracle's \
+                         has {} -- a short plane would zip-truncate the compare above and hide \
+                         a chroma-span defect",
+                        plane.len(),
+                        want.len()
+                    );
                 }
             }
         } else {
@@ -7097,6 +7185,15 @@ pub(crate) mod tests {
                     assert_eq!(
                         bad, 0,
                         "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ"
+                    );
+                    assert_eq!(
+                        g.len(),
+                        r.len(),
+                        "{NAME}: ffmpeg frame {i} plane {p}: ours has {} samples, ffmpeg's has {} \
+                         -- a short plane would zip-truncate the compare above and hide a \
+                         chroma-span defect",
+                        g.len(),
+                        r.len()
                     );
                 }
             }
@@ -7534,6 +7631,15 @@ pub(crate) mod tests {
                         "{NAME}: aomdec frame {i} plane {p} THROUGH THE PIPELINE: \
                          {bad} samples differ (class lr-band-release)"
                     );
+                    assert_eq!(
+                        plane.len(),
+                        want.len(),
+                        "{NAME}: aomdec frame {i} plane {p}: ours has {} samples, the oracle's \
+                         has {} -- a short plane would zip-truncate the compare above and hide \
+                         a chroma-span defect",
+                        plane.len(),
+                        want.len()
+                    );
                 }
             }
         } else {
@@ -7554,6 +7660,15 @@ pub(crate) mod tests {
                         bad, 0,
                         "{NAME}: ffmpeg frame {i} plane {p} THROUGH THE PIPELINE: \
                          {bad} samples differ"
+                    );
+                    assert_eq!(
+                        g.len(),
+                        r.len(),
+                        "{NAME}: ffmpeg frame {i} plane {p}: ours has {} samples, ffmpeg's has {} \
+                         -- a short plane would zip-truncate the compare above and hide a \
+                         chroma-span defect",
+                        g.len(),
+                        r.len()
                     );
                 }
             }
@@ -7881,7 +7996,7 @@ pub(crate) mod tests {
             return;
         }
         let refs = ffmpeg_decode_sequence(&stream, w, h, frames);
-        assert_eq!(ours.len(), frames, "{NAME}: decode-order frame count");
+        assert_eq!(ours.len(), frames, "{NAME}: shown/display frame count");
         for (i, (got, want)) in ours.iter().zip(refs.iter()).enumerate() {
             for (plane, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
                 .iter()
@@ -7891,6 +8006,15 @@ pub(crate) mod tests {
                 assert_eq!(
                     bad, 0,
                     "{NAME}: frame {i} plane {plane}: {bad} samples differ from ffmpeg"
+                );
+                assert_eq!(
+                    g.len(),
+                    r.len(),
+                    "{NAME}: frame {i} plane {plane}: ours has {} samples, ffmpeg's has {} -- a \
+                     short plane would zip-truncate the compare above and hide a chroma-span \
+                     defect",
+                    g.len(),
+                    r.len()
                 );
             }
         }
@@ -8025,6 +8149,15 @@ pub(crate) mod tests {
                     bad, 0,
                     "{NAME}: arm {arm} plane {plane}: {bad} samples differ from ffmpeg"
                 );
+                assert_eq!(
+                    g.len(),
+                    r.len(),
+                    "{NAME}: arm {arm} plane {plane}: ours has {} samples, ffmpeg's has {} -- a \
+                     short plane would zip-truncate the compare above and hide a chroma-span \
+                     defect",
+                    g.len(),
+                    r.len()
+                );
             }
         }
         eprintln!("{NAME}: 2 arms full-frame exact, {clips_total} chroma units clipped");
@@ -8093,6 +8226,14 @@ pub(crate) mod tests {
             assert_eq!(
                 bad, 0,
                 "{NAME}: plane {plane}: {bad} samples differ from ffmpeg"
+            );
+            assert_eq!(
+                g.len(),
+                r.len(),
+                "{NAME}: plane {plane}: ours has {} samples, ffmpeg's has {} -- a short plane \
+                 would zip-truncate the compare above and hide a chroma-span defect",
+                g.len(),
+                r.len()
             );
         }
         eprintln!(
@@ -8328,6 +8469,15 @@ pub(crate) mod tests {
                     first.is_none(),
                     "{NAME}: frame {i} plane {plane} differs from ffmpeg at sample {}",
                     first.unwrap()
+                );
+                assert_eq!(
+                    l.len(),
+                    r.len(),
+                    "{NAME}: frame {i} plane {plane}: ours has {} samples, ffmpeg's has {} -- a \
+                     short plane would zip-truncate the compare above and hide a chroma-span \
+                     defect",
+                    l.len(),
+                    r.len()
                 );
             }
         }
@@ -9764,11 +9914,10 @@ pub(crate) mod tests {
                     assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
                     let ffmpeg_frames =
                         ffmpeg_decode_sequence(&stream, width, height, frames.len());
-                    assert_eq!(
-                        frames.len(),
-                        ffmpeg_frames.len(),
-                        "{NAME}: {arm} frame count"
-                    );
+                    // No frame-count assert here: `ffmpeg_decode_sequence` was
+                    // handed `frames.len()` as its frame budget, so
+                    // `ffmpeg_frames.len() == frames.len()` holds by
+                    // construction and the assert was tautological.
                     // EVERY frame is compared; an arm whose decode never hit an
                     // intrabc block proves nothing about the DV/prediction path,
                     // so it is counted OUT OF SCOPE -- but a mismatch there is
@@ -11346,7 +11495,29 @@ pub(crate) mod tests {
                 let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                 assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
                 let mut mismatched = 0usize;
-                for (ours, ref_frame) in frames.iter().zip(theirs.iter()) {
+                for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+                    // A size mismatch makes every number this ladder prints
+                    // meaningless -- the `zip` walks below would truncate to the
+                    // shorter plane and report a clean ladder over what is
+                    // really a plane-shape defect -- so it is LOUD. A PIXEL
+                    // mismatch stays report-only: this gate deliberately
+                    // tolerates the pinned second defect (see the doc comment).
+                    for (plane, a, b) in [
+                        ("Y", &ours.y, &ref_frame.y),
+                        ("U", &ours.u, &ref_frame.u),
+                        ("V", &ours.v, &ref_frame.v),
+                    ] {
+                        assert_eq!(
+                            a.len(),
+                            b.len(),
+                            "{NAME}: frame {i} plane {plane}: ours has {} samples, ffmpeg's has \
+                             {} -- a size mismatch makes this whole diagnostic ladder \
+                             meaningless, so it is loud while a pixel mismatch stays \
+                             report-only",
+                            a.len(),
+                            b.len()
+                        );
+                    }
                     mismatched += ours
                         .y
                         .iter()
@@ -11894,11 +12065,10 @@ pub(crate) mod tests {
                 } else {
                     ffmpeg_decode_sequence(&stream, width, height, frames.len())
                 };
-                assert_eq!(
-                    frames.len(),
-                    ffmpeg_frames.len(),
-                    "{NAME}: {arm} at {depth}-bit -- frame count"
-                );
+                // No frame-count assert here: `ffmpeg_decode_sequence{,_10bit}`
+                // was handed `frames.len()` as its frame budget, so
+                // `ffmpeg_frames.len() == frames.len()` holds by construction
+                // and the assert was tautological.
                 assert!(
                     !frames.is_empty(),
                     "{NAME}: {arm} at {depth}-bit decoded no frame"
@@ -13636,6 +13806,15 @@ pub(crate) mod tests {
                     if let Some(d) = first_diff(a, b, w) {
                         panic!("{name}: seed {seed} frame {i} plane {plane}: {d} [{fired}]");
                     }
+                    assert_eq!(
+                        a.len(),
+                        b.len(),
+                        "{name}: seed {seed} frame {i} plane {plane}: ours has {} samples, \
+                         ffmpeg's has {} -- a short plane would zip-truncate the walk above \
+                         and hide a chroma-span defect",
+                        a.len(),
+                        b.len()
+                    );
                 }
             }
             compared += 1;
@@ -28889,6 +29068,22 @@ pub(crate) mod tests {
                                 "{NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} frame \
                                  {i} differs from ffmpeg"
                             );
+                            for (plane, a, b) in [
+                                ("Y", &ours.y, &theirs.y),
+                                ("U", &ours.u, &theirs.u),
+                                ("V", &ours.v, &theirs.v),
+                            ] {
+                                assert_eq!(
+                                    a.len(),
+                                    b.len(),
+                                    "{NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} \
+                                     frame {i} plane {plane}: ours has {} samples, ffmpeg's has \
+                                     {} -- a short plane would zip-truncate the diff count \
+                                     above and hide a chroma-span defect",
+                                    a.len(),
+                                    b.len()
+                                );
+                            }
                         }
                         // Every compared attempt must carry the case, so no
                         // compared attempt is out of scope and
@@ -29754,8 +29949,11 @@ pub(crate) mod tests {
                 ffmpeg_decode_sequence(&stream, width, height, frame_count)
             };
             assert_eq!(frames.len(), frame_count);
-            // EVERY decode-order frame compared, never just the shown ones
-            // (class [[gate-blind-to-hidden-frames]]).
+            // Every SHOWN/display frame `decode_stream` returned is compared --
+            // that is decode_stream's whole output, and nothing else is.
+            // HIDDEN frames are NOT covered here: they are never emitted as
+            // pictures, so no ffmpeg picture corresponds to them (class
+            // [[gate-blind-to-hidden-frames]]).
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 assert_eq!(
                     got.y, want.y,
@@ -29919,7 +30117,20 @@ pub(crate) mod tests {
             .unwrap_or(4);
         let frames = decode_stream(&stream).expect("our decode");
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
-        for f in 0..frame_count.min(frames.len()).min(ffmpeg_frames.len()) {
+        // The `.min()` chain below is a scratch diagnostic that tolerates a
+        // pinned stream whose counts disagree, but a SILENT shortfall reads as
+        // "these frames matched" for frames nobody compared. Say how many are
+        // actually walked.
+        let walked = frame_count.min(frames.len()).min(ffmpeg_frames.len());
+        if walked < frame_count {
+            eprintln!(
+                "pinned stream: asked for {frame_count} frames (EC_AV1_PIN_N), we show {}, ffmpeg \
+                 shows {} -- comparing the first {walked} only",
+                frames.len(),
+                ffmpeg_frames.len()
+            );
+        }
+        for f in 0..walked {
             let ours = &frames[f];
             let theirs = &ffmpeg_frames[f];
             for (plane_name, a, b, w) in [
@@ -29927,6 +30138,15 @@ pub(crate) mod tests {
                 ("u", &ours.u, &theirs.u, width / 2),
                 ("v", &ours.v, &theirs.v, width / 2),
             ] {
+                // A short plane would zip-truncate the walk below and report
+                // MATCH over the prefix the two share.
+                assert_eq!(
+                    a.len(),
+                    b.len(),
+                    "frame {f} plane {plane_name}: ours has {} samples, ffmpeg's has {}",
+                    a.len(),
+                    b.len()
+                );
                 let mut first = None;
                 let mut count = 0;
                 let mut worst = 0i32;
@@ -33995,6 +34215,15 @@ pub(crate) mod tests {
                         first.map(|k| a[k]),
                         first.map(|k| b[k]),
                     );
+                    assert_eq!(
+                        a.len(),
+                        b.len(),
+                        "{NAME} frame {i} {name} vs ffmpeg (seed {seed}): ours has {} samples, \
+                         ffmpeg's has {} -- a short plane would zip-truncate the walk above \
+                         and hide a chroma-span defect",
+                        a.len(),
+                        b.len()
+                    );
                 }
             }
             let hits = crate::decode::part128_none_hits() - before;
@@ -35589,6 +35818,15 @@ pub(crate) mod tests {
                                 b[d]
                             );
                         }
+                        assert_eq!(
+                            a.len(),
+                            b.len(),
+                            "{name}: {tag} frame {i} plane {plane}: ours has {} samples, \
+                             ffmpeg's has {} -- a short plane would zip-truncate the walk above \
+                             and hide a chroma-span defect",
+                            a.len(),
+                            b.len()
+                        );
                     }
                 }
                 compared += 1;
@@ -42549,6 +42787,15 @@ pub(crate) mod tests {
                                 b[i],
                             );
                         }
+                        assert_eq!(
+                            a.len(),
+                            b.len(),
+                            "{NAME}: segmented {w}x{h} crf {crf}, frame {f} plane {plane}: ours \
+                             has {} samples, ffmpeg's has {} -- a short plane would \
+                             zip-truncate the walk above and hide a chroma-span defect",
+                            a.len(),
+                            b.len()
+                        );
                     }
                 }
                 eprintln!("{NAME}: segmented {w}x{h} crf {crf} exact, block q span {lo}..{hi}");
@@ -42662,6 +42909,15 @@ pub(crate) mod tests {
                                     b[i],
                                 );
                             }
+                            assert_eq!(
+                                a.len(),
+                                b.len(),
+                                "{NAME}: {encoder} {point} at {w}x{h}, frame {f} plane {plane}: \
+                                 ours has {} samples, ffmpeg's has {} -- a short plane would \
+                                 zip-truncate the walk above and hide a chroma-span defect",
+                                a.len(),
+                                b.len()
+                            );
                         }
                     }
                     checked += 1;
@@ -42772,6 +43028,15 @@ pub(crate) mod tests {
                         b[i],
                     );
                 }
+                assert_eq!(
+                    a.len(),
+                    b.len(),
+                    "{NAME}: frame {f} plane {plane}: ours has {} samples, ffmpeg's has {} -- a \
+                     short plane would zip-truncate the walk above and hide a chroma-span \
+                     defect",
+                    a.len(),
+                    b.len()
+                );
             }
         }
         // The property is asserted, not hoped for: without more than one

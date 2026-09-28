@@ -205,7 +205,14 @@ struct LevelPlan {
 
 impl LevelPlan {
     fn new(slot: usize, offset: i16, weight: f64) -> Self {
-        Self { slot, offset, weight, left: weight, bound: false, rate: 0.0 }
+        Self {
+            slot,
+            offset,
+            weight,
+            left: weight,
+            bound: false,
+            rate: 0.0,
+        }
     }
 }
 
@@ -325,9 +332,8 @@ impl RateLoop {
         };
         let (hidden, leaves) = gop_shape(p, gop);
         let key = KEY_WEIGHT * w(p.key_q_offset);
-        let total: f64 = key
-            + leaves as f64
-            + hidden.iter().map(|&(o, n)| n as f64 * w(o)).sum::<f64>();
+        let total: f64 =
+            key + leaves as f64 + hidden.iter().map(|&(o, n)| n as f64 * w(o)).sum::<f64>();
         // One leaf's byte target: the run is worth `gop` frame targets and
         // `total` leaves.
         let scale = target_bytes * gop.max(1) as f64 / total.max(f64::EPSILON);
@@ -441,7 +447,10 @@ impl RateLoop {
         };
         self.q[slot] = (self.q[slot] + step).clamp(0.0, 255.0);
         let bound = !(1..=255).contains(&raw_q);
-        if let Some(plan) = self.plan_of(slot, offset).and_then(|i| self.plans[i].as_mut()) {
+        if let Some(plan) = self
+            .plan_of(slot, offset)
+            .and_then(|i| self.plans[i].as_mut())
+        {
             plan.bound = bound;
             plan.rate = actual_bytes as f64 / frame_weight.max(f64::EPSILON);
         }
@@ -478,7 +487,14 @@ impl RateLoop {
     /// clamped proportional step, the re-plan only moves the TARGET the next
     /// frame is measured against, and every key frame resets the whole plan,
     /// so no debt outlives one run.
-    fn replan(&mut self, level: Level, slot: usize, offset: i16, frame_weight: f64, actual_bytes: f64) {
+    fn replan(
+        &mut self,
+        level: Level,
+        slot: usize,
+        offset: i16,
+        frame_weight: f64,
+        actual_bytes: f64,
+    ) {
         if !self.per_level {
             return;
         }
@@ -491,7 +507,10 @@ impl RateLoop {
         }
         self.left_weight -= frame_weight;
         self.left_bytes -= actual_bytes;
-        if let Some(plan) = self.plan_of(slot, offset).and_then(|i| self.plans[i].as_mut()) {
+        if let Some(plan) = self
+            .plan_of(slot, offset)
+            .and_then(|i| self.plans[i].as_mut())
+        {
             plan.left = (plan.left - frame_weight).max(0.0);
         }
         // The tail of a run is not re-planned: under a leaf's worth of weight
@@ -526,8 +545,10 @@ impl RateLoop {
             // Every movable level is spent: nothing left to re-solve over.
             return;
         }
-        let scale = (bytes / weight)
-            .clamp(self.scale0 * Self::REPLAN_FLOOR, self.scale0 * Self::REPLAN_CLAMP);
+        let scale = (bytes / weight).clamp(
+            self.scale0 * Self::REPLAN_FLOOR,
+            self.scale0 * Self::REPLAN_CLAMP,
+        );
         self.target = [scale * self.key_weight, scale, scale];
     }
 }
@@ -759,8 +780,14 @@ impl Pyramid {
         }
         Some(Self {
             mini_gop,
-            arf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.arf_q_offset),
-            leaf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.leaf_q_offset),
+            arf_q_offset: f
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.arf_q_offset),
+            leaf_q_offset: f
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.leaf_q_offset),
             // A fourth field is the mid-level offset; the literal `off` asks
             // for the two-level pyramid at the same shape (the A/B arm the
             // sweep needs), and no field at all keeps the default's.
@@ -770,7 +797,10 @@ impl Pyramid {
                 Some(v) => v.parse().ok().or(d.mid_q_offset),
             },
             // A fifth field is the key frame's own offset.
-            key_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.key_q_offset),
+            key_q_offset: f
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.key_q_offset),
             // A sixth field is the quarter level's offset, `off` for none.
             quarter_q_offset: match f.next() {
                 None => d.quarter_q_offset,
@@ -1128,8 +1158,7 @@ fn last2() -> bool {
 /// this crate's tests never call `set_var` (`crate::envflags`), so the
 /// witness turns the lever on through this while holding
 /// [`crate::speed::knob_write`].
-static LAST2_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(u8::MAX);
+static LAST2_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
 /// Sets [`LAST2_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` witness
@@ -1256,8 +1285,7 @@ pub(crate) fn arf_tf_window_future() -> usize {
 /// [`set_last2`] has (this crate's tests never call `set_var`); `u8::MAX` /
 /// `usize::MAX` is unset, and a witness holds [`crate::speed::knob_write`]
 /// while it uses them.
-static LOOKAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(u8::MAX);
+static LOOKAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 static ARF_TF_FUT_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 static TPL_FUT_OVERRIDE: std::sync::atomic::AtomicUsize =
@@ -1275,13 +1303,19 @@ pub(crate) fn set_lookahead(on: Option<bool>) {
 /// Sets [`ARF_TF_FUT_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` witness
 pub(crate) fn set_arf_tf_future(n: Option<usize>) {
-    ARF_TF_FUT_OVERRIDE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+    ARF_TF_FUT_OVERRIDE.store(
+        n.unwrap_or(usize::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Sets [`TPL_FUT_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` witness
 pub(crate) fn set_tpl_fut(n: Option<usize>) {
-    TPL_FUT_OVERRIDE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+    TPL_FUT_OVERRIDE.store(
+        n.unwrap_or(usize::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// lane-tplfut: which window the TOP ARF's temporal lambda map propagates
@@ -1816,7 +1850,10 @@ impl Av1Encoder {
                 None,
                 &self.fctx,
                 None,
-                &lookahead.iter().map(|n| n.padded_to(SUPERBLOCK)).collect::<Vec<_>>(),
+                &lookahead
+                    .iter()
+                    .map(|n| n.padded_to(SUPERBLOCK))
+                    .collect::<Vec<_>>(),
             )?
         };
 
@@ -1892,15 +1929,18 @@ impl Av1Encoder {
         let mut collected = encoder.collected.take().expect("collecting");
         // Every source picture is coded exactly once, so a frame's display
         // order IS its index once the list is sorted by it.
-        let coding_order: Vec<usize> =
-            collected.iter().map(|(order, _)| *order as usize).collect();
+        let coding_order: Vec<usize> = collected.iter().map(|(order, _)| *order as usize).collect();
         collected.sort_by_key(|(order, _)| *order);
         let frames: Vec<Encoded> = collected.into_iter().map(|(_, encoded)| encoded).collect();
         assert!(
             coding_order.iter().all(|&i| i < frames.len()),
             "a coded frame's display position is outside the sequence"
         );
-        Ok(crate::encode::EncodedSequence { stream, frames, coding_order })
+        Ok(crate::encode::EncodedSequence {
+            stream,
+            frames,
+            coding_order,
+        })
     }
 
     /// Stamps a packet with its display and coding positions and advances the
@@ -1938,7 +1978,9 @@ impl Av1Encoder {
         let base = self
             .rate_loop
             .as_ref()
-            .map_or(i16::from(self.config.base_q_idx), |r| i16::from(r.q_idx(Level::Key)));
+            .map_or(i16::from(self.config.base_q_idx), |r| {
+                i16::from(r.q_idx(Level::Key))
+            });
         let offset = self.pyramid.map_or(0, |p| p.key_q_offset);
         let base_q_idx = (base + offset).clamp(1, 255) as u8;
         let encoded = encode_key_frame_inner(
@@ -2030,8 +2072,7 @@ impl Av1Encoder {
         // A LAST2 slot only counts when it holds a picture that is not the
         // one `LAST_FRAME` already names; otherwise the frame codes the
         // reference set it always did.
-        let last2_slot = last2_slot
-            .filter(|&s| s != last_slot && self.dpb[s as usize].is_some());
+        let last2_slot = last2_slot.filter(|&s| s != last_slot && self.dpb[s as usize].is_some());
         let slots = [
             last_slot,
             last2_slot.unwrap_or(last_slot),
@@ -2055,14 +2096,26 @@ impl Av1Encoder {
             .as_ref()
             .map(|s| s.picture.clone())
             .ok_or_else(|| {
-                Error::unsupported("AV1 encode", "an inter frame needs a previous reconstruction")
+                Error::unsupported(
+                    "AV1 encode",
+                    "an inter frame needs a previous reconstruction",
+                )
             })?;
-        let last2 = last2_slot.and_then(|s| self.dpb[s as usize].as_ref().map(|d| d.picture.clone()));
-        let golden = self.dpb[GOLDEN_SLOT as usize].as_ref().map(|s| s.picture.clone());
+        let last2 =
+            last2_slot.and_then(|s| self.dpb[s as usize].as_ref().map(|d| d.picture.clone()));
+        let golden = self.dpb[GOLDEN_SLOT as usize]
+            .as_ref()
+            .map(|s| s.picture.clone());
         let altref = (altref_slot != GOLDEN_SLOT)
-            .then(|| self.dpb[altref_slot as usize].as_ref().map(|s| s.picture.clone()))
+            .then(|| {
+                self.dpb[altref_slot as usize]
+                    .as_ref()
+                    .map(|s| s.picture.clone())
+            })
             .flatten();
-        let start_cdfs = self.dpb[last_slot as usize].as_ref().map(|s| s.cdfs.0.clone());
+        let start_cdfs = self.dpb[last_slot as usize]
+            .as_ref()
+            .map(|s| s.cdfs.0.clone());
         // lane-arfpred: the top ARF is coded from a TEMPORALLY FILTERED
         // source when `speed::ARF_TF` is non-zero -- the grain it would
         // otherwise spend its residual on is averaged out against the
@@ -2097,33 +2150,35 @@ impl Av1Encoder {
             }
             false => source,
         };
-        let encoded = || -> Result<Encoded> { encode_inter_frame(
-            &source,
-            &reference,
-            base_q_idx,
-            DEADZONE,
-            order_hint,
-            order_hints,
-            render,
-            start_cdfs.as_ref(),
-            golden.as_ref(),
-            altref.as_ref(),
-            last2.as_ref(),
-            &self.fctx,
-            Some(crate::encode::PyramidFrame {
-                last_slot,
-                self_slot,
-                altref_slot,
-                last2_slot,
-                show_frame,
-                sign_bias,
-                dq_level,
-            }),
-            // lane-arfcen: the group's own sources ARE this frame's window
-            // (`tpl_window`); it was `&[]` here, which switched the temporal
-            // lambda map off on every frame the default stream codes.
-            lookahead,
-        ) }();
+        let encoded = || -> Result<Encoded> {
+            encode_inter_frame(
+                &source,
+                &reference,
+                base_q_idx,
+                DEADZONE,
+                order_hint,
+                order_hints,
+                render,
+                start_cdfs.as_ref(),
+                golden.as_ref(),
+                altref.as_ref(),
+                last2.as_ref(),
+                &self.fctx,
+                Some(crate::encode::PyramidFrame {
+                    last_slot,
+                    self_slot,
+                    altref_slot,
+                    last2_slot,
+                    show_frame,
+                    sign_bias,
+                    dq_level,
+                }),
+                // lane-arfcen: the group's own sources ARE this frame's window
+                // (`tpl_window`); it was `&[]` here, which switched the temporal
+                // lambda map off on every frame the default stream codes.
+                lookahead,
+            )
+        }();
         // Name the pyramid position in any failure: an error out of the tile
         // writer or the filter search is otherwise indistinguishable between
         // the hidden frame and the leaves that read it.
@@ -2212,14 +2267,20 @@ impl Av1Encoder {
                 false => group[pos + 1..].iter().map(|(_, p)| p).collect(),
                 true => group[..pos].iter().rev().map(|(_, p)| p).collect(),
             };
-            window.into_iter().take(depth - 1).map(|p| p.padded_to(SUPERBLOCK)).collect()
+            window
+                .into_iter()
+                .take(depth - 1)
+                .map(|p| p.padded_to(SUPERBLOCK))
+                .collect()
         };
         // lane-last2: the slot a frame reading `last_slot` as `LAST_FRAME`
         // names as `LAST2_FRAME` -- the most recent shown leaf that is not
         // the one it already reads. `None` with the lever off, or before two
         // distinct past pictures exist.
         let last2_of = |hist: &[u8], last_slot: u8| -> Option<u8> {
-            last2().then(|| hist.iter().copied().find(|&s| s != last_slot)).flatten()
+            last2()
+                .then(|| hist.iter().copied().find(|&s| s != last_slot))
+                .flatten()
         };
         let anchor_slot = ANCHOR_SLOTS[self.anchor];
         let next_anchor_slot = ANCHOR_SLOTS[1 - self.anchor];
@@ -2263,7 +2324,11 @@ impl Av1Encoder {
         // `n` of the buffered display-future sources, nearest first, padded
         // like the frame being coded.
         let arf_tpl_future = |n: usize| -> Vec<Picture> {
-            future.iter().take(n).map(|(_, p)| p.padded_to(SUPERBLOCK)).collect()
+            future
+                .iter()
+                .take(n)
+                .map(|(_, p)| p.padded_to(SUPERBLOCK))
+                .collect()
         };
         let arf_tpl: Vec<Picture> = {
             let depth = crate::encode::tpl_depth();
@@ -2332,10 +2397,13 @@ impl Av1Encoder {
         // third level is switched on by the RUN's length, not by the group's:
         // the same GOP-length dependence `group_target` itself was built for.
         let long_run = self.config.gop > pyramid.mini_gop + pyramid.mini_gop / 2;
-        let mid = pyramid.mid_q_offset.filter(|_| leaves >= 3 && long_run).map(|offset| {
-            let at = (leaves - 1) / 2;
-            (at, offset)
-        });
+        let mid = pyramid
+            .mid_q_offset
+            .filter(|_| leaves >= 3 && long_run)
+            .map(|offset| {
+                let at = (leaves - 1) / 2;
+                (at, offset)
+            });
         if let Some((at, offset)) = mid {
             let (order, picture) = group[at].clone();
             packets.push(self.encode_pyramid_inter(
@@ -2571,8 +2639,7 @@ mod tests {
                 tile_rows_log2: 0,
             };
             let rate = RateTarget::BytesPerFrame(2_000);
-            let mut enc =
-                Av1Encoder::with_pyramid_and_rate_target(config, pyramid, rate).unwrap();
+            let mut enc = Av1Encoder::with_pyramid_and_rate_target(config, pyramid, rate).unwrap();
             let packets = encode_all(&mut enc, &pictures[..gop]);
             let coded = |level: Level| packets.iter().filter(|p| p.level == level).count();
             let (hidden, leaves) = gop_shape(pyramid, gop);
@@ -2592,8 +2659,12 @@ mod tests {
             let target_bytes = 2_000.0;
             let loop_ = RateLoop::new(target_bytes, 100.0, Some(pyramid), gop);
             let planned = loop_.target[0]
-                + loop_.target[2] * (leaves as f64
-                    + hidden.iter().map(|&(o, n)| n as f64 * loop_.weight(o)).sum::<f64>());
+                + loop_.target[2]
+                    * (leaves as f64
+                        + hidden
+                            .iter()
+                            .map(|&(o, n)| n as f64 * loop_.weight(o))
+                            .sum::<f64>());
             assert!(
                 (planned - target_bytes * gop as f64).abs() < 1.0,
                 "gop {gop}: plan {planned:.0} bytes against a {:.0} byte run",
@@ -2646,7 +2717,8 @@ mod tests {
             "leaf target {:.3} is not the exact remainder {want:.3} (naive division would \
              give {:.3})",
             rl.target[2],
-            (run_bytes - key_bytes - arf_bytes) / (leaves as f64 + hidden_weight - rl.weight(offset))
+            (run_bytes - key_bytes - arf_bytes)
+                / (leaves as f64 + hidden_weight - rl.weight(offset))
         );
         // And the re-plan stays BOUNDED: hidden levels that spend nothing at
         // all cannot run the leaves' target away.
@@ -2758,7 +2830,11 @@ mod tests {
         let tail = enc.flush().unwrap();
         assert_eq!(tail.len() as u64, delay, "flush yields the whole queue");
         for (i, p) in tail.iter().enumerate() {
-            assert_eq!(p.order, pictures - delay + i as u64, "flushed packet {i}: order");
+            assert_eq!(
+                p.order,
+                pictures - delay + i as u64,
+                "flushed packet {i}: order"
+            );
             assert!(!p.data.is_empty(), "flushed packet {i}: empty");
         }
         assert!(enc.flush().unwrap().is_empty(), "nothing is held twice");
@@ -2808,9 +2884,7 @@ mod tests {
         });
         let screen: Vec<Picture> = (0..frames).map(|t| screen_card(64, 64, t)).collect();
         let pyramid = Pyramid::from_env().expect("the pyramid is this build's default");
-        for (content, pictures, is_screen) in
-            [("film", &film, false), ("screen", &screen, true)]
-        {
+        for (content, pictures, is_screen) in [("film", &film, false), ("screen", &screen, true)] {
             let (width, height) = (pictures[0].width, pictures[0].height);
             for q in [150u8, 60] {
                 let config = EncoderConfig {
@@ -2838,7 +2912,10 @@ mod tests {
                 );
                 let sequence = crate::encode::encode_sequence(pictures, q, DEADZONE).unwrap();
                 assert_eq!(
-                    (packets.iter().map(|p| p.data.len()).sum::<usize>(), concat(&packets)),
+                    (
+                        packets.iter().map(|p| p.data.len()).sum::<usize>(),
+                        concat(&packets)
+                    ),
                     (sequence.stream.len(), sequence.stream.clone()),
                     "{content} q={q}: the facade's stream is not the sequence path's"
                 );
@@ -2848,7 +2925,11 @@ mod tests {
                     "{content} q={q}: one entry per picture, in display order"
                 );
                 if is_screen {
-                    assert_eq!(packets.len(), frames, "{content} q={q}: one packet per picture");
+                    assert_eq!(
+                        packets.len(),
+                        frames,
+                        "{content} q={q}: one packet per picture"
+                    );
                     for (i, (packet, coded)) in packets.iter().zip(&sequence.frames).enumerate() {
                         let cropped = crate::encode::crop_encoded(coded, width, height);
                         assert_eq!(
@@ -2894,7 +2975,11 @@ mod tests {
         let flat_packets = encode_all(&mut flat, &pictures);
         let mut gated = Av1Encoder::with_pyramid(config, Pyramid::default()).unwrap();
         let gated_packets = encode_all(&mut gated, &pictures);
-        assert_eq!(gated.pyramid(), None, "the gate left a screen stream on the pyramid");
+        assert_eq!(
+            gated.pyramid(),
+            None,
+            "the gate left a screen stream on the pyramid"
+        );
         assert_eq!(
             concat(&gated_packets),
             concat(&flat_packets),
@@ -2903,7 +2988,11 @@ mod tests {
         crate::encode::force_screen(Some(false));
         let mut kept = Av1Encoder::with_pyramid(config, Pyramid::default()).unwrap();
         let kept_packets = encode_all(&mut kept, &pictures);
-        assert_eq!(kept.pyramid(), Some(Pyramid::default()), "the gate ate a film stream");
+        assert_eq!(
+            kept.pyramid(),
+            Some(Pyramid::default()),
+            "the gate ate a film stream"
+        );
         assert!(
             kept_packets.iter().any(|p| p.level == Level::Arf),
             "a non-screen stream coded no hidden frame"
@@ -3203,8 +3292,14 @@ mod tests {
                         width,
                         height,
                         y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
-                        u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                        v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+                        u: bytes[luma..luma + chroma]
+                            .iter()
+                            .map(|&v| u16::from(v))
+                            .collect(),
+                        v: bytes[luma + chroma..]
+                            .iter()
+                            .map(|&v| u16::from(v))
+                            .collect(),
                     }
                 })
                 .collect(),
@@ -3270,7 +3365,9 @@ mod tests {
         let _knobs = crate::speed::knob_read();
         let (width, height, frames) = (640usize, 384usize, 48usize);
         let Some(pictures) = h264_clip_frames(width, height, frames) else {
-            eprintln!("SKIP bitrate_target_lands_within_5_percent_over_48_frames: no ffmpeg/fixture");
+            eprintln!(
+                "SKIP bitrate_target_lands_within_5_percent_over_48_frames: no ffmpeg/fixture"
+            );
             return;
         };
         let fps = 24.0;
@@ -3522,7 +3619,10 @@ mod tests {
         for packet in encode_all(&mut enc, &sources) {
             stream.extend_from_slice(&packet.data);
         }
-        eprintln!("{NAME}: {} cut colour-index maps written", crate::tile::palette_cut_maps_written());
+        eprintln!(
+            "{NAME}: {} cut colour-index maps written",
+            crate::tile::palette_cut_maps_written()
+        );
         assert!(
             crate::tile::palette_cut_maps_written() > 0,
             "{NAME}: no palette block is cut by the frame edge here -- the gate would pass blind"
@@ -3536,11 +3636,7 @@ mod tests {
         let theirs = ffmpeg_decode_planes(&stream, width, height);
         assert_eq!(theirs.len(), sources.len(), "{NAME}: ffmpeg's frames");
         for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
-            for (plane, got, want) in [
-                ("luma", &a.y, &b.0),
-                ("U", &a.u, &b.1),
-                ("V", &a.v, &b.2),
-            ] {
+            for (plane, got, want) in [("luma", &a.y, &b.0), ("U", &a.u, &b.1), ("V", &a.v, &b.2)] {
                 let got: Vec<u8> = got.iter().map(|&v| v as u8).collect();
                 if let Some(at) = got.iter().zip(want).position(|(x, y)| x != y) {
                     let w = if plane == "luma" { width } else { width / 2 };
@@ -3552,6 +3648,13 @@ mod tests {
                         want[at],
                     );
                 }
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "{NAME}: frame {i} {plane} is {} samples, ffmpeg's is {}",
+                    got.len(),
+                    want.len()
+                );
             }
         }
     }
@@ -3573,7 +3676,14 @@ mod tests {
         // our read (seen once: LAST 0 GOLDEN 0 ALTREF 0), so this takes the
         // exclusive lock.
         let _knobs = crate::speed::knob_write();
-        pyramid_round_trip(Pyramid { mini_gop: 4, mid_q_offset: None, ..Pyramid::default() }, 2);
+        pyramid_round_trip(
+            Pyramid {
+                mini_gop: 4,
+                mid_q_offset: None,
+                ..Pyramid::default()
+            },
+            2,
+        );
     }
 
     /// The same round trip over a THREE-level group (`mid_q_offset`): each
@@ -3586,7 +3696,11 @@ mod tests {
     fn a_three_level_pyramid_stream_decodes_in_display_order() {
         let _knobs = crate::speed::knob_write();
         pyramid_round_trip(
-            Pyramid { mini_gop: 8, mid_q_offset: Some(-8), ..Pyramid::default() },
+            Pyramid {
+                mini_gop: 8,
+                mid_q_offset: Some(-8),
+                ..Pyramid::default()
+            },
             2,
         );
     }
@@ -3631,15 +3745,24 @@ mod tests {
                 tile_cols_log2: 0,
                 tile_rows_log2: 0,
             };
-            let pyramid = Pyramid { key_q_offset: offset, ..Pyramid::default() };
+            let pyramid = Pyramid {
+                key_q_offset: offset,
+                ..Pyramid::default()
+            };
             let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
             let packets = enc.encode_frames(&test_card(128, 128, 0)).unwrap();
-            let key = packets.iter().find(|p| p.level == Level::Key).expect("key frame");
+            let key = packets
+                .iter()
+                .find(|p| p.level == Level::Key)
+                .expect("key frame");
             key.data.len()
         };
         let (base, finer) = (key_bytes(0), key_bytes(-48));
         eprintln!("key at base q {base} bytes, at base q - 48 {finer} bytes");
-        assert!(finer > base, "key_q_offset -48 did not reach the key frame ({finer} <= {base})");
+        assert!(
+            finer > base,
+            "key_q_offset -48 did not reach the key frame ({finer} <= {base})"
+        );
     }
 
     /// lane-last2's witness: a clip whose pictures ALTERNATE between two
@@ -3658,8 +3781,9 @@ mod tests {
         let _knobs = crate::speed::knob_write();
         crate::encode::force_screen(Some(false));
         let (width, height) = (128usize, 128usize);
-        let sources: Vec<Picture> =
-            (0..9).map(|t| test_card(width, height, (t % 2) * 24)).collect();
+        let sources: Vec<Picture> = (0..9)
+            .map(|t| test_card(width, height, (t % 2) * 24))
+            .collect();
         let run = |on: bool| -> ([usize; 8], Vec<u8>, Vec<Packet>) {
             set_last2(Some(on));
             let config = EncoderConfig {
@@ -3671,7 +3795,11 @@ mod tests {
                 tile_cols_log2: 0,
                 tile_rows_log2: 0,
             };
-            let pyramid = Pyramid { mini_gop: 4, mid_q_offset: None, ..Pyramid::default() };
+            let pyramid = Pyramid {
+                mini_gop: 4,
+                mid_q_offset: None,
+                ..Pyramid::default()
+            };
             let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
             let _ = crate::encode::take_ref_frame_hits();
             let mut packets = Vec::new();
@@ -3688,8 +3816,16 @@ mod tests {
         eprintln!(
             "LAST2 off: LAST {} LAST2 {} GOLDEN {} ALTREF {} ({} B); \
              on: LAST {} LAST2 {} GOLDEN {} ALTREF {} ({} B)",
-            off_hits[1], off_hits[2], off_hits[4], off_hits[7], off_stream.len(),
-            on_hits[1], on_hits[2], on_hits[4], on_hits[7], stream.len(),
+            off_hits[1],
+            off_hits[2],
+            off_hits[4],
+            off_hits[7],
+            off_stream.len(),
+            on_hits[1],
+            on_hits[2],
+            on_hits[4],
+            on_hits[7],
+            stream.len(),
         );
         assert_eq!(off_hits[2], 0, "LAST2 was coded with the lever OFF");
         assert!(
@@ -3701,7 +3837,11 @@ mod tests {
         // Display order and sample-exactness, both decoders (the same shape
         // `pyramid_round_trip` gates the hidden frames with).
         let ours = crate::stream::decode_stream(&stream).expect("our decoder");
-        assert_eq!(ours.len(), sources.len(), "our decoder's display-order count");
+        assert_eq!(
+            ours.len(),
+            sources.len(),
+            "our decoder's display-order count"
+        );
         if !have_ffmpeg() {
             eprintln!("SKIP the ffmpeg half of the LAST2 witness: no ffmpeg");
             return;
@@ -3722,7 +3862,10 @@ mod tests {
             }
         }
         // The reordering itself is unchanged by the second leaf slot.
-        let shown = packets.iter().filter(|p| p.level == Level::ShowExisting).count();
+        let shown = packets
+            .iter()
+            .filter(|p| p.level == Level::ShowExisting)
+            .count();
         let arfs = packets.iter().filter(|p| p.level == Level::Arf).count();
         assert_eq!(shown, arfs, "one show_existing_frame per hidden frame");
     }
@@ -3826,14 +3969,27 @@ mod tests {
                     held.len(),
                     "{n} pictures at gop {gop}: the lookahead changed the stream LENGTH"
                 );
-                assert!(flat == held, "{n} pictures at gop {gop}: the stream is not byte-identical");
+                assert!(
+                    flat == held,
+                    "{n} pictures at gop {gop}: the stream is not byte-identical"
+                );
                 assert_eq!(
-                    packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
-                    flat_packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                    packets
+                        .iter()
+                        .map(|p| (p.order, p.key, p.level))
+                        .collect::<Vec<_>>(),
+                    flat_packets
+                        .iter()
+                        .map(|p| (p.order, p.key, p.level))
+                        .collect::<Vec<_>>(),
                     "{n} pictures at gop {gop}: coding order/levels moved"
                 );
                 let ours = crate::stream::decode_stream(&held).expect("our decoder");
-                assert_eq!(ours.len(), n, "{n} pictures at gop {gop}: our decoder's count");
+                assert_eq!(
+                    ours.len(),
+                    n,
+                    "{n} pictures at gop {gop}: our decoder's count"
+                );
                 if !have_ffmpeg() {
                     continue;
                 }
@@ -3870,7 +4026,10 @@ mod tests {
             assert_eq!(theirs.len(), 17, "the symmetric arm's ffmpeg count");
             for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
                 let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
-                assert!(got == *b, "symmetric arm, display frame {i}: ours differs from ffmpeg");
+                assert!(
+                    got == *b,
+                    "symmetric arm, display frame {i}: ours differs from ffmpeg"
+                );
             }
         }
         crate::speed::set_speed(was);
@@ -3921,17 +4080,31 @@ mod tests {
                 for mode in [1usize, 2, 3] {
                     let (on, packets) = run(n, gop, mode);
                     assert_eq!(
-                        packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
-                        off_packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                        packets
+                            .iter()
+                            .map(|p| (p.order, p.key, p.level))
+                            .collect::<Vec<_>>(),
+                        off_packets
+                            .iter()
+                            .map(|p| (p.order, p.key, p.level))
+                            .collect::<Vec<_>>(),
                         "{n} pictures at gop {gop} mode {mode}: coding order/levels moved"
                     );
                     let ours = crate::stream::decode_stream(&on).expect("our decoder");
-                    assert_eq!(ours.len(), n, "{n} pictures at gop {gop} mode {mode}: our count");
+                    assert_eq!(
+                        ours.len(),
+                        n,
+                        "{n} pictures at gop {gop} mode {mode}: our count"
+                    );
                     if !have_ffmpeg() {
                         continue;
                     }
                     let theirs = ffmpeg_decode_luma(&on, width, height);
-                    assert_eq!(theirs.len(), n, "{n} pictures at gop {gop} mode {mode}: ffmpeg count");
+                    assert_eq!(
+                        theirs.len(),
+                        n,
+                        "{n} pictures at gop {gop} mode {mode}: ffmpeg count"
+                    );
                     for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
                         let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
                         assert!(
@@ -4028,13 +4201,22 @@ mod tests {
         };
         let (off, off_packets) = run(None);
         let (explicit_off, _) = run(Some(0));
-        assert_eq!(off, explicit_off, "mode 0 is not bit-exact with the default");
+        assert_eq!(
+            off, explicit_off,
+            "mode 0 is not bit-exact with the default"
+        );
         for (mode, arm) in [(1u8, 0usize), (2, 1), (4, 2)] {
             let (on, packets) = run(Some(mode));
             let hits = crate::encode::take_arfmode_hits();
             assert_eq!(
-                packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
-                off_packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                packets
+                    .iter()
+                    .map(|p| (p.order, p.key, p.level))
+                    .collect::<Vec<_>>(),
+                off_packets
+                    .iter()
+                    .map(|p| (p.order, p.key, p.level))
+                    .collect::<Vec<_>>(),
                 "mode {mode}: coding order/levels moved"
             );
             assert!(
@@ -4047,7 +4229,11 @@ mod tests {
                 "mode {mode} left the stream byte-identical despite {} firing hits",
                 hits[arm],
             );
-            eprintln!("mode {mode}: {} -> {} B, hits {hits:?}", off.len(), on.len());
+            eprintln!(
+                "mode {mode}: {} -> {} B, hits {hits:?}",
+                off.len(),
+                on.len()
+            );
             let ours = crate::stream::decode_stream(&on).expect("our decoder");
             assert_eq!(ours.len(), 17, "mode {mode}: our decoder's picture count");
             if !have_ffmpeg() {
@@ -4057,7 +4243,10 @@ mod tests {
             assert_eq!(theirs.len(), 17, "mode {mode}: ffmpeg's picture count");
             for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
                 let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
-                assert!(got == *b, "mode {mode}, frame {i}: ours differs from ffmpeg");
+                assert!(
+                    got == *b,
+                    "mode {mode}, frame {i}: ours differs from ffmpeg"
+                );
             }
         }
         crate::encode::set_arfmode(None);
@@ -4098,9 +4287,16 @@ mod tests {
             .collect();
         let mut sorted = coded.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, (0..9).collect::<Vec<u64>>(), "one packet per picture");
+        assert_eq!(
+            sorted,
+            (0..9).collect::<Vec<u64>>(),
+            "one packet per picture"
+        );
         assert_ne!(coded, sorted, "the pyramid never reordered anything");
-        let shown = packets.iter().filter(|p| p.level == Level::ShowExisting).count();
+        let shown = packets
+            .iter()
+            .filter(|p| p.level == Level::ShowExisting)
+            .count();
         assert_eq!(shown, hidden, "one show_existing_frame per hidden frame");
         for (i, p) in packets.iter().enumerate() {
             assert_eq!(p.dts, i as u64, "packet {i}: dts is the coding position");
@@ -4133,7 +4329,11 @@ mod tests {
 
         let stream = concat(&packets);
         let ours = crate::stream::decode_stream(&stream).expect("our decoder");
-        assert_eq!(ours.len(), sources.len(), "our decoder's display-order count");
+        assert_eq!(
+            ours.len(),
+            sources.len(),
+            "our decoder's display-order count"
+        );
         if !have_ffmpeg() {
             eprintln!("SKIP the ffmpeg half of the pyramid round trip: no ffmpeg");
             return;
@@ -4286,6 +4486,13 @@ mod tests {
                     b[at],
                 );
             }
+            assert_eq!(
+                got.len(),
+                b.len(),
+                "frame {i}: luma is {} samples, ffmpeg's is {}",
+                got.len(),
+                b.len()
+            );
         }
     }
 
@@ -4356,6 +4563,13 @@ mod tests {
                     b[at],
                 );
             }
+            assert_eq!(
+                got.len(),
+                b.len(),
+                "frame {i}: luma is {} samples, ffmpeg's is {}",
+                got.len(),
+                b.len()
+            );
         }
     }
 
@@ -4389,7 +4603,10 @@ mod tests {
             stream.extend_from_slice(&packet.data);
         }
         let edges = crate::encode::take_b64_edge_hits();
-        assert!(edges > 0, "no 64x64 root was taken at a superblock the frame edge cuts");
+        assert!(
+            edges > 0,
+            "no 64x64 root was taken at a superblock the frame edge cuts"
+        );
         eprintln!("edge 64x64 roots: {edges}");
 
         let ours = crate::stream::decode_stream(&stream).expect("our decoder");
@@ -4411,6 +4628,13 @@ mod tests {
                     theirs_i[at],
                 );
             }
+            assert_eq!(
+                got.len(),
+                theirs_i.len(),
+                "frame {i}: luma is {} samples, ffmpeg's is {}",
+                got.len(),
+                theirs_i.len()
+            );
         }
     }
 
@@ -4461,6 +4685,13 @@ mod tests {
                     theirs_i[at],
                 );
             }
+            assert_eq!(
+                got.len(),
+                theirs_i.len(),
+                "frame {i}: luma is {} samples, ffmpeg's is {}",
+                got.len(),
+                theirs_i.len()
+            );
         }
     }
 
@@ -4527,6 +4758,13 @@ mod tests {
                     theirs_i[at],
                 );
             }
+            assert_eq!(
+                got.len(),
+                theirs_i.len(),
+                "frame {i}: luma is {} samples, ffmpeg's is {}",
+                got.len(),
+                theirs_i.len()
+            );
         }
     }
 
@@ -4570,7 +4808,10 @@ mod tests {
             stream.extend_from_slice(&packet.data);
         }
         let compound = crate::encode::take_b64_compound_hits();
-        assert!(compound > 0, "a crossfade clip coded no COMPOUND 64x64 root at all");
+        assert!(
+            compound > 0,
+            "a crossfade clip coded no COMPOUND 64x64 root at all"
+        );
         eprintln!("compound 64x64 roots on a crossfade clip: {compound}");
 
         let ours = crate::stream::decode_stream(&stream).expect("our decoder");
@@ -4592,6 +4833,13 @@ mod tests {
                     theirs_i[at],
                 );
             }
+            assert_eq!(
+                got.len(),
+                theirs_i.len(),
+                "frame {i}: luma is {} samples, ffmpeg's is {}",
+                got.len(),
+                theirs_i.len()
+            );
         }
     }
 
@@ -4715,8 +4963,7 @@ mod tests {
                 let x0 = 32 + t * 32;
                 for y in 128..256 {
                     for x in x0..x0 + 128 {
-                        p.y[y * width + x] =
-                            if (x / 2 + y / 3) % 2 == 0 { 40 } else { 210 };
+                        p.y[y * width + x] = if (x / 2 + y / 3) % 2 == 0 { 40 } else { 210 };
                     }
                 }
                 p
@@ -4749,7 +4996,10 @@ mod tests {
                 "the quantizer grid was flat ({levels} level(s)): no delta_qindex was coded"
             );
         } else {
-            eprintln!("SKIP the fire count at preset {}: no tpl map", crate::speed::speed());
+            eprintln!(
+                "SKIP the fire count at preset {}: no tpl map",
+                crate::speed::speed()
+            );
         }
         let ours = crate::stream::decode_stream(&stream).expect("our decoder");
         assert_eq!(ours.len(), sources.len(), "our decoder's frames");
@@ -4767,12 +5017,22 @@ mod tests {
                         b[at],
                     );
                 }
+                assert_eq!(
+                    got.len(),
+                    b.len(),
+                    "frame {i}: luma is {} samples, ffmpeg's is {}",
+                    got.len(),
+                    b.len()
+                );
             }
         } else {
             eprintln!("SKIP the ffmpeg half: no ffmpeg");
         }
         crate::encode::set_deltaq_res(None);
-        eprintln!("delta_q witness: {levels} quantizer levels, {} bytes", stream.len());
+        eprintln!(
+            "delta_q witness: {levels} quantizer levels, {} bytes",
+            stream.len()
+        );
     }
 
     /// lane-txset's witness: a clip of hard directional edges makes the intra
@@ -4837,8 +5097,8 @@ mod tests {
         // still has to reach SOME non-`DCT_DCT` type -- that is the
         // "reachable at all" statement, class `gate-blind-to-feature`.
         if crate::speed::at(&crate::speed::TX_TYPE_SEARCH) {
-            let non_dct: usize = hits.iter().sum::<usize>()
-                - hits[crate::transform::TxType::DctDct as usize];
+            let non_dct: usize =
+                hits.iter().sum::<usize>() - hits[crate::transform::TxType::DctDct as usize];
             assert!(
                 non_dct > 0,
                 "every luma transform unit took DCT_DCT: {hits:?}"
@@ -4879,6 +5139,13 @@ mod tests {
                         b[at],
                     );
                 }
+                assert_eq!(
+                    got.len(),
+                    b.len(),
+                    "frame {i}: luma is {} samples, ffmpeg's is {}",
+                    got.len(),
+                    b.len()
+                );
             }
         } else {
             eprintln!("SKIP the ffmpeg half: no ffmpeg");
@@ -4964,11 +5231,21 @@ mod tests {
                         b[at],
                     );
                 }
+                assert_eq!(
+                    got.len(),
+                    b.len(),
+                    "frame {i}: luma is {} samples, ffmpeg's is {}",
+                    got.len(),
+                    b.len()
+                );
             }
         } else {
             eprintln!("SKIP the ffmpeg half: no ffmpeg");
         }
-        eprintln!("inter tx_type witness: hits {hits:?}, {} bytes", stream.len());
+        eprintln!(
+            "inter tx_type witness: hits {hits:?}, {} bytes",
+            stream.len()
+        );
     }
 
     /// lane-txi's witness: a `reduced_tx_set = 0` frame codes the WIDER
@@ -5035,7 +5312,10 @@ mod tests {
         crate::encode::set_wide_tx_set(None);
         crate::encode::set_inter_tx_search(None);
         crate::encode::set_intra_tx_search(None);
-        eprintln!("wide tx_type witness: intra {intra:?} inter {inter:?}, {} bytes", stream.len());
+        eprintln!(
+            "wide tx_type witness: intra {intra:?} inter {inter:?}, {} bytes",
+            stream.len()
+        );
         // The fire count is preset 0's, for the reason the five-type witness
         // spells out: a faster preset prunes the modes and partitions a type
         // wins on before it is ever priced (class `gate-blind-to-feature`).
@@ -5081,6 +5361,13 @@ mod tests {
                         b[at],
                     );
                 }
+                assert_eq!(
+                    got.len(),
+                    b.len(),
+                    "frame {i}: luma is {} samples, ffmpeg's is {}",
+                    got.len(),
+                    b.len()
+                );
             }
         } else {
             eprintln!("SKIP the ffmpeg half: no ffmpeg");
@@ -5167,9 +5454,11 @@ mod tests {
             assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
             let (cw, ch) = (width / 2, height / 2);
             for (i, (a, (y, u, v))) in ours.iter().zip(&theirs).enumerate() {
-                for (name, got16, want, w) in
-                    [("y", &a.y, y, width), ("u", &a.u, u, cw), ("v", &a.v, v, ch)]
-                {
+                for (name, got16, want, w) in [
+                    ("y", &a.y, y, width),
+                    ("u", &a.u, u, cw),
+                    ("v", &a.v, v, ch),
+                ] {
                     let got: Vec<u8> = got16.iter().map(|&s| s as u8).collect();
                     assert_eq!(got.len(), want.len(), "frame {i} {name} plane size");
                     if let Some(at) = got.iter().zip(want.iter()).position(|(x, y)| x != y) {
@@ -5223,10 +5512,18 @@ mod tests {
                 stream.extend_from_slice(&packet.data);
             }
             let ours = crate::stream::decode_stream(&stream).expect("our decoder");
-            assert_eq!(ours.len(), sources.len(), "speed {speed}: our decoder's frames");
+            assert_eq!(
+                ours.len(),
+                sources.len(),
+                "speed {speed}: our decoder's frames"
+            );
             if have_ffmpeg() {
                 let theirs = ffmpeg_decode_luma(&stream, width, height);
-                assert_eq!(theirs.len(), sources.len(), "speed {speed}: ffmpeg's frames");
+                assert_eq!(
+                    theirs.len(),
+                    sources.len(),
+                    "speed {speed}: ffmpeg's frames"
+                );
                 for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
                     let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
                     if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
@@ -5239,6 +5536,13 @@ mod tests {
                             b[at],
                         );
                     }
+                    assert_eq!(
+                        got.len(),
+                        b.len(),
+                        "speed {speed} frame {i}: luma is {} samples, ffmpeg's is {}",
+                        got.len(),
+                        b.len()
+                    );
                 }
             } else {
                 eprintln!("SKIP the ffmpeg half of speed {speed}: no ffmpeg");
@@ -5368,7 +5672,13 @@ mod tests {
     #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
     fn tile_search_wall_1080p() {
         let _knobs = crate::speed::knob_write();
-        tile_search_wall(1920, 1080, 12, &[(0, 0), (1, 0), (1, 1), (2, 1)], &[1, 2, 4, 8]);
+        tile_search_wall(
+            1920,
+            1080,
+            12,
+            &[(0, 0), (1, 0), (1, 1), (2, 1)],
+            &[1, 2, 4, 8],
+        );
     }
 
     /// The same table at the 4K frame size the editor exports (3840x1608),
@@ -5413,7 +5723,11 @@ mod tests {
         // One tile, so only the filter stage can differ between these.
         let one = coded(1);
         for threads in [2usize, 4, 8] {
-            assert_eq!(one, coded(threads), "the filter stage moved at {threads} threads");
+            assert_eq!(
+                one,
+                coded(threads),
+                "the filter stage moved at {threads} threads"
+            );
         }
         crate::par::set_tile_threads(1);
     }
@@ -5493,8 +5807,7 @@ mod tests {
         // 320x160 crops (its coding surface is one superblock row taller);
         // 320x192 is a whole number of superblocks.
         for (width, height) in [(320usize, 160usize), (320, 192)] {
-            let sources: Vec<Picture> =
-                (0..4).map(|t| test_card(width, height, t * 3)).collect();
+            let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
             run(&sources, width, height, (0, 0));
         }
         // Real gate content, where the CDEF preset search actually chooses
@@ -5649,7 +5962,12 @@ mod tests {
         for _pass in 0..2 {
             for (i, &((c, r), t)) in cells.iter().enumerate() {
                 let got = run(c, r, t);
-                assert!(got.1 > 0, "{}x{} tiles at {t} threads: empty stream", 1 << c, 1 << r);
+                assert!(
+                    got.1 > 0,
+                    "{}x{} tiles at {t} threads: empty stream",
+                    1 << c,
+                    1 << r
+                );
                 if best[i].is_none_or(|(w, _)| got.0 < w) {
                     best[i] = Some(got);
                 }
@@ -5681,7 +5999,10 @@ mod tests {
                 .map(|i| best[i].expect("cell").0.as_secs_f64());
             let Some(one) = one else { continue };
             for &t in &threads[1..] {
-                let i = cells.iter().position(|&(l, tt)| l == (c, r) && tt == t).expect("cell");
+                let i = cells
+                    .iter()
+                    .position(|&(l, tt)| l == (c, r) && tt == t)
+                    .expect("cell");
                 let secs = best[i].expect("cell").0.as_secs_f64();
                 let workers = (t.min(1 << (c + r))) as f64 / threads[0] as f64;
                 let speedup = one / secs;
@@ -5709,7 +6030,9 @@ mod tests {
     ) {
         let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
-        let listed = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output();
+        let listed = Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output();
         let has_rav1e = listed
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("librav1e"))
             .unwrap_or(false);
@@ -5720,7 +6043,8 @@ mod tests {
         eprintln!("| rav1e layout | threads | wall | fps | bytes |");
         for &(c, r) in layouts {
             for &t in threads {
-                let out = std::env::temp_dir().join(format!("ec-av1-rav1e-{}.ivf", std::process::id()));
+                let out =
+                    std::env::temp_dir().join(format!("ec-av1-rav1e-{}.ivf", std::process::id()));
                 let params = format!(
                     "speed=6:quantizer=100:tile_cols={}:tile_rows={}:threads={t}",
                     1 << c,
@@ -5737,7 +6061,15 @@ mod tests {
                     .expect("ffmpeg failed to run");
                 let secs = start.elapsed().as_secs_f64();
                 if !status.status.success() {
-                    eprintln!("| {}x{} | {t} | FAILED: {} |", 1 << c, 1 << r, String::from_utf8_lossy(&status.stderr).lines().last().unwrap_or(""));
+                    eprintln!(
+                        "| {}x{} | {t} | FAILED: {} |",
+                        1 << c,
+                        1 << r,
+                        String::from_utf8_lossy(&status.stderr)
+                            .lines()
+                            .last()
+                            .unwrap_or("")
+                    );
                     continue;
                 }
                 let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
@@ -5798,6 +6130,13 @@ mod tests {
                         at / width
                     );
                 }
+                assert_eq!(
+                    got.len(),
+                    b.len(),
+                    "1080p {layout} frame {i}: luma is {} samples, ffmpeg's is {}",
+                    got.len(),
+                    b.len()
+                );
             }
             eprintln!("1080p {layout}: {} bytes, sample-exact", stream.len());
         }
