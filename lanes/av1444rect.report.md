@@ -314,6 +314,34 @@ entry points pins read 12465 to a `read_coeffs_rect` call with **w=4, h=8,
 on a chroma `txb_skip` (`decodetxb.c:158`, symbol 1). Which caller and which
 plane is not yet established.
 
+### Round 4 — the unit census: it is NOT an ordering defect
+
+Main's neighbour lanes both warned that a chroma-only, ordering-suspect defect
+should be checked by COUNTING units first (Cem-2's H5 was a token-order
+blowup, 16x too many chroma walks). Counted on the 1016 B witness, one frame:
+
+| | ours | oracle |
+|---|---|---|
+| total coefficient unit reads | 2688 | 2395 |
+| luma (square reader) | 1213 | 1309 |
+| chroma (square reader) | 636 | 543 per plane, 1086 total |
+| rect-unit reads (`read_coeffs_rect`) | 839 | (subsumed above) |
+
+The oracle's 2395 `EC_COEFF_STEP tag=all_zero` lines are per
+`av1_read_coeffs_txb` call and are NOT skipped on eob=0, so the two sides are
+counting the same thing. The counts are in the same range — no 16x blowup, no
+missing order. **The intra-BC 4:4:4 chroma defect is not a token-order
+defect**, which is what Main asked to rule out before chasing a value-level
+root, and it is the second independent lane to reach that conclusion about a
+4:4:4 chroma fork (Cem-2's own 128-root turn, Selin2-2's H2/H3 census).
+
+There IS an asymmetry worth recording for whoever continues: we read 636
+square chroma units against the oracle's 1086, and 2052 luma reads against its
+1309. The luma side is pixel-exact to sample 205264, so the luma surplus is
+most likely a counting-shape difference (our var-tx leaves versus libaom's
+unit walk) rather than a walk defect; it is NOT established either way, and I
+am not claiming it.
+
 **Handed back, not landed.** The remaining 4:4:4 intra-BC defect is a **4x8
 rect coefficient unit**, present with 1:4 and rect partitions both disabled,
 and it is neither of the two candidates the follow-up named. Landing a partial
