@@ -12618,6 +12618,16 @@ fn decode_intrabc_128rect(
                 // within the chunk, plane-major inside the chunk.
                 let cu_tx = 32usize;
                 let chunk_chroma = cside * 64 / side;
+                // lane-av1-128rectspan: SQUARE per-axis geometry -- one value
+                // for both axes, which holds only while `ss_x == ss_y`. At
+                // 4:2:2 a TX_32X32 chroma unit's luma footprint is
+                // (64, 32), a mu chunk's chroma plane block is 32x64 (two
+                // stacked units), and `units_y`/`cu_y`/`unit_mi.0` below all
+                // need the same per-axis treatment
+                // `decode_block_128rect`'s walk already has. 4:2:2 is refused
+                // by name at the sequence header, so this arm is
+                // unreachable for it today -- it is a PORT note for that
+                // format, not a live defect.
                 let unit_luma = cu_tx * (side / cside);
                 let chunk_w_mi = 16.min(max_w_mi.saturating_sub(cc * 16));
                 let chunk_h_mi = 16.min(max_h_mi.saturating_sub(cr * 16));
@@ -18795,6 +18805,25 @@ thread_local! {
     /// frame's `tx_mode` is forced `ONLY_4X4`). Keeps the gate that owns this
     /// shape non-vacuous -- a stream that never codes one reads 0.
     pub(crate) static INTRA128_LOSSLESS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-128rectspan: chroma transform units of a 128-root HORZ/VERT
+    /// intra block re-stamped by the end-of-block replay
+    /// (`record_split_luma_rect` clobbers the per-unit contexts the chroma
+    /// walk published, so every unit replays its own state after it). A
+    /// non-skip 128x64/64x128 block codes `nch_x * cn * 2 + nch_y * cn_h * 2`
+    /// of them, so this reads 0 on any stream that never codes one -- the
+    /// non-vacuity anchor for the replay's own gate.
+    pub(crate) static SB128RECT_CHROMA_REPLAY_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// ... and the number of times that replay stamped a unit's state over a
+    /// height other than the unit's own LUMA-MI height -- the signature of the
+    /// width passed to both axes (`luma_span` where the in-loop stamp used
+    /// `luma_span_h`). Zero on every stream this decoder admits: both
+    /// supported chroma formats have `ss_x == ss_y` (4:2:0 and 4:4:4), and
+    /// 4:2:2 -- the one format whose two spans differ -- is refused by name
+    /// at the sequence header (`stream::decode_frame`), so the arm is
+    /// defensive until that format is ported. The counter turns a future
+    /// 4:2:2 admission (or any hardcoded span) into a named red gate instead
+    /// of silent mi-state corruption.
+    pub(crate) static SB128RECT_REPLAY_SPAN_MISMATCH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`SKIP_VARTX_LUMA_RESET_HITS`], for a gate's own before/after delta.
@@ -18819,6 +18848,17 @@ pub(crate) fn intra_sb128_hits() -> (usize, usize, [usize; 3]) {
         INTRA_SB128_HORZ_HITS.with(std::cell::Cell::get),
         INTRA_SB128_VERT_HITS.with(std::cell::Cell::get),
         INTRA_SB128_DEPTH_HITS.with(std::cell::Cell::get),
+    )
+}
+
+/// [`SB128RECT_CHROMA_REPLAY_HITS`] (chroma units re-stamped by
+/// `decode_block_128rect`'s end-of-block replay) and
+/// [`SB128RECT_REPLAY_SPAN_MISMATCH_HITS`] (replays whose stamped height was
+/// not the unit's own), for a gate's own before/after delta.
+pub(crate) fn sb128rect_chroma_replay_hits() -> (usize, usize) {
+    (
+        SB128RECT_CHROMA_REPLAY_HITS.with(std::cell::Cell::get),
+        SB128RECT_REPLAY_SPAN_MISMATCH_HITS.with(std::cell::Cell::get),
     )
 }
 
@@ -19189,8 +19229,29 @@ fn decode_block_128rect(
             uv_predict_mode,
             [&last_grids[0], &last_grids[1]],
         );
+        // lane-av1-128rectspan: the replay must re-stamp each unit over the
+        // SAME cells the walk above stamped it over -- `record_mi_chroma`'s
+        // height drives `left[]` and its width `above[]`, and the walk used
+        // the per-axis `luma_span_h`. Passing the width on both axes doubled
+        // the `left[]` run wherever the two differ (4:2:2), reaching 8 mi
+        // rows below the block on the last unit of a 128x64/64x128 strip and
+        // smearing a neighbour chunk's unit over its neighbour's rows.
+        //
+        // DEFENSIVE at the decoder's current capability set: both admitted
+        // chroma formats have `ss_x == ss_y` (4:2:0 ss (1,1), 4:4:4 ss
+        // (0,0)), so the two spans are equal and this line is a no-op on
+        // every stream `decode_stream` accepts; 4:2:2 (ss (1,0)) -- the one
+        // format where they differ -- is refused by name at the sequence
+        // header, so the arm is unreachable there. It stays per-axis because
+        // the walk it replays is per-axis, and a 4:2:2 port must not have to
+        // re-derive this. `SB128RECT_REPLAY_SPAN_MISMATCH_HITS` names the
+        // day that changes.
+        if luma_span != luma_span_h {
+            hit!(SB128RECT_REPLAY_SPAN_MISMATCH_HITS);
+        }
         for (plane, cu_mi, grid) in &units {
-            neighbours.record_mi_chroma(*cu_mi, luma_span, luma_span, *plane, grid);
+            neighbours.record_mi_chroma(*cu_mi, luma_span, luma_span_h, *plane, grid);
+            hit!(SB128RECT_CHROMA_REPLAY_HITS);
         }
     }
     // No palette exists at this size; the unconditional stamp clears any
