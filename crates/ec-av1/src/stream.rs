@@ -7108,6 +7108,157 @@ pub(crate) mod tests {
         eprintln!("{NAME}: 4:2:0 control {h4} HORZ_4 / {v4} VERT_4 strips, 0 own-extent gathers");
     }
 
+    /// lane-av1444rect r2 — the SAME class as the gate above, second
+    /// instance: `decode_rect4_16_intrabc` applied the 4:2:0 pair geometry at
+    /// ss (0,0), where `is_chroma_reference` makes an intra-BC 1:4 strip its
+    /// own chroma reference. It predicted and coded an 8x4 chroma block at
+    /// `(lmi - 1) * MI / 2` where libaom codes 16x4 at the strip's origin.
+    ///
+    /// **This is a PROGRESS gate, not an exactness gate, and it says so.** The
+    /// 4:4:4 intra-BC cell is still divergent: after the ss gate the LUMA
+    /// plane is exact to sample 205264 (it was 164416) and the entropy fork
+    /// moves from read 11750 to 12465, but both CHROMA planes still first
+    /// diverge at index 20532 and 390380 of 921600 samples are wrong. So the
+    /// assertion is a prefix floor on the plane the gate actually moved —
+    /// which only ever grows, and which the next lane's fix cannot turn red —
+    /// and the untouched chroma divergence is named, never asserted exact.
+    ///
+    /// Recipe (both fixtures, one frame, `testsrc2 640x480 r=25`):
+    /// ```text
+    /// aomenc --codec=av1 --bit-depth=8 --input-bit-depth=8 --passes=1
+    ///        --end-usage=q --cpu-used=0 --lag-in-frames=0 --kf-max-dist=1
+    ///        --limit=1 --threads=1 --enable-rect-partitions=1
+    ///        --enable-1to4-partitions=1 --min-partition-size=4
+    ///        --max-partition-size=64 --sb-size=64 --tune-content=screen
+    ///        --enable-intrabc=1 --enable-palette=1 --cq-level=60
+    ///        --enable-tx-size-search=0 --obu [--profile=1] -o out.obu src.y4m
+    /// ```
+    /// 4:4:4 (1016 B, sha256 7fe888ed…) carries 17 intrabc 16x4 strips at
+    /// ss (0,0); the 4:2:0 twin (890 B, sha256 d01352af…) is byte-exact and
+    /// is the identity arm — the ss gate cannot reach it, and the whole frame
+    /// is compared with the length asserted first.
+    #[test]
+    fn a_444_intrabc_rect4_reads_its_own_chroma_plane_block() {
+        const NAME: &str = "a_444_intrabc_rect4_reads_its_own_chroma_plane_block";
+        const W: usize = 640;
+        const H: usize = 480;
+        const PS: usize = W * H;
+        /// The luma prefix the ss gate makes exact (measured: 205264, i.e.
+        /// Y(464,320); before the gate the first wrong luma sample was 164416,
+        /// Y(576,256)). A floor, not a pin: fixing the open chroma divergence
+        /// moves this later, never earlier.
+        const LUMA_EXACT_PREFIX: usize = 205264;
+        let read = |name: &str, file: &str, len: usize, fnv: u64| -> Vec<u8> {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("fixtures/{file}"));
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{name}: pinned fixture {} is missing ({e}) -- a failure, not a skip",
+                    path.display()
+                )
+            });
+            assert_eq!(bytes.len(), len, "{name}: {file} length moved");
+            assert_eq!(fnv1a64(&bytes), fnv, "{name}: {file} bytes moved");
+            bytes
+        };
+        let stream444 = read(
+            NAME,
+            "444_intrabc_rect4_witness.obu",
+            1016,
+            0x27c2_fad5_4047_2994,
+        );
+        let stream420 = read(
+            NAME,
+            "420_intrabc_rect4_witness.obu",
+            890,
+            0x57ec_3da2_a63b_403a,
+        );
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_intrabc_rect4_own_chroma444_hits();
+        let frames = decode_stream(&stream444)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned 4:4:4 stream was refused: {e}"));
+        let own = crate::decode::intrabc_rect4_own_chroma444_hits();
+        assert!(
+            own > 0,
+            "{NAME}: no intra-BC 1:4 strip coded its own chroma plane block -- the \
+             corrected route never ran (class gate-blind-to-feature)"
+        );
+        assert_eq!(frames.len(), 1, "{NAME}: frame count");
+
+        // The identity arm FIRST and in full: the 4:2:0 twin must stay
+        // byte-exact. `decode_all_frames_vs_oracle` asserts the two frame
+        // lengths match before it compares anything -- the check whose absence
+        // turned an out-of-window divergence into a reported EXACT in this
+        // lane's own round 1.
+        if aomdec_path().is_file() {
+            decode_all_frames_vs_oracle(&stream420, &format!("{NAME}-420"));
+            crate::decode::reset_intrabc_rect4_own_chroma444_hits();
+            decode_stream(&stream420)
+                .unwrap_or_else(|e| panic!("{NAME}: the 4:2:0 twin was refused: {e}"));
+            assert_eq!(
+                crate::decode::intrabc_rect4_own_chroma444_hits(),
+                0,
+                "{NAME}: the 4:2:0 twin fired the ss (0,0)-only route"
+            );
+
+            // The 4:4:4 prefix claim. Same length-first discipline: an
+            // unequal-length compare would silently become a prefix compare
+            // and pass for the wrong reason.
+            let dir = std::env::temp_dir().join(format!("ec-av1-ibc444-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let obu = dir.join("in.obu");
+            std::fs::write(&obu, &stream444).expect("write stream");
+            let out = Command::new(aomdec_path())
+                .args(["--codec=av1", "-o"])
+                .arg(dir.join("out.y4m"))
+                .arg(&obu)
+                .env("EC_AV1_FINAL_DUMP", dir.join("aom"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("aomdec failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: the oracle aomdec refused the stream: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let reference = std::fs::read(dir.join("aom.f0")).expect("oracle dump");
+            assert_eq!(
+                reference.len(),
+                3 * PS,
+                "{NAME}: the oracle dump is {} bytes, the 4:4:4 frame is {} -- a \
+                 compare across different lengths is a PREFIX compare and passes \
+                 for the wrong reason",
+                reference.len(),
+                3 * PS
+            );
+            let ours = &frames[0];
+            let at = (0..LUMA_EXACT_PREFIX)
+                .find(|&k| ours.y[k] != u16::from(reference[k]))
+                .unwrap_or(LUMA_EXACT_PREFIX);
+            assert_eq!(
+                at,
+                LUMA_EXACT_PREFIX,
+                "{NAME}: the luma plane first differs from the oracle at sample {at} \
+                 (Y({},{})), inside the {LUMA_EXACT_PREFIX}-sample prefix this \
+                 gate covers -- the intra-BC own-chroma ss gate regressed",
+                at % W,
+                at / W
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!(
+                "{NAME}: {own} own-chroma intra-BC strip(s); luma exact to \
+                 {LUMA_EXACT_PREFIX}; chroma still diverges from index 20532 \
+                 (OPEN, see lanes/av1444rect.report.md §6)"
+            );
+        } else {
+            eprintln!("{NAME}: no oracle aomdec, pixel arm skipped");
+        }
+    }
+
     /// lane-av1lrflush: the pipelined loop-restoration band release flushes
     /// RU row 0 on the inter frame whose top superblock row carries a
     /// 128-root rect -- the exact shape lanes/av1444sb.report.md r2 named as
