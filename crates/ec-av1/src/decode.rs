@@ -9981,6 +9981,7 @@ fn read_intra_mode_rect(
     // `palette_uv` even on a chroma-reference strip. Fold the plane count
     // into the same `has_chroma` this reader already gates on.
     let has_chroma = has_chroma && !mono(fctx);
+    crate::msac::SymbolDecoder::set_symr_mi(mi_r as i64, mi_c as i64);
     let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if ec_istep {
         // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
@@ -16581,6 +16582,7 @@ fn read_intra_mode(
     // shape the oracle's own `ec_read_intra_frame_mode_info_impl` prints
     // under `EC_TRACE_MODE_STEP`) so a range ladder can be diffed line for
     // line against the instrumented aomdec, not just `tell()`.
+    crate::msac::SymbolDecoder::set_symr_mi(mi_r as i64, mi_c as i64);
     let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if ec_istep {
         // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
@@ -20330,6 +20332,7 @@ fn read_intra_mode_sub8(
     let has_chroma = has_chroma && !mono(fctx);
     let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
+    crate::msac::SymbolDecoder::set_symr_mi(mi_r as i64, mi_c as i64);
     if ec_istep {
         eprintln!("EC_IMODE mi_row={mi_r} mi_col={mi_c} fn=sub8 rng={}", dec.debug_state().0);
     }

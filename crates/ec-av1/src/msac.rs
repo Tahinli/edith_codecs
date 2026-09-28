@@ -321,6 +321,16 @@ impl Drop for SymbolDecoder<'_> {
     }
 }
 
+thread_local! {
+    /// The `(mi_row, mi_col)` the enclosing block reader is inside, for the
+    /// `EC_SYMR` trace. A symbol read carries no mi of its own, so without it
+    /// the per-read stream can only be located by correlating it against a
+    /// SEPARATE trace -- and that correlation is what mis-attributed reads in
+    /// rounds 22 and 23. Set by the mode readers at entry; `(-1,-1)` outside.
+    pub(crate) static SYMR_MI: std::cell::Cell<(i64, i64)> =
+        const { std::cell::Cell::new((-1, -1)) };
+}
+
 impl<'a> SymbolDecoder<'a> {
     /// `init_symbol` (spec 8.2.2).
     #[must_use]
@@ -397,6 +407,10 @@ impl<'a> SymbolDecoder<'a> {
 
     /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
     ///
+    pub(crate) fn set_symr_mi(mi_r: i64, mi_c: i64) {
+        SYMR_MI.with(|c| c.set((mi_r, mi_c)));
+    }
+
     /// `EC_SYMR=1` dumps every symbol read's PRE state (before the read and
     /// before the adaptation) together with the symbol and the post-read
     /// range, so a divergence against a reference decoder can be bisected
@@ -431,7 +445,9 @@ impl<'a> SymbolDecoder<'a> {
         }
         if symr {
             eprintln!(
-                "EC_SYMR pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
+                "EC_SYMR mi=({},{}) pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
+                SYMR_MI.with(std::cell::Cell::get).0,
+                SYMR_MI.with(std::cell::Cell::get).1,
                 pre_value,
                 pre_range,
                 pre_bit,
