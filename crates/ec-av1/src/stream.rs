@@ -42066,6 +42066,30 @@ pub(crate) mod tests {
     /// makes aomenc set `allow_screen_content_tools`, which this decoder
     /// refuses BY NAME at 12 bits (see `a_12bit_screen_content_stream_is_
     /// refused_by_name`).
+    ///
+    /// NON-VACUITY, RED-BEFORE PROVEN: the mode-info grid's ceil is the
+    /// arithmetic this cell depends on, and mutating it turns every arm red
+    /// -- `ec-av1-syntax`'s `h.mi_cols = 2 * ((h.frame_width + 7) >> 3)`
+    /// floored to `2 * (h.frame_width >> 3)` makes the first arm fail at
+    /// decode-order frame 0, byte 128 (ours 74 vs oracle 170, 11538 bytes
+    /// differ); reverted, the gate is green again. A NEARER mutation,
+    /// flooring `decode::round_ss` from libaom's `ROUND_POWER_OF_TWO`,
+    /// leaves this gate GREEN and is not evidence either way: aomenc rounds
+    /// a 4:2:0 frame's coded size DOWN to even, so no stream this recipe can
+    /// produce codes an odd luma dimension, and the chroma-extent ceil only
+    /// differs from its floor when the luma dimension is itself odd.
+    ///
+    /// Also asserted, so a recipe that silently became even-dimensioned can
+    /// not pass as this cell: the header's `ss (1,1)` and bit depth, the
+    /// partial mode-info grid (`mi*8 > dim`), every frame's chroma plane
+    /// being `ceil(w/2)*ceil(h/2)`, and
+    /// `decode::inter_edge_strip_hits()` non-zero after a per-arm reset --
+    /// measured per arm: `[0,6,0,4,48,12]`, `[0,0,0,4,0,6]`,
+    /// `[0,4,0,10,0,10]`, `[0,4,0,8,0,12]`, `[0,4,0,8,0,8]`,
+    /// `[0,0,0,12,0,14]`, where the even-size control (128x96) reads all
+    /// zeros. Without the counter a decoder that dropped the partial column
+    /// entirely would still pass the pixel compare (class
+    /// `gate-blind-to-feature`).
     #[test]
     fn a_real_aomenc_odd_coded_dimension_streams_decode_pixel_exact() {
         const NAME: &str = "a_real_aomenc_odd_coded_dimension_streams_decode_pixel_exact";

@@ -135,14 +135,30 @@ Shared helpers added: `odd_dim_stream` / `chroma_format_stream` (ffmpeg y4m →
 aomenc pipe, deadline from `run_with_stdin`), `odd_dim_header_mi_grid`,
 `assert_444_header`.
 
-**Honest gap in the proof:** the odd-dimensions gate's counter and geometry
-assertions are in place, but its red-before (mutation) proof is NOT
-complete. Forcing `decode::round_ss` from libaom's `ROUND_POWER_OF_TWO` to a
-floor division left the gate GREEN — the odd-dimension extents are computed
-from the mode-info grid (`mi_cols*4 >> ss`), not through `round_ss`. A
-mutation inside that extent computation is the outstanding proof. Gates B and
-C inherit the same `aomdec` byte-compare proof as the 180 existing gates, and
-no mutation proof either.
+**Red-before proof for gate A (done).** The mutation that bites is the
+mode-info grid's ceil: `ec-av1-syntax`'s
+`h.mi_cols = 2 * ((h.frame_width + 7) >> 3)` floored to
+`2 * (h.frame_width >> 3)` turns the gate red on the first arm — decode-order
+frame 0, byte 128, ours 74 vs oracle 170, 11538 bytes differ — and green again
+on revert.
+
+**Why the nearer mutation was the wrong one.** Flooring `decode::round_ss`
+(libaom's `ROUND_POWER_OF_TWO`) leaves the gate GREEN, and that is not a gap
+in the gate: aomenc rounds a 4:2:0 frame's coded size DOWN to even, so no
+stream this recipe can produce codes an odd luma dimension, and the
+chroma-extent ceil only differs from its floor when the luma dimension is
+itself odd. Verified directly: a `testsrc2 131x131` yuv420p y4m (ffmpeg
+accepts it) comes out of aomenc as a stream whose sequence header says
+`max_frame=130x130` — and this decoder decodes that 130x130 frame correctly.
+The ffmpeg reference for the same file comes back 131x131 (25873 samples
+against our 25350), which is ffmpeg padding to the y4m header, not a decoder
+defect. **Consequence for the matrix:** the "luma dimension itself odd" cell
+is not producible through the aomenc + lavfi recipe, so it can be neither
+gated nor refuted from here; the sweep's odd-dimension cell is "even, not a
+multiple of 8".
+
+**Still unproven:** gates B and C carry no mutation proof — they inherit the
+`aomdec` byte-compare proof the 180 existing gates run on.
 
 ## 3. Divergences, localized
 
