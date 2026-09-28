@@ -1690,10 +1690,20 @@ mod tests {
         // The 128-root call site's own `cfl` argument, with the comment that
         // explains it -- the two lines are matched together so that reordering
         // the arguments cannot leave this test pointing at another `false`.
-        const CFL_OFF_AT_128: &str = "            // `is_cfl_allowed` caps CFL at 32x32: `uv_mode` comes off the\n            \
-                                      // 13-symbol no-CFL CDF here, never the 14-symbol one.\n            false,";
+        //
+        // Whitespace-normalised (2026-09-28): the anchor used to be matched with
+        // its exact indentation, so any dedent or reformat of the call site --
+        // the wave merge dedented it by four spaces -- turned this enumeration
+        // red without the invariant it guards changing at all. Collapsing runs
+        // of whitespace keeps the SEMANTIC anchor (both comment lines plus the
+        // `false,` argument, in order) asserted while removing that fragility.
+        const CFL_OFF_AT_128: &str = "// `is_cfl_allowed` caps CFL at 32x32: `uv_mode` comes off the \
+                                      // 13-symbol no-CFL CDF here, never the 14-symbol one. false,";
+        fn squash_ws(s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
         assert_eq!(
-            src.matches(CFL_OFF_AT_128).count(),
+            squash_ws(src).matches(&squash_ws(CFL_OFF_AT_128)).count(),
             1,
             "the 128-root call site no longer passes cfl=false -- a CfL alpha can reach the \
              guard, so this enumeration proves nothing"
