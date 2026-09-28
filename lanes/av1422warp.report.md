@@ -58,25 +58,35 @@ with `chroma_stride`, and the two are equal at 4:2:0 and 4:4:4.
 
 Site: `Neighbours::smooth_uv_neighbour_unsnapped` read the above chroma neighbour
 at `(mi_r - 1, mi_c)` and the left at `(mi_r, mi_c - 1)`. libaom's
-`set_mi_row_col` (`av1_common_int.h:1395-1412`) puts them at
-`base_mi[-stride + ss_x]` and `base_mi[ss_y*stride - 1]`, where `base_mi` is the
-block's own mi already de-offset by `(mi_row & ss_y)` / `(mi_col & ss_x)` — which
-is exactly the snap the caller applies. So above is `(mi_r - 1, mi_c + ss_x)` and
-left is `(mi_r, mi_c - 1)`: **`ss_y*stride - 1` is a COLUMN offset of -1** (its
-row delta is 0 at every subsampling, since the row term is at most `stride - 1`
-elements). Only the above COLUMN gains `ss_x`. One chroma column spans two luma mi
-columns, so the chroma edge reaches into the right-hand luma block — that is
-where its reference lives.
+`set_mi_row_col` (`av1_common_int.h:1400-1401`) puts them at
+`base_mi[-mi_stride + ss_x]` and `base_mi[ss_y*mi_stride - 1]`, where `base_mi`
+is the block's own mi already de-offset by `(mi_row & ss_y)` / `(mi_col & ss_x)` —
+which is exactly the snap the caller applies. Read as (row, column) deltas that
+is `above = (-1, +ss_x)` and `left = (+ss_y, -1)`.
+
+**Shipped: the above column.** It carries `+ss_x` wherever `ss_x == 1` — 4:2:0,
+4:2:2 **and 4:4:0** all carry that column shift; only 4:4:4 (`ss_x == 0`) leaves
+the read where it was. Measured: folding it in leaves the 4:2:0 control
+byte-identical to `aomdec --rawvideo`. The honest statement of what that
+measurement shows is that the boolean the column feeds came out the same on the
+control's blocks — not that the shift is the identity there.
+
+**Not shipped, and KNOWN UNRESOLVED: the left row term `+ss_y`.** libaom puts the
+left reference one mi row DOWN at 4:2:0 and 4:4:0 (`ss_y == 1`) and on its own
+row at 4:2:2 (`ss_y == 0`); this reads its own row at every subsampling. No
+committed fixture presents a 1-mi-tall left neighbour (an 8x4 leaf's left block)
+at 4:2:0/4:4:0, so nothing in the tree can witness the correct term today. This
+is a named open discrepancy, not a settled one.
 
 ### How the split was chosen, and why 4:2:0 stays exact
 
 An earlier attempt applied libaom's formula to BOTH reads (`above` row
 `mi_r + ss_y - 1`, `left` row `mi_r + ss_y - 1`). That improved 4:2:2 (56142 →
 53395) but regressed the byte-exact 4:2:0 control, and gating only the column
-shift to 4:2:2 still regressed it — the row term, not the column term, was the
-wrong part. Doing the offset arithmetic settled it: `ss_y*stride - 1` elements
-from `base_mi` has row delta 0 for `ss_y ∈ {0,1}`, so the left read never moved.
-The shipped form is libaom's own at every subsampling.
+shift to 4:2:2 still regressed it — the `ss_y` term had been applied to the
+WRONG read (the above), and that crossing is what the regression exposed. The
+column term on its own is the part that measures clean; the row term is the part
+that is still open, and shipping it is deferred to a lane that can witness it.
 
 **Identity, measured three ways:**
 
@@ -159,6 +169,17 @@ measured on a pixel-exact 4:2:2 stream, because there is not one. The stream
 does open the OBMC-chroma and chroma-edge-filter defects, which no prior 4:2:2
 fixture reached — that is real coverage progress, and it is not the same thing as
 the bar.
+
+## Known unresolved
+
+- **Left chroma reference row term (`+ss_y`, libaom `av1_common_int.h:1400-1401`)
+  is NOT shipped.** `smooth_uv_neighbour_unsnapped` reads the left neighbour on
+  its own mi row at every subsampling; libaom reads it one row down at 4:2:0 and
+  4:4:0. Unblock: a stream with a 1-mi-tall left neighbour (an 8x4 leaf's left
+  block) at 4:2:0/4:4:0 — no committed fixture has one, which is why the
+  current read is byte-exact on the control and why the correct term cannot be
+  witnessed today. The above column term (`+ss_x`) IS shipped, at every
+  subsampling where `ss_x == 1`.
 
 ## State
 

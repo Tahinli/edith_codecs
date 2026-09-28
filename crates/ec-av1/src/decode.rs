@@ -9003,31 +9003,33 @@ impl Neighbours {
                 .filter(|&m| m != u8::MAX)
                 .map(usize::from)
         };
-        // libaom's two chroma-reference mi, per the shift the caller applies.
-        // 4:2:2 ONLY. `ss_y == 0` makes the above reference's row term
-        // `snapped_r - 1` (what this always read) and the left reference's
-        // row term `snapped_r` (unchanged); `ss_x == 1` moves the above
-        // reference one mi column right. At 4:2:0 both shifts are the
-        // identity on the values this already read (measured: the 4:2:0
-        // control stream is byte-exact with them folded in), and at 4:4:4
-        // `ss_x == 0` does the same -- so only 4:2:2 takes the new column.
-        // `set_mi_row_col` (libaom `av1_common_int.h:1395-1412`), with `mi_r`/
-        // `mi_c` already de-offset by the caller's `(mi_row & ss_y)` /
-        // `(mi_col & ss_x)` snap, i.e. already libaom's `base_mi`:
-        //   chroma_above_mi = base_mi[-stride + ss_x]
-        //   chroma_left_mi  = base_mi[ss_y*stride - 1]
-        // The second offset is `ss_y` ROWS down and one COLUMN left; at every
-        // subsampling `ss_y*stride - 1` lands on `base_mi`'s OWN row (the row
-        // term is at most `stride - 1` elements, so its row delta is 0), so
-        // the left read is `(mi_r, mi_c - 1)` -- unchanged. The first offset
-        // is one row up and `ss_x` columns right, and the `ss_x` COLUMN was
-        // what this dropped: one chroma column spans two luma mi columns, so
-        // the chroma edge reaches into the right-hand luma block and that is
-        // where its reference lives.
+        // libaom's two chroma-reference mi, from `set_mi_row_col`
+        // (`av1_common_int.h:1400-1401`), with `mi_r`/`mi_c` already
+        // de-offset by the caller's `(mi_row & ss_y)` / `(mi_col & ss_x)`
+        // snap -- i.e. already libaom's `base_mi`:
         //
-        // Measured: the column term is right at EVERY subsampling -- the
-        // 4:2:0 control is byte-exact with it folded in, and 4:4:4 is
-        // untouched because `ss_x == 0` there.
+        //   chroma_above_mi = base_mi[-mi_stride + ss_x]   row -1, col +ss_x
+        //   chroma_left_mi  = base_mi[ss_y*mi_stride - 1]  row +ss_y, col -1
+        //
+        // SHIPPED: the above COLUMN. It is `+ss_x` wherever `ss_x == 1` --
+        // 4:2:0, 4:2:2 AND 4:4:0 all carry that column shift, and only 4:4:4
+        // (`ss_x == 0`) leaves the read where it was. Measured: folding it in
+        // leaves the 4:2:0 control byte-identical to `aomdec --rawvideo`; the
+        // boolean it feeds is simply not exercised differently by that stream
+        // at its blocks. One chroma column spans two luma mi columns, so the
+        // chroma edge reaches into the right-hand luma block, and that is where
+        // its reference lives.
+        //
+        // NOT SHIPPED -- KNOWN UNRESOLVED: the left read's `+ss_y` ROW term.
+        // libaom puts the left reference one mi row DOWN at 4:2:0 and 4:4:0
+        // (`ss_y == 1`) and on its own row at 4:2:2 (`ss_y == 0`); this reads
+        // its own row at every subsampling. An earlier attempt applied the
+        // `ss_y` term to the WRONG read (the above) and regressed the
+        // byte-exact 4:2:0 control, which is what exposed the crossing. No
+        // committed fixture presents a 1-mi-tall left neighbour (an 8x4 leaf's
+        // left block) at 4:2:0/4:4:0, so nothing here can witness the correct
+        // term today -- treat this as a named open discrepancy, not a settled
+        // one. Unblock: one such stream.
         let above_mi = (mi_r.saturating_sub(1), mi_c + ss_x);
         let left_mi = (mi_r, mi_c.saturating_sub(1));
         let above = match self.uv_mode_col.get(above_mi.1) {
