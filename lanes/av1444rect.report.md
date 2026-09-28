@@ -276,39 +276,57 @@ geometry was wrong, not that the new geometry is right.
 
 ### Gate
 
-`a_444_intrabc_rect4_reads_its_own_chroma_plane_block` — a **progress gate,
-deliberately not an exactness gate**:
+`a_444_intrabc_rect4_reads_its_own_chroma_plane_block` — deliberately **not**
+an exactness gate. It asserts nothing about the 4:4:4 pixels:
 
 - both fixtures pinned (length + FNV);
-- non-vacuity: `intrabc_rect4_own_chroma444_hits()` must be non-zero (18 on
-  the 4:4:4 witness, 0 on the 4:2:0 twin), armed OUTSIDE the mutated
-  expression so the mutation test below fails on the pixel arm, not on the
-  counter;
+- non-vacuity: `intrabc_rect4_own_chroma444_hits()` is non-zero on the 4:4:4
+  witness (18) and zero on the 4:2:0 twin, so the route the ss gate sits on is
+  proven to run and proven to be ss-specific;
 - identity: the 4:2:0 twin is compared byte-for-byte through
   `decode_all_frames_vs_oracle`, which asserts the two frame lengths match
   before comparing;
-- the 4:4:4 claim is a **prefix floor** on the plane the gate moved: the luma
-  plane must be byte-exact to sample 205264. A floor only ever grows, so the
-  next lane's fix cannot turn this gate red;
-- the untouched chroma divergence (U/V from index 20532) is printed and named,
-  never asserted exact.
+- the open chroma divergence — 390380 of 921600 wrong, U and V both first wrong
+  at index 20532, entropy fork read 12465 at mi (90,108) — is named in a comment
+  and in the test's output line, and **never asserted**.
 
-**Mutation proof.** `own444 = false` (the old geometry, counter untouched) —
-the assert fires with the first luma difference at 164416 against a floor of
-205264.
+**A prefix-floor assert was written here first and removed.** It asserted the
+luma plane is byte-exact to sample 205264 — i.e. that our output is wrong by
+exactly N past that point. That encodes a defect as expected behaviour, the
+shape this suite refuses everywhere else, and it is a red-if-fixed assertion.
+Removed rather than kept as a regression guard. The red-before for the ss gate
+itself was measured instead, as an entropy measurement: `own444 = false` puts
+the first fork back at read 11750 / luma sample 164416, and 12465 / 205264
+with it.
 
-**Handed on, precisely:** the 4:4:4 intra-BC cell's remaining divergence is
-**in chroma, first at U/V index 20532 (x=52, y=32)**, and the entropy fork is
-read 12465 at mi (90,108) — same signature as the first (oracle
-`decodetxb.c:158`, the chroma `txb_skip`, symbol 1). Not localized to a line
-yet. Unverified candidates: `sub8_leaf_chroma444`'s single
-`around_mi_rect(lmi, bw, bh)` reused for both planes, and its non-lossless
-rect arm's context offset.
+### Round 3 — the chroma root is narrowed, not landed
+
+The follow-up named two candidates; **measurement eliminates both**:
+
+| candidate | verdict |
+|---|---|
+| (a) `sub8_leaf_chroma444`'s single `around_mi_rect(lmi, bw, bh)` reused for both planes | its `square` arm reads through `read_plane`, and a per-unit trace of every coefficient entry point (`read_plane`, `read_coeffs`, `read_coeffs_rect`) shows **no such unit at the fork's bit position** |
+| (b) the non-lossless rect arm's offset | that arm's `read_coeffs_rect` calls fire at msac bits 1912–2097, nowhere near the fork |
+
+**The fork, localized to a call shape.** Instrumenting all three coefficient
+entry points pins read 12465 to a `read_coeffs_rect` call with **w=4, h=8,
+`skip_ctx`=0** at bit 6893, at mi (90,108) — a 4x8 rect unit where the oracle is
+on a chroma `txb_skip` (`decodetxb.c:158`, symbol 1). Which caller and which
+plane is not yet established.
+
+**Handed back, not landed.** The remaining 4:4:4 intra-BC defect is a **4x8
+rect coefficient unit**, present with 1:4 and rect partitions both disabled,
+and it is neither of the two candidates the follow-up named. Landing a partial
+is out of scope for this round, so the merge candidate is the H1 fix (exact,
+gated, mutation-proven) plus the measured `own444` gate on the intra-BC 1:4
+geometry, and the chroma root goes on as a fresh task with the numbers above.
 
 ## 7. Residue handed on, not fixed here
 
-- **4:4:4 intra-BC chroma** — read 12465, mi (90,108), U/V first wrong at
-  index 20532. Per §6.
+- **4:4:4 intra-BC chroma** — a 4x8 rect coefficient unit: read 12465,
+  mi (90,108), `read_coeffs_rect(w=4, h=8, skip_ctx=0)` at bit 6893; U and V
+  first wrong at index 20532. Per §6; both originally-named candidates
+  eliminated by measurement, so this needs a fresh start, not a continuation.
 - **H2** — 4:4:4 lossy + tx-size-search chroma ±1, entropy-clean. Own lane.
 - **H3** — 4:4:4 lossless + tile columns. Selin2-2 (see §5's retraction).
 - **H4** — 4:4:4 lossless + tile rows, hard divergence. Own lane; untouched.
