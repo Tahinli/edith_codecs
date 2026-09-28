@@ -413,6 +413,14 @@ fn write_inter_block_128(
             // libaom codes every plane of a mu chunk before moving on. The
             // chroma `txb_skip_ctx` takes `get_txb_ctx`'s offset-10 rows
             // (+3 here) because the uv plane block is bigger than the unit.
+            // lane-av1-128rectspan: SQUARE per-axis geometry -- one TX_32X32
+            // per 64x64 mu chunk, stamped at span 64 on BOTH axes. That is
+            // 4:2:0/4:4:4 only: at 4:2:2 the chunk's chroma plane block is
+            // 32x64 (two stacked units) with a (64, 32) luma footprint per
+            // unit, so `unit_mi`, the `64`-spans and the whole `CHUNKS`
+            // raster need the same per-axis treatment before 4:2:2 could be
+            // written here. Refused by name at the sequence header today, so
+            // this is a PORT note, not a live defect.
             let mut pair = [Vec::new(), Vec::new()];
             for plane in 1..3usize {
                 let grid = unit_of(plane, cr, cc);
