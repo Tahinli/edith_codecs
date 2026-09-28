@@ -1098,6 +1098,87 @@ lead to keep open. Fixtures and dumps are in
 This is a 4:2:2-only entropy desync; no 4:2:0 or 4:4:4 evidence points at it, and
 both controls stayed byte-exact throughout.
 
+## Round 20 — EC_SYMR restored, tree protected, and the POISONER NAMED
+
+### Restoration and protection
+
+`EC_SYMR` had been lost on BOTH sides (my accidental `git checkout` of
+`aom_dsp/bitreader.h`, and an earlier one of `msac.rs`). Rebuilt to skill
+`ec-av1-consumption-gap-symr` Step 3 — ours an env-gated eprintln in
+`SymbolDecoder::symbol` printing `pre=(value,range,bit) cdf0=<PRE-adapt
+row[0]> n=<cdf.len()-1> s=<symbol> post_rng=<rng>`; the oracle the same
+fields around `aom_read_cdf`/`update_cdf`, with value = dif top-16 and
+bit = `8*(bptr-buf)-(cnt+15)`.
+
+The validation bar also caught a SECOND defect I had introduced earlier:
+11 format strings in the oracle's `decodetxb.c` carried `\\n` (a literal
+backslash-n) where `\n` (the newline escape) belongs, collapsing each
+unit's whole step run onto one line. Repaired. **Validation: the
+`all_zero` chain on a1_f0.obu now byte-matches the saved oracle trace
+(2512 lines) and 744 `name=mode` lines are emitted.**
+
+The oracle tree is now snapshotted — `86c3958 oracle instrumentation
+snapshot: EC_SYMR + rungs` — so a stray checkout cannot wipe it again.
+Pre-edit copies of both files also sit in
+`~/.cache/av1422warp/oracle-backup/`.
+
+### The poisoner, named
+
+`EC_SYMR` makes the two streams 1:1 BY CONSTRUCTION (both emit one line
+per symbol read, in decode order), which is what the earlier
+bit-position pairing could not do. On a1_f0.obu:
+
+```
+reads: oracle 46260, ours 46260
+reads 0..45259 : MATCH on value, range, CDF row (32768 - ours == oracle),
+                 alphabet, symbol AND post-read range
+read  45260    : FIRST DIVERGENCE
+    oracle pre=(27066, 42934, 92317) cdf0=15650 n=2 s=0 post_rng=45112
+    ours   pre=(27066, 42934, 92332) cdf0=17486 n=2 s=0 post_rng=46114
+                (as 32768- : 15282)
+```
+
+Same pre-state, same bit position, same alphabet, same symbol — a
+**different CDF row**. The trace names the read:
+
+```
+oracle  EC_COEFF_STEP tag=sign c=0 sign=0 dcctx=0    <- row 0
+ours    EC_COEFF_STEP tag=sign_rect pos=0 sign=0 dcctx=1  <- row 1
+```
+
+It is the **DC sign read of the chroma-U 4x4 transform of the 32x16 strip
+at mi(68,16)**. The strip is decoded by `decode_block_rect`, which built
+its chroma vote with `around_rect` and no 4:2:2 rerouting — the SIBLING
+of `decode_leaf_rect`, which the round-6 fix gated.
+
+### The fix (`d7c25c3c`)
+
+`decode_block_rect` now routes planes 1 and 2 through
+`around_mi_422_chroma` under the same `ss_x == 1 && ss_y == 0` gate the
+square/leaf paths use. Luma keeps the per-mi gather; 4:2:0 and 4:4:4 keep
+the plain rect walk verbatim.
+
+**Red/green.** All 46260 reads now match at STATE level; the only
+residual difference is the `bit` field over the last 17 reads, which is
+the reference's own buffer-end tell convention (its source says the tell
+offset "becomes important once we hit the end of the buffer"). Frame 0
+is **pixel-exact against aomdec for the first time on this stream**; the
+16-frame measure goes **0/16 -> 3/16** frames exact and **1619115 ->
+1332125** differing samples.
+
+**Identity, all four unchanged:** 4:2:0 control `a420.obu` byte-identical
+to `aomdec --rawvideo`; 4:4:4 `444_sb128rect_lr_witness.obu`
+byte-identical to the pre-lane build; pinned `422_allskip_2f.obu` and
+`422_sb128_3f.obu` still pixel-exact.
+
+### Not done
+
+`a1.obu` is still not all-exact (3/16 frames), so it stays unpinned and
+no gate is written. The next divergence is past frame 0 and was not
+localized this round — the natural continuation is the same EC_SYMR
+sequence diff run over the whole 16-frame stream, which now has a
+trustworthy instrument and a per-TU exactness baseline.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
