@@ -363,3 +363,148 @@ the bypass. Start from the shapes `refusal_inventory.rs` still names, and use
 the bypass recipe in `skill://ec-av1-422-probe-bypass` to widen the committed
 422 pins from "refuses by name" to "refuses by name, and is exact when
 admitted" for at least the lossless big-block case.
+
+---
+
+## 6. Round 4 (lane-av1444chr) — the "not measured" list, closed
+
+**Tree.** `lane-av1formatsweep` (this branch), append-only, no code change.
+Every verdict below is against the **durable instrumented aomdec**
+(`EC_AV1_FINAL_DUMP`, decode order), **not** ffmpeg, and every compare
+asserts (a) the two frame COUNTS are equal and (b) each frame's byte length
+is equal, before any sample is looked at. That is not pedantry: two of the
+twelve cells below first read DIVERGENT against an ffmpeg reference and
+turned out EXACT against aomdec (round-4 finding F, below).
+
+### 6.0 The two measurement traps this round hit (read before trusting any sweep number)
+
+**Trap 1 — a compare that truncates is a PREFIX compare.** A per-frame
+compare zipped against `min(len(ours), len(ref))` passes exactly when the
+defect lies outside the prefix; the 4:4:4 lossless defect sits at x >= 108,
+outside the 128x96 window a hardcoded geometry produces. This is how a
+"byte-exact 6/6" was reported for a stream that is wrong in every frame. The
+prefix compare must assert equal lengths first.
+
+**Trap 2 — an aomenc flag is not evidence the geometry changed.**
+`--tile-rows=1` at 256x128 is a **no-op**: with a 128px superblock the frame
+is a 2x1 SB grid, so there is no second SB row to tile. Verified by bytes,
+not by the flag:
+
+| stream | untiled sha256 | with `--tile-rows=1` | verdict |
+|---|---|---|---|
+| 4:4:4 lossless 10-bit, 256x128 | `ec7a6a0ed9d7c2bada8816bb692de3379620856644a462f287a6cc3e6d9c5103` | **identical** | flag had NO effect |
+| 4:4:4 lossless 12-bit, 256x128 | `ef7338136d560674677cb5fd903e60906ef4df7b2f4c93a990e65a5b5ed4402c` | **identical** | flag had NO effect |
+
+So this round's 10- and 12-bit "tile rows" cells are NOT tile witnesses; what
+they actually measure is the **untiled** 4:4:4 lossless stream at those depths,
+which is itself divergent (6.1). A real 4:4:4 tile-rows witness needs a
+geometry with two SB rows (>= 256 high at `--sb-size=128`).
+
+**Trap 3 — the reference can be the outlier.** Against `ffmpeg
+-pix_fmt yuv420p12le` the 12-bit 4:2:0 cells read as ~8175/8192 chroma
+samples wrong in every frame. Against aomdec the same streams are **byte-exact
+6/6**. ffmpeg's raw 12-bit 4:2:0 output is not the reference for this cell.
+
+### 6.1 4:4:4 at 10 and 12 bit — LOSSY tile cells and the untiled control
+
+Source `testsrc2=size=256x128:rate=25` yuv444p / yuv444p10le; the 12-bit runs
+need a smooth source (`mandelbrot` + `gblur=sigma=6`) or
+`--enable-palette=0 --enable-intrabc=0`, else the 12-bit screen-tools refusal
+fires first (H6). Common flags: `--lossless=1 --input-bit-depth=N
+--bit-depth=N --codec=av1 --passes=1 --end-usage=q --threads=1 --row-mt=0
+--lag-in-frames=0 --kf-max-dist=100 --limit=6 --obu -o - -`.
+
+| cell | stream | bytes | sha256 | verdict vs aomdec |
+|---|---|---|---|---|
+| 4:4:4 10-bit lossless, **no tiles** | `t444_10_notile` | 122730 | `ec7a6a0e…` | **DIVERGENT** from f1, 290506 samples, first (f1, s128) = Y(128,0) |
+| 4:4:4 10-bit + **2 tile columns** | `t444_10_col` | 122937 | `2d295c2c…` | **DIVERGENT** 248394 samples; f0 first (f0, s47853) = U(229,58) |
+| 4:4:4 12-bit lossless, **no tiles** | `t444_12_notile` | 171599 | `ef733813…` | **DIVERGENT** from f0, 264180 samples, first (f0, s32877) = U(109,0) |
+| 4:4:4 12-bit + **2 tile columns** | `t444_12columns` | 172340 | `06fb4a8d…` | **DIVERGENT** from f0, 174949 samples, **same first sample** (f0, s32877) = U(109,0) |
+
+Reading: the 10-bit tile-column stream's frame 0 carries the H3 signature
+(7 U + 11 V wrong against ffmpeg, first wrong U(237,58) — the sweep's H3 first
+divergence, reproduced at 10 bits), then diverges hard from frame 1. The 12-bit
+cell diverges from **frame 0** with the first wrong sample at U(109,0) whether
+or not tiles are on — i.e. at 12 bits the 4:4:4 lossless key-frame defect is
+present **untiled**. So the class is **not** depth-independent and **not**
+tile-specific: it is a 4:4:4 lossless chroma defect that appears at 8, 10 and
+12 bits, with or without tiles. None of these reduce to H1 (entropy fork —
+H2's stream is entropy-clean) or to H2 (lossy, tx-search-gated).
+
+### 6.2 4:4:4 superres and odd coded dimensions (8-bit lossy, cq 20, cpu-used 2)
+
+| cell | stream | bytes | sha256 | verdict vs aomdec |
+|---|---|---|---|---|
+| 4:4:4 **superres** 256x128 (`--superres-mode=1`) | `sr444` | 15239 | `06621606…` | **DIVERGENT** from f2, 76404 samples, first (f2, s192) = Y(192,0) |
+| 4:4:4 **odd coded dims 66x66** | `odd444_66x66` | 5938 | `973eddf4…` | **EXACT 4/4** — new exact cell |
+| 4:4:4 **odd coded dims 130x122** | `odd444_130x122` | 8945 | `c87ac65b…` | **DIVERGENT** from f3, 11521 samples, first (f3, s2208) = Y(128,16) |
+
+Note the aomenc flag is `--superres-mode=1`; there is no `--enable-superres`
+in this build (`aomenc --help | grep -i superres`).
+
+The 130x122 stream is the interesting one: 66x66 is exact at the same
+settings, so the 4:4:4 partial-frame walk is right at one odd geometry and
+wrong at another, and the first divergence is at (128,16) — inside the frame,
+not on its edge. Same shape of question as H2's retracted edge theory; **not
+claimed to be the same defect** without a discriminator run.
+
+### 6.3 12-bit 4:2:0 tiles and superres — the two cells the matrix left open
+
+Source `mandelbrot=size=256x128:rate=25` yuv420p12le (smooth, or the 12-bit
+screen-tools refusal fires), `--enable-palette=0 --enable-intrabc=0
+--input-bit-depth=12 --bit-depth=12 --profile=0 --cq-level=20 --cpu-used=2`.
+
+| cell | stream | bytes | sha256 | verdict vs aomdec |
+|---|---|---|---|---|
+| 4:2:0 12-bit + 2 tile columns | `t420_12_col` | 8713 | `c983a91c…` | **EXACT 6/6** |
+| 4:2:0 12-bit + 2 tile rows | `t420_12_row` | 8760 | `0bf14e1e…` | **EXACT 6/6** (flag effect at this geometry NOT verified — see caveat) |
+| 4:2:0 12-bit superres | `sr420_12` | 8494 | `9e8206bf…` | **EXACT 6/6** |
+
+Caveat, stated so the next round does not inherit it: at 256x128 `--tile-rows`
+was a proven no-op for 4:4:4, and I did **not** encode an untiled 4:2:0
+control here, so `t420_12_row` may be measuring the same untiled stream as
+`t420_12_col`. The EXACT verdict is safe either way (it is exact against the
+oracle); what is unproven is that it exercised tiles.
+
+### 6.4 4:4:0 (`ss 0,1`) — NOT PRODUCIBLE through aomenc
+
+The y4m muxer refuses the format outright: `yuv4mpeg can only handle yuv444p,
+yuv422p, yuv420p, yuv411p and gray8`. A raw `yuv440p` plane dump reaches
+aomenc, which has no 4:4:0 input path and falls back to 4:2:0
+(`Profile 1 requires 4:4:4 color format`; there is no `--input-format` flag
+in `--help`). So the `4:4:0 (ss 0,1)` row stays **unmeasured and
+unproducible by recipe**, for the same reason the 4:2:0 odd-luma-dimension row
+does: closing it needs a hand-built sequence header, not an aomenc run. The
+decoder's refusal (`subsampling_x != subsampling_y` refuses by name in
+`decode_frame`) is unchanged and still the honest answer for any 4:4:0 stream
+that is ever hand-built.
+
+### 6.5 Matrix deltas and the honest "not measured" list
+
+Matrix changes (§1): 4:4:4 row gains `odd dims 66x66 → y` (exact this lane),
+`superres → D`, `10/12-bit tiles → D`, `12-bit lossless → D`; 4:2:0 row gains
+`12-bit tiles + superres → y`. The tile-ROWS cells for 4:4:4 stay as they
+are — the 8-bit one is now Mustafa's EXACT (tile rows genuinely enabled at
+geometries with a second SB row), and the 10/12-bit ones are the untiled
+control above.
+
+Still not measured after this round: 4:4:4 at 10/12 bits with **tile rows
+actually enabled** (needs a >= 256-high geometry — trap 2); 4:4:4 superres at
+10/12 bits; 4:4:4 odd dims at 10/12 bits and at dimensions other than 66x66 /
+130x122; 4:4:4 lossless at 8 bits **without** tiles as a control for the H3
+witness; 4:4:0 at any depth (unproducible, §6.4); 4:2:2 (ss 1,0) beyond the
+existing probe-bypass row.
+
+### 6.6 Handed to other lanes
+
+- The 4:4:4 **lossless chroma** divergences at 8/10/12 bits with and without
+  tiles (first wrong sample U(109,0) at 12 bits, U(237,58) at 8 bits) go to
+  **Kaan-2** with H3 — same format, same unit family, and this round shows the
+  class is not tile-specific and not depth-specific, which narrows it.
+- The 4:4:4 **130x122** odd-dimension divergence and the 4:4:4 **superres**
+  divergence are unassigned; neither reduces to a known class on the evidence
+  here, and neither has a discriminator run.
+- Recorded from Mustafa-2 and folded into the matrix above: a hardcoded 4:2:0
+  luma footprint at the lossless 16x4/4x16 chroma-pair walk
+  (`Reach::of_tu` mis-answering at `ss 0,0`), same shape class as the wave's
+  other 4:4:4 bugs; its stream family is exact after the fix.
