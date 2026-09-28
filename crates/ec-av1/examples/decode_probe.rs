@@ -91,6 +91,13 @@ fn main() {
             "intrabc_128rect: {}",
             ec_av1::stream::intrabc_128rect_hits()
         );
+        // lane-av1-ibc128chunk: the 128-root intrabc strip's per-axis chroma
+        // mu-chunk walk -- unit count and the `(64>>ss_x)|(64>>ss_y)` extent.
+        println!(
+            "intrabc_128rect_chroma_chunk: units={} shape=0x{:x}",
+            ec_av1::stream::intrabc_128rect_chroma_chunk_hits(),
+            ec_av1::stream::intrabc_128rect_chunk_shape()
+        );
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         println!(
