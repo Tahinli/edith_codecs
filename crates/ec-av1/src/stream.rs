@@ -4978,6 +4978,75 @@ pub(crate) mod tests {
     /// this is a load-bearing-identity fingerprint for flake triage, not a
     /// security digest, so no `sha2` dep is pulled in) fixture fingerprint
     /// for the cdf-forwarding gate's instrumentation below.
+    /// Reads a pinned fixture, asserting its length and FNV first, so a
+    /// swapped or truncated pin fails loudly instead of silently changing
+    /// what the gate measures.
+    fn read_pin(path: &std::path::Path, len: usize, fnv: u64, name: &str) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| {
+            panic!(
+                "{name}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                path.display()
+            )
+        });
+        assert_eq!(bytes.len(), len, "{name}: fixture length moved");
+        assert_eq!(fnv1a64(&bytes), fnv, "{name}: fixture bytes moved");
+        bytes
+    }
+
+    /// Decodes `stream` and the oracle's `aomdec --rawvideo` output and
+    /// requires every sample of every frame to agree, in decode order.
+    fn assert_rawvideo_matches(
+        obu: &std::path::Path,
+        stream: &[u8],
+        name: &str,
+        frames: usize,
+    ) {
+        let dir = std::env::temp_dir().join(format!("ec-av1-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let raw = dir.join("aomdec.raw");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "--rawvideo", "-o"])
+            .arg(&raw)
+            .arg(obu)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{name}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
+        let _ = std::fs::remove_dir_all(&dir);
+        let decoded = decode_stream(stream).expect("decode for comparison");
+        let mut ours: Vec<u8> = Vec::with_capacity(ref_raw.len());
+        for f in &decoded {
+            for p in [&f.y, &f.u, &f.v] {
+                for s in p {
+                    ours.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+        }
+        assert_eq!(ours.len(), ref_raw.len(), "{name}: raw sizes differ");
+        assert_eq!(decoded.len(), frames, "{name}: frame count");
+        let first = ours
+            .iter()
+            .zip(&ref_raw)
+            .position(|(a, b)| a != b)
+            .unwrap_or(ours.len());
+        assert_eq!(
+            first,
+            ours.len(),
+            "{name}: {} bytes of decoded output differ from aomdec (first at {})",
+            ours.iter().zip(&ref_raw).filter(|(a, b)| a != b).count(),
+            first
+        );
+    }
+
     fn fnv1a64(bytes: &[u8]) -> u64 {
         let mut hash = 0xcbf29ce484222325u64;
         for &b in bytes {
@@ -6621,6 +6690,115 @@ pub(crate) mod tests {
             }
         } else {
             eprintln!("SKIP {NAME} ffmpeg arm: no ffmpeg");
+        }
+    }
+
+    /// lane-av1h5: the 128-ROOT lossless 4:4:4 pin, and the control arm
+    /// that proves the 128 root is what it needs.
+    ///
+    /// Witness: testsrc2 128x96 yuv444p10le, aomenc `--profile=1 --lossless=1
+    /// --enable-palette=0 --enable-intrabc=0 --cpu-used=0`, 6 frames; 63429
+    /// bytes, sha256 `bbffb979d20d581deb271aac75b7ee779dde57c024524ed6b1389356f55ca0fa`.
+    /// Control: the same recipe at `--max-partition-size=64` (61494 bytes,
+    /// sha256 `4cadce41e1f8967567b32f5cf8abaa46ffdf4fd6d4afe784c8d99a7f6bf1ae4c`),
+    /// which never reaches a 128 root.
+    ///
+    /// libaom's `decode_token_recon_block` (`av1/decoder/decodeframe.c:972`)
+    /// walks 64x64 "mu" chunks with the PLANE loop inside the chunk loop, on a
+    /// chunk grid of `mi_size_wide[BLOCK_64X64]` = 16 mi per axis. The var-tx
+    /// leaf list is a BLOCK-wide raster (32 leaves across at 128), so a chunk's
+    /// members are not contiguous: leaves 0..15 are chunk (0,0) row 0, but
+    /// chunk (0,0) rows 1..15 are leaves 32..47, 64..79, ... A chunk test on
+    /// the given order closed the chunk every SIXTEEN leaves and coded each
+    /// chunk's chroma sixteen times.
+    ///
+    /// The three assertions below are all EXACT and all stay true when the
+    /// stream becomes byte-exact. None of them is a floor on wrong output:
+    /// a no-op [`crate::decode::mu_chunk_order`] permutation reads 0 on
+    /// `mu_chunk_order_hits`, so the first cannot be satisfied by a gate that
+    /// merely ran; the walk and unit totals are libaom's own per-chunk counts;
+    /// the control arm is a straight exactness assertion.
+    #[test]
+    fn a_lossless_444_128_root_lossless_stream_reads_chunks_chunk_major() {
+        const NAME: &str = "a_lossless_444_128_root_lossless_stream_reads_chunks_chunk_major";
+        const W: usize = 128;
+        const H: usize = 96;
+        const FRAMES: usize = 6;
+        /// 5 inter frames, one unsplit 128 root each; frame 0 splits.
+        const ROOTS: usize = 5;
+        /// libaom's chunk grid on a 128x128 root: 2x2 chunks per root.
+        const CHUNKS_PER_ROOT: usize = 4;
+        /// Chroma TX_4X4 units per inter frame: 768 per plane over 128x96.
+        const UNITS_PER_FRAME: usize = 1536;
+
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_128root_lossless.obu");
+        let stream = read_pin(&obu, 63429, 0xf07d_47fc_fd51_2658, NAME);
+        let _guard = lock_gate_counters();
+        let (o0, w0, u0) = (
+            crate::decode::mu_chunk_order_hits(),
+            crate::decode::mu_chunk_walks(),
+            crate::decode::mu_chunk_walk_units(),
+        );
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
+        let (o1, w1, u1) = (
+            crate::decode::mu_chunk_order_hits(),
+            crate::decode::mu_chunk_walks(),
+            crate::decode::mu_chunk_walk_units(),
+        );
+        // (1) the reorder PERMUTED each root's walk -- a no-op reads 0.
+        assert_eq!(
+            o1 - o0,
+            ROOTS,
+            "{NAME}: the chunk-major sort permuted {}/{} of the 128 roots -- a no-op \
+             ordering must read 0 here, so this is what makes the gate non-vacuous",
+            o1 - o0,
+            ROOTS
+        );
+        // (2) libaom's own per-chunk counts: 4 chroma walks per 128 root, and
+        // the 1536 chroma units an inter frame codes at 128x96 4:4:4.
+        assert_eq!(
+            w1 - w0,
+            ROOTS * CHUNKS_PER_ROOT,
+            "{NAME}: {}/{} chunk-major chroma walks; the 16x redundancy (64 per \
+             frame instead of 4) would read {}",
+            w1 - w0,
+            ROOTS * CHUNKS_PER_ROOT,
+            ROOTS * CHUNKS_PER_ROOT * 16
+        );
+        assert_eq!(
+            u1 - u0,
+            ROOTS * UNITS_PER_FRAME,
+            "{NAME}: {}/{} chroma units over the 128 roots; the oracle codes {} \
+             per inter frame and our pre-fix walk read 16x that",
+            u1 - u0,
+            ROOTS * UNITS_PER_FRAME,
+            UNITS_PER_FRAME
+        );
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for f in &frames {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+
+        // (3) the control arm: no 128 root, and byte-exact through the oracle.
+        let ctrl = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_minp64_128root_control.obu");
+        let ctrl_stream = read_pin(
+            &ctrl,
+            61494,
+            0xf6f5_a3cb_efc7_eb10,
+            &format!("{NAME} control"),
+        );
+        let _ = decode_stream(&ctrl_stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the control arm no longer decodes cleanly: {e}"));
+        if aomdec_path().is_file() {
+            assert_rawvideo_matches(&ctrl, &ctrl_stream, NAME, FRAMES);
+        } else {
+            eprintln!(
+                "SKIP {NAME} control aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
         }
     }
 
