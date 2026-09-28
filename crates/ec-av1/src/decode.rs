@@ -18813,8 +18813,8 @@ thread_local! {
     /// of them, so this reads 0 on any stream that never codes one -- the
     /// non-vacuity anchor for the replay's own gate.
     pub(crate) static SB128RECT_CHROMA_REPLAY_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// ... and the number of times that replay stamped a unit's state over a
-    /// height other than the unit's own LUMA-MI height -- the signature of the
+    /// ... and the number of non-skip 128-root rect BLOCKS whose replay
+    /// height differs from the unit's own LUMA-MI height -- the signature of the
     /// width passed to both axes (`luma_span` where the in-loop stamp used
     /// `luma_span_h`). Zero on every stream this decoder admits: both
     /// supported chroma formats have `ss_x == ss_y` (4:2:0 and 4:4:4), and
