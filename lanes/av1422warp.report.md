@@ -1639,6 +1639,53 @@ in the source.
 
 Not pinned, no gate, refusal untouched.
 
+## Round 28 — table identity added; the attribution is NOT closed
+
+Instrument `05770240` (no behaviour change; identity re-proved: 4:2:0
+byte-exact, 4:4:4 byte-identical to the pre-lane build, both pinned 422
+witnesses pixel-exact) and oracle snapshot for the table names.
+
+`cdf0` alone cannot identify a table — two rows can share a first entry
+— which is exactly what stopped round 27. `EC_SYMR` now prints `cdf=`,
+set at the read sites in this window on both sides: `interintra`,
+`comp_group_idx`, `compound_idx`.
+
+**What the oracle's tag says:** read 107517 at mi(30,62) carries
+`cdf=interintra`, and the two reads this decoder omits sit either side
+of it. The oracle's `interintra` value there is 1, so it then reads the
+wedge follow-up as well.
+
+**Why that is still not an attribution.** The matching gate on our side
+(`enable_interintra_compound && !skip_mode`, decode.rs:41506) is **TRUE
+on every one of its 451 firings** — `enable_interintra_compound=true,
+skip_mode=false` — so this decoder is **not** skipping the interintra
+read there. The obvious reading ("the two missing reads are interintra")
+therefore does NOT hold, and I am not going to ship it. Two things are
+unverified and both must be settled first:
+
+1. **Our `cdf` tag has not been checked against a known read.** The
+   printed field parsed oddly in the diff (it showed `inter8`, a value
+   `set_symr_cdf` is never given), so either the tag is not being set on
+   the path the reads are on, or my parse of the field is wrong. Until
+   one known read is confirmed tagged correctly on our side, our half of
+   the window is unlabelled.
+2. **libaom's gate is a strict superset of ours** — `decodemv.c:1625` is
+   `enable_interintra_compound && !skip_mode && is_interintra_allowed(mbmi)`
+   and we implement the first two only. That makes libaom MORE restrictive, so
+   it cannot explain libaom reading and us skipping; but it is a real
+   divergence from source and should be reconciled on its own.
+
+**Handoff.** Verify our `cdf` tag end-to-end on a read whose table is known
+from an existing rung (the `EC_COEFF_STEP tag=tx_type` sites and our
+`inter_txbset_for` are the natural anchors), then re-run the window. Only
+with our side labelled is the two-symbol shift attributable; until then the
+only sound statement is the one above — the oracle reads an `interintra`
+symbol at mi(30,62) that this decoder does not read at that point, our
+interintra gate is open there, and the two cannot both be true without a
+label we have not verified.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
