@@ -310,16 +310,21 @@ mutation is for.
 
 ## 8. Identity
 
-All on `a9e5034e`, `--nocapture`, single-threaded, no SKIP except the one
-noted.
+All on `a9e5034e`, `--nocapture`, single-threaded.
 
-| family | gates | result |
+| family | gates that RAN | result |
 |---|---|---|
 | `a_444*` (both H1 gates among them) | 4 | ok |
-| `a_lossless_444*` + `a_real_aomenc_lossless_444*` | 5 | ok |
-| superres (`a_superres*`, `a_real_aomenc_*superres*`) | 8 | ok |
+| `a_lossless_444*` + `a_real_aomenc_lossless_444*` + screen-key-frame | 5 ran, 1 SKIP | ok |
+| superres (`a_superres*`, `a_real_aomenc_*superres*`) | 7 | ok |
 | rect-strip (`a_real_aomenc_*rect_strip*`, intra-rect-strip, skipped-lossless-intrabc) | 5 | ok |
 | the sweep's three chroma-format gates (cherry-picked `aeb696da` into a throwaway worktree at `a9e5034e`) | 3 | ok |
+
+25 gates ran, 1 skipped. The SKIP is why the counts are split by family
+instead of folded into one total: for the lossless+superres filter cargo
+reported `13 passed; 0 failed` while one of the thirteen printed its SKIP
+line, so that run line on its own reads as thirteen real gates. The 13
+is 12 real + 1 skip, split above as 5 + 1 and 7.
 
 The three sweep gates, quoted:
 
