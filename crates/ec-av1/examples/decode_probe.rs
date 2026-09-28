@@ -36,6 +36,20 @@ fn main() {
         }
         let (sc, dp) = ec_av1::decode::troy_chroma_counters();
         println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
+        println!(
+            "chroma422_square: {}",
+            ec_av1::decode::chroma422_square_hits()
+        );
+        println!("chroma422_rect: {}", ec_av1::decode::chroma422_rect_hits());
+        println!("chroma422_sub8: {}", ec_av1::decode::chroma422_sub8_hits());
+        println!(
+            "chroma422_chunk: {}",
+            ec_av1::decode::chroma422_chunk_hits()
+        );
+        println!(
+            "chroma422_pair_wide: {}",
+            ec_av1::decode::chroma422_pair_wide_hits()
+        );
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
         println!(
@@ -105,6 +119,14 @@ fn main() {
         );
         let (h84, h48) = ec_av1::decode::sub8_inter_rect_hits();
         println!("sub8_inter_rect: horz8x4={h84} vert4x8={h48}");
+        println!(
+            "llintra8_chroma_walk: {}",
+            ec_av1::decode::llintra8_chroma_walk_hits()
+        );
+        println!(
+            "sub8rect444_chroma_walk: {}",
+            ec_av1::decode::llsub8rect444_chroma_walk_hits()
+        );
         let si = ec_av1::stream::sub8_intra_rect_hits();
         println!(
             "sub8_intra_rect: horz8x4={} vert4x8={} chroma_ref={} mixed={} split4x4={}",
@@ -215,6 +237,10 @@ fn main() {
             "loss64: chroma_edge_tu_clip={} skip_lossless_band_reset={}",
             ec_av1::decode::chroma_edge_tu_clip_hits(),
             ec_av1::decode::skip_lossless_band_reset_hits(),
+        );
+        println!(
+            "llband: rect_split_lossless_chroma444={}",
+            ec_av1::decode::rect_split_lossless_chroma444_hits()
         );
         // lane-t900 r12: chroma edge-filter neighbour answered from the mi-granular
         // uv_mode grid instead of the coarse one-slot-per-column map.
