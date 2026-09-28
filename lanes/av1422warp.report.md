@@ -392,6 +392,61 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 11 — the two extra reads are NAMED: `use_filter_intra` + `filter_intra_mode`
+
+Bit positions added to the MODE rungs on both sides (our `EC_ISTEP`
+per-symbol macro, the oracle's twelve `EC_ISTEP` prints in
+`decodemv.c`), paired BIT-POSITION-ANCHORED throughout, then reverted
+(`grep -c bitpos` = 0).
+
+The window, with the constant −14 folded in (oracle bit in brackets):
+
+```
+        mi(68,16)                                        mi(64,24)
+oracle  92304 skip/cdef/dq  [92304]
+        92305 mode 0  [92305]   angle_y 0  [92305]
+        92309 uv_mode 4  [92309] angle_uv -2 [92312]
+        ---- block ends ----                          92323 skip/cdef/dq
+ours    92318 skip/cdef/dq  [92304]
+        92319 mode 0  [92305]   angle_y 0  [92305]
+        92323 uv_mode 4  [92309] angle_uv -2 [92312]
+        92326 use_filter_intra val=1   <-- EXTRA
+        92327 filter_intra_mode val=3  <-- EXTRA
+                                                   92337 skip/cdef/dq
+```
+
+**The two extra reads are at mi(68,16), and the oracle does not make
+them.** Its silence is not a rung gap: the oracle's `use_filter_intra`
+print sits inside `if (av1_filter_intra_allowed(cm, mbmi))` and its
+`filter_intra_mode` print inside `if (...use_filter_intra)`
+(`decodemv.c:638-656`), so a missing line means the read did not happen.
+
+**The block is the same on both sides** (enum-resolved, per the round-8
+lesson): oracle `EC_IMODE mi_row=68 mi_col=16 bsize=8`, and
+`enums.h:100-115` makes 8 = **BLOCK_32X16**; ours reads
+`EC_IMODE ... fn=rect bw=32 bh=16`. Same footprint, same bit position.
+
+**Which gate should have suppressed them** —
+`av1_filter_intra_allowed` (`reconintra.h:75-79`) is
+
+```
+mbmi->mode == DC_PRED && palette_size[0] == 0
+            && (enable_filter_intra && block_size_wide <= 32 && block_size_high <= 32)
+```
+
+The block satisfies the mode (0 = DC_PRED) and size (32/16, both <= 32)
+conditions, so the suppressing input is one of the two this lane did NOT
+measure: the sequence header's `enable_filter_intra`, or the block's
+`palette_size[0]`. **This lane ran out of budget before measuring
+either, and does not claim which.**
+
+**Unblock, now short.** Print `enable_filter_intra` and
+`palette_size[0]` for this block on both sides and compare against the
+predicate above. If `enable_filter_intra` agrees, the defect is our
+`palette_size[0]` state for the block; if it disagrees, it is the
+sequence-header bit. Either way it is a single boolean, and the fix is
+one gate on the `use_filter_intra` read.
+
 ### Round 10 — the second window: 3 bits, and they are in the MODE reads
 
 `EC_COEFF_STEP bitpos` re-added on both sides (18 rungs here, 11 in the
