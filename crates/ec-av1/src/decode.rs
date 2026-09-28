@@ -8953,7 +8953,25 @@ impl Neighbours {
         // mi(5,15): left neighbour SMOOTH_V at mi(5,14), read at mi(4,13)).
         let snap_y = (1usize << ss_y(fctx)) - 1;
         let snap_x = (1usize << ss_x(fctx)) - 1;
-        self.smooth_uv_neighbour_unsnapped(mi_r & !snap_y, mi_c & !snap_x, r, c)
+        // `set_mi_row_col` (libaom `av1_common_int.h:1395-1412`) puts the two
+        // chroma references at `base_mi[-stride + ss_x]` and
+        // `base_mi[ss_y*stride - 1]`, with `base_mi` the block's own mi already
+        // de-offset by `(mi_row & ss_y)` / `(mi_col & ss_x)`. The snap above IS
+        // that de-offsetting, so the references are
+        // `(snapped_r + ss_y - 1, snapped_c + ss_x)` and
+        // `(snapped_r, snapped_c - 1)` -- NOT `(snapped_r - 1, snapped_c)` /
+        // `(snapped_r, snapped_c - 1)` as this used to read them. At 4:4:4
+        // both shifts vanish; at 4:2:0 and 4:2:2 the above reference sits one
+        // mi column further right (one chroma column spans two luma mi
+        // columns, so the chroma edge reaches into the right-hand luma block)
+        // and the left reference one mi row further up.
+        self.smooth_uv_neighbour_unsnapped(
+            mi_r & !snap_y,
+            mi_c & !snap_x,
+            r,
+            c,
+            (ss_x(fctx), ss_y(fctx)),
+        )
     }
 
     /// [`Self::smooth_uv_neighbour`] without the chroma-reference snap, i.e.
@@ -8967,6 +8985,7 @@ impl Neighbours {
         mi_c: usize,
         r: usize,
         c: usize,
+        (ss_x, ss_y): (usize, usize),
     ) -> bool {
         // lane-mtfix r1: availability is TILE-relative on BOTH axes and on the
         // coarse fallback too. `above_uv_mode` is a frame-wide [`SUB`]-grid
@@ -8991,15 +9010,25 @@ impl Neighbours {
                 .filter(|&m| m != u8::MAX)
                 .map(usize::from)
         };
-        let above = match self.uv_mode_col.get(mi_c) {
-            _ if have_above && let Some(m) = cell(&self.uv_mode_grid, mi_r - 1, mi_c) => m,
-            Some(&(row, m)) if have_above && usize::from(row) == mi_r - 1 => usize::from(m),
+        // libaom's two chroma-reference mi, per the shift the caller applies.
+        // 4:2:2 ONLY. `ss_y == 0` makes the above reference's row term
+        // `snapped_r - 1` (what this always read) and the left reference's
+        // row term `snapped_r` (unchanged); `ss_x == 1` moves the above
+        // reference one mi column right. At 4:2:0 both shifts are the
+        // identity on the values this already read (measured: the 4:2:0
+        // control stream is byte-exact with them folded in), and at 4:4:4
+        // `ss_x == 0` does the same -- so only 4:2:2 takes the new column.
+        let above_mi = (mi_r.saturating_sub(1), mi_c);
+        let left_mi = (mi_r, mi_c.saturating_sub(1));
+        let above = match self.uv_mode_col.get(above_mi.1) {
+            _ if have_above && let Some(m) = cell(&self.uv_mode_grid, above_mi.0, above_mi.1) => m,
+            Some(&(row, m)) if have_above && usize::from(row) == above_mi.0 => usize::from(m),
             _ if have_above => self.above_uv_mode[c],
             _ => DC_PRED,
         };
-        let left = match self.uv_mode_row.get(mi_r) {
-            _ if have_left && let Some(m) = cell(&self.uv_mode_grid, mi_r, mi_c - 1) => m,
-            Some(&(col, m)) if have_left && usize::from(col) == mi_c - 1 => usize::from(m),
+        let left = match self.uv_mode_row.get(left_mi.0) {
+            _ if have_left && let Some(m) = cell(&self.uv_mode_grid, left_mi.0, left_mi.1) => m,
+            Some(&(col, m)) if have_left && usize::from(col) == left_mi.1 => usize::from(m),
             _ if have_left => self.left_uv_mode[r],
             _ => DC_PRED,
         };
@@ -15476,7 +15505,7 @@ fn decode_rect4_16_strip(
             // directional chroma strip, moving 4 samples by 1.
             let smooth_neighbor_uv =
                 neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c, fctx);
-            if smooth_neighbor_uv != neighbours.smooth_uv_neighbour_unsnapped(lmi.0, lmi.1, r, c)
+            if smooth_neighbor_uv != neighbours.smooth_uv_neighbour_unsnapped(lmi.0, lmi.1, r, c, (ss_x(fctx), ss_y(fctx)))
             {
                 hit!(RECT4_16_UV_PAIR_FILT_HITS);
             }
@@ -32095,7 +32124,7 @@ pub(crate) fn obmc_plan(
     // divides by zero at 4:4:4 (`trailing_zeros(0)` = 64, a debug shift panic).
     ss_x: usize,
     ss_y: usize,
-    chroma_side: usize,
+    chroma_stride: usize,
     px: usize,
     py: usize,
     cpx: usize,
@@ -32210,7 +32239,7 @@ pub(crate) fn obmc_plan(
         above,
         left,
         side,
-        chroma_side,
+        chroma_stride,
         write_w,
         write_h,
         px,
@@ -32293,7 +32322,16 @@ pub(crate) struct ObmcPlan {
     above: Vec<ObmcNb>,
     left: Vec<ObmcNb>,
     side: usize,
-    chroma_side: usize,
+    /// The chroma PREDICTION buffer's own stride -- `chroma_stride`, the PLANE
+    /// BLOCK's per-axis width, NOT the enclosing square `chroma_side`. At
+    /// 4:2:2 that buffer is `(side/2, side)` (lane-av1-422blockhalf), and
+    /// striding it with `chroma_side` put row `r` at `r*side`: a 32x16 luma
+    /// strip's left-pass chroma blend wrote row 15 at index 15*32 = 480 of a
+    /// 256-sample `16 x 16` buffer -- the out-of-bounds panic in
+    /// `obmc_blend_h` the pinned 4:2:2 rotzoom stream opened. Every other
+    /// consumer of `pred_u`/`pred_v` in this block already strides with
+    /// `chroma_stride`; at 4:2:0 and 4:4:4 the two are equal.
+    chroma_stride: usize,
     write_w: usize,
     write_h: usize,
     px: usize,
@@ -32320,7 +32358,7 @@ pub(crate) fn obmc_run(
 ) {
     let &ObmcPlan {
         side,
-        chroma_side,
+        chroma_stride,
         write_w,
         write_h,
         px,
@@ -32367,7 +32405,7 @@ pub(crate) fn obmc_run(
         let (cw, ch) = (write_w >> ss_x(fctx), write_h >> ss_y(fctx));
         eprintln!("OUR_MCB pre f={idx} cpx={cpx} cpy={cpy} cw={cw} ch={ch}");
         for r in 0..ch {
-            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_side + c]).collect();
+            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_stride + c]).collect();
             eprintln!("OUR_MCB prerow{r}: {row:?}");
         }
     }
@@ -32391,9 +32429,9 @@ pub(crate) fn obmc_run(
                 (bw >> ss_x(fctx), overlap_above >> ss_y(fctx), ox >> ss_x(fctx));
             let cw = cbw.min((write_w >> ss_x(fctx)) - cox);
             obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
-            obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
+            obmc_blend_v(pred_u, chroma_stride, cox, 0, cw, cbh, cbw, &tmp_u);
             obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
-            obmc_blend_v(pred_v, chroma_side, cox, 0, cw, cbh, cbw, &tmp_v);
+            obmc_blend_v(pred_v, chroma_stride, cox, 0, cw, cbh, cbw, &tmp_v);
         }
     }
 
@@ -32418,14 +32456,14 @@ pub(crate) fn obmc_run(
             }
         }
         let ch = cbh.min((write_h >> ss_y(fctx)) - coy);
-        obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
+        obmc_blend_h(pred_u, chroma_stride, 0, coy, cbw, ch, &tmp_u);
         obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
-        obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
+        obmc_blend_h(pred_v, chroma_stride, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
         let (cw, ch) = (write_w >> ss_x(fctx), write_h >> ss_y(fctx));
         for r in 0..ch {
-            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_side + c]).collect();
+            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_stride + c]).collect();
             eprintln!("OUR_MCB post f={idx} row{r}: {row:?}");
         }
     }
@@ -35352,7 +35390,7 @@ fn decode_inter_block(
                     write_h,
                     ss_x(fctx),
                     ss_y(fctx),
-                    chroma_side,
+                    chroma_stride,
                     px,
                     py,
                     cpx,
