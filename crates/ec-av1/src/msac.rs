@@ -445,7 +445,13 @@ impl<'a> SymbolDecoder<'a> {
     /// against its `cdf0`, never the raw numbers.
     #[inline]
     pub fn symbol(&mut self, cdf: &mut [u16]) -> usize {
-        let symr = std::env::var_os("EC_SYMR").is_some();
+        // lane-av1422warp r33 (reviewer P2): this ran on EVERY symbol read of
+        // EVERY stream, production formats included, and `std::env::var_os`
+        // is a real environment scan each time (~30ns x every symbol).
+        // `env_flag!` keeps one `LazyLock<bool>` per call SITE, so the check
+        // compiles to an atomic load. The trace is byte-identical: same
+        // condition, same format, same fields.
+        let symr = crate::envflags::env_flag!("EC_SYMR");
         let (pre_value, pre_range, pre_bit) = (self.value, self.range, self.bit);
         let pre_cdf0 = cdf.first().copied().unwrap_or(0);
         // lane-census: the syntax census charges this symbol's bits to the

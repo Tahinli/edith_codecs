@@ -4499,16 +4499,32 @@ thread_local! {
 }
 
 /// How many `GLOBAL_GLOBALMV` (compound) inter blocks decoded in the frame's
-/// upper half. Read by the pinned 4:2:2 coverage gate.
-#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+/// upper half -- the block's top mode-info row is under `mi_rows / 2`.
+///
+/// NO COMMITTED TEST READS THIS, and none can while the 4:2:2 header refusal
+/// stands: the pinned 4:2:2 coverage gate asserts the byte pin and the
+/// refusal by name, so nothing in the suite ever decodes a 4:2:2 stream.
+/// The figure quoted for that fixture comes from a patch-run-restore build
+/// with the `EC_AV1_ALLOW_422_PROBE` bypass applied and then reverted, which
+/// is the same discipline every 4:2:2 lane in this family uses.
+#[allow(dead_code)]
 pub(crate) fn top_half_compound_hits() -> usize {
     TOP_HALF_COMPOUND_HITS.with(std::cell::Cell::get)
 }
 
-/// How many inter blocks in the frame's upper half had at least one active
-/// reference slot on a non-`TRANSLATION` global-motion model -- i.e. blocks
-/// whose prediction goes through `crate::warp`.
-#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+/// How many inter blocks in the frame's upper half satisfy libaom's
+/// `is_global_mv_block` on at least one reference slot -- mode
+/// `GLOBAL_GLOBALMV` AND block >= 8x8 AND that slot's own global-motion
+/// model > `TRANSLATION`. This is the block set whose prediction goes
+/// through `crate::warp`, and it is exactly `is_global_mv0 || is_global_mv1`
+/// as computed at the increment site; it is NOT merely "some slot has a
+/// non-TRANSLATION model", which also counts blocks that are not global-mv
+/// blocks.
+///
+/// Like [`top_half_compound_hits`], no committed test reads it: with the
+/// 4:2:2 header refusal in force nothing in the suite decodes the stream
+/// these numbers describe.
+#[allow(dead_code)]
 pub(crate) fn top_half_warp_hits() -> usize {
     TOP_HALF_WARP_HITS.with(std::cell::Cell::get)
 }
@@ -31522,10 +31538,17 @@ fn overlappable_above(
             // The pair merge: the walk snaps back to the pair's even column
             // and the ODD half (the chroma-carrying one) is the neighbour for
             // both -- a 4-wide 1:4 strip is never an OBMC source on its own.
-            // lane-av1422warp r25: as in `overlappable_left`, snapping down
-            // lands on `mi_col - 1` at an ODD `mi_col` and the offsets below
-            // underflow (debug-build panic; `usize::MAX` in release). Clamp.
-            col = (col & !1).max(mi_col);
+            // lane-av1422warp r33 (reviewer P2): the snap must be UNCONDITIONAL.
+            // libaom `obmc.h:41-46` is
+            // `above_mi = prev_row_mi + (above_mi_col & ~1) + 1` -- the snapped
+            // COLUMN is used as-is and the +1 is what lands it back on the
+            // block's own left edge. Clamping the snapped INDEX to `mi_col`
+            // (an earlier r25 attempt) moved the index itself, so this
+            // decoded the neighbour one column RIGHT of libaom's and, after
+            // `col += step`, never visited `mi_col + 1`. Only the REPORTED
+            // offset can be negative -- `above_mi - mi_col == -1` -- so the
+            // clamp belongs there, not on the index.
+            col &= !1;
             src = col + 1;
             nb = grid.get(mi_row - 1, src);
             step = 2;
@@ -31541,7 +31564,7 @@ fn overlappable_above(
                 // neighbour PREDICTION at a frame edge, which picks the
                 // 4-tap kernel below 8 px (class narrow-block-sharp-kernel);
                 // the destination clip stays in `obmc_blend`.
-                out.push((col - mi_col, step.min(bw4), info, src - mi_col));
+                out.push((col.saturating_sub(mi_col), step.min(bw4), info, src - mi_col));
             }
         }
         col += step;
@@ -31578,13 +31601,13 @@ fn overlappable_left(
             // The pair merge, left-column mirror: a 4-TALL neighbour (a 16x4
             // strip) is half of a chroma pair and the pair's SECOND row is the
             // neighbour for both.
-            // lane-av1422warp r25: `row &= !1` rounds DOWN, so at an ODD
-            // `mi_row` it lands on `mi_row - 1` and the `row - mi_row`
-            // offsets below underflow -- `usize::MAX` in release, and a
-            // debug-build panic ("attempt to subtract with overflow",
-            // `overlappable_left` called from `decode_inter_block`) with
-            // EC_TRACE_MODE_STEP set. Clamp: the offset can never be negative.
-            row = (row & !1).max(mi_row);
+            // lane-av1422warp r33 (reviewer P2): the row mirror of the
+            // `overlappable_above` fix. libaom's left-column walk snaps
+            // `(left_mi_row & ~1)` and adds 1; the snap is unconditional and
+            // only the REPORTED `row - mi_row` can be -1. The r25 clamp moved
+            // the snapped index itself, which read the neighbour one row
+            // BELOW libaom's and then skipped `mi_row + 1` entirely.
+            row &= !1;
             src = row + 1;
             nb = grid.get(src, mi_col - 1);
             step = 2;
@@ -31596,7 +31619,7 @@ fn overlappable_left(
                 }
                 // lane-t900 r14: `AOMMIN(xd->height, mi_step)` -- see
                 // `overlappable_above`.
-                out.push((row - mi_row, step.min(bh4), info, src - mi_row));
+                out.push((row.saturating_sub(mi_row), step.min(bh4), info, src - mi_row));
             }
         }
         row += step;
@@ -33452,17 +33475,6 @@ fn decode_inter_block(
                 }
             }
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
-            if mi_row < mi_rows as usize / 2 {
-                if is_globalmv {
-                    TOP_HALF_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
-                }
-                if global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1
-                    || global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1
-                {
-                    TOP_HALF_WARP_HITS.with(|c| c.set(c.get() + 1));
-                }
-            }
-            // spec `is_nontrans_global_motion`: ALL active refs' models must
             // be non-TRANSLATION (IDENTITY counts) for the compound block's
             // interp-filter read to be suppressed.
             let gm_nontrans_models = is_globalmv
@@ -33489,6 +33501,22 @@ fn decode_inter_block(
             let is_global_mv1 = is_globalmv
                 && side >= 8
                 && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1;
+            // lane-av1422warp r33 (reviewer P3): the top-half census is
+            // placed HERE, after `is_global_mv0`/`is_global_mv1`, so it
+            // counts the same blocks libaom's `is_global_mv_block` does --
+            // mode GLOBAL_GLOBALMV AND block >= 8x8 AND that slot's own gm
+            // model > TRANSLATION. An earlier placement tested the model term
+            // alone, which counts blocks that are not global-mv blocks at
+            // all, so its number was an upper bound dressed up as an
+            // engagement figure.
+            if mi_row < mi_rows as usize / 2 {
+                if is_globalmv {
+                    TOP_HALF_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+                }
+                if is_global_mv0 || is_global_mv1 {
+                    TOP_HALF_WARP_HITS.with(|c| c.set(c.get() + 1));
+                }
+            }
             // libaom `av1_init_warp_params` + `allow_warp`'s
             // `global_warp_allowed` branch, run once per reference for a
             // compound block exactly as for a single-ref one (reconinter.c
@@ -46148,6 +46176,113 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+    /// lane-av1422warp r33: the OBMC pair-merge snap must move the READ to
+    /// libaom's position, not the reported offset.
+    ///
+    /// libaom `obmc.h:44-46`:
+    /// ```c
+    /// if (mi_step == 1) {
+    ///   above_mi_col &= ~1;                        // snap the INDEX, unconditional
+    ///   above_mi = prev_row_mi + above_mi_col + 1; // read at snap + 1
+    ///   mi_step = 2;
+    /// }
+    /// ```
+    /// and the relative offset handed to
+    /// `av1_setup_build_prediction_by_above_pred` is
+    /// `above_mi_col - mi_col` **after** the snap, which is `-1` at an odd
+    /// `mi_col`. An earlier fix clamped the snapped INDEX to `mi_col` to
+    /// stop that subtraction underflowing, which silenced the underflow and
+    /// in exchange read the neighbour one column RIGHT of libaom's and then
+    /// stepped past the block's own right edge.
+    ///
+    /// The grid here carries DISTINGUISHABLE neighbours at the pair's even
+    /// half, its odd half, and the column to the right of the pair, so the
+    /// test fails if the walk reads any position but the odd half. It is the
+    /// snapped READ this pins -- and no stream in the corpus exercises it
+    /// (a1.obu's 1338 traced OBMC neighbours are byte-identical before and
+    /// after the fix, because its 4-wide pair never starts on an odd edge),
+    /// so nothing else covers this branch.
+    #[test]
+    fn the_obmc_pair_merge_snap_reads_libaoms_neighbour_not_one_to_the_right() {
+        const NAME: &str =
+            "the_obmc_pair_merge_snap_reads_libaoms_neighbour_not_one_to_the_right";
+        // `ref_frame` 1 == LAST_FRAME, which is what `is_inter` consumers
+        // expect; the MV makes each cell individually identifiable.
+        let cell = |mv: (i16, i16), size: u8| MiInfo {
+            is_inter: true,
+            ref_frame: 1,
+            ref_frame1: 0,
+            mv: mv,
+            mv1: (0, 0),
+            is_new_mv: true,
+            size,
+            size_h: size,
+            is_global_mv0: false,
+            is_global_mv1: false,
+        };
+        const EVEN: (i16, i16) = (10, 10);
+        const ODD: (i16, i16) = (20, 20);
+        const RIGHT: (i16, i16) = (30, 30);
+
+        // --- the above walk, at an ODD `mi_col` ---
+        let mut grid = crate::mvstack::MiGrid::new(16, 16);
+        // The block under test sits at mi_col 5; the neighbour row is 4.
+        // A 4-wide inter cell at the ODD half (5) is what forces
+        // `mi_step == 1` and therefore the pair merge.
+        grid.set(4, 4, cell(EVEN, 1));
+        grid.set(4, 5, cell(ODD, 1));
+        grid.set(4, 6, cell(RIGHT, 4)); // one column RIGHT of the pair
+        // `bw4 == 2` so `AOMMIN(xd->width, mi_step)` is the pair's own 2
+        // rather than clipped to a 1-wide block's 1.
+        let nb = overlappable_above(&grid, 5, 5, 2, 16, 4);
+        assert!(
+            !nb.is_empty(),
+            "{NAME}: the above walk found no neighbour at all"
+        );
+        let (off4, span4, info, src4) = nb[0];
+        assert_eq!(
+            info.mv, ODD,
+            "{NAME}: the above pair merge read the wrong neighbour -- libaom \
+             snaps the column and reads snap+1, which is the ODD half"
+        );
+        assert_ne!(
+            info.mv, RIGHT,
+            "{NAME}: the clamp moved the snapped index onto mi_col, so the \
+             walk read one column RIGHT of libaom"
+        );
+        assert_eq!(src4, 0, "{NAME}: the read column's relative offset");
+        assert_eq!(span4, 2, "{NAME}: the pair steps over BOTH halves");
+        // libaom's `above_mi_col - mi_col` is -1 here; this tuple is
+        // `usize`, so the reported offset saturates to 0 rather than
+        // wrapping to `usize::MAX`. The snap is what the read depends on.
+        assert_eq!(off4, 0, "{NAME}: the reported offset must saturate, not wrap");
+
+        // --- the left walk, at an ODD `mi_row`: the same shape ---
+        let mut grid = crate::mvstack::MiGrid::new(16, 16);
+        grid.set(4, 4, cell(EVEN, 1));
+        grid.set(5, 4, cell(ODD, 1));
+        grid.set(6, 4, cell(RIGHT, 4));
+        let nb = overlappable_left(&grid, 5, 5, 2, 16, 4);
+        assert!(
+            !nb.is_empty(),
+            "{NAME}: the left walk found no neighbour at all"
+        );
+        let (off4, span4, info, src4) = nb[0];
+        assert_eq!(
+            info.mv, ODD,
+            "{NAME}: the left pair merge read the wrong neighbour -- libaom \
+             snaps the row and reads snap+1, which is the ODD half"
+        );
+        assert_ne!(
+            info.mv, RIGHT,
+            "{NAME}: the clamp moved the snapped row onto mi_row, so the walk \
+             read one row BELOW libaom"
+        );
+        assert_eq!(src4, 0, "{NAME}: the read row's relative offset");
+        assert_eq!(span4, 2, "{NAME}: the pair steps over BOTH halves");
+        assert_eq!(off4, 0, "{NAME}: the reported offset must saturate, not wrap");
+    }
+
     /// lane-twostage: the reference bank these gates decode against --
     /// `LAST_FRAME` alone, already in hand (`ref_frame` index 1).
     fn last_only(reference: &Picture) -> RefPix<'_> {
