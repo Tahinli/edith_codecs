@@ -2282,6 +2282,84 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1422warp: the SECOND 4:2:2 coverage witness -- the one
+    /// `422_sb128_3f.obu` could not be, because that stream's inter content
+    /// is skip-heavy (see `lanes/av1422stripwrite.report.md`, which named a
+    /// second fixture with real residuals, compound and warped motion above
+    /// the vertical midpoint as the thing that would justify lifting the
+    /// refusal). This is that fixture.
+    ///
+    /// `422_residual_compound_warp_16f.obu` (38845 bytes), sha256
+    /// `d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95`:
+    ///
+    /// ```text
+    /// ffmpeg -f lavfi -i "mandelbrot=size=256x288:rate=24:maxiter=220:
+    ///          start_scale=3:end_scale=0.35:end_pts=300:rotate=a=0.10"
+    ///        -frames:v 24 -pix_fmt yuv422p -f yuv4mpegpipe src422.y4m
+    /// aomenc --codec=av1 --profile=2 --input-bit-depth=8 --limit=16
+    ///        --width=256 --height=288 --lag-in-frames=25 --auto-alt-ref=1
+    ///        --enable-global-motion=1 --cq-level=24 --cpu-used=0
+    ///        --threads=4 --kf-min-dist=0 --kf-max-dist=999999 \
+    ///        -n ffp --pass=2 --fpf=src422.y4m -o a1.webm
+    /// ffmpeg -i a1.webm -c copy -f obu -y a1.obu
+    /// ```
+    ///
+    /// Measured on a patch-run-restore build (the `EC_AV1_ALLOW_422_PROBE`
+    /// bypass applied for the run, reverted after -- it is deliberately NOT
+    /// committed, and the refusal below is what the committed tree asserts):
+    ///
+    /// - all 16 frames pixel-exact against `aomdec --rawvideo`, 2359296
+    ///   bytes each, sha256 `4bfc2395e5ca6ea178f606e6b1ced773e26fc2d85b
+    ///   c3a6cdb63a402939aeb203` on both sides;
+    /// - the entropy stream pairs bit-for-bit against the instrumented
+    ///   oracle -- 246735 symbol reads each, no divergence anywhere in the
+    ///   stream, not merely at the window this lane spent nine rounds
+    ///   narrowing;
+    /// - the arms this fixture exists to cover really fire ABOVE the
+    ///   vertical midpoint: 248 upper-half blocks on a non-`TRANSLATION`
+    ///   global-motion model (`top_half_warp_hits`) and 3 upper-half
+    ///   `GLOBAL_GLOBALMV` compound blocks (`top_half_compound_hits`),
+    ///   alongside 25 compound-warp, 18 compound-warp-8x8-leaf, 84
+    ///   rotzoom global-warp, 22 Wiener and 10 SGRPROJ loop-restoration
+    ///   units frame-globally.
+    ///
+    /// The loop-restoration numbers are load-bearing twice over: decoding
+    /// this stream is what exposed the per-axis `read_lr` corner bug
+    /// (`restoration.rs`, `av1_loop_restoration_corners_in_sb`), whose fix
+    /// is what made the whole sequence pair. 4:2:0 and 4:4:4 are unchanged
+    /// by it -- byte-identical to their pre-lane decodes, with the LR gate
+    /// family green.
+    ///
+    /// Like its two siblings, the committed assertion is the byte pin plus
+    /// the refusal-by-name contract: with the header refusal standing,
+    /// NO committed test can decode a 4:2:2 stream, because the bypass that
+    /// would allow it must never be committed.
+    #[test]
+    fn the_pinned_422_residual_compound_warp_witness_is_present_and_refuses_by_name() {
+        const NAME: &str =
+            "the_pinned_422_residual_compound_warp_witness_is_present_and_refuses_by_name";
+        const REFUSAL: &str = "a chroma format of 4:2:2";
+        const FILE: &str = "422_residual_compound_warp_16f.obu";
+        const BYTES: usize = 38845;
+        const FP: u64 = 0x0e73a51e2cc0c424;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(FILE);
+        let data = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned witness {} is missing ({e}) -- the gate cannot run",
+                path.display()
+            )
+        });
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FP, "{NAME}: {FILE} bytes drifted");
+        let err = decode_stream(&data).unwrap_err().to_string();
+        assert!(
+            err.contains(REFUSAL),
+            "{NAME}: {FILE} must refuse by name, got: {err}"
+        );
+    }
+
 
     /// lane-av1-qmatrix: WITNESS for the lifted `using_qmatrix` refusal (the
     /// old gate `a_frame_using_quantisation_matrices_is_refused_by_name` is
