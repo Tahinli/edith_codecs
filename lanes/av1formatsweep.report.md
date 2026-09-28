@@ -13,7 +13,7 @@ or divergent.
 nothing here is an artifact of that lane's build.
 
 **Cross-check from the parallel lane (lane-av1leftref, the ss_y left-chroma
-reference fix).** That lane reports main and its tip byte-identical on all 35
+reference fix; landed as `83b6af97`).** That lane reports main and its tip byte-identical on all 35
 committed fixtures that decode at all (4:2:0, 4:4:4, 8/10/12-bit), with the
 six 4:2:2 pins decoding zero frames in both trees because they need the
 uncommitted bypass. That matches what this sweep measured independently: no
@@ -251,10 +251,35 @@ that partial block's chroma — its `unit_height` /
 `ROUND_POWER_OF_TWO` clamp at `ss 0` (decodeframe.c:989) or its above/left
 prediction reach at the frame edge — not in the transform-size rule.
 
-Named next step for the follow-up lane: dump both sides'
-`EC_PRED`/`EC_MCB` at the mi_row-16 chroma unit and compare the predicted
-plane before the residual add, which splits "prediction reach" from
-"reconstruction arithmetic" in one run.
+**Round 3 (this lane) — THE ROUND-2 LOCALIZATION IS REFUTED, RETRACTED.**
+Geometry controls kill it:
+
+| stream | frame grid | verdict |
+|---|---|---|
+| 128x96 (the H2 stream) | 1.5 x 2 block rows — partial bottom row | divergent, U+V, from f2 |
+| **128x128** | **2 x 2 whole 64 blocks — NO partial row, NO partial column** | **divergent, V only, 777 samples from f1** |
+| 160x96 | 2.5 x 2 — partial bottom row only | divergent, V only, from f3 |
+| 96x96 | partial row AND partial column | divergent, U+V, from f1 |
+| any of the above with `--enable-tx-size-search=0` | — | **exact** |
+
+Candidate (a), the partial block's `unit_height` / `ROUND_POWER_OF_TWO` clamp
+at ss 0, is refuted: a frame with no partial block anywhere reproduces the
+defect, and a wrong clamp would change the unit COUNT, which the
+bit-identical 140820-symbol entropy trace already excludes. Candidate (b) is
+also refuted *as an edge class* — the errors appear mid-block (first wrong
+sample V(27,60) in the 128x128 control, y=60, inside the first block row) and
+the affected extent tracks no frame edge. What survives is narrower and not
+geometry at all: **4:4:4 lossy inter with tx size search ON, chroma only,
+always ±1, luma always exact, entropy bit-identical, present before every
+filter, and the plane that errs varies with content** (V only at 128x128, U
+and V at 128x96/96x96).
+
+Named next step (one run, and it is the measurement that finally splits
+dequant from transform): take ONE affected 32x32 chroma unit and compare our
+dequantized coefficients against the oracle's `EC_COEFF_VAL` (and ours via
+`EC_DQCOEFF`). Values already different => the chroma dequant at `ss (0,0)`
+is the fault. Values equal but pixels differ => the fault is in the 32x32
+inverse transform / residual add.
 
 ### H3 — 4:4:4 lossless + 2 tile columns: 90 chroma samples wrong in the key frame
 
@@ -263,15 +288,26 @@ aomdec-confirmed (not an ffmpeg artefact). Frame 0: exactly 90 wrong
 samples, U and V, ±1, first at U(237,58). Frames 1–5: byte-exact.
 
 **Round 2 (this lane).** Also pre-filter: the same `EC_AV1_PREFILT_DUMP`
-pair shows all 90 samples wrong BEFORE deblock/CDEF/LR, luma 0 wrong. The
-decisive new fact is that frames 1–5 are byte-exact even though they predict
-from that same key frame — so the wrong samples are never read as a
-prediction source, which points at the key frame's chroma OUTPUT/crop or
-reference-store path rather than at reconstruction arithmetic every frame
-shares. **H2 and H3 therefore do NOT reduce to one defect:** same stage
-(pre-filter reconstruction), same plane (chroma only), same magnitude (±1) —
-but H2 fires on inter frames at a frame-edge partial block row and H3 fires
-on a lossless key frame and never propagates.
+pair shows all 90 samples wrong BEFORE deblock/CDEF/LR, luma 0 wrong. Frames
+1–5 are byte-exact even though they predict from that same key frame — so the
+wrong samples are never read as a prediction source.
+
+**Round 3 (this lane) — the output/crop and reference-store candidates are
+REFUTED.** The `EC_AV1_FINAL_DUMP` rung writes the picture exactly as it is
+handed to the reference slots, and diffing it against the oracle's rung 12
+gives the SAME 90 chroma samples wrong in frame 0 (first at U(237,58), luma 0)
+with frames 1–2 byte-exact. The error is therefore already in the stored
+reference picture: not introduced by the output crop, not introduced by the
+reference-store path. It is the key frame's own chroma reconstruction, and the
+fact that it never propagates is a property of which samples the inter frames
+happen to predict from, not evidence of a healthy path.
+
+**H2 and H3 still do not reduce to one defect.** Both are pre-filter,
+chroma-only, ±1, and present in the stored picture — but they run different
+unit paths: H2 is the LOSSY 32x32 chroma unit and needs tx size search ON,
+H3 is the LOSSLESS per-4x4 chroma unit (the walk
+`rect_split_lossless_chroma444_hits` counts) and fires with tx search
+irrelevant. No single fix is claimed for them.
 
 ### H4 — 4:4:4 lossless + 2 tile ROWS: hard divergence
 
@@ -311,12 +347,13 @@ dimensions; 4:4:4 at 10/12-bit with tiles; 12-bit 4:4:4 lossless; 4:4:0
    (single-tile-row frame-edge walk).
 3. **H5** 4:4:4 10-bit lossless 128-root — a cell the 8-bit 444 gates
    suggest is safe and is not.
-4. **H2** 4:4:4 lossy + tx size search chroma ±1 — reconstruction-only and
-   entropy-clean; round 2 exonerated the filter chain AND the tx-size clamp
-   (both sides already read TX_32X32 chroma units), so the remaining
-   candidates are the frame-edge partial block row's chroma `unit_height`
-   clamp and its prediction reach. One `EC_PRED`/`EC_MCB` pair at the
-   mi_row-16 chroma unit splits those two.
+4. **H2** 4:4:4 lossy + tx size search chroma ±1 — reconstruction-only,
+   entropy-clean, filter chain exonerated, tx-size clamp exonerated, and
+   (round 3) the frame-edge geometry exonerated too: a 128x128 control with
+   whole blocks reproduces it. What is left is the chroma unit's own
+   arithmetic at `ss (0,0)`, gated on tx size search being ON. One
+   `EC_DQCOEFF` vs `EC_COEFF_VAL` comparison on a single affected 32x32 unit
+   splits dequant from inverse transform.
 5. **H3** 4:4:4 lossless + tile columns, 90 chroma samples — smallest
    magnitude, likely the same root as H2.
 
