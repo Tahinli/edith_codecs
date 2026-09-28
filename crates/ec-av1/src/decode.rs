@@ -5508,8 +5508,10 @@ pub(crate) fn intra_rect4_strip_in_inter_hits(shape: usize) -> usize {
 // coefficient context over the STRIP'S OWN extent instead of the 4:2:0 pair's
 // (see [`decode_inter_block`]'s `around_c`). `is_chroma_reference`
 // (av1_common_int.h:1454) is unconditionally true at ss (0,0), so no pair
-// exists there; the counter is what keeps a 4:4:4 1:4-strip gate from passing
-// vacuously (a 4:2:0 stream of the same content leaves it at 0).
+// exists there; the counter keeps a 4:4:4 1:4-strip gate from passing
+// vacuously (a 4:2:0 stream of the same content leaves it at 0). It proves
+// REACH only, never that the fix bites -- that is the gate's byte compare and
+// its mutation, not this count (skill://ec-av1-pipeline-gate-counters).
 thread_local! {
     static RECT4_INTER_OWN_CHROMA444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -5526,10 +5528,21 @@ pub(crate) fn reset_rect4_inter_own_chroma444_hits() {
     RECT4_INTER_OWN_CHROMA444_HITS.with(|c| c.set(0));
 }
 
-// lane-av1444rect r2: how many intra-BC 1:4 strips at `ss (0,0)` coded their
-// OWN 16x4 / 4x16 chroma plane block instead of the 4:2:0 pair's 8x4 (see
-// [`decode_rect4_16_intrabc`]'s `own444`). A 4:2:0 / 4:2:2 stream of the same
-// recipe leaves it at 0, which is what makes it the 4:4:4-only route.
+// lane-av1444rect r2: how many intra-BC 1:4 strips at `ss (0,0)` took the
+// own-chroma arm of [`decode_rect4_16_intrabc`]'s `own444`. A 4:2:0 / 4:2:2
+// stream of the same recipe leaves it at 0, which is what makes it the
+// 4:4:4-only route.
+//
+// WHAT THIS COUNTER IS NOT: it is NOT evidence that the fix bites, and it
+// never was. A route counter fires identically before and after a change that
+// changes nothing downstream, so a non-zero count proves REACH and nothing
+// more. On this lane it is also armed deliberately OUTSIDE the `own444`
+// expression, so that the mutation (`own444 = false`) still increments it and
+// the red comes from the pixel/entropy arm instead. The evidence that the ss
+// gate bites is the measured fork move -- first entropy fork read 11750 ->
+// 12465, luma first wrong sample 164416 -> 205264, 455240 -> 390380 total --
+// not this count. See skill://ec-av1-pipeline-gate-counters: a counter needs
+// a DIFFERS-style assertion to carry a claim.
 thread_local! {
     static INTRABC_RECT4_OWN_CHROMA444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

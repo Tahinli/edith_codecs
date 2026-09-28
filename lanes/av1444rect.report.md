@@ -190,6 +190,16 @@ clamp on a 4:4:4 chroma TX_32X64 is still the prime suspect. Re-measured
 here to prove the class claim above: H2's numbers are bit-identical before
 and after, so this fix neither caused nor cured it.
 
+> **Derive the length, do not copy the multiplier.** The re-measurement
+> below writes `assert len(ours) == 2 * len(ref)`. That factor is a
+> **coincidence of 4:4:4 against 4:2:0 at the same geometry** — our `dump_yuv`
+> emits `u16` per sample while the oracle's 8-bit dump is `u8`, so the factor is
+> the bits-per-sample ratio and has nothing to do with chroma. At 4:2:2, at a
+> high bit depth, or on any fixture where the two sides do not agree on bit
+> depth, `2 *` is simply wrong. Compute the expected byte length from the plane
+> extents and the two bit depths (and assert the oracle's dump length against
+> that, not against a constant) before comparing anything.
+
 **H3: RETRACTED — my first claim was void, Selin2-2's measurement stands.**
 I reported this stream "byte-exact 6/6". It is not. My throwaway compare
 script hardcoded the frame geometry to 128x96 (the H1 fixture's) and
@@ -386,6 +396,15 @@ other fired 4800 msac bits away.
 
 ## 8. Method notes for the next lane
 
+- **A route counter is not proof a fix bites.** This lane learned it the hard
+  way: a counter can fire identically before and after a change that changes
+  nothing downstream, so a non-zero count proves REACH and nothing more. Both
+  counters this lane added carry that warning in their own doc comment, and
+  the intra-BC one is deliberately armed OUTSIDE the `own444` expression so the
+  mutation still increments it and the red lands on the pixel/entropy arm
+  instead. What carries the claim is the measured fork move and the mutation
+  red. Rule now in skill://ec-av1-pipeline-gate-counters: a counter needs a
+  DIFFERS-style assertion before it can carry a claim.
 - `testsrc2` is time-parameterised: any sweep recipe quoting it must pin
   `rate`, or the fixture is not reproducible. `rate=1` vs `rate=25` on
   128x96 yuv444p is the difference between an 8121-byte exact stream and
