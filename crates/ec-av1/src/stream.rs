@@ -6625,6 +6625,118 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1h5: the 128-ROOT lossless 4:4:4 pin. testsrc2 128x96
+    /// yuv444p10le, aomenc `--profile=1 --lossless=1 --enable-palette=0
+    /// --enable-intrabc=0 --cpu-used=0`, 6 frames; 63429 bytes, sha256
+    /// `bbffb979d20d581deb271aac75b7ee779dde57c024524ed6b1389356f55ca0fa`.
+    ///
+    /// This is the only committed cell where an UNSPLIT `BLOCK_128X128` root
+    /// meets lossless, and the only one that reaches libaom's 64x64 "mu" chunk
+    /// walk (`decode_token_recon_block`, decodeframe.c:972: the PLANE loop is
+    /// INSIDE the chunk loop). The var-tx leaf list is a BLOCK-wide raster, so
+    /// its chunk members are not contiguous: leaf 0..15 is chunk (0,0) row 0,
+    /// but chunk (0,0) rows 1..15 are leaves 32..47, 64..79, ... A chunk test
+    /// on the given order therefore closed the chunk every SIXTEEN leaves and
+    /// coded each chunk's chroma sixteen times -- 64 chroma walks per root
+    /// where libaom codes 4, and 24576 chroma units per inter frame against
+    /// the oracle's 1536.
+    ///
+    /// The gate pins the corrected route ([`crate::decode::mu_chunk_order_hits`]
+    /// must fire) and the first-difference position against `aomdec`'s
+    /// rawvideo. Reverting the reorder moves that position from 90273 back to
+    /// 74769, so the byte arm is the mutation witness.
+    #[test]
+    fn a_lossless_444_128_root_lossless_stream_reads_chunks_chunk_major() {
+        const NAME: &str = "a_lossless_444_128_root_lossless_stream_reads_chunks_chunk_major";
+        const FIXTURE_LEN: usize = 63429;
+        const FIXTURE_FNV: u64 = 0xf07d_47fc_fd51_2658;
+        /// First differing byte of the u16-LE YUV concatenation, measured
+        /// against `aomdec --rawvideo` with the chunk-major reorder in place.
+        /// The block-wide raster reaches 74769; the residual defect below it
+        /// is tracked in `lanes/av1h5.report.md` and is NOT what this gate
+        /// holds.
+        const FIRST_DIFF_FROM: usize = 90272;
+        const W: usize = 128;
+        const H: usize = 96;
+        const FRAMES: usize = 6;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_128root_lossless.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let _guard = lock_gate_counters();
+        let before = crate::decode::mu_chunk_order_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
+        });
+        let hits = crate::decode::mu_chunk_order_hits();
+        assert!(
+            hits > before,
+            "{NAME}: gate is vacuous -- no block took the chunk-major token order \
+             (delta {before} -> {hits})"
+        );
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for f in &frames {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+
+        if aomdec_path().is_file() {
+            let dir = std::env::temp_dir().join(format!("ec-av1-ll444root-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let raw = dir.join("aomdec.raw");
+            let out = Command::new(aomdec_path())
+                .args(["--codec=av1", "--rawvideo", "-o"])
+                .arg(&raw)
+                .arg(&obu)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("aomdec failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: the oracle aomdec refused the stream: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
+            let _ = std::fs::remove_dir_all(&dir);
+            // u16 LE, the concatenation `decode_probe` writes.
+            let mut ours: Vec<u8> = Vec::with_capacity(ref_raw.len());
+            for f in &frames {
+                for p in [&f.y, &f.u, &f.v] {
+                    for s in p {
+                        ours.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+            }
+            assert_eq!(ours.len(), ref_raw.len(), "{NAME}: raw sizes differ");
+            let first = ours
+                .iter()
+                .zip(&ref_raw)
+                .position(|(a, b)| a != b)
+                .unwrap_or(ours.len());
+            assert!(
+                first >= FIRST_DIFF_FROM,
+                "{NAME}: the chunk-major token order regressed -- first differing \
+                 byte is {first}, the block-wide raster reached {FIRST_DIFF_FROM} \
+                 or earlier (pre-fix this stream first differed at 74769)"
+            );
+        } else {
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
+        }
+    }
+
     /// lane-av1llpredgate2: the debug-exact pin for the ss-aware
     /// `obmc_skip_chroma_above` decision (lane-av1-llpred2). Fixture is the
     /// llpred/llpred2 reports' stream pinned into `fixtures/`: testsrc2
