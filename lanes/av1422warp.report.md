@@ -1,4 +1,4 @@
-# lane-av1422warp — second 4:2:2 coverage witness: one crash fixed, one edge-filter reference fixed, one transform-size defect localized
+# lane-av1422warp — the second 4:2:2 coverage witness: stream pixel-exact 16/16, fixture pinned, refusal KEPT
 
 Base `a7d22aec`, worktree `~/.cache/wt/av1422warp`, branch `lane-av1422warp`, no
 push. Target dir `$HOME/.cache/cargo-target-av1422warp`.
@@ -6,31 +6,40 @@ push. Target dir `$HOME/.cache/cargo-target-av1422warp`.
 ## Verdict
 
 The charter asked for a pixel-exact 4:2:2 stream with real residuals, compound
-and warped motion above the vertical midpoint. **The stream is not pixel-exact**,
-so it is NOT pinned and no coverage gate was written — a gate over a non-exact
-stream is a false claim. What it bought is two real 4:2:2 defects fixed (one a
-decode-blocking panic) and a third localized to a single desync window and handed
-off with paired dumps. The sequence-header refusal **stays**.
+and warped motion above the vertical midpoint. **It is pixel-exact**: all 16
+frames match `aomdec --rawvideo` byte for byte, and the entropy stream pairs
+246735-for-246735 against the instrumented oracle with no divergence anywhere.
+The fixture is **pinned** and a **coverage gate is committed**. The
+sequence-header refusal **stays** — see the lift section, which sets out why
+"exact" and "covered" are not the same bar.
 
-| commit | defect | before | after |
+| commit | what it settles | before | after |
 |---|---|---|---|
+| `af3285d5` | **the lift-blocker fix**: `read_lr` stepped the row axis by the COLUMN axis's term, and the superblock extent was 2x too large — the two cancelled exactly at 4:2:0, so 4:2:0/4:4:4 decoded byte-exact while carrying the bug | first divergence at symbol 107517; 16 frames non-exact | **246735/246735 paired, 16/16 pixel-exact** |
 | `4579d209` | OBMC strides the 4:2:2 chroma prediction with the square `chroma_side` | 0 frames decoded (panic) | 16/16 decode |
 | `a9611ea2` | chroma-above neighbour read one mi column left of libaom's | frame 0 PREFILT 56142 diffs | 53395 diffs; first divergent block byte-exact |
+| `a4532a41` → superseded | the OBMC pair-merge snap was clamped on the INDEX rather than the reported offset (reviewer P2) | read one column right of libaom, then skipped `mi_col + 1` | snap unconditional, offset saturates |
 
-## The stream (throwaway, `~/.cache/av1422warp/`, not committed)
+## Pinned, and the gate
 
-- `a1.obu` 38845 B, sha256 `d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95`
+`crates/ec-av1/fixtures/422_residual_compound_warp_16f.obu` — 38845 B, sha256
+`d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95`, fnv1a64
+`0x0e73a51e2cc0c424`. Gate
+`the_pinned_422_residual_compound_warp_witness_is_present_and_refuses_by_name`
+— pin plus refuse-by-name, the established 4:2:2 pattern, because with the
+header refusal standing no committed test *can* decode a 4:2:2 stream. It is
+mutation-proven both ways (flipped fixture byte panics `bytes drifted`; wrong
+refusal string panics `must refuse by name`).
+
+## The stream (source recipe; the fixture is now committed)
+
+- pinned `a1.obu` 38845 B, sha256 `d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95`
 - source `src422.y4m` sha256 `4d35eaf65d1a5541b3177e1183644c163b3868d8f141bed0ce9fdf833280ba9f`
 - 4:2:0 control `a420.obu` sha256 `1f43ef1ace6f7fa2f38c2deff765dd0bc529cbf7432788c736c7261350525e5b`
 
-```
-ffmpeg -f lavfi -i "mandelbrot=size=256x288:rate=24:maxiter=220:start_scale=3:end_scale=0.35:end_pts=300,rotate=a=0.10*t:c=none:ow=256:oh=288" \
-       -frames:v 24 -pix_fmt yuv422p -f yuv4mpegpipe src422.y4m
-aomenc --codec=av1 --profile=2 --input-bit-depth=8 --limit=16 --width=256 --height=288 \
-       --lag-in-frames=25 --auto-alt-ref=1 --enable-global-motion=1 --cq-level=24 \
-       --cpu-used=0 --threads=4 --kf-min-dist=0 --kf-max-dist=99999 -o a1.webm src422.y4m
-ffmpeg -i a1.webm -c:v copy -f obu a1.obu
-```
+Measured against `aomdec --rawvideo`: 2359296 bytes, sha256
+`4bfc2395e5ca6ea178f606e6b1ced773e26fc2d85bc3a6cdb63a402939aeb203` on both
+sides.
 
 Rotzoom mandelbrot is lane-av1gwarp12's lever (a similarity transform is exactly
 the family the 4-parameter ROTZOOM model expresses); `lag-in-frames=25` plus
@@ -1989,6 +1998,84 @@ LR-off 4:2:2 witness next**, then re-assess.
 
 Not lifting. Refusal untouched. Nothing pushed.
 
+## Round 33 — reviewer rework, five findings
+
+All five accepted. Two were real defects the round-32 evidence had hidden, and
+one of those two invalidates a number this report had already published.
+
+### P2 (a4532a41) — the OBMC snap was clamped on the wrong value
+
+`overlappable_above` / `overlappable_left` snapped the pair index with
+`& !1` and then clamped the **snapped index** to `mi_col`/`mi_row` to stop the
+reported offset underflowing. libaom (`obmc.h:44-46`) does the snap
+unconditionally and reads at `snap + 1`; only the *reported* offset
+(`above_mi_col - mi_col`) is negative, and it feeds
+`av1_setup_build_prediction_by_above_pred` while the **read** feeds
+`above_filter.get(mi_col + src4)` and the `MiInfo` itself. So the clamp
+silenced the underflow and, in exchange, read the neighbour one column RIGHT
+of libaom's and then stepped past `mi_col + 1` entirely.
+
+Both sites now keep the snap unconditional and clamp only the offset
+(`col.saturating_sub(mi_col)`, `row.saturating_sub(mi_row)`). Note the
+representability point, because it is a real (if small) residual: the tuple is
+`usize`, so libaom's `-1` is carried as `0`.
+
+**New gate** `the_obmc_pair_merge_snap_reads_libaoms_neighbour_not_one_to_the_right`
+pins the snapped READ with a synthetic grid carrying distinguishable
+neighbours at the pair's even half, its odd half, and the column to the right.
+Mutation-proven: restoring the old clamp on the column fails with
+`left: (30, 30)`, restoring it on the row fails with `left: (30, 30) /
+right: (20, 20)`. The test is necessary because **no stream in the corpus
+exercises this branch** — a1.obu's 1338 traced OBMC neighbours are identical
+before and after the fix, because its 4-wide pair never starts on an odd edge.
+
+### P2 (msac.rs:448) — hot-path env lookup
+
+`SymbolDecoder::symbol` called `std::env::var_os("EC_SYMR")` on **every symbol
+read of every stream**, production formats included. Now
+`crate::envflags::env_flag!("EC_SYMR")` (one `LazyLock<bool>` per call site, the
+`ecdump_armed` precedent at msac.rs:1059). Proved byte-identical: the same
+build with `var_os` and with `env_flag!` produces identical 246735-line
+`EC_SYMR` traces.
+
+### P3 — `MI_SIZE` doc (restoration.rs)
+
+The constant's doc claimed "`MI_SIZE` (aom_scale.h): pixels per mode-info
+unit". libaom's `MI_SIZE` is **4** (`av1/common/enums.h:39-40`,
+`1 << MI_SIZE_LOG2`, `MI_SIZE_LOG2 2`) and lives in `enums.h`, not
+`aom_scale.h`. The constant is renamed `MI_SIZE_8PX` and both its doc and
+`read_lr`'s are restated in 8-pixel terms, with the reason the value is
+double libaom's (its `denom` is a pixel count, so its numerator and
+denominator already sit on opposite scales) and the paired trace named as the
+authority. The rename exists so nobody "corrects" it back to 4.
+
+### P3 (finding 5) — the top-half census was an upper bound, and 248 was wrong
+
+`top_half_warp_hits` incremented on "either slot's global-motion model >
+TRANSLATION" alone, omitting `is_globalmv && side >= 8`, so it counted blocks
+that are not global-mv blocks. It now increments on `is_global_mv0 ||
+is_global_mv1`, the same predicates libaom's `is_global_mv_block` uses, with
+the census moved below their definition.
+
+**The corrected upper-half figure is 3, not 248** (compound stays 3). The
+frame-global numbers are unchanged: compound_warp 25, compound_warp_8 18,
+rotzoom_gm_warp 84, lr_wiener 22, lr_sgrproj 10, cdef_idx 53, part128_split
+95. The gate doc comment and the lift section are corrected; the earlier 248
+was never a count of anything real.
+
+Both accessors' `#[allow(dead_code)]` comments claimed they were "read only
+from the `#[cfg(test)]` gates" / "read by the pinned 4:2:2 coverage gate".
+**Neither has a committed reader and none can**, for the same reason the gate
+cannot decode: the header refusal stands. Both docs now say that plainly.
+
+### P2 (report headline)
+
+Verdict, summary table, lift section and State rewritten to the final state:
+16/16 pixel-exact, fixture pinned with its gate, refusal KEPT with the
+LR-off / second-recipe reasoning. Per-round sections are left as history, so
+the report still contains the superseded 248 and the earlier non-exact
+verdict — they are dated by round, and the top of the file is the truth.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
@@ -2008,14 +2095,37 @@ each variant of the smooth-type resolution: committed neighbours-only 56142;
 own-mode OR'd in 62175; chroma range `8..=10` 63624; range `7..=10` 63624;
 `7..=10` plus own mode 64759. All strictly worse than the committed form.
 
-## Refusal-lift bar: NOT met
+## Refusal-lift bar: NOT met — exactness is not coverage
 
-Beyond the stream still being non-exact, the charter's other precondition is
-unproven: compound and warped motion above the vertical midpoint has not been
-measured on a pixel-exact 4:2:2 stream, because there is not one. The stream
-does open the OBMC-chroma and chroma-edge-filter defects, which no prior 4:2:2
-fixture reached — that is real coverage progress, and it is not the same thing as
-the bar.
+The old blocker ("a second 4:2:2 fixture with real residuals, compound and
+warped motion above the vertical midpoint would justify lifting") is now
+**discharged as written**: that fixture exists, and it is exact. The refusal
+still stays, on three grounds that a second exact stream does not answer.
+
+1. **The top-half engagement is thin, and smaller than it first looked.**
+   Measured with the census gated on libaom's actual `is_global_mv_block`
+   (reviewer P3 corrected this — see below), the upper half carries **3**
+   global-mv blocks and **3** `GLOBAL_GLOBALMV` compound blocks. An earlier
+   figure of 248 came from a counter that tested only the global-motion model
+   term and so counted every block with a non-`TRANSLATION` model on either
+   slot, global-mv or not; it was an upper bound, not engagement. The
+   frame-global figures are ample (25 compound-warp, 18 compound-warp 8x8
+   leaf, 84 rotzoom global-warp) but they are not the charter's
+   above-the-midpoint condition.
+2. **One stream, one recipe.** Everything rests on a single 256x288 mandelbrot
+   encode. A second independent encoder recipe would test the decoder against
+   a different partitioning and motion-field structure rather than re-testing
+   the same one.
+3. **The path just fixed is still only half-covered.** What `af3285d5` repaired
+   is *128x128 superblock + loop restoration + non-4:2:0*. **4:2:2 with loop
+   restoration OFF** is untested, and it is a different range computation
+   again (`av1_lr_count_units` over a full-height chroma plane with no units to
+   place). A refusal lifted on the strength of the stream that found the bug
+   would be lifting on the stream's own blind spot.
+
+**Recommendation: keep the refusal; charter the LR-off 4:2:2 witness next,
+then a second encoder recipe, then re-assess.** The lift decision should not be
+made in the same round that fixed the bug the stream was built to find.
 
 ## Known unresolved
 
@@ -2030,7 +2140,22 @@ the bar.
 
 ## State
 
-Two commits on `lane-av1422warp`, no push. Worktree clean; the
-`EC_AV1_ALLOW_422_PROBE` bypass is reverted and in neither commit. All
-instrumentation (`EC_FULLDUMP`, `EC_FDSTR`, the `OOB_BLEND_*` bounds rungs) was
-removed before the commits. No suite run on this branch — Main's job.
+44 commits on `lane-av1422warp`, no push. Worktree clean; the
+`EC_AV1_ALLOW_422_PROBE` bypass is reverted and in no commit. All temporary
+instrumentation was removed except what is documented above as a permanent
+gate counter or as the `EC_SYMR` trace.
+
+Final state, for the VPS suite:
+
+- **pixel-exact**: 16/16 frames vs `aomdec --rawvideo`; entropy pairs
+  246735-for-246735 with no divergence anywhere in the stream.
+- **identity**: 4:2:0 control byte-exact, 4:4:4 LR witness byte-identical to
+  its pre-lane decode, both previously pinned 4:2:2 witnesses pixel-exact, LR
+  gate family 12/12, OBMC family 9/9, scoped battery (420/444/inter/superres/
+  cdef) 118 passed / 0 failed / 7 ignored.
+- **pinned**: `422_residual_compound_warp_16f.obu` with its gate.
+- **refusal**: UNCHANGED and unconditional. The bypass is not committed.
+
+Known unresolved, carried forward: the left chroma reference row term
+(`+ss_y`, libaom `av1_common_int.h:1400-1401`) is still not shipped, for the
+reason given above.
