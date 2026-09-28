@@ -2671,7 +2671,6 @@ pub(crate) mod tests {
         );
     }
 
-
     /// lane-av1-qmatrix: WITNESS for the lifted `using_qmatrix` refusal (the
     /// old gate `a_frame_using_quantisation_matrices_is_refused_by_name` is
     /// its mirror image -- its own panic said "flip this gate to a witness"
@@ -42035,5 +42034,467 @@ pub(crate) mod tests {
             crate::decode::segment_id_hits(),
             crate::decode::segment_ids_seen()
         );
+    }
+
+    /// lane-av1formatsweep: the ODD CODED DIMENSION cell -- a frame whose
+    /// width or height is not a multiple of 8, so the last mode-info column
+    /// and the last chroma plane row/column are PARTIAL (`mi_cols * 8 >
+    /// width`, and at 4:2:0 the chroma plane is `ceil(w/2) x ceil(h/2)`).
+    ///
+    /// Nothing else in this file ever encoded one: every frame size in the
+    /// suite (the `tiny_frame_size_sweep` ladder included -- 8,16,24,32,48,
+    /// 64,72,136,192) is a multiple of 8, so the partial-chroma-plane walk
+    /// had no committed exactness evidence at any depth. The class matters
+    /// for a 4:2:2 lift too: at ss (1,0) the chroma plane is
+    /// `ceil(w/2) x h`, so the partial extent lands on the OTHER axis.
+    ///
+    /// NON-VACUITY: `decode::inter_edge_strip_hits()` (the frame-edge strip
+    /// walk) is asserted to fire, and the even-size control arm is asserted
+    /// to leave it at zero -- measured: 130x122 -> `[0,2,0,4,0,6]`,
+    /// 130x130 -> `[0,3,0,2,24,6]`, 128x96 -> all zero. Without that pair a
+    /// decoder that dropped the partial column entirely would still pass the
+    /// pixel compare (class `gate-blind-to-feature`).
+    ///
+    /// Recipe (deterministic: single pass, single thread, no row-mt):
+    /// `ffmpeg -f lavfi -i testsrc2=size=<W>x<H>:rate=25 -frames:v 4
+    /// -pix_fmt <pix> -f yuv4mpegpipe -` piped to
+    /// `aomenc --codec=av1 --passes=1 --end-usage=q --cq-level=20
+    /// --cpu-used=2 --threads=1 --row-mt=0 --lag-in-frames=0
+    /// --kf-max-dist=100 --limit=4 --obu -o - -`, plus
+    /// `--input-bit-depth=N --bit-depth=N` at 10 and 12 bits. The 12-bit arm
+    /// uses the smoothed `mandelbrot` source because a sharp-edged source
+    /// makes aomenc set `allow_screen_content_tools`, which this decoder
+    /// refuses BY NAME at 12 bits (see `a_12bit_screen_content_stream_is_
+    /// refused_by_name`).
+    #[test]
+    fn a_real_aomenc_odd_coded_dimension_streams_decode_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_odd_coded_dimension_streams_decode_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        // (width, height, pix_fmt, bit_depth, smooth_source)
+        let arms: &[(usize, usize, &str, usize, bool)] = &[
+            (130, 130, "yuv420p", 8, false),
+            (66, 66, "yuv420p", 8, false),
+            (194, 122, "yuv420p", 8, false),
+            (130, 122, "yuv420p", 8, false),
+            (130, 122, "yuv420p10le", 10, false),
+            (130, 122, "yuv420p12le", 12, true),
+        ];
+        let mut odd_arms = 0usize;
+        for &(width, height, pix_fmt, bit_depth, smooth) in arms {
+            let stream = odd_dim_stream(width, height, pix_fmt, bit_depth, smooth);
+            // The header must really carry the odd geometry, or the arm
+            // silently degrades to an even-dimension stream (class
+            // `arrival-not-intent`).
+            let (mi_cols, mi_rows) = odd_dim_header_mi_grid(&stream, NAME, bit_depth);
+            assert!(
+                mi_cols * 8 > width || mi_rows * 8 > height,
+                "{NAME}: {width}x{height} is not an odd coded dimension \
+                 (mi grid {mi_cols}x{mi_rows})"
+            );
+            // Reset per attempt, never a delta across arms (class
+            // `counter-from-refused-stream`).
+            crate::decode::reset_inter_edge_strip_hits();
+            let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: refused {width}x{height}: {e}"));
+            let chroma = ((width + 1) / 2) * ((height + 1) / 2);
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(f.y.len(), width * height, "{NAME}: frame {i} luma extent");
+                assert_eq!(
+                    f.u.len(),
+                    chroma,
+                    "{NAME}: frame {i} chroma extent -- a {width}x{height} frame's \
+                     chroma plane is ceil(w/2)*ceil(h/2) = {chroma}, not w/2*h/2"
+                );
+            }
+            let edge = crate::decode::inter_edge_strip_hits();
+            assert!(
+                edge.iter().any(|&n| n > 0),
+                "{NAME}: {width}x{height} decoded byte-exact but walked NO \
+                 frame-edge strip -- the partial-column chroma extent this \
+                 cell exists for was never reached (class \
+                 `gate-blind-to-feature`): {edge:?}"
+            );
+            eprintln!(
+                "{NAME}: {width}x{height} {pix_fmt}: {frames_decoded} frames \
+                 byte-exact vs aomdec, frame-edge walk {edge:?}"
+            );
+            odd_arms += 1;
+        }
+        assert!(odd_arms == arms.len(), "{NAME}: arm loop ended early");
+    }
+
+    /// lane-av1formatsweep: encodes the odd-dimension arm's fixture --
+    /// `testsrc2` (or the smoothed `mandelbrot` source at 12 bits, which
+    /// keeps `allow_screen_content_tools` off) as `y4m`, then hands the pipe
+    /// to `aomenc`. The child deadline comes from `run_with_stdin`
+    /// (`EC_AV1_CHILD_TIMEOUT_SECS`), so a wedged encoder fails loudly.
+    fn odd_dim_stream(
+        width: usize,
+        height: usize,
+        pix_fmt: &str,
+        bit_depth: usize,
+        smooth: bool,
+    ) -> Vec<u8> {
+        let source = if smooth {
+            format!("mandelbrot=size={width}x{height}:rate=25")
+        } else {
+            format!("testsrc2=size={width}x{height}:rate=25")
+        };
+        let mut ffmpeg_args: Vec<String> = vec![
+            "-v".into(),
+            "error".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            source,
+        ];
+        if smooth {
+            ffmpeg_args.extend(["-vf".into(), "gblur=sigma=6".into()]);
+        }
+        ffmpeg_args.extend([
+            "-frames:v".into(),
+            "4".into(),
+            "-pix_fmt".into(),
+            pix_fmt.into(),
+            "-strict".into(),
+            "-1".into(),
+            "-f".into(),
+            "yuv4mpegpipe".into(),
+            "-".into(),
+        ]);
+        let y4m = Command::new("ffmpeg")
+            .args(&ffmpeg_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg refused the {width}x{height} {pix_fmt} source: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let mut args: Vec<String> = [
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=20",
+            "--cpu-used=2",
+            "--threads=1",
+            "--row-mt=0",
+            "--lag-in-frames=0",
+            "--kf-max-dist=100",
+            "--limit=4",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        if bit_depth > 8 {
+            args.push(format!("--input-bit-depth={bit_depth}"));
+            args.push(format!("--bit-depth={bit_depth}"));
+        }
+        args.extend(["--obu".into(), "-o".into(), "-".into(), "-".into()]);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "aomenc refused {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    /// Reads `(mi_cols, mi_rows)` out of a stream's first frame header, and
+    /// asserts the sequence header says the bit depth the caller asked for.
+    fn odd_dim_header_mi_grid(stream: &[u8], name: &str, bit_depth: usize) -> (usize, usize) {
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut seen_depth = None;
+        let mut grid = None;
+        while pos < stream.len() {
+            let obu = parser
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: aomenc OBU does not parse: {e:?}"));
+            if obu.total_size == 0 {
+                break;
+            }
+            pos += obu.total_size;
+            match obu.kind {
+                ObuKind::SequenceHeader(seq) => {
+                    assert_eq!(
+                        seq.color_config.bit_depth as usize, bit_depth,
+                        "{name}: the stream is not {bit_depth}-bit"
+                    );
+                    assert_eq!(
+                        (
+                            seq.color_config.subsampling_x,
+                            seq.color_config.subsampling_y
+                        ),
+                        (1, 1),
+                        "{name}: not a 4:2:0 stream"
+                    );
+                    seen_depth = Some(seq.color_config.bit_depth);
+                }
+                ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) => {
+                    grid = Some((
+                        (h.frame_width as usize + 7) / 8,
+                        (h.frame_height as usize + 7) / 8,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        assert!(seen_depth.is_some(), "{name}: no sequence header parsed");
+        grid.expect("the stream carries no frame header")
+    }
+
+    /// lane-av1formatsweep: the 4:4:4 x 10-BIT cell. Every committed 4:4:4
+    /// exactness gate in this file is `--lossless=1` at 8 bits
+    /// (`a_real_aomenc_lossless_444_key_frame_decodes_sample_exact`,
+    /// `a_lossless_444_min_partition64_inter_stream_decodes_pixel_exact`,
+    /// `a_lossless_444_defaultp_inter_strip_stream_decodes_byte_exact`, the
+    /// `ll444_*` pins), so the whole committed 4:4:4 evidence base is LOSSLESS
+    /// 8-bit: no 4:4:4 stream above 8 bits had a committed exactness gate.
+    ///
+    /// NON-VACUITY: `decode::rect_split_lossless_chroma444_hits()` -- the
+    /// per-4x4 chroma unit walk a lossless HORZ/VERT strip takes at
+    /// subsampling 0/0 -- is asserted to fire (measured 32 units on this
+    /// recipe), and the sequence header is asserted to say ss (0,0) at
+    /// 10-bit before any pixel is trusted. A 4:2:0 stream of the same
+    /// content leaves that counter at zero, so the pixel compare alone would
+    /// not prove the 4:4:4 chroma path ran (class `gate-blind-to-feature`).
+    ///
+    /// Recipe: `testsrc2 128x96` yuv444p10le 6 frames, `aomenc --codec=av1
+    /// --profile=1 --input-bit-depth=10 --bit-depth=10 --lossless=1
+    /// --enable-palette=0 --enable-intrabc=0 --cq-level=20 --cpu-used=2
+    /// --passes=1 --end-usage=q --threads=1 --row-mt=0 --lag-in-frames=0
+    /// --kf-max-dist=100 --limit=6 --obu -o - -`.
+    #[test]
+    fn a_lossless_444_10bit_inter_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_lossless_444_10bit_inter_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let stream = chroma_format_stream(
+            128,
+            96,
+            "yuv444p10le",
+            10,
+            6,
+            &[
+                "--lossless=1",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                // `--cpu-used=2`, NOT 0: at `--cpu-used=0` aomenc reaches
+                // the 128-root partition (measured `part128: split=1
+                // none=5` where this recipe reads `none=0`) and THAT stream
+                // diverges at 10-bit 4:4:4 from frame 1 on -- 11152 of
+                // 36864 samples, first at Y(8,4), with ffmpeg and aomdec
+                // agreeing on the reference. Handoff, not this gate's
+                // subject; see `lanes/av1formatsweep.report.md`.
+                "--cpu-used=2",
+                "--cq-level=20",
+            ],
+            0,
+        );
+        assert_444_header(&stream, NAME, 10);
+        let before_444 = crate::decode::rect_split_lossless_chroma444_hits();
+        let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        assert!(
+            crate::decode::rect_split_lossless_chroma444_hits() > before_444,
+            "{NAME} went blind: no lossless strip walked its chroma as 4:4:4 \
+             4x4 units"
+        );
+        assert!(
+            frames_decoded >= 6,
+            "{NAME}: expected the six-frame recipe to decode"
+        );
+        eprintln!("{NAME}: {frames_decoded} frames byte-exact vs aomdec at 10-bit 4:4:4");
+    }
+
+    /// lane-av1formatsweep: the 4:4:4 x 12-BIT cell -- the deepest chroma
+    /// format the spec allows, and the one no committed gate reached. A
+    /// sharp-edged source makes aomenc set `allow_screen_content_tools`,
+    /// which this decoder refuses BY NAME at 12 bits (palette and intrabc
+    /// have no 12-bit witness), so the arm encodes the SMOOTHED
+    /// `mandelbrot` source -- the same trick `a_real_aomenc_12bit_stream_
+    /// decodes_pixel_exact`'s in-tree source exists for.
+    ///
+    /// NON-VACUITY: the header is asserted to say ss (0,0) at 12 bits,
+    /// `mc::mc_subpel_hits()` (the 12-bit-sensitive subpel round pair) must
+    /// fire -- a key-frame-only stream would pass the pixel compare without
+    /// touching it -- and every decoded frame's chroma plane is asserted to
+    /// be FULL resolution, which is the 4:4:4 extent itself.
+    ///
+    /// Recipe: `mandelbrot 128x96` + `-vf gblur=sigma=6` yuv444p12le 6 frames,
+    /// `aomenc --codec=av1 --input-bit-depth=12 --bit-depth=12 --passes=1
+    /// --end-usage=q --cq-level=20 --cpu-used=2 --threads=1 --row-mt=0
+    /// --lag-in-frames=0 --kf-max-dist=100 --limit=6 --obu -o - -`.
+    /// aomenc picks `seq_profile=2` here (12-bit forces it) with
+    /// `subsampling_x/y = 0,0` -- still 4:4:4 planes, and the decoder's
+    /// refusal only rejects `subsampling_x != subsampling_y`.
+    #[test]
+    fn a_444_12bit_inter_sequence_decodes_pixel_exact() {
+        const NAME: &str = "a_444_12bit_inter_sequence_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let stream = chroma_format_stream(128, 96, "yuv444p12le", 12, 6, &["--cq-level=20"], 1);
+        assert_444_header(&stream, NAME, 12);
+        let before_subpel = crate::mc::mc_subpel_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: refused a real 12-bit 4:4:4 stream: {e}"));
+        let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        assert!(
+            crate::mc::mc_subpel_hits() > before_subpel,
+            "{NAME} went blind: no subpel inter prediction ran, so the \
+             12-bit round pair is unexercised"
+        );
+        // The 4:4:4 chroma EXTENT is the cell's own claim: at ss (0,0) the
+        // chroma planes are full resolution, so a decoder that kept the
+        // 4:2:0 extent would produce quarter-size chroma planes and a
+        // byte-length the oracle cannot even match. (CDEF is NOT asserted
+        // here: on this smoothed source CDEF runs but skips every band --
+        // measured `cdef_band: rect_skip_writes=11`, zero index literals --
+        // so a CDEF assertion would be a claim the witness cannot carry.)
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.u.len(),
+                128 * 96,
+                "{NAME}: frame {i} chroma plane is {} samples -- at 4:4:4 it \
+                 must be full resolution (128x96), not the 4:2:0 quarter",
+                f.u.len()
+            );
+        }
+        eprintln!("{NAME}: {frames_decoded} frames byte-exact vs aomdec at 12-bit 4:4:4");
+    }
+
+    /// lane-av1formatsweep: a `testsrc2`/`mandelbrot` source rendered to
+    /// `pix_fmt` as y4m and piped to `aomenc` at `bit_depth`, with `extra`
+    /// aomenc flags. `smooth` selects the gblur'd `mandelbrot` source (1) or
+    /// `testsrc2` (0). The child deadline comes from `run_with_stdin`
+    /// (`EC_AV1_CHILD_TIMEOUT_SECS`), so a wedged encoder fails loudly.
+    fn chroma_format_stream(
+        width: usize,
+        height: usize,
+        pix_fmt: &str,
+        bit_depth: usize,
+        frames: usize,
+        extra: &[&str],
+        smooth: u8,
+    ) -> Vec<u8> {
+        let source = if smooth == 1 {
+            format!("mandelbrot=size={width}x{height}:rate=25")
+        } else {
+            format!("testsrc2=size={width}x{height}:rate=25")
+        };
+        let mut ffmpeg_args: Vec<String> = vec![
+            "-v".into(),
+            "error".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            source,
+        ];
+        if smooth == 1 {
+            ffmpeg_args.extend(["-vf".into(), "gblur=sigma=6".into()]);
+        }
+        ffmpeg_args.extend([
+            "-frames:v".into(),
+            frames.to_string(),
+            "-pix_fmt".into(),
+            pix_fmt.into(),
+            "-strict".into(),
+            "-1".into(),
+            "-f".into(),
+            "yuv4mpegpipe".into(),
+            "-".into(),
+        ]);
+        let y4m = Command::new("ffmpeg")
+            .args(&ffmpeg_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg refused the {width}x{height} {pix_fmt} source: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        // AOMENC FLAG PRECEDENCE (COMMON): aomenc keeps the FIRST occurrence
+        // of a flag, so the per-arm override goes BEFORE the base list.
+        let limit = format!("--limit={frames}");
+        let mut args: Vec<String> = extra.iter().map(|s| (*s).to_owned()).collect();
+        args.extend(
+            [
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--threads=1",
+                "--row-mt=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=100",
+                limit.as_str(),
+            ]
+            .iter()
+            .map(|s| (*s).to_owned()),
+        );
+        if bit_depth > 8 {
+            args.push(format!("--input-bit-depth={bit_depth}"));
+            args.push(format!("--bit-depth={bit_depth}"));
+        }
+        args.extend(["--obu".into(), "-o".into(), "-".into(), "-".into()]);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "aomenc refused {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    /// Asserts the stream's sequence header really is 4:4:4 (`ss 0,0`) at
+    /// `bit_depth` before any pixel comparison is trusted (class
+    /// `arrival-not-intent`: a recipe that silently produced 4:2:0 would
+    /// make the whole gate a no-op for its own subject).
+    fn assert_444_header(stream: &[u8], name: &str, bit_depth: usize) {
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut seen = false;
+        while pos < stream.len() {
+            let obu = parser
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: aomenc OBU does not parse: {e:?}"));
+            if obu.total_size == 0 {
+                break;
+            }
+            pos += obu.total_size;
+            if let ObuKind::SequenceHeader(seq) = obu.kind {
+                let cc = &seq.color_config;
+                assert_eq!(
+                    (cc.subsampling_x, cc.subsampling_y),
+                    (0, 0),
+                    "{name}: the stream is not 4:4:4 (ss {}x{})",
+                    cc.subsampling_x,
+                    cc.subsampling_y
+                );
+                assert_eq!(
+                    cc.bit_depth as usize, bit_depth,
+                    "{name}: the stream is {}-bit, not {bit_depth}-bit",
+                    cc.bit_depth
+                );
+                seen = true;
+            }
+        }
+        assert!(seen, "{name}: no sequence header parsed");
     }
 }
