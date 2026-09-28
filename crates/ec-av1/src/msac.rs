@@ -329,6 +329,12 @@ thread_local! {
     /// rounds 22 and 23. Set by the mode readers at entry; `(-1,-1)` outside.
     pub(crate) static SYMR_MI: std::cell::Cell<(i64, i64)> =
         const { std::cell::Cell::new((-1, -1)) };
+    /// A short tag for the READER PHASE ("intra", "inter", "mv", ...), printed
+    /// on every `EC_SYMR` line. The coefficient rungs stop well before some
+    /// divergences, so the per-read stream is the only instrument that covers
+    /// the inter path; without a phase its reads are unattributable.
+    pub(crate) static SYMR_PHASE: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("") };
 }
 
 impl<'a> SymbolDecoder<'a> {
@@ -407,6 +413,10 @@ impl<'a> SymbolDecoder<'a> {
 
     /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
     ///
+    pub(crate) fn set_symr_phase(p: &'static str) {
+        SYMR_PHASE.with(|c| c.set(p));
+    }
+
     pub(crate) fn set_symr_mi(mi_r: i64, mi_c: i64) {
         SYMR_MI.with(|c| c.set((mi_r, mi_c)));
     }
@@ -445,7 +455,8 @@ impl<'a> SymbolDecoder<'a> {
         }
         if symr {
             eprintln!(
-                "EC_SYMR mi=({},{}) pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
+                "EC_SYMR ph={} mi=({},{}) pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
+                SYMR_PHASE.with(std::cell::Cell::get),
                 SYMR_MI.with(std::cell::Cell::get).0,
                 SYMR_MI.with(std::cell::Cell::get).1,
                 pre_value,

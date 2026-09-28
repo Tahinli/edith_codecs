@@ -33046,6 +33046,11 @@ fn decode_inter_block(
     // combinations that don't implement scaled MC yet.
     frame_width: usize, fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
+    // Round 27: the per-read trace is the only instrument that reaches the inter
+    // path (the coefficient rungs stop well before the frame-3 divergence),
+    // so publish the phase and the block's mi for every read it makes.
+    crate::msac::SymbolDecoder::set_symr_phase("inter");
+    crate::msac::SymbolDecoder::set_symr_mi(at.0 as i64, at.1 as i64);
 
     // lane-inter4 r1: `at` is in MI units (4 px) so a 32-level 1:4 strip can
     // name an 8-px offset; `(r, c)` stays the enclosing 16-px cell for the
@@ -40401,6 +40406,13 @@ fn decode_inter_block8(
     // (`use_superres`) -- mirrors [`decode_inter_block`]'s own param.
     frame_width: usize, fctx: &crate::decode::FrameCtx,
 ) -> Result<(bool, bool, bool, Option<(i8, i8, u8, u8)>, [u8; 2], (i8, Option<i8>))> {
+    // Round 27: this is the function whose mode read carries the block's real
+    // mi (the `EC_MODE_VAL8` rung prints it). The `decode_inter_block`
+    // entry sets the same label from ITS `at`, which is a different block --
+    // publishing from here is what makes the EC_SYMR mi trustworthy on the
+    // inter path, which is what round 22 got wrong by assuming it was not.
+    crate::msac::SymbolDecoder::set_symr_phase("inter8");
+    crate::msac::SymbolDecoder::set_symr_mi(leaf_mi.0 as i64, leaf_mi.1 as i64);
     const LAST_FRAME: i8 = 1;
     // lane-gmaffine r2: the leaf's OWN switchable-filter symbols, handed back
     // so the caller stamps them into `Neighbours` instead of the `[3, 3]`
