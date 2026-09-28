@@ -1179,6 +1179,77 @@ localized this round — the natural continuation is the same EC_SYMR
 sequence diff run over the whole 16-frame stream, which now has a
 trustworthy instrument and a per-TU exactness baseline.
 
+## Round 21 — full-stream diff: frame 1 is a RECON defect, frame 2 is a NEW entropy class
+
+Bypass reverted, worktree clean at `9c86a18f`, 4:2:0 control byte-exact.
+
+### The EC_SYMR sequence diff over all 16 frames
+
+```
+oracle 246735 reads, ours 166211
+reads 0..107516 : MATCH on value, range, CDF row, alphabet, symbol, post_rng
+read  107517    : FIRST DIVERGENCE (frame 2)
+    oracle pre=(45039, 61960, bit 3129) cdf0=24278 n=2 s=1 post_rng=45863
+    ours   pre=(45039, 61960, bit 3144) cdf0=6401  n=8 s=3 post_rng=45500
+                                               (as 32768- : 26367)
+```
+
+Identical coder state and identical bit position, but the two decoders
+take a **different syntax branch**: the oracle reads `n=2`, then `n=2`,
+then its `n=8`; this decoder reads its `n=8` straight away. That is a
+MISSING read, not a wrong row — a different class from the two closed
+defects (the OBMC chroma stride and the chroma dc-sign vote), both of
+which were same-position/same-value/different-row.
+
+Our block at that point is a sub-8x8 leaf, `EC_IMODE mi_row=24 mi_col=57
+fn=sub8`, reached after its own `skip`/`cdef`/`dq` reads — all of which
+pair. So the two decoders agree up to the block's mode-info and then
+disagree about what the block IS.
+
+### Two separate residuals, not one
+
+Per-frame differing-sample counts against `aomdec --rawvideo`:
+
+```
+frame  0:      0   EXACT     frame  8: 118214
+frame  1:  33375            frame  9: 103043
+frame  2:  57364            frame 10: 119670
+frame  3:  59542            frame 11: 126676
+frame  4: 109837            frame 12: 127177
+frame  5:  96361            frame 13: 133154
+frame  6: 115869            frame 14: 131843
+frame  7:      0   EXACT     frame 15:      0   EXACT
+```
+
+**3/16 frames exact (0, 7, 15)** — up from 0/16 — and the total is
+1332125 differing samples, down from 1619115.
+
+**Frame 1 is a RECONSTRUCTION defect, not an entropy one**: the EC_SYMR
+sequence pairs across all of frame 1 (reads 46260..104192) while its
+pixels differ by 33375 samples. Whatever it is, it is downstream of a
+correct bitstream — a different class again, and the first thing worth
+attacking, because it needs no entropy forensics at all.
+
+**Frame 2 onward is the new entropy class** at read 107517.
+
+### Handoff
+
+Two open items, neither in the closed family:
+
+1. **Frame 1, reconstruction only.** Entropy exact, pixels wrong. Compare
+   the stage dumps for frame 1 (PREFILT/POSTDEBLOCK/POSTCDEF) to localise
+   it; the ladder will not help, it is already clean there.
+2. **Frame 2 read 107517.** A missing read: our sub-8x8 leaf at
+   mi(24,57) takes an `n=8` mode read where libaom takes `n=2`, `n=2`,
+   `n=8`. The first step is to establish what the two `n=2` reads ARE —
+   the natural candidates at 4:2:2 are the chroma-reference pair
+   bookkeeping (`is_chroma_reference`: one chroma column per PAIR of luma
+   mi columns) and a frame's intra/inter block decision. The
+   sequence-numbered EC_SYMR diff is now a working instrument for that,
+   with per-TU exactness on frames 0/7/15 as the baseline.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
