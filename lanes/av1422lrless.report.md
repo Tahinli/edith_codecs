@@ -85,9 +85,27 @@ ffmpeg -i a3.webm -c copy -f obu -y a3.obu
 
 38538 bytes, sha256
 `8bed368f7ec4bca772137c6a9c2af89e1b2767ed5f937b91bd9e72ec60aeb42f`, fnv1a64
-`0x4b8ff761701e2bef`. (The arm pinned at `4a18a77b` — 38701 bytes,
-`0xf331fb2ed6b79efa` — came from an uncontrolled 2-pass encode and is
-**replaced**.)
+`0x4b8ff761701e2bef`.
+
+**What the withdrawn arm actually was**, stated precisely because "a
+2-pass encode" alone was wrong: the 38701-byte arm pinned at `4a18a77b`
+(sha256 `205146b85d93a6bf…`, fnv1a64 `0xf331fb2ed6b79efa`) is the
+**two-pass** encode (aomenc's default, no `--pass=1`) **with**
+`--enable-restoration=0`. Re-encoding it reproduces those bytes exactly:
+
+```
+$ aomenc … --enable-global-motion=1 --enable-restoration=0 --cq-level=24 …   # no --pass=1
+38701B   205146b85d93a6bf586f7d3cf8778fe1a62887a2e2b265068c563ce9462e0479
+         fnv1a64 0xf331fb2ed6b79efa
+```
+
+So it differed from the reproduced LR-on recipe in **two** ways — pass
+structure (2-pass vs `--pass=1`) *and* the restoration flag — which is
+exactly why the pair was not controlled and why it was replaced. The 38774
+in the table above is a different arm: two-pass **without**
+`--enable-restoration=0`, i.e. the 2-pass LR-on encode. Both numbers are
+right; they measure different invocations, and the report previously
+conflated them.
 
 **The engagement advantage survives the honest pair**, which is what the
 regeneration was for: top-half compound **11** against the sibling's 3.
