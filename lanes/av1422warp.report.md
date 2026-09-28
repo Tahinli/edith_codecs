@@ -392,6 +392,60 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 13 — SETTLED: the oracle DOES consume them, and our reads match exactly
+
+**Outcome (a).** The rung emission is fixed — the bit position is now
+appended BEFORE the format string's `\n`, so it lands on the same
+physical line (all 18 `EC_ISTEP` and 14 `EC_COEFF_STEP` sites in
+`decodemv.c` / `decodetxb.c`; `aomdec` rebuilt, all reverted again,
+`grep -c bitpos` = 0).
+
+With correct emission, the oracle at mi(68,16):
+
+```
+angle_uv          val=-2  rng=57128  bitpos=92312
+use_filter_intra  val=1   rng=37468  bitpos=92312
+filter_intra_mode val=3   rng=35632  bitpos=92313
+next block mi(64,24) skip           bitpos=92323
+```
+
+and ours, from the same trace:
+
+```
+angle_uv          val=-2             bitpos 92312
+use_filter_intra  val=1              bitpos 92312
+filter_intra_mode val=3              bitpos 92313
+next block mi(64,24) skip           bitpos 92323
+```
+
+**Identical — same values, same bit positions, same next-block
+position.** The oracle consumes both symbols; so do we; the reads
+agree. This window is CLOSED and the two extra reads that rounds 11 and
+12 chased never existed.
+
+**Why rounds 11 and 12 saw them anyway — the mechanism, recorded so it
+is not repeated.** With the position on the previous line, a
+record-wise parse (split on `EC_ISTEP`, read `bitpos=` from inside the
+record) attributes each read's position to the PRECEDING read, because
+that is the line it was physically printed on. So the two
+`use_filter_intra` / `filter_intra_mode` reads carried the bit positions
+of the reads before them, and a window bounded on those positions
+silently excluded them. The lesson is sharper than round 8's: **with a
+multi-field rung, a positional parse is only as good as the field's
+placement** — and a field that lands on an adjacent line does not
+announce itself, it just quietly misattributes.
+
+**What the round-10 "3 bits short" number now means.** It stands as a
+measurement — the coefficient-unit bit delta is constant -14 through
+unit 2427 and changes at 2428 — but the window attributed to it does
+NOT contain the divergence: the mode reads in it are now proven to
+match symbol for symbol and bit for bit. The three bits are elsewhere
+in that span, or the all_zero-level delta change at 2428 has a cause
+this lane has not reached. **This lane ran out of budget before
+re-anchoring the ladder past mi(68,16) to find the real first-delta
+read**, which is the next step and is unchanged from round 12's option
+(a) branch.
+
 ### Round 12 — CORRECTION to round 11: the extra reads are real, the CAUSE is not what round 11 said
 
 Round 11 was wrong twice over, both times from trusting a print
