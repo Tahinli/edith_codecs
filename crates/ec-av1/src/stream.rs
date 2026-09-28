@@ -18992,6 +18992,108 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1444chr: a 4:4:4 INTER chroma unit inherits the `tx_type` of
+    /// the luma leaf covering its OWN quadrant, not the block-level (top-left
+    /// leaf) one. `av1_get_tx_type` (`blockd.h:1287-1297`) reads
+    /// `xd->tx_type_map` at the chroma unit's own position scaled back to
+    /// luma, and `read_coeffs`' `all_zero` arm stamps `DCT_DCT` into that
+    /// leaf's cell (`decodetxb.c:199-203`) -- so a chroma unit sitting over a
+    /// luma leaf that coded NOTHING must reconstruct as DCT_DCT even when the
+    /// block's top-left leaf is `IDTX`.
+    ///
+    /// The fixture is the report's witness pinned into `fixtures/`:
+    /// `testsrc2 128x128` yuv444p 4 frames, aomenc `--profile=1 --cq-level=20
+    /// --cpu-used=2 --sb-size=64 --min-partition-size=64
+    /// --max-partition-size=64 --passes=1 --end-usage=q --threads=1 --row-mt=0
+    /// --lag-in-frames=0 --kf-max-dist=100 --limit=4 --obu`; 27933 bytes,
+    /// sha256 `a06c9f7a0862252f6ab7ebdcec340d0602e730e38089365f14747db37f8e78d5`.
+    /// Every inter block is a whole 64x64 (min=max partition 64) whose luma
+    /// var-tx tree is four TX_32X32 leaves, so each block's chroma plane is
+    /// four TX_32X32 units -- one per leaf.
+    ///
+    /// Pre-fix, decode-order frames 1/2/3 differ from the oracle in 777/640/554
+    /// V samples (luma and U exact) and the per-unit type census disagrees at
+    /// exactly the units over the skipped leaf: V(0,32) of block mi(0,0) in
+    /// frame 1, V(64,96) of block mi(16,16) in every inter frame. Post-fix all
+    /// 136 non-empty inter units agree with the oracle's `EC_DQCOEFF` type and
+    /// every frame is byte-exact.
+    ///
+    /// The non-vacuity bar is the DIFFERS counter, not the route counter: a
+    /// route counter fires on every four-unit chroma read (96 of them here)
+    /// and stayed green through a no-op fix that changed zero pixels, because
+    /// on a block whose four leaves agree the per-quadrant resolve and the
+    /// block-level value are the same answer. The number that says the resolve
+    /// CHANGED something is 8 on this stream -- the four skipped-leaf quadrants
+    /// (two of them in decode-order frame 1), each resolved once per chroma
+    /// plane -- and it must be 0 on the 4:2:0 control below, since the arm is
+    /// unreachable at 4:2:0.
+    #[test]
+    fn a_pinned_444_inter_stream_chroma_units_inherit_their_own_quadrants_tx_type() {
+        const NAME: &str =
+            "a_pinned_444_inter_stream_chroma_units_inherit_their_own_quadrants_tx_type";
+        const FIXTURE_LEN: usize = 27933;
+        const FIXTURE_FNV: u64 = 0x85fa_830b_8800_90df;
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP {NAME}: no aomenc/aomdec oracle at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_quad_leaf_tx_type.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let quad0 = crate::decode::chroma_quad_leaf_tx_hits();
+        let diff0 = crate::decode::chroma_quad_leaf_tx_diff_hits();
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        let quad = crate::decode::chroma_quad_leaf_tx_hits() - quad0;
+        let diff = crate::decode::chroma_quad_leaf_tx_diff_hits() - diff0;
+        assert_eq!(
+            frames, 4,
+            "{NAME}: expected 4 decode-order frames ({hidden} hidden)"
+        );
+        assert!(
+            quad >= 2 * diff && quad > 0,
+            "{NAME}: no chroma unit took its type from the covering luma leaf \
+             (quad {quad}, differs {diff}) -- the corrected route never ran"
+        );
+        assert!(
+            diff >= 2,
+            "{NAME}: the per-quadrant resolve never CHANGED an answer (diff {diff}; measured 4 \
+             on this stream, 2 of them in decode-order frame 1). A route counter alone is not a \
+             witness: it fires on every four-unit chroma read, including the \
+             blocks whose four leaves all agree -- the exact shape a no-op fix looked green on."
+        );
+        eprintln!("{NAME}: quad-resolved chroma units {quad}, of which {diff} differed");
+
+        // 4:2:0 control: the same decode, same counters, zero differences --
+        // the four-unit arm is the 4:4:4 (`ss 0/0`) route only.
+        let control = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/av1_192x128_8bit_intra64_in_inter.obu"),
+        )
+        .unwrap_or_else(|e| panic!("{NAME}: reading the 4:2:0 control: {e}"));
+        let c_quad0 = crate::decode::chroma_quad_leaf_tx_hits();
+        let c_diff0 = crate::decode::chroma_quad_leaf_tx_diff_hits();
+        let c_frames = decode_stream(&control)
+            .unwrap_or_else(|e| panic!("{NAME}: the 4:2:0 control no longer decodes: {e}"))
+            .len();
+        let c_quad = crate::decode::chroma_quad_leaf_tx_hits() - c_quad0;
+        let c_diff = crate::decode::chroma_quad_leaf_tx_diff_hits() - c_diff0;
+        assert!(c_frames > 0, "{NAME}: the 4:2:0 control decoded no frames");
+        assert_eq!(
+            (c_quad, c_diff),
+            (0, 0),
+            "{NAME}: the 4:2:0 control fired the 4:4:4 four-unit route ({c_quad} units, {c_diff} \
+             differing) -- the counter is not specific to the route it claims to witness"
+        );
+    }
+
     /// lane-inter4 r2: the 32x32-level inter `PARTITION_HORZ`/`PARTITION_VERT`
     /// strips (32x16 / 16x32) carrying a REAL residual -- the capability r1
     /// found missing ("a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
