@@ -9562,6 +9562,186 @@ pub(crate) mod tests {
             "{NAME}: measured byte 108"
         );
     }
+
+    /// lane-av1tilerows: the 4:4:4 LOSSLESS rect-pair chroma REACH fix --
+    /// the defect lane `av1formatsweep` filed as **H4** ("4:4:4 lossless +
+    /// `--tile-rows=1`, frame 3 onward the whole plane goes flat") and this
+    /// lane's red-before actually measured.
+    ///
+    /// **The H4 label was wrong; the defect it points at is real.** Two
+    /// corrections to the sweep's framing, both measured:
+    ///
+    /// 1. `--tile-rows=1` at 256x128 is a **no-op**. aomenc's default
+    ///    superblock is 128px, so 256x128 is 2x1 superblocks -- there is no
+    ///    second superblock ROW to split, and aomenc silently emits a
+    ///    stream BYTE-IDENTICAL to `--tile-columns=0 --tile-rows=0`
+    ///    (verified: both 64828 bytes, `cmp` equal). The sweep's "tiled"
+    ///    fixture contained no tile rows at all. Tile rows at 4:4:4
+    ///    lossless are exact here: measured pixel-exact at 1, 2 and 4 tile
+    ///    rows, both axes (2x2), at 256x128 / 256x256 / 128x256 / 512x128,
+    ///    on a recipe that is exact without tiles.
+    /// 2. The "frames 0-2 byte-exact, frame 3 onward flat, Y(0,0) 128 vs
+    ///    81" signature is a **harness frame-order mismatch, not a decode
+    ///    defect**: with altref on, aomdec's `EC_AV1_FINAL_DUMP` writes 7
+    ///    frames in DECODE order while `ffmpeg -f rawvideo` writes 6 in
+    ///    DISPLAY order. Indexing one against the other makes frame 1 differ
+    ///    by 29109 samples (30%) -- and aomdec-vs-ffmpeg ALONE reproduces
+    ///    the identical 29109/24412/20046/19906 counts with no edith
+    ///    decoder in the loop. Our decode-order output is byte-exact against
+    ///    the oracle on all 7.
+    ///
+    /// The defect IS real, is in the class the sweep named (a hardcoded
+    /// 4:2:0-shaped walk at 4:4:4), and is tile-INDEPENDENT: it reproduces
+    /// on the zero-tile stream. `decode.rs`'s lossless 16x4/4x16 chroma-pair
+    /// walk passed `tu_reach` a hardcoded 4:2:0 luma footprint
+    /// (`ox * 2, oy * 2, 8`) for every chroma transform unit. At 4:4:4 a
+    /// 4x4 chroma unit is 4x4 LUMA, so the footprint is doubled:
+    /// `Reach::of_tu`'s `col_off + tx_w < bw` test then answers against a
+    /// block twice its real width and every unit past the midpoint wrongly
+    /// reports `above_right = false`, so a directional chroma strip predicts
+    /// from a neighbour libaom never reads.
+    ///
+    /// **Measured site (red-before, `git stash` of the fix, same tree):**
+    /// `testsrc2 256x128 yuv444p`, aomenc `--profile=1 --lossless=1
+    /// --passes=1 --end-usage=q --threads=1 --row-mt=0 --limit=6
+    /// --cpu-used=2 --lag-in-frames=0 --kf-max-dist=100` (pinned below).
+    /// Frame 0 (the KEY frame) and all five inter frames: **63 samples wrong
+    /// per frame, U 29 + V 34, first at U(110,26) / V(108,26), deltas -10..+13**,
+    /// region x108..125 y26..29 -- a 16x4 chroma strip at 4:4:4, whose rows
+    /// are NOT block-aligned (y26), which is the signature of a REACH
+    /// answer and not of a coefficient or transform error.
+    ///
+    /// **Entropy is bit-identical**: `EC_SYMR` on both sides, 351109 reads
+    /// compared on `(value, range, symbol, post_rng)` with the CDF-row
+    /// convention reconciled (`32768 - ours_cdf0 == oracle_cdf0`): **zero
+    /// divergence**. So this is reconstruction arithmetic, not an entropy
+    /// fork -- which is what separates it from the H1 rect-partition fork
+    /// (that one forks `EC_SYMR` at `decodetxb.c:158` `txb_skip`).
+    ///
+    /// A second, far worse instance of the SAME defect is the 512x128
+    /// `--cpu-used=2` stream (18779 wrong in the key frame, growing to
+    /// 130708 by frame 5) -- but that stream ALSO forks entropy
+    /// (459866 oracle reads vs 369136 ours), so it is not claimed here;
+    /// it belongs to the H1 rect-partition lane. The pinned fixture below is
+    /// the entropy-clean, fully-repaired instance.
+    ///
+    /// Non-vacuity: the fixture bytes are pinned (length + FNV-1a, like the
+    /// other `ll444_*` pins), the header must really be `ss (0,0)` at 8-bit
+    /// with `lossless == 1` (asserted from the parsed sequence header, not
+    /// assumed), the tiled sweep gates' counter
+    /// `decode::rect4_16_lossless_chroma_hits()` must FIRE (measured 80
+    /// units on this fixture -- a 4:2:0 stream of the same content leaves it
+    /// at 0, because a 4:2:0 lossless 16x4 pair is an 8x4 chroma block and
+    /// takes the pair-merge, not this walk), and every frame must be
+    /// byte-exact through BOTH the oracle `aomdec --rawvideo` (decode order,
+    /// the 7-frame compare that the hidden-frame gates use) and ffmpeg
+    /// (display order, 4:4:4 full-resolution chroma).
+    #[test]
+    fn a_lossless_444_rect16x4_chroma_reach_is_ss_aware() {
+        const NAME: &str = "a_lossless_444_rect16x4_chroma_reach_is_ss_aware";
+        const FIXTURE_LEN: usize = 77918;
+        const FIXTURE_FNV: u64 = 0xe2a2_90ac_f249_4bf7;
+        const W: usize = 256;
+        const H: usize = 128;
+        const FRAMES: usize = 6;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_rect16x4_chroma_reach.obu");
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        // The header must really be the shape the fix is about: 4:4:4
+        // (ss 0/0) at 8-bit. A fixture that silently became 4:2:0 would
+        // take the pair-merge and make every arm below vacuous.
+        {
+            let mut p = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut seq = None;
+            while pos < stream.len() {
+                let Ok(obu) = p.parse_obu(&stream[pos..]) else {
+                    break;
+                };
+                pos += obu.total_size;
+                if matches!(obu.kind, ObuKind::SequenceHeader(_)) {
+                    seq = p.sequence_header();
+                    break;
+                }
+            }
+            let seq = seq.unwrap_or_else(|| panic!("{NAME}: no sequence header parsed"));
+            assert_eq!(
+                (seq.color_config.subsampling_x, seq.color_config.subsampling_y),
+                (0, 0),
+                "{NAME}: fixture is not 4:4:4 (ss {}x{})",
+                seq.color_config.subsampling_x,
+                seq.color_config.subsampling_y
+            );
+            assert_eq!(
+                seq.color_config.bit_depth, 8,
+                "{NAME}: fixture bit depth moved"
+            );
+            assert_eq!(seq.max_frame_width, W as u32, "{NAME}: fixture width moved");
+            assert_eq!(seq.max_frame_height, H as u32, "{NAME}: fixture height moved");
+        }
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_rect4_16_pair_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}")
+        });
+        let hits = crate::decode::rect4_16_lossless_chroma_hits();
+        assert!(
+            hits > 0,
+            "{NAME}: gate is vacuous -- no lossless 16x4/4x16 chroma-pair unit was \
+             walked (rect4_16_lossless_chroma_hits = {hits}), so the repaired \
+             `tu_reach` call site never ran"
+        );
+        assert_eq!(frames.len(), FRAMES, "{NAME}: shown frame count");
+        for f in &frames {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+
+        // The oracle, DECODE order, every frame including hidden alt-ref
+        // frames. This is the arm that proves the repair against aomdec's
+        // own reconstruction, not just ffmpeg's.
+        if aomdec_path().is_file() {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert!(
+                decoded >= FRAMES,
+                "{NAME}: oracle decoded {decoded} frames, expected at least {FRAMES}"
+            );
+            let _ = hidden;
+        } else {
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
+        }
+
+        // ffmpeg's decoder: DISPLAY order, full-resolution chroma.
+        if have_ffmpeg() {
+            let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
+            for (i, (got, want)) in frames.iter().zip(refs.iter()).enumerate() {
+                for (p, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                    .iter()
+                    .enumerate()
+                {
+                    let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ"
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME} ffmpeg arm: no ffmpeg");
+        }
+    }
     /// lane-av1-intrabc r4: the reviewer's unblock witness for the rect-strip
     /// reconstruction -- a CODED `use_intrabc` block (so its residual reader
     /// runs, not just the prediction copy) on a 2:1 strip in BOTH

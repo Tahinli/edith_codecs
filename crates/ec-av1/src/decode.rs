@@ -17479,12 +17479,26 @@ fn decode_rect4_16_strip(
                     for rr in 0..ch / 4 {
                         for cc in 0..cw / 4 {
                             let (ox, oy) = (cc * 4, rr * 4);
+                            // The unit's origin and extent in LUMA pixels: `<< ss`
+                            // at 4:2:0 (8x8 luma for a 4x4 chroma unit), identity
+                            // at 4:4:4 -- the same form as the block-walk sibling
+                            // at decode.rs:35342. The hardcoded `ox * 2 / 8` is
+                            // only right at ss (1,1): at 4:4:4 it claims a 4x4
+                            // chroma unit is 8x8 luma, so `of_tu`'s
+                            // `col_off + tx_w < bw` test answers against a
+                            // footprint twice the real one and every unit past
+                            // the block's midpoint wrongly reports
+                            // `above_right = false` -- a directional chroma
+                            // strip then predicts from a neighbour libaom
+                            // never reads (measured: key frame 0, 4:4:4 lossless
+                            // 16x4 strip at (104,26), U 29 + V 34 samples wrong,
+                            // entropy bit-identical over 351109 EC_SYMR reads).
                             let cu_reach = tu_reach(
                                 pw,
                                 ph,
-                                ox * 2,
-                                oy * 2,
-                                8,
+                                ox << ss_x(fctx),
+                                oy << ss_y(fctx),
+                                4 << ss_x(fctx),
                                 pair_reach,
                                 ppx,
                                 ppy,
@@ -17563,12 +17577,15 @@ fn decode_rect4_16_strip(
                             // one entry over the unit's two cells
                             // (`read_intra_chroma_lossless`).
                             let cu_around = neighbours.around_mi(cu_mi, MI);
+                            // Same ss-aware luma footprint as the skip arm
+                            // above -- `ox * 2 / 8` is the 4:2:0-only form and
+                            // mis-answers `of_tu` at 4:4:4 (see there).
                             let cu_reach = tu_reach(
                                 pw,
                                 ph,
-                                ox * 2,
-                                oy * 2,
-                                8,
+                                ox << ss_x(fctx),
+                                oy << ss_y(fctx),
+                                4 << ss_x(fctx),
                                 pair_reach,
                                 ppx,
                                 ppy,
