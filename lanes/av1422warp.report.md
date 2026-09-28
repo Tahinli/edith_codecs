@@ -1467,6 +1467,69 @@ transform-type set libaom selects for a 16x32 chroma plane block at
 
 Not pinned, no gate, refusal untouched.
 
+## Round 25 — attribution blocked by a rung gap; a real underflow found on the way
+
+New head for this section's code: `a4532a41`. Bypass reverted, worktree
+clean, 4:2:0 control byte-exact.
+
+### The attribution could not be completed — and why
+
+`EC_COEFF_STEP` is emitted on both sides, but **neither side's tags
+cover reads 107493-107517**: the last tagged read on both is 107492
+(`sign`/`post_golomb`) and the next is 107542 on ours and 107752 on the
+oracle's. So the `n=2,n=2,n=8` against `n=8,n=10,n=2` shape sits in a
+region where no coefficient rung fires on either side, and the promised
+lookup is not available without extending coverage into the phase that
+reads there (the `n=2` pair is partition-alphabet sized and the
+`n=8`/`n=10` are transform-type sized, which points at `read_var_tx_size`
+in `decodeframe.c` — untagged on both sides).
+
+### What the round did find: a real underflow in both OBMC walks
+
+Chasing the tag gap surfaced a **debug-build panic on a1.obu**:
+`attempt to subtract with overflow` at `decode.rs:31540`, then
+`31491` — `overlappable_left` and `overlappable_above`, both called
+from `decode_inter_block`.
+
+The OBMC pair merge snaps back to the chroma pair's even row/column
+(`row &= !1` / `col &= !1`, lane-obmcrec r1) so the ODD half is the
+neighbour for both strips. That snap rounds DOWN, so at an ODD
+`mi_row` / `mi_col` it lands on `mi_row - 1` / `mi_col - 1` and the
+`row - mi_row` / `col - mi_col` offsets pushed into the neighbour list
+underflow: `usize::MAX` in release, panic in debug. Both snaps are now
+clamped with `.max(mi_row)` / `.max(mi_col)`; where the offset was
+already non-negative the arithmetic is unchanged.
+
+**Witness and its limit.** The panic reproduces on a1.obu with
+`EC_TRACE_MODE_STEP=1`, single- AND multi-threaded, and does NOT
+reproduce without that flag — which I could not explain, and am
+recording as unexplained rather than inventing a reason. It is a
+provable arithmetic defect with a panic as its witness, so it is fixed;
+but it is **not** the frame-3 divergence: the 16-frame EC_SYMR
+sequence diff is unchanged and the first divergence is still seq=107517
+at mi(64,56). Identity re-proved after the edit: 4:2:0 control
+byte-exact, 4:4:4 witness byte-identical to the pre-lane build, both
+pinned 422 witnesses pixel-exact.
+
+### Handoff
+
+Two open items, and the first is now the smaller one:
+
+1. **Extend the coefficient/transform-type rung into `read_var_tx_size`
+   on both sides** (libaom `decodeframe.c`; this decoder's
+   `read_var_tx_size` / txfm_partition read). That is what turns
+   reads 107517-107519 from an alphabet guess into a symbol name, and
+   it is the same shape as the two rung-coverage gaps this lane has
+   already been bitten by.
+2. **The mi(64,56) 32x32 block's coefficient reads.** With coverage in
+   place, read the transform-type set libaom selects for this block's
+   16x32 rect chroma plane block at 4:2:2 against ours. The `n=8` vs
+   `n=10` alphabets already say the two sides are offering
+   transform-type sets of DIFFERENT SIZES for the same block, which is
+   a set-content or set-selection defect rather than a value one.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
