@@ -13256,7 +13256,28 @@ fn decode_block_rect(
         // --enable-tx-size-search=0 the encoder writes no such symbol, so the
         // decoder consumed one that was never there.
         {
-        let around = neighbours.around_rect(at, bw, bh);
+        // lane-av1422warp r20: this 32x16/16x32 strip reader is the SIBLING of
+        // `decode_leaf_rect`, and it was the one left ungated: at ss (1,0) the
+        // strip's chroma is a square (side/2, side) block whose above cells
+        // spread over `side` LUMA mi columns, so the per-mi rect gather
+        // double-counts every chroma column's whole-unit dc sign. Measured on
+        // the pinned 4:2:2 rotzoom stream (a1.obu frame 0): the chroma-U 4x4
+        // transform of the 32x16 strip at mi(68,16) reads its DC sign from
+        // `dc_sign_ctx` 1 where libaom reads row 0 -- the first read of
+        // 45260 whose pre-state, bit position and symbol all match and only
+        // the CDF row differs, and the first divergence in the EC_SYMR
+        // sequence (all 45259 reads before it pair exactly). Luma keeps the
+        // per-mi gather; 4:2:0 and 4:4:4 keep the plain rect walk verbatim.
+        let mut around = neighbours.around_rect(at, bw, bh);
+        if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+            let c2 = neighbours.around_mi_422_chroma(
+                (at.0 * (SUB / MI), at.1 * (SUB / MI)),
+                bw,
+                bh,
+            );
+            around[1] = c2[1];
+            around[2] = c2[2];
+        }
         let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, fi_tx_row(mode, filter_intra));
         let (luma_levels, luma_tx_type) = read_coeffs_rect(
             dec,

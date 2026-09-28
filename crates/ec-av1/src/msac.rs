@@ -396,8 +396,18 @@ impl<'a> SymbolDecoder<'a> {
     }
 
     /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
+    ///
+    /// `EC_SYMR=1` dumps every symbol read's PRE state (before the read and
+    /// before the adaptation) together with the symbol and the post-read
+    /// range, so a divergence against a reference decoder can be bisected
+    /// read by read. `cdf0` is the PRE-adapt row[0] -- the reference's own
+    /// print of the same row is POST-adapt, so compare `32768 - ours_cdf0`
+    /// against its `cdf0`, never the raw numbers.
     #[inline]
     pub fn symbol(&mut self, cdf: &mut [u16]) -> usize {
+        let symr = std::env::var_os("EC_SYMR").is_some();
+        let (pre_value, pre_range, pre_bit) = (self.value, self.range, self.bit);
+        let pre_cdf0 = cdf.first().copied().unwrap_or(0);
         // lane-census: the syntax census charges this symbol's bits to the
         // TABLE it read, so every coding tool is accounted without a
         // per-call-site label. Off (`EC_AV1_BITCENSUS` unset) this is one
@@ -418,6 +428,18 @@ impl<'a> SymbolDecoder<'a> {
         }
         if crate::census::armed() {
             crate::census::charge(cdf.as_ptr() as usize, self.tell_bits() - t0);
+        }
+        if symr {
+            eprintln!(
+                "EC_SYMR pre=({},{},{}) cdf0={} n={} s={} post_rng={}",
+                pre_value,
+                pre_range,
+                pre_bit,
+                pre_cdf0,
+                cdf.len() - 1,
+                s,
+                self.range
+            );
         }
         s
     }
