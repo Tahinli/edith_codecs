@@ -1581,6 +1581,64 @@ inter path's mi is not published by the intra mode reader.
 
 Not pinned, no gate, refusal untouched.
 
+## Round 27 — the inter path is tagged, and a wrong mi label of mine is fixed
+
+Instrument `7f55d054` (phase + corrected inter mi, no behaviour change;
+identity re-proved: 4:2:0 byte-exact, 4:4:4 byte-identical to the
+pre-lane build, both pinned 422 witnesses pixel-exact) and oracle
+snapshot `ec_symr_phase`.
+
+### A label error of mine, found and fixed at the source
+
+Round 27 first published the mi from `decode_inter_block`'s entry `at`.
+That labels a **different block**: it reported mi(28,52) for reads this
+decoder makes for mi(30,62). Our own `EC_MODE_VAL8` rung — printed by
+the function that actually reads the mode — reports mi(30,62). The
+phase/mi are now also published from `decode_inter_block8` at the
+block's own `leaf_mi`.
+
+This is round 22's misattribution class exactly, and it is now closed at
+the source rather than worked around: with the label correct the two
+sides are demonstrably in the SAME block.
+
+### The divergence, correctly attributed
+
+```
+oracle  ph=inter   mi=(30,62) n=2  s=1     107517   <-- the two missing reads
+        ph=inter   mi=(30,62) n=2  s=1     107518
+        ph=inter   mi=(30,62) n=8  s=3     107519
+ours    ph=inter8  mi=(30,62) n=8  s=3     107517   <-- identical to the oracle's 107519
+        ph=inter8  mi=(30,62) n=10 s=0     107518
+        ph=inter    mi=(32,0)  n=2  s=0    107519
+```
+
+Reads 107514-107516 pair at mi(30,62) on both sides. Then **this decoder
+omits two 2-symbol inter-mode reads that libaom makes**, and its n=8 at
+107519 is bit-identical to our n=8 at 107517 — a clean **two-symbol
+shift, same block, same coder state** (pre `val=45039, rng=61960`).
+
+**Not claimed: which two symbols.** libaom's 2-symbol reads in this
+region are `interintra_cdf[bsize_group]` (decodemv.c:1628) and, after a
+compound block, `comp_group_idx` / `compound_idx` (:1677, :1685); the
+`n=3` pair just before (107514-107515) is in the MV/dmv region, which
+this decoder's own path labels `inter8`. Pinning WHICH two requires
+matching the read to its CDF context, and the `EC_SYMR` line carries the
+`cdf0` pre-value but not the table identity — so the next step is to
+extend the print with the CDF pointer (or the `bsize_group`) and pair on
+that. I am not going to name them from alphabet size alone; that is the
+same shortcut that produced rounds 8, 11 and 15.
+
+### Handoff
+
+Extend `EC_SYMR` on both sides with the CDF table IDENTITY (pointer or
+`bsize_group`/`size_group` index) alongside `cdf0`. That is the last
+thing `cdf0` alone cannot tell you — two rows can share a first entry —
+and it converts "two 2-symbol reads" into the named pair. With that, the
+gate that decides whether this decoder reads them is one comparison away
+in the source.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
