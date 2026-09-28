@@ -50,16 +50,27 @@ name (no exactness claim possible or wanted); **–** = not measured.
 | cell | 8-bit | 10-bit | 12-bit |
 |---|---|---|---|
 | even dims, key+inter | Y (≈120 gates) | Y (≈40 gates) | Y (4 gates) |
-| **odd coded dims** (`w%8≠0` or `h%8≠0`) | **y → gate A** | **y → gate A** | **y → gate A** |
+| **even, not a multiple of 8** (`w%8≠0` or `h%8≠0`, both even) | **y → gate A** | **y → gate A** | **y → gate A** |
+| luma dimension itself ODD | not producible¹ | not producible¹ | not producible¹ |
 | partial-superblock edge (72, 136, …) | Y (`tiny_frame_size_sweep`) | Y | – |
 | tile columns / rows | Y (2 and 4, both axes) | Y (multi-tile family) | – |
 | superres | Y | Y | – |
 | film grain / warp / CDEF+LR | Y | Y | Y |
 
-Odd coded dimensions had **no committed gate at any depth**: every frame size
-in the crate (the tiny-size ladder included — 8, 16, 24, 32, 48, 64, 72, 136,
-192, 200…248) is a multiple of 8, so the partial-chroma-plane walk had no
-exactness evidence. Measured exact, and gated.
+¹ **Neither gateable nor refutable from this recipe:** aomenc rounds a 4:2:0
+frame's coded size DOWN to even, so no stream it produces from a lavfi source
+codes an odd luma dimension at all. Verified: a `testsrc2 131x131` yuv420p
+y4m (ffmpeg accepts it) encodes to a sequence header of `max_frame=130x130`,
+which this decoder decodes correctly; the ffmpeg reference for the same file
+comes back 131x131 because ffmpeg pads to the y4m header. Closing that cell
+needs a hand-built stream (the `Av1Parser` header writer the sweep's own
+`every_frame_size_a_header_can_code_has_a_mode_info_grid` gate already uses),
+not an aomenc recipe.
+
+Even non-multiple-of-8 dimensions had **no committed gate at any depth**:
+every frame size in the crate (the tiny-size ladder included — 8, 16, 24, 32,
+48, 64, 72, 136, 192, 200…248) is a multiple of 8, so the partial-chroma-plane
+walk had no exactness evidence. Measured exact, and gated.
 
 ### 4:4:4 (`ss 0,0`) — the whole committed base is LOSSLESS 8-bit
 
@@ -157,8 +168,13 @@ is not producible through the aomenc + lavfi recipe, so it can be neither
 gated nor refuted from here; the sweep's odd-dimension cell is "even, not a
 multiple of 8".
 
-**Still unproven:** gates B and C carry no mutation proof — they inherit the
-`aomdec` byte-compare proof the 180 existing gates run on.
+**Declared debt:** gates B (4:4:4 lossless 10-bit) and C (4:4:4 12-bit)
+carry NO targeted mutation proof. They inherit the `aomdec` byte-compare the
+180 existing gates run on, plus their own header/counter non-vacuity asserts
+(`rect_split_lossless_chroma444_hits()`, `mc_subpel_hits()`, the full-resolution
+chroma extent). A future lane that touches the 4:4:4 unit geometry should
+spend a mutation on them; the shape of the proof is the one in gate A's doc
+comment — mutate the site the CELL depends on, not a nearby helper.
 
 ## 3. Divergences, localized
 
@@ -216,17 +232,46 @@ only, luma exactly zero wrong**, magnitude ±1 (up to ±20 at cq 40).
 `EC_SYMR` on both sides: **140820 reads, zero divergence** — the entropy
 decode is bit-identical, so this is pure reconstruction arithmetic, not a
 fork. `--enable-tx-size-search=0` → exact; every filter toggle changes
-nothing. Prime suspect is the chroma transform-unit shape at `ss (0,0)`: at
-4:2:0 the chroma rect is halved and a `TX_32X64` chroma unit cannot arise,
-while at 4:4:4 it can, and libaom clamps it —
-`max_txsize_rect_lookup[BLOCK_32X64] = TX_32X64` then
-`av1_get_adjusted_tx_size` (`blockd.h` ~1363) reduces TX_32X64 to TX_32X32.
+nothing.
+
+**Round 2 (this lane, deeper).** The pre-filter dumps exonerate the whole
+filter chain: `EC_AV1_PREFILT_DUMP` on both sides shows frame 2 already
+carries 847 wrong CHROMA samples (luma 0 wrong) BEFORE deblock, CDEF and LR.
+The oracle's per-unit census (`EC_COEFF plane=… row=… col=… tx_size=…`) shows
+every chroma unit in this stream is `tx_size=3` (TX_32X32) at mi_row 0 / 0 and
+mi_row 16, mi_col 0 and 8 — i.e. the `av1_get_adjusted_tx_size` clamp the
+first suspect pointed at is ALREADY being applied correctly on both sides
+(`decode_inter_block`'s 4:4:4 arm computes `if side >= 64 { 32 }`), and there
+is no chroma unit at mi_row 8 at all. The wrong pixels are exactly the left
+column of chroma units of the BOTTOM, frame-edge PARTIAL block row (frame is
+96 high, blocks 64: the second block row has 32 real luma rows, so its chroma
+band is 32 rows at `ss (0,0)` where 4:2:0 would give 16). Both sides walk the
+same units with the same coefficients, so the defect is in what happens to
+that partial block's chroma — its `unit_height` /
+`ROUND_POWER_OF_TWO` clamp at `ss 0` (decodeframe.c:989) or its above/left
+prediction reach at the frame edge — not in the transform-size rule.
+
+Named next step for the follow-up lane: dump both sides'
+`EC_PRED`/`EC_MCB` at the mi_row-16 chroma unit and compare the predicted
+plane before the residual add, which splits "prediction reach" from
+"reconstruction arithmetic" in one run.
 
 ### H3 — 4:4:4 lossless + 2 tile columns: 90 chroma samples wrong in the key frame
 
 256x128 `testsrc2 yuv444p`, `--lossless=1 --tile-columns=1`, 6 frames,
 aomdec-confirmed (not an ffmpeg artefact). Frame 0: exactly 90 wrong
 samples, U and V, ±1, first at U(237,58). Frames 1–5: byte-exact.
+
+**Round 2 (this lane).** Also pre-filter: the same `EC_AV1_PREFILT_DUMP`
+pair shows all 90 samples wrong BEFORE deblock/CDEF/LR, luma 0 wrong. The
+decisive new fact is that frames 1–5 are byte-exact even though they predict
+from that same key frame — so the wrong samples are never read as a
+prediction source, which points at the key frame's chroma OUTPUT/crop or
+reference-store path rather than at reconstruction arithmetic every frame
+shares. **H2 and H3 therefore do NOT reduce to one defect:** same stage
+(pre-filter reconstruction), same plane (chroma only), same magnitude (±1) —
+but H2 fires on inter frames at a frame-edge partial block row and H3 fires
+on a lossless key frame and never propagates.
 
 ### H4 — 4:4:4 lossless + 2 tile ROWS: hard divergence
 
@@ -266,9 +311,12 @@ dimensions; 4:4:4 at 10/12-bit with tiles; 12-bit 4:4:4 lossless; 4:4:0
    (single-tile-row frame-edge walk).
 3. **H5** 4:4:4 10-bit lossless 128-root — a cell the 8-bit 444 gates
    suggest is safe and is not.
-4. **H2** 4:4:4 lossy + tx size search chroma ±1 — reconstruction-only,
-   entropy-clean, so the `av1_get_adjusted_tx_size` clamp is the first thing
-   to check.
+4. **H2** 4:4:4 lossy + tx size search chroma ±1 — reconstruction-only and
+   entropy-clean; round 2 exonerated the filter chain AND the tx-size clamp
+   (both sides already read TX_32X32 chroma units), so the remaining
+   candidates are the frame-edge partial block row's chroma `unit_height`
+   clamp and its prediction reach. One `EC_PRED`/`EC_MCB` pair at the
+   mi_row-16 chroma unit splits those two.
 5. **H3** 4:4:4 lossless + tile columns, 90 chroma samples — smallest
    magnitude, likely the same root as H2.
 
