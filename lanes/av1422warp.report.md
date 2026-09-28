@@ -1224,13 +1224,10 @@ frame  7:      0   EXACT     frame 15:      0   EXACT
 **3/16 frames exact (0, 7, 15)** — up from 0/16 — and the total is
 1332125 differing samples, down from 1619115.
 
-**Frame 1 is a RECONSTRUCTION defect, not an entropy one**: the EC_SYMR
-sequence pairs across all of frame 1 (reads 46260..104192) while its
-pixels differ by 33375 samples. Whatever it is, it is downstream of a
-correct bitstream — a different class again, and the first thing worth
-attacking, because it needs no entropy forensics at all.
-
-**Frame 2 onward is the new entropy class** at read 107517.
+**RETRACTED — see round 22.** This section indexed pictures by SHOW
+order while the dumps and the EC_SYMR sequence are DECODE order. Scanned
+correctly there is ONE defect: picture 3 is the first damaged picture and
+the read-107517 entropy divergence is in that same picture.
 
 ### Handoff
 
@@ -1247,6 +1244,90 @@ Two open items, neither in the closed family:
    mi columns) and a frame's intra/inter block decision. The
    sequence-numbered EC_SYMR diff is now a working instrument for that,
    with per-TU exactness on frames 0/7/15 as the baseline.
+
+Not pinned, no gate, refusal untouched.
+
+## Round 22 — the stage exoneration, and a CORRECTION to round 21
+
+No code shipped this round; the tree is back at `401118ea`, bypass
+reverted, 4:2:0 control byte-exact.
+
+### CORRECTION to round 21: there is ONE defect, not two
+
+Round 21 said "frame 1 is a reconstruction defect with exact entropy" and
+"frame 2 is the new entropy class". That was **output-index confusion**:
+the stage dumps are indexed by DECODE-order picture, the raw output by
+SHOW order, and with alt-ref they differ. Scanned properly, over the
+decode-order pictures:
+
+```
+pictures 0, 1, 2 : PREFILT identical AND final identical
+picture  3       : PREFILT DIFFERS (first Y at (128,0), U at (128,1), V at (128,9))
+pictures 4..15   : all differ
+```
+
+So picture 3 is the first damaged picture and the EC_SYMR divergence at
+read 107517 is IN picture 3 — the same defect, entropy and pixels
+together. The round-21 "two residuals" framing is withdrawn.
+
+### Loop filters exonerated
+
+On the oracle's own frame-1 dump, `post-deblock` and `post-CDEF` both
+differ from `final` (first difference at index 116), so CDEF and loop
+restoration are **active** on this picture, and the picture is exact at
+PREFILT anyway. The defect is therefore upstream of the loop filters —
+reconstruction, reached through the entropy desync, not a filter stage.
+
+### The block, named precisely
+
+At read 107517 both decoders are at the same coder state
+(pre `value=45039, range=61960`, same bit). The block is the 4x4 sub-8x8
+leaf at **mi(24,57)** and the syntax pairs to its mode:
+
+```
+ours    mi(24,57) skip cdef dq  mode -> 41536            ... and stops
+oracle  mi(24,57) skip cdef dq  mode=0  angle_y=0
+                   uv_mode=13  angle_uv=0  use_filter_intra=1  filter_intra_mode=0
+```
+
+**This decoder reads no chroma syntax at all on that leaf** — it treats
+the odd mi column as never a chroma reference. libaom reads four more
+symbols there, and across the trace it reads `uv_mode` at odd columns
+118 times, so this is systematic, not a one-off.
+
+libaom's actual predicate (`av1_common_int.h:1459-1460`) is per axis
+
+```
+(mi_col & 1) || !(bw & 1) || !subsampling_x
+```
+
+so for a ONE-mi-wide leaf — what a VERT split of an 8x16 strip leaves —
+the chroma reference is the ODD column, whichever leaf index that is.
+`decode_leaf_split4` already implements exactly that (`(lmi.1 & 1) == 1`).
+`decode_leaf_rect8`'s vert clause is `!vert || i == 1`, which names the
+SECOND leaf unconditionally: right only when the split starts on an even
+column, inverted when it starts on an odd one.
+
+**Implemented, measured, and REVERTED.** With the `i == 1` clause
+corrected to the column parity, the 16-frame EC_SYMR sequence diff is
+**bit-identical to before** (first divergence still 107517) — this stream
+never reaches the inverted case, so the change is correct by source and
+**unexercised here**. Shipping an unproven change is not this lane's
+practice, so it is recorded as a candidate rather than committed.
+
+### Handoff
+
+The defect is a chroma-reference test that is wrong on an odd mi column.
+Two of the three sub-8x8 arms are now known: `decode_leaf_split4` is
+correct, `decode_leaf_rect8` is correct-by-source but unexercised. **A
+trace of `has_chroma` fired 268 times on this stream and never once for
+mi(24,57)**, so the arm that reads that leaf has not been identified —
+neither `decode_leaf_split4` nor `decode_leaf_rect8` is called for it.
+The first concrete step is to find that third path (or the condition
+under which those two are reached for a 4x4 leaf at an odd column),
+apply the `av1_common_int.h:1459-1460` predicate, and re-run the
+sequence diff: the EC_SYMR instrument is a working oracle for it and
+pictures 0/1/2 are per-TU exact as the baseline.
 
 Not pinned, no gate, refusal untouched.
 
