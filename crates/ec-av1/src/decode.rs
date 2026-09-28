@@ -5610,6 +5610,37 @@ pub(crate) fn uv_tile_edge_suppressed_hits() -> usize {
     UV_TILE_EDGE_SUPPRESSED_HITS.with(|c| c.get())
 }
 
+// lane-av1leftref: how many chroma intra-edge filter-type reads land on a
+// left neighbour whose `uv_mode` at libaom's real read cell
+// (`base_mi[ss_y * mi_stride - 1]` = row `+ss_y`, col `-1`) DIFFERS from the
+// cell this decoder used to read (its own mi row). Two buckets: the raw mode
+// value moved, and `is_smooth_mode` -- the boolean the read actually feeds --
+// flipped. The second is the one that can move pixels.
+thread_local! {
+    static UV_LEFT_SS_Y_MODE_DIFF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static UV_LEFT_SS_Y_SMOOTH_DIFF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    static UV_LEFT_SS_Y_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`UV_LEFT_SS_Y_READS`].
+pub fn uv_left_ss_y_reads() -> usize {
+    UV_LEFT_SS_Y_READS.with(|c| c.get())
+}
+
+/// Current value of [`UV_LEFT_SS_Y_MODE_DIFF_HITS`].
+pub fn uv_left_ss_y_mode_diff_hits() -> usize {
+    UV_LEFT_SS_Y_MODE_DIFF_HITS.with(|c| c.get())
+}
+
+/// Current value of [`UV_LEFT_SS_Y_SMOOTH_DIFF_HITS`].
+pub fn uv_left_ss_y_smooth_diff_hits() -> usize {
+    UV_LEFT_SS_Y_SMOOTH_DIFF_HITS.with(|c| c.get())
+}
+
 // lane-cfl r1 gate counters: `UV_CFL_PRED` blocks (every `cfl_alpha_signs`
 // read) and chroma blocks with a NONZERO `angle_delta_uv` -- the two block
 // shapes the r1 chroma defect showed up on.
@@ -9555,7 +9586,15 @@ impl Neighbours {
         // by `-(mi_row & ss_y) * stride - (mi_col & ss_x)`. The helper applies
         // the two chroma-reference offsets on top of it -- see its own comment
         // for which axis each one moves.
-        self.smooth_uv_neighbour_unsnapped(mi_r & !snap_y, mi_c & !snap_x, r, c, ss_x(fctx))
+        self.smooth_uv_neighbour_unsnapped(
+            mi_r & !snap_y,
+            mi_c & !snap_x,
+            r,
+            c,
+            ss_x(fctx),
+            ss_y(fctx),
+            true,
+        )
     }
 
     /// [`Self::smooth_uv_neighbour`] without the chroma-reference snap, i.e.
@@ -9563,6 +9602,13 @@ impl Neighbours {
     /// counter wants this: it measures how often the snap CHANGES the answer,
     /// which is what the lane-kf1200/kf900 chroma-reference fix buys. Every
     /// decode path uses the snapping form.
+    /// `decode_path` is `true` only for the snapping form every decode call
+    /// site uses; the 16x4/4x16 pair witness's mirror passes `false`, so the
+    /// `+ss_y` counters measure the read that actually filters a chroma edge
+    /// and not the counter-only one. (The mirror reads an ODD mi row -- the
+    /// pair's chroma-reference half -- where the two cells differ far more
+    /// often; counting it would make this lane look reachable when no
+    /// committed fixture reaches it on the decode path.)
     fn smooth_uv_neighbour_unsnapped(
         &self,
         mi_r: usize,
@@ -9570,6 +9616,8 @@ impl Neighbours {
         r: usize,
         c: usize,
         ss_x: usize,
+        ss_y: usize,
+        decode_path: bool,
     ) -> bool {
         // lane-mtfix r1: availability is TILE-relative on BOTH axes and on the
         // coarse fallback too. `above_uv_mode` is a frame-wide [`SUB`]-grid
@@ -9611,34 +9659,73 @@ impl Neighbours {
         // chroma edge reaches into the right-hand luma block, and that is where
         // its reference lives.
         //
-        // NOT SHIPPED -- KNOWN UNRESOLVED: the left read's `+ss_y` ROW term.
-        // libaom puts the left reference one mi row DOWN at 4:2:0 and 4:4:0
-        // (`ss_y == 1`) and on its own row at 4:2:2 (`ss_y == 0`); this reads
-        // its own row at every subsampling. An earlier attempt applied the
-        // `ss_y` term to the WRONG read (the above) and regressed the
-        // byte-exact 4:2:0 control, which is what exposed the crossing. No
-        // committed fixture presents a 1-mi-tall left neighbour (an 8x4 leaf's
-        // left block) at 4:2:0/4:4:0, so nothing here can witness the correct
-        // term today -- treat this as a named open discrepancy, not a settled
-        // one. Unblock: one such stream.
+        // SHIPPED (lane-av1leftref): the left read's `+ss_y` ROW term -- the
+        // last open item lane-av1422warp carried. libaom puts the left
+        // reference one mi row DOWN at 4:2:0 and 4:4:0 (`ss_y == 1`) and on
+        // its own row at 4:2:2 (`ss_y == 0`); this read its own row at every
+        // subsampling. An earlier attempt applied the `ss_y` term to the WRONG
+        // read (the above) and regressed the byte-exact 4:2:0 control, which
+        // is what exposed the crossing. The premise that blocked the correct
+        // read -- "no committed fixture presents a 1-mi-tall left neighbour at
+        // 4:2:0/4:4:0" -- was wrong: the observable condition is not the 8x4
+        // leaf specifically but any left neighbour at most 1 mi tall, which
+        // 4:2:0 partitioning produces constantly. Six committed 4:2:0
+        // fixtures reach it (see the report's measurement table), and on
+        // `hg_ss600_key_frame.obu` the boolean flips.
         let above_mi = (mi_r.saturating_sub(1), mi_c + ss_x);
-        let left_mi = (mi_r, mi_c.saturating_sub(1));
+        // lane-av1leftref: libaom's LEFT read carries the `+ss_y` ROW term --
+        // `base_mi[ss_y * mi_stride - 1]` (`av1_common_int.h:1400-1401`) is
+        // one mi row DOWN at 4:2:0 and 4:4:0 (`ss_y == 1`), and on its own
+        // row at 4:2:2 (`ss_y == 0`) and 4:4:4. The read below used its own
+        // row at every subsampling. The term is only observable when the two
+        // cells hold DIFFERENT blocks, i.e. the left neighbour is 1 mi tall or
+        // shorter -- then `(row, col-1)` and `(row+1, col-1)` are two blocks
+        // and only libaom's is the chroma reference. The two counters below
+        // are the gate's non-vacuity proof: the mode value moved on
+        // `UV_LEFT_SS_Y_MODE_DIFF_HITS` reads, and the boolean this feeds
+        // (`is_smooth_mode` -> `av1_get_intra_edge_filter_type` -> the chroma
+        // edge filter) flipped on `UV_LEFT_SS_Y_SMOOTH_DIFF_HITS`.
+        let left_mi = (mi_r + ss_y, mi_c.saturating_sub(1));
+        let read_left = |row: usize| -> usize {
+            match self.uv_mode_row.get(row) {
+                _ if have_left && let Some(m) = cell(&self.uv_mode_grid, row, left_mi.1) => m,
+                Some(&(col, m)) if have_left && usize::from(col) == left_mi.1 => usize::from(m),
+                _ if have_left => self.left_uv_mode[r],
+                _ => DC_PRED,
+            }
+        };
         let above = match self.uv_mode_col.get(above_mi.1) {
             _ if have_above && let Some(m) = cell(&self.uv_mode_grid, above_mi.0, above_mi.1) => m,
             Some(&(row, m)) if have_above && usize::from(row) == above_mi.0 => usize::from(m),
             _ if have_above => self.above_uv_mode[c],
             _ => DC_PRED,
         };
-        let left = match self.uv_mode_row.get(left_mi.0) {
-            _ if have_left && let Some(m) = cell(&self.uv_mode_grid, left_mi.0, left_mi.1) => m,
-            Some(&(col, m)) if have_left && usize::from(col) == left_mi.1 => usize::from(m),
-            _ if have_left => self.left_uv_mode[r],
-            _ => DC_PRED,
-        };
+        let left = read_left(left_mi.0);
+        // lane-av1leftref: the gate's reach + load-bearing counters. `READS` is
+        // how many chroma edge-filter-type reads took this path at all, so a
+        // gate can tell "the arm never ran" from "the arm ran and the `+ss_y`
+        // term did not change the answer". The two DIFF buckets compare
+        // libaom's read cell against the pre-lane own-row cell; both read 0 on
+        // every committed fixture and every one of the ~1000 encodes swept in
+        // `lanes/av1leftref.report.md`, which is what makes the read change a
+        // proven no-op on today's material rather than an unmeasured guess.
+        if decode_path && have_left && ss_y > 0 {
+            hit!(UV_LEFT_SS_Y_READS);
+            // The pre-lane read, kept as the counter's own-row arm: it is what
+            // this decoder answered before the `+ss_y` term landed, and
+            // comparing against it is what proves the term is load-bearing.
+            let own_row = read_left(mi_r);
+            if own_row != left {
+                hit!(UV_LEFT_SS_Y_MODE_DIFF_HITS);
+            }
+            if is_smooth_mode(own_row) != is_smooth_mode(left) {
+                hit!(UV_LEFT_SS_Y_SMOOTH_DIFF_HITS);
+            }
+        }
         if have_above && cell(&self.uv_mode_grid, mi_r - 1, mi_c).is_some_and(|m| {
             !matches!(self.uv_mode_col.get(mi_c), Some(&(row, cm)) if usize::from(row) == mi_r - 1 && usize::from(cm) == m)
-        }) || have_left && cell(&self.uv_mode_grid, mi_r, mi_c - 1).is_some_and(|m| {
-            !matches!(self.uv_mode_row.get(mi_r), Some(&(col, cm)) if usize::from(col) == mi_c - 1 && usize::from(cm) == m)
+        }) || have_left && cell(&self.uv_mode_grid, left_mi.0, left_mi.1).is_some_and(|m| {
+            !matches!(self.uv_mode_row.get(left_mi.0), Some(&(col, cm)) if usize::from(col) == left_mi.1 && usize::from(cm) == m)
         }) {
             hit!(UV_MODE_GRID_OVERRIDE_HITS);
         }
@@ -17365,7 +17452,15 @@ fn decode_rect4_16_strip(
         // counter's mirror of the snapping form, and the shipped read offsets
         // the above COLUMN by `+ss_x` (libaom's `chroma_above_mi`).
         if smooth_neighbor_uv
-            != neighbours.smooth_uv_neighbour_unsnapped(lmi.0, lmi.1, r, c, ss_x(fctx))
+            != neighbours.smooth_uv_neighbour_unsnapped(
+                lmi.0,
+                lmi.1,
+                r,
+                c,
+                ss_x(fctx),
+                ss_y(fctx),
+                false,
+            )
         {
             hit!(RECT4_16_UV_PAIR_FILT_HITS);
         }
