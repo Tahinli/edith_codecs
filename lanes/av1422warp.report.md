@@ -196,15 +196,64 @@ a missing read, and the `EC_ISTEP` line ORDER is not comparable between the two
 builds (the oracle's trace jumps back from mi(50,26) to mi(48,28)), so the
 step-by-step pairing cannot be used to bracket the extra read either.
 
+### The bit-position bisect (run; narrows it, does not close it)
+
+I added an exact bit position to the coefficient rungs on BOTH sides — ours via
+the existing `SymbolDecoder::debug_bitpos()` (`msac.rs:520`), the oracle via
+`aom_reader_tell(r)` in `decodetxb.c`'s `EC_COEFF_STEP` prints — rebuilt
+`aomdec` with ninja, and paired the all_zero-level traces on bit position rather
+than on the colliding 16-bit `rng`. Both rungs have since been reverted (the
+oracle's `aomdec` is rebuilt to its committed shape; `strings aomdec | grep -c
+bitpos` = 0).
+
+The result is a clean constant, and it is the strongest statement this lane can
+make about the desync:
+
+```
+unit          oracle bit    ours bit    delta
+1414              56335        56349      -14
+1415              56347        56361      -14
+1416              56374        56388      -14
+1417              56424        56438      -14
+1418              56469        56483      -14     <- last unit that pairs
+1419              56507        56527      -20     <- first divergent unit
+```
+
+The offset is a **constant -14** for every unit from 0 to 1418 — a fixed
+convention difference between `debug_bitpos` and `aom_reader_tell`, nothing more.
+At unit 1419 it becomes **-20**: relative to that baseline we are **exactly 6 bits
+ahead**. So whatever the defect is, between unit 1418's `txb_skip` read and unit
+1419's, we consume 6 more bits than libaom. That is a magnitude, and it is
+bounded and small — not a whole skipped block or a whole mis-sized symbol read.
+
+**Why this does not name the symbol.** I extended the same `bitpos` field to the
+per-coefficient `tag=base` / `tag=br` prints to bisect inside the window, and
+tried a bit-anchored greedy alignment of the two step streams. It does not work,
+and the reason is worth recording: the two readers traverse a transform unit's
+coefficients in DIFFERENT ORDERS (the oracle goes `read_coeffs_reverse_2d`, `c`
+descending from `end_si`; ours emits `c=53, c=52, c=51` on what is plainly a
+different unit), so their step streams have no index correspondence — 32500
+oracle steps against 16464 of ours. Matching on bit position alone is ambiguous
+and the alignment breaks within the first few hundred steps, long before the
+window of interest. **A next lane must not trust a step-index pairing here.**
+
+The workable refinement, which this lane did not have the budget to run: restrict
+the comparison to ONE transform unit at a time (pair on the unit's own
+coordinates, per the `ec-av1-oracle-trace-pairing` skill's "restrict pairing to
+one frame/block" rule) rather than to the whole step stream. The 6-bit magnitude
+says the target is very close — the same unit's tail, or the mode reads between
+two units.
+
 ### Unblock
 
-Bisect the bit position directly, not through the 16-bit `rng` the rungs print
-(it collides and the two traces interleave differently). Concretely: add an
-`EC_BITPOS` rung to the oracle's `aom_read_symbol`/header read and to ours,
-then diff the two symbol sequences between mi(50,26)'s last chroma unit and
-mi(50,28)'s `skip`. The 4:2:2-only constructs in that window are the candidates:
-the chroma-reference bookkeeping for the shared mi(50,27) column, and whatever
-the 4:2:2 block tail reads after the shared chroma. Fixtures and dumps are in
+The bit-position bisect below has been run and narrows this to a **6-bit**
+excess consumed between unit 1418's and unit 1419's `txb_skip` reads. Continue
+by restricting the per-coefficient step pairing to a SINGLE transform unit at a
+time — the whole-stream pairing does not work, because the two readers traverse
+a unit's coefficients in different orders. The 4:2:2-only constructs in that
+window remain the candidates: the chroma-reference bookkeeping for the shared
+mi(50,27) column, and whatever the 4:2:2 block tail reads after the shared
+chroma. Fixtures and dumps are in
 `~/.cache/av1422warp/` (`a1_f0.obu`, `f0.opred`, `f0.mpred`, `f0.ocoeff`,
 `f0.mcoeff`, `f0.ostep`, `f0.step`, `f0.otx`); the probe bypass
 (`EC_AV1_ALLOW_422_PROBE`) is reverted and in no commit.
