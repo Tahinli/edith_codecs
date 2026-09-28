@@ -1,5 +1,3 @@
-/home/tahinli/Documents/Code/Rust/edith_codecs/crates/ec-av1/examples/decode_probe.rs:
-
 //! Where does a real stream stop? Decode one AV1 file and print the answer.
 //!
 //! The gates in [`ec_av1::stream`] each pin one capability against one encoder

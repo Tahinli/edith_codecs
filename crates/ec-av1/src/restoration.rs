@@ -479,8 +479,16 @@ fn ceil_div(a: u32, b: u32) -> u32 {
 /// is >= 64px, so only the top-of-superblock call ever has non-empty
 /// corners, matching this decoder's own once-per-SB call site) and reads
 /// one `read_lr_unit` per covered `(rrow, rcol)`, per plane, in plane
-/// order. `sb_mi` is the superblock's mode-info width (`SB_MI`, 16 for the
-/// 64px superblocks this decoder always uses).
+/// order.
+///
+/// `mi_row`/`mi_col`/`sb_mi` are all in **mode-info units (4x4)**, in true
+/// frame coordinates -- this is the one call that converts a superblock's
+/// position into absolute frame space, so it cannot carry the half-mi
+/// convention the partition walks use. A 64px superblock is 8 mi and a
+/// 128px superblock is 16 mi; the callers pass `SB_MI / 2` and `SB_MI`
+/// respectively (`SB_MI` being 16). The corners themselves then step each
+/// axis by [`MI_SIZE_8PX`] pixels -- see that constant's doc for why it is
+/// 8 and not libaom's 4.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_lr(
     dec: &mut SymbolDecoder,
@@ -501,27 +509,50 @@ pub(crate) fn read_lr(
         if ftype == RestorationType::None {
             continue;
         }
-        let mi_size = if plane == 0 {
-            4u32
+        // `av1_loop_restoration_corners_in_sb` (restoration.c:1303-1338),
+        // transcribed per axis. The two axes are NOT symmetric: libaom
+        // derives `mi_size_x` from `subsampling_x` and `mi_size_y` from
+        // `subsampling_y`, and derives the row corners from the Y term
+        // alone. This decoder used one `mi_size = 4 >> subsampling_x` for
+        // both axes, so at 4:2:2 (ss_x 1, ss_y 0) the row range was
+        // computed from the COLUMN axis's subsampling -- a 4x-too-small
+        // row step, which made `rrow0 == rrow1` (an empty range, zero
+        // `read_lr_unit` calls) wherever libaom reads a chroma unit. That
+        // is the two missing `wiener_restore_cdf` reads this lane spent
+        // nine rounds localising: the oracle reads three at mi(30,62),
+        // this decoder read one.
+        //
+        // One mode-info unit is 8 pixels (`MI_SIZE_8PX`; see its doc for why
+        // that is not libaom's `MI_SIZE`). Superres
+        // widens the column axis only (spec 7.16), so it enters `num_x`
+        // and `denom_x` and leaves the row axis alone, exactly as libaom
+        // does with `av1_superres_scaled`.
+        let is_uv = plane != 0;
+        let ss_x = if is_uv {
+            crate::decode::ss_x(fctx) as u32
         } else {
-            4u32 >> (crate::decode::ss_x(fctx) as u32)
+            0
         };
+        let ss_y = if is_uv {
+            crate::decode::ss_y(fctx) as u32
+        } else {
+            0
+        };
+        let mi_size_x = MI_SIZE_8PX >> ss_x;
+        let mi_size_y = MI_SIZE_8PX >> ss_y;
         let unit_size = lr.loop_restoration_size[plane];
         let horz_units = grid.horz_units[plane] as u32;
         let vert_units = grid.vert_units[plane] as u32;
-        // `av1_loop_restoration_corners_in_sb` (restoration.c:1314): under
-        // superres the mi column is in DOWNSCALED units while the unit grid
-        // is in upscaled ones, so the column division scales by
-        // `superres_denom / SCALE_NUMERATOR` (`mi_to_num_x`/`denom_x`). Rows
-        // are never scaled (spec 7.16 widens columns only).
         let (num_x, denom_x) = match crate::decode::superres(fctx) {
-            Some((_, denom)) => (mi_size * denom, unit_size * 8),
-            None => (mi_size, unit_size),
+            Some((_, d)) => (mi_size_x * d, unit_size * SCALE_NUMERATOR),
+            None => (mi_size_x, unit_size),
         };
+        let num_y = mi_size_y;
+        let denom_y = unit_size;
         let rcol0 = ceil_div(mi_col * num_x, denom_x);
         let rcol1 = ceil_div((mi_col + sb_mi) * num_x, denom_x).min(horz_units);
-        let rrow0 = ceil_div(mi_row * mi_size, unit_size);
-        let rrow1 = ceil_div((mi_row + sb_mi) * mi_size, unit_size).min(vert_units);
+        let rrow0 = ceil_div(mi_row * num_y, denom_y);
+        let rrow1 = ceil_div((mi_row + sb_mi) * num_y, denom_y).min(vert_units);
         let chroma = plane != 0;
         for rrow in rrow0..rrow1 {
             for rcol in rcol0..rcol1 {
@@ -555,6 +586,27 @@ thread_local! {
     static LR_LAST_STRIPE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Pixels per mode-info unit (4x4 mi is 8 pixels). This is what
+/// `av1_loop_restoration_corners_in_sb` (`restoration.c:1303-1338`) steps
+/// each axis by, subsampled per axis: `MI_SIZE_8PX >> ss_x` for columns,
+/// `MI_SIZE_8PX >> ss_y` for rows.
+///
+/// NAMING, because it is a trap: libaom's own `MI_SIZE` is **4**
+/// (`av1/common/enums.h:39-40`, `1 << MI_SIZE_LOG2` with `MI_SIZE_LOG2 2`),
+/// and libaom writes `mi_size_x = MI_SIZE >> ss_x` -- the same expression,
+/// at half this value. The factor of two is not a transcription slip: its
+/// `denom_x`/`denom_y` (`rsi->restoration_unit_size`) is a PIXEL count
+/// (128 for a 128px superblock), so libaom's numerator and denominator
+/// already sit on opposite scales, and doubling the numerator lands both in
+/// pixels. This constant is deliberately NOT called `MI_SIZE`, so nobody
+/// "corrects" it back to 4 and halves every restoration-unit range.
+///
+/// The authority is the paired trace, not this comment: at 8 the whole
+/// 16-frame 4:2:2 stream pairs 246735-for-246735 against the instrumented
+/// oracle, and at 4 it does not.
+const MI_SIZE_8PX: u32 = 8;
+/// `SCALE_NUMERATOR` (aom_scale.h): the superres scale's fixed point, 8.
+const SCALE_NUMERATOR: u32 = 8;
 /// Current value of [`LR_STRIPE0_HITS`].
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn lr_stripe0_hits() -> usize {

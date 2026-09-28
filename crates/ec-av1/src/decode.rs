@@ -1,5 +1,3 @@
-/home/tahinli/Documents/Code/Rust/edith_codecs/crates/ec-av1/src/decode.rs:
-
 //! Software decoder for this crate's own key-frame tile payloads (spec 5.11),
 //! the reader half of [`crate::tile`]'s writer.
 //!
@@ -4918,6 +4916,47 @@ pub(crate) fn warp_selected_hits() -> usize {
 // into the compound intermediate) rather than translationally -- the
 // gate's proof that a `GLOBAL_GLOBALMV` block under a ROTZOOM/AFFINE model
 // really reached [`crate::warp::warp_affine_compound`].
+// lane-av1422warp: the 4:2:2 coverage witness has to show compound and warped
+// motion firing ABOVE the vertical midpoint, and every pre-existing warp
+// counter is frame-global. These two are the same arms restricted to blocks
+// whose top mode-info row is in the frame's upper half, which is the half
+// this lane's evidence covers.
+thread_local! {
+    static TOP_HALF_COMPOUND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOP_HALF_WARP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many `GLOBAL_GLOBALMV` (compound) inter blocks decoded in the frame's
+/// upper half -- the block's top mode-info row is under `mi_rows / 2`.
+///
+/// NO COMMITTED TEST READS THIS, and none can while the 4:2:2 header refusal
+/// stands: the pinned 4:2:2 coverage gate asserts the byte pin and the
+/// refusal by name, so nothing in the suite ever decodes a 4:2:2 stream.
+/// The figure quoted for that fixture comes from a patch-run-restore build
+/// with the `EC_AV1_ALLOW_422_PROBE` bypass applied and then reverted, which
+/// is the same discipline every 4:2:2 lane in this family uses.
+#[allow(dead_code)]
+pub(crate) fn top_half_compound_hits() -> usize {
+    TOP_HALF_COMPOUND_HITS.with(std::cell::Cell::get)
+}
+
+/// How many inter blocks in the frame's upper half satisfy libaom's
+/// `is_global_mv_block` on at least one reference slot -- mode
+/// `GLOBAL_GLOBALMV` AND block >= 8x8 AND that slot's own global-motion
+/// model > `TRANSLATION`. This is the block set whose prediction goes
+/// through `crate::warp`, and it is exactly `is_global_mv0 || is_global_mv1`
+/// as computed at the increment site; it is NOT merely "some slot has a
+/// non-TRANSLATION model", which also counts blocks that are not global-mv
+/// blocks.
+///
+/// Like [`top_half_compound_hits`], no committed test reads it: with the
+/// 4:2:2 header refusal in force nothing in the suite decodes the stream
+/// these numbers describe.
+#[allow(dead_code)]
+pub(crate) fn top_half_warp_hits() -> usize {
+    TOP_HALF_WARP_HITS.with(std::cell::Cell::get)
+}
+
 thread_local! {
     static COMPOUND_WARP_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -9511,7 +9550,12 @@ impl Neighbours {
         // mi(5,15): left neighbour SMOOTH_V at mi(5,14), read at mi(4,13)).
         let snap_y = (1usize << ss_y(fctx)) - 1;
         let snap_x = (1usize << ss_x(fctx)) - 1;
-        self.smooth_uv_neighbour_unsnapped(mi_r & !snap_y, mi_c & !snap_x, r, c)
+        // The snap IS libaom's `base_mi` de-offsetting (`set_mi_row_col`,
+        // `av1_common_int.h:1395-1412`): `base_mi` is the block's own mi moved
+        // by `-(mi_row & ss_y) * stride - (mi_col & ss_x)`. The helper applies
+        // the two chroma-reference offsets on top of it -- see its own comment
+        // for which axis each one moves.
+        self.smooth_uv_neighbour_unsnapped(mi_r & !snap_y, mi_c & !snap_x, r, c, ss_x(fctx))
     }
 
     /// [`Self::smooth_uv_neighbour`] without the chroma-reference snap, i.e.
@@ -9519,7 +9563,14 @@ impl Neighbours {
     /// counter wants this: it measures how often the snap CHANGES the answer,
     /// which is what the lane-kf1200/kf900 chroma-reference fix buys. Every
     /// decode path uses the snapping form.
-    fn smooth_uv_neighbour_unsnapped(&self, mi_r: usize, mi_c: usize, r: usize, c: usize) -> bool {
+    fn smooth_uv_neighbour_unsnapped(
+        &self,
+        mi_r: usize,
+        mi_c: usize,
+        r: usize,
+        c: usize,
+        ss_x: usize,
+    ) -> bool {
         // lane-mtfix r1: availability is TILE-relative on BOTH axes and on the
         // coarse fallback too. `above_uv_mode` is a frame-wide [`SUB`]-grid
         // array that `start_tile` does not clear, so a block on a tile's first
@@ -9543,15 +9594,44 @@ impl Neighbours {
                 .filter(|&m| m != u8::MAX)
                 .map(usize::from)
         };
-        let above = match self.uv_mode_col.get(mi_c) {
-            _ if have_above && let Some(m) = cell(&self.uv_mode_grid, mi_r - 1, mi_c) => m,
-            Some(&(row, m)) if have_above && usize::from(row) == mi_r - 1 => usize::from(m),
+        // libaom's two chroma-reference mi, from `set_mi_row_col`
+        // (`av1_common_int.h:1400-1401`), with `mi_r`/`mi_c` already
+        // de-offset by the caller's `(mi_row & ss_y)` / `(mi_col & ss_x)`
+        // snap -- i.e. already libaom's `base_mi`:
+        //
+        //   chroma_above_mi = base_mi[-mi_stride + ss_x]   row -1, col +ss_x
+        //   chroma_left_mi  = base_mi[ss_y*mi_stride - 1]  row +ss_y, col -1
+        //
+        // SHIPPED: the above COLUMN. It is `+ss_x` wherever `ss_x == 1` --
+        // 4:2:0, 4:2:2 AND 4:4:0 all carry that column shift, and only 4:4:4
+        // (`ss_x == 0`) leaves the read where it was. Measured: folding it in
+        // leaves the 4:2:0 control byte-identical to `aomdec --rawvideo`; the
+        // boolean it feeds is simply not exercised differently by that stream
+        // at its blocks. One chroma column spans two luma mi columns, so the
+        // chroma edge reaches into the right-hand luma block, and that is where
+        // its reference lives.
+        //
+        // NOT SHIPPED -- KNOWN UNRESOLVED: the left read's `+ss_y` ROW term.
+        // libaom puts the left reference one mi row DOWN at 4:2:0 and 4:4:0
+        // (`ss_y == 1`) and on its own row at 4:2:2 (`ss_y == 0`); this reads
+        // its own row at every subsampling. An earlier attempt applied the
+        // `ss_y` term to the WRONG read (the above) and regressed the
+        // byte-exact 4:2:0 control, which is what exposed the crossing. No
+        // committed fixture presents a 1-mi-tall left neighbour (an 8x4 leaf's
+        // left block) at 4:2:0/4:4:0, so nothing here can witness the correct
+        // term today -- treat this as a named open discrepancy, not a settled
+        // one. Unblock: one such stream.
+        let above_mi = (mi_r.saturating_sub(1), mi_c + ss_x);
+        let left_mi = (mi_r, mi_c.saturating_sub(1));
+        let above = match self.uv_mode_col.get(above_mi.1) {
+            _ if have_above && let Some(m) = cell(&self.uv_mode_grid, above_mi.0, above_mi.1) => m,
+            Some(&(row, m)) if have_above && usize::from(row) == above_mi.0 => usize::from(m),
             _ if have_above => self.above_uv_mode[c],
             _ => DC_PRED,
         };
-        let left = match self.uv_mode_row.get(mi_r) {
-            _ if have_left && let Some(m) = cell(&self.uv_mode_grid, mi_r, mi_c - 1) => m,
-            Some(&(col, m)) if have_left && usize::from(col) == mi_c - 1 => usize::from(m),
+        let left = match self.uv_mode_row.get(left_mi.0) {
+            _ if have_left && let Some(m) = cell(&self.uv_mode_grid, left_mi.0, left_mi.1) => m,
+            Some(&(col, m)) if have_left && usize::from(col) == left_mi.1 => usize::from(m),
             _ if have_left => self.left_uv_mode[r],
             _ => DC_PRED,
         };
@@ -10518,6 +10598,7 @@ fn read_intra_mode_rect(
     // `palette_uv` even on a chroma-reference strip. Fold the plane count
     // into the same `has_chroma` this reader already gates on.
     let has_chroma = has_chroma && !mono(fctx);
+    crate::msac::SymbolDecoder::set_symr_mi(mi_r as i64, mi_c as i64);
     let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if ec_istep {
         // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
@@ -10619,6 +10700,7 @@ fn read_intra_mode_rect(
     // frame's `read_intra_frame_mode_info` (decodemv.c:1065 `read_intra_mode`
     // off `kf_y_mode_cdf[above][left]`).
     let mode = if let Some((size_group, _)) = inter {
+        crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
         dec.symbol(&mut cdfs.y_mode[size_group])
     } else {
         let above_ctx = INTRA_MODE_CTX[above_mode];
@@ -10643,8 +10725,10 @@ fn read_intra_mode_rect(
     let uv_mode = if !has_chroma {
         DC_PRED
     } else if cfl {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     istep!("uv_mode", uv_mode as i32);
@@ -12457,6 +12541,7 @@ fn decode_intra_rect_in_inter(
         }
         return Ok(());
     }
+    crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
     let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
     // lane-t900 r1: this arm read six mode symbols with no ladder rung of its
     // own, so a cross-decoder bisection could only see the block's first
@@ -12495,8 +12580,10 @@ fn decode_intra_rect_in_inter(
     let uv_mode = if !has_chroma {
         DC_PRED
     } else if cfl_allowed {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     if step_trace {
@@ -14258,7 +14345,25 @@ fn decode_block_rect(
         // --enable-tx-size-search=0 the encoder writes no such symbol, so the
         // decoder consumed one that was never there.
         {
-            let around = neighbours.around_rect(at, bw, bh);
+            // lane-av1422warp r20: this 32x16/16x32 strip reader is the SIBLING of
+            // `decode_leaf_rect`, and it was the one left ungated: at ss (1,0) the
+            // strip's chroma is a square (side/2, side) block whose above cells
+            // spread over `side` LUMA mi columns, so the per-mi rect gather
+            // double-counts every chroma column's whole-unit dc sign. Measured on
+            // the pinned 4:2:2 rotzoom stream (a1.obu frame 0): the chroma-U 4x4
+            // transform of the 32x16 strip at mi(68,16) reads its DC sign from
+            // `dc_sign_ctx` 1 where libaom reads row 0 -- the first read of
+            // 45260 whose pre-state, bit position and symbol all match and only
+            // the CDF row differs, and the first divergence in the EC_SYMR
+            // sequence (all 45259 reads before it pair exactly). Luma keeps the
+            // per-mi gather; 4:2:0 and 4:4:4 keep the plain rect walk verbatim.
+            let mut around = neighbours.around_rect(at, bw, bh);
+            if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                let c2 =
+                    neighbours.around_mi_422_chroma((at.0 * (SUB / MI), at.1 * (SUB / MI)), bw, bh);
+                around[1] = c2[1];
+                around[2] = c2[2];
+            }
             let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, fi_tx_row(mode, filter_intra));
             let (luma_levels, luma_tx_type) = read_coeffs_rect(
                 dec,
@@ -14809,7 +14914,28 @@ fn decode_leaf_rect(
         } else {
             TxbSet::ChromaRect8x4
         };
-        let around = neighbours.around_mi_rect(leaf_mi, bw, bh);
+        // lane-av1422warp: at ss (1,0) this leaf's chroma is a SQUARE
+        // (side/2, side) block, so `side` chroma 4-px cells above it spread
+        // over `side` LUMA mi columns -- one chroma column per PAIR of luma
+        // mi cells, and both carry the covering unit's whole-unit dc sign.
+        // The per-mi rect gather therefore double-counts every chroma
+        // column's sign. `around_mi_422_chroma`'s every-second above-cell
+        // sampling is libaom's `txb_w_unit` sum, and every other 4:2:2 chroma
+        // gather in this file already routes through it (see the gate at this
+        // arm's siblings); this one did not, so a 4:2:2 rect leaf voted over
+        // luma unit counts. Measured on the pinned 4:2:2 rotzoom stream
+        // (a1.obu frame 0): the 16x8 leaf at mi(48,28) resolved its V plane's
+        // dc sign from vote 0 (`dc_sign_cdf[0]`) where the oracle resolves a
+        // negative vote (`dc_sign_cdf[1]`), which is the first bit-position
+        // divergence in the frame (the bit offset is a clean constant through
+        // coefficient unit 1418 and turns 6 bits at 1419). Luma keeps the
+        // per-mi gather; 4:2:0 and 4:4:4 keep the plain rect walk verbatim.
+        let mut around = neighbours.around_mi_rect(leaf_mi, bw, bh);
+        if chroma_422 {
+            let c = neighbours.around_mi_422_chroma(leaf_mi, bw, bh);
+            around[1] = c[1];
+            around[2] = c[2];
+        }
         let luma_set = if reduced_tx_set {
             TxbSet::LumaRect16x8
         } else {
@@ -17234,7 +17360,13 @@ fn decode_rect4_16_strip(
         // `av1_use_intra_edge_upsample` on (blk_wh 12 <= 16) for a
         // directional chroma strip, moving 4 samples by 1.
         let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c, fctx);
-        if smooth_neighbor_uv != neighbours.smooth_uv_neighbour_unsnapped(lmi.0, lmi.1, r, c) {
+        // lane-av1422warp: `smooth_uv_neighbour_unsnapped` now takes the
+        // frame's own `ss_x` -- the unsnapped read is the pair-merge witness
+        // counter's mirror of the snapping form, and the shipped read offsets
+        // the above COLUMN by `+ss_x` (libaom's `chroma_above_mi`).
+        if smooth_neighbor_uv
+            != neighbours.smooth_uv_neighbour_unsnapped(lmi.0, lmi.1, r, c, ss_x(fctx))
+        {
             hit!(RECT4_16_UV_PAIR_FILT_HITS);
         }
         // lane-av1-rect14: a lossless frame forces TX_4X4 on every plane
@@ -18441,6 +18573,7 @@ fn read_intra_mode(
     // shape the oracle's own `ec_read_intra_frame_mode_info_impl` prints
     // under `EC_TRACE_MODE_STEP`) so a range ladder can be diffed line for
     // line against the instrumented aomdec, not just `tell()`.
+    crate::msac::SymbolDecoder::set_symr_mi(mi_r as i64, mi_c as i64);
     let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if ec_istep {
         // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
@@ -18568,8 +18701,10 @@ fn read_intra_mode(
     let uv_mode = if !has_chroma {
         DC_PRED
     } else if cfl {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     if trace {
@@ -22865,6 +23000,7 @@ fn read_intra_mode_sub8(
     let has_chroma = has_chroma && !mono(fctx);
     let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
+    crate::msac::SymbolDecoder::set_symr_mi(mi_r as i64, mi_c as i64);
     if ec_istep {
         eprintln!(
             "EC_IMODE mi_row={mi_r} mi_col={mi_c} fn=sub8 rng={}",
@@ -22968,8 +23104,10 @@ fn read_intra_mode_sub8(
         // divergence at the rect leaf mi (8,16) of `ll444.obu`; class
         // `wrong-alphabet-same-value`, lane-av1-llsub8).
         let uv_mode = if cfl_allowed_px(seg_w_mi * MI, seg_h_mi * MI, fctx) {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if trace {
@@ -32017,9 +32155,19 @@ fn read_sb128_root(
         lr,
         lr_grid,
         lr_reference,
-        mi_r128,
-        mi_c128,
-        SB_MI * 2,
+        // `read_lr` is the ONE consumer that turns this superblock's
+        // mode-info origin into ABSOLUTE frame space -- it divides by the
+        // restoration-unit size, which is a real pixel count. The partition
+        // decode below is self-consistent with `mi_r128` as written (it
+        // only ever uses relative offsets from it), which is why a 128x128
+        // stream decoded correctly for 4:2:0 and 4:4:4 while placing its
+        // loop-restoration units at double the offset. `sb_r`/`sb_c` index
+        // 64px superblocks, so a 128px superblock's origin is half a
+        // `SB_MI` per 64px step -- `(sb_r & !1) * SB_MI` is twice the true
+        // mi row. The extent is `SB_MI`: a 128px superblock is 16 mi.
+        (sb_r & !1) * (SB_MI / 2),
+        (sb_c & !1) * (SB_MI / 2),
+        SB_MI,
         fctx,
     );
     let at128 = ((mi_r128 / SUB_MI) as usize, (mi_c128 / SUB_MI) as usize);
@@ -32654,9 +32802,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         lr,
                         &mut lr_grid,
                         &mut lr_reference,
-                        sb_r * SB_MI,
-                        sb_c * SB_MI,
-                        SB_MI,
+                        // True mode-info units: a 64px superblock is 8, and `SB_MI` is 16.
+                        // `read_lr` divides by the restoration-unit size (a real pixel count),
+                        // so it is the one consumer that needs the absolute origin in real mi.
+                        // The half-mi convention these arguments used to carry only worked
+                        // while `read_lr` also counted in half-mi -- the two cancelled.
+                        sb_r * (SB_MI / 2),
+                        sb_c * (SB_MI / 2),
+                        SB_MI / 2,
                         fctx,
                     );
                 }
@@ -35833,6 +35986,16 @@ fn overlappable_above(
             // The pair merge: the walk snaps back to the pair's even column
             // and the ODD half (the chroma-carrying one) is the neighbour for
             // both -- a 4-wide 1:4 strip is never an OBMC source on its own.
+            // lane-av1422warp r33 (reviewer P2): the snap must be UNCONDITIONAL.
+            // libaom `obmc.h:41-46` is
+            // `above_mi = prev_row_mi + (above_mi_col & ~1) + 1` -- the snapped
+            // COLUMN is used as-is and the +1 is what lands it back on the
+            // block's own left edge. Clamping the snapped INDEX to `mi_col`
+            // (an earlier r25 attempt) moved the index itself, so this
+            // decoded the neighbour one column RIGHT of libaom's and, after
+            // `col += step`, never visited `mi_col + 1`. Only the REPORTED
+            // offset can be negative -- `above_mi - mi_col == -1` -- so the
+            // clamp belongs there, not on the index.
             col &= !1;
             src = col + 1;
             nb = grid.get(mi_row - 1, src);
@@ -35849,7 +36012,12 @@ fn overlappable_above(
                 // neighbour PREDICTION at a frame edge, which picks the
                 // 4-tap kernel below 8 px (class narrow-block-sharp-kernel);
                 // the destination clip stays in `obmc_blend`.
-                out.push((col - mi_col, step.min(bw4), info, src - mi_col));
+                out.push((
+                    col.saturating_sub(mi_col),
+                    step.min(bw4),
+                    info,
+                    src - mi_col,
+                ));
             }
         }
         col += step;
@@ -35889,6 +36057,12 @@ fn overlappable_left(
             // The pair merge, left-column mirror: a 4-TALL neighbour (a 16x4
             // strip) is half of a chroma pair and the pair's SECOND row is the
             // neighbour for both.
+            // lane-av1422warp r33 (reviewer P2): the row mirror of the
+            // `overlappable_above` fix. libaom's left-column walk snaps
+            // `(left_mi_row & ~1)` and adds 1; the snap is unconditional and
+            // only the REPORTED `row - mi_row` can be -1. The r25 clamp moved
+            // the snapped index itself, which read the neighbour one row
+            // BELOW libaom's and then skipped `mi_row + 1` entirely.
             row &= !1;
             src = row + 1;
             nb = grid.get(src, mi_col - 1);
@@ -35901,7 +36075,12 @@ fn overlappable_left(
                 }
                 // lane-t900 r14: `AOMMIN(xd->height, mi_step)` -- see
                 // `overlappable_above`.
-                out.push((row - mi_row, step.min(bh4), info, src - mi_row));
+                out.push((
+                    row.saturating_sub(mi_row),
+                    step.min(bh4),
+                    info,
+                    src - mi_row,
+                ));
             }
         }
         row += step;
@@ -36576,7 +36755,7 @@ pub(crate) fn obmc_plan(
     // divides by zero at 4:4:4 (`trailing_zeros(0)` = 64, a debug shift panic).
     ss_x: usize,
     ss_y: usize,
-    chroma_side: usize,
+    chroma_stride: usize,
     px: usize,
     py: usize,
     cpx: usize,
@@ -36715,7 +36894,7 @@ pub(crate) fn obmc_plan(
         above,
         left,
         side,
-        chroma_side,
+        chroma_stride,
         write_w,
         write_h,
         px,
@@ -36795,7 +36974,16 @@ pub(crate) struct ObmcPlan {
     above: Vec<ObmcNb>,
     left: Vec<ObmcNb>,
     side: usize,
-    chroma_side: usize,
+    /// The chroma PREDICTION buffer's own stride -- `chroma_stride`, the PLANE
+    /// BLOCK's per-axis width, NOT the enclosing square `chroma_side`. At
+    /// 4:2:2 that buffer is `(side/2, side)` (lane-av1-422blockhalf), and
+    /// striding it with `chroma_side` put row `r` at `r*side`: a 32x16 luma
+    /// strip's left-pass chroma blend wrote row 15 at index 15*32 = 480 of a
+    /// 256-sample `16 x 16` buffer -- the out-of-bounds panic in
+    /// `obmc_blend_h` the pinned 4:2:2 rotzoom stream opened. Every other
+    /// consumer of `pred_u`/`pred_v` in this block already strides with
+    /// `chroma_stride`; at 4:2:0 and 4:4:4 the two are equal.
+    chroma_stride: usize,
     write_w: usize,
     write_h: usize,
     px: usize,
@@ -36822,7 +37010,7 @@ pub(crate) fn obmc_run(
 ) {
     let &ObmcPlan {
         side,
-        chroma_side,
+        chroma_stride,
         write_w,
         write_h,
         px,
@@ -36869,7 +37057,7 @@ pub(crate) fn obmc_run(
         let (cw, ch) = (write_w >> ss_x(fctx), write_h >> ss_y(fctx));
         eprintln!("OUR_MCB pre f={idx} cpx={cpx} cpy={cpy} cw={cw} ch={ch}");
         for r in 0..ch {
-            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_side + c]).collect();
+            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_stride + c]).collect();
             eprintln!("OUR_MCB prerow{r}: {row:?}");
         }
     }
@@ -36922,7 +37110,7 @@ pub(crate) fn obmc_run(
                 &mut tmp_u,
                 fctx,
             );
-            obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
+            obmc_blend_v(pred_u, chroma_stride, cox, 0, cw, cbh, cbw, &tmp_u);
             obmc_neighbour_pred(
                 nv,
                 cpx + cox,
@@ -36937,7 +37125,7 @@ pub(crate) fn obmc_run(
                 &mut tmp_v,
                 fctx,
             );
-            obmc_blend_v(pred_v, chroma_side, cox, 0, cw, cbh, cbw, &tmp_v);
+            obmc_blend_v(pred_v, chroma_stride, cox, 0, cw, cbh, cbw, &tmp_v);
         }
     }
 
@@ -36991,7 +37179,7 @@ pub(crate) fn obmc_run(
             }
         }
         let ch = cbh.min((write_h >> ss_y(fctx)) - coy);
-        obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
+        obmc_blend_h(pred_u, chroma_stride, 0, coy, cbw, ch, &tmp_u);
         obmc_neighbour_pred(
             nv,
             cpx,
@@ -37006,12 +37194,12 @@ pub(crate) fn obmc_run(
             &mut tmp_v,
             fctx,
         );
-        obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
+        obmc_blend_h(pred_v, chroma_stride, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
         let (cw, ch) = (write_w >> ss_x(fctx), write_h >> ss_y(fctx));
         for r in 0..ch {
-            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_side + c]).collect();
+            let row: Vec<u16> = (0..cw).map(|c| pred_u[r * chroma_stride + c]).collect();
             eprintln!("OUR_MCB post f={idx} row{r}: {row:?}");
         }
     }
@@ -37526,6 +37714,11 @@ fn decode_inter_block(
     frame_width: usize,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
+    // Round 27: the per-read trace is the only instrument that reaches the inter
+    // path (the coefficient rungs stop well before the frame-3 divergence),
+    // so publish the phase and the block's mi for every read it makes.
+    crate::msac::SymbolDecoder::set_symr_phase("inter");
+    crate::msac::SymbolDecoder::set_symr_mi(at.0 as i64, at.1 as i64);
     // lane-inter4 r1: `at` is in MI units (4 px) so a 32-level 1:4 strip can
     // name an 8-px offset; `(r, c)` stays the enclosing 16-px cell for the
     // few 16-px-granular uses below.
@@ -37888,7 +38081,6 @@ fn decode_inter_block(
                 }
             }
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
-            // spec `is_nontrans_global_motion`: ALL active refs' models must
             // be non-TRANSLATION (IDENTITY counts) for the compound block's
             // interp-filter read to be suppressed.
             let gm_nontrans_models = is_globalmv
@@ -37917,6 +38109,22 @@ fn decode_inter_block(
             let is_global_mv1 = is_globalmv
                 && side >= 8
                 && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1;
+            // lane-av1422warp r33 (reviewer P3): the top-half census is
+            // placed HERE, after `is_global_mv0`/`is_global_mv1`, so it
+            // counts the same blocks libaom's `is_global_mv_block` does --
+            // mode GLOBAL_GLOBALMV AND block >= 8x8 AND that slot's own gm
+            // model > TRANSLATION. An earlier placement tested the model term
+            // alone, which counts blocks that are not global-mv blocks at
+            // all, so its number was an upper bound dressed up as an
+            // engagement figure.
+            if mi_row < mi_rows as usize / 2 {
+                if is_globalmv {
+                    TOP_HALF_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+                }
+                if is_global_mv0 || is_global_mv1 {
+                    TOP_HALF_WARP_HITS.with(|c| c.set(c.get() + 1));
+                }
+            }
             // libaom `av1_init_warp_params` + `allow_warp`'s
             // `global_warp_allowed` branch, run once per reference for a
             // compound block exactly as for a single-ref one (reconinter.c
@@ -38026,6 +38234,7 @@ fn decode_inter_block(
                 && enable_masked_compound
                 && is_any_masked_compound_used_here(write_w, write_h)
             {
+                crate::msac::SymbolDecoder::set_symr_cdf("comp_group_idx");
                 dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
             } else {
                 0
@@ -38316,6 +38525,7 @@ fn decode_inter_block(
                         ref_order_hints[(ref0 - LAST_FRAME) as usize],
                         ref_order_hints[(ref1 - LAST_FRAME) as usize],
                     );
+                    crate::msac::SymbolDecoder::set_symr_cdf("compound_idx");
                     let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
                     if crate::envflags::env_flag!("EC_TRACE_MODE") {
                         eprintln!(
@@ -39652,6 +39862,7 @@ fn decode_inter_block(
                 // TRUE footprint -- a 16x8 strip is group 1, a 32x16 strip
                 // group 2, not their square `side`'s 2/3.
                 let bsize_group = size_group_wh(write_w, write_h);
+                crate::msac::SymbolDecoder::set_symr_cdf("interintra");
                 let interintra = dec.symbol(&mut cdfs.interintra[bsize_group]) == 1;
                 if interintra {
                     // lane-interintra r1 (decodemv.c 1540-1555): interintra_mode,
@@ -39838,6 +40049,7 @@ fn decode_inter_block(
                     hit!(FIMV_ALPHABET_HITS);
                 }
                 if warp_eligible {
+                    crate::msac::SymbolDecoder::set_symr_cdf("motion_mode");
                     let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
                     match mode {
                         0 => {}
@@ -40148,7 +40360,7 @@ fn decode_inter_block(
                     write_h,
                     ss_x(fctx),
                     ss_y(fctx),
-                    chroma_side,
+                    chroma_stride,
                     px,
                     py,
                     cpx,
@@ -41328,6 +41540,7 @@ fn decode_inter_block(
             );
             return Ok(());
         }
+        crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
         let mode = dec.symbol(&mut cdfs.y_mode[size_group_wh(write_w, write_h)]);
         if crate::envflags::env_flag!("EC_IIS") {
             eprintln!(
@@ -41381,8 +41594,10 @@ fn decode_inter_block(
         let uv_mode = if !has_chroma {
             DC_PRED
         } else if cfl_allowed {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if (9..=12).contains(&uv_mode) {
@@ -43773,6 +43988,7 @@ fn decode_intra_sub8_leaf(
     let step = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     // `size_group_lookup[BLOCK_8X4] == size_group_lookup[BLOCK_4X8] == 0`
     // (libaom common_data.h:61).
+    crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
     let mode = dec.symbol(&mut cdfs.y_mode[0]);
     if step {
         eprintln!(
@@ -43795,8 +44011,10 @@ fn decode_intra_sub8_leaf(
         // always 4x4-or-smaller, so the predicate stays true and this read
         // is unchanged.
         let uv_mode = if cfl_allowed_px(bw, bh, fctx) {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if step {
@@ -45873,6 +46091,13 @@ fn decode_inter_block8(
     [u8; 2],
     (i8, Option<i8>),
 )> {
+    // Round 27: this is the function whose mode read carries the block's real
+    // mi (the `EC_MODE_VAL8` rung prints it). The `decode_inter_block`
+    // entry sets the same label from ITS `at`, which is a different block --
+    // publishing from here is what makes the EC_SYMR mi trustworthy on the
+    // inter path, which is what round 22 got wrong by assuming it was not.
+    crate::msac::SymbolDecoder::set_symr_phase("inter8");
+    crate::msac::SymbolDecoder::set_symr_mi(leaf_mi.0 as i64, leaf_mi.1 as i64);
     const LAST_FRAME: i8 = 1;
     // lane-gmaffine r2: the leaf's OWN switchable-filter symbols, handed back
     // so the caller stamps them into `Neighbours` instead of the `[3, 3]`
@@ -46145,6 +46370,7 @@ fn decode_inter_block8(
                     && enable_masked_compound
                     && is_any_masked_compound_used_here(SIDE, SIDE)
                 {
+                    crate::msac::SymbolDecoder::set_symr_cdf("comp_group_idx");
                     dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
                 } else {
                     0
@@ -46199,6 +46425,7 @@ fn decode_inter_block8(
                             ref_order_hints[(ref0 - LAST_FRAME) as usize],
                             ref_order_hints[(ref1 - LAST_FRAME) as usize],
                         );
+                        crate::msac::SymbolDecoder::set_symr_cdf("compound_idx");
                         let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
                         if idx == 1 {
                             (8, 8, 1u8)
@@ -47072,6 +47299,7 @@ fn decode_inter_block8(
         let mut interintra_mode: Option<u8> = None;
         let mut wedge_mask: Option<(&'static [u8], usize)> = None;
         if enable_interintra_compound && !skip_mode {
+            crate::msac::SymbolDecoder::set_symr_cdf("interintra");
             let interintra = dec.symbol(&mut cdfs.interintra[SIZE_GROUP_8]) == 1;
             if interintra {
                 // lane-interintra r1: same read pair as the 16/32 site;
@@ -47178,6 +47406,7 @@ fn decode_inter_block8(
                 hit!(FIMV_ALPHABET_HITS);
             }
             if warp_eligible {
+                crate::msac::SymbolDecoder::set_symr_cdf("motion_mode");
                 let mode = dec.symbol(&mut cdfs.motion_mode[0]);
                 match mode {
                     0 => {}
@@ -47767,6 +47996,7 @@ fn decode_inter_block8(
             }
         }
     } else {
+        crate::msac::SymbolDecoder::set_symr_cdf("y_mode");
         let mode = dec.symbol(&mut cdfs.y_mode[SIZE_GROUP_8]);
         if mode >= 13 {
             return Err(unsupported(
@@ -47828,8 +48058,10 @@ fn decode_inter_block8(
         let uv_mode = if !has_chroma {
             DC_PRED
         } else if cfl_allowed_px(SIDE, SIDE, fctx) {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_cfl[mode])
         } else {
+            crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
             dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
         };
         if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
@@ -49351,9 +49583,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         lr,
                         &mut lr_grid,
                         &mut lr_reference,
-                        sb_r * SB_MI,
-                        sb_c * SB_MI,
-                        SB_MI,
+                        // True mode-info units: a 64px superblock is 8, and `SB_MI` is 16.
+                        // `read_lr` divides by the restoration-unit size (a real pixel count),
+                        // so it is the one consumer that needs the absolute origin in real mi.
+                        // The half-mi convention these arguments used to carry only worked
+                        // while `read_lr` also counted in half-mi -- the two cancelled.
+                        sb_r * (SB_MI / 2),
+                        sb_c * (SB_MI / 2),
+                        SB_MI / 2,
                         fctx,
                     );
                 }
@@ -52109,6 +52346,118 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+    /// lane-av1422warp r33: the OBMC pair-merge snap must move the READ to
+    /// libaom's position, not the reported offset.
+    ///
+    /// libaom `obmc.h:44-46`:
+    /// ```c
+    /// if (mi_step == 1) {
+    ///   above_mi_col &= ~1;                        // snap the INDEX, unconditional
+    ///   above_mi = prev_row_mi + above_mi_col + 1; // read at snap + 1
+    ///   mi_step = 2;
+    /// }
+    /// ```
+    /// and the relative offset handed to
+    /// `av1_setup_build_prediction_by_above_pred` is
+    /// `above_mi_col - mi_col` **after** the snap, which is `-1` at an odd
+    /// `mi_col`. An earlier fix clamped the snapped INDEX to `mi_col` to
+    /// stop that subtraction underflowing, which silenced the underflow and
+    /// in exchange read the neighbour one column RIGHT of libaom's and then
+    /// stepped past the block's own right edge.
+    ///
+    /// The grid here carries DISTINGUISHABLE neighbours at the pair's even
+    /// half, its odd half, and the column to the right of the pair, so the
+    /// test fails if the walk reads any position but the odd half. It is the
+    /// snapped READ this pins -- and no stream in the corpus exercises it
+    /// (a1.obu's 1338 traced OBMC neighbours are byte-identical before and
+    /// after the fix, because its 4-wide pair never starts on an odd edge),
+    /// so nothing else covers this branch.
+    #[test]
+    fn the_obmc_pair_merge_snap_reads_libaoms_neighbour_not_one_to_the_right() {
+        const NAME: &str = "the_obmc_pair_merge_snap_reads_libaoms_neighbour_not_one_to_the_right";
+        // `ref_frame` 1 == LAST_FRAME, which is what `is_inter` consumers
+        // expect; the MV makes each cell individually identifiable.
+        let cell = |mv: (i16, i16), size: u8| MiInfo {
+            is_inter: true,
+            ref_frame: 1,
+            ref_frame1: 0,
+            mv: mv,
+            mv1: (0, 0),
+            is_new_mv: true,
+            size,
+            size_h: size,
+            is_global_mv0: false,
+            is_global_mv1: false,
+        };
+        const EVEN: (i16, i16) = (10, 10);
+        const ODD: (i16, i16) = (20, 20);
+        const RIGHT: (i16, i16) = (30, 30);
+
+        // --- the above walk, at an ODD `mi_col` ---
+        let mut grid = crate::mvstack::MiGrid::new(16, 16);
+        // The block under test sits at mi_col 5; the neighbour row is 4.
+        // A 4-wide inter cell at the ODD half (5) is what forces
+        // `mi_step == 1` and therefore the pair merge.
+        grid.set(4, 4, cell(EVEN, 1));
+        grid.set(4, 5, cell(ODD, 1));
+        grid.set(4, 6, cell(RIGHT, 4)); // one column RIGHT of the pair
+        // `bw4 == 2` so `AOMMIN(xd->width, mi_step)` is the pair's own 2
+        // rather than clipped to a 1-wide block's 1.
+        let nb = overlappable_above(&grid, 5, 5, 2, 16, 4);
+        assert!(
+            !nb.is_empty(),
+            "{NAME}: the above walk found no neighbour at all"
+        );
+        let (off4, span4, info, src4) = nb[0];
+        assert_eq!(
+            info.mv, ODD,
+            "{NAME}: the above pair merge read the wrong neighbour -- libaom \
+             snaps the column and reads snap+1, which is the ODD half"
+        );
+        assert_ne!(
+            info.mv, RIGHT,
+            "{NAME}: the clamp moved the snapped index onto mi_col, so the \
+             walk read one column RIGHT of libaom"
+        );
+        assert_eq!(src4, 0, "{NAME}: the read column's relative offset");
+        assert_eq!(span4, 2, "{NAME}: the pair steps over BOTH halves");
+        // libaom's `above_mi_col - mi_col` is -1 here; this tuple is
+        // `usize`, so the reported offset saturates to 0 rather than
+        // wrapping to `usize::MAX`. The snap is what the read depends on.
+        assert_eq!(
+            off4, 0,
+            "{NAME}: the reported offset must saturate, not wrap"
+        );
+
+        // --- the left walk, at an ODD `mi_row`: the same shape ---
+        let mut grid = crate::mvstack::MiGrid::new(16, 16);
+        grid.set(4, 4, cell(EVEN, 1));
+        grid.set(5, 4, cell(ODD, 1));
+        grid.set(6, 4, cell(RIGHT, 4));
+        let nb = overlappable_left(&grid, 5, 5, 2, 16, 4);
+        assert!(
+            !nb.is_empty(),
+            "{NAME}: the left walk found no neighbour at all"
+        );
+        let (off4, span4, info, src4) = nb[0];
+        assert_eq!(
+            info.mv, ODD,
+            "{NAME}: the left pair merge read the wrong neighbour -- libaom \
+             snaps the row and reads snap+1, which is the ODD half"
+        );
+        assert_ne!(
+            info.mv, RIGHT,
+            "{NAME}: the clamp moved the snapped row onto mi_row, so the walk \
+             read one row BELOW libaom"
+        );
+        assert_eq!(src4, 0, "{NAME}: the read row's relative offset");
+        assert_eq!(span4, 2, "{NAME}: the pair steps over BOTH halves");
+        assert_eq!(
+            off4, 0,
+            "{NAME}: the reported offset must saturate, not wrap"
+        );
+    }
+
     /// lane-twostage: the reference bank these gates decode against --
     /// `LAST_FRAME` alone, already in hand (`ref_frame` index 1).
     fn last_only(reference: &Picture) -> RefPix<'_> {
@@ -53376,6 +53725,7 @@ mod tests {
             DC_PRED,
             &mut cdfs.kf_y_mode[INTRA_MODE_CTX[DC_PRED]][INTRA_MODE_CTX[DC_PRED]],
         );
+        crate::msac::SymbolDecoder::set_symr_cdf("uv_mode");
         enc.symbol(DC_PRED, &mut cdfs.uv_mode_no_cfl[DC_PRED]);
         let data = enc.finish();
         let decoded = decode_key_frame_tile(
