@@ -5504,6 +5504,28 @@ pub(crate) fn intra_rect4_strip_in_inter_hits(shape: usize) -> usize {
     INTRA_RECT4_IN_INTER_HITS.with(|c| c.get()[shape])
 }
 
+// lane-av1444rect: how many 1:4 inter strips at `ss_x == 0` read their chroma
+// coefficient context over the STRIP'S OWN extent instead of the 4:2:0 pair's
+// (see [`decode_inter_block`]'s `around_c`). `is_chroma_reference`
+// (av1_common_int.h:1454) is unconditionally true at ss (0,0), so no pair
+// exists there; the counter is what keeps a 4:4:4 1:4-strip gate from passing
+// vacuously (a 4:2:0 stream of the same content leaves it at 0).
+thread_local! {
+    static RECT4_INTER_OWN_CHROMA444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT4_INTER_OWN_CHROMA444_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn rect4_inter_own_chroma444_hits() -> usize {
+    RECT4_INTER_OWN_CHROMA444_HITS.with(std::cell::Cell::get)
+}
+
+/// Resets [`RECT4_INTER_OWN_CHROMA444_HITS`] before a decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_rect4_inter_own_chroma444_hits() {
+    RECT4_INTER_OWN_CHROMA444_HITS.with(|c| c.set(0));
+}
+
 // lane-intra14 r1: set while an INTRA block of an INTER frame is decoded
 // through one of the key-frame rect readers ([`decode_block_rect4`],
 // [`decode_block_rect64`]). `Some((size_group, skip))` tells
@@ -40828,17 +40850,38 @@ fn decode_inter_block(
                 // ([`Neighbours::around_mi_422_chroma`]) -- and the same
                 // reroute catches 4:2:2 VERT: its (8, 16) pair span's
                 // above side covers one chroma column per two luma mi
-                // columns, the identical double-count. The plain per-mi
-                // gather survives only where the ss gate excludes it:
-                // the 4:2:0 pair merge (16, 8) and every 4:4:4 shape.
+                // columns, the identical double-count.
+                //
+                // lane-av1444rect (H1, MEASURED): the (16, 8) / (8, 16) pair
+                // extent was reached at ss (0,0) too, where no pair exists.
+                // At 4:4:4 `is_chroma_reference` (av1_common_int.h:1454)
+                // reduces BOTH parity clauses to `!subsampling_y` /
+                // `!subsampling_x`, so every block is its own chroma
+                // reference: a HORZ_4 16x4 strip codes its OWN 16x4 chroma
+                // and the setter above already gave it `pair_mi == at_mi`.
+                // Its coefficient context is therefore the strip's own,
+                // which is exactly the `around` gathered one screen above
+                // as `around_mi_rect(at_mi, write_w, write_h)`. The pair
+                // gather read one EXTRA luma mi row of LEFT chroma context
+                // (`ph = 8` covers left[8] and left[9], a 4-px strip only
+                // left[8]), so the U unit's `get_txb_ctx` saw a neighbour
+                // libaom does not have and forked the arithmetic coder: the
+                // 6441-byte 4:4:4 lossy cq-20 stream, frame 1, mi(8,16)
+                // read our `txb_skip_ctx` 1 (0 above + 1 left) where the
+                // oracle read offset-7 row 7 (ctx_base 0).
                 let around_c = match strip_chroma {
+                    // lane-av1444rect: the arm `is_chroma_reference` makes the
+                    // ONLY correct choice at ss_x 0 -- no pair exists, the
+                    // extent is the strip's own. Counted so a 4:4:4 1:4-strip
+                    // gate can prove it exercised this route (a 4:2:0 stream
+                    // of the same content reads 0).
+                    Some(_) if ss_x(fctx) == 0 => {
+                        hit!(RECT4_INTER_OWN_CHROMA444_HITS);
+                        around
+                    }
                     Some(s) if s.has_chroma => {
                         let (pw, ph) = if s.horz {
-                            if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
-                                (16, 4)
-                            } else {
-                                (16, 8)
-                            }
+                            if ss_y(fctx) == 0 { (16, 4) } else { (16, 8) }
                         } else {
                             (8, 16)
                         };
