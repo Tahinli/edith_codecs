@@ -19155,6 +19155,48 @@ fn dump_stage(var: &str, y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     }
 }
 
+/// `EC_AV1_PREFILT_WIDE_DUMP=<prefix>` -> `<prefix>.f<N>`, the pre-loop-filter
+/// reconstruction cropped to each plane's mi-ALIGNED true extent, byte for
+/// byte the shape aomdec's own rung 7 writes (`y_width`/`y_height`,
+/// `uv_width`/`uv_height`), so the two can be diffed directly.
+///
+/// lane-av1444edge: this used to be an inline block in the KEY-frame tile path
+/// only, with a FUNCTION-LOCAL `static IDX2` as its counter. Both facts were
+/// measurement traps, and the second one is why the first went unnoticed:
+/// the inter-frame path (`decode_inter_frame_tile_with_cdfs`) had no wide
+/// prefilter dump at all, so every 4:4:4 lossy divergence localized to an
+/// inter frame had no pre-filter rung to compare against and got attributed to
+/// reconstruction when the oracle could not see it. The `static` also restarted
+/// per monomorphisation, so every frame after the first overwrote `.f0` -- a
+/// per-frame bisection silently compared the LAST decoded frame. The counter
+/// is now the shared per-var [`dump_stage_idx`] map, and the call also sits on
+/// the inter path (skipped when the filter pipeline is active, which has
+/// already deblocked by the time the tile tail runs -- same condition
+/// `capture_filter_replay` guards itself with).
+fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
+    let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_WIDE_DUMP") else {
+        return;
+    };
+    use std::io::Write;
+    let idx = dump_stage_idx("EC_AV1_PREFILT_WIDE_DUMP");
+    let crop = |plane: &PlaneBuf<'_>| -> Vec<u8> {
+        let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
+        for row in 0..plane.true_height {
+            out.extend(
+                plane.data[row * plane.width..][..plane.true_width]
+                    .iter()
+                    .map(|&s| s as u8),
+            );
+        }
+        out
+    };
+    if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+        let _ = f.write_all(&crop(y));
+        let _ = f.write_all(&crop(u));
+        let _ = f.write_all(&crop(v));
+    }
+}
+
 /// The value [`fresh_plane`] fills with under `EC_AV1_PLANE_SENTINEL`: no
 /// legal sample can equal it (reconstruction clamps to `(1 << bit_depth) - 1`,
 /// at most 4095), so a decode that hashes identically under the flag proves
@@ -34514,27 +34556,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_WIDE_DUMP") {
-        use std::io::Write;
-        static IDX2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let idx = IDX2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let crop_wide = |plane: &PlaneBuf<'_>| -> Vec<u8> {
-            let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
-            for row in 0..plane.true_height {
-                out.extend(
-                    plane.data[row * plane.width..][..plane.true_width]
-                        .iter()
-                        .map(|&s| s as u8),
-                );
-            }
-            out
-        };
-        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            let _ = f.write_all(&crop_wide(&y));
-            let _ = f.write_all(&crop_wide(&u));
-            let _ = f.write_all(&crop_wide(&v));
-        }
-    }
+    dump_prefilter_wide(&y, &u, &v);
     // lane-av1fwd: the encoder's filter search re-decodes this same key
     // frame tile per candidate -- capture it once (see [`FilterReplay`]),
     // on the shape whose tail is the two filter calls and nothing else.
@@ -52080,6 +52102,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    // lane-av1444edge: the inter-frame path's mi-aligned pre-loop-filter
+    // dump, the rung the key-frame path has always had (see
+    // `dump_prefilter_wide`). Placed beside the padded `EC_AV1_PREFILT_DUMP`
+    // above, i.e. before the filter pipeline is released, so the two agree on
+    // the point in the sequence they sample.
+    dump_prefilter_wide(&y, &u, &v);
     // lane-pipefilt: release the rows still pending and wait the pipeline
     // out; from here the picture is deblocked and CDEF-filtered exactly as
     // the whole-frame path leaves it.
