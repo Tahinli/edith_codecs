@@ -1686,6 +1686,61 @@ label we have not verified.
 
 Not pinned, no gate, refusal untouched.
 
+## Round 29 — our tag was printing the PHASE; fixed, and the window is now labelled
+
+`a4a1fcdb`: the `cdf=` slot of `EC_SYMR` was passing `SYMR_PHASE` a second
+time — an off-by-one from adding the phase argument in round 27 and the cdf
+one in round 28. **Every read reported the phase in the cdf field.** That is
+precisely the `inter8` round 28 saw where no code path ever sets that value,
+and it is why this lane could not label its own half of the window. With it
+fixed the tag is live and verified against three distinct tables on a1.obu:
+`interintra` 72533, `compound_idx` 33655, `comp_group_idx` 13744. No behaviour
+change; identity re-proved (4:2:0 byte-exact, 4:4:4 byte-identical to
+pre-lane, both pinned 422 witnesses pixel-exact).
+
+### The window, both sides now labelled
+
+```
+  [107516] O cdf=interintra mi=(30,62) n=2 s=1 | M cdf=interintra mi=(30,62) n=2 s=1   pair
+  [107517] O cdf=interintra mi=(30,62) n=2 s=1 | M cdf=interintra mi=(30,62) n=8 s=3   <-- DIVERGES
+  [107518] O cdf=interintra mi=(30,62) n=2 s=1 | M cdf=interintra mi=(30,62) n=10 s=0
+  [107519] O cdf=interintra mi=(30,62) n=8 s=3 | M cdf=interintra mi=(32,0)  n=2 s=0
+```
+
+Our `n=8` at 107517 is bit-identical to the oracle's at 107519, and the `n=10`
+that follows matches too — so the oracle performs **two extra 2-symbol reads**
+at mi(30,62) that this decoder does not, and the oracle's `interintra` value
+there is **1**, so libaom then reads the wedge follow-up
+(`decodemv.c:1639/1642`) as well.
+
+### What is still NOT closed, precisely
+
+Our `interintra` gate (`decode.rs:41506`, `enable_interintra_compound &&
+!skip_mode`) is TRUE on all 451 of its firings and we do read `interintra`
+(72533 tagged reads) — so this decoder is **not** skipping the symbol
+globally. The two missing reads are therefore not "our gate is wrong"; our
+block at mi(30,62) reaches the `interintra` read at a different point in the
+sequence than libaom's does. The two reads are NAMED
+(`interintra` + its wedge follow-up, by the oracle's tag and its value of 1)
+but the reason our path differs at that block is not yet established, and I am
+not shipping a gate change on an unestablished reason.
+
+### Not done from this round's charter
+
+Step 3 — reconciling the missing `is_interintra_allowed(mbmi)` term
+(`decodemv.c:1625` is a strict superset of ours) — is **not** done. libaom's
+extra term can only make libaom read FEWER interintra symbols, so it cannot be
+the cause of the two extra reads observed here, and landing it blind would
+change a gate on a stream I cannot yet explain. It stays open.
+
+**Handoff.** With the tag live, the next step is to find which read this
+decoder performs at mi(30,62) where the oracle performs `interintra` — i.e.
+to tag the remaining inter-path reads (`y_mode`, `uv_mode`, `motion_mode`,
+`skip`, and the `dmv`/MV reads) so the pair before 107517 is fully labelled.
+Everything needed is now in place and verified.
+
+Not pinned, no gate, refusal untouched.
+
 ## Two refuted hypotheses — do not re-chase
 
 1. **"libaom ORs the block's OWN `uv_mode` into the edge-filter type."** False.
