@@ -275,6 +275,13 @@ fn compare_sequence(stream: &Path) -> Result<usize, String> {
                 a[pos], b[pos]
             ));
         }
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "frame {i} is {} samples, ffmpeg gave {}",
+            a.len(),
+            b.len()
+        );
     }
     Ok(ours.len())
 }
@@ -319,6 +326,12 @@ fn jvt_cavlc_first_idr_bit_exact() {
                         );
                         ok = false;
                     }
+                    assert_eq!(
+                        ours.len(),
+                        frame_len,
+                        "{name}: frame is {} samples ({w}x{h}), the reference frame is {frame_len}",
+                        ours.len()
+                    );
                 } else {
                     eprintln!("WARN {name}: no reference YUV, ffmpeg only");
                 }
@@ -332,6 +345,12 @@ fn jvt_cavlc_first_idr_bit_exact() {
                         );
                         ok = false;
                     }
+                    assert_eq!(
+                        ours.len(),
+                        frame_len,
+                        "{name}: frame is {} samples ({w}x{h}), the ffmpeg frame is {frame_len}",
+                        ours.len()
+                    );
                 }
                 if ok {
                     passed.push(name.to_string());
@@ -688,6 +707,13 @@ fn round_trip(dir: &Path, tag: &str, size: &str, extra: &[&str]) -> Result<usize
     if ours.len() > expected.len() {
         return Err(format!(
             "{tag}: {w}x{h} is {} bytes, ffmpeg gave {}",
+            ours.len(),
+            expected.len()
+        ));
+    }
+    if ours.len() < expected.len() {
+        return Err(format!(
+            "{tag}: {w}x{h} decoded to {} bytes, ffmpeg gave {}",
             ours.len(),
             expected.len()
         ));
@@ -1082,6 +1108,12 @@ fn jvt_full_sequence_bit_exact() {
                         bad = Some((i, pos));
                         break;
                     }
+                    assert_eq!(
+                        f.len(),
+                        len,
+                        "{name}: frame {i} is {} samples, {len} expected",
+                        f.len()
+                    );
                 }
                 match bad {
                     None if frames.len() == want => {
@@ -1300,6 +1332,13 @@ fn output_is_display_order_and_the_reorder_is_real() {
         assert!(
             first_diff(a, b).is_none(),
             "display-order frame {i} differs from ffmpeg"
+        );
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "display-order frame {i} is {} samples, ffmpeg gave {}",
+            a.len(),
+            b.len()
         );
     }
     // Every decode-order frame is somewhere in the display-order set: the two
@@ -2011,6 +2050,13 @@ fn packet_entry_surface_reorders_and_carries_timestamps() {
             first_diff(ours, theirs).is_none(),
             "packet-path frame {i} differs from ffmpeg"
         );
+        assert_eq!(
+            ours.len(),
+            theirs.len(),
+            "packet-path frame {i} is {} samples, ffmpeg gave {}",
+            ours.len(),
+            theirs.len()
+        );
     }
     // Each packet was tagged with its own index in *decode* order, so the tag
     // that comes back on a picture says which packet produced it. Decoding the
@@ -2025,6 +2071,13 @@ fn packet_entry_surface_reorders_and_carries_timestamps() {
             first_diff(pixels, &by_decode_order[tag]).is_none(),
             "output position {position} carries the timestamp of packet {tag}, \
              but its pixels are a different picture"
+        );
+        assert_eq!(
+            pixels.len(),
+            by_decode_order[tag].len(),
+            "output position {position} is {} samples, decode-order frame {tag} is {}",
+            pixels.len(),
+            by_decode_order[tag].len()
         );
     }
     let order: Vec<i64> = out.iter().map(|(pts, _)| *pts).collect();

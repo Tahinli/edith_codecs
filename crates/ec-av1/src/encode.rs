@@ -40,12 +40,12 @@ use crate::sequence::sequence_header_obu;
 use crate::tile::{
     BlockCoeffs, Coeff, INTRA_MODE_CTX, InterInfo, InterMode, Quadrant, Superblock, partition_bits,
 };
+#[cfg(test)]
+use crate::transform::forward_and_quantize;
 use crate::transform::{
     TxType, dequant_and_inverse_typed_wh, forward_and_quantize_typed,
     forward_and_quantize_typed_scaled,
 };
-#[cfg(test)]
-use crate::transform::forward_and_quantize;
 
 /// The side of the larger of the two luma blocks this encoder codes, in
 /// samples.
@@ -153,7 +153,10 @@ const HIDDEN_LAMBDA_FACTOR: f64 = 1.0;
 
 /// [`HIDDEN_LAMBDA_FACTOR`], swept by `EC_AV1_LAMBDA_HIDDEN` in any build.
 fn hidden_lambda_factor() -> f64 {
-    match std::env::var("EC_AV1_LAMBDA_HIDDEN").ok().and_then(|v| v.parse().ok()) {
+    match std::env::var("EC_AV1_LAMBDA_HIDDEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         Some(f) => f,
         None => HIDDEN_LAMBDA_FACTOR,
     }
@@ -200,7 +203,10 @@ const KEY_LAMBDA_FACTOR: f64 = 1.0;
 
 /// [`KEY_LAMBDA_FACTOR`], or what `EC_AV1_LAMBDA_KEY` names in a test build.
 fn key_lambda_factor() -> f64 {
-    match std::env::var("EC_AV1_LAMBDA_KEY").ok().and_then(|v| v.parse::<f64>().ok()) {
+    match std::env::var("EC_AV1_LAMBDA_KEY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
         Some(k) if cfg!(test) => k,
         _ => KEY_LAMBDA_FACTOR,
     }
@@ -290,21 +296,13 @@ pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType]
         TxType::Idtx,
     ];
     match set {
-        TxbSet::Luma16 | TxbSet::Luma8 | TxbSet::Luma4
-            if intra_tx_search_on(screen) =>
-        {
-            &INTRA2
-        }
+        TxbSet::Luma16 | TxbSet::Luma8 | TxbSet::Luma4 if intra_tx_search_on(screen) => &INTRA2,
         // lane-txi: a `reduced_tx_set == 0` frame's intra 8x8/4x4 reads the
         // SEVEN-type `TX_SET_INTRA_1` (`decode::txbset_for`'s `Luma{8,4}Set1`;
         // 16x16 stays `TX_SET_INTRA_2`, there is no `Luma16Set1`). The two
         // extra members are the 1-D DCTs, and the order is the reader's own
         // map (`decode::tx_type_from_symbol`, 8-wide CDF).
-        TxbSet::Luma8Set1 | TxbSet::Luma4Set1
-            if intra_tx_search_on(screen) =>
-        {
-            &INTRA1
-        }
+        TxbSet::Luma8Set1 | TxbSet::Luma4Set1 if intra_tx_search_on(screen) => &INTRA1,
         _ => &DCT,
     }
 }
@@ -375,11 +373,13 @@ pub(crate) fn wide_tx_set(screen: bool) -> bool {
         _ => {}
     }
     static ENV: std::sync::LazyLock<Option<InterTxSearch>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_TXSET_WIDE").ok().map(|v| match v.as_str() {
-            "0" | "off" => InterTxSearch::Off,
-            "screen" => InterTxSearch::Screen,
-            _ => InterTxSearch::All,
-        })
+        crate::envflags::var("EC_AV1_TXSET_WIDE")
+            .ok()
+            .map(|v| match v.as_str() {
+                "0" | "off" => InterTxSearch::Off,
+                "screen" => InterTxSearch::Screen,
+                _ => InterTxSearch::All,
+            })
     });
     match ENV.unwrap_or(if crate::speed::at(&crate::speed::WIDE_TX_SET) {
         InterTxSearch::Screen
@@ -397,8 +397,7 @@ pub(crate) fn wide_tx_set(screen: bool) -> bool {
 /// [`set_inter_tx_search`] has: the lever is OFF at every preset, so the
 /// witness that has to see the wider alphabets turns it on through this while
 /// holding [`crate::speed::knob_write`].
-static WIDE_TX_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(u8::MAX);
+static WIDE_TX_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
 /// Sets [`WIDE_TX_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` gates
@@ -414,11 +413,7 @@ pub(crate) fn set_wide_tx_set(on: Option<bool>) {
 /// [`crate::cdf_state::Cdfs`], but the trial that prices a type has to read
 /// the same alphabet or the two disagree on what a `tx_type` symbol costs.
 pub(crate) fn luma_set_for(set: TxbSet, screen: bool) -> TxbSet {
-    if wide_tx_set(screen) {
-        set.wide()
-    } else {
-        set
-    }
+    if wide_tx_set(screen) { set.wide() } else { set }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -435,8 +430,7 @@ pub(crate) enum InterTxSearch {
 /// [`set_deltaq_res`] has: the lever is OFF at every preset, so the witness
 /// that has to see a non-`DCT_DCT` inter unit turns it on through this while
 /// holding [`crate::speed::knob_write`].
-static INTER_TX_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(u8::MAX);
+static INTER_TX_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
 /// Sets [`INTER_TX_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` gates
@@ -454,12 +448,14 @@ fn inter_tx_type_search() -> InterTxSearch {
         _ => {}
     }
     static ENV: std::sync::LazyLock<Option<InterTxSearch>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_TXSET_INTER").ok().map(|v| match v.as_str() {
-            "0" | "off" => InterTxSearch::Off,
-            "screen" => InterTxSearch::Screen,
-            "le16" => InterTxSearch::Le16,
-            _ => InterTxSearch::All,
-        })
+        crate::envflags::var("EC_AV1_TXSET_INTER")
+            .ok()
+            .map(|v| match v.as_str() {
+                "0" | "off" => InterTxSearch::Off,
+                "screen" => InterTxSearch::Screen,
+                "le16" => InterTxSearch::Le16,
+                _ => InterTxSearch::All,
+            })
     });
     ENV.unwrap_or_else(|| {
         if crate::speed::at(&crate::speed::TX_TYPE_SEARCH_INTER) {
@@ -525,8 +521,7 @@ fn intra_tx_search_on(screen: bool) -> bool {
 
 /// A PROCESS-GLOBAL [`intra_tx_search_on`] override (`u8::MAX` = unset), the
 /// shape [`set_inter_tx_search`] has.
-static INTRA_TX_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(u8::MAX);
+static INTRA_TX_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
 /// Sets [`INTRA_TX_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` gates
@@ -542,9 +537,8 @@ pub(crate) fn set_intra_tx_search(on: Option<bool>) {
 /// content gate [`tx_type_candidates`] ships behind. Any other value keeps
 /// the gate (`0`/`off` still switches the search off entirely).
 fn intra_tx_all_frames() -> bool {
-    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_TXSET").is_ok_and(|v| v == "all")
-    });
+    static ENV: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_TXSET").is_ok_and(|v| v == "all"));
     *ENV
 }
 
@@ -731,7 +725,9 @@ pub fn take_b64_root_hits() -> usize {
 /// what the SIZE costs from what the 128x128 BLOCK buys.
 fn b128_root() -> bool {
     static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B128").ok().is_none_or(|v| v != "0")
+        crate::envflags::var("EC_AV1_B128")
+            .ok()
+            .is_none_or(|v| v != "0")
     });
     *ENV
 }
@@ -758,7 +754,9 @@ fn b128_root() -> bool {
 /// defect flag.
 fn b128_residual() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B128RES").ok().map(|v| v != "0")
+        crate::envflags::var("EC_AV1_B128RES")
+            .ok()
+            .map(|v| v != "0")
     });
     (ENV.unwrap_or(false) || FORCE_B128_RESIDUAL.load(std::sync::atomic::Ordering::Relaxed))
         && b128_root()
@@ -799,8 +797,7 @@ pub(crate) fn force_b128_rectres(on: bool) {
 /// How many rect/AB pieces the search left WITH a residual rather than
 /// skipped, since the last [`take_b128_rectres_hits`] (class
 /// `gate-blind-to-feature`).
-static B128_RECTRES_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static B128_RECTRES_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The rect/AB-piece-residual count since the last call, and zero it.
 pub fn take_b128_rectres_hits() -> usize {
@@ -816,15 +813,16 @@ pub fn take_b128_rectres_hits() -> usize {
 /// names a second reference).
 fn b128_compound() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B128COMP").ok().map(|v| v != "0")
+        crate::envflags::var("EC_AV1_B128COMP")
+            .ok()
+            .map(|v| v != "0")
     });
     ENV.unwrap_or(true) && b128_root()
 }
 
 /// How many 128 roots came out COMPOUND since the last
 /// [`take_b128_compound_hits`] (class `gate-blind-to-feature`).
-static B128_COMPOUND_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static B128_COMPOUND_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The compound-128 count since the last call, and zero it.
 pub fn take_b128_compound_hits() -> usize {
@@ -837,9 +835,8 @@ pub fn take_b128_compound_hits() -> usize {
 /// halved ([`search_root_128_rect`], `crate::tile::write_inter_block_128_rect`).
 /// `EC_AV1_B128HV=0` is this arm's attribution control.
 fn b128_rect() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B128HV").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_B128HV").ok().map(|v| v != "0"));
     ENV.unwrap_or(true) && b128_root()
 }
 
@@ -848,9 +845,8 @@ fn b128_rect() -> bool {
 /// attribution control (the pre-lane pricing, where a 128 rect root and the
 /// four-superblock arm were both priced as if the group were free).
 fn rectdq() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_RECTDQ").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_RECTDQ").ok().map(|v| v != "0"));
     ENV.unwrap_or(true)
 }
 
@@ -978,9 +974,8 @@ pub(crate) fn force_b128_rect(which: u8) {
 /// 64x64 pieces could carry the 64 root's residual, which is where libaom's
 /// AB shapes earn their keep) or a cheaper partition price.
 fn b128_ab() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B128AB").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_B128AB").ok().map(|v| v != "0"));
     ENV.unwrap_or(false) && b128_root()
 }
 
@@ -1043,8 +1038,7 @@ static FORCE_B128_RESIDUAL: std::sync::atomic::AtomicBool =
 /// the 128 root whenever it produced a candidate at all, whatever its four
 /// cells cost, so a witness codes the block it is about rather than waiting
 /// for content on which the root also wins its own comparison.
-static FORCE_B128_ROOT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static FORCE_B128_ROOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Arms [`FORCE_B128_RESIDUAL`] -- and with it [`FORCE_B128_ROOT`], since a
 /// forced residual block only reaches the writer if its root is taken.
@@ -1062,8 +1056,7 @@ pub(crate) fn force_b128_root(on: bool) {
 
 /// How many 128 roots came out cheaper WITH a residual than skipped, since
 /// the last [`take_b128_residual_hits`] (class `gate-blind-to-feature`).
-static B128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static B128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The 128-residual count since the last call, and zero it.
 pub fn take_b128_residual_hits() -> usize {
@@ -1087,9 +1080,8 @@ pub fn take_b128_none_hits() -> usize {
 /// `EC_AV1_RDOQ=0` in any build restores the plain deadzone quantiser --
 /// which is what the byte pins are taken under when they name it.
 fn rdoq_on() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_RDOQ").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_RDOQ").ok().map(|v| v != "0"));
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::RDOQ))
 }
 
@@ -1143,9 +1135,8 @@ fn rdoq_lambda() -> f64 {
 
 /// [`B64_ROOT`], or what `EC_AV1_B64` names.
 fn b64_root() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B64").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_B64").ok().map(|v| v != "0"));
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::B64_ROOT))
 }
 
@@ -1189,9 +1180,8 @@ pub fn take_i64_root_hits() -> [usize; 3] {
 
 /// [`I64_ROOT`], or what `EC_AV1_I64` names.
 fn i64_root() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_I64").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_I64").ok().map(|v| v != "0"));
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::I64_ROOT))
 }
 
@@ -1230,9 +1220,8 @@ fn i64_root() -> bool {
 /// transforms per superblock: a root that wins is four quadrant searches that
 /// never run.
 fn b64_residual() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B64RES").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_B64RES").ok().map(|v| v != "0"));
     ENV.unwrap_or(true) && b64_root()
 }
 
@@ -1258,7 +1247,9 @@ pub fn take_b64_residual_hits() -> usize {
 /// Off by `EC_AV1_B64COMP=0`, so both arms measure on one build.
 fn b64_compound() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B64COMP").ok().map(|v| v != "0")
+        crate::envflags::var("EC_AV1_B64COMP")
+            .ok()
+            .map(|v| v != "0")
     });
     ENV.unwrap_or(true) && b64_root()
 }
@@ -1282,7 +1273,9 @@ pub fn take_b64_compound_hits() -> usize {
 /// Off by `EC_AV1_B64VARTX=0`.
 fn b64_var_tx() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B64VARTX").ok().map(|v| v != "0")
+        crate::envflags::var("EC_AV1_B64VARTX")
+            .ok()
+            .map(|v| v != "0")
     });
     ENV.unwrap_or(true) && b64_root()
 }
@@ -1315,7 +1308,9 @@ fn b64_edge() -> bool {
 /// but is gated by [`i64_root`].
 fn edge_root_enabled() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_B64EDGE").ok().map(|v| v != "0")
+        crate::envflags::var("EC_AV1_B64EDGE")
+            .ok()
+            .map(|v| v != "0")
     });
     ENV.unwrap_or(true)
 }
@@ -1388,7 +1383,9 @@ pub(crate) const SPLIT_RD_THRESHOLD: f64 = 0.125;
 /// [`SPLIT_RD_THRESHOLD`], swept by `EC_AV1_SPLIT_RD` in any build.
 fn split_rd_threshold() -> f64 {
     static ENV: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_SPLIT_RD").ok().and_then(|v| v.parse().ok())
+        crate::envflags::var("EC_AV1_SPLIT_RD")
+            .ok()
+            .and_then(|v| v.parse().ok())
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::SPLIT_RD))
 }
@@ -1674,7 +1671,8 @@ fn intra_predict_u8(
     bh: usize,
     enable_edge_filter: bool,
     smooth_neighbor: bool,
-    dst: &mut [u8], fctx: &crate::decode::FrameCtx,
+    dst: &mut [u8],
+    fctx: &crate::decode::FrameCtx,
 ) {
     // Three heap allocations per call became three stack buffers: this runs
     // once per mode per trial, and an edge is at most `bw + bh` samples while
@@ -1713,7 +1711,8 @@ fn intra_predict_u8(
             bh,
             enable_edge_filter,
             smooth_neighbor,
-            dst16, fctx,
+            dst16,
+            fctx,
         );
         for (d, &s) in dst.iter_mut().zip(dst16.iter()) {
             *d = s as u8;
@@ -1740,7 +1739,8 @@ fn filter_intra_predict_u8(
     left: Option<&[u8]>,
     corner: Option<u8>,
     side: usize,
-    dst: &mut [u8], fctx: &crate::decode::FrameCtx,
+    dst: &mut [u8],
+    fctx: &crate::decode::FrameCtx,
 ) {
     let mut above_buf = [0u16; 2 * BLOCK];
     let mut left_buf = [0u16; 2 * BLOCK];
@@ -1764,7 +1764,8 @@ fn filter_intra_predict_u8(
         corner.map(u16::from),
         side,
         side,
-        &mut dst16[..n], fctx,
+        &mut dst16[..n],
+        fctx,
     );
     for (d, &v) in dst.iter_mut().zip(dst16[..n].iter()) {
         *d = v as u8;
@@ -2354,8 +2355,7 @@ pub const GOLDEN_SLOT: u8 = 1;
 /// environment (`u8::MAX` = unset), the shape [`set_inter_tx_search`] has:
 /// the witness that has to see a non-REGULAR kernel coded and decoded turns
 /// it on through this while holding [`crate::speed::knob_write`].
-static INTERP_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(u8::MAX);
+static INTERP_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
 /// Sets [`INTERP_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` gates
@@ -2375,11 +2375,13 @@ fn frame_interp_filter() -> ec_av1_syntax::InterpolationFilter {
         _ => {}
     }
     static ENV: std::sync::LazyLock<Option<F>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_INTERP").ok().map(|v| match v.as_str() {
-            "smooth" => F::EighttapSmooth,
-            "sharp" => F::EighttapSharp,
-            _ => F::Eighttap,
-        })
+        crate::envflags::var("EC_AV1_INTERP")
+            .ok()
+            .map(|v| match v.as_str() {
+                "smooth" => F::EighttapSmooth,
+                "sharp" => F::EighttapSharp,
+                _ => F::Eighttap,
+            })
     });
     ENV.unwrap_or(F::Eighttap)
 }
@@ -2398,7 +2400,9 @@ pub fn inter_frame_headers(
     order_hint: u32,
     last_slot: u8,
 ) -> Result<(SequenceHeader, FrameHeader)> {
-    inter_frame_headers_slots(width, height, base_q_idx, order_hint, last_slot, last_slot, last_slot)
+    inter_frame_headers_slots(
+        width, height, base_q_idx, order_hint, last_slot, last_slot, last_slot,
+    )
 }
 
 /// [`inter_frame_headers`] with the three slots named apart: the one read as
@@ -2472,8 +2476,7 @@ pub fn inter_frame_headers_slots(
         // `allow_warped_motion` besides -- which is what makes an eligible
         // block read the 3-symbol `motion_mode_cdf` alphabet instead of the
         // 2-symbol `obmc_cdf` one (libaom `motion_mode_allowed`).
-        is_motion_mode_switchable: crate::envflags::env_flag!("EC_AV1_OBMC")
-            || warp_on(),
+        is_motion_mode_switchable: crate::envflags::env_flag!("EC_AV1_OBMC") || warp_on(),
         allow_warped_motion: warp_on(),
         use_ref_frame_mvs: false,
         // Forces `get_tx_set` (spec 5.11.48) to the two-symbol
@@ -2546,8 +2549,11 @@ struct CoefCtxMap {
 /// padding-inclusive score the search used before lane-sse, which is how the
 /// before/after arms of the straddling gate rows are read off ONE binary.
 fn edge_sse() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> =
-        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_EDGESSE").ok().map(|v| v != "0"));
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_EDGESSE")
+            .ok()
+            .map(|v| v != "0")
+    });
     ENV.unwrap_or(true)
 }
 
@@ -2558,8 +2564,9 @@ fn edge_sse() -> bool {
 /// `gate-blind-to-feature` -- both gate films are superblock-aligned, so
 /// without this census no gate row can say the clip fires at all).
 fn edge_census() -> bool {
-    static ENV: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_EDGE_CENSUS").ok().as_deref() == Some("1"));
+    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_EDGE_CENSUS").ok().as_deref() == Some("1")
+    });
     *ENV
 }
 
@@ -2698,8 +2705,7 @@ impl Plane<'_> {
         let down = down.min(self.tile_y1);
         let above_n = (y > self.tile_y0 && across > x).then(|| across - x);
         if let Some(n) = above_n {
-            above_buf[..n]
-                .copy_from_slice(&self.reconstruction[(y - 1) * self.width + x..][..n]);
+            above_buf[..n].copy_from_slice(&self.reconstruction[(y - 1) * self.width + x..][..n]);
         }
         let left_n = (x > self.tile_x0 && down > y).then(|| down - y);
         if let Some(n) = left_n {
@@ -2719,8 +2725,24 @@ impl Plane<'_> {
     /// Codes one block under one mode without committing it: hands back the
     /// levels, the block the decoder would reconstruct, the squared error
     /// against the source and an estimate of what the levels cost in bits.
-    fn trial(&self, at: At, mode: u8, angle_delta: i32, base_q_idx: u8, deadzone: f64, fctx: &crate::decode::FrameCtx) -> Trial {
-        self.trial_typed(at, mode, angle_delta, base_q_idx, deadzone, TxType::DctDct, fctx)
+    fn trial(
+        &self,
+        at: At,
+        mode: u8,
+        angle_delta: i32,
+        base_q_idx: u8,
+        deadzone: f64,
+        fctx: &crate::decode::FrameCtx,
+    ) -> Trial {
+        self.trial_typed(
+            at,
+            mode,
+            angle_delta,
+            base_q_idx,
+            deadzone,
+            TxType::DctDct,
+            fctx,
+        )
     }
 
     /// [`Self::trial`] under a named transform type -- what an intra chroma
@@ -2785,8 +2807,10 @@ impl Plane<'_> {
             let (mut inside, mut whole) = (0u64, 0u64);
             for row in 0..side {
                 let source = &self.source[(y + row) * self.width + x..][..side];
-                for (col, (&s, &r)) in
-                    source.iter().zip(&reconstruction[row * side..][..side]).enumerate()
+                for (col, (&s, &r)) in source
+                    .iter()
+                    .zip(&reconstruction[row * side..][..side])
+                    .enumerate()
                 {
                     let d = u64::from(u32::from(s.abs_diff(r)).pow(2));
                     whole += d;
@@ -2834,7 +2858,8 @@ impl Plane<'_> {
             side,
             false,
             false,
-            prediction, fctx,
+            prediction,
+            fctx,
         );
 
         let mut residual = [0i32; BLOCK * BLOCK];
@@ -2853,18 +2878,35 @@ impl Plane<'_> {
         // grid this trial would really code.
         let (levels, rdoq_bits) = if rdoq_on() {
             let (mut levels, scaled) = forward_and_quantize_typed_scaled(
-                residual, side, 8, i32::from(base_q_idx), deadzone, tx_type,
+                residual,
+                side,
+                8,
+                i32::from(base_q_idx),
+                deadzone,
+                tx_type,
             );
             let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, at.set);
             let bits = crate::tile::rdoq(
-                &mut levels, &scaled, side, base_q_idx, at.set, skip_ctx, sign_ctx, rdoq_lambda(),
+                &mut levels,
+                &scaled,
+                side,
+                base_q_idx,
+                at.set,
+                skip_ctx,
+                sign_ctx,
+                rdoq_lambda(),
                 tx_type,
             );
             (levels, Some(bits))
         } else {
             (
                 forward_and_quantize_typed(
-                    residual, side, 8, i32::from(base_q_idx), deadzone, tx_type,
+                    residual,
+                    side,
+                    8,
+                    i32::from(base_q_idx),
+                    deadzone,
+                    tx_type,
                 ),
                 None,
             )
@@ -2877,7 +2919,15 @@ impl Plane<'_> {
         // residual reconstructs to the prediction itself -- `clamp(p + 0)` is
         // `p` for a `u8`, so the bytes are the same.
         let coded = dequant_and_inverse_typed_wh(
-            &levels, side, side, 8, i32::from(base_q_idx), 0, 0, tx_type, None,
+            &levels,
+            side,
+            side,
+            8,
+            i32::from(base_q_idx),
+            0,
+            0,
+            tx_type,
+            None,
         );
         #[cfg(test)]
         stage_since(2, t);
@@ -2952,7 +3002,15 @@ impl Plane<'_> {
         set: TxbSet,
     ) -> Trial {
         self.code_from_prediction_typed(
-            x, y, side, prediction, skip, base_q_idx, deadzone, set, TxType::DctDct,
+            x,
+            y,
+            side,
+            prediction,
+            skip,
+            base_q_idx,
+            deadzone,
+            set,
+            TxType::DctDct,
         )
     }
 
@@ -3007,20 +3065,36 @@ impl Plane<'_> {
         let t = stage_start();
         // lane-rdoq, as in [`Self::trial_typed`].
         let (levels, rdoq_bits) = if rdoq_on() {
-            let (mut levels, scaled) =
-                forward_and_quantize_typed_scaled(
-                    residual, side, 8, i32::from(base_q_idx), deadzone, tx_type,
-                );
+            let (mut levels, scaled) = forward_and_quantize_typed_scaled(
+                residual,
+                side,
+                8,
+                i32::from(base_q_idx),
+                deadzone,
+                tx_type,
+            );
             let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, set);
             let bits = crate::tile::rdoq(
-                &mut levels, &scaled, side, base_q_idx, set, skip_ctx, sign_ctx, rdoq_lambda(),
+                &mut levels,
+                &scaled,
+                side,
+                base_q_idx,
+                set,
+                skip_ctx,
+                sign_ctx,
+                rdoq_lambda(),
                 tx_type,
             );
             (levels, Some(bits))
         } else {
             (
                 forward_and_quantize_typed(
-                    residual, side, 8, i32::from(base_q_idx), deadzone, tx_type,
+                    residual,
+                    side,
+                    8,
+                    i32::from(base_q_idx),
+                    deadzone,
+                    tx_type,
                 ),
                 None,
             )
@@ -3113,9 +3187,12 @@ impl Plane<'_> {
         // per unit (decode.rs `decode_block`, `push_intra_rect`'s
         // `filter_intra`), not once over the whole block.
         filter_intra: Option<u8>,
-        search: &Search, fctx: &crate::decode::FrameCtx,
+        search: &Search,
+        fctx: &crate::decode::FrameCtx,
     ) -> (Vec<i32>, f64, f64, Vec<TxType>) {
-        let At { x, y, side, reach, .. } = at;
+        let At {
+            x, y, side, reach, ..
+        } = at;
         let tx = side >> depth;
         let n = 1usize << depth;
         let set = luma_set_for(
@@ -3150,9 +3227,16 @@ impl Plane<'_> {
                 };
                 let trial = match filter_intra {
                     Some(fi) => {
-                        let (mut above_buf, mut left_buf) = ([0u8; 2 * SUPERBLOCK], [0u8; 2 * SUPERBLOCK]);
-                        let (above, left, corner) =
-                            self.edges_into(tu.x, tu.y, tx, tu.reach, &mut above_buf, &mut left_buf);
+                        let (mut above_buf, mut left_buf) =
+                            ([0u8; 2 * SUPERBLOCK], [0u8; 2 * SUPERBLOCK]);
+                        let (above, left, corner) = self.edges_into(
+                            tu.x,
+                            tu.y,
+                            tx,
+                            tu.reach,
+                            &mut above_buf,
+                            &mut left_buf,
+                        );
                         let mut prediction = vec![0u8; tx * tx];
                         filter_intra_predict_u8(
                             usize::from(fi),
@@ -3182,8 +3266,13 @@ impl Plane<'_> {
                         let mut best: Option<(f64, TxType, Trial)> = None;
                         for &tx_type in tx_type_candidates(set, search.screen) {
                             let candidate = self.trial_typed(
-                                tu, mode, angle_delta, search.base_q_idx, search.deadzone,
-                                tx_type, fctx,
+                                tu,
+                                mode,
+                                angle_delta,
+                                search.base_q_idx,
+                                search.deadzone,
+                                tx_type,
+                                fctx,
                             );
                             // lane-txi: a non-`DCT_DCT` type is charged its
                             // bits at `EC_AV1_TXRD_LAMBDA` times the mode
@@ -3201,8 +3290,7 @@ impl Plane<'_> {
                                 best = Some((cost, tx_type, candidate));
                             }
                         }
-                        let (_, tx_type, trial) =
-                            best.expect("the candidate list is never empty");
+                        let (_, tx_type, trial) = best.expect("the candidate list is never empty");
                         tx_types[tu_row * n + tu_col] = tx_type;
                         TX_TYPE_HITS[tx_type as usize]
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3343,8 +3431,7 @@ impl Plane<'_> {
     fn source_block_rect(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
         let mut out = vec![0u8; w * h];
         for row in 0..h {
-            out[row * w..][..w]
-                .copy_from_slice(&self.source[(y + row) * self.width + x..][..w]);
+            out[row * w..][..w].copy_from_slice(&self.source[(y + row) * self.width + x..][..w]);
         }
         out
     }
@@ -3403,7 +3490,8 @@ impl Plane<'_> {
         at: At,
         modes: &[u8],
         mode_bits: &[f64; 13],
-        lambda: f64, fctx: &crate::decode::FrameCtx,
+        lambda: f64,
+        fctx: &crate::decode::FrameCtx,
     ) -> Vec<(f64, u8)> {
         let At {
             x, y, side, reach, ..
@@ -3425,7 +3513,8 @@ impl Plane<'_> {
                     side,
                     false,
                     false,
-                    &mut prediction, fctx,
+                    &mut prediction,
+                    fctx,
                 );
                 let sad = self.block_sad(x, y, side, &prediction);
                 (sad + lambda * mode_bits[usize::from(mode)], mode)
@@ -3447,7 +3536,8 @@ impl Plane<'_> {
         &mut self,
         at: At,
         search: &Search,
-        mode_bits: &[f64; 13], fctx: &crate::decode::FrameCtx,
+        mode_bits: &[f64; 13],
+        fctx: &crate::decode::FrameCtx,
     ) -> (Vec<Coeff>, u8, i32, f64, TxType) {
         let At {
             x, y, side, reach, ..
@@ -3475,7 +3565,8 @@ impl Plane<'_> {
                     side,
                     false,
                     false,
-                    &mut prediction, fctx,
+                    &mut prediction,
+                    fctx,
                 );
                 let sad = if want_sad {
                     self.block_sad(x, y, side, &prediction)
@@ -3505,7 +3596,10 @@ impl Plane<'_> {
             }
         }
         let ranking: Vec<(f64, u8)> = if census_on() {
-            scored.iter().map(|&(score, mode, _)| (score, mode)).collect()
+            scored
+                .iter()
+                .map(|&(score, mode, _)| (score, mode))
+                .collect()
         } else {
             Vec::new()
         };
@@ -3563,7 +3657,8 @@ impl Plane<'_> {
                     side,
                     false,
                     false,
-                    &mut prediction, fctx,
+                    &mut prediction,
+                    fctx,
                 );
                 let candidate = self.code_from_prediction(
                     x,
@@ -3575,8 +3670,9 @@ impl Plane<'_> {
                     search.deadzone,
                     at.set,
                 );
-                let bits = symbol_bits(row, (crate::tile::ANGLE_DELTA_ZERO as i32 + delta) as usize)
-                    - zero_bits;
+                let bits =
+                    symbol_bits(row, (crate::tile::ANGLE_DELTA_ZERO as i32 + delta) as usize)
+                        - zero_bits;
                 let cost_d = candidate.sse
                     + search.lambda * (candidate.bits + mode_bits[usize::from(mode)] + bits);
                 if cost_d < cost {
@@ -3594,7 +3690,13 @@ impl Plane<'_> {
         let mut tx_type = TxType::DctDct;
         for &candidate_type in tx_type_candidates(at.set, search.screen).iter().skip(1) {
             let candidate = self.trial_typed(
-                at, mode, angle_delta, search.base_q_idx, search.deadzone, candidate_type, fctx,
+                at,
+                mode,
+                angle_delta,
+                search.base_q_idx,
+                search.deadzone,
+                candidate_type,
+                fctx,
             );
             let cost_t =
                 candidate.sse + search.lambda * (candidate.bits + mode_bits[usize::from(mode)]);
@@ -3615,7 +3717,13 @@ impl Plane<'_> {
         self.commit(x, y, side, &trial);
         // A 64-point transform codes only its top-left 32x32 corner, which is
         // the grid `code_from_prediction` hands back (lane-i64).
-        (coeffs(&trial.levels, side.min(BLOCK)), mode, angle_delta, cost, tx_type)
+        (
+            coeffs(&trial.levels, side.min(BLOCK)),
+            mode,
+            angle_delta,
+            cost,
+            tx_type,
+        )
     }
 }
 
@@ -3662,7 +3770,6 @@ const HAS_TOP_RIGHT: [&[u8]; 4] = [
         255, 255, 85, 85, 119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85, 255, 127, 85, 85,
         119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85,
     ],
-
     // has_tr_4x4 (libaom av1/common/reconintra.c, transcribed verbatim) --
     // table_stride(4) == 32 (128 / 4), so 32 bits per row, 32 rows, 128
     // bytes. Sub-8x8 leaves (lane-sub8) are the only blocks that reach here
@@ -3691,7 +3798,6 @@ const HAS_BOTTOM_LEFT: [&[u8]; 4] = [
         84, 85, 16, 17, 84, 85, 0, 1, 84, 85, 16, 17, 84, 85, 0, 0, 84, 85, 16, 17, 84, 85, 0, 1,
         84, 85, 16, 17, 84, 85, 0, 0,
     ],
-
     // has_bl_4x4 (same source, same order).
     &[
         84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17,
@@ -3770,21 +3876,42 @@ impl Drop for VertAbGuard {
 /// 10 of the 21 reachable superblock positions for above-right and 7 for
 /// below-left.
 /// `has_tr_4x8` (`reconintra.c`), transcribed verbatim: 64 bytes, row stride 32 bits (`128 / 4`).
-const HAS_TR_4X8: [u8; 64] = [255, 255, 255, 255, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 127, 255, 127, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 255, 255, 127, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 127, 255, 127, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119];
+const HAS_TR_4X8: [u8; 64] = [
+    255, 255, 255, 255, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 127, 255,
+    127, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 255, 255, 127, 119, 119,
+    119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 127, 255, 127, 119, 119, 119, 119, 127,
+    127, 127, 127, 119, 119, 119, 119,
+];
 /// `has_bl_4x8` (`reconintra.c`), transcribed verbatim: 64 bytes, row stride 32 bits (`128 / 4`).
-const HAS_BL_4X8: [u8; 64] = [16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 1, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 0, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 1, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 0, 0];
+const HAS_BL_4X8: [u8; 64] = [
+    16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 1, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17,
+    17, 0, 0, 0, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 1, 0, 16, 17, 17, 17, 0, 1,
+    1, 1, 16, 17, 17, 17, 0, 0, 0, 0,
+];
 /// `has_tr_8x4` (`reconintra.c`), transcribed verbatim: 64 bytes, row stride 16 bits (`128 / 8`).
-const HAS_TR_8X4: [u8; 64] = [255, 255, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 127, 127, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 255, 127, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 127, 127, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0];
+const HAS_TR_8X4: [u8; 64] = [
+    255, 255, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 127, 127, 0, 0, 85, 85, 0, 0, 119,
+    119, 0, 0, 85, 85, 0, 0, 255, 127, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 127, 127,
+    0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0,
+];
 /// `has_bl_8x4` (`reconintra.c`), transcribed verbatim: 64 bytes, row stride 16 bits (`128 / 8`).
-const HAS_BL_8X4: [u8; 64] = [254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 1, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 0, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 1, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 0];
+const HAS_BL_8X4: [u8; 64] = [
+    254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 1, 254, 255, 84, 85, 254,
+    255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 0, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255,
+    84, 85, 254, 255, 0, 1, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 0,
+];
 /// `has_tr_8x16` (`reconintra.c`), transcribed verbatim: 16 bytes, row stride 16 bits (`128 / 8`).
-const HAS_TR_8X16: [u8; 16] = [255, 255, 119, 119, 127, 127, 119, 119, 255, 127, 119, 119, 127, 127, 119, 119];
+const HAS_TR_8X16: [u8; 16] = [
+    255, 255, 119, 119, 127, 127, 119, 119, 255, 127, 119, 119, 127, 127, 119, 119,
+];
 /// `has_bl_8x16` (`reconintra.c`), transcribed verbatim: 16 bytes, row stride 16 bits (`128 / 8`).
 const HAS_BL_8X16: [u8; 16] = [16, 17, 0, 1, 16, 17, 0, 0, 16, 17, 0, 1, 16, 17, 0, 0];
 /// `has_tr_16x8` (`reconintra.c`), transcribed verbatim: 16 bytes, row stride 8 bits (`128 / 16`).
 const HAS_TR_16X8: [u8; 16] = [255, 0, 85, 0, 119, 0, 85, 0, 127, 0, 85, 0, 119, 0, 85, 0];
 /// `has_bl_16x8` (`reconintra.c`), transcribed verbatim: 16 bytes, row stride 8 bits (`128 / 16`).
-const HAS_BL_16X8: [u8; 16] = [254, 84, 254, 16, 254, 84, 254, 0, 254, 84, 254, 16, 254, 84, 254, 0];
+const HAS_BL_16X8: [u8; 16] = [
+    254, 84, 254, 16, 254, 84, 254, 0, 254, 84, 254, 16, 254, 84, 254, 0,
+];
 /// `has_tr_16x32` (`reconintra.c`), transcribed verbatim: 4 bytes, row stride 8 bits (`128 / 16`).
 const HAS_TR_16X32: [u8; 4] = [255, 119, 127, 119];
 /// `has_bl_16x32` (`reconintra.c`), transcribed verbatim: 4 bytes, row stride 8 bits (`128 / 16`).
@@ -3802,13 +3929,24 @@ const HAS_TR_64X32: [u8; 1] = [19];
 /// `has_bl_64x32` (`reconintra.c`), transcribed verbatim: 1 bytes, row stride 2 bits (`128 / 64`).
 const HAS_BL_64X32: [u8; 1] = [34];
 /// `has_tr_4x16` (`reconintra.c`), transcribed verbatim: 32 bytes, row stride 32 bits (`128 / 4`).
-const HAS_TR_4X16: [u8; 32] = [255, 255, 255, 255, 127, 127, 127, 127, 255, 127, 255, 127, 127, 127, 127, 127, 255, 255, 255, 127, 127, 127, 127, 127, 255, 127, 255, 127, 127, 127, 127, 127];
+const HAS_TR_4X16: [u8; 32] = [
+    255, 255, 255, 255, 127, 127, 127, 127, 255, 127, 255, 127, 127, 127, 127, 127, 255, 255, 255,
+    127, 127, 127, 127, 127, 255, 127, 255, 127, 127, 127, 127, 127,
+];
 /// `has_bl_4x16` (`reconintra.c`), transcribed verbatim: 32 bytes, row stride 32 bits (`128 / 4`).
-const HAS_BL_4X16: [u8; 32] = [0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0];
+const HAS_BL_4X16: [u8; 32] = [
+    0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0,
+];
 /// `has_tr_16x4` (`reconintra.c`), transcribed verbatim: 32 bytes, row stride 8 bits (`128 / 16`).
-const HAS_TR_16X4: [u8; 32] = [255, 0, 0, 0, 85, 0, 0, 0, 119, 0, 0, 0, 85, 0, 0, 0, 127, 0, 0, 0, 85, 0, 0, 0, 119, 0, 0, 0, 85, 0, 0, 0];
+const HAS_TR_16X4: [u8; 32] = [
+    255, 0, 0, 0, 85, 0, 0, 0, 119, 0, 0, 0, 85, 0, 0, 0, 127, 0, 0, 0, 85, 0, 0, 0, 119, 0, 0, 0,
+    85, 0, 0, 0,
+];
 /// `has_bl_16x4` (`reconintra.c`), transcribed verbatim: 32 bytes, row stride 8 bits (`128 / 16`).
-const HAS_BL_16X4: [u8; 32] = [254, 254, 254, 84, 254, 254, 254, 16, 254, 254, 254, 84, 254, 254, 254, 0, 254, 254, 254, 84, 254, 254, 254, 16, 254, 254, 254, 84, 254, 254, 254, 0];
+const HAS_BL_16X4: [u8; 32] = [
+    254, 254, 254, 84, 254, 254, 254, 16, 254, 254, 254, 84, 254, 254, 254, 0, 254, 254, 254, 84,
+    254, 254, 254, 16, 254, 254, 254, 84, 254, 254, 254, 0,
+];
 /// `has_tr_8x32` (`reconintra.c`), transcribed verbatim: 8 bytes, row stride 16 bits (`128 / 8`).
 const HAS_TR_8X32: [u8; 8] = [255, 255, 127, 127, 255, 127, 127, 127];
 /// `has_bl_8x32` (`reconintra.c`), transcribed verbatim: 8 bytes, row stride 16 bits (`128 / 8`).
@@ -3911,7 +4049,14 @@ impl Reach {
 
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
     /// in a frame of `width` by `height`.
-    pub(crate) fn of(side: usize, x: usize, y: usize, width: usize, height: usize, fctx: &crate::decode::FrameCtx) -> Self {
+    pub(crate) fn of(
+        side: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        fctx: &crate::decode::FrameCtx,
+    ) -> Self {
         Self {
             above_right: y > 0 && x + side < width && Self::top_right(side, x, y, fctx),
             below_left: x > 0 && y + side < height && Self::bottom_left(side, x, y, fctx),
@@ -3929,7 +4074,8 @@ impl Reach {
         x: usize,
         y: usize,
         width: usize,
-        height: usize, fctx: &crate::decode::FrameCtx,
+        height: usize,
+        fctx: &crate::decode::FrameCtx,
     ) -> Self {
         Self {
             above_right: y > 0 && x + bw < width && Self::top_right_rect(bw, bh, x, y, fctx),
@@ -3948,10 +4094,16 @@ impl Reach {
     /// no 4x4 row at all (`has_tr_vert_tables[BLOCK_4X4]` is NULL), so a TX4
     /// unit inside an 8x8 square of a `PARTITION_VERT_A`/`_B` panicked on a
     /// real `--enable-tx-size-search=1` stream (lane-ab16 r2).
-     /// libaom `has_top_right` at block granularity (`row_off`/`col_off` 0,
+    /// libaom `has_top_right` at block granularity (`row_off`/`col_off` 0,
     /// the transform covering the whole block, luma): everything before the
     /// table lookup is that function's own early-exit ladder.
-    fn top_right_rect(bw: usize, bh: usize, x: usize, y: usize, fctx: &crate::decode::FrameCtx) -> bool {
+    fn top_right_rect(
+        bw: usize,
+        bh: usize,
+        x: usize,
+        y: usize,
+        fctx: &crate::decode::FrameCtx,
+    ) -> bool {
         let sb_mi: usize = reach_sb_px(fctx) / 4;
         let (mi_row, mi_col) = (y / 4, x / 4);
         let bw_log2 = (bw / 4).trailing_zeros() as usize;
@@ -3984,7 +4136,13 @@ impl Reach {
     }
 
     /// libaom `has_bottom_left`, same granularity as [`Self::top_right_rect`].
-    fn bottom_left_rect(bw: usize, bh: usize, x: usize, y: usize, fctx: &crate::decode::FrameCtx) -> bool {
+    fn bottom_left_rect(
+        bw: usize,
+        bh: usize,
+        x: usize,
+        y: usize,
+        fctx: &crate::decode::FrameCtx,
+    ) -> bool {
         let sb_mi: usize = reach_sb_px(fctx) / 4;
         let (mi_row, mi_col) = (y / 4, x / 4);
         let bw_log2 = (bw / 4).trailing_zeros() as usize;
@@ -4054,7 +4212,9 @@ impl Reach {
         // position inside the superblock and is what the bit index below
         // steps by (a merge that shadowed it desynced every block size).
         let table_row = Self::table(side);
-        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) && table_row < HAS_TOP_RIGHT_VERT.len() {
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get)
+            && table_row < HAS_TOP_RIGHT_VERT.len()
+        {
             HAS_TOP_RIGHT_VERT[table_row]
         } else {
             HAS_TOP_RIGHT[table_row]
@@ -4089,7 +4249,9 @@ impl Reach {
         // position inside the superblock and is what the bit index below
         // steps by (a merge that shadowed it desynced every block size).
         let table_row = Self::table(side);
-        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) && table_row < HAS_BOTTOM_LEFT_VERT.len() {
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get)
+            && table_row < HAS_BOTTOM_LEFT_VERT.len()
+        {
             HAS_BOTTOM_LEFT_VERT[table_row]
         } else {
             HAS_BOTTOM_LEFT[table_row]
@@ -4102,7 +4264,12 @@ impl Reach {
 
     /// Where a block sits inside its superblock, in blocks of its own size,
     /// and how many of them a superblock is across.
-    fn position(side: usize, x: usize, y: usize, fctx: &crate::decode::FrameCtx) -> (usize, usize, usize) {
+    fn position(
+        side: usize,
+        x: usize,
+        y: usize,
+        fctx: &crate::decode::FrameCtx,
+    ) -> (usize, usize, usize) {
         let sb = reach_sb_px(fctx);
         ((y % sb) / side, (x % sb) / side, sb / side)
     }
@@ -4147,7 +4314,9 @@ impl Reach {
 /// bits -- back off for an A/B on one build.
 pub(crate) fn warp_on() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_WARP").ok().map(|v| !matches!(v.as_str(), "0" | "off"))
+        crate::envflags::var("EC_AV1_WARP")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "off"))
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::WARP))
 }
@@ -4400,12 +4569,9 @@ fn warp_prediction(
 /// was LAST+GOLDEN or LAST+ALTREF: `comp_bwdref[0][0] = 1` prices a BWDREF or
 /// ALTREF2 partner as ALTREF and drops its `p6` symbol entirely, and the
 /// `uni_comp_ref` leaves price a LAST+LAST2 pair as LAST+GOLDEN.
-pub(crate) fn compound_ref_bits(
-    (ref0, ref1): (i8, i8),
-    stack: &crate::mvstack::MvStack,
-) -> f64 {
+pub(crate) fn compound_ref_bits((ref0, ref1): (i8, i8), stack: &crate::mvstack::MvStack) -> f64 {
     use crate::mvstack::{
-        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
         comp_reference_type_ctx, is_uni_comp_ref, single_ref_p1_ctx, single_ref_p2_ctx,
         single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
         uni_comp_ref_p1_ctx,
@@ -4526,7 +4692,7 @@ fn comp_mode_single_bits(stack: &crate::mvstack::MvStack) -> f64 {
 /// paid nothing at all, so compound was overcharged by the whole symbol.
 pub(crate) fn single_ref_bits(ref_frame: i8, stack: &crate::mvstack::MvStack) -> f64 {
     use crate::mvstack::{
-        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
         single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
         single_ref_p5_ctx, single_ref_p6_ctx,
     };
@@ -4557,20 +4723,23 @@ pub(crate) fn single_ref_bits(ref_frame: i8, stack: &crate::mvstack::MvStack) ->
             };
     }
     let far = ref_frame == LAST3_FRAME || ref_frame == GOLDEN_FRAME;
-    comp_mode + p1 + symbol_bits(
-        &cdf::SINGLE_REF[single_ref_p3_ctx(a, a1, l, l1)][2],
-        usize::from(far),
-    ) + if far {
-        symbol_bits(
-            &cdf::SINGLE_REF[single_ref_p5_ctx(a, a1, l, l1)][4],
-            usize::from(ref_frame == GOLDEN_FRAME),
+    comp_mode
+        + p1
+        + symbol_bits(
+            &cdf::SINGLE_REF[single_ref_p3_ctx(a, a1, l, l1)][2],
+            usize::from(far),
         )
-    } else {
-        symbol_bits(
-            &cdf::SINGLE_REF[single_ref_p4_ctx(a, a1, l, l1)][3],
-            usize::from(ref_frame == LAST2_FRAME),
-        )
-    }
+        + if far {
+            symbol_bits(
+                &cdf::SINGLE_REF[single_ref_p5_ctx(a, a1, l, l1)][4],
+                usize::from(ref_frame == GOLDEN_FRAME),
+            )
+        } else {
+            symbol_bits(
+                &cdf::SINGLE_REF[single_ref_p4_ctx(a, a1, l, l1)][3],
+                usize::from(ref_frame == LAST2_FRAME),
+            )
+        }
 }
 
 pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
@@ -4698,7 +4867,11 @@ fn split_census(
     } else {
         6
     };
-    let (win, lose) = if split_won { (split, flat) } else { (flat, split) };
+    let (win, lose) = if split_won {
+        (split, flat)
+    } else {
+        (flat, split)
+    };
     add(off, (win.0 * 64.0).max(0.0) as u64);
     add(off + 1, win.1.max(0.0) as u64);
     add(off + 2, (lose.0 * 64.0).max(0.0) as u64);
@@ -4831,7 +5004,10 @@ fn newmv_census_block(
     } else {
         add(4, (new_cost - other_cost).max(0.0) as u64);
     }
-    add(5, ((mv.0 - nearest.0).unsigned_abs() + (mv.1 - nearest.1).unsigned_abs()) as u64);
+    add(
+        5,
+        ((mv.0 - nearest.0).unsigned_abs() + (mv.1 - nearest.1).unsigned_abs()) as u64,
+    );
     if mv == nearest {
         add(6, 1);
     }
@@ -4886,8 +5062,16 @@ pub(crate) fn dump_newmv_census() {
         g[2],
         100.0 * g[3] as f64 / g[2].max(1) as f64,
     );
-    let [calls, evals, _subpel, rounds, near_pred, unmoved, widest, widest_moves] =
-        crate::motion::take_census();
+    let [
+        calls,
+        evals,
+        _subpel,
+        rounds,
+        near_pred,
+        unmoved,
+        widest,
+        widest_moves,
+    ] = crate::motion::take_census();
     let per = |n: u64| n as f64 / calls.max(1) as f64;
     eprintln!(
         "NEWMVCENSUS search: {calls} calls, {:.1} evals/call, {:.2} integer rounds/call; \
@@ -5019,7 +5203,9 @@ static INTER_TX_SPLIT_HITS: [std::sync::atomic::AtomicUsize; 8] =
 /// cannot pay for it (class `gate-blind-to-feature`). `EC_AV1_TX32_DEPTH`.
 fn tx32_depth_search() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_TX32_DEPTH").ok().map(|v| !matches!(v.as_str(), "0" | "off"))
+        crate::envflags::var("EC_AV1_TX32_DEPTH")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "off"))
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX32_DEPTH))
 }
@@ -5034,7 +5220,9 @@ fn tx32_depth_search() -> bool {
 /// `EC_AV1_COMP_VARTX`.
 fn compound_var_tx() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_COMP_VARTX").ok().map(|v| !matches!(v.as_str(), "0" | "off"))
+        crate::envflags::var("EC_AV1_COMP_VARTX")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "off"))
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::COMPOUND_VAR_TX))
 }
@@ -5112,18 +5300,44 @@ fn recode_inter_chroma(
     fctx: &crate::decode::FrameCtx,
 ) -> Option<[Trial; 2]> {
     let c = side / 2;
-    let tx = crate::decode::reduce_inherited_chroma_tx_type(luma_tx_type, c.min(32), c.min(32), fctx);
+    let tx =
+        crate::decode::reduce_inherited_chroma_tx_type(luma_tx_type, c.min(32), c.min(32), fctx);
     if tx == TxType::DctDct {
         return None;
     }
     Some([0usize, 1].map(|p| match second {
         Some((mv1, r1)) => mc_trial_compound_typed(
-            &chroma[p], x / 2, y / 2, c, (mv, mv1), false, refs[p], r1[p], search.base_q_idx,
-            search.deadzone, set, tx, fctx,
+            &chroma[p],
+            x / 2,
+            y / 2,
+            c,
+            (mv, mv1),
+            false,
+            refs[p],
+            r1[p],
+            search.base_q_idx,
+            search.deadzone,
+            set,
+            tx,
+            fctx,
         ),
         None => mc_trial_typed(
-            &chroma[p], x / 2, y / 2, c, mv, false, refs[p].0, refs[p].1, refs[p].2, refs[p].3,
-            false, search.base_q_idx, search.deadzone, set, tx, fctx,
+            &chroma[p],
+            x / 2,
+            y / 2,
+            c,
+            mv,
+            false,
+            refs[p].0,
+            refs[p].1,
+            refs[p].2,
+            refs[p].3,
+            false,
+            search.base_q_idx,
+            search.deadzone,
+            set,
+            tx,
+            fctx,
         ),
     }))
 }
@@ -5172,9 +5386,7 @@ fn commit_inter_luma(
         // seven-type candidate list below reachable -- and prices every
         // candidate, `IDTX` included, in the alphabet its symbol is really
         // coded into.
-        if let Some(fset) =
-            inter_luma_set(side).map(|set| luma_set_for(set, search.screen))
-        {
+        if let Some(fset) = inter_luma_set(side).map(|set| luma_set_for(set, search.screen)) {
             let lambda = search.lambda * tx_type_lambda_mult();
             let cost = |t: &Trial| t.sse + lambda * t.bits;
             for &tx_type in inter_tx_type_candidates(fset, search.screen) {
@@ -5183,12 +5395,36 @@ fn commit_inter_luma(
                 }
                 let candidate = match second {
                     Some((mv1, ref1)) => mc_trial_compound_typed(
-                        luma, x, y, side, (mv, mv1), true, reference, ref1, search.base_q_idx,
-                        search.deadzone, fset, tx_type, fctx,
+                        luma,
+                        x,
+                        y,
+                        side,
+                        (mv, mv1),
+                        true,
+                        reference,
+                        ref1,
+                        search.base_q_idx,
+                        search.deadzone,
+                        fset,
+                        tx_type,
+                        fctx,
                     ),
                     None => mc_trial_typed(
-                        luma, x, y, side, mv, true, reference.0, reference.1, reference.2,
-                        reference.3, false, search.base_q_idx, search.deadzone, fset, tx_type,
+                        luma,
+                        x,
+                        y,
+                        side,
+                        mv,
+                        true,
+                        reference.0,
+                        reference.1,
+                        reference.2,
+                        reference.3,
+                        false,
+                        search.base_q_idx,
+                        search.deadzone,
+                        fset,
+                        tx_type,
                         fctx,
                     ),
                 };
@@ -5223,13 +5459,37 @@ fn commit_inter_luma(
         if let Some(fset) = inter_luma_set(side) {
             let here = match second {
                 Some((mv1, ref1)) => mc_trial_compound_typed(
-                    luma, x, y, side, (mv, mv1), true, reference, ref1, search.base_q_idx,
-                    search.deadzone, fset, TxType::DctDct, fctx,
+                    luma,
+                    x,
+                    y,
+                    side,
+                    (mv, mv1),
+                    true,
+                    reference,
+                    ref1,
+                    search.base_q_idx,
+                    search.deadzone,
+                    fset,
+                    TxType::DctDct,
+                    fctx,
                 ),
                 None => mc_trial_typed(
-                    luma, x, y, side, mv, true, reference.0, reference.1, reference.2,
-                    reference.3, false, search.base_q_idx, search.deadzone, fset,
-                    TxType::DctDct, fctx,
+                    luma,
+                    x,
+                    y,
+                    side,
+                    mv,
+                    true,
+                    reference.0,
+                    reference.1,
+                    reference.2,
+                    reference.3,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    fset,
+                    TxType::DctDct,
+                    fctx,
                 ),
             };
             TXRD_STATS[5].fetch_add(here.sse as u64, Relaxed);
@@ -5241,16 +5501,21 @@ fn commit_inter_luma(
                     "TXRD block {n} at ({x},{y}) side={side} compound={} mv={mv:?} \
                      flat sse={:.0} bits={:.1} | here sse={:.0} bits={:.1} | chosen {flat_type:?} \
                      sse={:.0} bits={:.1}",
-                    second.is_some(), flat.sse, flat.bits, here.sse, here.bits,
-                    flat_ref.sse, flat_ref.bits,
+                    second.is_some(),
+                    flat.sse,
+                    flat.bits,
+                    here.sse,
+                    here.bits,
+                    flat_ref.sse,
+                    flat_ref.bits,
                 );
             }
         }
     }
     // What the caller's already-counted `flat` cost has to be corrected by
     // when a non-`DCT_DCT` type won it, the same way the split delta below is.
-    let flat_gain = (flat_ref.sse + search.lambda * flat_ref.bits)
-        - (flat.sse + search.lambda * flat.bits);
+    let flat_gain =
+        (flat_ref.sse + search.lambda * flat_ref.bits) - (flat.sse + search.lambda * flat.bits);
     let eligible = tx_select()
         && tx_select_inter()
         && !skip
@@ -5291,12 +5556,37 @@ fn commit_inter_luma(
             let (tu_x, tu_y) = (x + tu_col * tx, y + tu_row * tx);
             let unit = |tx_type: TxType| match second {
                 Some((mv1, ref1)) => mc_trial_compound_typed(
-                    luma, tu_x, tu_y, tx, (mv, mv1), true, reference, ref1,
-                    search.base_q_idx, search.deadzone, set, tx_type, fctx,
+                    luma,
+                    tu_x,
+                    tu_y,
+                    tx,
+                    (mv, mv1),
+                    true,
+                    reference,
+                    ref1,
+                    search.base_q_idx,
+                    search.deadzone,
+                    set,
+                    tx_type,
+                    fctx,
                 ),
                 None => mc_trial_typed(
-                    luma, tu_x, tu_y, tx, mv, true, reference.0, reference.1, reference.2,
-                    reference.3, false, search.base_q_idx, search.deadzone, set, tx_type, fctx,
+                    luma,
+                    tu_x,
+                    tu_y,
+                    tx,
+                    mv,
+                    true,
+                    reference.0,
+                    reference.1,
+                    reference.2,
+                    reference.3,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    set,
+                    tx_type,
+                    fctx,
                 ),
             };
             let mut best: Option<(f64, TxType, Trial)> = None;
@@ -5324,7 +5614,14 @@ fn commit_inter_luma(
     let split_cost = sse + search.lambda * split_lambda_mult() * split_rate;
     let flat_cost = flat_ref.sse + search.lambda * flat_rate;
     if split_census_on() {
-        split_census(1, false, side, split_cost < flat_cost, (split_rate, sse), (flat_rate, flat_ref.sse));
+        split_census(
+            1,
+            false,
+            side,
+            split_cost < flat_cost,
+            (split_rate, sse),
+            (flat_rate, flat_ref.sse),
+        );
     }
     let class = usize::from(side == BLOCK) * 4 + usize::from(second.is_some()) * 2;
     // The depth census has a leaf row and a 32x32 row and no 64 one, so the
@@ -5384,7 +5681,9 @@ fn palette_candidates(block: &[u8]) -> Vec<crate::tile::PaletteY> {
     for &v in block {
         histogram[usize::from(v)] += 1;
     }
-    let present: Vec<u16> = (0..256u16).filter(|&v| histogram[usize::from(v)] > 0).collect();
+    let present: Vec<u16> = (0..256u16)
+        .filter(|&v| histogram[usize::from(v)] > 0)
+        .collect();
     if present.len() < 2 {
         return Vec::new();
     }
@@ -5402,7 +5701,11 @@ fn palette_candidates(block: &[u8]) -> Vec<crate::tile::PaletteY> {
                     .expect("a palette holds at least two colours")
             })
             .collect();
-        crate::tile::PaletteY { size: colors.len() as u8, colors: base, map }
+        crate::tile::PaletteY {
+            size: colors.len() as u8,
+            colors: base,
+            map,
+        }
     };
     if present.len() <= 8 {
         return vec![exact(&present)];
@@ -5410,10 +5713,7 @@ fn palette_candidates(block: &[u8]) -> Vec<crate::tile::PaletteY> {
     if present.len() > palette_max_colors() {
         return Vec::new();
     }
-    let (lo, hi) = (
-        i32::from(present[0]),
-        i32::from(present[present.len() - 1]),
-    );
+    let (lo, hi) = (i32::from(present[0]), i32::from(present[present.len() - 1]));
     let mut out = Vec::with_capacity(2);
     for n in [8usize, 4] {
         // Even seeding across the block's own range, then four Lloyd passes
@@ -5595,7 +5895,10 @@ fn intrabc_worth_it(y: &[u8], width: usize, true_width: usize, true_height: usiz
         while bx + IBC_HASH <= true_width {
             total += 1;
             if let Some(hits) = table.get(&ibc_hash(y, width, bx, by)) {
-                if hits.iter().any(|&(hx, hy)| (hx as usize, hy as usize) != (bx, by)) {
+                if hits
+                    .iter()
+                    .any(|&(hx, hy)| (hx as usize, hy as usize) != (bx, by))
+                {
                     matched += 1;
                 }
             }
@@ -5603,7 +5906,11 @@ fn intrabc_worth_it(y: &[u8], width: usize, true_width: usize, true_height: usiz
         }
         by += IBC_HASH;
     }
-    let share = if total == 0 { 0.0 } else { matched as f64 / total as f64 };
+    let share = if total == 0 {
+        0.0
+    } else {
+        matched as f64 / total as f64
+    };
     (share * 100.0 >= intrabc_pct() as f64, share)
 }
 
@@ -5637,7 +5944,13 @@ struct Ibc {
 impl Ibc {
     fn new(tile: (usize, usize, usize, usize), source: &[u8], width: usize) -> Self {
         let mut table = std::collections::HashMap::new();
-        ibc_index(&mut table, source, width, (tile.0, tile.1), (tile.2, tile.3));
+        ibc_index(
+            &mut table,
+            source,
+            width,
+            (tile.0, tile.1),
+            (tile.2, tile.3),
+        );
         Self {
             table,
             tile,
@@ -5677,7 +5990,11 @@ impl Ibc {
         // Counting 64s under a 128 superblock let the search take a source
         // from a 64 row the 128 visit order had not reconstructed yet.
         let sb_log2 = if crate::encode::sb128_on() { 7 } else { 6 };
-        let delay: i32 = if sb_log2 == 7 { INTRABC_DELAY_SB64 / 2 } else { INTRABC_DELAY_SB64 };
+        let delay: i32 = if sb_log2 == 7 {
+            INTRABC_DELAY_SB64 / 2
+        } else {
+            INTRABC_DELAY_SB64
+        };
         let active_sb_row = (y as i32 - ty0) >> sb_log2;
         let active_sb_col = (x as i32 - tx0) >> sb_log2;
         let src_sb_row = (sy + h - 1 - ty0) >> sb_log2;
@@ -5705,7 +6022,10 @@ static IBC_SEARCH: [std::sync::atomic::AtomicUsize; 3] =
 
 impl Drop for Ibc {
     fn drop(&mut self) {
-        for (slot, n) in [self.lookups, self.found, self.hits].into_iter().enumerate() {
+        for (slot, n) in [self.lookups, self.found, self.hits]
+            .into_iter()
+            .enumerate()
+        {
             IBC_SEARCH[slot].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -5850,19 +6170,17 @@ fn ibc_search(
 ) -> Option<((i32, i32), f64, (usize, usize))> {
     let pred = ibc.last_dv.unwrap_or((0, -(64 + 256) * 8));
     let mut best: Option<((i32, i32), f64, (usize, usize))> = None;
-    let consider = |ibc: &Ibc, sx: usize, sy: usize, best: &mut Option<((i32, i32), f64, (usize, usize))>| {
-        let dv = (
-            (sy as i32 - y as i32) * 8,
-            (sx as i32 - x as i32) * 8,
-        );
-        if !ibc.dv_valid(x, y, side, side, dv) {
-            return;
-        }
-        let cost = ibc_sse(luma, chroma, (x, y), (sx, sy), side) + lambda * dv_bits(dv, pred);
-        if best.as_ref().is_none_or(|b| cost < b.1) {
-            *best = Some((dv, cost, (sx, sy)));
-        }
-    };
+    let consider =
+        |ibc: &Ibc, sx: usize, sy: usize, best: &mut Option<((i32, i32), f64, (usize, usize))>| {
+            let dv = ((sy as i32 - y as i32) * 8, (sx as i32 - x as i32) * 8);
+            if !ibc.dv_valid(x, y, side, side, dv) {
+                return;
+            }
+            let cost = ibc_sse(luma, chroma, (x, y), (sx, sy), side) + lambda * dv_bits(dv, pred);
+            if best.as_ref().is_none_or(|b| cost < b.1) {
+                *best = Some((dv, cost, (sx, sy)));
+            }
+        };
     ibc.lookups += 1;
     let key = ibc_hash(luma.source, luma.width, x, y);
     // The table is filled in raster order, so the entries BEFORE this block's
@@ -5984,13 +6302,19 @@ fn code_square(
             let cost_d = sse + search.lambda * split_lambda_mult() * rate;
             if census_flat.is_some() {
                 let c = (bits + tx_depth_bits(side, depth), sse);
-                if census_split.is_none_or(|b| sse + search.lambda * rate < b.1 + search.lambda * b.0)
+                if census_split
+                    .is_none_or(|b| sse + search.lambda * rate < b.1 + search.lambda * b.0)
                 {
                     census_split = Some(c);
                 }
             }
             if cost_d < best.0 {
-                best = (cost_d, depth, luma.snapshot(x, y, side), coeffs(&levels, side));
+                best = (
+                    cost_d,
+                    depth,
+                    luma.snapshot(x, y, side),
+                    coeffs(&levels, side),
+                );
                 best_types = types;
             }
         }
@@ -6050,7 +6374,11 @@ fn code_square(
                     * (trial.bits
                         + mode_bits[DC_PRED as usize]
                         + crate::tile::palette_bits(&pal, side, on)
-                        + if tx_select { tx_depth_bits(side, 0) } else { 0.0 });
+                        + if tx_select {
+                            tx_depth_bits(side, 0)
+                        } else {
+                            0.0
+                        });
             if cost_p < cost {
                 cost = cost_p;
                 mode = DC_PRED as u8;
@@ -6101,7 +6429,11 @@ fn code_square(
         }
         let one_bits = symbol_bits(row, 1);
         let kept = luma.snapshot(x, y, side);
-        let max_depth = if tx_select && search.screen { max_tx_depth(side) } else { 0 };
+        let max_depth = if tx_select && search.screen {
+            max_tx_depth(side)
+        } else {
+            0
+        };
         let mut best: Option<(f64, u8, usize, (Vec<u8>, Vec<CoefCtx>), Vec<Coeff>)> = None;
         for fi in 0..5u8 {
             for depth in 0..=max_depth {
@@ -6116,7 +6448,11 @@ fn code_square(
                             + mode_bits[DC_PRED as usize]
                             + one_bits
                             + symbol_bits(&cdf::FILTER_INTRA_MODE, usize::from(fi))
-                            + if tx_select { tx_depth_bits(side, depth) } else { 0.0 });
+                            + if tx_select {
+                                tx_depth_bits(side, depth)
+                            } else {
+                                0.0
+                            });
                 if cost_f < cost && best.as_ref().is_none_or(|b| cost_f < b.0) {
                     best = Some((
                         cost_f,
@@ -6214,8 +6550,8 @@ const CHROMA_MODES: [u8; 7] = [
 /// The thirteen intra mode names, for the chroma fire count's print.
 #[cfg(test)]
 const UV_MODE_NAMES: [&str; 14] = [
-    "DC", "V", "H", "D45", "D135", "D113", "D157", "D203", "D67", "SMOOTH", "SMOOTH_V",
-    "SMOOTH_H", "PAETH", "CFL",
+    "DC", "V", "H", "D45", "D135", "D113", "D157", "D203", "D67", "SMOOTH", "SMOOTH_V", "SMOOTH_H",
+    "PAETH", "CFL",
 ];
 
 /// How many blocks each chroma mode has won, indexed by the mode itself --
@@ -6253,18 +6589,16 @@ pub(crate) fn take_angle_delta_hits() -> [usize; 7] {
 /// Whether the luma search refines a directional winner's `angle_delta_y`
 /// (`EC_AV1_ANGLE=0` switches it off, the lane's own on/off pair).
 fn angle_delta_on() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_ANGLE").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_ANGLE").ok().map(|v| v != "0"));
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::ANGLE))
 }
 
 /// Whether the chroma search offers `UV_CFL_PRED` at all (`EC_AV1_CFL=0`
 /// switches it off, which is how the lane measured its own on/off pair).
 fn cfl_on() -> bool {
-    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_CFL").ok().map(|v| v != "0")
-    });
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_CFL").ok().map(|v| v != "0"));
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::CFL))
 }
 
@@ -6347,7 +6681,9 @@ pub(crate) fn filter_intra_on() -> bool {
         return forced;
     }
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_FILTER_INTRA").ok().map(|v| v != "0")
+        crate::envflags::var("EC_AV1_FILTER_INTRA")
+            .ok()
+            .map(|v| v != "0")
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::FILTER_INTRA))
 }
@@ -6470,8 +6806,24 @@ fn search_chroma(
         } else {
             crate::decode::default_intra_tx_type(mode)
         };
-        let u = chroma[0].trial_typed(at, mode, 0, search.base_q_idx, search.deadzone, tx_type, fctx);
-        let v = chroma[1].trial_typed(at, mode, 0, search.base_q_idx, search.deadzone, tx_type, fctx);
+        let u = chroma[0].trial_typed(
+            at,
+            mode,
+            0,
+            search.base_q_idx,
+            search.deadzone,
+            tx_type,
+            fctx,
+        );
+        let v = chroma[1].trial_typed(
+            at,
+            mode,
+            0,
+            search.base_q_idx,
+            search.deadzone,
+            tx_type,
+            fctx,
+        );
         let cost = u.sse + v.sse + search.lambda * (bits + u.bits + v.bits);
         if best.as_ref().is_none_or(|(b, ..)| cost < *b) {
             best = Some((cost, mode, u, v));
@@ -6543,10 +6895,24 @@ fn search_chroma(
             };
             let (pu, pv) = (predict(&candidate.u_colors), predict(&candidate.v_colors));
             let u_trial = chroma[0].code_from_prediction(
-                at.x, at.y, at.side, &pu, false, search.base_q_idx, search.deadzone, set,
+                at.x,
+                at.y,
+                at.side,
+                &pu,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                set,
             );
             let v_trial = chroma[1].code_from_prediction(
-                at.x, at.y, at.side, &pv, false, search.base_q_idx, search.deadzone, set,
+                at.x,
+                at.y,
+                at.side,
+                &pv,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                set,
             );
             let cost_p = u_trial.sse
                 + v_trial.sse
@@ -6583,7 +6949,16 @@ fn search_chroma(
                 plane.edges_into(at.x, at.y, at.side, at.reach, &mut above_buf, &mut left_buf);
             let mut prediction = vec![0u8; at.side * at.side];
             intra_predict_u8(
-                DC_PRED, 0, above, left, corner, at.side, at.side, false, false, &mut prediction,
+                DC_PRED,
+                0,
+                above,
+                left,
+                corner,
+                at.side,
+                at.side,
+                false,
+                false,
+                &mut prediction,
                 fctx,
             );
             prediction
@@ -6660,11 +7035,7 @@ fn search_chroma(
             };
             // At least one alpha must be nonzero: `cfl_alpha_signs` has no
             // (ZERO, ZERO) joint value ([`crate::tile::cfl_joint_sign`]).
-            let combos: [(i32, i32); 3] = [
-                (picked[0], picked[1]),
-                (picked[0], 0),
-                (0, picked[1]),
-            ];
+            let combos: [(i32, i32); 3] = [(picked[0], picked[1]), (picked[0], 0), (0, picked[1])];
             for &(alpha_u, alpha_v) in &combos {
                 if (alpha_u, alpha_v) == (0, 0) {
                     continue;
@@ -6752,9 +7123,17 @@ fn leaf_compound_stacks<'a>(
                 r,
                 p,
                 crate::mvstack::find_mv_stack_compound(
-                    grid, mi_row, mi_col, bw4, bh4,
-                    (crate::mvstack::LAST_FRAME, r), mi_cols, mi_rows,
-                    grid.sign_bias_table(), &[(0, 0); 7], None,
+                    grid,
+                    mi_row,
+                    mi_col,
+                    bw4,
+                    bh4,
+                    (crate::mvstack::LAST_FRAME, r),
+                    mi_cols,
+                    mi_rows,
+                    grid.sign_bias_table(),
+                    &[(0, 0); 7],
+                    None,
                 ),
             )
         })
@@ -6945,7 +7324,8 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        luma_set, fctx,
+        luma_set,
+        fctx,
     );
     let u = mc_trial(
         &chroma[0],
@@ -6961,7 +7341,8 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        chroma_set, fctx,
+        chroma_set,
+        fctx,
     );
     let v = mc_trial(
         &chroma[1],
@@ -6977,7 +7358,8 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        chroma_set, fctx,
+        chroma_set,
+        fctx,
     );
     let skip = luma_trial.levels.iter().all(|&l| l == 0)
         && u.levels.iter().all(|&l| l == 0)
@@ -7055,7 +7437,8 @@ fn code_square_inter(
             side,
             stack.pred_mv,
             &seeds[..seed_n],
-            search.lambda, fctx,
+            search.lambda,
+            fctx,
             1,
         );
         let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
@@ -7063,7 +7446,15 @@ fn code_square_inter(
         let mv_residual = mv_residual_bits(new_mv, stack.pred_mv);
         if mv_residual.is_none() {
             // lane-newmv: a vector the writer cannot name never reaches RD.
-            newmv_census_block(side, false, f64::INFINITY, best.0, new_mv, stack.nearest_mv, 0.0);
+            newmv_census_block(
+                side,
+                false,
+                f64::INFINITY,
+                best.0,
+                new_mv,
+                stack.nearest_mv,
+                0.0,
+            );
         }
         if let Some(mv_bits) = mv_residual {
             searched_new = Some(new_mv);
@@ -7074,17 +7465,54 @@ fn code_square_inter(
             } else {
                 (
                     mc_trial(
-                        luma, x, y, side, new_mv, true, ref_luma.0, ref_luma.1, ref_luma.2,
-                        ref_luma.3, false, search.base_q_idx, search.deadzone, luma_set, fctx,
-                    ),
-                    mc_trial(
-                        &chroma[0], x / 2, y / 2, side / 2, new_mv, false, ref_u.0, ref_u.1,
-                        ref_u.2, ref_u.3, false, search.base_q_idx, search.deadzone, chroma_set,
+                        luma,
+                        x,
+                        y,
+                        side,
+                        new_mv,
+                        true,
+                        ref_luma.0,
+                        ref_luma.1,
+                        ref_luma.2,
+                        ref_luma.3,
+                        false,
+                        search.base_q_idx,
+                        search.deadzone,
+                        luma_set,
                         fctx,
                     ),
                     mc_trial(
-                        &chroma[1], x / 2, y / 2, side / 2, new_mv, false, ref_v.0, ref_v.1,
-                        ref_v.2, ref_v.3, false, search.base_q_idx, search.deadzone, chroma_set,
+                        &chroma[0],
+                        x / 2,
+                        y / 2,
+                        side / 2,
+                        new_mv,
+                        false,
+                        ref_u.0,
+                        ref_u.1,
+                        ref_u.2,
+                        ref_u.3,
+                        false,
+                        search.base_q_idx,
+                        search.deadzone,
+                        chroma_set,
+                        fctx,
+                    ),
+                    mc_trial(
+                        &chroma[1],
+                        x / 2,
+                        y / 2,
+                        side / 2,
+                        new_mv,
+                        false,
+                        ref_v.0,
+                        ref_v.1,
+                        ref_v.2,
+                        ref_v.3,
+                        false,
+                        search.base_q_idx,
+                        search.deadzone,
+                        chroma_set,
                         fctx,
                     ),
                 )
@@ -7113,7 +7541,15 @@ fn code_square_inter(
                         } else {
                             luma_new.bits + u_new.bits + v_new.bits
                         });
-            newmv_census_block(side, true, cost_new, best.0, new_mv, stack.nearest_mv, mv_bits);
+            newmv_census_block(
+                side,
+                true,
+                cost_new,
+                best.0,
+                new_mv,
+                stack.nearest_mv,
+                mv_bits,
+            );
             if cost_new < best.0 {
                 single_syntax = intra_inter_bits(true)
                     + single_ref_bits
@@ -7154,13 +7590,15 @@ fn code_square_inter(
         // above stay.
         arfmode_hit(2);
     }
-    for (ref1, g, cstack) in compound.iter().filter(|_| leaf_compound() && search.arf_leaf_compound) {
+    for (ref1, g, cstack) in compound
+        .iter()
+        .filter(|_| leaf_compound() && search.arf_leaf_compound)
+    {
         let (ref1, g) = (*ref1, *g);
         // The whole `comp_mode` + reference-pair tree at the writer's own
         // contexts, for THIS pair (lane-ctx).
         let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
-        let mode_ctx =
-            cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
+        let mode_ctx = cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
             |mode: usize| pair_bits + symbol_bits(&cdf::INTER_COMPOUND_MODE[mode_ctx], mode);
         let mut ccands: Vec<(((i32, i32), (i32, i32)), f64, InterInfo)> = vec![
@@ -7213,8 +7651,19 @@ fn code_square_inter(
             let skip = margin > 0.0
                 && searched_new_cost.is_some_and(|last| {
                     motion::cost_at(
-                        &g.y, g.width, luma.true_width, luma.true_height, &source_block, x, y,
-                        side, side, cstack.nearest_mv.1, cbase.1, search.lambda, fctx,
+                        &g.y,
+                        g.width,
+                        luma.true_width,
+                        luma.true_height,
+                        &source_block,
+                        x,
+                        y,
+                        side,
+                        side,
+                        cstack.nearest_mv.1,
+                        cbase.1,
+                        search.lambda,
+                        fctx,
                     ) * margin
                         <= last
                 });
@@ -7229,8 +7678,20 @@ fn code_square_inter(
                     seed_n += 1;
                 }
                 let found = motion::search(
-                    &g.y, g.width, luma.true_width, luma.true_height, &source_block, x, y, side,
-                    side, cbase.1, &seeds[..seed_n], search.lambda, fctx, ref_distance(ref1),
+                    &g.y,
+                    g.width,
+                    luma.true_width,
+                    luma.true_height,
+                    &source_block,
+                    x,
+                    y,
+                    side,
+                    side,
+                    cbase.1,
+                    &seeds[..seed_n],
+                    search.lambda,
+                    fctx,
+                    ref_distance(ref1),
                 );
                 second_new = Some(round_to_valid_mv(found.mv, cbase.1));
             }
@@ -7302,19 +7763,46 @@ fn code_square_inter(
         );
         for (mvs, bits, info) in ccands {
             let luma_c = mc_trial_compound(
-                luma, x, y, side, mvs, true,
-                (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), g_luma,
-                search.base_q_idx, search.deadzone, luma_set, fctx,
+                luma,
+                x,
+                y,
+                side,
+                mvs,
+                true,
+                (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
+                g_luma,
+                search.base_q_idx,
+                search.deadzone,
+                luma_set,
+                fctx,
             );
             let u_c = mc_trial_compound(
-                &chroma[0], x / 2, y / 2, side / 2, mvs, false,
-                (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3), g_u,
-                search.base_q_idx, search.deadzone, chroma_set, fctx,
+                &chroma[0],
+                x / 2,
+                y / 2,
+                side / 2,
+                mvs,
+                false,
+                (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                g_u,
+                search.base_q_idx,
+                search.deadzone,
+                chroma_set,
+                fctx,
             );
             let v_c = mc_trial_compound(
-                &chroma[1], x / 2, y / 2, side / 2, mvs, false,
-                (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3), g_v,
-                search.base_q_idx, search.deadzone, chroma_set, fctx,
+                &chroma[1],
+                x / 2,
+                y / 2,
+                side / 2,
+                mvs,
+                false,
+                (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                g_v,
+                search.base_q_idx,
+                search.deadzone,
+                chroma_set,
+                fctx,
             );
             let skip_c = luma_c.levels.iter().all(|&l| l == 0)
                 && u_c.levels.iter().all(|&l| l == 0)
@@ -7326,7 +7814,11 @@ fn code_square_inter(
                     * (skip_bits(skip_c)
                         + intra_inter_bits(true)
                         + bits
-                        + if skip_c { 0.0 } else { luma_c.bits + u_c.bits + v_c.bits });
+                        + if skip_c {
+                            0.0
+                        } else {
+                            luma_c.bits + u_c.bits + v_c.bits
+                        });
             if cost_c < best.0 {
                 best = (cost_c, Some((luma_c, u_c, v_c, skip_c, info)));
             }
@@ -7409,14 +7901,33 @@ fn code_square_inter(
         }
         for (motion, pred) in candidates {
             let luma_o = luma.code_from_prediction(
-                x, y, side, &pred[0], false, search.base_q_idx, search.deadzone, luma_set,
+                x,
+                y,
+                side,
+                &pred[0],
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                luma_set,
             );
             let u_o = chroma[0].code_from_prediction(
-                x / 2, y / 2, side / 2, &pred[1], false, search.base_q_idx, search.deadzone,
+                x / 2,
+                y / 2,
+                side / 2,
+                &pred[1],
+                false,
+                search.base_q_idx,
+                search.deadzone,
                 chroma_set,
             );
             let v_o = chroma[1].code_from_prediction(
-                x / 2, y / 2, side / 2, &pred[2], false, search.base_q_idx, search.deadzone,
+                x / 2,
+                y / 2,
+                side / 2,
+                &pred[2],
+                false,
+                search.base_q_idx,
+                search.deadzone,
                 chroma_set,
             );
             let skip_o = luma_o.levels.iter().all(|&l| l == 0)
@@ -7429,7 +7940,11 @@ fn code_square_inter(
                     * (skip_bits(skip_o)
                         + single_syntax
                         + mm(motion)
-                        + if skip_o { 0.0 } else { luma_o.bits + u_o.bits + v_o.bits });
+                        + if skip_o {
+                            0.0
+                        } else {
+                            luma_o.bits + u_o.bits + v_o.bits
+                        });
             // The incumbent pays the motion_mode symbol IT would code, so
             // both sides of the comparison carry that syntax.
             if cost_o < best.0 + search.lambda * mm(motion_won) {
@@ -7487,22 +8002,31 @@ fn code_square_inter(
                     )
                 })
             });
-            let (levels, tx_depth, dcost, luma_tx_types) = if motion_won != 0
-                || (info.ref1.is_some() && second.is_none())
-            {
-                luma.commit(x, y, side, &luma_new);
-                (luma_new.levels.clone(), 0, 0.0, Vec::new())
-            } else {
-                commit_inter_luma(
-                    luma, (x, y), side, info.mv,
-                    (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
-                    search, &luma_new, skip_new, second, fctx,
-                )
-            };
+            let (levels, tx_depth, dcost, luma_tx_types) =
+                if motion_won != 0 || (info.ref1.is_some() && second.is_none()) {
+                    luma.commit(x, y, side, &luma_new);
+                    (luma_new.levels.clone(), 0, 0.0, Vec::new())
+                } else {
+                    commit_inter_luma(
+                        luma,
+                        (x, y),
+                        side,
+                        info.mv,
+                        (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
+                        search,
+                        &luma_new,
+                        skip_new,
+                        second,
+                        fctx,
+                    )
+                };
             // lane-txrd: chroma follows the luma type the search just chose.
             let [u_new, v_new] = match luma_tx_types.first().copied() {
                 Some(t) => recode_inter_chroma(
-                    chroma, (x, y), side, info.mv,
+                    chroma,
+                    (x, y),
+                    side,
+                    info.mv,
                     [
                         (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
                         (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
@@ -7512,13 +8036,26 @@ fn code_square_inter(
                             (
                                 info.mv1,
                                 [
-                                    (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
-                                    (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                                    (
+                                        g.u.as_slice(),
+                                        g.width / 2,
+                                        chroma[0].true_width,
+                                        chroma[0].true_height,
+                                    ),
+                                    (
+                                        g.v.as_slice(),
+                                        g.width / 2,
+                                        chroma[1].true_width,
+                                        chroma[1].true_height,
+                                    ),
                                 ],
                             )
                         })
                     }),
-                    search, chroma_set, t, fctx,
+                    search,
+                    chroma_set,
+                    t,
+                    fctx,
                 )
                 .unwrap_or([u_new, v_new]),
                 None => [u_new, v_new],
@@ -7539,7 +8076,7 @@ fn code_square_inter(
                     eight: None,
                     dv: None,
                     palette: None,
-            palette_uv: None,
+                    palette_uv: None,
                     tx_depth,
                     luma_tx_types,
                     inter: Some(info),
@@ -7559,50 +8096,69 @@ fn code_square_inter(
     }
     if inter_cost < intra_cost {
         let (levels, tx_depth, dcost, luma_tx_types) = commit_inter_luma(
-            luma, (x, y), side, mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_trial, skip, None, fctx,
+            luma,
+            (x, y),
+            side,
+            mv,
+            (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
+            search,
+            &luma_trial,
+            skip,
+            None,
+            fctx,
         );
         // lane-txrd: chroma follows the luma type (this tail's block is
         // single-reference `NEARESTMV`, so no compound second half).
         let [u, v] = match luma_tx_types.first().copied() {
             Some(t) => recode_inter_chroma(
-                chroma, (x, y), side, mv,
+                chroma,
+                (x, y),
+                side,
+                mv,
                 [
                     (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
                     (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
                 ],
-                None, search, chroma_set, t, fctx,
+                None,
+                search,
+                chroma_set,
+                t,
+                fctx,
             )
             .unwrap_or([u, v]),
             None => [u, v],
         };
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
         chroma[1].commit(x / 2, y / 2, side / 2, &v);
-        (BlockCoeffs {
-            luma_tx_types,
-            angle_delta_y: 0,
-            cfl_alphas: None,
-            filter_intra: None,
-            luma: coeffs(&levels, side),
-            u: coeffs(&u.levels, side / 2),
-            v: coeffs(&v.levels, side / 2),
-            mode: DC_PRED as u8,
-            uv_mode: DC_PRED,
-            skip,
-            eight: None,
-            dv: None,
-            palette: None,
-            palette_uv: None,
-            tx_depth,
-            motion_mode: 0,
-            inter: Some(InterInfo {
-                ref1: None,
-                mv1: (0, 0),
-                ref_frame: crate::mvstack::LAST_FRAME,
-                mode: InterMode::NearestMv,
-                mv,
-                ref_mv_idx: 0,
-            }),
-        }, inter_cost + dcost)
+        (
+            BlockCoeffs {
+                luma_tx_types,
+                angle_delta_y: 0,
+                cfl_alphas: None,
+                filter_intra: None,
+                luma: coeffs(&levels, side),
+                u: coeffs(&u.levels, side / 2),
+                v: coeffs(&v.levels, side / 2),
+                mode: DC_PRED as u8,
+                uv_mode: DC_PRED,
+                skip,
+                eight: None,
+                dv: None,
+                palette: None,
+                palette_uv: None,
+                tx_depth,
+                motion_mode: 0,
+                inter: Some(InterInfo {
+                    ref1: None,
+                    mv1: (0, 0),
+                    ref_frame: crate::mvstack::LAST_FRAME,
+                    mode: InterMode::NearestMv,
+                    mv,
+                    ref_mv_idx: 0,
+                }),
+            },
+            inter_cost + dcost,
+        )
     } else {
         (intra_block, intra_cost)
     }
@@ -7812,7 +8368,9 @@ fn arfmode() -> u8 {
         n => return n,
     }
     static ENV: std::sync::LazyLock<Option<u8>> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_ARFMODE").ok().and_then(|v| v.parse().ok())
+        crate::envflags::var("EC_AV1_ARFMODE")
+            .ok()
+            .and_then(|v| v.parse().ok())
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::ARFMODE))
 }
@@ -8069,7 +8627,11 @@ fn armed_tiles() -> (u32, u32) {
 /// `context_update_tile_id` names. The result cannot depend on the thread
 /// count: each job writes one tile from the frame's own starting tables into
 /// its own slot.
-fn write_tiles<F>(tiles: usize, store: usize, code: F) -> Result<(Vec<Vec<u8>>, Option<crate::cdf_state::Cdfs>)>
+fn write_tiles<F>(
+    tiles: usize,
+    store: usize,
+    code: F,
+) -> Result<(Vec<Vec<u8>>, Option<crate::cdf_state::Cdfs>)>
 where
     F: Fn(usize) -> Result<(Vec<u8>, Option<crate::cdf_state::Cdfs>)> + Sync + Send,
 {
@@ -8082,7 +8644,8 @@ where
             slots.push(Some(code(index)));
         }
     } else {
-        let done: std::sync::Mutex<Vec<Slot>> = std::sync::Mutex::new((0..tiles).map(|_| None).collect());
+        let done: std::sync::Mutex<Vec<Slot>> =
+            std::sync::Mutex::new((0..tiles).map(|_| None).collect());
         {
             let batch = crate::par::Batch::new("ec-av1-tile");
             for (from, to) in crate::par::bands(tiles, threads) {
@@ -8164,7 +8727,13 @@ where
 /// of the frame's reconstruction because a tile's prediction never reads a
 /// sample outside its own rectangle, and every sample inside it is written
 /// before it is read.
-fn fresh_plane(source: &[u8], width: usize, height: usize, true_width: usize, true_height: usize) -> Plane<'_> {
+fn fresh_plane(
+    source: &[u8],
+    width: usize,
+    height: usize,
+    true_width: usize,
+    true_height: usize,
+) -> Plane<'_> {
     Plane {
         source,
         reconstruction: vec![128; source.len()],
@@ -8270,7 +8839,12 @@ fn clip_planes_to_tile(
 /// Returns an error under the same conditions
 /// [`encode_key_frame_with_modes`] does.
 pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Result<Encoded> {
-    encode_key_frame_with_ctx(picture, base_q_idx, deadzone, &crate::decode::FrameCtx::for_encoder())
+    encode_key_frame_with_ctx(
+        picture,
+        base_q_idx,
+        deadzone,
+        &crate::decode::FrameCtx::for_encoder(),
+    )
 }
 
 /// [`encode_key_frame`] with the per-block intra modes given rather than
@@ -8312,10 +8886,20 @@ pub fn encode_sequence(
     base_q_idx: u8,
     deadzone: f64,
 ) -> Result<EncodedSequence> {
-    encode_sequence_with_ctx(pictures, base_q_idx, deadzone, &crate::decode::FrameCtx::for_encoder())
+    encode_sequence_with_ctx(
+        pictures,
+        base_q_idx,
+        deadzone,
+        &crate::decode::FrameCtx::for_encoder(),
+    )
 }
 
-pub(crate) fn encode_key_frame_with_ctx(picture: &Picture, base_q_idx: u8, deadzone: f64, fctx: &crate::decode::FrameCtx) -> Result<Encoded> {
+pub(crate) fn encode_key_frame_with_ctx(
+    picture: &Picture,
+    base_q_idx: u8,
+    deadzone: f64,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<Encoded> {
     encode_key_frame_with_modes_with_ctx(picture, base_q_idx, deadzone, &KEY_FRAME_MODES, fctx)
 }
 
@@ -8334,7 +8918,8 @@ pub(crate) fn encode_key_frame_with_modes_with_ctx(
     picture: &Picture,
     base_q_idx: u8,
     deadzone: f64,
-    modes: &[u8], fctx: &crate::decode::FrameCtx,
+    modes: &[u8],
+    fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     picture.check_even()?;
     let padded = picture.padded_to(BLOCK);
@@ -8345,7 +8930,8 @@ pub(crate) fn encode_key_frame_with_modes_with_ctx(
         modes,
         split_blocks(),
         (picture.width, picture.height),
-        unspecified_color_config(), fctx,
+        unspecified_color_config(),
+        fctx,
     )?;
     Ok(crop_encoded(&encoded, picture.width, picture.height))
 }
@@ -8361,7 +8947,8 @@ pub(crate) fn encode_key_frame_inner(
     modes: &[u8],
     split_blocks: bool,
     render: (usize, usize),
-    color_config: ColorConfig, fctx: &crate::decode::FrameCtx,
+    color_config: ColorConfig,
+    fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     // lane-refs: an intra frame runs no motion compensation, and the
     // context is shared across the sequence -- put the kernel back to the
@@ -8533,8 +9120,12 @@ pub(crate) fn encode_key_frame_inner(
     // because a 32x32 block may be split into four 16x16 ones.
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     // This frame's tile grid (one tile unless the facade armed more).
-    let layout =
-        crate::tile::TileLayout::new(header.mi_cols, header.mi_rows, tile_cols_log2, tile_rows_log2);
+    let layout = crate::tile::TileLayout::new(
+        header.mi_cols,
+        header.mi_rows,
+        tile_cols_log2,
+        tile_rows_log2,
+    );
     header.tile_info = tile_info_of(&layout, 1);
     // The filter search re-decodes this frame's tiles; the decoder derives
     // every tile's own rect from this same `tile_info` (its `mi_col_starts`/
@@ -8560,10 +9151,28 @@ pub(crate) fn encode_key_frame_inner(
      -> Result<Vec<(usize, Superblock, Vec<u8>)>> {
         crate::tile::arm_pricing_cdfs(None, false);
         let rect = layout.rect(index);
-        let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
+        let mut luma = fresh_plane(
+            &picture_y8,
+            frame_width,
+            frame_height,
+            true_width,
+            true_height,
+        );
         let mut chroma = [
-            fresh_plane(&picture_u8, frame_width / 2, frame_height / 2, true_width / 2, true_height / 2),
-            fresh_plane(&picture_v8, frame_width / 2, frame_height / 2, true_width / 2, true_height / 2),
+            fresh_plane(
+                &picture_u8,
+                frame_width / 2,
+                frame_height / 2,
+                true_width / 2,
+                true_height / 2,
+            ),
+            fresh_plane(
+                &picture_v8,
+                frame_width / 2,
+                frame_height / 2,
+                true_width / 2,
+                true_height / 2,
+            ),
         ];
         clip_planes_to_tile(&mut luma, &mut chroma, rect);
         let mut above_mode = vec![DC_PRED; cols * 2];
@@ -8581,285 +9190,286 @@ pub(crate) fn encode_key_frame_inner(
             )
         });
         let mut coded: Vec<(usize, Superblock, Vec<u8>)> = Vec::new();
-    for sb_row in rect.sb_row0 as usize..rect.sb_row1 as usize {
-        for sb_col in rect.sb_col0 as usize..rect.sb_col1 as usize {
-            let mut modes = Vec::with_capacity(4);
-            // The quadrants of a superblock are coded in the order the decoder
-            // walks them, which for a 64x64 split into 32x32 blocks is raster
-            // order among the quadrants that are inside the frame.
-            let mut blocks = Vec::with_capacity(4);
-            // lane-i64: the whole superblock as ONE 64x64 intra block, tried
-            // BEFORE its quadrants (so both start from the same
-            // reconstruction) and compared against the four of them below --
-            // the shape the inter frame's own 64 root takes
-            // (`search_skip_64`). A frame that allows intrabc is refused
-            // outright ([`I64_ROOT`]) because the quadrant searches below
-            // carry DV state a discarded trial would desync.
-            let (x64, y64) = (sb_col * SUPERBLOCK, sb_row * SUPERBLOCK);
-            // lane-corner LIFTED the two guards this root shipped with: the
-            // frame no longer has to be a whole number of superblocks, and
-            // the superblock no longer has to be wholly inside the frame.
-            // The desync the guards were written for (a 248x152 corner's
-            // chroma disagreeing three ways) does NOT reproduce at this
-            // revision -- see
-            // `stream::tests::a_doubly_cut_superblock_root_round_trips_in_every_plane`,
-            // which pins all three planes of the encoder's reconstruction,
-            // our decoder and ffmpeg on four straddling sizes, three of them
-            // cut on BOTH axes, with the edge fire count asserted. What the
-            // guards cost was every key-frame root on an arbitrary export
-            // size (the `aligned` line switched the whole feature off on, for
-            // instance, a 1920x792 frame).
-            let whole_inside = x64 + SUPERBLOCK <= luma.true_width
-                && y64 + SUPERBLOCK <= luma.true_height;
-            // lane-corner: and the superblock the true frame edge CUTS
-            // THROUGH with more than half of each axis still inside, which is
-            // all AV1 asks of a `PARTITION_NONE` root (spec
-            // `decode_partition`'s `has_cols`/`has_rows`, the same pair the
-            // key writer's `Superblock::Whole` arm checks) -- the shape the
-            // inter root already takes ([`b64_edge`]).
-            let edge_inside = edge_root_enabled()
-                && crate::tile::has_half(
-                    sb_col as u32 * crate::tile::SB_MI,
-                    crate::tile::SB_MI,
-                    header.mi_cols,
-                )
-                && crate::tile::has_half(
-                    sb_row as u32 * crate::tile::SB_MI,
-                    crate::tile::SB_MI,
-                    header.mi_rows,
-                );
-            let sb64_legal = i64_root()
-                && ibc.is_none()
-                && sb_row * 2 + 1 < rows
-                && sb_col * 2 + 1 < cols
-                && (whole_inside || edge_inside);
-            let mut sb64: Option<(f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> = None;
-            if sb64_legal {
-                I64_HITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let base = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
-                let (c64, r64) = (sb_col * 4, sb_row * 4);
-                let (block, cost) = code_square(
-                    &mut luma,
-                    &mut chroma,
-                    (x64, y64),
-                    SUPERBLOCK,
-                    &search,
-                    &mode_bits(above_mode[c64], left_mode[r64]),
-                    tx_select,
-                    None,
-                    true,
-                    fctx,
-                );
-                let cost = cost + search.lambda * crate::tile::partition_bits(SUPERBLOCK, false);
-                let after = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
-                restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &base);
-                sb64 = Some((cost, block, after));
-            }
-            // A superblock whose 64x64 trial already codes almost nothing per
-            // pixel is taken outright and its quadrants are never searched --
-            // `split_rd_breakout` one size up, at the threshold the inter
-            // root clamps to ([`b64_breakout_threshold`]), where this lever
-            // BUYS wall instead of spending it.
-            let early64 = sb64.as_ref().is_some_and(|(c, _, _)| {
-                split_rd_breakout_at(b64_breakout_threshold(), *c, SUPERBLOCK, search.lambda)
-            });
-            // What the four quadrants cost together, including the split
-            // partition symbol at the superblock level, so the two arms are
-            // one comparable number.
-            let mut sb_cost = match sb64 {
-                Some(_) => search.lambda * crate::tile::partition_bits(SUPERBLOCK, true),
-                None => 0.0,
-            };
-            for quadrant in 0..if early64 { 0 } else { 4 } {
-                let (col, row) = (sb_col * 2 + quadrant % 2, sb_row * 2 + quadrant / 2);
-                if col >= cols || row >= rows {
-                    continue;
-                }
-                let (x, y) = (col * BLOCK, row * BLOCK);
-                let (c0, r0) = (col * 2, row * 2);
-                let base = snapshot(&luma, &chroma, (x, y), BLOCK);
-
-                // spec `decode_partition`'s hasRows/hasCols recomputed at this
-                // 32x32 block's own half (see `crate::tile::has_half`): the
-                // true frame edge can fall inside a quadrant a superblock-level
-                // check already let through. A quadrant that fails either may
-                // not be left whole; a 16x16 sub-block that fails either (once
-                // split) is a leaf this writer has no rectangular transform
-                // for, so the search must not pick a split that would need one.
-                let (has_cols32, has_rows32) = (
-                    crate::tile::has_half(
-                        col as u32 * crate::tile::BLOCK_MI,
-                        crate::tile::BLOCK_MI,
+        for sb_row in rect.sb_row0 as usize..rect.sb_row1 as usize {
+            for sb_col in rect.sb_col0 as usize..rect.sb_col1 as usize {
+                let mut modes = Vec::with_capacity(4);
+                // The quadrants of a superblock are coded in the order the decoder
+                // walks them, which for a 64x64 split into 32x32 blocks is raster
+                // order among the quadrants that are inside the frame.
+                let mut blocks = Vec::with_capacity(4);
+                // lane-i64: the whole superblock as ONE 64x64 intra block, tried
+                // BEFORE its quadrants (so both start from the same
+                // reconstruction) and compared against the four of them below --
+                // the shape the inter frame's own 64 root takes
+                // (`search_skip_64`). A frame that allows intrabc is refused
+                // outright ([`I64_ROOT`]) because the quadrant searches below
+                // carry DV state a discarded trial would desync.
+                let (x64, y64) = (sb_col * SUPERBLOCK, sb_row * SUPERBLOCK);
+                // lane-corner LIFTED the two guards this root shipped with: the
+                // frame no longer has to be a whole number of superblocks, and
+                // the superblock no longer has to be wholly inside the frame.
+                // The desync the guards were written for (a 248x152 corner's
+                // chroma disagreeing three ways) does NOT reproduce at this
+                // revision -- see
+                // `stream::tests::a_doubly_cut_superblock_root_round_trips_in_every_plane`,
+                // which pins all three planes of the encoder's reconstruction,
+                // our decoder and ffmpeg on four straddling sizes, three of them
+                // cut on BOTH axes, with the edge fire count asserted. What the
+                // guards cost was every key-frame root on an arbitrary export
+                // size (the `aligned` line switched the whole feature off on, for
+                // instance, a 1920x792 frame).
+                let whole_inside =
+                    x64 + SUPERBLOCK <= luma.true_width && y64 + SUPERBLOCK <= luma.true_height;
+                // lane-corner: and the superblock the true frame edge CUTS
+                // THROUGH with more than half of each axis still inside, which is
+                // all AV1 asks of a `PARTITION_NONE` root (spec
+                // `decode_partition`'s `has_cols`/`has_rows`, the same pair the
+                // key writer's `Superblock::Whole` arm checks) -- the shape the
+                // inter root already takes ([`b64_edge`]).
+                let edge_inside = edge_root_enabled()
+                    && crate::tile::has_half(
+                        sb_col as u32 * crate::tile::SB_MI,
+                        crate::tile::SB_MI,
                         header.mi_cols,
-                    ),
-                    crate::tile::has_half(
-                        row as u32 * crate::tile::BLOCK_MI,
-                        crate::tile::BLOCK_MI,
+                    )
+                    && crate::tile::has_half(
+                        sb_row as u32 * crate::tile::SB_MI,
+                        crate::tile::SB_MI,
                         header.mi_rows,
-                    ),
-                );
-                let whole_legal = has_cols32 && has_rows32;
-                // A 16x16 sub-block's own hasCols/hasRows (spec
-                // `decode_partition`, recomputed at this leaf's own half):
-                // either axis false is a straddling leaf this writer codes as
-                // the 8x8 leaves that are inside it
-                // (`crate::tile::write_leaf8`, lane-av1-rect r7). Both axes
-                // false is the same split with the partition symbol inferred
-                // rather than coded -- no rectangular transform is needed
-                // (lane-av1rect).
-                let sub_half = |sr: usize, sc: usize| {
-                    (
+                    );
+                let sb64_legal = i64_root()
+                    && ibc.is_none()
+                    && sb_row * 2 + 1 < rows
+                    && sb_col * 2 + 1 < cols
+                    && (whole_inside || edge_inside);
+                let mut sb64: Option<(f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> = None;
+                if sb64_legal {
+                    I64_HITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let base = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
+                    let (c64, r64) = (sb_col * 4, sb_row * 4);
+                    let (block, cost) = code_square(
+                        &mut luma,
+                        &mut chroma,
+                        (x64, y64),
+                        SUPERBLOCK,
+                        &search,
+                        &mode_bits(above_mode[c64], left_mode[r64]),
+                        tx_select,
+                        None,
+                        true,
+                        fctx,
+                    );
+                    let cost =
+                        cost + search.lambda * crate::tile::partition_bits(SUPERBLOCK, false);
+                    let after = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
+                    restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &base);
+                    sb64 = Some((cost, block, after));
+                }
+                // A superblock whose 64x64 trial already codes almost nothing per
+                // pixel is taken outright and its quadrants are never searched --
+                // `split_rd_breakout` one size up, at the threshold the inter
+                // root clamps to ([`b64_breakout_threshold`]), where this lever
+                // BUYS wall instead of spending it.
+                let early64 = sb64.as_ref().is_some_and(|(c, _, _)| {
+                    split_rd_breakout_at(b64_breakout_threshold(), *c, SUPERBLOCK, search.lambda)
+                });
+                // What the four quadrants cost together, including the split
+                // partition symbol at the superblock level, so the two arms are
+                // one comparable number.
+                let mut sb_cost = match sb64 {
+                    Some(_) => search.lambda * crate::tile::partition_bits(SUPERBLOCK, true),
+                    None => 0.0,
+                };
+                for quadrant in 0..if early64 { 0 } else { 4 } {
+                    let (col, row) = (sb_col * 2 + quadrant % 2, sb_row * 2 + quadrant / 2);
+                    if col >= cols || row >= rows {
+                        continue;
+                    }
+                    let (x, y) = (col * BLOCK, row * BLOCK);
+                    let (c0, r0) = (col * 2, row * 2);
+                    let base = snapshot(&luma, &chroma, (x, y), BLOCK);
+
+                    // spec `decode_partition`'s hasRows/hasCols recomputed at this
+                    // 32x32 block's own half (see `crate::tile::has_half`): the
+                    // true frame edge can fall inside a quadrant a superblock-level
+                    // check already let through. A quadrant that fails either may
+                    // not be left whole; a 16x16 sub-block that fails either (once
+                    // split) is a leaf this writer has no rectangular transform
+                    // for, so the search must not pick a split that would need one.
+                    let (has_cols32, has_rows32) = (
                         crate::tile::has_half(
-                            sc as u32 * crate::tile::SUB_MI,
-                            crate::tile::SUB_MI,
+                            col as u32 * crate::tile::BLOCK_MI,
+                            crate::tile::BLOCK_MI,
                             header.mi_cols,
                         ),
                         crate::tile::has_half(
-                            sr as u32 * crate::tile::SUB_MI,
-                            crate::tile::SUB_MI,
+                            row as u32 * crate::tile::BLOCK_MI,
+                            crate::tile::BLOCK_MI,
                             header.mi_rows,
                         ),
-                    )
-                };
-                // What the whole 32x32 costs, including the partition symbol
-                // that says it is not split.
-                let (whole, mut cost_whole) = code_square(
-                    &mut luma,
-                    &mut chroma,
-                    (x, y),
-                    BLOCK,
-                    &search,
-                    &mode_bits(above_mode[c0], left_mode[r0]),
-                    tx_select,
-                    ibc.as_mut(),
-                    true,
-                    fctx,
-                );
-                cost_whole += search.lambda * partition_bits(BLOCK, false);
-                let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
+                    );
+                    let whole_legal = has_cols32 && has_rows32;
+                    // A 16x16 sub-block's own hasCols/hasRows (spec
+                    // `decode_partition`, recomputed at this leaf's own half):
+                    // either axis false is a straddling leaf this writer codes as
+                    // the 8x8 leaves that are inside it
+                    // (`crate::tile::write_leaf8`, lane-av1-rect r7). Both axes
+                    // false is the same split with the partition symbol inferred
+                    // rather than coded -- no rectangular transform is needed
+                    // (lane-av1rect).
+                    let sub_half = |sr: usize, sc: usize| {
+                        (
+                            crate::tile::has_half(
+                                sc as u32 * crate::tile::SUB_MI,
+                                crate::tile::SUB_MI,
+                                header.mi_cols,
+                            ),
+                            crate::tile::has_half(
+                                sr as u32 * crate::tile::SUB_MI,
+                                crate::tile::SUB_MI,
+                                header.mi_rows,
+                            ),
+                        )
+                    };
+                    // What the whole 32x32 costs, including the partition symbol
+                    // that says it is not split.
+                    let (whole, mut cost_whole) = code_square(
+                        &mut luma,
+                        &mut chroma,
+                        (x, y),
+                        BLOCK,
+                        &search,
+                        &mode_bits(above_mode[c0], left_mode[r0]),
+                        tx_select,
+                        ibc.as_mut(),
+                        true,
+                        fctx,
+                    );
+                    cost_whole += search.lambda * partition_bits(BLOCK, false);
+                    let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
 
-                // What four 16x16 blocks cost instead, each searched against
-                // the reconstruction the ones before it left.
-                restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
-                let mut split = Vec::with_capacity(4);
-                let mut cost_split = search.lambda
-                    * (partition_bits(BLOCK, true) + 4.0 * partition_bits(SUB, false));
-                let mut split_modes = Vec::with_capacity(4);
-                for sub in 0..4 {
-                    let (sc, sr) = (c0 + sub % 2, r0 + sub / 2);
-                    // Same filter as the writer's `sub_positions` (spec
-                    // `decode_partition`'s `r >= MiRows || c >= MiCols` early
-                    // return): a sub-block whose own origin sits past the
-                    // true frame is never coded, so it must not be searched
-                    // or pushed onto `split` either, or the writer's block
-                    // count will not match what it is prepared to name.
-                    if (sr as u32) * crate::tile::SUB_MI >= header.mi_rows
-                        || (sc as u32) * crate::tile::SUB_MI >= header.mi_cols
-                    {
-                        continue;
-                    }
-                    let (has_cols16, has_rows16) = sub_half(sr, sc);
-                    if has_cols16 && has_rows16 {
-                        let (block, cost) = code_square(
-                            &mut luma,
-                            &mut chroma,
-                            (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
-                            SUB,
-                            &search,
-                            &mode_bits(above_mode[sc], left_mode[sr]),
-                            tx_select,
-                            ibc.as_mut(),
-                            true,
-                            fctx,
-                        );
-                        cost_split += cost;
-                        split_modes.push(block.mode);
-                        above_mode[sc] = block.mode;
-                        left_mode[sr] = block.mode;
-                        split.push(block);
-                    } else {
-                        // A straddling 16x16: two (or, at a true corner, one)
-                        // 8x8 leaves, in the raster order `write_leaf8`'s
-                        // caller expects. Both leaves cost against the SAME
-                        // enclosing-slot mode context (see
-                        // `crate::tile::write_leaf8`'s doc), and neither
-                        // updates `above_mode`/`left_mode` at this SUB slot --
-                        // the writer never does either, so the search must
-                        // not diverge from what it will actually read next.
-                        let leaf_mode_bits = mode_bits(above_mode[sc], left_mode[sr]);
-                        let (x_sub, y_sub) = (x + (sub % 2) * SUB, y + (sub / 2) * SUB);
-                        let mut leaves = Vec::with_capacity(2);
-                        for i in 0..4 {
-                            let leaf_x = x_sub + (i % 2) * 8;
-                            let leaf_y = y_sub + (i / 2) * 8;
-                            if leaf_x >= luma.true_width || leaf_y >= luma.true_height {
-                                continue;
-                            }
-                            let (leaf, cost) = code_square(
+                    // What four 16x16 blocks cost instead, each searched against
+                    // the reconstruction the ones before it left.
+                    restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
+                    let mut split = Vec::with_capacity(4);
+                    let mut cost_split = search.lambda
+                        * (partition_bits(BLOCK, true) + 4.0 * partition_bits(SUB, false));
+                    let mut split_modes = Vec::with_capacity(4);
+                    for sub in 0..4 {
+                        let (sc, sr) = (c0 + sub % 2, r0 + sub / 2);
+                        // Same filter as the writer's `sub_positions` (spec
+                        // `decode_partition`'s `r >= MiRows || c >= MiCols` early
+                        // return): a sub-block whose own origin sits past the
+                        // true frame is never coded, so it must not be searched
+                        // or pushed onto `split` either, or the writer's block
+                        // count will not match what it is prepared to name.
+                        if (sr as u32) * crate::tile::SUB_MI >= header.mi_rows
+                            || (sc as u32) * crate::tile::SUB_MI >= header.mi_cols
+                        {
+                            continue;
+                        }
+                        let (has_cols16, has_rows16) = sub_half(sr, sc);
+                        if has_cols16 && has_rows16 {
+                            let (block, cost) = code_square(
                                 &mut luma,
                                 &mut chroma,
-                                (leaf_x, leaf_y),
-                                8,
+                                (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
+                                SUB,
                                 &search,
-                                &leaf_mode_bits,
+                                &mode_bits(above_mode[sc], left_mode[sr]),
                                 tx_select,
-                                None,
+                                ibc.as_mut(),
                                 true,
                                 fctx,
                             );
                             cost_split += cost;
-                            split_modes.push(leaf.mode);
-                            leaves.push(leaf);
+                            split_modes.push(block.mode);
+                            above_mode[sc] = block.mode;
+                            left_mode[sr] = block.mode;
+                            split.push(block);
+                        } else {
+                            // A straddling 16x16: two (or, at a true corner, one)
+                            // 8x8 leaves, in the raster order `write_leaf8`'s
+                            // caller expects. Both leaves cost against the SAME
+                            // enclosing-slot mode context (see
+                            // `crate::tile::write_leaf8`'s doc), and neither
+                            // updates `above_mode`/`left_mode` at this SUB slot --
+                            // the writer never does either, so the search must
+                            // not diverge from what it will actually read next.
+                            let leaf_mode_bits = mode_bits(above_mode[sc], left_mode[sr]);
+                            let (x_sub, y_sub) = (x + (sub % 2) * SUB, y + (sub / 2) * SUB);
+                            let mut leaves = Vec::with_capacity(2);
+                            for i in 0..4 {
+                                let leaf_x = x_sub + (i % 2) * 8;
+                                let leaf_y = y_sub + (i / 2) * 8;
+                                if leaf_x >= luma.true_width || leaf_y >= luma.true_height {
+                                    continue;
+                                }
+                                let (leaf, cost) = code_square(
+                                    &mut luma,
+                                    &mut chroma,
+                                    (leaf_x, leaf_y),
+                                    8,
+                                    &search,
+                                    &leaf_mode_bits,
+                                    tx_select,
+                                    None,
+                                    true,
+                                    fctx,
+                                );
+                                cost_split += cost;
+                                split_modes.push(leaf.mode);
+                                leaves.push(leaf);
+                            }
+                            split.push(BlockCoeffs {
+                                eight: Some(leaves),
+                                ..BlockCoeffs::default()
+                            });
                         }
-                        split.push(BlockCoeffs {
-                            eight: Some(leaves),
-                            ..BlockCoeffs::default()
-                        });
                     }
-                }
 
-                // A split whose subs are all whole 16x16 is a real quality
-                // alternative to `whole`, exactly as before. Through r14, a
-                // split carrying an 8x8-leaf sub was only ever forced
-                // (`!whole_legal`), never chosen on cost, because the leaf
-                // path was not yet proven against a real decoder; r15 proved
-                // it against ffmpeg, and lane-av1dec r5 taught crate::decode
-                // the read path (`decode_leaf8`), so leaf8 can now win on
-                // cost anywhere, same as any other split.
-                if !whole_legal || (split_blocks && cost_split < cost_whole) {
-                    sb_cost += cost_split;
-                    modes.extend_from_slice(&split_modes);
-                    blocks.push(Quadrant::Split(split));
-                } else {
-                    sb_cost += cost_whole;
-                    restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
-                    for cell in 0..2 {
-                        above_mode[c0 + cell] = whole.mode;
-                        left_mode[r0 + cell] = whole.mode;
+                    // A split whose subs are all whole 16x16 is a real quality
+                    // alternative to `whole`, exactly as before. Through r14, a
+                    // split carrying an 8x8-leaf sub was only ever forced
+                    // (`!whole_legal`), never chosen on cost, because the leaf
+                    // path was not yet proven against a real decoder; r15 proved
+                    // it against ffmpeg, and lane-av1dec r5 taught crate::decode
+                    // the read path (`decode_leaf8`), so leaf8 can now win on
+                    // cost anywhere, same as any other split.
+                    if !whole_legal || (split_blocks && cost_split < cost_whole) {
+                        sb_cost += cost_split;
+                        modes.extend_from_slice(&split_modes);
+                        blocks.push(Quadrant::Split(split));
+                    } else {
+                        sb_cost += cost_whole;
+                        restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
+                        for cell in 0..2 {
+                            above_mode[c0 + cell] = whole.mode;
+                            left_mode[r0 + cell] = whole.mode;
+                        }
+                        modes.push(whole.mode);
+                        blocks.push(Quadrant::Whole(whole));
                     }
-                    modes.push(whole.mode);
-                    blocks.push(Quadrant::Whole(whole));
                 }
-            }
-            let index = sb_row * sb_cols + sb_col;
-            match sb64 {
-                Some((cost64, block, after)) if early64 || cost64 < sb_cost => {
-                    restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
-                    for cell in 0..4 {
-                        above_mode[sb_col * 4 + cell] = block.mode;
-                        left_mode[sb_row * 4 + cell] = block.mode;
+                let index = sb_row * sb_cols + sb_col;
+                match sb64 {
+                    Some((cost64, block, after)) if early64 || cost64 < sb_cost => {
+                        restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
+                        for cell in 0..4 {
+                            above_mode[sb_col * 4 + cell] = block.mode;
+                            left_mode[sb_row * 4 + cell] = block.mode;
+                        }
+                        I64_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if !whole_inside {
+                            I64_HITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let mode = block.mode;
+                        coded.push((index, Superblock::Whole(block), vec![mode]));
                     }
-                    I64_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if !whole_inside {
-                        I64_HITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    let mode = block.mode;
-                    coded.push((index, Superblock::Whole(block), vec![mode]));
+                    _ => coded.push((index, Superblock::Split(blocks), modes)),
                 }
-                _ => coded.push((index, Superblock::Split(blocks), modes)),
             }
         }
-    }
         let (x0, y0) = (rect.mi_col0 as usize * 4, rect.mi_row0 as usize * 4);
         let (x1, y1) = (rect.mi_col1 as usize * 4, rect.mi_row1 as usize * 4);
         copy_rect(luma_out, &luma.reconstruction, frame_width, x0, y0, x1, y1);
@@ -8880,7 +9490,8 @@ pub(crate) fn encode_key_frame_inner(
     // Back into frame raster order: the tile writer indexes `superblocks` by
     // the frame's own superblock index, and `modes` is the coding order the
     // ablation drivers read.
-    let mut in_order: Vec<Option<(Superblock, Vec<u8>)>> = (0..sb_cols * sb_rows).map(|_| None).collect();
+    let mut in_order: Vec<Option<(Superblock, Vec<u8>)>> =
+        (0..sb_cols * sb_rows).map(|_| None).collect();
     for (at, superblock, block_modes) in searched.into_iter().flatten() {
         in_order[at] = Some((superblock, block_modes));
     }
@@ -8893,7 +9504,10 @@ pub(crate) fn encode_key_frame_inner(
     }
 
     #[cfg(test)]
-    record_predicted_bits(crate::tile::predicted_coeff_bits_sb(&superblocks, base_q_idx));
+    record_predicted_bits(crate::tile::predicted_coeff_bits_sb(
+        &superblocks,
+        base_q_idx,
+    ));
     // A key frame always starts from the defaults (`primary_ref_frame` is
     // `PRIMARY_REF_NONE`), and its header keeps `disable_frame_end_update_cdf`
     // set, so what it stores into the slots it refreshes is exactly those
@@ -9062,12 +9676,7 @@ fn pick_and_apply_filters(
     // carry -- empty (the identity map) for a frame whose every block covers
     // one 64x64 CDEF unit.
     cdef_owner: &[u32],
-    recode: impl Fn(
-        u8,
-        usize,
-        &[u8],
-        &[Option<crate::restoration::WienerInfo>],
-    ) -> Result<Vec<Vec<u8>>>,
+    recode: impl Fn(u8, usize, &[u8], &[Option<crate::restoration::WienerInfo>]) -> Result<Vec<Vec<u8>>>,
     decode: impl Fn(
         &LoopFilterParams,
         &CdefParams,
@@ -9206,7 +9815,14 @@ fn pick_and_apply_filters(
                 assert_eq!(a.stride, b.stride, "the captured plane strides moved");
                 let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
                 for (i, (w, h)) in [(fw, fh), (cw, ch), (cw, ch)].into_iter().enumerate() {
-                    region(&a.deblocked[i], &b.deblocked[i], a.stride[i], w, h, "deblocked");
+                    region(
+                        &a.deblocked[i],
+                        &b.deblocked[i],
+                        a.stride[i],
+                        w,
+                        h,
+                        "deblocked",
+                    );
                     region(&a.cdefed[i], &b.cdefed[i], a.stride[i], w, h, "cdefed");
                 }
             }
@@ -9297,9 +9913,30 @@ fn pick_and_apply_filters(
     header.loop_restoration = lr;
     let dec_cw = filtered.width.div_ceil(2);
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
-    crate::filter_search::splice(&mut luma.reconstruction, luma.width, &filtered.y, filtered.width, fw, fh);
-    crate::filter_search::splice(&mut chroma[0].reconstruction, chroma[0].width, &filtered.u, dec_cw, cw, ch);
-    crate::filter_search::splice(&mut chroma[1].reconstruction, chroma[1].width, &filtered.v, dec_cw, cw, ch);
+    crate::filter_search::splice(
+        &mut luma.reconstruction,
+        luma.width,
+        &filtered.y,
+        filtered.width,
+        fw,
+        fh,
+    );
+    crate::filter_search::splice(
+        &mut chroma[0].reconstruction,
+        chroma[0].width,
+        &filtered.u,
+        dec_cw,
+        cw,
+        ch,
+    );
+    crate::filter_search::splice(
+        &mut chroma[1].reconstruction,
+        chroma[1].width,
+        &filtered.v,
+        dec_cw,
+        cw,
+        ch,
+    );
     Ok(())
 }
 
@@ -9526,7 +10163,10 @@ fn ref_distance(ref_frame: i8) -> u32 {
         .unsigned_abs()
         .max(1);
     if crate::envflags::env_flag!("EC_TRACE_DIST") {
-        eprintln!("EC_DIST ref={ref_frame} bits={bits} oh={order_hint} hint={} d={d}", hints[i]);
+        eprintln!(
+            "EC_DIST ref={ref_frame} bits={bits} oh={order_hint} hint={} d={d}",
+            hints[i]
+        );
     }
     d
 }
@@ -9567,7 +10207,10 @@ static HP_MV_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8
 /// Sets [`HP_MV_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` gates
 pub(crate) fn set_high_precision_mv(on: Option<bool>) {
-    HP_MV_OVERRIDE.store(on.map_or(u8::MAX, u8::from), std::sync::atomic::Ordering::Relaxed);
+    HP_MV_OVERRIDE.store(
+        on.map_or(u8::MAX, u8::from),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// The qindex below which an inter frame codes `allow_high_precision_mv`
@@ -9636,8 +10279,22 @@ fn mc_trial(
     fctx: &crate::decode::FrameCtx,
 ) -> Trial {
     mc_trial_typed(
-        plane, x, y, side, mv, luma, reference, stride, ref_width, ref_height, skip, base_q_idx,
-        deadzone, set, TxType::DctDct, fctx,
+        plane,
+        x,
+        y,
+        side,
+        mv,
+        luma,
+        reference,
+        stride,
+        ref_width,
+        ref_height,
+        skip,
+        base_q_idx,
+        deadzone,
+        set,
+        TxType::DctDct,
+        fctx,
     )
 }
 
@@ -9681,7 +10338,8 @@ fn mc_trial_typed(
         y_q4,
         side,
         side,
-        prediction16, fctx,
+        prediction16,
+        fctx,
     );
     let mut prediction = [0u8; BLOCK * BLOCK];
     let prediction = &mut prediction[..side * side];
@@ -9715,7 +10373,19 @@ fn mc_trial_compound(
     fctx: &crate::decode::FrameCtx,
 ) -> Trial {
     mc_trial_compound_typed(
-        plane, x, y, side, mvs, luma, ref0, ref1, base_q_idx, deadzone, set, TxType::DctDct, fctx,
+        plane,
+        x,
+        y,
+        side,
+        mvs,
+        luma,
+        ref0,
+        ref1,
+        base_q_idx,
+        deadzone,
+        set,
+        TxType::DctDct,
+        fctx,
     )
 }
 
@@ -9753,7 +10423,8 @@ fn mc_trial_compound_typed(
             side,
             fctx.interp_filter.get(),
             fctx.interp_filter.get(),
-            dst, fctx,
+            dst,
+            fctx,
         );
     }
     let mut blended16 = [0u16; BLOCK * BLOCK];
@@ -9846,7 +10517,8 @@ fn predict_compound_u8(
             side,
             fctx.interp_filter.get(),
             fctx.interp_filter.get(),
-            dst, fctx,
+            dst,
+            fctx,
         );
     }
     let mut blended = vec![0u16; side * side];
@@ -9988,7 +10660,11 @@ fn search_root_128(
         // only its top-left corner), packed per plane into one 64-wide grid
         // with chunk (cr, cc) at (cr * 32, cc * 32) -- the layout
         // `write_inter_block_128` slices back out in the same chunk order.
-        let mut packed = [vec![0i32; 64 * 64], vec![0i32; 64 * 64], vec![0i32; 64 * 64]];
+        let mut packed = [
+            vec![0i32; 64 * 64],
+            vec![0i32; 64 * 64],
+            vec![0i32; 64 * 64],
+        ];
         let mut chunks: Vec<((usize, usize), [Trial; 3])> = Vec::new();
         let (mut sse_skip, mut sse_res, mut coeff_bits) = (0.0f64, 0.0f64, 0.0f64);
         for (cr, cc) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
@@ -10003,16 +10679,34 @@ fn search_root_128(
                 + chroma[1].block_sse(cx, cy, half, &pred_v);
             let trials = [
                 luma.code_from_prediction(
-                    px, py, SUPERBLOCK, &pred_y, false, root_search.base_q_idx,
-                    root_search.deadzone, TxbSet::Luma64,
+                    px,
+                    py,
+                    SUPERBLOCK,
+                    &pred_y,
+                    false,
+                    root_search.base_q_idx,
+                    root_search.deadzone,
+                    TxbSet::Luma64,
                 ),
                 chroma[0].code_from_prediction(
-                    cx, cy, half, &pred_u, false, root_search.base_q_idx,
-                    root_search.deadzone, TxbSet::Chroma32,
+                    cx,
+                    cy,
+                    half,
+                    &pred_u,
+                    false,
+                    root_search.base_q_idx,
+                    root_search.deadzone,
+                    TxbSet::Chroma32,
                 ),
                 chroma[1].code_from_prediction(
-                    cx, cy, half, &pred_v, false, root_search.base_q_idx,
-                    root_search.deadzone, TxbSet::Chroma32,
+                    cx,
+                    cy,
+                    half,
+                    &pred_v,
+                    false,
+                    root_search.base_q_idx,
+                    root_search.deadzone,
+                    TxbSet::Chroma32,
                 ),
             ];
             for (plane, trial) in trials.iter().enumerate() {
@@ -10111,7 +10805,11 @@ fn search_rect_residual(
     // only its top-left corner), packed per plane into one 64-wide grid with
     // chunk (cr, cc) at (cr * 32, cc * 32) -- the layout the writer slices
     // back out in the same chunk order.
-    let mut packed = [vec![0i32; 64 * 64], vec![0i32; 64 * 64], vec![0i32; 64 * 64]];
+    let mut packed = [
+        vec![0i32; 64 * 64],
+        vec![0i32; 64 * 64],
+        vec![0i32; 64 * 64],
+    ];
     let mut sse_skip = 0.0f64;
     let mut sse_res = 0.0f64;
     let mut coeff_bits = 0.0f64;
@@ -10128,15 +10826,33 @@ fn search_rect_residual(
             + chroma[1].block_sse(cx, cy, half, &pred_v);
         let trials = [
             luma.code_from_prediction(
-                cxx, cyy, MU, &pred_y, false, search.base_q_idx, search.deadzone,
+                cxx,
+                cyy,
+                MU,
+                &pred_y,
+                false,
+                search.base_q_idx,
+                search.deadzone,
                 TxbSet::Luma64,
             ),
             chroma[0].code_from_prediction(
-                cx, cy, half, &pred_u, false, search.base_q_idx, search.deadzone,
+                cx,
+                cy,
+                half,
+                &pred_u,
+                false,
+                search.base_q_idx,
+                search.deadzone,
                 TxbSet::Chroma32,
             ),
             chroma[1].code_from_prediction(
-                cx, cy, half, &pred_v, false, search.base_q_idx, search.deadzone,
+                cx,
+                cy,
+                half,
+                &pred_v,
+                false,
+                search.base_q_idx,
+                search.deadzone,
                 TxbSet::Chroma32,
             ),
         ];
@@ -10258,7 +10974,11 @@ fn search_root_128_rect(
             None => search,
         }
     };
-    let (w, h) = if horz { (SIDE, SUPERBLOCK) } else { (SUPERBLOCK, SIDE) };
+    let (w, h) = if horz {
+        (SIDE, SUPERBLOCK)
+    } else {
+        (SUPERBLOCK, SIDE)
+    };
     let (w_mi, h_mi) = (w / 4, h / 4);
     let base = snapshot(luma, chroma, (x128, y128), SIDE);
     let grid_base = grid.snapshot_rect(mi_row, mi_col, SIDE_MI, SIDE_MI);
@@ -10575,7 +11295,11 @@ fn search_skip_64(
     let sq = bw.min(bh);
     let units: Vec<(usize, usize, usize, usize, bool)> = (0..3usize)
         .flat_map(|plane| {
-            let (ox, oy, s) = if plane == 0 { (x, y, sq) } else { (x / 2, y / 2, sq / 2) };
+            let (ox, oy, s) = if plane == 0 {
+                (x, y, sq)
+            } else {
+                (x / 2, y / 2, sq / 2)
+            };
             (0..bh / sq).flat_map(move |j| {
                 (0..bw / sq).map(move |i| (plane, ox + i * s, oy + j * s, s, plane == 0))
             })
@@ -10651,40 +11375,45 @@ fn search_skip_64(
         let trials: Vec<Trial> = units
             .iter()
             .map(|&(plane, px, py, s, is_luma)| {
-            let (samples, stride, w, h) = match plane {
-                0 => (&reference.y, reference.width, luma.true_width, luma.true_height),
-                1 => (
-                    &reference.u,
-                    reference.width / 2,
-                    chroma[0].true_width,
-                    chroma[0].true_height,
-                ),
-                _ => (
-                    &reference.v,
-                    reference.width / 2,
-                    chroma[1].true_width,
-                    chroma[1].true_height,
-                ),
-            };
-            let prediction = predict_u8(samples, stride, w, h, (px, py), s, info.mv, is_luma, fctx);
-            let target: &Plane = if plane == 0 { luma } else { &chroma[plane - 1] };
-            // `skip` true: the trial is the prediction itself plus its SSE,
-            // so no transform of any size is involved (the reason a 64x64
-            // root can be coded at all before a forward TX_64X64 exists).
-            target.code_from_prediction(
-                px,
-                py,
-                s,
-                &prediction,
-                true,
-                search.base_q_idx,
-                search.deadzone,
-                TxbSet::Luma32Inter,
-            )
+                let (samples, stride, w, h) = match plane {
+                    0 => (
+                        &reference.y,
+                        reference.width,
+                        luma.true_width,
+                        luma.true_height,
+                    ),
+                    1 => (
+                        &reference.u,
+                        reference.width / 2,
+                        chroma[0].true_width,
+                        chroma[0].true_height,
+                    ),
+                    _ => (
+                        &reference.v,
+                        reference.width / 2,
+                        chroma[1].true_width,
+                        chroma[1].true_height,
+                    ),
+                };
+                let prediction =
+                    predict_u8(samples, stride, w, h, (px, py), s, info.mv, is_luma, fctx);
+                let target: &Plane = if plane == 0 { luma } else { &chroma[plane - 1] };
+                // `skip` true: the trial is the prediction itself plus its SSE,
+                // so no transform of any size is involved (the reason a 64x64
+                // root can be coded at all before a forward TX_64X64 exists).
+                target.code_from_prediction(
+                    px,
+                    py,
+                    s,
+                    &prediction,
+                    true,
+                    search.base_q_idx,
+                    search.deadzone,
+                    TxbSet::Luma32Inter,
+                )
             })
             .collect();
-        let cost =
-            trials.iter().map(|t| t.sse).sum::<f64>() + search.lambda * (fixed + bits);
+        let cost = trials.iter().map(|t| t.sse).sum::<f64>() + search.lambda * (fixed + bits);
         if best.as_ref().is_none_or(|b| cost < b.0) {
             best = Some((cost, fixed + bits, info, trials));
         }
@@ -10699,8 +11428,7 @@ fn search_skip_64(
         // The whole `comp_mode` + reference-pair tree at the writer's own
         // contexts, for THIS pair (lane-ctx).
         let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
-        let mode_ctx =
-            cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
+        let mode_ctx = cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
             |mode: usize| pair_bits + symbol_bits(&cdf::INTER_COMPOUND_MODE[mode_ctx], mode);
         let compound_info = |mode: InterMode, mvs: ((i32, i32), (i32, i32))| InterInfo {
@@ -10746,43 +11474,57 @@ fn search_skip_64(
             let trials: Vec<Trial> = units
                 .iter()
                 .map(|&(plane, px, py, s, is_luma)| {
-                let (r0, r1) = match plane {
-                    0 => (
-                        (reference.y.as_slice(), reference.width, luma.true_width, luma.true_height),
-                        (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
-                    ),
-                    1 => (
-                        (
-                            reference.u.as_slice(),
-                            reference.width / 2,
-                            chroma[0].true_width,
-                            chroma[0].true_height,
+                    let (r0, r1) = match plane {
+                        0 => (
+                            (
+                                reference.y.as_slice(),
+                                reference.width,
+                                luma.true_width,
+                                luma.true_height,
+                            ),
+                            (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
                         ),
-                        (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
-                    ),
-                    _ => (
-                        (
-                            reference.v.as_slice(),
-                            reference.width / 2,
-                            chroma[1].true_width,
-                            chroma[1].true_height,
+                        1 => (
+                            (
+                                reference.u.as_slice(),
+                                reference.width / 2,
+                                chroma[0].true_width,
+                                chroma[0].true_height,
+                            ),
+                            (
+                                g.u.as_slice(),
+                                g.width / 2,
+                                chroma[0].true_width,
+                                chroma[0].true_height,
+                            ),
                         ),
-                        (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
-                    ),
-                };
-                let prediction =
-                    predict_compound_u8(r0, r1, (px, py), s, mvs, is_luma, fctx);
-                let target: &Plane = if plane == 0 { luma } else { &chroma[plane - 1] };
-                target.code_from_prediction(
-                    px,
-                    py,
-                    s,
-                    &prediction,
-                    true,
-                    search.base_q_idx,
-                    search.deadzone,
-                    TxbSet::Luma32Inter,
-                )
+                        _ => (
+                            (
+                                reference.v.as_slice(),
+                                reference.width / 2,
+                                chroma[1].true_width,
+                                chroma[1].true_height,
+                            ),
+                            (
+                                g.v.as_slice(),
+                                g.width / 2,
+                                chroma[1].true_width,
+                                chroma[1].true_height,
+                            ),
+                        ),
+                    };
+                    let prediction = predict_compound_u8(r0, r1, (px, py), s, mvs, is_luma, fctx);
+                    let target: &Plane = if plane == 0 { luma } else { &chroma[plane - 1] };
+                    target.code_from_prediction(
+                        px,
+                        py,
+                        s,
+                        &prediction,
+                        true,
+                        search.base_q_idx,
+                        search.deadzone,
+                        TxbSet::Luma32Inter,
+                    )
                 })
                 .collect();
             let syntax = fixed - ref_bits + bits;
@@ -10843,12 +11585,15 @@ fn search_skip_64(
         // winner and hands back the cost it took off the flat arm).
         let (levels, depth, gain, tx_types) = if b64_var_tx() {
             let second = info.ref1.and_then(|r1| {
-                compound.iter().find(|(r, _, _)| *r == r1).map(|&(_, g, _)| {
-                    (
-                        info.mv1,
-                        (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
-                    )
-                })
+                compound
+                    .iter()
+                    .find(|(r, _, _)| *r == r1)
+                    .map(|&(_, g, _)| {
+                        (
+                            info.mv1,
+                            (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                        )
+                    })
             });
             luma_committed = true;
             commit_inter_luma(
@@ -10856,7 +11601,12 @@ fn search_skip_64(
                 (x, y),
                 bw,
                 info.mv,
-                (&reference.y, reference.width, luma.true_width, luma.true_height),
+                (
+                    &reference.y,
+                    reference.width,
+                    luma.true_width,
+                    luma.true_height,
+                ),
                 search,
                 &residual_trials[0],
                 false,
@@ -10908,8 +11658,16 @@ fn search_skip_64(
                 (false, Some((levels, _, _))) => coeffs(levels, BLOCK),
                 (false, None) => coeffs(&trials[0].levels, BLOCK),
             },
-            u: if skip { Vec::new() } else { coeffs(&trials[1].levels, bw / 2) },
-            v: if skip { Vec::new() } else { coeffs(&trials[2].levels, bw / 2) },
+            u: if skip {
+                Vec::new()
+            } else {
+                coeffs(&trials[1].levels, bw / 2)
+            },
+            v: if skip {
+                Vec::new()
+            } else {
+                coeffs(&trials[2].levels, bw / 2)
+            },
             ..BlockCoeffs::default()
         },
     ))
@@ -10993,7 +11751,8 @@ fn search_inter_block(
         DC_PRED,
         0,
         search.base_q_idx,
-        search.deadzone, fctx,
+        search.deadzone,
+        fctx,
     );
     let v_trial = chroma[1].trial(
         At {
@@ -11006,7 +11765,8 @@ fn search_inter_block(
         DC_PRED,
         0,
         search.base_q_idx,
-        search.deadzone, fctx,
+        search.deadzone,
+        fctx,
     );
 
     let intra_modes: Vec<u8> = match search.top_k {
@@ -11021,14 +11781,22 @@ fn search_inter_block(
                 },
                 search.modes,
                 mode_bits,
-                search.lambda, fctx,
+                search.lambda,
+                fctx,
             );
             prune_by_sad(search.modes, scored, k)
         }
         _ => search.modes.to_vec(),
     };
     census_add(5, 1);
-    census_add(6, if search.arf_leaf_intra { intra_modes.len() } else { 0 });
+    census_add(
+        6,
+        if search.arf_leaf_intra {
+            intra_modes.len()
+        } else {
+            0
+        },
+    );
     // lane-arfmode: arm 1 drops the whole-32 block's intra candidates at the
     // top ARF too -- the probe proved the ARF's intra AREA lives HERE, not at
     // the leaves (film A arm 1 vs control byte-identical with the leaf gate
@@ -11047,7 +11815,8 @@ fn search_inter_block(
                 mode,
                 0,
                 search.base_q_idx,
-                search.deadzone, fctx,
+                search.deadzone,
+                fctx,
             );
             let u = u_trial.clone();
             let v = v_trial.clone();
@@ -11182,7 +11951,8 @@ fn search_inter_block(
         BLOCK,
         stack.pred_mv,
         &seeds[..seed_n],
-        search.lambda, fctx,
+        search.lambda,
+        fctx,
         1,
     );
     #[cfg(test)]
@@ -11259,8 +12029,8 @@ fn search_inter_block(
         // neighbour already found, which is how GOLDEN/ALTREF were offered
         // before `EXTRA_REF_NEW_MV`, and it is what separates the reference's
         // own value from the second motion search's wall.
-        let searched = extra_ref_new_mv()
-            && (ref_frame != crate::mvstack::LAST2_FRAME || last2_new_mv());
+        let searched =
+            extra_ref_new_mv() && (ref_frame != crate::mvstack::LAST2_FRAME || last2_new_mv());
         let margin = extra_new_skip_margin();
         if searched {
             newmv_census_global(0);
@@ -11302,7 +12072,8 @@ fn search_inter_block(
                 BLOCK,
                 gstack.pred_mv,
                 &gseeds[..gn],
-                search.lambda, fctx,
+                search.lambda,
+                fctx,
                 ref_distance(ref_frame),
             );
             #[cfg(test)]
@@ -11347,8 +12118,7 @@ fn search_inter_block(
         // The whole `comp_mode` + reference-pair tree at the writer's own
         // contexts, for THIS pair (lane-ctx).
         let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
-        let mode_ctx =
-            cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
+        let mode_ctx = cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
             |mode: usize| pair_bits + symbol_bits(&cdf::INTER_COMPOUND_MODE[mode_ctx], mode);
         let mut ccands: Vec<(((i32, i32), (i32, i32)), f64, InterInfo)> = vec![
@@ -11437,10 +12207,9 @@ fn search_inter_block(
                 ));
             }
             let base = cbase;
-            if let (Some(b0), Some(b1)) = (
-                mv_residual_bits(mv, base.0),
-                mv_residual_bits(mv1, base.1),
-            ) {
+            if let (Some(b0), Some(b1)) =
+                (mv_residual_bits(mv, base.0), mv_residual_bits(mv1, base.1))
+            {
                 ccands.push((
                     (mv, mv1),
                     mode_bits_of(7) + b0 + b1,
@@ -11458,23 +12227,60 @@ fn search_inter_block(
         ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         ccands.dedup_by_key(|c| c.0);
         let g_luma = (g.y.as_slice(), g.width, luma.true_width, luma.true_height);
-        let g_u = (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height);
-        let g_v = (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height);
+        let g_u = (
+            g.u.as_slice(),
+            g.width / 2,
+            chroma[0].true_width,
+            chroma[0].true_height,
+        );
+        let g_v = (
+            g.v.as_slice(),
+            g.width / 2,
+            chroma[1].true_width,
+            chroma[1].true_height,
+        );
         for (mvs, bits, info) in ccands {
             let luma_trial = mc_trial_compound(
-                luma, x, y, BLOCK, mvs, true,
-                (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), g_luma,
-                search.base_q_idx, search.deadzone, TxbSet::Luma32Inter, fctx,
+                luma,
+                x,
+                y,
+                BLOCK,
+                mvs,
+                true,
+                (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
+                g_luma,
+                search.base_q_idx,
+                search.deadzone,
+                TxbSet::Luma32Inter,
+                fctx,
             );
             let u = mc_trial_compound(
-                &chroma[0], x / 2, y / 2, BLOCK / 2, mvs, false,
-                (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3), g_u,
-                search.base_q_idx, search.deadzone, chroma_set, fctx,
+                &chroma[0],
+                x / 2,
+                y / 2,
+                BLOCK / 2,
+                mvs,
+                false,
+                (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                g_u,
+                search.base_q_idx,
+                search.deadzone,
+                chroma_set,
+                fctx,
             );
             let v = mc_trial_compound(
-                &chroma[1], x / 2, y / 2, BLOCK / 2, mvs, false,
-                (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3), g_v,
-                search.base_q_idx, search.deadzone, chroma_set, fctx,
+                &chroma[1],
+                x / 2,
+                y / 2,
+                BLOCK / 2,
+                mvs,
+                false,
+                (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                g_v,
+                search.base_q_idx,
+                search.deadzone,
+                chroma_set,
+                fctx,
             );
             let skip = luma_trial.levels.iter().all(|&l| l == 0)
                 && u.levels.iter().all(|&l| l == 0)
@@ -11486,7 +12292,11 @@ fn search_inter_block(
                     * (skip_bits(skip)
                         + intra_inter_bits(true)
                         + bits
-                        + if skip { 0.0 } else { luma_trial.bits + u.bits + v.bits });
+                        + if skip {
+                            0.0
+                        } else {
+                            luma_trial.bits + u.bits + v.bits
+                        });
             consider(Candidate {
                 cost,
                 luma: luma_trial,
@@ -11515,14 +12325,22 @@ fn search_inter_block(
     let (mut new_cost, mut other_cost) = (f64::INFINITY, f64::INFINITY);
     {
         for (mv, mode_bits_inter, info) in cands {
-            let (ref_luma, ref_u, ref_v) = match extra
-                .iter()
-                .find(|(r, _, _)| *r == info.ref_frame)
+            let (ref_luma, ref_u, ref_v) = match extra.iter().find(|(r, _, _)| *r == info.ref_frame)
             {
                 Some(&(_, g, _)) => (
                     (&g.y, g.width, luma.true_width, luma.true_height),
-                    (&g.u, g.width / 2, chroma[0].true_width, chroma[0].true_height),
-                    (&g.v, g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                    (
+                        &g.u,
+                        g.width / 2,
+                        chroma[0].true_width,
+                        chroma[0].true_height,
+                    ),
+                    (
+                        &g.v,
+                        g.width / 2,
+                        chroma[1].true_width,
+                        chroma[1].true_height,
+                    ),
                 ),
                 None => (ref_luma, ref_u, ref_v),
             };
@@ -11540,7 +12358,8 @@ fn search_inter_block(
                 false,
                 search.base_q_idx,
                 search.deadzone,
-                TxbSet::Luma32Inter, fctx,
+                TxbSet::Luma32Inter,
+                fctx,
             );
             let u = mc_trial(
                 &chroma[0],
@@ -11556,7 +12375,8 @@ fn search_inter_block(
                 false,
                 search.base_q_idx,
                 search.deadzone,
-                chroma_set, fctx,
+                chroma_set,
+                fctx,
             );
             let v = mc_trial(
                 &chroma[1],
@@ -11572,7 +12392,8 @@ fn search_inter_block(
                 false,
                 search.base_q_idx,
                 search.deadzone,
-                chroma_set, fctx,
+                chroma_set,
+                fctx,
             );
             let skip = luma_trial.levels.iter().all(|&l| l == 0)
                 && u.levels.iter().all(|&l| l == 0)
@@ -11612,9 +12433,25 @@ fn search_inter_block(
         }
     }
     if let Some((new_mv, bits)) = newmv_syntax {
-        newmv_census_block(BLOCK, true, new_cost, other_cost, new_mv, stack.nearest_mv, bits);
+        newmv_census_block(
+            BLOCK,
+            true,
+            new_cost,
+            other_cost,
+            new_mv,
+            stack.nearest_mv,
+            bits,
+        );
     } else {
-        newmv_census_block(BLOCK, false, f64::INFINITY, other_cost, mv, stack.nearest_mv, 0.0);
+        newmv_census_block(
+            BLOCK,
+            false,
+            f64::INFINITY,
+            other_cost,
+            mv,
+            stack.nearest_mv,
+            0.0,
+        );
     }
 
     let best = best.expect("the search offers at least the intra modes");
@@ -11642,11 +12479,10 @@ fn search_inter_block(
     // residual price here is the static-CDF estimate.
     let mut best = best;
     let mut motion_won = 0u8;
-    if let Some(info) = best.inter.filter(|i| {
-        i.ref1.is_none()
-            && (crate::envflags::env_flag!("EC_AV1_OBMC")
-                || warp_on())
-    }) {
+    if let Some(info) = best
+        .inter
+        .filter(|i| i.ref1.is_none() && (crate::envflags::env_flag!("EC_AV1_OBMC") || warp_on()))
+    {
         let mut refs: [Option<&Picture>; 8] = [None; 8];
         refs[LAST_FRAME as usize] = Some(reference);
         for &(r, p, _) in extra {
@@ -11658,8 +12494,18 @@ fn search_inter_block(
             match extra.iter().find(|(r, _, _)| *r == info.ref_frame) {
                 Some(&(_, g, _)) => [
                     (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
-                    (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
-                    (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                    (
+                        g.u.as_slice(),
+                        g.width / 2,
+                        chroma[0].true_width,
+                        chroma[0].true_height,
+                    ),
+                    (
+                        g.v.as_slice(),
+                        g.width / 2,
+                        chroma[1].true_width,
+                        chroma[1].true_height,
+                    ),
                 ],
                 None => [
                     (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
@@ -11717,15 +12563,33 @@ fn search_inter_block(
         }
         for (motion, pred) in candidates {
             let luma_trial = luma.code_from_prediction(
-                x, y, BLOCK, &pred[0], false, search.base_q_idx, search.deadzone,
+                x,
+                y,
+                BLOCK,
+                &pred[0],
+                false,
+                search.base_q_idx,
+                search.deadzone,
                 TxbSet::Luma32Inter,
             );
             let u = chroma[0].code_from_prediction(
-                x / 2, y / 2, BLOCK / 2, &pred[1], false, search.base_q_idx, search.deadzone,
+                x / 2,
+                y / 2,
+                BLOCK / 2,
+                &pred[1],
+                false,
+                search.base_q_idx,
+                search.deadzone,
                 chroma_set,
             );
             let v = chroma[1].code_from_prediction(
-                x / 2, y / 2, BLOCK / 2, &pred[2], false, search.base_q_idx, search.deadzone,
+                x / 2,
+                y / 2,
+                BLOCK / 2,
+                &pred[2],
+                false,
+                search.base_q_idx,
+                search.deadzone,
                 chroma_set,
             );
             let skip = luma_trial.levels.iter().all(|&l| l == 0)
@@ -11739,7 +12603,11 @@ fn search_inter_block(
                         + intra_inter_bits(true)
                         + best.mode_bits
                         + mm(motion)
-                        + if skip { 0.0 } else { luma_trial.bits + u.bits + v.bits });
+                        + if skip {
+                            0.0
+                        } else {
+                            luma_trial.bits + u.bits + v.bits
+                        });
             if cost < best.cost + search.lambda * mm(motion_won) {
                 motion_won = motion;
                 best = Candidate {
@@ -11802,7 +12670,15 @@ fn search_inter_block(
                     (best.luma.levels.clone(), 0, 0.0, Vec::new())
                 }
                 false => commit_inter_luma(
-                    luma, (x, y), BLOCK, info.mv, own, search, &best.luma, best.skip, second,
+                    luma,
+                    (x, y),
+                    BLOCK,
+                    info.mv,
+                    own,
+                    search,
+                    &best.luma,
+                    best.skip,
+                    second,
                     fctx,
                 ),
             }
@@ -11813,12 +12689,25 @@ fn search_inter_block(
         }
     };
     // lane-txrd: chroma follows the luma type the var-tx/type search chose.
-    let [bu, bv] = match (best.inter.filter(|_| motion_won == 0), luma_tx_types.first().copied()) {
+    let [bu, bv] = match (
+        best.inter.filter(|_| motion_won == 0),
+        luma_tx_types.first().copied(),
+    ) {
         (Some(info), Some(t)) => {
             let (ou, ov) = match extra.iter().find(|(r, _, _)| *r == info.ref_frame) {
                 Some(&(_, g, _)) => (
-                    (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
-                    (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                    (
+                        g.u.as_slice(),
+                        g.width / 2,
+                        chroma[0].true_width,
+                        chroma[0].true_height,
+                    ),
+                    (
+                        g.v.as_slice(),
+                        g.width / 2,
+                        chroma[1].true_width,
+                        chroma[1].true_height,
+                    ),
                 ),
                 None => (
                     (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
@@ -11830,20 +12719,43 @@ fn search_inter_block(
                     (
                         info.mv1,
                         [
-                            (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
-                            (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                            (
+                                g.u.as_slice(),
+                                g.width / 2,
+                                chroma[0].true_width,
+                                chroma[0].true_height,
+                            ),
+                            (
+                                g.v.as_slice(),
+                                g.width / 2,
+                                chroma[1].true_width,
+                                chroma[1].true_height,
+                            ),
                         ],
                     )
                 })
             });
             recode_inter_chroma(
-                chroma, (x, y), BLOCK, info.mv, [ou, ov], sec, search, chroma_set, t, fctx,
+                chroma,
+                (x, y),
+                BLOCK,
+                info.mv,
+                [ou, ov],
+                sec,
+                search,
+                chroma_set,
+                t,
+                fctx,
             )
             .unwrap_or([best.u, best.v])
         }
         _ => [best.u, best.v],
     };
-    let best = Candidate { u: bu, v: bv, ..best };
+    let best = Candidate {
+        u: bu,
+        v: bv,
+        ..best
+    };
     chroma[0].commit(x / 2, y / 2, BLOCK / 2, &best.u);
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
     (
@@ -11906,7 +12818,11 @@ fn deltaq_res_log2() -> Option<u8> {
         4 => return None,
         r => return Some(r),
     }
-    match crate::envflags::var("EC_AV1_DELTAQ").ok().as_deref().map(str::trim) {
+    match crate::envflags::var("EC_AV1_DELTAQ")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
         Some("0") => None,
         Some(v) => v.parse::<u8>().ok().filter(|r| *r <= 3),
         None => Some(crate::speed::at(&crate::speed::DELTAQ_RES)).filter(|r| *r < 4),
@@ -11918,8 +12834,7 @@ fn deltaq_res_log2() -> Option<u8> {
 /// sets it holds [`crate::speed::knob_write`], the same exclusive lock the
 /// speed presets take, because the streams every other test pins move under
 /// it (the shipped default is OFF, see [`crate::speed::DELTAQ_RES`]).
-static DELTAQ_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(u8::MAX);
+static DELTAQ_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
 /// Sets [`DELTAQ_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` gates
@@ -12045,7 +12960,11 @@ fn dq_tpl_strength(level: DqLevel) -> Option<f64> {
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|k| k.is_finite() && *k >= 0.0);
-    let base = match crate::envflags::var("EC_AV1_DQ_TPL").ok().as_deref().map(str::trim) {
+    let base = match crate::envflags::var("EC_AV1_DQ_TPL")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
         Some("0") => return None,
         Some(_) => Some(env_k.unwrap_or(1.0)),
         None => env_k.or_else(|| Some(crate::speed::at(&crate::speed::DQ_TPL_K))),
@@ -12083,8 +13002,11 @@ fn dq_level_k_of(spec: Option<&str>) -> [f64; 3] {
     let mut k = crate::speed::DQ_LEVEL_K;
     if let Some(spec) = spec {
         for (slot, field) in k.iter_mut().zip(spec.split(':')) {
-            if let Some(v) =
-                field.trim().parse::<f64>().ok().filter(|v: &f64| v.is_finite() && *v >= 0.0)
+            if let Some(v) = field
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v: &f64| v.is_finite() && *v >= 0.0)
             {
                 *slot = v;
             }
@@ -12098,13 +13020,19 @@ fn dq_level_k_of(spec: Option<&str>) -> [f64; 3] {
 /// libaom's objective ([`deltaq_libaom`]) gives for the same superblocks and
 /// the same tpl map -- and which of the two the frame actually coded.
 fn dq_census() -> bool {
-    crate::envflags::var("EC_AV1_DQ_CENSUS").ok().as_deref().map(str::trim) == Some("1")
+    crate::envflags::var("EC_AV1_DQ_CENSUS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        == Some("1")
 }
 
 /// The histogram/extent summary [`dq_census`] prints for one set of offsets.
 fn dq_summary(offsets: &[i32]) -> String {
     let n = offsets.len().max(1);
-    let (lo, hi) = offsets.iter().fold((0i32, 0i32), |(l, h), &o| (l.min(o), h.max(o)));
+    let (lo, hi) = offsets
+        .iter()
+        .fold((0i32, 0i32), |(l, h), &o| (l.min(o), h.max(o)));
     let nz = offsets.iter().filter(|&&o| o != 0).count();
     let mean = offsets.iter().map(|&o| f64::from(o)).sum::<f64>() / n as f64;
     let absmean = offsets.iter().map(|&o| f64::from(o.abs())).sum::<f64>() / n as f64;
@@ -12146,7 +13074,11 @@ fn sb_q_search<'m>(
 ) -> Search<'m> {
     let q = sb_q[sb_r * sb_cols + sb_c];
     let ratio = f64::from(ac_q(8, i32::from(q))) / f64::from(ac_q(8, i32::from(base_q_idx)));
-    Search { base_q_idx: q, lambda: base.lambda * ratio * ratio, ..base }
+    Search {
+        base_q_idx: q,
+        lambda: base.lambda * ratio * ratio,
+        ..base
+    }
 }
 
 fn tpl_strength() -> f64 {
@@ -12254,12 +13186,7 @@ static TPL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// the left/above winners, first-best tie-break. Built once on the frame's
 /// own thread and read-only afterwards, so it cannot make a tile's bytes
 /// depend on the thread count.
-fn tpl_coarse_pass(
-    cur: &[u8],
-    next: &[u8],
-    width: usize,
-    height: usize,
-) -> Vec<((i32, i32), u32)> {
+fn tpl_coarse_pass(cur: &[u8], next: &[u8], width: usize, height: usize) -> Vec<((i32, i32), u32)> {
     let (cells_x, cells_y) = (width / 16, height / 16);
     let sad = |bx: usize, by: usize, (mx, my): (i32, i32)| -> u32 {
         let (sx, sy) = (bx as i32 + mx, by as i32 + my);
@@ -12271,7 +13198,11 @@ fn tpl_coarse_pass(
         for r in 0..16 {
             let a = &next[(by + r) * width + bx..][..16];
             let b = &cur[(sy + r) * width + sx..][..16];
-            sum += a.iter().zip(b).map(|(&p, &q)| u32::from(p.abs_diff(q))).sum::<u32>();
+            sum += a
+                .iter()
+                .zip(b)
+                .map(|(&p, &q)| u32::from(p.abs_diff(q)))
+                .sum::<u32>();
         }
         sum
     };
@@ -12323,7 +13254,10 @@ fn tpl_intra_costs(frame: &[u8], width: usize, height: usize) -> Vec<u32> {
             let (bx, by) = (cx * 16, cy * 16);
             let mut sum = 0u32;
             for r in 0..16 {
-                sum += frame[(by + r) * width + bx..][..16].iter().map(|&p| u32::from(p)).sum::<u32>();
+                sum += frame[(by + r) * width + bx..][..16]
+                    .iter()
+                    .map(|&p| u32::from(p))
+                    .sum::<u32>();
             }
             let dc = ((sum + 128) / 256) as u8;
             let mut cost = 0u32;
@@ -12397,7 +13331,9 @@ fn tpl_sb_factors(map: &[f64], cells_x: usize, cells_y: usize, k: f64) -> Vec<f6
         for w in map {
             hist[((w / mean * 2.0) as usize).min(7)] += 1;
         }
-        let (lo, hi) = out.iter().fold((f64::MAX, 0.0f64), |(l, h), &f| (l.min(f), h.max(f)));
+        let (lo, hi) = out
+            .iter()
+            .fold((f64::MAX, 0.0f64), |(l, h), &f| (l.min(f), h.max(f)));
         eprintln!(
             "tpl k={k}: {} cells mean w={mean:.3}, w/mean hist (0-.5,.5-1,..,>3.5) {hist:?}, \
              sb factor {lo:.3}..{hi:.3}, lookahead wall {:.1} ms cumulative",
@@ -12440,7 +13376,10 @@ fn tpl_lambda_factors(
     let (cells_x, cells_y) = (width / 16, height / 16);
     let cells = cells_x * cells_y;
     let levels = frames.len();
-    let intra: Vec<Vec<u32>> = frames.iter().map(|f| tpl_intra_costs(f, width, height)).collect();
+    let intra: Vec<Vec<u32>> = frames
+        .iter()
+        .map(|f| tpl_intra_costs(f, width, height))
+        .collect();
     let passes: Vec<Vec<((i32, i32), u32)>> = (1..levels)
         .map(|f| tpl_coarse_pass(frames[f - 1], frames[f], width, height))
         .collect();
@@ -12501,8 +13440,7 @@ fn tpl_lambda_factors(
         .unwrap_or(0.0);
     let sb_agg = std::env::var("EC_AV1_TPL_SB").ok().as_deref() != Some("0");
     let log_beta = std::env::var("EC_AV1_TPL_LOG").ok().as_deref() != Some("0");
-    let intra_mean =
-        intra[0].iter().map(|&c| f64::from(c)).sum::<f64>() / cells.max(1) as f64;
+    let intra_mean = intra[0].iter().map(|&c| f64::from(c)).sum::<f64>() / cells.max(1) as f64;
     let floor = floor_frac * intra_mean;
     let denom = |c: usize| f64::from(intra[0][c].max(1)).max(floor).max(1.0);
     // Per-cell ratios, or one ratio per 64x64 superblock (4x4 cells) shared by
@@ -12546,7 +13484,9 @@ fn tpl_lambda_factors(
         for &f in &out {
             hist[((f * 4.0) as usize).min(7)] += 1;
         }
-        let (lo, hi) = out.iter().fold((f64::MAX, 0.0f64), |(l, h), &f| (l.min(f), h.max(f)));
+        let (lo, hi) = out
+            .iter()
+            .fold((f64::MAX, 0.0f64), |(l, h), &f| (l.min(f), h.max(f)));
         let flat = out.iter().filter(|&&f| (0.9..=1.1).contains(&f)).count();
         eprintln!(
             "tpl k={k} d={levels}: {cells} cells, factor hist (0-.25,.25-.5,..,>1.75) {hist:?}, \
@@ -12636,7 +13576,11 @@ pub(crate) fn arf_temporal_filter(src: &Picture, window: &[Picture], strength: f
         for row in 0..SIDE {
             let c = &src.y[(by + row) * src.width + bx..][..SIDE];
             let p = &r.y[(sy + row) * r.width + sx..][..SIDE];
-            acc += c.iter().zip(p).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum::<u64>();
+            acc += c
+                .iter()
+                .zip(p)
+                .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                .sum::<u64>();
         }
         Some((acc, (sy, sx)))
     };
@@ -12647,7 +13591,16 @@ pub(crate) fn arf_temporal_filter(src: &Picture, window: &[Picture], strength: f
         let mut step = 16isize;
         while step >= 1 {
             let from = centre;
-            for (dy, dx) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+            for (dy, dx) in [
+                (-1, -1),
+                (-1, 0),
+                (-1, 1),
+                (0, -1),
+                (0, 1),
+                (1, -1),
+                (1, 0),
+                (1, 1),
+            ] {
                 let mv = (from.0 + dy * step, from.1 + dx * step);
                 if let Some(s) = sad(r, bx, by, mv) {
                     if s.0 < best.0 {
@@ -12687,7 +13640,9 @@ pub(crate) fn arf_temporal_filter(src: &Picture, window: &[Picture], strength: f
                 }
             }
             for r in &neighbours {
-                let Some((sy, sx)) = search(r, bx, by) else { continue };
+                let Some((sy, sx)) = search(r, bx, by) else {
+                    continue;
+                };
                 let mut sse = 0f64;
                 for row in 0..SIDE {
                     for col in 0..SIDE {
@@ -12845,7 +13800,9 @@ pub(crate) fn encode_inter_frame(
     // the two cannot disagree (a header saying SMOOTH over a REGULAR-searched
     // tile decodes to different pixels than the encoder scored).
     header.interpolation_filter = frame_interp_filter();
-    fctx.interp_filter.set(mc::InterpFilterKind::from_header(header.interpolation_filter));
+    fctx.interp_filter.set(mc::InterpFilterKind::from_header(
+        header.interpolation_filter,
+    ));
     let sign_bias = pyramid.map_or(crate::mvstack::NO_SIGN_BIAS, |p| p.sign_bias);
     // The order hint behind each `ref_frame_idx` entry. The flat path's own
     // slot plan (`inter_frame_headers_slots`) is: every reference but
@@ -12906,8 +13863,8 @@ pub(crate) fn encode_inter_frame(
     // ([`SEQ_SCREEN`]): a frame header that contradicts
     // `seq_force_screen_content_tools` is a corrupt stream, not a tighter
     // encode.
-    let screen = seq_screen()
-        && screen_content(&picture_y8, picture.width, true_width, true_height);
+    let screen =
+        seq_screen() && screen_content(&picture_y8, picture.width, true_width, true_height);
     header.allow_screen_content_tools = screen;
     // lane-txi, as on the key frame: the header bit the writer's own
     // `Cdfs` then reads for every luma `tx_type` symbol.
@@ -13004,33 +13961,34 @@ pub(crate) fn encode_inter_frame(
         .iter()
         .take_while(|n| n.width == picture.width && n.height == picture.height)
         .collect();
-    let tpl_sources: Vec<Vec<u8>> =
-        window.iter().map(|n| n.y.iter().map(|&v| v as u8).collect()).collect();
+    let tpl_sources: Vec<Vec<u8>> = window
+        .iter()
+        .map(|n| n.y.iter().map(|&v| v as u8).collect())
+        .collect();
     let tpl_cells_x = picture.width / 16;
     // `.1` is the propagating map's raw per-cell dependence ratio, which only
     // [`deltaq_libaom`] reads; the one-frame area map has no such ratio.
-    let tpl_both: Option<(Vec<f64>, Option<Vec<f64>>)> =
-        (tpl_k > 0.0 && !tpl_sources.is_empty()).then(|| {
-        if tpl_propagating() {
-            let mut frames: Vec<&[u8]> = vec![&picture_y8];
-            frames.extend(tpl_sources.iter().map(Vec::as_slice));
-            let (f, r) = tpl_lambda_factors(&frames, picture.width, picture.height, tpl_k);
-            (f, Some(r))
-        } else {
-            // The shipped map is one factor per 64x64; it is spread over that
-            // superblock's own 16 cells so the application site below (which
-            // averages the four cells of a 32x32 block) reads exactly the
-            // superblock factor, whichever map fed it.
-            let map =
-                tpl_area_map(&picture_y8, &tpl_sources[0], picture.width, picture.height);
-            let cells_y = picture.height / 16;
-            let sb = tpl_sb_factors(&map, tpl_cells_x, cells_y, tpl_k);
-            let f: Vec<f64> = (0..tpl_cells_x * cells_y)
-                .map(|c| sb[(c / tpl_cells_x / 4) * (tpl_cells_x / 4) + (c % tpl_cells_x) / 4])
-                .collect();
-            (f, None)
-        }
-    });
+    let tpl_both: Option<(Vec<f64>, Option<Vec<f64>>)> = (tpl_k > 0.0 && !tpl_sources.is_empty())
+        .then(|| {
+            if tpl_propagating() {
+                let mut frames: Vec<&[u8]> = vec![&picture_y8];
+                frames.extend(tpl_sources.iter().map(Vec::as_slice));
+                let (f, r) = tpl_lambda_factors(&frames, picture.width, picture.height, tpl_k);
+                (f, Some(r))
+            } else {
+                // The shipped map is one factor per 64x64; it is spread over that
+                // superblock's own 16 cells so the application site below (which
+                // averages the four cells of a 32x32 block) reads exactly the
+                // superblock factor, whichever map fed it.
+                let map = tpl_area_map(&picture_y8, &tpl_sources[0], picture.width, picture.height);
+                let cells_y = picture.height / 16;
+                let sb = tpl_sb_factors(&map, tpl_cells_x, cells_y, tpl_k);
+                let f: Vec<f64> = (0..tpl_cells_x * cells_y)
+                    .map(|c| sb[(c / tpl_cells_x / 4) * (tpl_cells_x / 4) + (c % tpl_cells_x) / 4])
+                    .collect();
+                (f, None)
+            }
+        });
     let (tpl_factors, tpl_ratio) = match tpl_both {
         Some((f, r)) => (Some(f), r),
         None => (None, None),
@@ -13086,8 +14044,9 @@ pub(crate) fn encode_inter_frame(
     let sb_q: Option<Vec<u8>> = match (&tpl_factors, deltaq_res) {
         (Some(f), Some(res)) => {
             let libaom = dq_tpl_strength(dq_level);
-            let mut g: Vec<u8> =
-                (0..sb_cols * _sb_rows).map(|sb| sb_qindex(f, res, sb, libaom)).collect();
+            let mut g: Vec<u8> = (0..sb_cols * _sb_rows)
+                .map(|sb| sb_qindex(f, res, sb, libaom))
+                .collect();
             // lane-b128m: under 128 superblocks the delta_q syntax is coded
             // ONCE per 128 root (the reader's own unit), so all four 64x64
             // cells of a root have to be searched -- and quantized -- at the
@@ -13147,8 +14106,12 @@ pub(crate) fn encode_inter_frame(
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
     // This frame's tile grid, as in `encode_key_frame_inner`.
     let (tile_cols_log2, tile_rows_log2) = armed_tiles();
-    let layout =
-        crate::tile::TileLayout::new(header.mi_cols, header.mi_rows, tile_cols_log2, tile_rows_log2);
+    let layout = crate::tile::TileLayout::new(
+        header.mi_cols,
+        header.mi_rows,
+        tile_cols_log2,
+        tile_rows_log2,
+    );
     header.tile_info = tile_info_of(&layout, 1);
     let header_tile_info = header.tile_info.clone();
     // lane-hbd r4: `motion::search` is 8-bit only (its SAD/cost math is
@@ -13181,10 +14144,28 @@ pub(crate) fn encode_inter_frame(
         crate::tile::arm_high_precision_mv(hp_mv);
         crate::tile::arm_pricing_cdfs(start_cdfs, screen);
         let rect = layout.rect(index);
-        let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
+        let mut luma = fresh_plane(
+            &picture_y8,
+            frame_width,
+            frame_height,
+            true_width,
+            true_height,
+        );
         let mut chroma = [
-            fresh_plane(&picture_u8, frame_width / 2, frame_height / 2, true_width / 2, true_height / 2),
-            fresh_plane(&picture_v8, frame_width / 2, frame_height / 2, true_width / 2, true_height / 2),
+            fresh_plane(
+                &picture_u8,
+                frame_width / 2,
+                frame_height / 2,
+                true_width / 2,
+                true_height / 2,
+            ),
+            fresh_plane(
+                &picture_v8,
+                frame_width / 2,
+                frame_height / 2,
+                true_width / 2,
+                true_height / 2,
+            ),
         ];
         clip_planes_to_tile(&mut luma, &mut chroma, rect);
         let mut grid = MiGrid::new(mi_cols, mi_rows);
@@ -13203,113 +14184,84 @@ pub(crate) fn encode_inter_frame(
             rect.mi_col1 as usize,
         );
         let mut blocks: Vec<(usize, Quadrant)> = Vec::new();
-    // lane-b128: under a 128x128 superblock the search walks the roots the
-    // WRITER walks (`tile::sb_write_order`: TL, TR, BL, BR inside each root),
-    // not plain raster -- a search that visits BL before TR builds every mv
-    // stack and neighbour context off blocks the writer has not coded yet,
-    // which is what made the write-time drl clamp fire at all (lane-sb128b).
-    // At a 64 superblock the two orders are identical and this is the same
-    // raster loop as before.
-    let sb128_search = sb128_on();
-    let root_step = if sb128_search { 2 } else { 1 };
-    let mut roots: Vec<(usize, usize)> = Vec::new();
-    {
-        let (r0, r1) = (rect.sb_row0 as usize, rect.sb_row1 as usize);
-        let (c0, c1) = (rect.sb_col0 as usize, rect.sb_col1 as usize);
-        let mut r = r0;
-        while r < r1 {
-            let mut c = c0;
-            while c < c1 {
-                roots.push((r, c));
-                c += root_step;
+        // lane-b128: under a 128x128 superblock the search walks the roots the
+        // WRITER walks (`tile::sb_write_order`: TL, TR, BL, BR inside each root),
+        // not plain raster -- a search that visits BL before TR builds every mv
+        // stack and neighbour context off blocks the writer has not coded yet,
+        // which is what made the write-time drl clamp fire at all (lane-sb128b).
+        // At a 64 superblock the two orders are identical and this is the same
+        // raster loop as before.
+        let sb128_search = sb128_on();
+        let root_step = if sb128_search { 2 } else { 1 };
+        let mut roots: Vec<(usize, usize)> = Vec::new();
+        {
+            let (r0, r1) = (rect.sb_row0 as usize, rect.sb_row1 as usize);
+            let (c0, c1) = (rect.sb_col0 as usize, rect.sb_col1 as usize);
+            let mut r = r0;
+            while r < r1 {
+                let mut c = c0;
+                while c < c1 {
+                    roots.push((r, c));
+                    c += root_step;
+                }
+                r += root_step;
             }
-            r += root_step;
         }
-    }
-    for (root_r, root_c) in roots {
-        // The 64x64 cells of this root, in the writer's own order.
-        let cells: Vec<(usize, usize)> = if sb128_search {
-            [(0, 0), (0, 1), (1, 0), (1, 1)]
-                .into_iter()
-                .map(|(dr, dc)| (root_r + dr, root_c + dc))
-                .filter(|&(r, c)| r < rect.sb_row1 as usize && c < rect.sb_col1 as usize)
-                .collect()
-        } else {
-            vec![(root_r, root_c)]
-        };
-        // What the four cells below really cost, against which the whole
-        // 128x128 candidate is weighed.
-        let mark128 = blocks.len();
-        let mut root_cost = 0.0f64;
-        // The 128 root's own compound pairs, at its 32x32-mi window (the 64
-        // root builds the same list one size down, per superblock).
-        let root_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
-            if header.reference_select && b128_compound() && !screen && sb128_search {
-                [
-                    (crate::mvstack::GOLDEN_FRAME, golden),
-                    (crate::mvstack::ALTREF_FRAME, altref),
-                ]
-                .into_iter()
-                .filter_map(|(r, pic)| {
-                    pic.map(|p| {
-                        (
-                            r,
-                            p,
-                            crate::mvstack::find_mv_stack_compound(
-                                &grid,
-                                root_r * 16,
-                                root_c * 16,
-                                32,
-                                32,
-                                (crate::mvstack::LAST_FRAME, r),
-                                mi_cols,
-                                mi_rows,
-                                grid.sign_bias_table(),
-                                &[(0, 0); 7],
-                                None,
-                            ),
-                        )
-                    })
-                })
-                .collect()
+        for (root_r, root_c) in roots {
+            // The 64x64 cells of this root, in the writer's own order.
+            let cells: Vec<(usize, usize)> = if sb128_search {
+                [(0, 0), (0, 1), (1, 0), (1, 1)]
+                    .into_iter()
+                    .map(|(dr, dc)| (root_r + dr, root_c + dc))
+                    .filter(|&(r, c)| r < rect.sb_row1 as usize && c < rect.sb_col1 as usize)
+                    .collect()
             } else {
-                Vec::new()
+                vec![(root_r, root_c)]
             };
-        let root128 = (sb128_search && b128_root() && cells.len() == 4)
-            .then(|| search_root_128(
-                &mut luma,
-                &mut chroma,
-                &grid,
-                (root_r, root_c),
-                (rows, cols),
-                (header.mi_cols, header.mi_rows),
-                search,
-                &tpl_factors,
-                sb_q.as_ref(),
-                sb_cols,
-                tpl_cells_x,
-                base_q_idx,
-                dq_res,
-                reference,
-                &root_compound,
-                fctx,
-            ))
-            .flatten();
-        // lane-b128hv: the same root as two 128x64 / 64x128 halves. Both cuts
-        // are priced; the cheaper one competes with the NONE block and with
-        // the four superblocks below.
-        let forced_rect = FORCE_B128_RECT.load(std::sync::atomic::Ordering::Relaxed);
-        let root_rect = (sb128_search && b128_rect() && cells.len() == 4)
-            .then(|| {
-                let mut best: Option<(bool, _)> = None;
-                for horz in [true, false] {
-                    if forced_rect != 0 && forced_rect != u8::from(horz) + u8::from(!horz) * 2 {
-                        continue;
-                    }
-                    let Some(found) = search_root_128_rect(
+            // What the four cells below really cost, against which the whole
+            // 128x128 candidate is weighed.
+            let mark128 = blocks.len();
+            let mut root_cost = 0.0f64;
+            // The 128 root's own compound pairs, at its 32x32-mi window (the 64
+            // root builds the same list one size down, per superblock).
+            let root_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+                if header.reference_select && b128_compound() && !screen && sb128_search {
+                    [
+                        (crate::mvstack::GOLDEN_FRAME, golden),
+                        (crate::mvstack::ALTREF_FRAME, altref),
+                    ]
+                    .into_iter()
+                    .filter_map(|(r, pic)| {
+                        pic.map(|p| {
+                            (
+                                r,
+                                p,
+                                crate::mvstack::find_mv_stack_compound(
+                                    &grid,
+                                    root_r * 16,
+                                    root_c * 16,
+                                    32,
+                                    32,
+                                    (crate::mvstack::LAST_FRAME, r),
+                                    mi_cols,
+                                    mi_rows,
+                                    grid.sign_bias_table(),
+                                    &[(0, 0); 7],
+                                    None,
+                                ),
+                            )
+                        })
+                    })
+                    .collect()
+                } else {
+                    Vec::new()
+                };
+            let root128 = (sb128_search && b128_root() && cells.len() == 4)
+                .then(|| {
+                    search_root_128(
                         &mut luma,
                         &mut chroma,
-                        &mut grid,
+                        &grid,
                         (root_r, root_c),
                         (rows, cols),
                         (header.mi_cols, header.mi_rows),
@@ -13322,269 +14274,177 @@ pub(crate) fn encode_inter_frame(
                         dq_res,
                         reference,
                         &root_compound,
-                        horz,
                         fctx,
-                    ) else {
-                        continue;
-                    };
-                    if best.as_ref().is_none_or(|b: &(bool, (f64, f64, _, _))| found.0 < b.1.0) {
-                        best = Some((horz, found));
+                    )
+                })
+                .flatten();
+            // lane-b128hv: the same root as two 128x64 / 64x128 halves. Both cuts
+            // are priced; the cheaper one competes with the NONE block and with
+            // the four superblocks below.
+            let forced_rect = FORCE_B128_RECT.load(std::sync::atomic::Ordering::Relaxed);
+            let root_rect = (sb128_search && b128_rect() && cells.len() == 4)
+                .then(|| {
+                    let mut best: Option<(bool, _)> = None;
+                    for horz in [true, false] {
+                        if forced_rect != 0 && forced_rect != u8::from(horz) + u8::from(!horz) * 2 {
+                            continue;
+                        }
+                        let Some(found) = search_root_128_rect(
+                            &mut luma,
+                            &mut chroma,
+                            &mut grid,
+                            (root_r, root_c),
+                            (rows, cols),
+                            (header.mi_cols, header.mi_rows),
+                            search,
+                            &tpl_factors,
+                            sb_q.as_ref(),
+                            sb_cols,
+                            tpl_cells_x,
+                            base_q_idx,
+                            dq_res,
+                            reference,
+                            &root_compound,
+                            horz,
+                            fctx,
+                        ) else {
+                            continue;
+                        };
+                        if best
+                            .as_ref()
+                            .is_none_or(|b: &(bool, (f64, f64, _, _))| found.0 < b.1.0)
+                        {
+                            best = Some((horz, found));
+                        }
                     }
-                }
-                best
-            })
-            .flatten();
-        // lane-ab128: and the same root as one of the four AB shapes -- two
-        // 64x64 pieces plus one 128x64 / 64x128 half. All four are priced;
-        // the cheapest joins the candidate list below.
-        let forced_ab = FORCE_B128_AB.load(std::sync::atomic::Ordering::Relaxed);
-        let root_ab = (sb128_search
-            && (b128_ab() || forced_ab != 0)
-            && cells.len() == 4
-            && forced_rect == 0)
-            .then(|| {
-                let mut best: Option<(usize, _)> = None;
-                for symbol in 4..=7usize {
-                    if forced_ab != 0 && usize::from(forced_ab) != symbol {
-                        continue;
+                    best
+                })
+                .flatten();
+            // lane-ab128: and the same root as one of the four AB shapes -- two
+            // 64x64 pieces plus one 128x64 / 64x128 half. All four are priced;
+            // the cheapest joins the candidate list below.
+            let forced_ab = FORCE_B128_AB.load(std::sync::atomic::Ordering::Relaxed);
+            let root_ab = (sb128_search
+                && (b128_ab() || forced_ab != 0)
+                && cells.len() == 4
+                && forced_rect == 0)
+                .then(|| {
+                    let mut best: Option<(usize, _)> = None;
+                    for symbol in 4..=7usize {
+                        if forced_ab != 0 && usize::from(forced_ab) != symbol {
+                            continue;
+                        }
+                        let Some(found) = search_root_128_ab(
+                            &mut luma,
+                            &mut chroma,
+                            &mut grid,
+                            (root_r, root_c),
+                            (rows, cols),
+                            (header.mi_cols, header.mi_rows),
+                            search,
+                            &tpl_factors,
+                            sb_q.as_ref(),
+                            sb_cols,
+                            tpl_cells_x,
+                            base_q_idx,
+                            reference,
+                            &root_compound,
+                            symbol,
+                            fctx,
+                        ) else {
+                            continue;
+                        };
+                        if best
+                            .as_ref()
+                            .is_none_or(|b: &(usize, (f64, f64, _, _))| found.0 < b.1.0)
+                        {
+                            best = Some((symbol, found));
+                        }
                     }
-                    let Some(found) = search_root_128_ab(
-                        &mut luma,
-                        &mut chroma,
-                        &mut grid,
-                        (root_r, root_c),
-                        (rows, cols),
-                        (header.mi_cols, header.mi_rows),
-                        search,
-                        &tpl_factors,
-                        sb_q.as_ref(),
-                        sb_cols,
-                        tpl_cells_x,
-                        base_q_idx,
-                        reference,
-                        &root_compound,
-                        symbol,
-                        fctx,
-                    ) else {
-                        continue;
-                    };
-                    if best.as_ref().is_none_or(|b: &(usize, (f64, f64, _, _))| found.0 < b.1.0) {
-                        best = Some((symbol, found));
-                    }
-                }
-                best
-            })
-            .flatten();
-        for (sb_r, sb_c) in cells {
-            // lane-b64: the whole superblock as ONE 64x64 block, tried before
-            // its quadrants are (`search_skip_64`) and compared against the
-            // four of them below. Only a superblock wholly inside the true
-            // frame is offered it, and (lane-b64b, `EC_AV1_B64EDGE`) one the
-            // edge CUTS THROUGH: the spec's own `has_cols`/`has_rows` ask
-            // only that the block's half is inside, and the trial is ranked
-            // over the inside part alone ([`Plane::block_sse`]).
-            let (x64, y64) = (sb_c * SUPERBLOCK, sb_r * SUPERBLOCK);
-            let whole_inside = (sb_c as u32 + 1) * crate::tile::SB_MI <= header.mi_cols
-                && (sb_r as u32 + 1) * crate::tile::SB_MI <= header.mi_rows
-                && x64 + SUPERBLOCK <= luma.true_width
-                && y64 + SUPERBLOCK <= luma.true_height;
-            let edge_inside = b64_edge()
-                && crate::tile::has_half(
-                    sb_c as u32 * crate::tile::SB_MI,
-                    crate::tile::SB_MI,
-                    header.mi_cols,
-                )
-                && crate::tile::has_half(
-                    sb_r as u32 * crate::tile::SB_MI,
-                    crate::tile::SB_MI,
-                    header.mi_rows,
-                );
-            let sb64_legal = b64_root()
-                && sb_r * 2 + 1 < rows
-                && sb_c * 2 + 1 < cols
-                && (whole_inside || edge_inside);
-            // One lambda for the whole superblock, the same mean the 32x32
-            // level takes over its own four tpl cells: the 64-vs-four-32
-            // comparison below weighs one cost against four, so both sides
-            // have to be priced at the same lambda.
-            let sb_search = match &tpl_factors {
-                // lane-deltaq: with a per-superblock quantizer the lambda
-                // comes from that quantizer, not from the raw map factor --
-                // the two agree exactly at `EC_AV1_DELTAQ_K=1` unclamped.
-                Some(_) if sb_q.is_some() => sb_q_search(sb_q.as_ref().expect("armed"), sb_cols, base_q_idx, (sb_r, sb_c), search),
-                Some(f) if sb64_legal => {
-                    let mean = (0..16)
-                        .map(|i| f[(sb_r * 4 + i / 4) * tpl_cells_x + sb_c * 4 + i % 4])
-                        .sum::<f64>()
-                        / 16.0;
-                    Search { lambda: search.lambda * mean, ..search }
-                }
-                _ => search,
-            };
-            let mark = blocks.len();
-            let mut sb64: Option<(f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> = None;
-            let mut sb_cost = 0.0f64;
-            if sb64_legal {
-                let base = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
-                let (mi_row, mi_col) = (sb_r * 16, sb_c * 16);
-                let stack =
-                    find_mv_stack(&grid, mi_row, mi_col, 16, 16, LAST_FRAME, mi_cols, mi_rows);
-                // lane-b64b: the `LAST` + extra-reference pairs at this
-                // superblock's own 16x16-mi window, the same stacks the tile
-                // writer's `Whole64` arm rebuilds. Empty unless the frame
-                // codes `reference_select`, which is what gates the syntax.
-                // `!screen` for the same reason the residual arm is gated
-                // there ([`b64_residual`]): a desktop capture's superblocks
-                // are flat runs the skip arm already codes for nothing, and
-                // MEASURED, compound at the root cost it +33.4/-23.8 ->
-                // +33.7/-23.6 while both film rows gained (step 1's table).
-                let sb_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
-                    if header.reference_select && b64_compound() && !screen {
-                        [
-                            (crate::mvstack::GOLDEN_FRAME, golden),
-                            (crate::mvstack::ALTREF_FRAME, altref),
-                        ]
-                        .into_iter()
-                        .filter_map(|(r, pic)| {
-                            pic.map(|p| {
-                                (
-                                    r,
-                                    p,
-                                    crate::mvstack::find_mv_stack_compound(
-                                        &grid,
-                                        mi_row,
-                                        mi_col,
-                                        16,
-                                        16,
-                                        (crate::mvstack::LAST_FRAME, r),
-                                        mi_cols,
-                                        mi_rows,
-                                        grid.sign_bias_table(),
-                                        &[(0, 0); 7],
-                                        None,
-                                    ),
-                                )
-                            })
-                        })
-                        .collect()
-                    } else {
-                        Vec::new()
-                    };
-                if let Some((cost, block)) = search_skip_64(
-                    &mut luma,
-                    &mut chroma,
-                    (x64, y64),
-                    (SUPERBLOCK, SUPERBLOCK),
-                    &sb_search,
-                    b64_residual() && !screen,
-                    reference,
-                    &stack,
-                    &sb_compound,
-                    fctx,
-                ) {
-                    let after = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
-                    restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &base);
-                    let cost = cost
-                        + sb_search.lambda * crate::tile::partition_bits(SUPERBLOCK, false);
-                    sb64 = Some((cost, block, after));
-                }
-            }
-            // A superblock whose 64x64 trial already codes almost nothing per
-            // pixel is taken outright and its quadrants are never searched --
-            // the same `split_rd_breakout` shape the 32x32 level uses one
-            // size up, and where this lever BUYS wall instead of spending it.
-            let early64 = sb64.as_ref().is_some_and(|(c, _, _)| {
-                split_rd_breakout_at(
-                    b64_breakout_threshold(),
-                    *c,
-                    SUPERBLOCK,
-                    sb_search.lambda,
-                )
-            });
-            for quadrant in 0..if early64 { 0 } else { 4 } {
-                let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
-                // lane-av1tpl2: this 32x32 block's own lambda -- every RD
-                // decision under it (partition, mode, tx, motion) reads
-                // `search.lambda`, so scaling the one field here scales all
-                // of them. 32x32 and not the 16x16 the map is built at
-                // because the whole-vs-split comparison right below weighs
-                // one 32x32 cost against four 16x16 ones: a per-leaf lambda
-                // would make those two numbers incomparable.
-                let search = match &tpl_factors {
-                    // lane-deltaq: the quantizer is a SUPERBLOCK-level
-                    // symbol, so all four quadrants take their superblock's
-                    // own qindex and the lambda it implies. No granularity is
-                    // lost: the shipped map (`EC_AV1_TPL_SB`) is already one
-                    // factor per superblock, shared by its sixteen cells.
-                    Some(_) if sb_q.is_some() => sb_q_search(sb_q.as_ref().expect("armed"), sb_cols, base_q_idx, (sb_r, sb_c), search),
-                    Some(f) => {
-                        let mean = (0..4)
-                            .map(|i| f[(r32 * 2 + i / 2) * tpl_cells_x + c32 * 2 + i % 2])
-                            .sum::<f64>()
-                            / 4.0;
-                        Search { lambda: search.lambda * mean, ..search }
-                    }
-                    None => search,
-                };
-                // Same filter as the tile writer's: a quadrant whose own mi
-                // origin is not inside the true frame is never coded.
-                if r32 >= rows || c32 >= cols {
-                    continue;
-                }
-                // spec `decode_partition`'s hasRows/hasCols recomputed at this
-                // 32x32 block's own half (`crate::tile::has_half`), same as
-                // the key frame search: the true frame edge can fall inside a
-                // quadrant a superblock-level check already let through, and
-                // such a quadrant cannot be left whole -- it must split into
-                // the 16x16 leaves that are actually inside the true frame
-                // (`crate::tile::sb_coeff_inter_frame_tile`'s `Quadrant::Split`
-                // arm).
-                let (has_cols32, has_rows32) = (
-                    crate::tile::has_half(
-                        c32 as u32 * crate::tile::BLOCK_MI,
-                        crate::tile::BLOCK_MI,
+                    best
+                })
+                .flatten();
+            for (sb_r, sb_c) in cells {
+                // lane-b64: the whole superblock as ONE 64x64 block, tried before
+                // its quadrants are (`search_skip_64`) and compared against the
+                // four of them below. Only a superblock wholly inside the true
+                // frame is offered it, and (lane-b64b, `EC_AV1_B64EDGE`) one the
+                // edge CUTS THROUGH: the spec's own `has_cols`/`has_rows` ask
+                // only that the block's half is inside, and the trial is ranked
+                // over the inside part alone ([`Plane::block_sse`]).
+                let (x64, y64) = (sb_c * SUPERBLOCK, sb_r * SUPERBLOCK);
+                let whole_inside = (sb_c as u32 + 1) * crate::tile::SB_MI <= header.mi_cols
+                    && (sb_r as u32 + 1) * crate::tile::SB_MI <= header.mi_rows
+                    && x64 + SUPERBLOCK <= luma.true_width
+                    && y64 + SUPERBLOCK <= luma.true_height;
+                let edge_inside = b64_edge()
+                    && crate::tile::has_half(
+                        sb_c as u32 * crate::tile::SB_MI,
+                        crate::tile::SB_MI,
                         header.mi_cols,
-                    ),
-                    crate::tile::has_half(
-                        r32 as u32 * crate::tile::BLOCK_MI,
-                        crate::tile::BLOCK_MI,
+                    )
+                    && crate::tile::has_half(
+                        sb_r as u32 * crate::tile::SB_MI,
+                        crate::tile::SB_MI,
                         header.mi_rows,
+                    );
+                let sb64_legal = b64_root()
+                    && sb_r * 2 + 1 < rows
+                    && sb_c * 2 + 1 < cols
+                    && (whole_inside || edge_inside);
+                // One lambda for the whole superblock, the same mean the 32x32
+                // level takes over its own four tpl cells: the 64-vs-four-32
+                // comparison below weighs one cost against four, so both sides
+                // have to be priced at the same lambda.
+                let sb_search = match &tpl_factors {
+                    // lane-deltaq: with a per-superblock quantizer the lambda
+                    // comes from that quantizer, not from the raw map factor --
+                    // the two agree exactly at `EC_AV1_DELTAQ_K=1` unclamped.
+                    Some(_) if sb_q.is_some() => sb_q_search(
+                        sb_q.as_ref().expect("armed"),
+                        sb_cols,
+                        base_q_idx,
+                        (sb_r, sb_c),
+                        search,
                     ),
-                );
-                if has_cols32 && has_rows32 {
-                    let (x, y) = (c32 * BLOCK, r32 * BLOCK);
-                    let (mi_row, mi_col) = (r32 * 8, c32 * 8);
+                    Some(f) if sb64_legal => {
+                        let mean = (0..16)
+                            .map(|i| f[(sb_r * 4 + i / 4) * tpl_cells_x + sb_c * 4 + i % 4])
+                            .sum::<f64>()
+                            / 16.0;
+                        Search {
+                            lambda: search.lambda * mean,
+                            ..search
+                        }
+                    }
+                    _ => search,
+                };
+                let mark = blocks.len();
+                let mut sb64: Option<(f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> = None;
+                let mut sb_cost = 0.0f64;
+                if sb64_legal {
+                    let base = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
+                    let (mi_row, mi_col) = (sb_r * 16, sb_c * 16);
                     let stack =
-                        find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
-                    let extra_stacks: Vec<(i8, &Picture, MvStack)> = [
-                        (crate::mvstack::LAST2_FRAME, last2),
-                        (crate::mvstack::GOLDEN_FRAME, golden),
-                        (crate::mvstack::ALTREF_FRAME, altref),
-                    ]
-                    .into_iter()
-                    .filter_map(|(r, pic)| {
-                        pic.map(|p| {
-                            (
-                                r,
-                                p,
-                                find_mv_stack(&grid, mi_row, mi_col, 8, 8, r, mi_cols, mi_rows),
-                            )
-                        })
-                    })
-                    .collect();
-                    let extra: Vec<(i8, &Picture, &MvStack)> = extra_stacks
-                        .iter()
-                        .map(|(r, p, st)| (*r, *p, st))
-                        .collect();
-                    // The COMPOUND stack of each `LAST` + extra pair, off the
-                    // same grid (and the same armed sign bias) the tile writer
-                    // rebuilds it from. Empty unless this frame codes
-                    // `reference_select`, which is what gates the syntax.
-                    let compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
-                        if header.reference_select {
-                            extra_stacks
-                                .iter()
-                                .map(|&(r, p, _)| {
+                        find_mv_stack(&grid, mi_row, mi_col, 16, 16, LAST_FRAME, mi_cols, mi_rows);
+                    // lane-b64b: the `LAST` + extra-reference pairs at this
+                    // superblock's own 16x16-mi window, the same stacks the tile
+                    // writer's `Whole64` arm rebuilds. Empty unless the frame
+                    // codes `reference_select`, which is what gates the syntax.
+                    // `!screen` for the same reason the residual arm is gated
+                    // there ([`b64_residual`]): a desktop capture's superblocks
+                    // are flat runs the skip arm already codes for nothing, and
+                    // MEASURED, compound at the root cost it +33.4/-23.8 ->
+                    // +33.7/-23.6 while both film rows gained (step 1's table).
+                    let sb_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+                        if header.reference_select && b64_compound() && !screen {
+                            [
+                                (crate::mvstack::GOLDEN_FRAME, golden),
+                                (crate::mvstack::ALTREF_FRAME, altref),
+                            ]
+                            .into_iter()
+                            .filter_map(|(r, pic)| {
+                                pic.map(|p| {
                                     (
                                         r,
                                         p,
@@ -13592,8 +14452,8 @@ pub(crate) fn encode_inter_frame(
                                             &grid,
                                             mi_row,
                                             mi_col,
-                                            8,
-                                            8,
+                                            16,
+                                            16,
                                             (crate::mvstack::LAST_FRAME, r),
                                             mi_cols,
                                             mi_rows,
@@ -13603,64 +14463,204 @@ pub(crate) fn encode_inter_frame(
                                         ),
                                     )
                                 })
-                                .collect()
+                            })
+                            .collect()
                         } else {
                             Vec::new()
                         };
-
-                    let base = snapshot(&luma, &chroma, (x, y), BLOCK);
-                    let (block, mut cost_whole) = search_inter_block(
+                    if let Some((cost, block)) = search_skip_64(
                         &mut luma,
                         &mut chroma,
-                        (x, y),
-                        &search,
-                        &mode_bits_table,
+                        (x64, y64),
+                        (SUPERBLOCK, SUPERBLOCK),
+                        &sb_search,
+                        b64_residual() && !screen,
                         reference,
                         &stack,
-                        &extra,
-                        &compound,
-                        &grid,
-                        (mi_row, mi_col),
-                        (mi_rows, mi_cols),
+                        &sb_compound,
                         fctx,
-                    );
-                    cost_whole += search.lambda * partition_bits(BLOCK, false);
-                    let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
-
-                    // What four 16x16 leaves cost instead (spec
-                    // PARTITION_SPLIT at BLOCK_32X32, which
-                    // `sb_coeff_inter_frame_tile`'s `Quadrant::Split` arm
-                    // already writes for a straddling quadrant). Each leaf is
-                    // searched against the reconstruction -- and the `mi`
-                    // grid -- the ones before it left, exactly as the writer
-                    // and the decoder will read them.
-                    //
-                    // A block the whole-32 search left skipped (no residual
-                    // at all) is not offered the split: libaom prunes the
-                    // same way at cpu-used 6, and it is where the wall would
-                    // otherwise go on static content.
-                    let leaf_positions: Vec<(usize, usize)> = (0..4)
-                        .map(|i| (r32 * 2 + i / 2, c32 * 2 + i % 2))
-                        .collect();
-                    let leaves_legal = leaf_positions.iter().all(|&(sr, sc)| {
+                    ) {
+                        let after = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
+                        restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &base);
+                        let cost = cost
+                            + sb_search.lambda * crate::tile::partition_bits(SUPERBLOCK, false);
+                        sb64 = Some((cost, block, after));
+                    }
+                }
+                // A superblock whose 64x64 trial already codes almost nothing per
+                // pixel is taken outright and its quadrants are never searched --
+                // the same `split_rd_breakout` shape the 32x32 level uses one
+                // size up, and where this lever BUYS wall instead of spending it.
+                let early64 = sb64.as_ref().is_some_and(|(c, _, _)| {
+                    split_rd_breakout_at(b64_breakout_threshold(), *c, SUPERBLOCK, sb_search.lambda)
+                });
+                for quadrant in 0..if early64 { 0 } else { 4 } {
+                    let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                    // lane-av1tpl2: this 32x32 block's own lambda -- every RD
+                    // decision under it (partition, mode, tx, motion) reads
+                    // `search.lambda`, so scaling the one field here scales all
+                    // of them. 32x32 and not the 16x16 the map is built at
+                    // because the whole-vs-split comparison right below weighs
+                    // one 32x32 cost against four 16x16 ones: a per-leaf lambda
+                    // would make those two numbers incomparable.
+                    let search = match &tpl_factors {
+                        // lane-deltaq: the quantizer is a SUPERBLOCK-level
+                        // symbol, so all four quadrants take their superblock's
+                        // own qindex and the lambda it implies. No granularity is
+                        // lost: the shipped map (`EC_AV1_TPL_SB`) is already one
+                        // factor per superblock, shared by its sixteen cells.
+                        Some(_) if sb_q.is_some() => sb_q_search(
+                            sb_q.as_ref().expect("armed"),
+                            sb_cols,
+                            base_q_idx,
+                            (sb_r, sb_c),
+                            search,
+                        ),
+                        Some(f) => {
+                            let mean = (0..4)
+                                .map(|i| f[(r32 * 2 + i / 2) * tpl_cells_x + c32 * 2 + i % 2])
+                                .sum::<f64>()
+                                / 4.0;
+                            Search {
+                                lambda: search.lambda * mean,
+                                ..search
+                            }
+                        }
+                        None => search,
+                    };
+                    // Same filter as the tile writer's: a quadrant whose own mi
+                    // origin is not inside the true frame is never coded.
+                    if r32 >= rows || c32 >= cols {
+                        continue;
+                    }
+                    // spec `decode_partition`'s hasRows/hasCols recomputed at this
+                    // 32x32 block's own half (`crate::tile::has_half`), same as
+                    // the key frame search: the true frame edge can fall inside a
+                    // quadrant a superblock-level check already let through, and
+                    // such a quadrant cannot be left whole -- it must split into
+                    // the 16x16 leaves that are actually inside the true frame
+                    // (`crate::tile::sb_coeff_inter_frame_tile`'s `Quadrant::Split`
+                    // arm).
+                    let (has_cols32, has_rows32) = (
                         crate::tile::has_half(
-                            sc as u32 * crate::tile::SUB_MI,
-                            crate::tile::SUB_MI,
+                            c32 as u32 * crate::tile::BLOCK_MI,
+                            crate::tile::BLOCK_MI,
                             header.mi_cols,
-                        ) && crate::tile::has_half(
-                            sr as u32 * crate::tile::SUB_MI,
-                            crate::tile::SUB_MI,
+                        ),
+                        crate::tile::has_half(
+                            r32 as u32 * crate::tile::BLOCK_MI,
+                            crate::tile::BLOCK_MI,
                             header.mi_rows,
-                        )
-                    });
-                    // The breakout above: a 32x32 block that codes almost
-                    // nothing is not offered the split at all.
-                    let breakout = split_breakout_coeffs();
-                    let split = (!block.skip
-                        && !split_rd_breakout(cost_whole, BLOCK, search.lambda)
-                        && (breakout == 0 || block.luma.len() > 4 * breakout)
-                        && leaves_legal
-                        && split_inter_blocks())
+                        ),
+                    );
+                    if has_cols32 && has_rows32 {
+                        let (x, y) = (c32 * BLOCK, r32 * BLOCK);
+                        let (mi_row, mi_col) = (r32 * 8, c32 * 8);
+                        let stack = find_mv_stack(
+                            &grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows,
+                        );
+                        let extra_stacks: Vec<(i8, &Picture, MvStack)> = [
+                            (crate::mvstack::LAST2_FRAME, last2),
+                            (crate::mvstack::GOLDEN_FRAME, golden),
+                            (crate::mvstack::ALTREF_FRAME, altref),
+                        ]
+                        .into_iter()
+                        .filter_map(|(r, pic)| {
+                            pic.map(|p| {
+                                (
+                                    r,
+                                    p,
+                                    find_mv_stack(&grid, mi_row, mi_col, 8, 8, r, mi_cols, mi_rows),
+                                )
+                            })
+                        })
+                        .collect();
+                        let extra: Vec<(i8, &Picture, &MvStack)> =
+                            extra_stacks.iter().map(|(r, p, st)| (*r, *p, st)).collect();
+                        // The COMPOUND stack of each `LAST` + extra pair, off the
+                        // same grid (and the same armed sign bias) the tile writer
+                        // rebuilds it from. Empty unless this frame codes
+                        // `reference_select`, which is what gates the syntax.
+                        let compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+                            if header.reference_select {
+                                extra_stacks
+                                    .iter()
+                                    .map(|&(r, p, _)| {
+                                        (
+                                            r,
+                                            p,
+                                            crate::mvstack::find_mv_stack_compound(
+                                                &grid,
+                                                mi_row,
+                                                mi_col,
+                                                8,
+                                                8,
+                                                (crate::mvstack::LAST_FRAME, r),
+                                                mi_cols,
+                                                mi_rows,
+                                                grid.sign_bias_table(),
+                                                &[(0, 0); 7],
+                                                None,
+                                            ),
+                                        )
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                        let base = snapshot(&luma, &chroma, (x, y), BLOCK);
+                        let (block, mut cost_whole) = search_inter_block(
+                            &mut luma,
+                            &mut chroma,
+                            (x, y),
+                            &search,
+                            &mode_bits_table,
+                            reference,
+                            &stack,
+                            &extra,
+                            &compound,
+                            &grid,
+                            (mi_row, mi_col),
+                            (mi_rows, mi_cols),
+                            fctx,
+                        );
+                        cost_whole += search.lambda * partition_bits(BLOCK, false);
+                        let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
+
+                        // What four 16x16 leaves cost instead (spec
+                        // PARTITION_SPLIT at BLOCK_32X32, which
+                        // `sb_coeff_inter_frame_tile`'s `Quadrant::Split` arm
+                        // already writes for a straddling quadrant). Each leaf is
+                        // searched against the reconstruction -- and the `mi`
+                        // grid -- the ones before it left, exactly as the writer
+                        // and the decoder will read them.
+                        //
+                        // A block the whole-32 search left skipped (no residual
+                        // at all) is not offered the split: libaom prunes the
+                        // same way at cpu-used 6, and it is where the wall would
+                        // otherwise go on static content.
+                        let leaf_positions: Vec<(usize, usize)> =
+                            (0..4).map(|i| (r32 * 2 + i / 2, c32 * 2 + i % 2)).collect();
+                        let leaves_legal = leaf_positions.iter().all(|&(sr, sc)| {
+                            crate::tile::has_half(
+                                sc as u32 * crate::tile::SUB_MI,
+                                crate::tile::SUB_MI,
+                                header.mi_cols,
+                            ) && crate::tile::has_half(
+                                sr as u32 * crate::tile::SUB_MI,
+                                crate::tile::SUB_MI,
+                                header.mi_rows,
+                            )
+                        });
+                        // The breakout above: a 32x32 block that codes almost
+                        // nothing is not offered the split at all.
+                        let breakout = split_breakout_coeffs();
+                        let split = (!block.skip
+                            && !split_rd_breakout(cost_whole, BLOCK, search.lambda)
+                            && (breakout == 0 || block.luma.len() > 4 * breakout)
+                            && leaves_legal
+                            && split_inter_blocks())
                         .then(|| {
                             restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
                             let mut cost = search.lambda * partition_bits(BLOCK, true);
@@ -13673,8 +14673,16 @@ pub(crate) fn encode_inter_frame(
                                     &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
                                 );
                                 let cstacks = leaf_compound_stacks(
-                                    &grid, mi_row, mi_col, 4, 4, mi_cols, mi_rows,
-                                    header.reference_select, golden, altref,
+                                    &grid,
+                                    mi_row,
+                                    mi_col,
+                                    4,
+                                    4,
+                                    mi_cols,
+                                    mi_rows,
+                                    header.reference_select,
+                                    golden,
+                                    altref,
                                 );
                                 let (leaf, leaf_cost) = code_square_inter(
                                     &mut luma,
@@ -13692,8 +14700,8 @@ pub(crate) fn encode_inter_frame(
                                     &obmc_refs,
                                     fctx,
                                 );
-                                let leaf_cost = leaf_cost
-                                    + search.lambda * partition_bits(SUB, false);
+                                let leaf_cost =
+                                    leaf_cost + search.lambda * partition_bits(SUB, false);
                                 let after_leaf = snapshot(&luma, &chroma, (lx, ly), SUB);
 
                                 // And what four 8x8 leaves cost instead --
@@ -13715,66 +14723,74 @@ pub(crate) fn encode_inter_frame(
                                     // `sub_positions` path below) are a
                                     // different site and stay.
                                     && (search.arf_leaf8 || arfmode_hit_and_no()))
-                                    .then(|| {
-                                        restore(
-                                            &mut luma, &mut chroma, (lx, ly), SUB, &leaf_base,
+                                .then(|| {
+                                    restore(&mut luma, &mut chroma, (lx, ly), SUB, &leaf_base);
+                                    let mut cost8 = search.lambda
+                                        * (partition_bits(SUB, true)
+                                            + 4.0 * partition_bits(8, false));
+                                    let mut eight = Vec::with_capacity(4);
+                                    for i in 0..4 {
+                                        let (mr, mc) = (mi_row + (i / 2) * 2, mi_col + (i % 2) * 2);
+                                        let stack8 = find_mv_stack(
+                                            &grid, mr, mc, 2, 2, LAST_FRAME, mi_cols, mi_rows,
                                         );
-                                        let mut cost8 = search.lambda
-                                            * (partition_bits(SUB, true)
-                                                + 4.0 * partition_bits(8, false));
-                                        let mut eight = Vec::with_capacity(4);
-                                        for i in 0..4 {
-                                            let (mr, mc) =
-                                                (mi_row + (i / 2) * 2, mi_col + (i % 2) * 2);
-                                            let stack8 = find_mv_stack(
-                                                &grid, mr, mc, 2, 2, LAST_FRAME, mi_cols, mi_rows,
-                                            );
-                                            let cstacks8: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
-                                                if header.reference_select && leaf_compound() {
-                                                    [
-                                                        (crate::mvstack::GOLDEN_FRAME, golden),
-                                                        (crate::mvstack::ALTREF_FRAME, altref),
-                                                    ]
-                                                    .into_iter()
-                                                    .filter_map(|(r, pic)| {
-                                                        pic.map(|p| {
-                                                            (
-                                                                r,
-                                                                p,
-                                                                crate::mvstack::find_mv_stack_compound(
-                                                                    &grid, mr, mc, 2, 2,
-                                                                    (crate::mvstack::LAST_FRAME, r), mi_cols, mi_rows,
-                                                                    grid.sign_bias_table(), &[(0, 0); 7], None,
-                                                                ),
-                                                            )
-                                                        })
-                                                    })
-                                                    .collect()
-                                                } else {
-                                                    Vec::new()
-                                                };
-                                            let (leaf8, cost) = code_square_inter(
-                                                &mut luma,
-                                                &mut chroma,
-                                                (lx + (i % 2) * 8, ly + (i / 2) * 8),
-                                                8,
-                                                &search,
-                                                &mode_bits_table,
-                                                reference,
-                                                &stack8,
-                                                &cstacks8,
-                                                &grid,
-                                                (mr, mc),
-                                                (mi_rows, mi_cols),
-                                                &obmc_refs,
-                                                fctx,
-                                            );
-                                            cost8 += cost;
-                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter, leaf8.skip);
-                                            eight.push(leaf8);
-                                        }
-                                        (eight, cost8)
-                                    });
+                                        let cstacks8: Vec<(
+                                            i8,
+                                            &Picture,
+                                            crate::mvstack::CompoundMvStack,
+                                        )> = if header.reference_select && leaf_compound() {
+                                            [
+                                                (crate::mvstack::GOLDEN_FRAME, golden),
+                                                (crate::mvstack::ALTREF_FRAME, altref),
+                                            ]
+                                            .into_iter()
+                                            .filter_map(|(r, pic)| {
+                                                pic.map(|p| {
+                                                    (
+                                                        r,
+                                                        p,
+                                                        crate::mvstack::find_mv_stack_compound(
+                                                            &grid,
+                                                            mr,
+                                                            mc,
+                                                            2,
+                                                            2,
+                                                            (crate::mvstack::LAST_FRAME, r),
+                                                            mi_cols,
+                                                            mi_rows,
+                                                            grid.sign_bias_table(),
+                                                            &[(0, 0); 7],
+                                                            None,
+                                                        ),
+                                                    )
+                                                })
+                                            })
+                                            .collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        let (leaf8, cost) = code_square_inter(
+                                            &mut luma,
+                                            &mut chroma,
+                                            (lx + (i % 2) * 8, ly + (i / 2) * 8),
+                                            8,
+                                            &search,
+                                            &mode_bits_table,
+                                            reference,
+                                            &stack8,
+                                            &cstacks8,
+                                            &grid,
+                                            (mr, mc),
+                                            (mi_rows, mi_cols),
+                                            &obmc_refs,
+                                            fctx,
+                                        );
+                                        cost8 += cost;
+                                        record_mi(&mut grid, mr, mc, 2, leaf8.inter, leaf8.skip);
+                                        eight.push(leaf8);
+                                    }
+                                    (eight, cost8)
+                                });
                                 match eight {
                                     Some((eight, cost8)) if cost8 < leaf_cost => {
                                         partition_hit(3);
@@ -13785,9 +14801,9 @@ pub(crate) fn encode_inter_frame(
                                         });
                                         continue;
                                     }
-                                    Some(_) => restore(
-                                        &mut luma, &mut chroma, (lx, ly), SUB, &after_leaf,
-                                    ),
+                                    Some(_) => {
+                                        restore(&mut luma, &mut chroma, (lx, ly), SUB, &after_leaf)
+                                    }
                                     None => {}
                                 }
                                 partition_hit(2);
@@ -13797,113 +14813,78 @@ pub(crate) fn encode_inter_frame(
                             }
                             (leaves, cost)
                         });
-                    if let Some((leaves, cost)) = split {
-                        if cost < cost_whole {
-                            // The leaves' own `mi` cells are already in the
-                            // grid, and their reconstruction is what the
-                            // planes hold.
-                            partition_hit(1);
-                            sb_cost += cost;
-                            blocks.push((r32 * cols + c32, Quadrant::Split(leaves)));
-                            continue;
+                        if let Some((leaves, cost)) = split {
+                            if cost < cost_whole {
+                                // The leaves' own `mi` cells are already in the
+                                // grid, and their reconstruction is what the
+                                // planes hold.
+                                partition_hit(1);
+                                sb_cost += cost;
+                                blocks.push((r32 * cols + c32, Quadrant::Split(leaves)));
+                                continue;
+                            }
+                            restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
                         }
-                        restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
-                    }
-                    partition_hit(0);
-                    sb_cost += cost_whole;
-                    record_mi(&mut grid, mi_row, mi_col, 8, block.inter, block.skip);
-                    blocks.push((r32 * cols + c32, Quadrant::Whole(block)));
-                } else {
-                    // The sub-positions actually inside the true frame, same
-                    // filter as `sb_coeff_inter_frame_tile`'s `sub_positions`.
-                    let sub_positions: Vec<(usize, usize)> = (0..4)
-                        .map(|i| (r32 * 2 + i / 2, c32 * 2 + i % 2))
-                        .filter(|&(sr, sc)| {
-                            (sr as u32) * crate::tile::SUB_MI < header.mi_rows
-                                && (sc as u32) * crate::tile::SUB_MI < header.mi_cols
-                        })
-                        .collect();
-                    // Each leaf searches intra against its own `NEARESTMV`
-                    // candidate (`code_square_inter`), same real-inter choice
-                    // `search_inter_block` makes for a whole 32x32 block, at
-                    // this leaf's own 4x4-mi mv-stack window -- unless the
-                    // leaf's own half itself straddles the true edge, which
-                    // it codes as two (or one, at a true corner) 8x8 leaves
-                    // (`crate::tile::write_leaf8`'s inter counterpart),
-                    // mirroring the key frame search's straddling-16x16
-                    // handling above (lane-av1inter8).
-                    let mut leaves = Vec::with_capacity(sub_positions.len());
-                    for (sr, sc) in sub_positions {
-                        let (has_cols16, has_rows16) = (
-                            crate::tile::has_half(
-                                sc as u32 * crate::tile::SUB_MI,
-                                crate::tile::SUB_MI,
-                                header.mi_cols,
-                            ),
-                            crate::tile::has_half(
-                                sr as u32 * crate::tile::SUB_MI,
-                                crate::tile::SUB_MI,
-                                header.mi_rows,
-                            ),
-                        );
-                        if has_cols16 && has_rows16 {
-                            let (x, y) = (sc * SUB, sr * SUB);
-                            let (mi_row, mi_col) = (sr * 4, sc * 4);
-                            let stack = find_mv_stack(
-                                &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
+                        partition_hit(0);
+                        sb_cost += cost_whole;
+                        record_mi(&mut grid, mi_row, mi_col, 8, block.inter, block.skip);
+                        blocks.push((r32 * cols + c32, Quadrant::Whole(block)));
+                    } else {
+                        // The sub-positions actually inside the true frame, same
+                        // filter as `sb_coeff_inter_frame_tile`'s `sub_positions`.
+                        let sub_positions: Vec<(usize, usize)> = (0..4)
+                            .map(|i| (r32 * 2 + i / 2, c32 * 2 + i % 2))
+                            .filter(|&(sr, sc)| {
+                                (sr as u32) * crate::tile::SUB_MI < header.mi_rows
+                                    && (sc as u32) * crate::tile::SUB_MI < header.mi_cols
+                            })
+                            .collect();
+                        // Each leaf searches intra against its own `NEARESTMV`
+                        // candidate (`code_square_inter`), same real-inter choice
+                        // `search_inter_block` makes for a whole 32x32 block, at
+                        // this leaf's own 4x4-mi mv-stack window -- unless the
+                        // leaf's own half itself straddles the true edge, which
+                        // it codes as two (or one, at a true corner) 8x8 leaves
+                        // (`crate::tile::write_leaf8`'s inter counterpart),
+                        // mirroring the key frame search's straddling-16x16
+                        // handling above (lane-av1inter8).
+                        let mut leaves = Vec::with_capacity(sub_positions.len());
+                        for (sr, sc) in sub_positions {
+                            let (has_cols16, has_rows16) = (
+                                crate::tile::has_half(
+                                    sc as u32 * crate::tile::SUB_MI,
+                                    crate::tile::SUB_MI,
+                                    header.mi_cols,
+                                ),
+                                crate::tile::has_half(
+                                    sr as u32 * crate::tile::SUB_MI,
+                                    crate::tile::SUB_MI,
+                                    header.mi_rows,
+                                ),
                             );
-                            let cstacks = leaf_compound_stacks(
-                                &grid, mi_row, mi_col, 4, 4, mi_cols, mi_rows,
-                                header.reference_select, golden, altref,
-                            );
-                            let (block, _) = code_square_inter(
-                                &mut luma,
-                                &mut chroma,
-                                (x, y),
-                                SUB,
-                                &search,
-                                &mode_bits_table,
-                                reference,
-                                &stack,
-                                &cstacks,
-                                &grid,
-                                (mi_row, mi_col),
-                                (mi_rows, mi_cols),
-                                &obmc_refs,
-                                fctx,
-                            );
-                            // One publication point for every coded leaf
-                            // (`record_mi`): this site used to spell the vote
-                            // out with `ref_frame` pinned to LAST and `mv1`
-                            // to (0,0), which is the encoder-grid-drift class
-                            // -- correct only for as long as a leaf can never
-                            // be compound.
-                            record_mi(&mut grid, mi_row, mi_col, 4, block.inter, block.skip);
-                            leaves.push(block);
-                        } else {
-                            let (x_sub, y_sub) = (sc * SUB, sr * SUB);
-                            let (mi_row0, mi_col0) = (sr * 4, sc * 4);
-                            let mut eight = Vec::with_capacity(2);
-                            for i in 0..4 {
-                                let leaf_x = x_sub + (i % 2) * 8;
-                                let leaf_y = y_sub + (i / 2) * 8;
-                                if leaf_x >= luma.true_width || leaf_y >= luma.true_height {
-                                    continue;
-                                }
-                                let (mi_row, mi_col) =
-                                    (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
+                            if has_cols16 && has_rows16 {
+                                let (x, y) = (sc * SUB, sr * SUB);
+                                let (mi_row, mi_col) = (sr * 4, sc * 4);
                                 let stack = find_mv_stack(
-                                    &grid, mi_row, mi_col, 2, 2, LAST_FRAME, mi_cols, mi_rows,
+                                    &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
                                 );
                                 let cstacks = leaf_compound_stacks(
-                                    &grid, mi_row, mi_col, 2, 2, mi_cols, mi_rows,
-                                    header.reference_select, golden, altref,
+                                    &grid,
+                                    mi_row,
+                                    mi_col,
+                                    4,
+                                    4,
+                                    mi_cols,
+                                    mi_rows,
+                                    header.reference_select,
+                                    golden,
+                                    altref,
                                 );
-                                let (leaf, _) = code_square_inter(
+                                let (block, _) = code_square_inter(
                                     &mut luma,
                                     &mut chroma,
-                                    (leaf_x, leaf_y),
-                                    8,
+                                    (x, y),
+                                    SUB,
                                     &search,
                                     &mode_bits_table,
                                     reference,
@@ -13915,149 +14896,209 @@ pub(crate) fn encode_inter_frame(
                                     &obmc_refs,
                                     fctx,
                                 );
-                                // Same publication point as the 16x16
-                                // straddling leaf above (`record_mi`).
-                                record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter, leaf.skip);
-                                eight.push(leaf);
+                                // One publication point for every coded leaf
+                                // (`record_mi`): this site used to spell the vote
+                                // out with `ref_frame` pinned to LAST and `mv1`
+                                // to (0,0), which is the encoder-grid-drift class
+                                // -- correct only for as long as a leaf can never
+                                // be compound.
+                                record_mi(&mut grid, mi_row, mi_col, 4, block.inter, block.skip);
+                                leaves.push(block);
+                            } else {
+                                let (x_sub, y_sub) = (sc * SUB, sr * SUB);
+                                let (mi_row0, mi_col0) = (sr * 4, sc * 4);
+                                let mut eight = Vec::with_capacity(2);
+                                for i in 0..4 {
+                                    let leaf_x = x_sub + (i % 2) * 8;
+                                    let leaf_y = y_sub + (i / 2) * 8;
+                                    if leaf_x >= luma.true_width || leaf_y >= luma.true_height {
+                                        continue;
+                                    }
+                                    let (mi_row, mi_col) =
+                                        (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
+                                    let stack = find_mv_stack(
+                                        &grid, mi_row, mi_col, 2, 2, LAST_FRAME, mi_cols, mi_rows,
+                                    );
+                                    let cstacks = leaf_compound_stacks(
+                                        &grid,
+                                        mi_row,
+                                        mi_col,
+                                        2,
+                                        2,
+                                        mi_cols,
+                                        mi_rows,
+                                        header.reference_select,
+                                        golden,
+                                        altref,
+                                    );
+                                    let (leaf, _) = code_square_inter(
+                                        &mut luma,
+                                        &mut chroma,
+                                        (leaf_x, leaf_y),
+                                        8,
+                                        &search,
+                                        &mode_bits_table,
+                                        reference,
+                                        &stack,
+                                        &cstacks,
+                                        &grid,
+                                        (mi_row, mi_col),
+                                        (mi_rows, mi_cols),
+                                        &obmc_refs,
+                                        fctx,
+                                    );
+                                    // Same publication point as the 16x16
+                                    // straddling leaf above (`record_mi`).
+                                    record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter, leaf.skip);
+                                    eight.push(leaf);
+                                }
+                                leaves.push(BlockCoeffs {
+                                    eight: Some(eight),
+                                    ..BlockCoeffs::default()
+                                });
                             }
-                            leaves.push(BlockCoeffs {
-                                eight: Some(eight),
-                                ..BlockCoeffs::default()
-                            });
                         }
+                        blocks.push((r32 * cols + c32, Quadrant::Split(leaves)));
                     }
-                    blocks.push((r32 * cols + c32, Quadrant::Split(leaves)));
+                }
+                // The 64x64 root against what its four quadrants really cost.
+                if let Some((cost64, block, after)) = sb64
+                    && (early64
+                        || cost64
+                            < sb_cost
+                                + sb_search.lambda * crate::tile::partition_bits(SUPERBLOCK, true))
+                {
+                    B64_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if block.inter.is_some_and(|i| i.ref1.is_some()) {
+                        B64_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if !whole_inside {
+                        B64_EDGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    blocks.truncate(mark);
+                    restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
+                    // Overwrites every 16x16 mi cell the quadrant searches
+                    // published under this superblock, so the next block's stack
+                    // is built off the block that was really coded.
+                    record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter, block.skip);
+                    blocks.push(((sb_r * 2) * cols + sb_c * 2, Quadrant::Whole64(block)));
+                    for q in 1..4 {
+                        let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
+                        blocks.push((r32 * cols + c32, Quadrant::Covered));
+                    }
+                    root_cost += cost64;
+                } else {
+                    root_cost += sb_cost;
                 }
             }
-            // The 64x64 root against what its four quadrants really cost.
-            if let Some((cost64, block, after)) = sb64
-                && (early64
-                    || cost64
-                        < sb_cost
-                            + sb_search.lambda * crate::tile::partition_bits(SUPERBLOCK, true))
-            {
-                B64_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if block.inter.is_some_and(|i| i.ref1.is_some()) {
-                    B64_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                if !whole_inside {
-                    B64_EDGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                blocks.truncate(mark);
-                restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
-                // Overwrites every 16x16 mi cell the quadrant searches
-                // published under this superblock, so the next block's stack
-                // is built off the block that was really coded.
-                record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter, block.skip);
-                blocks.push(((sb_r * 2) * cols + sb_c * 2, Quadrant::Whole64(block)));
-                for q in 1..4 {
-                    let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
-                    blocks.push((r32 * cols + c32, Quadrant::Covered));
-                }
-                root_cost += cost64;
-            } else {
-                root_cost += sb_cost;
+            // lane-b128: the whole 128x128 root (`PARTITION_NONE` at the root's
+            // `partition_w128` symbol) against what its four superblocks really
+            // cost, the same weighing the 64 root does one size down. Both sides
+            // carry their own partition symbol, so the comparison is complete.
+            // The root candidates, each tagged with the PARTITION symbol its
+            // writer codes: 0 NONE, 1 HORZ, 2 VERT (lane-b128hv), 4..=7 the AB
+            // shapes (lane-ab128).
+            let mut cands: Vec<(f64, f64, usize, Vec<BlockCoeffs>, _)> = Vec::new();
+            if let Some((c, l, b, a)) = root128 {
+                cands.push((c, l, 0, vec![b], a));
             }
-        }
-        // lane-b128: the whole 128x128 root (`PARTITION_NONE` at the root's
-        // `partition_w128` symbol) against what its four superblocks really
-        // cost, the same weighing the 64 root does one size down. Both sides
-        // carry their own partition symbol, so the comparison is complete.
-        // The root candidates, each tagged with the PARTITION symbol its
-        // writer codes: 0 NONE, 1 HORZ, 2 VERT (lane-b128hv), 4..=7 the AB
-        // shapes (lane-ab128).
-        let mut cands: Vec<(f64, f64, usize, Vec<BlockCoeffs>, _)> = Vec::new();
-        if let Some((c, l, b, a)) = root128 {
-            cands.push((c, l, 0, vec![b], a));
-        }
-        if let Some((horz, (c, l, halves, a))) = root_rect {
-            cands.push((c, l, usize::from(!horz) + 1, halves.to_vec(), a));
-        }
-        if let Some((symbol, (c, l, pieces, a))) = root_ab {
-            cands.push((c, l, symbol, pieces.to_vec(), a));
-        }
-        // The witness knobs drop every other arm outright: on synthetic
-        // content the whole block always wins its own comparison.
-        if forced_rect != 0 {
-            cands.retain(|c| c.2 == 1 || c.2 == 2);
-        }
-        if forced_ab != 0 {
-            cands.retain(|c| c.2 == usize::from(forced_ab));
-        }
-        cands.sort_by(|a, b| a.0.total_cmp(&b.0));
-        // lane-rectdq class sweep: under a 128 superblock grid the FOUR-
-        // superblock arm codes the delta_q group too -- the Whole64 writer
-        // (tile.rs `sb_coeff_inter_frame_tile_cdfs`, the `write_delta_q` call
-        // with `!sb128_armed()`) and every smaller shape below it pass
-        // `is_whole_sb = false` under a 128 grid, so the arm's first
-        // (root-origin) superblock codes the group even when skipped. Only the skipped 128
-        // NONE root escapes it, so the split side is charged here at the same
-        // root lambda the candidates are priced with.
-        let split_dq =
-            delta_q_bits_at_root(sb_q.as_ref(), sb_cols, base_q_idx, dq_res, (root_r, root_c));
-        if let Some((cost128, lambda128, shape, halves, after)) = cands.into_iter().next()
-            && (cost128
+            if let Some((horz, (c, l, halves, a))) = root_rect {
+                cands.push((c, l, usize::from(!horz) + 1, halves.to_vec(), a));
+            }
+            if let Some((symbol, (c, l, pieces, a))) = root_ab {
+                cands.push((c, l, symbol, pieces.to_vec(), a));
+            }
+            // The witness knobs drop every other arm outright: on synthetic
+            // content the whole block always wins its own comparison.
+            if forced_rect != 0 {
+                cands.retain(|c| c.2 == 1 || c.2 == 2);
+            }
+            if forced_ab != 0 {
+                cands.retain(|c| c.2 == usize::from(forced_ab));
+            }
+            cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+            // lane-rectdq class sweep: under a 128 superblock grid the FOUR-
+            // superblock arm codes the delta_q group too -- the Whole64 writer
+            // (tile.rs `sb_coeff_inter_frame_tile_cdfs`, the `write_delta_q` call
+            // with `!sb128_armed()`) and every smaller shape below it pass
+            // `is_whole_sb = false` under a 128 grid, so the arm's first
+            // (root-origin) superblock codes the group even when skipped. Only the skipped 128
+            // NONE root escapes it, so the split side is charged here at the same
+            // root lambda the candidates are priced with.
+            let split_dq =
+                delta_q_bits_at_root(sb_q.as_ref(), sb_cols, base_q_idx, dq_res, (root_r, root_c));
+            if let Some((cost128, lambda128, shape, halves, after)) = cands.into_iter().next()
+                && (cost128
                 < root_cost + lambda128 * (crate::tile::partition_bits(128, true) + split_dq)
                 // The witness knobs take the root whatever it costs, so the
                 // forced block really reaches the writer.
                 || FORCE_B128_ROOT.load(std::sync::atomic::Ordering::Relaxed)
                 || forced_rect != 0
                 || forced_ab != 0)
-        {
-            let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
-            blocks.truncate(mark128);
-            restore(&mut luma, &mut chroma, (x128, y128), SUPERBLOCK * 2, &after);
-            let at = (root_r * 2) * cols + root_c * 2;
-            match shape {
-                0 => {
-                    B128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let block = halves.into_iter().next().expect("the NONE arm's block");
-                    record_mi(&mut grid, root_r * 16, root_c * 16, 32, block.inter, block.skip);
-                    blocks.push((at, Quadrant::Whole128(block)));
-                }
-                // lane-ab128: three pieces, published at their own footprints
-                // in the writer's own order ([`ab128_pieces`]).
-                symbol @ 4..=7 => {
-                    B128_AB_HITS[symbol - 4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    for (((mr, mc), (w, h)), piece) in
-                        ab128_pieces(symbol, (root_r * 16, root_c * 16)).iter().zip(&halves)
-                    {
-                        record_mi_rect(
+            {
+                let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
+                blocks.truncate(mark128);
+                restore(&mut luma, &mut chroma, (x128, y128), SUPERBLOCK * 2, &after);
+                let at = (root_r * 2) * cols + root_c * 2;
+                match shape {
+                    0 => {
+                        B128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let block = halves.into_iter().next().expect("the NONE arm's block");
+                        record_mi(
                             &mut grid,
-                            *mr,
-                            *mc,
-                            (w / 4, h / 4),
-                            piece.inter,
-                            piece.skip,
+                            root_r * 16,
+                            root_c * 16,
+                            32,
+                            block.inter,
+                            block.skip,
                         );
+                        blocks.push((at, Quadrant::Whole128(block)));
                     }
-                    blocks.push((at, Quadrant::Ab128(symbol as u8, halves)));
-                }
-                symbol => {
-                    let horz = symbol == 1;
-                    if horz {
-                        B128_HORZ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        B128_VERT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // lane-ab128: three pieces, published at their own footprints
+                    // in the writer's own order ([`ab128_pieces`]).
+                    symbol @ 4..=7 => {
+                        B128_AB_HITS[symbol - 4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        for (((mr, mc), (w, h)), piece) in
+                            ab128_pieces(symbol, (root_r * 16, root_c * 16))
+                                .iter()
+                                .zip(&halves)
+                        {
+                            record_mi_rect(
+                                &mut grid,
+                                *mr,
+                                *mc,
+                                (w / 4, h / 4),
+                                piece.inter,
+                                piece.skip,
+                            );
+                        }
+                        blocks.push((at, Quadrant::Ab128(symbol as u8, halves)));
                     }
-                    let (w_mi, h_mi) = if horz { (32usize, 16usize) } else { (16, 32) };
-                    for (i, half) in halves.iter().enumerate() {
-                        let (mr, mc) = if horz {
-                            (root_r * 16 + i * 16, root_c * 16)
+                    symbol => {
+                        let horz = symbol == 1;
+                        if horz {
+                            B128_HORZ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         } else {
-                            (root_r * 16, root_c * 16 + i * 16)
-                        };
-                        record_mi_rect(&mut grid, mr, mc, (w_mi, h_mi), half.inter, half.skip);
+                            B128_VERT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let (w_mi, h_mi) = if horz { (32usize, 16usize) } else { (16, 32) };
+                        for (i, half) in halves.iter().enumerate() {
+                            let (mr, mc) = if horz {
+                                (root_r * 16 + i * 16, root_c * 16)
+                            } else {
+                                (root_r * 16, root_c * 16 + i * 16)
+                            };
+                            record_mi_rect(&mut grid, mr, mc, (w_mi, h_mi), half.inter, half.skip);
+                        }
+                        blocks.push((at, Quadrant::Rect128(horz, halves)));
                     }
-                    blocks.push((at, Quadrant::Rect128(horz, halves)));
                 }
-            }
-            for q in 1..16 {
-                let (r32, c32) = (root_r * 2 + q / 4, root_c * 2 + q % 4);
-                blocks.push((r32 * cols + c32, Quadrant::Covered));
+                for q in 1..16 {
+                    let (r32, c32) = (root_r * 2 + q / 4, root_c * 2 + q % 4);
+                    blocks.push((r32 * cols + c32, Quadrant::Covered));
+                }
             }
         }
-    }
         let (x0, y0) = (rect.mi_col0 as usize * 4, rect.mi_row0 as usize * 4);
         let (x1, y1) = (rect.mi_col1 as usize * 4, rect.mi_row1 as usize * 4);
         copy_rect(luma_out, &luma.reconstruction, frame_width, x0, y0, x1, y1);
@@ -14105,9 +15146,9 @@ pub(crate) fn encode_inter_frame(
         // arm at the 128 root).
         let compound = blocks
             .iter()
-            .filter(|q| {
-                matches!(q, Quadrant::Whole128(b) if b.inter.is_some_and(|i| i.ref1.is_some()))
-            })
+            .filter(
+                |q| matches!(q, Quadrant::Whole128(b) if b.inter.is_some_and(|i| i.ref1.is_some())),
+            )
             .count();
         // lane-b128hv: and how many roots took a rect cut instead, per shape
         // -- the HORZ/VERT fire count the gate rows are read against.
@@ -14487,7 +15528,8 @@ pub struct EncodedSequence {
 pub(crate) fn encode_sequence_with_ctx(
     pictures: &[Picture],
     base_q_idx: u8,
-    deadzone: f64, fctx: &crate::decode::FrameCtx,
+    deadzone: f64,
+    fctx: &crate::decode::FrameCtx,
 ) -> Result<EncodedSequence> {
     let Some((first, rest)) = pictures.split_first() else {
         return Err(Error::unsupported(
@@ -14545,7 +15587,8 @@ pub(crate) fn encode_sequence_with_ctx(
         &KEY_FRAME_MODES,
         split_blocks(),
         render,
-        unspecified_color_config(), fctx,
+        unspecified_color_config(),
+        fctx,
     )?;
     let mut stream = key.stream.clone();
     // Slot 1 keeps the key frame's own reconstruction for the whole GOP (the
@@ -14621,7 +15664,10 @@ mod tests {
             for key in [true, false] {
                 for side in [8usize, 16, 32, 64] {
                     let base = super::split_census_base(site, key, side);
-                    assert!(base + 10 <= super::SPLIT_CENSUS.len(), "{site} {key} {side}");
+                    assert!(
+                        base + 10 <= super::SPLIT_CENSUS.len(),
+                        "{site} {key} {side}"
+                    );
                     assert!(seen.insert(base), "{site} {key} {side} collides");
                 }
             }
@@ -14659,8 +15705,8 @@ mod tests {
             // set holds is the one that wins at least once.
             for target in 0..n.max(1) {
                 let mv = stack.entries.get(target).map_or(stack.pred_mv, |e| e.mv);
-                let (_, idx) = best_new_mv_syntax(&stack, mv)
-                    .expect("a zero residual is always codable");
+                let (_, idx) =
+                    best_new_mv_syntax(&stack, mv).expect("a zero residual is always codable");
                 let idx = usize::from(idx);
                 assert_eq!(
                     crate::tile::signalled_drl_idx(n, 0, idx),
@@ -14713,8 +15759,8 @@ mod tests {
         use crate::cdf::{COMP_BWDREF, COMP_MODE, COMP_REF, COMP_REF_TYPE, UNI_COMP_REF};
         use crate::encode::symbol_bits as b;
         use crate::mvstack::{
-            ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
-            LAST_FRAME, NeighbourRef, comp_reference_type_ctx, reference_mode_ctx,
+            ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME,
+            LAST3_FRAME, NeighbourRef, comp_reference_type_ctx, reference_mode_ctx,
             single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
             single_ref_p5_ctx, single_ref_p6_ctx, uni_comp_ref_p1_ctx,
         };
@@ -14723,7 +15769,11 @@ mod tests {
         // selector: 1..=6 are `single_ref_p*_ctx`, 7 is `uni_comp_ref_p1_ctx`.
         type Sym = (char, usize, usize, usize);
         let cases: [((i8, i8), bool, &[Sym]); 7] = [
-            ((LAST_FRAME, LAST2_FRAME), true, &[('u', 0, 1, 0), ('u', 1, 7, 0)]),
+            (
+                (LAST_FRAME, LAST2_FRAME),
+                true,
+                &[('u', 0, 1, 0), ('u', 1, 7, 0)],
+            ),
             (
                 (LAST_FRAME, LAST3_FRAME),
                 true,
@@ -14743,12 +15793,22 @@ mod tests {
             (
                 (LAST_FRAME, BWDREF_FRAME),
                 false,
-                &[('c', 0, 3, 0), ('c', 1, 4, 0), ('b', 0, 2, 0), ('b', 1, 6, 0)],
+                &[
+                    ('c', 0, 3, 0),
+                    ('c', 1, 4, 0),
+                    ('b', 0, 2, 0),
+                    ('b', 1, 6, 0),
+                ],
             ),
             (
                 (LAST_FRAME, ALTREF2_FRAME),
                 false,
-                &[('c', 0, 3, 0), ('c', 1, 4, 0), ('b', 0, 2, 0), ('b', 1, 6, 1)],
+                &[
+                    ('c', 0, 3, 0),
+                    ('c', 1, 4, 0),
+                    ('b', 0, 2, 0),
+                    ('b', 1, 6, 1),
+                ],
             ),
         ];
         let nbr = |ref0, ref1: Option<i8>| {
@@ -14824,7 +15884,11 @@ mod tests {
         use crate::mvstack::NeighbourRef;
         let nbr = |is_inter| NeighbourRef {
             is_inter,
-            ref0: if is_inter { crate::mvstack::LAST_FRAME } else { 0 },
+            ref0: if is_inter {
+                crate::mvstack::LAST_FRAME
+            } else {
+                0
+            },
             ref1: None,
             uni: false,
         };
@@ -14881,8 +15945,8 @@ mod tests {
         use crate::cdf::SINGLE_REF as SR;
         use crate::encode::symbol_bits as b;
         use crate::mvstack::{
-            ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
-            LAST_FRAME, MvStack, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx,
+            ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME,
+            LAST3_FRAME, MvStack, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx,
             single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
         };
         let stack_with = |above_refs, left_refs, above_nbr, left_nbr| MvStack {
@@ -14893,7 +15957,12 @@ mod tests {
             ..bare_stack()
         };
         let nbr = |ref0, ref1| {
-            Some(crate::mvstack::NeighbourRef { is_inter: true, ref0, ref1, uni: false })
+            Some(crate::mvstack::NeighbourRef {
+                is_inter: true,
+                ref0,
+                ref1,
+                uni: false,
+            })
         };
         // (reference, the symbols `write_single_ref` emits as (p index, value))
         let cases: [(i8, &[(usize, usize)]); 7] = [
@@ -14935,9 +16004,8 @@ mod tests {
                 let mut want: f64 = symbols.iter().map(|&(p, v)| b(&SR[ctx_of(p)][p], v)).sum();
                 if super::reference_select() {
                     want += b(
-                        &crate::cdf::COMP_MODE[crate::mvstack::reference_mode_ctx(
-                            above_nbr, left_nbr,
-                        )],
+                        &crate::cdf::COMP_MODE
+                            [crate::mvstack::reference_mode_ctx(above_nbr, left_nbr)],
                         0,
                     );
                 }
@@ -14972,13 +16040,25 @@ mod tests {
         let mut reconstruction = vec![10u8; 64 * 64];
         // Off by 190 at (50, 50) -- past the true edge in both axes.
         reconstruction[50 * 64 + 50] = 200;
-        assert_eq!(plane.block_sse(0, 0, 64, &reconstruction), 0.0, "padding was scored");
+        assert_eq!(
+            plane.block_sse(0, 0, 64, &reconstruction),
+            0.0,
+            "padding was scored"
+        );
         // Off by 10 at (39, 39) -- the last sample the decoder shows.
         reconstruction[39 * 64 + 39] = 20;
-        assert_eq!(plane.block_sse(0, 0, 64, &reconstruction), 100.0, "inside was not scored");
+        assert_eq!(
+            plane.block_sse(0, 0, 64, &reconstruction),
+            100.0,
+            "inside was not scored"
+        );
         // A 16x16 block whose every sample is padding.
         let block = vec![200u8; 16 * 16];
-        assert_eq!(plane.block_sse(48, 0, 16, &block), 0.0, "a block past the edge scored");
+        assert_eq!(
+            plane.block_sse(48, 0, 16, &block),
+            0.0,
+            "a block past the edge scored"
+        );
         // A 16x16 block the edge cuts: 8 of its columns are inside.
         assert_eq!(plane.block_sse(32, 32, 16, &block), (190.0 * 190.0) * 64.0);
     }
@@ -14993,26 +16073,57 @@ mod tests {
         // A superblock the window leans on more than the frame average is
         // coded FINER (lower qindex); a slack one coarser; the average one
         // exactly at the base.
-        assert!(super::deltaq_libaom(base, 8.0, rf, 1.0, res) < base, "leaned-on SB must go finer");
-        assert!(super::deltaq_libaom(base, 0.2, rf, 1.0, res) > base, "idle SB must go coarser");
-        assert_eq!(super::deltaq_libaom(base, rf, rf, 1.0, res), base, "the average SB moves 0");
+        assert!(
+            super::deltaq_libaom(base, 8.0, rf, 1.0, res) < base,
+            "leaned-on SB must go finer"
+        );
+        assert!(
+            super::deltaq_libaom(base, 0.2, rf, 1.0, res) > base,
+            "idle SB must go coarser"
+        );
+        assert_eq!(
+            super::deltaq_libaom(base, rf, rf, 1.0, res),
+            base,
+            "the average SB moves 0"
+        );
         // Every offset is a whole number of steps and inside +-(res * 9 - 1).
         let max = ((res * 9 - 1) / res) * res;
         for r in [0.0f64, 0.01, 0.5, 1.0, 3.0, 50.0, 1e6] {
             for k in [0.5f64, 1.0, 1.5] {
                 let q = i32::from(super::deltaq_libaom(base, r, rf, k, res));
                 let d = q - i32::from(base);
-                assert_eq!(d % res, 0, "r={r} k={k}: offset {d} is not a whole {res}-step");
-                assert!(d.abs() <= max, "r={r} k={k}: offset {d} past libaom's +-{max}");
+                assert_eq!(
+                    d % res,
+                    0,
+                    "r={r} k={k}: offset {d} is not a whole {res}-step"
+                );
+                assert!(
+                    d.abs() <= max,
+                    "r={r} k={k}: offset {d} past libaom's +-{max}"
+                );
             }
         }
         // The clamp is REACHED from both ends, so the bound is a real bound
         // and not a formula that never gets there.
-        assert_eq!(i32::from(super::deltaq_libaom(base, 1e9, rf, 1.0, res)) - i32::from(base), -max);
-        assert_eq!(i32::from(super::deltaq_libaom(base, 0.0, 1e9, 1.0, res)) - i32::from(base), max);
+        assert_eq!(
+            i32::from(super::deltaq_libaom(base, 1e9, rf, 1.0, res)) - i32::from(base),
+            -max
+        );
+        assert_eq!(
+            i32::from(super::deltaq_libaom(base, 0.0, 1e9, 1.0, res)) - i32::from(base),
+            max
+        );
         // A stronger `k` never moves less than a weaker one.
-        let d = |k: f64| (i32::from(super::deltaq_libaom(base, 8.0, rf, k, res)) - i32::from(base)).abs();
-        assert!(d(0.5) <= d(1.0) && d(1.0) <= d(1.5), "strength must be monotone: {} {} {}", d(0.5), d(1.0), d(1.5));
+        let d = |k: f64| {
+            (i32::from(super::deltaq_libaom(base, 8.0, rf, k, res)) - i32::from(base)).abs()
+        };
+        assert!(
+            d(0.5) <= d(1.0) && d(1.0) <= d(1.5),
+            "strength must be monotone: {} {} {}",
+            d(0.5),
+            d(1.0),
+            d(1.5)
+        );
         // The frame reference is libaom's log-mean: flat in, the same value out.
         assert!((super::tpl_frame_ratio(&[2.5; 16]) - 2.5).abs() < 1e-9);
     }
@@ -15045,13 +16156,22 @@ mod tests {
         let (f, _) = super::tpl_lambda_factors(&frames, w, h, 1.0);
         assert_eq!(f.len(), 64, "16x4 cells of 16x16");
         for (i, &v) in f.iter().enumerate() {
-            assert!((v - 1.0).abs() < 1e-6, "cell {i} factor {v}, a flat map must move no lambda");
+            assert!(
+                (v - 1.0).abs() < 1e-6,
+                "cell {i} factor {v}, a flat map must move no lambda"
+            );
         }
 
         // Left half textured, right half constant: the window saves bits
         // predicting the left half and nothing at all on the right.
         let split: Vec<u8> = (0..w * h)
-            .map(|i| if i % w < w / 2 { ((i * 37) % 251) as u8 } else { 128 })
+            .map(|i| {
+                if i % w < w / 2 {
+                    ((i * 37) % 251) as u8
+                } else {
+                    128
+                }
+            })
             .collect();
         let frames: Vec<&[u8]> = vec![&split, &split, &split];
         let cells_x = w / 16;
@@ -15059,8 +16179,14 @@ mod tests {
             let (f, _) = super::tpl_lambda_factors(&frames, w, h, k);
             for r in 0..h / 16 {
                 let (lean, idle) = (f[r * cells_x], f[r * cells_x + cells_x - 1]);
-                assert!(lean < 1.0, "k={k} row {r}: leaned-on cell factor {lean} must be < 1");
-                assert!(idle > 1.0, "k={k} row {r}: idle cell factor {idle} must be > 1");
+                assert!(
+                    lean < 1.0,
+                    "k={k} row {r}: leaned-on cell factor {lean} must be < 1"
+                );
+                assert!(
+                    idle > 1.0,
+                    "k={k} row {r}: idle cell factor {idle} must be > 1"
+                );
             }
         }
     }
@@ -15076,13 +16202,23 @@ mod tests {
     /// availability -- wrong pixels, no error).
     #[test]
     fn rect_reach_tables_are_indexed_with_a_32_mi_row_stride() {
-        for (bw, bh) in [(16usize, 8usize), (8, 16), (32, 16), (16, 32), (64, 32), (32, 64)] {
-            let (bw_log2, bh_log2) =
-                ((bw / 4).trailing_zeros() as usize, (bh / 4).trailing_zeros() as usize);
+        for (bw, bh) in [
+            (16usize, 8usize),
+            (8, 16),
+            (32, 16),
+            (16, 32),
+            (64, 32),
+            (32, 64),
+        ] {
+            let (bw_log2, bh_log2) = (
+                (bw / 4).trailing_zeros() as usize,
+                (bh / 4).trailing_zeros() as usize,
+            );
             let (rows, cols) = (32 >> bh_log2, 32 >> bw_log2);
-            for (name, table) in
-                [("has_tr", rect_reach_tables(bw, bh).0), ("has_bl", rect_reach_tables(bw, bh).1)]
-            {
+            for (name, table) in [
+                ("has_tr", rect_reach_tables(bw, bh).0),
+                ("has_bl", rect_reach_tables(bw, bh).1),
+            ] {
                 assert_eq!(
                     table.len() * 8,
                     rows * cols,
@@ -15141,20 +16277,20 @@ mod tests {
         let fctx = &crate::decode::FrameCtx::new();
         // (bw, bh, has_tr len, has_tr byte sum, has_bl len, has_bl byte sum).
         const SHAPES: [(usize, usize, usize, u32, usize, u32); 14] = [
-        (4, 8, 64, 9280, 64, 550),
-        (8, 4, 64, 3712, 64, 9630),
-        (8, 16, 16, 2352, 16, 134),
-        (16, 8, 16, 960, 16, 2400),
-        (16, 32, 4, 620, 4, 32),
-        (32, 16, 4, 32, 4, 184),
-        (32, 64, 1, 127, 1, 0),
-        (64, 32, 1, 19, 1, 34),
-        (4, 16, 32, 5472, 32, 14),
-        (16, 4, 32, 960, 32, 6464),
-        (8, 32, 8, 1400, 8, 2),
-        (32, 8, 8, 32, 8, 1136),
-        (16, 64, 2, 382, 2, 0),
-        (64, 16, 2, 4, 2, 84),
+            (4, 8, 64, 9280, 64, 550),
+            (8, 4, 64, 3712, 64, 9630),
+            (8, 16, 16, 2352, 16, 134),
+            (16, 8, 16, 960, 16, 2400),
+            (16, 32, 4, 620, 4, 32),
+            (32, 16, 4, 32, 4, 184),
+            (32, 64, 1, 127, 1, 0),
+            (64, 32, 1, 19, 1, 34),
+            (4, 16, 32, 5472, 32, 14),
+            (16, 4, 32, 960, 32, 6464),
+            (8, 32, 8, 1400, 8, 2),
+            (32, 8, 8, 32, 8, 1136),
+            (16, 64, 2, 382, 2, 0),
+            (64, 16, 2, 4, 2, 84),
         ];
         /// libaom `reconintra.c` `has_top_right`/`has_bottom_left`, ported for
         /// a block whose transform covers it whole (`row_off == col_off == 0`,
@@ -15166,7 +16302,8 @@ mod tests {
             x: usize,
             y: usize,
             width: usize,
-            height: usize, _fctx: &crate::decode::FrameCtx,
+            height: usize,
+            _fctx: &crate::decode::FrameCtx,
         ) -> (bool, bool) {
             let (bw_log2, bh_log2) = ((bw / 4).ilog2() as usize, (bh / 4).ilog2() as usize);
             let (_bw_unit, bh_unit) = (bw / 4, bh / 4);
@@ -15289,8 +16426,14 @@ mod tests {
             width,
             height,
             y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
-            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
+            v: out.stdout[luma + chroma..]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
         }
     }
 
@@ -15448,12 +16591,18 @@ mod tests {
     #[test]
     fn ffmpeg_decodes_exactly_what_the_encoder_reconstructed() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP ffmpeg_decodes_exactly_what_the_encoder_reconstructed: no ffmpeg");
             return;
         }
-        for &(width, height) in &[(64usize, 64usize), (96, 64), (160, 96), (32, 48), (248, 152)] {
+        for &(width, height) in &[
+            (64usize, 64usize),
+            (96, 64),
+            (160, 96),
+            (32, 48),
+            (248, 152),
+        ] {
             let picture = test_card(width, height);
             let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
@@ -15547,7 +16696,10 @@ mod tests {
         // exactness assert below passes on a stream that codes
         // `palette_uv_mode == 0` everywhere.
         let uv_hits = crate::tile::take_palette_uv_hits();
-        assert!(uv_hits[0] > 0, "no block took a chroma palette: {uv_hits:?}");
+        assert!(
+            uv_hits[0] > 0,
+            "no block took a chroma palette: {uv_hits:?}"
+        );
         let uv_cached = crate::tile::take_palette_uv_cache_hits();
         eprintln!(
             "chroma palette blocks {} sizes {:?}, {uv_cached} colours from the neighbour cache",
@@ -15614,13 +16766,25 @@ mod tests {
             "no inter frame set allow_screen_content_tools"
         );
         let gop_decoded = crate::stream::decode_stream(&gop.stream).unwrap();
+        assert_eq!(
+            gop_decoded.len(),
+            gop.frames.len(),
+            "our decoder: GOP frame count"
+        );
         for (i, (ours, frame)) in gop_decoded.iter().zip(gop.frames.iter()).enumerate() {
-            assert_eq!(ours.y, frame.reconstruction.y, "our decoder: GOP frame {i} luma");
+            assert_eq!(
+                ours.y, frame.reconstruction.y,
+                "our decoder: GOP frame {i} luma"
+            );
         }
         if have_ffmpeg() {
             let ff = ffmpeg_decode_sequence(&gop.stream, width, height, moved.len());
+            assert_eq!(ff.len(), gop.frames.len(), "ffmpeg: GOP frame count");
             for (i, (theirs, frame)) in ff.iter().zip(gop.frames.iter()).enumerate() {
-                assert_eq!(theirs.y, frame.reconstruction.y, "ffmpeg: GOP frame {i} luma");
+                assert_eq!(
+                    theirs.y, frame.reconstruction.y,
+                    "ffmpeg: GOP frame {i} luma"
+                );
                 assert_eq!(theirs.u, frame.reconstruction.u, "ffmpeg: GOP frame {i} U");
                 assert_eq!(theirs.v, frame.reconstruction.v, "ffmpeg: GOP frame {i} V");
             }
@@ -15629,7 +16793,10 @@ mod tests {
         // The other half of the keep rule: film-shaped content leaves the
         // detector (and so the whole sequence header) alone.
         let film = encode_key_frame_with_ctx(&test_card(width, height), 100, 0.5, fctx).unwrap();
-        assert!(!film.screen, "the detector fired on the film-shaped test card");
+        assert!(
+            !film.screen,
+            "the detector fired on the film-shaped test card"
+        );
     }
 
     /// The lane's keep-rule measurement: the gate's own screen capture, one
@@ -15642,9 +16809,9 @@ mod tests {
     fn probe_intrabc_key_frame() {
         let _knobs = crate::speed::knob_write();
         let fctx = &crate::decode::FrameCtx::for_encoder();
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures");
-        let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) else {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"))
+        else {
             eprintln!("SKIP probe_intrabc_key_frame: no real-library manifest");
             return;
         };
@@ -15652,7 +16819,9 @@ mod tests {
             .lines()
             .skip(1)
             .filter_map(|l| l.split('\t').next())
-            .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+            .find(|p| {
+                p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists()
+            })
         else {
             eprintln!("SKIP probe_intrabc_key_frame: no OBS recording");
             return;
@@ -15675,7 +16844,9 @@ mod tests {
                     psnr_all(&encoded.reconstruction, &picture),
                     hits[0],
                     &hits[1..],
-                    search[0], search[1], search[2],
+                    search[0],
+                    search[1],
+                    search[2],
                 );
             }
         }
@@ -15750,7 +16921,7 @@ mod tests {
     #[test]
     fn a_nearestmv_block_with_one_nonzero_coefficient_decodes_clean() {
         let _knobs = crate::speed::knob_write();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_nearestmv_block_with_one_nonzero_coefficient_decodes_clean: no ffmpeg"
@@ -15817,9 +16988,13 @@ mod tests {
         // too or the decoder reads a `motion_mode` symbol nobody wrote.
         crate::tile::arm_motion_mode(inter_header.is_motion_mode_switchable);
         crate::tile::arm_warped_motion(inter_header.allow_warped_motion);
-        let tile =
-            crate::tile::sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
-                .unwrap();
+        let tile = crate::tile::sb_coeff_inter_frame_tile(
+            inter_header.mi_cols,
+            inter_header.mi_rows,
+            100,
+            &blocks,
+        )
+        .unwrap();
 
         // `key.stream` is already a temporal delimiter, the sequence header
         // and the key frame's own OBU (`encode_key_frame` built it from the
@@ -15888,9 +17063,13 @@ mod tests {
         let _knobs = crate::speed::knob_write();
         let fctx = &crate::decode::FrameCtx::for_encoder();
         crate::decode::set_verify_final_replay(true);
-        for &(width, height) in
-            &[(64usize, 56usize), (216, 96), (192, 120), (640, 352), (1280, 720)]
-        {
+        for &(width, height) in &[
+            (64usize, 56usize),
+            (216, 96),
+            (192, 120),
+            (640, 352),
+            (1280, 720),
+        ] {
             eprintln!("--- {width}x{height}");
             let picture = test_card(width, height);
             let _ = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
@@ -15915,7 +17094,7 @@ mod tests {
     #[test]
     fn a_frame_round_trips_at_its_own_size() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP a_frame_round_trips_at_its_own_size: no ffmpeg");
             return;
@@ -15982,7 +17161,7 @@ mod tests {
     #[test]
     fn an_854x480_picture_round_trips_through_its_padding() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             return;
         }
@@ -16013,7 +17192,7 @@ mod tests {
     ///    (`has_tr_vert_8x8` bit 16 = 0, ordinary `has_tr_8x8` bit 16 = 1).
     #[test]
     fn of_tu_follows_the_block_row_including_under_vert_ab() {
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         // The 8x8 square at superblock row 1, column 0, and the TX4 unit in
         // its top-right corner (`col_off = 4`, `row_off = 0`): that unit's
         // above-right answer is the BLOCK's, which is the whole reason a unit
@@ -16082,7 +17261,13 @@ mod tests {
             (table[index / 8] >> (index % 8)) & 1 != 0
         }
 
-        fn libaom_bottom_left(side: usize, x: usize, y: usize, height: usize, _fctx: &crate::decode::FrameCtx) -> bool {
+        fn libaom_bottom_left(
+            side: usize,
+            x: usize,
+            y: usize,
+            height: usize,
+            _fctx: &crate::decode::FrameCtx,
+        ) -> bool {
             if x == 0 || y + side >= height {
                 return false;
             }
@@ -16145,7 +17330,14 @@ mod tests {
     fn of_tu_matches_libaom_has_top_right_and_has_bottom_left_per_unit() {
         // libaom, in MI units: bw_unit/bh_unit = block size / 4,
         // *_count_unit = tx size / 4.
-        fn libaom_tr(bw: usize, bh: usize, col_off: usize, row_off: usize, tx: usize, blk: bool) -> bool {
+        fn libaom_tr(
+            bw: usize,
+            bh: usize,
+            col_off: usize,
+            row_off: usize,
+            tx: usize,
+            blk: bool,
+        ) -> bool {
             let (plane_bw_unit, count) = (bw / 4, tx / 4);
             let (col_off_u, row_off_u) = (col_off / 4, row_off / 4);
             let _ = bh;
@@ -16157,7 +17349,14 @@ mod tests {
                 blk
             }
         }
-        fn libaom_bl(bw: usize, bh: usize, col_off: usize, row_off: usize, tx: usize, blk: bool) -> bool {
+        fn libaom_bl(
+            bw: usize,
+            bh: usize,
+            col_off: usize,
+            row_off: usize,
+            tx: usize,
+            blk: bool,
+        ) -> bool {
             let (plane_bh_unit, count) = (bh / 4, tx / 4);
             let (col_off_u, row_off_u) = (col_off / 4, row_off / 4);
             let _ = bw;
@@ -16169,14 +17368,34 @@ mod tests {
                 blk
             }
         }
-        for &(bw, bh) in &[(8, 8), (16, 16), (32, 32), (64, 64), (16, 8), (8, 16), (32, 16), (16, 32), (64, 32), (32, 64)] {
+        for &(bw, bh) in &[
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (64, 64),
+            (16, 8),
+            (8, 16),
+            (32, 16),
+            (16, 32),
+            (64, 32),
+            (32, 64),
+        ] {
             for &tx in &[4usize, 8, 16, 32] {
                 if tx > bw.min(bh) {
                     continue;
                 }
                 for row_off in (0..bh).step_by(tx) {
                     for col_off in (0..bw).step_by(tx) {
-                        for &blk in &[Reach { above_right: false, below_left: false }, Reach { above_right: true, below_left: true }] {
+                        for &blk in &[
+                            Reach {
+                                above_right: false,
+                                below_left: false,
+                            },
+                            Reach {
+                                above_right: true,
+                                below_left: true,
+                            },
+                        ] {
                             let got = Reach::of_tu(bw, bh, col_off, row_off, tx, tx, blk);
                             assert_eq!(
                                 got.above_right,
@@ -16197,7 +17416,7 @@ mod tests {
 
     #[test]
     fn vert_ab_partition_flips_below_left_for_the_top_right_8x8() {
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let (width, height) = (SUPERBLOCK * 3, SUPERBLOCK * 3);
         // Interior superblock, so neither the frame edge nor the col == 0 /
         // last-row early returns answer instead of the table.
@@ -16232,7 +17451,7 @@ mod tests {
     #[test]
     fn odd_dimensions_are_refused() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         for &(width, height) in &[(1921usize, 1080usize), (1920, 1081), (63, 63)] {
             let picture = Picture::grey(width, height);
             let err = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx)
@@ -16251,7 +17470,7 @@ mod tests {
     #[test]
     fn sequence_round_trips_at_a_non_multiple_size() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP sequence_round_trips_at_a_non_multiple_size: no ffmpeg");
             return;
@@ -16295,7 +17514,7 @@ mod tests {
     #[test]
     fn a_sequence_round_trips_at_the_exactly_half_straddle_size() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP a_sequence_round_trips_at_the_exactly_half_straddle_size: no ffmpeg");
             return;
@@ -16341,10 +17560,11 @@ mod tests {
     #[test]
     fn key_frame_and_inter_frame_both_encode_at_half_straddle_size() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let (width, height) = (640usize, 360usize);
         let picture = Picture::grey(width, height);
-        encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).expect("key frame now codes the mod-32==8 straddle");
+        encode_key_frame_with_ctx(&picture, 100, 0.5, fctx)
+            .expect("key frame now codes the mod-32==8 straddle");
 
         // `encode_sequence`'s second frame is the inter path: same size, now
         // wired the same way.
@@ -16361,7 +17581,7 @@ mod tests {
     #[test]
     fn a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames: \
@@ -16387,7 +17607,7 @@ mod tests {
     #[test]
     fn a_640x360_half_straddle_sequence_round_trips_through_ffmpeg() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_640x360_half_straddle_sequence_round_trips_through_ffmpeg: no ffmpeg"
@@ -16435,8 +17655,14 @@ mod tests {
             width,
             height,
             y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
-            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
+            v: out.stdout[luma + chroma..]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
         }
     }
 
@@ -16447,7 +17673,7 @@ mod tests {
     #[ignore = "a sweep, not a gate"]
     fn probe_lambda() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let mut pictures = vec![
             ("test card".to_string(), test_card(160, 96)),
             ("stripes".to_string(), stripes(160, 96, true)),
@@ -16479,7 +17705,7 @@ mod tests {
     #[ignore = "a sweep, not a gate"]
     fn probe_ladder() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         for (name, picture) in sweep_pictures() {
             let all = ladder(&picture, &KEY_FRAME_MODES, fctx);
             let points = all
@@ -16498,7 +17724,7 @@ mod tests {
     #[ignore = "a sweep, not a gate"]
     fn probe_split() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         for (name, picture) in sweep_pictures() {
             let ladder = |split: bool| {
                 let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
@@ -16511,7 +17737,8 @@ mod tests {
                             &KEY_FRAME_MODES,
                             split,
                             (picture.width, picture.height),
-                            unspecified_color_config(), fctx,
+                            unspecified_color_config(),
+                            fctx,
                         )
                         .unwrap();
                         (
@@ -16531,7 +17758,8 @@ mod tests {
                 &KEY_FRAME_MODES,
                 true,
                 (picture.width, picture.height),
-                unspecified_color_config(), fctx,
+                unspecified_color_config(),
+                fctx,
             )
             .unwrap()
             .modes
@@ -16561,17 +17789,28 @@ mod tests {
 
     /// Where two planes first disagree, and by how much: a mismatch reported as
     /// a position says which block and which sample of it went wrong, which a
-    /// pair of thousand-sample arrays does not.
+    /// pair of thousand-sample arrays does not. A length difference counts as a
+    /// disagreement: `zip` stops at the shorter plane, so a short one would
+    /// otherwise compare exact over the prefix the two share.
     fn first_difference(ours: &[u16], theirs: &[u16], width: usize) -> Option<String> {
-        let i = ours.iter().zip(theirs).position(|(a, b)| a != b)?;
-        let differ = ours.iter().zip(theirs).filter(|(a, b)| a != b).count();
-        Some(format!(
-            "{differ} samples differ, first at ({}, {}): ours {} theirs {}",
-            i % width,
-            i / width,
-            ours[i],
-            theirs[i]
-        ))
+        if let Some(i) = ours.iter().zip(theirs).position(|(a, b)| a != b) {
+            let differ = ours.iter().zip(theirs).filter(|(a, b)| a != b).count();
+            return Some(format!(
+                "{differ} samples differ, first at ({}, {}): ours {} theirs {}",
+                i % width,
+                i / width,
+                ours[i],
+                theirs[i]
+            ));
+        }
+        if ours.len() != theirs.len() {
+            return Some(format!(
+                "no sample in the shared prefix differs, but ours is {} samples and theirs is {}",
+                ours.len(),
+                theirs.len()
+            ));
+        }
+        None
     }
 
     /// Every mode the encoder offers has to predict what the decoder predicts,
@@ -16580,7 +17819,7 @@ mod tests {
     #[test]
     fn every_mode_decodes_to_what_the_encoder_predicted() {
         let _knobs = crate::speed::knob_write();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP every_mode_decodes_to_what_the_encoder_predicted: no ffmpeg");
             return;
@@ -16596,7 +17835,9 @@ mod tests {
         for (width, height) in [(128, 96), (160, 96)] {
             let picture = test_card(width, height);
             for mode in KEY_FRAME_MODES {
-                let encoded = encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[mode], fctx).unwrap();
+                let encoded =
+                    encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[mode], fctx)
+                        .unwrap();
                 let decoded = ffmpeg_decode(&encoded.stream, width, height);
                 for (plane, ours, theirs, stride) in [
                     ("luma", &encoded.reconstruction.y, &decoded.y, width),
@@ -16624,7 +17865,7 @@ mod tests {
     #[test]
     fn the_search_picks_the_direction_the_picture_runs() {
         let _knobs = crate::speed::knob_write();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         // Same confound as [`every_mode_decodes_to_what_the_encoder_predicted`]:
         // a filter-intra block is coded `DC_PRED` whatever mode the arm
         // offers, and these stripes are SCREEN content, where the filter arm
@@ -16639,7 +17880,8 @@ mod tests {
             // tie then goes to whichever is cheaper to name, which is not what
             // this gate is about.
             let encoded =
-                encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[V_PRED, H_PRED], fctx).unwrap();
+                encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[V_PRED, H_PRED], fctx)
+                    .unwrap();
             // The first block of the picture has neither neighbour, so it
             // cannot tell the modes apart; every other one can.
             let picked = encoded.modes[1..].iter().filter(|&&m| m == want).count();
@@ -16674,8 +17916,8 @@ mod tests {
         if high <= low {
             let ref_lo_rate = reference.iter().map(|p| p.1).fold(f64::MAX, f64::min);
             let other_hi_rate = other.iter().map(|p| p.1).fold(f64::MIN, f64::max);
-            let dominates = other[0].0 > reference[reference.len() - 1].0
-                && other_hi_rate <= ref_lo_rate;
+            let dominates =
+                other[0].0 > reference[reference.len() - 1].0 && other_hi_rate <= ref_lo_rate;
             assert!(
                 dominates,
                 "the two ladders have to overlap in PSNR: {reference:?} vs {other:?}"
@@ -16714,7 +17956,8 @@ mod tests {
         let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
             .iter()
             .map(|&q| {
-                let encoded = encode_key_frame_with_modes_with_ctx(picture, q, 0.5, modes, fctx).unwrap();
+                let encoded =
+                    encode_key_frame_with_modes_with_ctx(picture, q, 0.5, modes, fctx).unwrap();
                 (
                     psnr(&encoded.reconstruction.y, picture.y.as_slice()),
                     (encoded.stream.len() as f64).log10(),
@@ -16732,7 +17975,7 @@ mod tests {
     #[test]
     fn the_search_beats_dc_alone() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         for (name, picture, want) in [
             ("test card", test_card(160, 96), -0.05),
             ("stripes", stripes(160, 96, true), -0.40),
@@ -16775,7 +18018,7 @@ mod tests {
     #[ignore = "a sweep, not a gate"]
     fn probe_directional() {
         let _knobs = crate::speed::knob_write();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         for (name, picture) in sweep_pictures() {
             let dc = ladder(&picture, &[DC_PRED], fctx);
             let flat = ladder(&picture, &NON_DIRECTIONAL, fctx);
@@ -16850,7 +18093,7 @@ mod tests {
     #[test]
     fn the_search_picks_the_diagonal_the_picture_runs() {
         let _knobs = crate::speed::knob_write();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         for (down_right, want) in [(true, D135_PRED), (false, D45_PRED)] {
             let picture = diagonal(160, 96, down_right);
             let (mode, count, blocks) = favourite_mode(&picture, fctx);
@@ -16870,7 +18113,7 @@ mod tests {
     #[test]
     fn the_diagonals_beat_the_modes_that_read_no_further() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         for (name, picture, want) in [
             ("down-right", diagonal(160, 96, true), -0.20),
             ("down-left", diagonal(160, 96, false), -0.20),
@@ -16894,7 +18137,7 @@ mod tests {
     #[test]
     fn a_mode_the_encoder_cannot_predict_is_refused() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let picture = test_card(64, 64);
         let message = encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[13], fctx)
             .unwrap_err()
@@ -16914,7 +18157,7 @@ mod tests {
     #[test]
     fn the_encoded_picture_is_the_one_that_went_in() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let picture = test_card(160, 96);
         let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let luma = psnr(&encoded.reconstruction.y, &picture.y);
@@ -16937,7 +18180,7 @@ mod tests {
     #[test]
     fn fidelity_and_rate_move_with_the_quantizer() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let picture = test_card(128, 128);
         let mut previous: Option<(usize, f64)> = None;
         for &q in &[70u8, 90, 110] {
@@ -16984,8 +18227,14 @@ mod tests {
         // `predicted_coeff_bits_track_the_tile_the_writer_wrote` measures the
         // drift of), after which the exact bound comes back.
         for &(lo, hi) in &[(20u8, 21u8), (60, 61), (120, 121)] {
-            let lo_bytes = encode_key_frame_with_ctx(&picture, lo, 0.5, fctx).unwrap().stream.len();
-            let hi_bytes = encode_key_frame_with_ctx(&picture, hi, 0.5, fctx).unwrap().stream.len();
+            let lo_bytes = encode_key_frame_with_ctx(&picture, lo, 0.5, fctx)
+                .unwrap()
+                .stream
+                .len();
+            let hi_bytes = encode_key_frame_with_ctx(&picture, hi, 0.5, fctx)
+                .unwrap()
+                .stream
+                .len();
             assert!(
                 hi_bytes as f64 <= lo_bytes as f64 * 1.10,
                 "q {lo}->{hi} crosses a context boundary: {lo_bytes} -> {hi_bytes} bytes"
@@ -16998,7 +18247,7 @@ mod tests {
     #[test]
     fn a_flat_picture_costs_almost_nothing() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let mut picture = Picture::grey(128, 128);
         picture.y.fill(97);
         let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
@@ -17035,7 +18284,7 @@ mod tests {
     #[test]
     fn a_picture_off_the_block_grid_encodes_and_a_malformed_one_is_refused() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         encode_key_frame_with_ctx(&Picture::grey(40, 40), 100, 0.5, fctx)
             .expect("40x40 cuts a 16x16 leaf on both axes, which is an inferred split");
         encode_key_frame_with_ctx(&Picture::grey(36, 40), 100, 0.5, fctx)
@@ -17119,7 +18368,7 @@ mod tests {
     #[test]
     fn a_single_axis_straddle_round_trips_through_ffmpeg() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP a_single_axis_straddle_round_trips_through_ffmpeg: no ffmpeg");
             return;
@@ -17149,7 +18398,7 @@ mod tests {
     #[test]
     fn a_frame_of_real_video_decodes_to_what_the_encoder_reconstructed() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let Ok(clip) = std::env::var("EC_AV1_CLIP") else {
             eprintln!(
                 "SKIP a_frame_of_real_video_decodes_to_what_the_encoder_reconstructed: \
@@ -17247,9 +18496,18 @@ mod tests {
                 Picture {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
-                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
+                    y: out.stdout[base..base + luma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    u: out.stdout[base + luma..base + luma + chroma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
                 }
             })
             .collect()
@@ -17264,7 +18522,7 @@ mod tests {
     #[test]
     fn every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed: no ffmpeg"
@@ -17279,6 +18537,11 @@ mod tests {
         assert_eq!(encoded.frames.len(), 5);
 
         let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 5);
+        assert_eq!(
+            encoded.frames.len(),
+            decoded.len(),
+            "frame count: ours vs ffmpeg"
+        );
         for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
             assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: luma");
             assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: U");
@@ -17362,8 +18625,7 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
         let _ = take_b128_none_hits();
         let _ = crate::tile::take_sb128_none_hits();
         let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
@@ -17373,7 +18635,10 @@ mod tests {
             coded > 0,
             "no 128x128 block was coded on this clip, so it cannot witness the root search",
         );
-        assert_eq!(won, coded, "every 128x128 root the search took must be coded as one");
+        assert_eq!(
+            won, coded,
+            "every 128x128 root the search took must be coded as one"
+        );
         let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
         assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
         for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
@@ -17385,14 +18650,27 @@ mod tests {
             ] {
                 let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
                 assert_eq!(
-                    differ, 0,
+                    differ,
+                    0,
                     "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
                      own reconstruction",
                     got.len()
                 );
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                    got.len(),
+                    want.len()
+                );
             }
         }
         let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        assert_eq!(
+            encoded.frames.len(),
+            ff.len(),
+            "frame count: ours vs ffmpeg"
+        );
         for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
             assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
             assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
@@ -17446,14 +18724,15 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
         let _ = take_b128_residual_hits();
         let _ = crate::tile::take_sb128_residual_hits();
         force_b128_residual(true);
         let encoded = encode_sequence(&pictures, 60, 0.5).unwrap();
-        let (won, coded) =
-            (take_b128_residual_hits(), crate::tile::take_sb128_residual_hits());
+        let (won, coded) = (
+            take_b128_residual_hits(),
+            crate::tile::take_sb128_residual_hits(),
+        );
         eprintln!("128x128 blocks WITH a residual: search won {won}, writer coded {coded}");
         assert!(
             coded > 0,
@@ -17470,14 +18749,27 @@ mod tests {
             ] {
                 let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
                 assert_eq!(
-                    differ, 0,
+                    differ,
+                    0,
                     "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
                      own reconstruction",
                     got.len()
                 );
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                    got.len(),
+                    want.len()
+                );
             }
         }
         let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        assert_eq!(
+            encoded.frames.len(),
+            ff.len(),
+            "frame count: ours vs ffmpeg"
+        );
         for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
             assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
             assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
@@ -17530,8 +18822,7 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
         force_b128_root(true);
         force_b128_residual(true);
         let _ = crate::tile::take_sb128_residual_hits();
@@ -17543,7 +18834,10 @@ mod tests {
             "128x128 blocks WITH a residual: writer coded {coded}; 64x64 CDEF units taking \
              another unit's literal: {covered}"
         );
-        assert!(coded > 0, "no 128x128 block carried a residual on this clip");
+        assert!(
+            coded > 0,
+            "no 128x128 block carried a residual on this clip"
+        );
         assert!(
             covered > 0,
             "no 64x64 unit took a non-zero preset from another unit's literal, so this clip \
@@ -17559,9 +18853,21 @@ mod tests {
             ] {
                 let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
                 assert_eq!(differ, 0, "frame {i}: {plane} -- {differ} samples differ");
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                    got.len(),
+                    want.len()
+                );
             }
         }
         let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        assert_eq!(
+            encoded.frames.len(),
+            ff.len(),
+            "frame count: ours vs ffmpeg"
+        );
         for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
             assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
             assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
@@ -17604,15 +18910,16 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
         force_b128_rect(1);
         force_b128_rectres(true);
         let _ = take_b128_rectres_hits();
         let _ = crate::tile::take_sb128_rectres_hits();
         let encoded = encode_sequence(&pictures, 60, 0.5).unwrap();
-        let (won, coded) =
-            (take_b128_rectres_hits(), crate::tile::take_sb128_rectres_hits());
+        let (won, coded) = (
+            take_b128_rectres_hits(),
+            crate::tile::take_sb128_rectres_hits(),
+        );
         eprintln!("rect halves WITH a residual: search won {won}, writer coded {coded}");
         assert!(
             coded > 0,
@@ -17629,14 +18936,27 @@ mod tests {
             ] {
                 let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
                 assert_eq!(
-                    differ, 0,
+                    differ,
+                    0,
                     "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
                      own reconstruction",
                     got.len()
                 );
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                    got.len(),
+                    want.len()
+                );
             }
         }
         let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        assert_eq!(
+            encoded.frames.len(),
+            ff.len(),
+            "frame count: ours vs ffmpeg"
+        );
         for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
             assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
             assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
@@ -17676,15 +18996,16 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
         force_b128_ab(4);
         force_b128_rectres(true);
         let _ = take_b128_rectres_hits();
         let _ = crate::tile::take_sb128_rectres_hits();
         let encoded = encode_sequence(&pictures, 60, 0.5).unwrap();
-        let (won, coded) =
-            (take_b128_rectres_hits(), crate::tile::take_sb128_rectres_hits());
+        let (won, coded) = (
+            take_b128_rectres_hits(),
+            crate::tile::take_sb128_rectres_hits(),
+        );
         eprintln!("AB pieces WITH a residual: search won {won}, writer coded {coded}");
         assert!(
             coded > 0,
@@ -17701,14 +19022,27 @@ mod tests {
             ] {
                 let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
                 assert_eq!(
-                    differ, 0,
+                    differ,
+                    0,
                     "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
                      own reconstruction",
                     got.len()
                 );
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                    got.len(),
+                    want.len()
+                );
             }
         }
         let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        assert_eq!(
+            encoded.frames.len(),
+            ff.len(),
+            "frame count: ours vs ffmpeg"
+        );
         for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
             assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
             assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
@@ -17751,8 +19085,7 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
         force_b128_rect(1);
         force_b128_rectres(true);
         let _ = crate::tile::take_sb128_rectres_hits();
@@ -17780,9 +19113,21 @@ mod tests {
             ] {
                 let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
                 assert_eq!(differ, 0, "frame {i}: {plane} -- {differ} samples differ");
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                    got.len(),
+                    want.len()
+                );
             }
         }
         let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        assert_eq!(
+            encoded.frames.len(),
+            ff.len(),
+            "frame count: ours vs ffmpeg"
+        );
         for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
             assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
             assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
@@ -17824,8 +19169,7 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
         // The compound candidate wins the 128 block's own search on this pan
         // but the root then loses to its four cells, so the root is forced
         // (the residual arm is left at its default, off).
@@ -17833,10 +19177,15 @@ mod tests {
         let _ = take_b128_compound_hits();
         let _ = crate::tile::take_sb128_compound_hits();
         let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
-        let (won, coded) =
-            (take_b128_compound_hits(), crate::tile::take_sb128_compound_hits());
+        let (won, coded) = (
+            take_b128_compound_hits(),
+            crate::tile::take_sb128_compound_hits(),
+        );
         eprintln!("COMPOUND 128x128 blocks: search won {won}, writer coded {coded}");
-        assert!(coded > 0, "no compound 128x128 block was coded on this clip");
+        assert!(
+            coded > 0,
+            "no compound 128x128 block was coded on this clip"
+        );
         let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
         assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
         for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
@@ -17847,9 +19196,21 @@ mod tests {
             ] {
                 let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
                 assert_eq!(differ, 0, "frame {i}: {plane} -- {differ} samples differ");
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                    got.len(),
+                    want.len()
+                );
             }
         }
         let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        assert_eq!(
+            encoded.frames.len(),
+            ff.len(),
+            "frame count: ours vs ffmpeg"
+        );
         for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
             assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
             assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
@@ -17899,8 +19260,7 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
         let mut unforced = (0usize, 0usize);
         for (label, force) in [("HORZ", 1u8), ("VERT", 2), ("unforced", 0)] {
             force_b128_rect(force);
@@ -17936,12 +19296,30 @@ mod tests {
                     ("V", &dec.v, &frame.reconstruction.v),
                 ] {
                     let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
-                    assert_eq!(differ, 0, "{label} frame {i}: {plane} -- {differ} samples differ");
+                    assert_eq!(
+                        differ, 0,
+                        "{label} frame {i}: {plane} -- {differ} samples differ"
+                    );
+                    assert_eq!(
+                        got.len(),
+                        want.len(),
+                        "{label} frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                        got.len(),
+                        want.len()
+                    );
                 }
             }
             let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+            assert_eq!(
+                encoded.frames.len(),
+                ff.len(),
+                "{label}: frame count: ours vs ffmpeg"
+            );
             for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
-                assert_eq!(dec.y, frame.reconstruction.y, "{label} frame {i}: ffmpeg luma");
+                assert_eq!(
+                    dec.y, frame.reconstruction.y,
+                    "{label} frame {i}: ffmpeg luma"
+                );
                 assert_eq!(dec.u, frame.reconstruction.u, "{label} frame {i}: ffmpeg U");
                 assert_eq!(dec.v, frame.reconstruction.v, "{label} frame {i}: ffmpeg V");
             }
@@ -17993,13 +19371,16 @@ mod tests {
             .success();
         assert!(ok, "ffmpeg could not write the synthetic clip");
         let (width, height) = (1280usize, 768usize);
-        let pictures =
-            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        let pictures = crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
         let names = ["HORZ_A", "HORZ_B", "VERT_A", "VERT_B"];
         let mut unforced = [0usize; 4];
         for force in [4u8, 5, 6, 7, 0] {
             force_b128_ab(force);
-            let label = if force == 0 { "unforced" } else { names[usize::from(force) - 4] };
+            let label = if force == 0 {
+                "unforced"
+            } else {
+                names[usize::from(force) - 4]
+            };
             let _ = take_b128_ab_hits();
             let _ = crate::tile::take_sb128_ab_hits();
             let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
@@ -18016,7 +19397,10 @@ mod tests {
                 unforced = won;
             } else {
                 let i = usize::from(force) - 4;
-                assert!(coded[i] > 0, "no {label} root was coded with {label} forced");
+                assert!(
+                    coded[i] > 0,
+                    "no {label} root was coded with {label} forced"
+                );
             }
             let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
             assert_eq!(decoded.len(), encoded.frames.len(), "{label}: frame count");
@@ -18027,12 +19411,30 @@ mod tests {
                     ("V", &dec.v, &frame.reconstruction.v),
                 ] {
                     let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
-                    assert_eq!(differ, 0, "{label} frame {i}: {plane} -- {differ} samples differ");
+                    assert_eq!(
+                        differ, 0,
+                        "{label} frame {i}: {plane} -- {differ} samples differ"
+                    );
+                    assert_eq!(
+                        got.len(),
+                        want.len(),
+                        "{label} frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                        got.len(),
+                        want.len()
+                    );
                 }
             }
             let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+            assert_eq!(
+                encoded.frames.len(),
+                ff.len(),
+                "{label}: frame count: ours vs ffmpeg"
+            );
             for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
-                assert_eq!(dec.y, frame.reconstruction.y, "{label} frame {i}: ffmpeg luma");
+                assert_eq!(
+                    dec.y, frame.reconstruction.y,
+                    "{label} frame {i}: ffmpeg luma"
+                );
                 assert_eq!(dec.u, frame.reconstruction.u, "{label} frame {i}: ffmpeg U");
                 assert_eq!(dec.v, frame.reconstruction.v, "{label} frame {i}: ffmpeg V");
             }
@@ -18057,7 +19459,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let clip = dir.join("mandelbrot-1280x768.y4m");
         let ok = Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "mandelbrot=size=1280x768:rate=24"])
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "mandelbrot=size=1280x768:rate=24",
+            ])
             .args(["-frames:v", "12", "-pix_fmt", "yuv420p"])
             .arg(&clip)
             .status()
@@ -18089,10 +19499,18 @@ mod tests {
             ] {
                 let differ = got.iter().zip(want).filter(|(a, b)| a != b).count();
                 assert_eq!(
-                    differ, 0,
+                    differ,
+                    0,
                     "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
                      own reconstruction",
                     got.len()
+                );
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "frame {i}: {plane} is {} samples, the reconstruction's is {}",
+                    got.len(),
+                    want.len()
                 );
             }
         }
@@ -18109,8 +19527,9 @@ mod tests {
         // still splits at every larger size ([[gate-blind-to-feature]] --
         // the guard is right, the fixture had shrunk under it).
         let (width, height) = (256usize, 128usize);
-        let pictures: Vec<Picture> =
-            (0..5).map(|i| panned_test_card(width, height, i * 3)).collect();
+        let pictures: Vec<Picture> = (0..5)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
         let _ = take_inter_tx_split_hits();
         let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         let raw = take_inter_tx_split_hits();
@@ -18187,8 +19606,11 @@ mod tests {
         let mut worst_under: f64 = 0.0;
         // The census is per CODED frame, so it is zipped in coding order --
         // which is not display order under a pyramid.
-        let coded: Vec<&Encoded> =
-            encoded.coding_order.iter().map(|&i| &encoded.frames[i]).collect();
+        let coded: Vec<&Encoded> = encoded
+            .coding_order
+            .iter()
+            .map(|&i| &encoded.frames[i])
+            .collect();
         for (i, (frame, &bits)) in coded.into_iter().zip(&predicted).enumerate() {
             let written = frame.tile.len() as f64 * 8.0;
             let drift = (written - bits) / written;
@@ -18203,7 +19625,10 @@ mod tests {
             if written >= 512.0 {
                 worst_under = worst_under.max(drift);
             }
-            eprintln!("{i:5}  {bits:14.0}  {written:12.0}  {:+6.2}%", drift * 100.0);
+            eprintln!(
+                "{i:5}  {bits:14.0}  {written:12.0}  {:+6.2}%",
+                drift * 100.0
+            );
         }
         // Measured 2026-09-06 on this sequence: -13.5% at the key frame,
         // -8.1%, -3.8%, -2.1%, +1.8% down the inter frames. The search
@@ -18338,7 +19763,9 @@ mod tests {
                 .lines()
                 .skip(1)
                 .filter_map(|l| l.split('\t').next())
-                .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+                .find(|p| {
+                    p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists()
+                })
         {
             clips.push(("screen".to_string(), std::path::PathBuf::from(p)));
         }
@@ -18369,7 +19796,11 @@ mod tests {
                 println!(
                     "| {set} | {} | {blocks} | {priced:.0} | {written:.0} | {:+.1}% |",
                     crate::tile::census_bucket_label(*bucket),
-                    if *written > 0.0 { (priced - written) / written * 100.0 } else { 0.0 }
+                    if *written > 0.0 {
+                        (priced - written) / written * 100.0
+                    } else {
+                        0.0
+                    }
                 );
             }
             println!(
@@ -18377,7 +19808,10 @@ mod tests {
                 rows.values().map(|r| r.0).sum::<u64>(),
                 (priced_all - written_all) / written_all * 100.0
             );
-            assert!(written_all > 0.0, "{name}: the census saw no transform block");
+            assert!(
+                written_all > 0.0,
+                "{name}: the census saw no transform block"
+            );
         }
     }
 
@@ -18391,7 +19825,7 @@ mod tests {
     #[test]
     fn low_motion_makes_an_inter_frame_smaller_than_the_key_frame() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         let (width, height) = (256usize, 128usize);
         let pictures: Vec<Picture> = (0..5)
             .map(|i| panned_test_card(width, height, i * 2))
@@ -18429,19 +19863,21 @@ mod tests {
     #[ignore = "a perf probe, not a gate"]
     fn stage_timing_breakdown() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         use std::time::Instant;
 
         for &(width, height) in &[(1920usize, 1080usize), (3840, 2160)] {
             let picture = test_card(width, height);
 
             let t = Instant::now();
-            let dc_only = encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[DC_PRED], fctx).unwrap();
+            let dc_only =
+                encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[DC_PRED], fctx).unwrap();
             let dc_only_t = t.elapsed();
 
             let t = Instant::now();
             let non_directional =
-                encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &NON_DIRECTIONAL, fctx).unwrap();
+                encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &NON_DIRECTIONAL, fctx)
+                    .unwrap();
             let non_directional_t = t.elapsed();
 
             let t = Instant::now();
@@ -18464,8 +19900,23 @@ mod tests {
             let padded_ref = all_modes.reconstruction.padded_to(SUPERBLOCK);
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
-            let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, None, fctx, None, &[]).unwrap();
+            let inter = encode_inter_frame(
+                &padded_pic,
+                &padded_ref,
+                100,
+                0.5,
+                1,
+                flat_order_hints(1, 0, false),
+                (width, height),
+                None,
+                None,
+                None,
+                None,
+                fctx,
+                None,
+                &[],
+            )
+            .unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -18523,7 +19974,8 @@ mod tests {
                     side,
                     false,
                     false,
-                    &mut prediction, fctx,
+                    &mut prediction,
+                    fctx,
                 );
             }
             let predict_t = t.elapsed() / N;
@@ -18552,7 +20004,7 @@ mod tests {
     #[ignore = "a perf probe, not a gate"]
     fn stage_timing_breakdown_inter() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         use std::time::Instant;
 
         let (width, height) = (1280usize, 720);
@@ -18563,8 +20015,23 @@ mod tests {
 
         stage_reset();
         let t = Instant::now();
-        let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, None, fctx, None, &[]).unwrap();
+        let inter = encode_inter_frame(
+            &padded_pic,
+            &padded_ref,
+            100,
+            0.5,
+            1,
+            flat_order_hints(1, 0, false),
+            (width, height),
+            None,
+            None,
+            None,
+            None,
+            fctx,
+            None,
+            &[],
+        )
+        .unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -18601,7 +20068,7 @@ mod tests {
     #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
     fn prune_k_quality_sweep() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP prune_k_quality_sweep: no ffmpeg");
             return;
@@ -18684,8 +20151,14 @@ mod tests {
                 width,
                 height,
                 y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
-                u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+                u: bytes[luma..luma + chroma]
+                    .iter()
+                    .map(|&v| u16::from(v))
+                    .collect(),
+                v: bytes[luma + chroma..]
+                    .iter()
+                    .map(|&v| u16::from(v))
+                    .collect(),
             }
         })
     }
@@ -18702,7 +20175,7 @@ mod tests {
     #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
     fn prune_k_quality_sweep_inter() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP prune_k_quality_sweep_inter: no ffmpeg");
             return;
@@ -18744,7 +20217,14 @@ mod tests {
                     0.5,
                     1,
                     flat_order_hints(1, 0, false),
-                    (width, height), None, None, None, None, fctx, None, &[],
+                    (width, height),
+                    None,
+                    None,
+                    None,
+                    None,
+                    fctx,
+                    None,
+                    &[],
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -18762,7 +20242,14 @@ mod tests {
                         0.5,
                         1,
                         flat_order_hints(1, 0, false),
-                        (width, height), None, None, None, None, fctx, None, &[],
+                        (width, height),
+                        None,
+                        None,
+                        None,
+                        None,
+                        fctx,
+                        None,
+                        &[],
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
@@ -18789,7 +20276,14 @@ mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Picture> {
-        clip_frames_vf(clip, skip, &format!("scale={width}:{height}"), width, height, frames)
+        clip_frames_vf(
+            clip,
+            skip,
+            &format!("scale={width}:{height}"),
+            width,
+            height,
+            frames,
+        )
     }
 
     /// [`clip_frames`] with the filter chain spelled out, so a caller can ask
@@ -18832,7 +20326,7 @@ mod tests {
     #[test]
     fn real_clip_encodes_within_its_quality_and_size_budget() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP real_clip_encodes_within_its_quality_and_size_budget: no ffmpeg");
             return;
@@ -18894,7 +20388,7 @@ mod tests {
     #[test]
     fn real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size: \
@@ -18952,7 +20446,7 @@ mod tests {
     #[ignore = "a perf probe, not a gate"]
     fn sequence_bench_sanity() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         use std::time::Instant;
         let (width, height) = (1280usize, 720usize);
         let pictures: Vec<Picture> = (0..24)
@@ -18976,7 +20470,7 @@ mod tests {
     #[ignore = "a calibration probe, not a gate"]
     fn calibration_sweep_base_q_idx() {
         let _knobs = crate::speed::knob_read();
-    let fctx = &crate::decode::FrameCtx::for_encoder();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP calibration_sweep_base_q_idx: no ffmpeg");
             return;
@@ -19063,7 +20557,10 @@ mod tests {
         let mut ladder = Vec::new();
         let mut wall = 0.0;
         for (i, params) in points.iter().enumerate() {
-            let obu = dir.join(format!("ec-av1-bd-{}-{encoder}-{i}.obu", std::process::id()));
+            let obu = dir.join(format!(
+                "ec-av1-bd-{}-{encoder}-{i}.obu",
+                std::process::id()
+            ));
             let start = std::time::Instant::now();
             let out = Command::new("ffmpeg")
                 .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
@@ -19221,7 +20718,11 @@ mod tests {
                     );
                 }
             }
-            let per_frame: Vec<f64> = decoded.iter().zip(source).map(|(d, s)| psnr_all(d, s)).collect();
+            let per_frame: Vec<f64> = decoded
+                .iter()
+                .zip(source)
+                .map(|(d, s)| psnr_all(d, s))
+                .collect();
             // lane-txrd: does a tool's loss start at the FIRST inter frame
             // (a local mispricing) or grow down the GOP (propagation into
             // the reference chain)? One line per q point answers it.
@@ -19276,7 +20777,13 @@ mod tests {
         width: usize,
         height: usize,
         pyramid: Option<crate::encoder::Pyramid>,
-    ) -> (Vec<(f64, f64)>, f64, [usize; 4], [usize; 4], Option<crate::encoder::Pyramid>) {
+    ) -> (
+        Vec<(f64, f64)>,
+        f64,
+        [usize; 4],
+        [usize; 4],
+        Option<crate::encoder::Pyramid>,
+    ) {
         use crate::encoder::{Av1Encoder, Colour, EncoderConfig, Level};
         let slot = |l: Level| match l {
             Level::Key => 0,
@@ -19321,7 +20828,11 @@ mod tests {
             // source picture, in the right order -- checked against our own
             // decoder as well as ffmpeg's, both below.
             let ours = crate::stream::decode_stream(&stream).expect("our decoder");
-            assert_eq!(ours.len(), source.len(), "{name} q={q}: our display-order count");
+            assert_eq!(
+                ours.len(),
+                source.len(),
+                "{name} q={q}: our display-order count"
+            );
             let decoded = ffmpeg_decode_sequence(&stream, width, height, source.len());
             for (i, (d, o)) in decoded.iter().zip(&ours).enumerate() {
                 if let Some((plane, s, got, want)) = first_plane_mismatch(d, o) {
@@ -19501,7 +21012,10 @@ mod tests {
         // -- 8290 -> 8291 bytes at q=150. The q=60 pin does NOT move: at that
         // quantizer the rect cut never wins its own comparison on this clip.
         // `EC_AV1_B128HV=0` restores 8290 exactly.
-        let pins: [(u8, usize, u64); 2] = [(150, 8291, 0x1f00bb0eb099a27f), (60, 33227, 0x57ee6b1f8eacd881)];
+        let pins: [(u8, usize, u64); 2] = [
+            (150, 8291, 0x1f00bb0eb099a27f),
+            (60, 33227, 0x57ee6b1f8eacd881),
+        ];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
@@ -19587,12 +21101,20 @@ mod tests {
                 }
             }
             let n = frames.len().max(1) as f64;
-            eprintln!("{label} {cw}x{ch}, {} frames -- share of 16x16 blocks with 2..=N colours and per-pixel var > V:", frames.len());
-            eprintln!("  N \\ V |{}", floors.iter().map(|f| format!("{f:>8}")).collect::<String>());
+            eprintln!(
+                "{label} {cw}x{ch}, {} frames -- share of 16x16 blocks with 2..=N colours and per-pixel var > V:",
+                frames.len()
+            );
+            eprintln!(
+                "  N \\ V |{}",
+                floors.iter().map(|f| format!("{f:>8}")).collect::<String>()
+            );
             for (li, &limit) in limits.iter().enumerate() {
                 eprintln!(
                     "  {limit:>5} |{}",
-                    (0..5).map(|fi| format!("{:>7.1}%", acc[li][fi] / n)).collect::<String>()
+                    (0..5)
+                        .map(|fi| format!("{:>7.1}%", acc[li][fi] / n))
+                        .collect::<String>()
                 );
             }
         };
@@ -19604,7 +21126,14 @@ mod tests {
             let cw = nw.min(1920) / 128 * 128;
             let ch = nh.min(1024) / 128 * 128;
             let (x, y0) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
-            let frames = clip_frames_vf(&path, &seek, &format!("crop={cw}:{ch}:{x}:{y0}"), cw, ch, 12);
+            let frames = clip_frames_vf(
+                &path,
+                &seek,
+                &format!("crop={cw}:{ch}:{x}:{y0}"),
+                cw,
+                ch,
+                12,
+            );
             census(&name, &frames, cw, ch);
             // The 640x384 gate scales instead of cropping, and the scaling
             // changes the census (bars smooth out): the constants have to
@@ -19639,7 +21168,8 @@ mod tests {
             return;
         }
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
-        let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) else {
+        let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"))
+        else {
             eprintln!("SKIP probe_screen_library: no real-library manifest");
             return;
         };
@@ -19648,32 +21178,36 @@ mod tests {
         // Whatever ffmpeg gave us, without the exact-count assertion the
         // gate loaders make: a seek near the end of a clip returns fewer
         // frames, and that is a row to print, not a panic.
-        let decode = |clip: &str, seek: &str, vf: &str, w: usize, h: usize, n: usize| -> Vec<Picture> {
-            let out = Command::new("ffmpeg")
-                .args(["-v", "error", "-ss", seek, "-i", clip])
-                .args(["-frames:v", &n.to_string()])
-                .args(["-vf", vf])
-                .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
-                .output();
-            let Ok(out) = out else { return Vec::new() };
-            if !out.status.success() {
-                return Vec::new();
-            }
-            let (luma, chroma) = (w * h, w * h / 4);
-            let frame_len = luma + 2 * chroma;
-            (0..out.stdout.len() / frame_len)
-                .map(|i| {
-                    let b = &out.stdout[i * frame_len..][..frame_len];
-                    Picture {
-                        width: w,
-                        height: h,
-                        y: b[..luma].iter().map(|&v| u16::from(v)).collect(),
-                        u: b[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                        v: b[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
-                    }
-                })
-                .collect()
-        };
+        let decode =
+            |clip: &str, seek: &str, vf: &str, w: usize, h: usize, n: usize| -> Vec<Picture> {
+                let out = Command::new("ffmpeg")
+                    .args(["-v", "error", "-ss", seek, "-i", clip])
+                    .args(["-frames:v", &n.to_string()])
+                    .args(["-vf", vf])
+                    .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+                    .output();
+                let Ok(out) = out else { return Vec::new() };
+                if !out.status.success() {
+                    return Vec::new();
+                }
+                let (luma, chroma) = (w * h, w * h / 4);
+                let frame_len = luma + 2 * chroma;
+                (0..out.stdout.len() / frame_len)
+                    .map(|i| {
+                        let b = &out.stdout[i * frame_len..][..frame_len];
+                        Picture {
+                            width: w,
+                            height: h,
+                            y: b[..luma].iter().map(|&v| u16::from(v)).collect(),
+                            u: b[luma..luma + chroma]
+                                .iter()
+                                .map(|&v| u16::from(v))
+                                .collect(),
+                            v: b[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+                        }
+                    })
+                    .collect()
+            };
         // Share (%) of 16x16 blocks with 2..=N colours and per-pixel
         // variance > V, for every (N, V) of the sweep grid, over one frame.
         let census = |y: &[u8], w: usize, h: usize| -> [[f64; 7]; 5] {
@@ -19720,10 +21254,19 @@ mod tests {
         // are desktop recordings; everything else in this library is camera
         // or film material.
         let mut rows: Vec<(String, String, String, f64, bool)> = Vec::new();
-        for (label, file) in [("bars 1080p", "h264-1080p-23.976-8bit.mp4"), ("bars 2160p", "h264-2160p-23.976-8bit.mp4")] {
+        for (label, file) in [
+            ("bars 1080p", "h264-1080p-23.976-8bit.mp4"),
+            ("bars 2160p", "h264-2160p-23.976-8bit.mp4"),
+        ] {
             let path = fixtures.join("video").join(file);
             if path.exists() {
-                rows.push(("fx".into(), label.into(), path.to_str().unwrap().into(), 10.0, false));
+                rows.push((
+                    "fx".into(),
+                    label.into(),
+                    path.to_str().unwrap().into(),
+                    10.0,
+                    false,
+                ));
             }
         }
         for (i, line) in manifest.lines().skip(1).enumerate() {
@@ -19761,7 +21304,9 @@ mod tests {
         // Per (N, V): the worst camera/film row and the best screen row, so
         // the separation of the whole library is one subtraction.
         let (mut cam_max, mut scr_min) = ([[0f64; 7]; 5], [[100f64; 7]; 5]);
-        eprintln!("| idx | codec size | class | offset | qualifying blocks | verdict | mean/sd/MAD |");
+        eprintln!(
+            "| idx | codec size | class | offset | qualifying blocks | verdict | mean/sd/MAD |"
+        );
         for (idx, label, path, dur, is_capture) in &rows {
             let Some((nw, nh)) = probe_dims(path) else {
                 eprintln!("SKIP {idx}: ffprobe gave no size");
@@ -19776,10 +21321,14 @@ mod tests {
                 let seek = format!("{:.3}", dur * f64::from(pct) / 100.0);
                 let frames = decode(path, &seek, &vf, cw, ch, 4);
                 if frames.is_empty() {
-                    eprintln!("| {idx} | {label} | {} | {pct}% | SKIP: ffmpeg decoded no frame here |", if *is_capture { "screen" } else { "camera" });
+                    eprintln!(
+                        "| {idx} | {label} | {} | {pct}% | SKIP: ffmpeg decoded no frame here |",
+                        if *is_capture { "screen" } else { "camera" }
+                    );
                     continue;
                 }
-                let (mut share, mut yes, mut mean, mut sd, mut mad) = (0f64, 0usize, 0f64, 0f64, 0f64);
+                let (mut share, mut yes, mut mean, mut sd, mut mad) =
+                    (0f64, 0usize, 0f64, 0f64, 0f64);
                 let mut prev: Option<Vec<u8>> = None;
                 for picture in &frames {
                     let y: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
@@ -19800,7 +21349,12 @@ mod tests {
                     mean += sum / n;
                     sd += (sq / n - (sum / n) * (sum / n)).max(0.0).sqrt();
                     if let Some(p) = &prev {
-                        mad += p.iter().zip(&y).map(|(&a, &b)| f64::from(a.abs_diff(b))).sum::<f64>() / n;
+                        mad += p
+                            .iter()
+                            .zip(&y)
+                            .map(|(&a, &b)| f64::from(a.abs_diff(b)))
+                            .sum::<f64>()
+                            / n;
                     }
                     prev = Some(y);
                 }
@@ -19809,7 +21363,11 @@ mod tests {
                     "| {idx} | {label} | {} | {pct}% | {:.1}% | {} ({yes}/{} frames) | {:.0}/{:.1}/{:.2} |",
                     if *is_capture { "screen" } else { "camera" },
                     share / f,
-                    if yes * 2 > frames.len() { "SCREEN" } else { "camera" },
+                    if yes * 2 > frames.len() {
+                        "SCREEN"
+                    } else {
+                        "camera"
+                    },
                     frames.len(),
                     mean / f,
                     sd / f,
@@ -19829,8 +21387,16 @@ mod tests {
                 }
             }
         }
-        eprintln!("sweep over the whole library -- worst camera/film share vs best screen share, per (N colours, var > V):");
-        eprintln!("  N \\ V |{}", floors.iter().map(|f| format!("{:>18}", format!("V>{f}"))).collect::<String>());
+        eprintln!(
+            "sweep over the whole library -- worst camera/film share vs best screen share, per (N colours, var > V):"
+        );
+        eprintln!(
+            "  N \\ V |{}",
+            floors
+                .iter()
+                .map(|f| format!("{:>18}", format!("V>{f}")))
+                .collect::<String>()
+        );
         let (mut best, mut best_rule) = (f64::MIN, (16usize, 16u64));
         for (li, &limit) in limits.iter().enumerate() {
             let mut row = String::new();
@@ -20006,13 +21572,19 @@ mod tests {
                     .lines()
                     .skip(1)
                     .filter_map(|l| l.split('\t').next())
-                    .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists());
+                    .find(|p| {
+                        p.contains("/OBS/")
+                            && p.ends_with(".mkv")
+                            && std::path::Path::new(p).exists()
+                    });
                 match screen {
                     Some(p) => clips.push((
                         format!("screen capture ({})", p.rsplit('/').next().unwrap_or(p)),
                         std::path::PathBuf::from(p),
                     )),
-                    None => eprintln!("SKIP screen capture: no OBS recording in the manifest exists"),
+                    None => {
+                        eprintln!("SKIP screen capture: no OBS recording in the manifest exists")
+                    }
                 }
             }
             Err(e) => eprintln!("SKIP screen capture: no real-library manifest ({e})"),
@@ -20040,7 +21612,9 @@ mod tests {
         println!(
             "\n{frames} frames of each clip at {width}x{height}, gop={frames}, 1 tile, 1 thread"
         );
-        println!("| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e |");
+        println!(
+            "| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e |"
+        );
         println!("|---|---|---|---|---|");
         for (name, path) in &clips {
             let fctx = &crate::decode::FrameCtx::for_encoder();
@@ -20078,8 +21652,14 @@ mod tests {
                         "{name}: facade, pyramid requested {pyramid:?} effective \
                          {effective:?} -- frames key {} arf {} leaf {} \
                          show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
-                        counts[0], counts[1], counts[2], counts[3],
-                        bytes[0], bytes[1], bytes[2], bytes[3],
+                        counts[0],
+                        counts[1],
+                        counts[2],
+                        counts[3],
+                        bytes[0],
+                        bytes[1],
+                        bytes[2],
+                        bytes[3],
                     );
                     (ladder, wall)
                 }
@@ -20130,15 +21710,19 @@ mod tests {
                  GLOBAL_GLOBAL {} NEW_NEW {}; pairs LAST+GOLDEN {} LAST+ALTREF {}",
                 modes_total + comp_total,
                 100.0 * comp_total as f64 / (modes_total + comp_total) as f64,
-                comp_modes[0], comp_modes[1], comp_modes[2], comp_modes[3],
-                comp_modes[6], comp_modes[7],
-                comp_pairs[3], comp_pairs[6],
+                comp_modes[0],
+                comp_modes[1],
+                comp_modes[2],
+                comp_modes[3],
+                comp_modes[6],
+                comp_modes[7],
+                comp_pairs[3],
+                comp_pairs[6],
             );
             eprintln!(
                 "{name}: leaf (16x16 and below) compound modes NEAREST_NEAREST {} \
                  NEAR_NEAR {} NEAREST_NEW {} NEW_NEAREST {} GLOBAL_GLOBAL {} NEW_NEW {}",
-                comp_leaf[0], comp_leaf[1], comp_leaf[2], comp_leaf[3], comp_leaf[6],
-                comp_leaf[7],
+                comp_leaf[0], comp_leaf[1], comp_leaf[2], comp_leaf[3], comp_leaf[6], comp_leaf[7],
             );
             eprintln!(
                 "{name}: compound by size 8x8 {} 16x16 {} 32x32 {}",
@@ -20148,8 +21732,16 @@ mod tests {
             // evaluations (one `mc::predict` + SAD each) a search spends, how
             // many of them are subpel, and how often the winner is the seed
             // it started from -- the census the seeded search is judged by.
-            let [calls, evals, subpel, rounds, near_pred, unmoved, widest, widest_moves] =
-                crate::motion::take_census();
+            let [
+                calls,
+                evals,
+                subpel,
+                rounds,
+                near_pred,
+                unmoved,
+                widest,
+                widest_moves,
+            ] = crate::motion::take_census();
             let per = |n: u64| n as f64 / calls.max(1) as f64;
             eprintln!(
                 "{name}: motion search {calls} calls, {evals} candidate evals ({:.1}/call, \
@@ -20209,10 +21801,7 @@ mod tests {
                 by_bits[usize::from(*b)] += 1;
             }
             let units: usize = presets.iter().flat_map(|(_, c)| c).sum();
-            let on_extra: usize = presets
-                .iter()
-                .flat_map(|(_, c)| c.iter().skip(1))
-                .sum();
+            let on_extra: usize = presets.iter().flat_map(|(_, c)| c.iter().skip(1)).sum();
             eprintln!(
                 "{name}: cdef_bits frames {}/{}/{}/{} (0/1/2/3); {} of {} 64x64 units \
                  on a non-default preset ({:.1}%)",
@@ -20340,7 +21929,15 @@ mod tests {
                 "{name}: motion_mode 32x32 SIMPLE={} OBMC={} WARP={} | 16x16 SIMPLE={} OBMC={} \
                  WARP={} | 8x8 SIMPLE={} OBMC={} WARP={} ({:.1}% OBMC / {:.1}% WARP of {} \
                  eligible)",
-                mm[0], mm[1], mm[2], mm[3], mm[4], mm[5], mm[6], mm[7], mm[8],
+                mm[0],
+                mm[1],
+                mm[2],
+                mm[3],
+                mm[4],
+                mm[5],
+                mm[6],
+                mm[7],
+                mm[8],
                 100.0 * (mm[1] + mm[4] + mm[7]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
                 100.0 * (mm[2] + mm[5] + mm[8]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
                 mm.iter().sum::<usize>(),
@@ -20404,34 +22001,64 @@ mod tests {
         // this row's four encodes -- the gate could not say whether a type
         // search fired at all (class `gate-blind-to-feature`).
         const NAMES: [&str; 16] = [
-            "IDTX", "DCT_DCT", "ADST_ADST", "ADST_DCT", "DCT_ADST", "V_DCT", "H_DCT",
-            "FLIPADST_DCT", "DCT_FLIPADST", "FLIPADST_FLIPADST", "ADST_FLIPADST",
-            "FLIPADST_ADST", "V_ADST", "H_ADST", "V_FLIPADST", "H_FLIPADST",
+            "IDTX",
+            "DCT_DCT",
+            "ADST_ADST",
+            "ADST_DCT",
+            "DCT_ADST",
+            "V_DCT",
+            "H_DCT",
+            "FLIPADST_DCT",
+            "DCT_FLIPADST",
+            "FLIPADST_FLIPADST",
+            "ADST_FLIPADST",
+            "FLIPADST_ADST",
+            "V_ADST",
+            "H_ADST",
+            "V_FLIPADST",
+            "H_FLIPADST",
         ];
         let name_of = |t: usize| NAMES[t];
-        for (label, hits) in [("inter", take_inter_tx_type_hits()), ("intra", take_tx_type_hits())] {
+        for (label, hits) in [
+            ("inter", take_inter_tx_type_hits()),
+            ("intra", take_tx_type_hits()),
+        ] {
             let total: usize = hits.iter().sum();
             let live: Vec<String> = hits
                 .iter()
                 .enumerate()
                 .filter(|&(_, &n)| n > 0)
-                .map(|(t, &n)| format!("{}={n} ({:.1}%)", name_of(t), 100.0 * n as f64 / total.max(1) as f64))
+                .map(|(t, &n)| {
+                    format!(
+                        "{}={n} ({:.1}%)",
+                        name_of(t),
+                        100.0 * n as f64 / total.max(1) as f64
+                    )
+                })
                 .collect();
-            eprintln!("{name}: {label} tx_type of {total} units -- {}", live.join(" "));
+            eprintln!(
+                "{name}: {label} tx_type of {total} units -- {}",
+                live.join(" ")
+            );
         }
         let t = take_txrd_stats();
         if t[0] > 0 {
             eprintln!(
                 "{name}: txrd flat decisions={} chosen sse={} bits={:.0} | DCT_DCT sse={} \
                  bits={:.0} (dsse {:+.2}%, dbits {:+.2}%)",
-                t[0], t[1], t[3] as f64 / 64.0, t[2], t[4] as f64 / 64.0,
+                t[0],
+                t[1],
+                t[3] as f64 / 64.0,
+                t[2],
+                t[4] as f64 / 64.0,
                 100.0 * (t[1] as f64 - t[2] as f64) / t[2].max(1) as f64,
                 100.0 * (t[3] as f64 - t[4] as f64) / t[4].max(1) as f64,
             );
             eprintln!(
                 "{name}: txrd DCT_DCT re-predicted HERE sse={} bits={:.0} (vs the passed-in \
                  flat: dsse {:+.2}%, dbits {:+.2}%)",
-                t[5], t[6] as f64 / 64.0,
+                t[5],
+                t[6] as f64 / 64.0,
                 100.0 * (t[5] as f64 - t[2] as f64) / t[2].max(1) as f64,
                 100.0 * (t[6] as f64 - t[4] as f64) / t[4].max(1) as f64,
             );
@@ -20455,9 +22082,13 @@ mod tests {
     /// read on.
     fn native_crop_override(clip: &str) -> Option<(String, usize, usize)> {
         let spec = std::env::var("EC_AV1_NATIVE_CROP").ok()?;
-        let (w, h) = spec.split_once('x').expect("EC_AV1_NATIVE_CROP is <width>x<height>");
-        let (cw, ch): (usize, usize) =
-            (w.parse().expect("crop width"), h.parse().expect("crop height"));
+        let (w, h) = spec
+            .split_once('x')
+            .expect("EC_AV1_NATIVE_CROP is <width>x<height>");
+        let (cw, ch): (usize, usize) = (
+            w.parse().expect("crop width"),
+            h.parse().expect("crop height"),
+        );
         let (nw, nh) = crate::probe::dims(clip)?;
         assert!(cw <= nw && ch <= nh, "{cw}x{ch} does not fit in {nw}x{nh}");
         let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
@@ -20491,9 +22122,11 @@ mod tests {
             }
             let path = fixtures.join("video").join(file);
             match path.exists() {
-                true => {
-                    clips.push((label.to_string(), path.to_str().unwrap().to_string(), "0".into()))
-                }
+                true => clips.push((
+                    label.to_string(),
+                    path.to_str().unwrap().to_string(),
+                    "0".into(),
+                )),
                 false => eprintln!("SKIP {label}: {file} missing"),
             }
         }
@@ -20521,7 +22154,12 @@ mod tests {
         };
         for (want, label, width, seek) in [
             (all || film, "film A (1080p source)", "1920", "00:35:00"),
-            (all || film4k, "film B (2160p HDR source)", "3840", "00:40:00"),
+            (
+                all || film4k,
+                "film B (2160p HDR source)",
+                "3840",
+                "00:40:00",
+            ),
         ] {
             if !want {
                 continue;
@@ -20537,14 +22175,19 @@ mod tests {
                     .lines()
                     .skip(1)
                     .filter_map(|l| l.split('\t').next())
-                    .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
-                {
+                    .find(|p| {
+                        p.contains("/OBS/")
+                            && p.ends_with(".mkv")
+                            && std::path::Path::new(p).exists()
+                    }) {
                     Some(p) => clips.push((
                         format!("screen capture ({})", p.rsplit('/').next().unwrap_or(p)),
                         p.to_string(),
                         "0".into(),
                     )),
-                    None => eprintln!("SKIP screen capture: no OBS recording in the manifest exists"),
+                    None => {
+                        eprintln!("SKIP screen capture: no OBS recording in the manifest exists")
+                    }
                 },
                 Err(e) => eprintln!("SKIP screen capture: no real-library manifest ({e})"),
             }
@@ -20719,7 +22362,9 @@ mod tests {
             intrabc_enabled(),
             palette_max_colors(),
         );
-        println!("| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |");
+        println!(
+            "| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |"
+        );
         println!("|---|---|---|---|---|");
         for (name, path, seek) in &clips {
             let fctx = &crate::decode::FrameCtx::for_encoder();
@@ -20834,7 +22479,15 @@ mod tests {
                 "{name}: motion_mode 32x32 SIMPLE={} OBMC={} WARP={} | 16x16 SIMPLE={} OBMC={} \
                  WARP={} | 8x8 SIMPLE={} OBMC={} WARP={} ({:.1}% OBMC / {:.1}% WARP of {} \
                  eligible)",
-                mm[0], mm[1], mm[2], mm[3], mm[4], mm[5], mm[6], mm[7], mm[8],
+                mm[0],
+                mm[1],
+                mm[2],
+                mm[3],
+                mm[4],
+                mm[5],
+                mm[6],
+                mm[7],
+                mm[8],
                 100.0 * (mm[1] + mm[4] + mm[7]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
                 100.0 * (mm[2] + mm[5] + mm[8]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
                 mm.iter().sum::<usize>(),
@@ -20850,7 +22503,11 @@ mod tests {
             eprintln!(
                 "{name}: references LAST {} LAST2 {} GOLDEN {} ALTREF {} of {} inter blocks \
                  (LAST2 {:.1}%)",
-                rh[1], rh[2], rh[4], rh[7], rtot,
+                rh[1],
+                rh[2],
+                rh[4],
+                rh[7],
+                rtot,
                 100.0 * rh[2] as f64 / rtot.max(1) as f64,
             );
             let palette = crate::tile::take_palette_hits();
@@ -20967,7 +22624,10 @@ mod tests {
                     let notes =
                         std::mem::take(&mut *LADDER_FAILURES.lock().expect("ladder failures"));
                     if !notes.is_empty() {
-                        eprintln!("{name} {label}: {} point(s) our decoder could not read (reference row, not a gate failure)", notes.len());
+                        eprintln!(
+                            "{name} {label}: {} point(s) our decoder could not read (reference row, not a gate failure)",
+                            notes.len()
+                        );
                     }
                     assert_monotone(&format!("{name}: {label}"), &lad);
                     println!(
@@ -21013,13 +22673,14 @@ mod tests {
             };
             let (cw, ch) = (nw.min(1920) / 128 * 128, nh.min(1024) / 128 * 128);
             let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
-            let source =
-                clip_frames_vf(path, "0", &format!("crop={cw}:{ch}:{x}:{y}"), cw, ch, 8);
+            let source = clip_frames_vf(path, "0", &format!("crop={cw}:{ch}:{x}:{y}"), cw, ch, 8);
             let mut costs: Vec<f64> = Vec::new();
             for pic in &source {
                 let y8: Vec<u8> = pic.y.iter().map(|&v| v as u8).collect();
                 costs.extend(
-                    super::tpl_intra_costs(&y8, cw, ch).iter().map(|&c| f64::from(c)),
+                    super::tpl_intra_costs(&y8, cw, ch)
+                        .iter()
+                        .map(|&c| f64::from(c)),
                 );
             }
             let mean = costs.iter().sum::<f64>() / costs.len() as f64;
@@ -21074,7 +22735,15 @@ mod tests {
         // window is a real derivation and not the frame itself -- exactly the
         // shape film B has (3840x1608, never 3840x2160).
         let ok = Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=384x202:rate=10"])
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=384x202:rate=10",
+            ])
             .args(["-frames:v", "20", "-pix_fmt", "yuv420p"])
             .arg(&clip)
             .status()
@@ -21091,7 +22760,9 @@ mod tests {
         let gate = clip_frames_vf(path, seek, &vf, w, h, 6);
         let probe = crate::probe::source(path, seek, &vf, w, h, 6);
         assert!(
-            gate.iter().zip(&probe).all(|(a, b)| a.y == b.y && a.u == b.u && a.v == b.v),
+            gate.iter()
+                .zip(&probe)
+                .all(|(a, b)| a.y == b.y && a.u == b.u && a.v == b.v),
             "the probe's source differs from the gate's at the same window"
         );
         let bytes = |src: &[Picture]| {
@@ -21099,7 +22770,11 @@ mod tests {
                 .unwrap()
                 .stream
         };
-        assert_eq!(bytes(&gate), bytes(&probe), "probe and gate code different bytes");
+        assert_eq!(
+            bytes(&gate),
+            bytes(&probe),
+            "probe and gate code different bytes"
+        );
         // The two witnesses that both halves of the arming reach ffmpeg: the
         // seek, and the crop's own offset (the film-B defect in miniature --
         // the probe was reading `crop=..:568` of a 1608-high frame).
@@ -21125,18 +22800,33 @@ mod tests {
     fn probe_parity_point() {
         let _knobs = crate::speed::knob_write();
         let g = |k: &str| std::env::var(k).unwrap();
-        let (w, h) = g("EC_PARITY_DIMS").split_once(':').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())).unwrap();
+        let (w, h) = g("EC_PARITY_DIMS")
+            .split_once(':')
+            .map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))
+            .unwrap();
         let frames: usize = g("EC_PARITY_FRAMES").parse().unwrap();
         let q: u8 = g("EC_PARITY_Q").parse().unwrap();
-        let source = clip_frames_vf(&g("EC_PARITY_CLIP"), &g("EC_PARITY_SS"), &g("EC_PARITY_VF"), w, h, frames);
+        let source = clip_frames_vf(
+            &g("EC_PARITY_CLIP"),
+            &g("EC_PARITY_SS"),
+            &g("EC_PARITY_VF"),
+            w,
+            h,
+            frames,
+        );
         let fctx = &crate::decode::FrameCtx::for_encoder();
         let e = encode_sequence_with_ctx(&source, q, 0.5, fctx).unwrap();
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for &b in &e.stream {
             hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
         }
-        eprintln!("PARITY q={q} bytes={} fnv1a={hash:016x} speed={} pyramid {:?} effective {:?}",
-            e.stream.len(), crate::speed::speed(), crate::encoder::Pyramid::from_env(), last_sequence_pyramid());
+        eprintln!(
+            "PARITY q={q} bytes={} fnv1a={hash:016x} speed={} pyramid {:?} effective {:?}",
+            e.stream.len(),
+            crate::speed::speed(),
+            crate::encoder::Pyramid::from_env(),
+            last_sequence_pyramid()
+        );
     }
     /// lane-refs/lane-last2: IS A SECOND PAST REFERENCE WORTH RETAINING? The
     /// lever this census priced SHIPS since lane-last2 (merge `321b2dc1`):
@@ -21186,7 +22876,11 @@ mod tests {
             for row in 0..SIDE {
                 let c = &cur.y[(by + row) * cur.width + bx..][..SIDE];
                 let p = &r.y[(sy + row) * r.width + sx..][..SIDE];
-                acc += c.iter().zip(p).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum::<u64>();
+                acc += c
+                    .iter()
+                    .zip(p)
+                    .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                    .sum::<u64>();
             }
             Some(acc)
         };
@@ -21194,11 +22888,23 @@ mod tests {
         // that still finds real pans. Both references get exactly this one,
         // so the comparison is search-fair.
         let search = |cur: &Picture, r: &Picture, bx: usize, by: usize| -> u64 {
-            let mut best = (sad(cur, r, bx, by, (0, 0)).unwrap_or(u64::MAX), (0isize, 0isize));
+            let mut best = (
+                sad(cur, r, bx, by, (0, 0)).unwrap_or(u64::MAX),
+                (0isize, 0isize),
+            );
             let mut step = 16isize;
             while step >= 1 {
                 let centre = best.1;
-                for (dy, dx) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+                for (dy, dx) in [
+                    (-1, -1),
+                    (-1, 0),
+                    (-1, 1),
+                    (0, -1),
+                    (0, 1),
+                    (1, -1),
+                    (1, 0),
+                    (1, 1),
+                ] {
                     let mv = (centre.0 + dy * step, centre.1 + dx * step);
                     if let Some(s) = sad(cur, r, bx, by, mv) {
                         if s < best.0 {
@@ -21210,7 +22916,9 @@ mod tests {
             }
             best.0
         };
-        println!("| clip | level (near/far lag) | blocks | far wins | far wins >10% | SAD near | SAD best-of | energy removed |");
+        println!(
+            "| clip | level (near/far lag) | blocks | far wins | far wins >10% | SAD near | SAD best-of | energy removed |"
+        );
         println!("|---|---|---|---|---|---|---|---|");
         for (name, path, seek) in native_gate_clips() {
             if !name.starts_with("film ") {
@@ -21298,7 +23006,11 @@ mod tests {
             for row in 0..SIDE {
                 let c = &cur[row * cw..][..SIDE];
                 let p = &r.y[(sy + row) * r.width + sx..][..SIDE];
-                acc += c.iter().zip(p).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum::<u64>();
+                acc += c
+                    .iter()
+                    .zip(p)
+                    .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                    .sum::<u64>();
             }
             Some((acc, (sy, sx)))
         };
@@ -21313,7 +23025,16 @@ mod tests {
             let mut step = 16isize;
             while step >= 1 {
                 let from = centre;
-                for (dy, dx) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+                for (dy, dx) in [
+                    (-1, -1),
+                    (-1, 0),
+                    (-1, 1),
+                    (0, -1),
+                    (0, 1),
+                    (1, -1),
+                    (1, 0),
+                    (1, 1),
+                ] {
                     let mv = (from.0 + dy * step, from.1 + dx * step);
                     if let Some(s) = at(cur, cw, r, bx, by, mv) {
                         if s.0 < best.0 {
@@ -21436,7 +23157,9 @@ mod tests {
         // the signal`). `panned_test_card` shifts by whole pixels, so the
         // search finds the sub-pel positions off the reconstruction instead:
         // three frames of a slow diagonal pan.
-        let pictures: Vec<Picture> = (0..3).map(|i| panned_test_card(width, height, i * 3)).collect();
+        let pictures: Vec<Picture> = (0..3)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
         let mut streams = Vec::new();
         for filter in [
             ec_av1_syntax::InterpolationFilter::Eighttap,
@@ -21450,7 +23173,10 @@ mod tests {
             let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
             assert_eq!(decoded.len(), 3, "{filter:?}: decoded frame count");
             for (i, (frame, decoded)) in encoded.frames.iter().zip(&decoded).enumerate() {
-                assert_eq!(decoded.y, frame.reconstruction.y, "{filter:?} frame {i}: luma");
+                assert_eq!(
+                    decoded.y, frame.reconstruction.y,
+                    "{filter:?} frame {i}: luma"
+                );
                 assert_eq!(decoded.u, frame.reconstruction.u, "{filter:?} frame {i}: U");
                 assert_eq!(decoded.v, frame.reconstruction.v, "{filter:?} frame {i}: V");
             }
@@ -21463,7 +23189,6 @@ mod tests {
             }
         }
     }
-
 
     /// lane-hpmv: THE EIGHTH-PEL VECTOR REACHES THE STREAM. With
     /// `allow_high_precision_mv` off the writer refuses an odd eighth-pel
@@ -21487,7 +23212,9 @@ mod tests {
             return;
         }
         let (width, height) = (256usize, 128usize);
-        let pictures: Vec<Picture> = (0..3).map(|i| panned_test_card(width, height, i * 3)).collect();
+        let pictures: Vec<Picture> = (0..3)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
         let mut arms = Vec::new();
         for hp in [false, true] {
             set_high_precision_mv(Some(hp));
@@ -21499,10 +23226,15 @@ mod tests {
             let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
             let ours = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
             assert_eq!(decoded.len(), pictures.len(), "hp={hp}: ffmpeg frame count");
-            assert_eq!(ours.len(), pictures.len(), "hp={hp}: our decoder frame count");
+            assert_eq!(
+                ours.len(),
+                pictures.len(),
+                "hp={hp}: our decoder frame count"
+            );
             for (i, e) in encoded.frames.iter().enumerate() {
                 for (who, got) in [("ffmpeg", &decoded[i]), ("our decoder", &ours[i])] {
-                    if let Some((plane, s, got, want)) = first_plane_mismatch(got, &e.reconstruction)
+                    if let Some((plane, s, got, want)) =
+                        first_plane_mismatch(got, &e.reconstruction)
                     {
                         panic!(
                             "hp={hp} frame {i} plane {plane} sample {s}: {who} decoded {got}, \
@@ -21515,8 +23247,15 @@ mod tests {
         }
         set_high_precision_mv(None);
         let (off, on) = (&arms[0], &arms[1]);
-        assert_eq!(off.0, 0, "a frame without the header bit codes no hp symbol");
-        assert!(on.0 > 0, "a high-precision frame codes hp symbols (got {})", on.0);
+        assert_eq!(
+            off.0, 0,
+            "a frame without the header bit codes no hp symbol"
+        );
+        assert!(
+            on.0 > 0,
+            "a high-precision frame codes hp symbols (got {})",
+            on.0
+        );
         assert!(
             on.1 > 0,
             "a high-precision frame codes eighth-pel vectors ({} hp symbols, none of them zero)",
