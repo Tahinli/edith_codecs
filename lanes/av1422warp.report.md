@@ -392,6 +392,63 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 17 — MEASURED: the bands MATCH, and round 15's mystery is solved
+
+Build discipline first: `touch` before `ninja`, and the known-firing rung
+verified at **744 `name=mode` lines** before any new field was trusted.
+All instrumentation reverted; `aomdec` restored (744 lines, zero stray
+strings), 4:2:0 control byte-exact.
+
+**Round 15's mystery, solved.** The `MODECTX` rung there did not
+"fail to fire" — it fired, printed for the first block, and then the
+**process died**. `above_mi` is NULL for a block on the frame's first
+row (and `left_mi` on its first column), and the unguarded
+`above_mi->mode` dereference killed the decode, so nothing after that
+one line was ever emitted. A `MODEMARK` printed BEFORE the field access
+made it unambiguous: 1 marker, 0 mode lines. Guarded
+(`above_mi ? above_mi->mode : -1`), the extended print works and the
+rung returns to 744. **Round 15's conclusion was an artefact of a NULL
+dereference, and is now closed rather than left as a mystery.**
+
+**The band-match verdict: THEY MATCH.** With the guard, the oracle at
+mi(64,24) reports
+
+```
+EC_ISTEP mi_row=64 mi_col=24 name=mode val=6 rng=44416 above_mode=0 left_mode=6
+```
+
+against ours `above_mode=0 left_mode=6 above_ctx=0 left_ctx=4 -> mode=1`.
+Compared across the WHOLE frame — all 744 mode reads, ours from all
+three `kf_y_mode` sites (square, rect, sub-8) — the contexts are
+identical up to and including mi(64,24) (oracle mode-read index 723 of
+744). The 37 raw differences are all libaom's NULL neighbour (`-1`)
+against our `DC_PRED`, which `get_y_mode_cdf` maps to the same context;
+after that mapping 17 remain, and **every one of them is at index >= 724,
+i.e. strictly after the divergence**. The first differing context is the
+first one downstream of it.
+
+**So: not a neighbour-lookup defect.** The lane-rectx r5 mi-exact
+override hypothesis is **ruled out** for this block — the square path's
+coarse bands carry exactly what libaom's `above_mbmi` / `left_mbmi`
+carry here. (Whether the square path *should* use the mi-exact map
+generally is a separate question this block does not answer.)
+
+**Where that leaves the defect.** Same context, same bit position,
+different symbol value (1 against 6) — so the divergence is the
+`kf_y_mode[0][4]` **table state**, not the row. AV1's
+`aom_read_symbol` adapts backwards as well as forwards, so a read from a
+NEIGHBOURING row can move `[0][4]` without moving any bit position, and
+the ladder cannot see that. Main's step 4 is therefore the live
+question and the one worth the next round.
+
+**Unblock.** Print `kf_y_mode[0][4]` (and the whole `kf_y_mode` table, or
+just that entry) immediately BEFORE the mi(64,24) mode read on both
+sides. If the entry already differs, the drift is upstream and the
+first read that moved it is findable by walking the table backwards
+across the 723 preceding mode reads. If the entry agrees and only the
+decoded value differs, the defect is in the symbol decode itself, not
+in the table — a much narrower target.
+
 ### Round 16 — the unblock was NOT completed, and a build hazard was found
 
 No code change; `aomdec` restored to its committed shape
@@ -456,8 +513,11 @@ MODECTXM mi=(64,24) above_mode=0 left_mode=6 above_ctx=0 left_ctx=4
 ```
 
 **The oracle side could not be measured, and this lane will not guess
-past that — see round 16, which found the likely reason and leaves the
-conclusion UNVERIFIED.** A `MODECTX` rung placed immediately above
+past that — SOLVED in round 17: the rung fired and the unguarded
+`above_mi->mode` dereference killed the decode at the frame's first
+row, so nothing after the first line was ever emitted. Guarded, the
+extended print works. Round 15's "does not fire" was a NULL
+dereference, not a property of the decoder. A `MODECTX` rung placed immediately above
 `mbmi->mode = read_intra_mode(r, get_y_mode_cdf(ec_ctx, above_mi,
 left_mi))` in `decodemv.c:936`, rebuilt, with its format string
 confirmed present in the binary and the env var set, emits nothing —
