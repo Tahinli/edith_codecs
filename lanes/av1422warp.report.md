@@ -1290,10 +1290,11 @@ oracle  mi(24,57) skip cdef dq  mode=0  angle_y=0
                    uv_mode=13  angle_uv=0  use_filter_intra=1  filter_intra_mode=0
 ```
 
-**This decoder reads no chroma syntax at all on that leaf** — it treats
-the odd mi column as never a chroma reference. libaom reads four more
-symbols there, and across the trace it reads `uv_mode` at odd columns
-118 times, so this is systematic, not a one-off.
+**RETRACTED — see round 23.** "This decoder reads no chroma syntax at
+all on that leaf" was read off `EC_ISTEP`, and
+`read_intra_mode_sub8` emits no `istep!` for `uv_mode` or
+`use_filter_intra`, so their absence proves nothing. The leaf IS reached
+through `decode_leaf_split4` with `has_chroma=true`.
 
 libaom's actual predicate (`av1_common_int.h:1459-1460`) is per axis
 
@@ -1328,6 +1329,75 @@ under which those two are reached for a 4x4 leaf at an odd column),
 apply the `av1_common_int.h:1459-1460` predicate, and re-run the
 sequence diff: the EC_SYMR instrument is a working oracle for it and
 pictures 0/1/2 are per-TU exact as the baseline.
+
+Not pinned, no gate, refusal untouched.
+
+## Round 23 — the third path IS `decode_leaf_split4`, and round 22's read of it was a rung gap
+
+No code shipped; tree back at `7d274652`, bypass reverted, 4:2:0 control
+byte-exact.
+
+### Path identified (`#[track_caller]` on `read_intra_mode_sub8`)
+
+The 4x4 sub-8x8 leaf at mi(24,57) is read by the call at
+`decode.rs:21098` — inside **`decode_leaf_split4`**, not a third path.
+The attribution of all 370 sub-8x8 mode reads splits 236 /
+`decode_leaf_split4` and 134 / `decode_leaf_rect8`. The round-22
+conclusion that "neither arm is called for it" was wrong: the
+`has_chroma` trace added in round 22 was grepped on the wrong field name
+(`col=` against a format that prints `lmi=(...)`), so its "never fired
+for mi(24,57)" was a grep artefact.
+
+Re-run correctly, at that leaf:
+
+```
+HC split4 lmi=(24,55) i=1 c422=true has_chroma=true
+HC split4 lmi=(24,56) i=0 c422=true has_chroma=false
+HC split4 lmi=(24,57) i=1 c422=true has_chroma=true
+```
+
+**So `has_chroma` is TRUE at mi(24,57)** and this decoder's chroma
+gate is open and correct there.
+
+### Round 22's central claim is WITHDRAWN
+
+Round 22 concluded "this decoder reads no chroma syntax at that leaf,
+where libaom reads uv_mode/angle_uv/use_filter_intra/filter_intra_mode"
+and built the odd-column theory on it. That was read off `EC_ISTEP` —
+and **`read_intra_mode_sub8` emits no `istep!` for `uv_mode` or
+`use_filter_intra` at all** (its `chroma` and `filter_intra` blocks print
+only under the separate `trace` flag, decode.rs:20406-20449). Their
+absence from `EC_ISTEP` is a rung gap, not evidence that the symbol went
+unread. This is the same class of error as rounds 8, 11 and 15: a
+conclusion from a print without checking that the print covers the site.
+
+What survives from round 22: the loop filters are exonerated, and the
+first damaged picture is 3 with the read-107517 divergence in it.
+
+### What the evidence now supports
+
+`has_chroma=true` at mi(24,57) and yet the EC_SYMR sequence diverges
+there — so if the chroma symbols are read (which the open gate says they
+should be), the divergence is a VALUE or ROW difference inside them
+rather than a missing read, and the "n=2, n=2, n=8 against a bare n=8"
+shape needs re-reading against a trace that actually covers the sub-8x8
+chroma symbols.
+
+`decode_leaf_rect8`'s column-parity correction is therefore **still
+unlanded** — the evidence that motivated it has collapsed, and it stays
+correct-by-source-but-unwitnessed rather than committed on a theory
+this lane has already had to retract once.
+
+### Handoff
+
+The right instrument, and it is a small edit: put the **mi coordinates
+into the `EC_SYMR` print itself** (it currently has no mi, which is why
+read 107517 could only be located by a fragile cross-file correlation
+against a trace whose rungs do not cover the sub-8x8 chroma symbols).
+With `EC_SYMR ... mi=(r,c)` on both sides, read 107517 names its own
+block, the n=2/n=2/n=8 vs n=8 shape can be attributed to real symbols,
+and the same diff runs per picture against the pictures 0/1/2 exact
+baseline.
 
 Not pinned, no gate, refusal untouched.
 
