@@ -392,6 +392,76 @@ tx_size lookup (the oracle's `get_tx_size_context` for that block is
 printable and ours computes the same `above + left` form as everywhere
 else).
 
+### Round 12 — CORRECTION to round 11: the extra reads are real, the CAUSE is not what round 11 said
+
+Round 11 was wrong twice over, both times from trusting a print
+without checking how it is emitted. Recorded here rather than left
+standing.
+
+**Error 1, a parse artefact.** The oracle's `EC_ISTEP` lines carry
+`bitpos=` but the insertion point placed it after the format string's
+`\n`, so the position lands on the PREVIOUS line. Round 11's
+line-filtered window therefore dropped every oracle `use_filter_intra` /
+`filter_intra_mode` line it was looking for. Re-parsed RECORD-WISE
+(splitting on `EC_ISTEP` and reading the bit position out of the record
+rather than the physical line), the oracle emits 241 `use_filter_intra`
+lines and the two sides read:
+
+```
+ORACLE  [92304] skip/cdef/dq   [92305] mode 0  angle_y 0
+        [92309] uv_mode 4      [92312] angle_uv -2
+        [92323] skip  <- next block, no filter_intra in between
+OURS    [92304] skip/cdef/dq   [92305] mode 0  angle_y 0
+        [92309] uv_mode 4      [92312] angle_uv -2
+        [92312] use_filter_intra  val=1
+        [92313] filter_intra_mode val=3
+        [92323] skip
+```
+
+So the OBSERVATION survives the correction: at mi(68,16) we make those
+two reads and the oracle shows none in that span.
+
+**Error 2, and this one kills round 11's conclusion.** Round 11 said
+libaom's `av1_filter_intra_allowed` should have suppressed them and that
+the suppressing input was `enable_filter_intra` or `palette_size[0]`.
+Measured directly, with a rung inside libaom's own
+`read_filter_intra_mode_info`:
+
+```
+PALSZ mi=68,16 bsize=8 mode=0 psize0=0 efi=1 wide=32 high=16 allowed=1
+```
+
+**`allowed=1`.** libaom's predicate is SATISFIED at that block — mode is
+DC_PRED (0), `palette_size[0]` is 0, `enable_filter_intra` is 1, and the
+32x16 footprint passes `wide <= 32 && high <= 32`. So libaom DOES read
+`use_filter_intra` there, and round 11's "the read should not have
+happened" framing is wrong. The two unmeasured inputs were measured and
+BOTH AGREE with us; there is no stale palette state and no header-bit
+disagreement.
+
+**What is left, stated honestly.** Our two extra reads are real in the
+bit stream, and libaom's own predicate says the corresponding reads are
+allowed — so the divergence is NOT a missing/extra gate in the sense
+round 11 described, and this lane cannot say what it is. The one
+remaining tension is internal to the instrumented oracle: its
+`allowed=1` and its absent `use_filter_intra` EC_ISTEP at mi(68,16) do
+not sit together, which points at the ORACLE's instrumentation (the
+`EC_ISTEP` print is inside the `if`, and something about that path is not
+reaching it) rather than at a decoder defect. **The next lane should
+re-verify the oracle side before touching ours** — on the strength of
+rounds 8, 11 and 12, this tree has twice rewarded a conclusion that a
+single print, read without checking its emission or its guard,
+contradicted.
+
+**Unblock, restated.** Do NOT gate our `use_filter_intra` read. First
+settle the oracle: does an unmodified-ish `aomdec` consume the
+`use_filter_intra` symbol at mi(68,16)? Compare its bit position after
+`angle_uv` with aomdec's mode-info trace, with the print placed so its
+bit position is on the SAME line (append the field before the `\n`).
+Only if the oracle genuinely does not consume it is our read the defect,
+and then the predicate that would have to differ is not
+`av1_filter_intra_allowed` — it is whatever else gates the call.
+
 ### Round 11 — the two extra reads are NAMED: `use_filter_intra` + `filter_intra_mode`
 
 Bit positions added to the MODE rungs on both sides (our `EC_ISTEP`
