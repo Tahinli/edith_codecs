@@ -363,6 +363,47 @@ byte-identical to the pre-lane build; pinned `422_allskip_2f.obu` and
 `422_sb128_3f.obu` still pixel-exact. The gate is ss (1,0), so the sampler
 is not reached at 4:2:0 or 4:4:4 at all.
 
+### Round 7 — the mi(64,24) boundary localized to a PARTITION/bsize decision
+
+Paired on `a1_f0.obu` with the round-6 fix in place. The boundary is a
+**block-structure** decision, not a transform lookup and not another
+neighbour vote:
+
+```
+oracle  EC_IMODE mi_row=64 mi_col=24 bsize=9                 (BLOCK_64X32)
+        -> codes a 32x32 luma TU (TU 2428, sum 174006), chroma 16x32
+ours    EC_IMODE mi_row=64 mi_col=24 fn=sq side=32           (a 32x32 SQUARE)
+        EC_ISTEP ... name=tx_depth val=2 ctx=1               -> 32 >> 2 = TX_8X8
+        -> codes 8x8 leaves (sum 10816), chroma 8x8
+```
+
+So at the same mi the oracle walks a 64x32 rect and we walk a 32x32
+square — the PARTITION symbol, not `tx_depth`, is where the two decoders
+part company. The block sits on the frame's last superblock row (288
+tall, SB rows at 0/128/256, the last only 32 rows), inside SB(mi_row 64,
+mi_col 0).
+
+**Where the reader actually parts.** Both step traces already differ at
+that block's FIRST symbol (`skip`, oracle rng 39524 against ours 40716),
+so the desync precedes it; and the coefficient ladder pairs through unit
+2427, which is mi(68,16)'s V chroma. The window is therefore the reads
+between mi(68,16)'s chroma tail and mi(64,24)'s mode read — not the
+tx_size lookup (the oracle's `get_tx_size_context` for that block is
+printable and ours computes the same `above + left` form as everywhere
+else).
+
+**Why this round stops here rather than continuing.** The partition rungs
+this lane has — ours `EC_TRACE_PART`, the oracle's `AOMMB` — do not fire
+for these blocks at all, and the bit-position rungs used in rounds 5-6 are
+reverted. Closing this needs a fresh instrumentation round aimed at the
+SUPERBLOCK partition symbol and its context, which is a scheduling
+decision rather than another step inside this lane. Flagged as such.
+
+**Still open, same structure family:** the scan-table disagreement recorded
+above (unit 1418, values matching by scan index but positions not). It is
+in this same block/transform-structure family and should be looked at
+alongside this boundary.
+
 **Hand-off, new class.** The new first divergence is at coefficient unit
 2427 / TU 2428, mi(64,24), where the oracle codes a **32x32** luma TU and
 we code **8x8** leaves. That is block/partition structure, not a neighbour
