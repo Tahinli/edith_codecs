@@ -36,6 +36,13 @@ fn main() {
                 buf.extend_from_slice(&s.to_le_bytes());
             }
         }
+        // `i` indexes `decode_stream`'s output, which is DISPLAY order and
+        // SHOWN frames only -- hidden alt-refs are never emitted. Every other
+        // `.f{N}` in this crate (EC_AV1_FINAL_DUMP, EC_AV1_DECODE_ORDER_DUMP,
+        // EC_AV1_PREFILT_DUMP) uses a DECODE index, so this file does NOT line
+        // up with an aomdec dump past frame 0 on a stream with altref. Compare
+        // against ffmpeg rawvideo, or against aomdec via
+        // `decode_all_frames_vs_oracle`.
         let name = format!("{out}.f{i}.yuv");
         if let Err(e) = std::fs::write(&name, &buf) {
             eprintln!("{name}: {e}");

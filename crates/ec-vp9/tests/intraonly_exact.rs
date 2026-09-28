@@ -80,6 +80,11 @@ fn intra_only_frame_and_its_successors_match_ffmpeg() {
             got.extend(pic.y.iter().map(|&v| v as u8));
             got.extend(pic.u.iter().map(|&v| v as u8));
             got.extend(pic.v.iter().map(|&v| v as u8));
+            assert_eq!(
+                got.len(),
+                frame_bytes,
+                "frame {i}: our planes are {w}x{h} I420"
+            );
             let diff = got.iter().zip(want).position(|(a, b)| a != b);
             assert!(
                 diff.is_none(),
