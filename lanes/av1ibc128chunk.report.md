@@ -193,7 +193,8 @@ to verify. Measured unreachability: a temporary env-gated counter in the arm
 records **0 hits across the whole `lossless` and `intrabc` gate battery**
 (13 + 19 tests). Unblock: one lossless sb128 4:2:0 stream coding a NON-SKIP
 128-root intrabc strip (`--lossless=1 --sb-size=128 --min-partition-size=64
-then the twin's raster reshape plus a witness. Carried as a named pre-existing,
+--enable-rect-partitions=1 --enable-intrabc=1` over near-match screen
+content), then the twin's raster reshape plus a witness. Carried as a named pre-existing,
 not as a silent skip.
 
 **Re-measured after the reshape (r2):** both witnesses byte-identical to
