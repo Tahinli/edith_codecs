@@ -50,6 +50,12 @@ fn main() {
             "chroma422_pair_wide: {}",
             ec_av1::decode::chroma422_pair_wide_hits()
         );
+        println!(
+            "uv_left_ss_y: reads={} mode_diff={} smooth_diff={}",
+            ec_av1::decode::uv_left_ss_y_reads(),
+            ec_av1::decode::uv_left_ss_y_mode_diff_hits(),
+            ec_av1::decode::uv_left_ss_y_smooth_diff_hits()
+        );
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
         println!(
