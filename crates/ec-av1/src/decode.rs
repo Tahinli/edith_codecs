@@ -12886,38 +12886,97 @@ fn decode_intrabc_128rect(
         let cu = if lossless(fctx) { 4usize } else { 32usize };
         // The unit's own footprint on the LUMA mi grid (the chroma context
         // bands are luma-mi indexed, [`Self::record_mi_chroma`]'s
-        // convention), PER AXIS: `cu << ss` px, i.e. 8 px per TX_4X4 unit and
+        // convention), PER AXIS: `cu << ss` px, i.e. 8 px per TX_4x4 unit and
         // 64 px per TX_32X32 one at 4:2:0 -- 4 px / 32 px at 4:2:2.
         let unit_luma_w = cu << ss_x(fctx);
         let unit_luma_h = cu << ss_y(fctx);
-        // Raster over the block's chroma plane, one mu chunk per axis step at
-        // its own per-axis chroma extent (the same extents the read loop
-        // above laid the composed grid out at) -- a unit the frame edge
-        // clipped codes nothing and carries no composed samples beyond the
-        // clip, so it replays as the zero state exactly like libaom's
-        // uncoded unit. lane-av1-ibc128chunk: the old `chunk_chroma = cside *
-        // 64 / side` cut the replay's step to the 4:2:0 square on BOTH axes,
-        // so at 4:2:2 it walked a 32-row step down a 64-row chunk and
-        // re-stamped a 16x16-mi span over an 8-row-tall unit.
+        // A 64x64 mu chunk's chroma plane block is PER-AXIS
+        // `(64 >> ss_x) x (64 >> ss_y)` -- 32x32 at 4:2:0 (ONE TX_32X32 per
+        // chunk), 32x64 at 4:2:2 (TWO STACKED), 64x64 at 4:4:4 (FOUR);
+        // `av1_get_max_uv_txsize` caps the unit at 32 on each axis.
         let chunk_chroma_w = (64usize) >> ss_x(fctx);
         let chunk_chroma_h = (64usize) >> ss_y(fctx);
-        let (rows, cols) = ((ch / chunk_chroma_h).max(1), (cw / chunk_chroma_w).max(1));
-        for cr in 0..rows {
-            for cc in 0..cols {
-                let unit_mi = (
-                    mi_r + cr * (unit_luma_h / MI),
-                    mi_c + cc * (unit_luma_w / MI),
-                );
-                for (plane_idx, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
-                    let mut unit = Vec::with_capacity(cu * cu);
-                    for rr in 0..cu {
-                        let start = (cr * chunk_chroma_h + rr) * cside
-                            + cc * chunk_chroma_w;
-                        unit.extend_from_slice(&grid[start..start + cu]);
-                    }
-                    neighbours.record_mi_chroma(
-                        unit_mi, unit_luma_w, unit_luma_h, plane_idx, &unit,
+        if lossless(fctx) {
+            // lane-av1-ibc128chunk, PRE-EXISTING and NOT this lane's: on a
+            // LOSSLESS frame `cu` is 4 and the composed plane grid is a raster
+            // of TX_4x4 units, not a `cu`-per-chunk tiling -- so `rows`/`cols`
+            // below (which count mu CHUNKS at the 4:2:0 chunk extent) do not
+            // enumerate it, and this arm re-stamps only the 4x4 at each
+            // chunk's top-left with a 2x2-mi span. The twin
+            // (`decode_inter_block`'s `mu_chroma_units`, lane-av1-llinter)
+            // instead raster-walks the WHOLE plane block at `cu` steps, and
+            // that is the correct shape here too. It is left as-is on purpose:
+            // it is a 4:2:0 defect, not a subsampling square-cut, and fixing
+            // it would change 4:2:0 LOSSLESS output -- which this lane's
+            // byte-identity requirement forbids doing on an unverified
+            // reconstruction. Measured unreachability: this arm is entered
+            // 0 times by the whole `lossless` and `intrabc` gate battery
+            // (temporary env-gated counter in the arm). Unblock: one
+            // lossless sb128 4:2:0 stream coding a NON-SKIP 128-root
+            // intrabc strip (`--lossless=1 --sb-size=128
+            // --min-partition-size=64 --enable-rect-partitions=1
+            // --enable-intrabc=1` over near-match screen content).
+            let (rows, cols) = ((ch / chunk_chroma_h).max(1), (cw / chunk_chroma_w).max(1));
+            for cr in 0..rows {
+                for cc in 0..cols {
+                    let unit_mi = (
+                        mi_r + cr * (unit_luma_h / MI),
+                        mi_c + cc * (unit_luma_w / MI),
                     );
+                    for (plane_idx, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
+                        let mut unit = Vec::with_capacity(cu * cu);
+                        for rr in 0..cu {
+                            let start = (cr * chunk_chroma_h + rr) * cside
+                                + cc * chunk_chroma_w;
+                            unit.extend_from_slice(&grid[start..start + cu]);
+                        }
+                        neighbours.record_mi_chroma(
+                            unit_mi, unit_luma_w, unit_luma_h, plane_idx, &unit,
+                        );
+                    }
+                }
+            }
+        } else {
+            // The chunk count on each axis, then EVERY unit inside each
+            // chunk at its own mi origin, its own `(cu << ss)`-px entropy-cell
+            // span, and its own quadrant of the composed plane grid -- the
+            // twin's loop (decode_inter_block's `mu_chroma_units`,
+            // lane-av1-444 c8). lane-av1-ibc128chunk: the loop used to count
+            // mu CHUNKS in `rows`/`cols` and then step the mi origin and read
+            // the grid PER UNIT, which only agrees when a chunk holds exactly
+            // one unit. At 4:2:0 (`chunk_chroma == cu`) it is
+            // line-identical to the old walk; at 4:2:2 and 4:4:4 a chunk holds
+            // 2 or 4, so the old body reached only the first of the stacked
+            // units and the rest of the chunk kept the composed-grid smearing
+            // this replay exists to undo. A unit the frame edge clipped codes
+            // nothing and carries no composed samples beyond the clip, so it
+            // replays as the zero state exactly like libaom's uncoded unit.
+            let (ur, uc) = (chunk_chroma_h / cu, chunk_chroma_w / cu);
+            let (rows, cols) = ((ch / chunk_chroma_h).max(1), (cw / chunk_chroma_w).max(1));
+            for cr in 0..rows {
+                for cc in 0..cols {
+                    for kr in 0..ur {
+                        for kc in 0..uc {
+                            let unit_mi = (
+                                mi_r + (cr * 64 + kr * unit_luma_h) / MI,
+                                mi_c + (cc * 64 + kc * unit_luma_w) / MI,
+                            );
+                            let (cy, cx) = (
+                                cr * chunk_chroma_h + kr * cu,
+                                cc * chunk_chroma_w + kc * cu,
+                            );
+                            for (plane_idx, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
+                                let mut unit = Vec::with_capacity(cu * cu);
+                                for rr in 0..cu {
+                                    let start = (cy + rr) * cside + cx;
+                                    unit.extend_from_slice(&grid[start..start + cu]);
+                                }
+                                neighbours.record_mi_chroma(
+                                    unit_mi, unit_luma_w, unit_luma_h, plane_idx, &unit,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

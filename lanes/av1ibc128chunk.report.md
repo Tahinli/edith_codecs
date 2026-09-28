@@ -118,14 +118,22 @@ build, compared with `cmp` on the full raw output.
 | `422_intrabc_sb128_strip_notxsearch.obu` | parent `a7d22aec` | **2** | **8** | **DIFF** |
 | `422_intrabc_sb128_strip_notxsearch.obu` | this lane | **6** | **48** | **EXACT** |
 
-Frame-level detail on the primary witness (245760 samples/frame: 384x320 Y +
-2 x 192x320 chroma):
+Frame-level detail, per fixture (245760 samples/frame: 384x320 Y + 2 x 192x320
+chroma), re-measured per fixture after review — the first cut of this section
+reported the `_notxsearch` arm's counts under the primary witness:
 
-- **red**, frame 0: 45135 samples differ, first at byte 98368 = Y **row 256,
-  col 64** — the top-left of the first 128x64 intrabc block (traced at
-  `mi_row=64 mi_col=0`, `py = 64*4 = 256`). Frame 3 the same shape (44540
-  samples, same first offset). Frames 1, 2, 4 exact (no intrabc block).
-- **fixed**: `cmp` identical on all 245760 x 5 bytes; 5 frames decoded, 0 hidden.
+| fixture | build | f0 | f1 | f2 | f3 | f4 |
+|---|---|---|---|---|---|---|
+| `422_intrabc_sb128_strip.obu` (primary) | parent `a7d22aec` | **46891** | 0 | 0 | **44842** | 0 |
+| `422_intrabc_sb128_strip.obu` (primary) | this lane | 0 | 0 | 0 | 0 | 0 |
+| `422_intrabc_sb128_strip_notxsearch.obu` | parent `a7d22aec` | **45135** | 0 | 0 | **44540** | 0 |
+| `422_intrabc_sb128_strip_notxsearch.obu` | this lane | 0 | 0 | 0 | 0 | 0 |
+
+Both fixtures' red first difference is byte 98368 = frame 0, Y **row 256,
+col 64** — the top-left of the first 128x64 intrabc block (traced at
+`mi_row=64 mi_col=0`, `py = 64*4 = 256`). Frames 1, 2, 4 carry no intrabc
+block and are exact in every build. Green: `cmp` identical on all
+245760 x 5 bytes, 5 frames decoded, 0 hidden.
 
 The red build reached only 2 of the 6 blocks: reading 4 chroma units where
 libaom codes 8 desynced the tile, and the remaining 4 blocks were misparsed.
@@ -136,6 +144,70 @@ position (`rng=49296` at the first block in both):
 
     red    4 stamps  (1 per plane per chunk, 2 chunks)
     fixed  8 stamps  (2 per plane per chunk, 2 chunks)
+
+## Rework after review (r2) — the `mu_chroma` replay's chunk/unit step
+
+Review r1 FAILed the first cut on a real coverage regression I introduced, and
+corrected this report's red counts (done above; the 45135/44540 pair was the
+`_notxsearch` arm, the primary's are 46891/44842).
+
+**The defect.** The first cut gave the replay per-axis *extents* but kept the
+old *step*: `rows`/`cols` count mu CHUNKS (`ch / chunk_chroma_h`), while the
+loop body advanced the mi origin and read the grid PER UNIT
+(`cr * (unit_luma_h / MI)`, grid `(cr * chunk_chroma_h)`). Those agree only when
+a chunk holds exactly one unit. At 4:2:0 (`chunk_chroma == cu == 32`) it is
+line-identical to the parent, so nothing measured it; at 4:2:2
+(`chunk_chroma_h = 64 = 2 * cu`) the body reached only the FIRST of the two
+stacked units per chunk, so rows `mi_r+8 .. mi_r+16` kept the composed-grid
+smearing the replay exists to undo. The parent reached those rows (with a wrong
+span but full coverage), so this was a coverage regression *my* patch added,
+not a pre-existing gap.
+
+**The reshape**, in the twin's chunk-then-unit loop
+(`decode_inter_block`'s `mu_chroma_units`, decode.rs:37456-37494,
+lane-av1-444 c8):
+
+    let (ur, uc) = (chunk_chroma_h / cu, chunk_chroma_w / cu);
+    for cr in 0..rows { for cc in 0..cols {
+      for kr in 0..ur { for kc in 0..uc {
+        unit_mi = (mi_r + (cr * 64 + kr * unit_luma_h) / MI,
+                   mi_c + (cc * 64 + kc * unit_luma_w) / MI);
+        (cy, cx) = (cr * chunk_chroma_h + kr * cu, cc * chunk_chroma_w + kc * cu);
+        ... let start = (cy + rr) * cside + cx;
+
+`cr * 64` is the mu chunk's LUMA-px step, which is 64 on both axes at every
+subsampling — that is why the twin can write it unshifted. At 4:2:0 `ur`/`uc`
+are 1, so `kr`/`kc` are 0, `unit_mi` collapses to `mi_r + cr*16`, and the grid
+origin to `(cr*32, cc*32)`: **line-identical to the pre-rework walk**. The new
+gate pins the shape, and the mutation proof below shows it is load-bearing.
+
+**The LOSSLESS arm is pre-existing and deliberately untouched.** On a lossless
+frame `cu` is 4 and the composed grid is a raster of TX_4x4 units, so the
+chunk-counted `rows`/`cols` do not enumerate it at all: that arm re-stamps only
+the 4x4 at each chunk's top-left with a 2x2-mi span. The twin raster-walks the
+whole plane block instead (lane-av1-llinter). It is left as-is on purpose: it is
+a **4:2:0** defect, not a subsampling square-cut, so it is out of this lane's
+class, and fixing it would change 4:2:0 LOSSLESS output — which this lane's
+byte-identity requirement forbids doing on a reconstruction I have no witness
+to verify. Measured unreachability: a temporary env-gated counter in the arm
+records **0 hits across the whole `lossless` and `intrabc` gate battery**
+(13 + 19 tests). Unblock: one lossless sb128 4:2:0 stream coding a NON-SKIP
+128-root intrabc strip (`--lossless=1 --sb-size=128 --min-partition-size=64
+then the twin's raster reshape plus a witness. Carried as a named pre-existing,
+not as a silent skip.
+
+**Re-measured after the reshape (r2):** both witnesses byte-identical to
+`a7d22aec`-relative tip r1's output (6 blocks, 48 chroma units, 5/5 frames exact
+vs `aomdec`) — the reshape is a pure coverage repair, no output change on any
+witness. `an_sb128_rect_strip_with_intrabc_decodes_pixel_exact`,
+`an_sb128_screen_stream_with_intrabc_decodes_pixel_exact`,
+`a_lossless_sb128_rect_intra_block_decodes_sample_exact`,
+`a_444_sb128_root_rect_stream_with_restoration_decodes_pixel_exact`,
+`the_pinned_422_bigblock_witnesses_are_present_and_refuse_by_name` and both new
+gates: **7 passed / 0 failed**. Two mutation proofs on the source-scan arm,
+both FAILING it: forcing `let (ur, uc) = (1, 1);` (the per-chunk-only shape)
+gives `found 0`; re-introducing `cside * 64 / side` at the read-walk site gives
+`left: 1, right: 0`. Restored, the gate passes.
 
 ## Reproduce (patch-run-restore, local only)
 
@@ -171,13 +243,16 @@ position (`rng=49296` at the first block in both):
   source-scan arm. Scans `decode_intrabc_128rect`'s body **with comments
   stripped** (the fix's own comments quote the old expression to say what it
   was) and pins: zero `cside * 64 / side`; the `chunk_chroma_w/h` pair at
-  **both** de-square-cut sites (read walk and `mu_chroma` replay); the
+  **both** de-square-cut sites (read walk and `mu_chroma` replay); the replay's
+  chunk-then-unit shape (`let (ur, uc) = (chunk_chroma_h / cu, chunk_chroma_w /
+  cu);`, `for kr in 0..ur {`, `for kc in 0..uc {` — the r2 coverage fix); the
   `unit_luma_w/h`, `cw/ch`, `cpx/cpy` and `around_mi_rect` forms once each; the
   replay's own `cu << ss` pair; the per-axis unit arithmetic
   (`(64>>ss_x)/32 * (64>>ss_y)/32` = 1 / 2 / 4 at 4:2:0 / 4:2:2 / 4:4:4); and
-  both new counter accessors. **Non-vacuity measured**: re-introducing
-  `let chunk_chroma_w = cside * 64 / side;` at the read-walk site makes it fail
-  with `left: 1, right: 0`; restored, it passes.
+  both new counter accessors. **Non-vacuity measured twice**: forcing
+  `let (ur, uc) = (1, 1);` (the per-chunk-only shape) fails it with
+  `found 0`, and re-introducing `let chunk_chroma_w = cside * 64 / side;` at
+  the read-walk site fails it with `left: 1, right: 0`; restored, it passes.
 
 ## Byte-identity outside 4:2:2
 
