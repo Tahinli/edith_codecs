@@ -321,17 +321,40 @@ is out of scope for this round, so the merge candidate is the H1 fix (exact,
 gated, mutation-proven) plus the measured `own444` gate on the intra-BC 1:4
 geometry, and the chroma root goes on as a fresh task with the numbers above.
 
+**The fastest next measurement** (Selin2-2, from the H2 round): the per-unit
+`txtype` census from the oracle's `idct.c` rung. On H2 it found the fault in
+one pass — two chroma units whose `txtype` differed from what the block-level
+type implied, on a frame where every luma unit was IDTX, so "luma is exact"
+carried no information. This cell has exactly that asymmetry (entropy fork on
+a chroma unit, luma clean), so the census decides in about a minute whether
+the fork is a coefficient-read problem or a type/extent problem — the only
+fork left in this cell.
+
 ## 7. Residue handed on, not fixed here
 
 - **4:4:4 intra-BC chroma** — a 4x8 rect coefficient unit: read 12465,
   mi (90,108), `read_coeffs_rect(w=4, h=8, skip_ctx=0)` at bit 6893; U and V
   first wrong at index 20532. Per §6; both originally-named candidates
   eliminated by measurement, so this needs a fresh start, not a continuation.
-- **H2** — 4:4:4 lossy + tx-size-search chroma ±1, entropy-clean. Own lane.
-- **H3** — 4:4:4 lossless + tile columns. Selin2-2 (see §5's retraction).
+- **H2** and **H3** are with Kaan-2 as of this writing (Selin2-2's round
+  closed with the census committed); §5's retraction is the record they need.
 - **H4** — 4:4:4 lossless + tile rows, hard divergence. Own lane; untouched.
 - **H5** — 4:4:4 10-bit lossless 128 root, chroma band/offset term. Zeynep-3.
 - **H6** — 12-bit 4:4:4 needs a smoothed source. Coverage caveat, not a defect.
+
+**The prior, adopted from Selin2-2's round 4.** 4:4:4 chroma defects in this
+decoder cluster in the **sub-8 and strip/partition unit walks, not in the
+64x64 whole-block paths**. The 64x64 whole-block 4:4:4 paths are exact in every
+cell closed so far; the odd-dimension 66x66 control is exact; 4:2:0 12-bit
+tiles and superres are exact. Everything divergent is a 4:4:4 cell whose
+chroma is split into units smaller than the block, or where a partial-frame
+geometry applies. It matches what is left here — a 4x8 rect unit, not a strip
+— and it reframes the earlier "it is the 1:4 reader" guess as wrong.
+
+The sharper frame is Selin2-2's: **a value whose scope is wrong at the point
+it is consumed.** Both candidates this lane chased were that mistake, just not
+at the site — one had a per-plane extent that was not at the fork at all, the
+other fired 4800 msac bits away.
 
 ## 8. Method notes for the next lane
 
