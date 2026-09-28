@@ -12,6 +12,15 @@ or divergent.
 `~/.cache/wt/av1leftref` was measured first and gave identical verdicts, so
 nothing here is an artifact of that lane's build.
 
+**Cross-check from the parallel lane (lane-av1leftref, the ss_y left-chroma
+reference fix).** That lane reports main and its tip byte-identical on all 35
+committed fixtures that decode at all (4:2:0, 4:4:4, 8/10/12-bit), with the
+six 4:2:2 pins decoding zero frames in both trees because they need the
+uncommitted bypass. That matches what this sweep measured independently: no
+verdict in §1 moved between the two builds. For 4:2:2 the change is a no-op by
+construction anyway — libaom's read offset is `ss_y`, and 4:2:2 has
+`ss_y = 0`, so the cell read is the same one.
+
 **Method.** (1) Every `#[test]` in the crate was enumerated (693 total, 285
 in `stream.rs`) and each `a_real_aomenc_*` / 4:4:4-named gate resolved to its
 shape from the aomenc flag vector its body (or its helper) actually builds.
