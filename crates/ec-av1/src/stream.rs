@@ -7410,9 +7410,6 @@ pub(crate) mod tests {
     #[test]
     fn a_444_intrabc_rect4_reads_its_own_chroma_plane_block() {
         const NAME: &str = "a_444_intrabc_rect4_reads_its_own_chroma_plane_block";
-        const W: usize = 640;
-        const H: usize = 480;
-        const PS: usize = W * H;
         let read = |name: &str, file: &str, len: usize, fnv: u64| -> Vec<u8> {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("fixtures/{file}"));
