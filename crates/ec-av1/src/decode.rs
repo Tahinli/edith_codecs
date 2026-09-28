@@ -13701,7 +13701,28 @@ fn decode_leaf_rect(
         } else {
             TxbSet::ChromaRect8x4
         };
-        let around = neighbours.around_mi_rect(leaf_mi, bw, bh);
+        // lane-av1422warp: at ss (1,0) this leaf's chroma is a SQUARE
+        // (side/2, side) block, so `side` chroma 4-px cells above it spread
+        // over `side` LUMA mi columns -- one chroma column per PAIR of luma
+        // mi cells, and both carry the covering unit's whole-unit dc sign.
+        // The per-mi rect gather therefore double-counts every chroma
+        // column's sign. `around_mi_422_chroma`'s every-second above-cell
+        // sampling is libaom's `txb_w_unit` sum, and every other 4:2:2 chroma
+        // gather in this file already routes through it (see the gate at this
+        // arm's siblings); this one did not, so a 4:2:2 rect leaf voted over
+        // luma unit counts. Measured on the pinned 4:2:2 rotzoom stream
+        // (a1.obu frame 0): the 16x8 leaf at mi(48,28) resolved its V plane's
+        // dc sign from vote 0 (`dc_sign_cdf[0]`) where the oracle resolves a
+        // negative vote (`dc_sign_cdf[1]`), which is the first bit-position
+        // divergence in the frame (the bit offset is a clean constant through
+        // coefficient unit 1418 and turns 6 bits at 1419). Luma keeps the
+        // per-mi gather; 4:2:0 and 4:4:4 keep the plain rect walk verbatim.
+        let mut around = neighbours.around_mi_rect(leaf_mi, bw, bh);
+        if chroma_422 {
+            let c = neighbours.around_mi_422_chroma(leaf_mi, bw, bh);
+            around[1] = c[1];
+            around[2] = c[2];
+        }
         let luma_set = if reduced_tx_set {
             TxbSet::LumaRect16x8
         } else {
