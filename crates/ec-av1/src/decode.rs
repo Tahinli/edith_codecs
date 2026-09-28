@@ -5526,6 +5526,26 @@ pub(crate) fn reset_rect4_inter_own_chroma444_hits() {
     RECT4_INTER_OWN_CHROMA444_HITS.with(|c| c.set(0));
 }
 
+// lane-av1444rect r2: how many intra-BC 1:4 strips at `ss (0,0)` coded their
+// OWN 16x4 / 4x16 chroma plane block instead of the 4:2:0 pair's 8x4 (see
+// [`decode_rect4_16_intrabc`]'s `own444`). A 4:2:0 / 4:2:2 stream of the same
+// recipe leaves it at 0, which is what makes it the 4:4:4-only route.
+thread_local! {
+    static INTRABC_RECT4_OWN_CHROMA444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRABC_RECT4_OWN_CHROMA444_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn intrabc_rect4_own_chroma444_hits() -> usize {
+    INTRABC_RECT4_OWN_CHROMA444_HITS.with(std::cell::Cell::get)
+}
+
+/// Resets [`INTRABC_RECT4_OWN_CHROMA444_HITS`] before a decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_rect4_own_chroma444_hits() {
+    INTRABC_RECT4_OWN_CHROMA444_HITS.with(|c| c.set(0));
+}
+
 // lane-intra14 r1: set while an INTRA block of an INTER frame is decoded
 // through one of the key-frame rect readers ([`decode_block_rect4`],
 // [`decode_block_rect64`]). `Some((size_group, skip))` tells
@@ -16483,10 +16503,42 @@ fn decode_rect4_16_intrabc(
         pred_y[row * side..][..bw].copy_from_slice(&pred_y_dense[row * bw..][..bw]);
     }
 
-    let (pw, ph) = if horz { (16usize, 8usize) } else { (8, 16) };
-    let (cw, ch) = (pw / 2, ph / 2);
+    // lane-av1444rect r2 (the class this lane named, second instance): the
+    // pair geometry below is the 4:2:0 one and was applied at every `ss`. At
+    // ss (0,0) `is_chroma_reference` (av1_common_int.h:1454) is
+    // unconditionally true -- the strip is its own chroma reference, there is
+    // no pair, and its chroma plane block IS the strip: 16x4 (HORZ_4) / 4x16
+    // (VERT_4) at the strip's own origin, with its coefficient context read
+    // over that same extent. The old constants instead predicted and coded an
+    // 8x4 block at `(lmi - 1) * MI / 2`, a quarter of the position.
+    //
+    // MEASURED on a `testsrc2` 640x480 `--tune-content=screen --enable-intrabc=1
+    // --enable-palette=1 --cq-level=60 --min-partition-size=4
+    // --max-partition-size=64 --sb-size=64 --profile=1` stream (1016 B, 17
+    // intrabc 16x4 strips at ss (0,0)): 455240 of 921600 samples wrong, the
+    // entropy fork at read 11750 (`decodetxb.c:158`, the chroma `txb_skip`).
+    // `--enable-intrabc=0` at the same settings is byte-exact, and the 4:2:0
+    // twin of the same recipe is byte-exact.
+    //
+    // 4:2:0 and 4:2:2 keep every constant below verbatim -- the arm is gated on
+    // the full ss (0,0), not on a per-axis shift, so `pw / 2` and the literal
+    // halving are untouched for both.
+    let own444 = ss_x(fctx) == 0 && ss_y(fctx) == 0;
+    if ss_x(fctx) == 0 && ss_y(fctx) == 0 && has_chroma {
+        hit!(INTRABC_RECT4_OWN_CHROMA444_HITS);
+    }
+    let (pw, ph) = if own444 {
+        (bw, bh)
+    } else if horz {
+        (16usize, 8usize)
+    } else {
+        (8, 16)
+    };
+    let (cw, ch) = if own444 { (bw, bh) } else { (pw / 2, ph / 2) };
     let pair_mi = if has_chroma {
-        if horz {
+        if own444 {
+            lmi
+        } else if horz {
             (lmi.0 - 1, lmi.1)
         } else {
             (lmi.0, lmi.1 - 1)
@@ -16495,7 +16547,11 @@ fn decode_rect4_16_intrabc(
         lmi
     };
     let (cpx, cpy) = if has_chroma {
-        (pair_mi.1 * MI / 2, pair_mi.0 * MI / 2)
+        if own444 {
+            (px, py)
+        } else {
+            (pair_mi.1 * MI / 2, pair_mi.0 * MI / 2)
+        }
     } else {
         (0, 0)
     };
