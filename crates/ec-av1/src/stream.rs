@@ -2316,8 +2316,9 @@ pub(crate) mod tests {
     ///   stream, not merely at the window this lane spent nine rounds
     ///   narrowing;
     /// - the arms this fixture exists to cover really fire ABOVE the
-    ///   vertical midpoint: 248 upper-half blocks on a non-`TRANSLATION`
-    ///   global-motion model (`top_half_warp_hits`) and 3 upper-half
+    ///   vertical midpoint: 3 upper-half blocks on a non-`TRANSLATION`
+    ///   global-motion model (`top_half_warp_hits`, gated on libaom's
+    ///   `is_global_mv_block` per slot) and 3 upper-half
     ///   `GLOBAL_GLOBALMV` compound blocks (`top_half_compound_hits`),
     ///   alongside 25 compound-warp, 18 compound-warp-8x8-leaf, 84
     ///   rotzoom global-warp, 22 Wiener and 10 SGRPROJ loop-restoration

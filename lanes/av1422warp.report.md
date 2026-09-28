@@ -2140,7 +2140,7 @@ made in the same round that fixed the bug the stream was built to find.
 
 ## State
 
-44 commits on `lane-av1422warp`, no push. Worktree clean; the
+48 commits on `lane-av1422warp`, no push. Worktree clean; the
 `EC_AV1_ALLOW_422_PROBE` bypass is reverted and in no commit. All temporary
 instrumentation was removed except what is documented above as a permanent
 gate counter or as the `EC_SYMR` trace.
@@ -2151,7 +2151,7 @@ Final state, for the VPS suite:
   246735-for-246735 with no divergence anywhere in the stream.
 - **identity**: 4:2:0 control byte-exact, 4:4:4 LR witness byte-identical to
   its pre-lane decode, both previously pinned 4:2:2 witnesses pixel-exact, LR
-  gate family 12/12, OBMC family 9/9, scoped battery (420/444/inter/superres/
+  gate family 12/12, OBMC family 10/10, scoped battery (420/444/inter/superres/
   cdef) 118 passed / 0 failed / 7 ignored.
 - **pinned**: `422_residual_compound_warp_16f.obu` with its gate.
 - **refusal**: UNCHANGED and unconditional. The bypass is not committed.
