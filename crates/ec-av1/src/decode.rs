@@ -4488,6 +4488,31 @@ pub(crate) fn warp_selected_hits() -> usize {
 // into the compound intermediate) rather than translationally -- the
 // gate's proof that a `GLOBAL_GLOBALMV` block under a ROTZOOM/AFFINE model
 // really reached [`crate::warp::warp_affine_compound`].
+// lane-av1422warp: the 4:2:2 coverage witness has to show compound and warped
+// motion firing ABOVE the vertical midpoint, and every pre-existing warp
+// counter is frame-global. These two are the same arms restricted to blocks
+// whose top mode-info row is in the frame's upper half, which is the half
+// this lane's evidence covers.
+thread_local! {
+    static TOP_HALF_COMPOUND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOP_HALF_WARP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many `GLOBAL_GLOBALMV` (compound) inter blocks decoded in the frame's
+/// upper half. Read by the pinned 4:2:2 coverage gate.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn top_half_compound_hits() -> usize {
+    TOP_HALF_COMPOUND_HITS.with(std::cell::Cell::get)
+}
+
+/// How many inter blocks in the frame's upper half had at least one active
+/// reference slot on a non-`TRANSLATION` global-motion model -- i.e. blocks
+/// whose prediction goes through `crate::warp`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn top_half_warp_hits() -> usize {
+    TOP_HALF_WARP_HITS.with(std::cell::Cell::get)
+}
+
 thread_local! {
     static COMPOUND_WARP_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -28046,9 +28071,19 @@ fn read_sb128_root(
         lr,
         lr_grid,
         lr_reference,
-        mi_r128,
-        mi_c128,
-        SB_MI * 2, fctx,
+        // `read_lr` is the ONE consumer that turns this superblock's
+        // mode-info origin into ABSOLUTE frame space -- it divides by the
+        // restoration-unit size, which is a real pixel count. The partition
+        // decode below is self-consistent with `mi_r128` as written (it
+        // only ever uses relative offsets from it), which is why a 128x128
+        // stream decoded correctly for 4:2:0 and 4:4:4 while placing its
+        // loop-restoration units at double the offset. `sb_r`/`sb_c` index
+        // 64px superblocks, so a 128px superblock's origin is half a
+        // `SB_MI` per 64px step -- `(sb_r & !1) * SB_MI` is twice the true
+        // mi row. The extent is `SB_MI`: a 128px superblock is 16 mi.
+        (sb_r & !1) * (SB_MI / 2),
+        (sb_c & !1) * (SB_MI / 2),
+        SB_MI, fctx,
     );
     let at128 = ((mi_r128 / SUB_MI) as usize, (mi_c128 / SUB_MI) as usize);
     let ctx128 = neighbours.partition_ctx(at128, 128);
@@ -28666,9 +28701,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                     lr,
                     &mut lr_grid,
                     &mut lr_reference,
-                    sb_r * SB_MI,
-                    sb_c * SB_MI,
-                    SB_MI, fctx,
+                    // True mode-info units: a 64px superblock is 8, and `SB_MI` is 16.
+                    // `read_lr` divides by the restoration-unit size (a real pixel count),
+                    // so it is the one consumer that needs the absolute origin in real mi.
+                    // The half-mi convention these arguments used to carry only worked
+                    // while `read_lr` also counted in half-mi -- the two cancelled.
+                    sb_r * (SB_MI / 2),
+                    sb_c * (SB_MI / 2),
+                    SB_MI / 2, fctx,
                 );
             }
             fctx.cdef_transmitted.with(|c| c.set(false));
@@ -33412,6 +33452,16 @@ fn decode_inter_block(
                 }
             }
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
+            if mi_row < mi_rows as usize / 2 {
+                if is_globalmv {
+                    TOP_HALF_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+                }
+                if global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1
+                    || global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1
+                {
+                    TOP_HALF_WARP_HITS.with(|c| c.set(c.get() + 1));
+                }
+            }
             // spec `is_nontrans_global_motion`: ALL active refs' models must
             // be non-TRANSLATION (IDENTITY counts) for the compound block's
             // interp-filter read to be suppressed.
@@ -43559,9 +43609,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     lr,
                     &mut lr_grid,
                     &mut lr_reference,
-                    sb_r * SB_MI,
-                    sb_c * SB_MI,
-                    SB_MI, fctx,
+                    // True mode-info units: a 64px superblock is 8, and `SB_MI` is 16.
+                    // `read_lr` divides by the restoration-unit size (a real pixel count),
+                    // so it is the one consumer that needs the absolute origin in real mi.
+                    // The half-mi convention these arguments used to carry only worked
+                    // while `read_lr` also counted in half-mi -- the two cancelled.
+                    sb_r * (SB_MI / 2),
+                    sb_c * (SB_MI / 2),
+                    SB_MI / 2, fctx,
                 );
             }
             fctx.cdef_transmitted.with(|c| c.set(false));
