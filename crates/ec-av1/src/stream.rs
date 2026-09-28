@@ -217,6 +217,22 @@ pub fn intrabc_128rect_hits() -> usize {
     crate::decode::intrabc_128rect_hits()
 }
 
+/// lane-av1-ibc128chunk: chroma transform units the 128-root intrabc strip's
+/// mu-chunk walk read, one per `read_inter_plane` chroma call. At 4:2:2 a
+/// 64x64 mu chunk's chroma plane block is 32x64 and holds TWO STACKED
+/// TX_32X32 units per plane; the square-cut walk this gate witnesses read
+/// one. Measured on the pinned witness: 8 before, 48 after.
+pub fn intrabc_128rect_chroma_chunk_hits() -> usize {
+    crate::decode::intrabc_128rect_chroma_chunk_hits()
+}
+
+/// lane-av1-ibc128chunk: the 128-root intrabc strip's per-axis chroma chunk
+/// extents as `(64 >> ss_x) << 8 | (64 >> ss_y)` on the last chunk walked --
+/// 32|32 at 4:2:0, 32|64 at 4:2:2, 64|64 at 4:4:4.
+pub fn intrabc_128rect_chunk_shape() -> usize {
+    crate::decode::intrabc_128rect_chunk_shape()
+}
+
 /// Blocks reconstructed with intra block copy at an 8x8 LEAF specifically
 /// (lane-kf900 r7's shape); [`crate::decode::intrabc_hits`] counts every shape.
 pub fn leaf8_intrabc_hits() -> usize {
@@ -2278,6 +2294,169 @@ pub(crate) mod tests {
             assert!(
                 err.contains(REFUSAL),
                 "{NAME}: {file} must refuse by name, got: {err}"
+            );
+        }
+    }
+
+    /// lane-av1-ibc128chunk: the WITNESS for the 128-root intrabc strip's
+    /// de-square-cut mu-chunk chroma walk, and the byte pin for it.
+    ///
+    /// `decode_intrabc_128rect` cut each mu chunk's chroma plane block with
+    /// `chunk_chroma = cside * 64 / side` -- a `chroma_side`-SQUARE chunk,
+    /// i.e. the 4:2:0 count on BOTH axes (the same defect lane-av1-422bigblock
+    /// fixed, and witnessed, in `decode_inter_block` and
+    /// `decode_block_128rect`; this copy was deferred there as unwitnessed).
+    /// At 4:2:2 a 64x64 mu chunk's chroma plane block is 32x64, so it holds
+    /// TWO STACKED TX_32X32 units per plane: the square-cut walk read one per
+    /// plane per chunk, left the chunk's lower 32 chroma rows with no
+    /// residual at all, and stamped each unit's entropy context over a
+    /// 16x16-mi luma span instead of 16x8.
+    ///
+    /// Measured red-before on the pinned witness (parent `a7d22aec`, via the
+    /// local `EC_AV1_ALLOW_422_PROBE` patch-run-restore build): 8 chroma
+    /// units stamped over the stream's two reached blocks and frames 0 and 3
+    /// diverge from `aomdec` (45135 / 44540 of 245760 samples each), the
+    /// first difference at Y sample 98368 -- frame 0, row 256, col 64, the
+    /// top-left corner of the first 128x64 intrabc block at mi(64,0). The
+    /// red build then lost 4 of the stream's 6 intrabc blocks to the desync.
+    /// Green-after, same fixture: 48 chroma units stamped, all 6 blocks
+    /// decoded, and ALL FIVE frames byte-identical to `aomdec --rawvideo`.
+    ///
+    /// Committed code refuses 4:2:2 at the sequence header, so the decode
+    /// assertions above are probe-measured and reproducible from the lane
+    /// report's recipe; what this gate can assert in committed code is the
+    /// byte pin, the refusal-by-name contract, and -- in the arm below --
+    /// that the per-axis walk is still spelled per-axis in the source.
+    #[test]
+    fn the_pinned_422_intrabc_sb128_strip_witnesses_refuse_by_name() {
+        const NAME: &str = "the_pinned_422_intrabc_sb128_strip_witnesses_refuse_by_name";
+        const REFUSAL: &str = "a chroma format of 4:2:2";
+        for (file, bytes, fp) in [
+            ("422_intrabc_sb128_strip.obu", 1672usize, 0x50f5cfc576e4cd00_u64),
+            (
+                "422_intrabc_sb128_strip_notxsearch.obu",
+                1675,
+                0xd4936f252ff8cff0,
+            ),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(file);
+            let data = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{NAME}: pinned witness {} is missing ({e}) -- the gate cannot run",
+                    path.display()
+                )
+            });
+            assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
+            assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
+            let err = decode_stream(&data).unwrap_err().to_string();
+            assert!(
+                err.contains(REFUSAL),
+                "{NAME}: {file} must refuse by name, got: {err}"
+            );
+        }
+    }
+
+    /// lane-av1-ibc128chunk: the SOURCE-SCAN arm of the witness gate above.
+    ///
+    /// The decode-level half of the red/green evidence cannot run in
+    /// committed code (the 4:2:2 refusal stands), so this arm pins the thing
+    /// that would silently bring the defect back: the square-cut
+    /// `chunk_chroma = cside * 64 / side` expression, and the per-axis
+    /// replacements that replaced it at BOTH sites in
+    /// [`decode_intrabc_128rect`] -- the mu-chunk read walk and the
+    /// `mu_chroma` per-unit context replay. It also pins the per-axis
+    /// counters' accessors so the arms stay reachable, and the walk's own
+    /// per-axis extent, derived here from the same `64 >> ss` form the
+    /// witnesses measured (4:2:0 = one TX_32X32 per plane per chunk,
+    /// 4:2:2 = two stacked, 4:4:4 = four).
+    #[test]
+    fn the_intrabc_128rect_chroma_chunk_walk_stays_per_axis() {
+        const NAME: &str = "the_intrabc_128rect_chroma_chunk_walk_stays_per_axis";
+        let src = include_str!("decode.rs");
+        let body = src
+            .split_once("fn decode_intrabc_128rect(")
+            .expect("decode_intrabc_128rect must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("decode_intrabc_128rect must be a top-level fn")
+            .0;
+        // Scan CODE only: the fix's own comments quote the old expression to
+        // say what it was, and a prose mention must not read as a
+        // reintroduction (nor mask one).
+        let stripped: Vec<&str> = body
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
+            .collect();
+        let code = stripped.join("\n");
+        let body = code.as_str();
+        assert_eq!(
+            body.matches("cside * 64 / side").count(),
+            0,
+            "{NAME}: the square-cut `cside * 64 / side` chunk extent is BACK in \
+             decode_intrabc_128rect -- that expression is the 4:2:2 defect this \
+             gate exists for (a 64x64 mu chunk's chroma plane block is \
+             (64 >> ss_x) x (64 >> ss_y), not `chroma_side` square)"
+        );
+        // Both sites, the read walk and the replay: each declares the pair
+        // once and each takes its steps on the per-axis halves.
+        for name in [
+            "let chunk_chroma_w = (64usize) >> ss_x(fctx);",
+            "let chunk_chroma_h = (64usize) >> ss_y(fctx);",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                2,
+                "{NAME}: `{name}` must appear at BOTH de-square-cut sites in \
+                 decode_intrabc_128rect (the mu-chunk read walk and the mu_chroma \
+                 context replay), found {}",
+                body.matches(name).count()
+            );
+        }
+        for name in [
+            "let unit_luma_w = cu_tx << ss_x(fctx);",
+            "let unit_luma_h = cu_tx << ss_y(fctx);",
+            "let (cw, ch) = (bw >> ss_x(fctx), bh >> ss_y(fctx));",
+            "let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));",
+            "neighbours.around_mi_rect(unit_mi, unit_luma_w, unit_luma_h)",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{NAME}: `{name}` must appear exactly once in \
+                 decode_intrabc_128rect, found {}",
+                body.matches(name).count()
+            );
+        }
+        // The replay's own unit luma span is the lossless/lossy `cu << ss` form
+        // (site 2 spells it separately from the read walk's `cu_tx << ss`).
+        for name in [
+            "let unit_luma_w = cu << ss_x(fctx);",
+            "let unit_luma_h = cu << ss_y(fctx);",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{NAME}: `{name}` must appear exactly once in \
+                 decode_intrabc_128rect, found {}",
+                body.matches(name).count()
+            );
+        }
+        // The per-axis chunk extent the geometry demands, spelled out here so
+        // the scan and the witnesses cannot disagree about it.
+        let per_axis_units = |ss_x: u32, ss_y: u32| (64 >> ss_x) / 32 * (64 >> ss_y) / 32;
+        assert_eq!(per_axis_units(1, 1), 1, "{NAME}: 4:2:0 must stay one unit");
+        assert_eq!(per_axis_units(1, 0), 2, "{NAME}: 4:2:2 must be two units");
+        assert_eq!(per_axis_units(0, 0), 4, "{NAME}: 4:4:4 must be four units");
+        // The counters the probe arms read must stay exported.
+        for name in [
+            "pub fn intrabc_128rect_chroma_chunk_hits()",
+            "pub fn intrabc_128rect_chunk_shape()",
+        ] {
+            assert!(
+                src.contains(name),
+                "{NAME}: the accessor `{name}` must stay in decode.rs"
             );
         }
     }

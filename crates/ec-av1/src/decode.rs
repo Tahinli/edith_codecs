@@ -4179,6 +4179,21 @@ thread_local! {
     /// guard (`decode_block_128rect`). A refused block bumps
     /// [`INTRABC_HITS`] but never this one.
     static INTRABC_128RECT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1-ibc128chunk: chroma transform units the 128-root intrabc
+    /// strip's mu-chunk walk read, one per `read_inter_plane` chroma call.
+    /// At 4:2:0 a 64x64 mu chunk's chroma plane block is 32x32, so one
+    /// TX_32X32 per plane per chunk; at 4:2:2 it is 32x64 and holds TWO
+    /// STACKED units per plane. The square-cut `chunk_chroma = cside * 64 /
+    /// side` model walked the 4:2:0 count on every axis, so this counter is
+    /// the reach/arm witness for the per-axis walk.
+    static INTRABC_128RECT_CHROMA_CHUNK_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// lane-av1-ibc128chunk: the mu-chunk walk's per-axis chroma extents, as
+    /// `(64 >> ss_x) << 8 | (64 >> ss_y)` on the LAST chunk -- the pair the
+    /// per-axis walk used. A 4:2:2 run and a 4:2:0 run of the same block
+    /// differ here (32|64 vs 32|32), which is what the de-square-cut fixes.
+    static INTRABC_128RECT_CHUNK_SHAPE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Current value of [`INTRABC_128RECT_HITS`].
@@ -4191,6 +4206,26 @@ pub fn intrabc_128rect_hits() -> usize {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_intrabc_128rect_hits() {
     INTRABC_128RECT_HITS.with(|c| c.set(0));
+}
+
+/// Current value of [`INTRABC_128RECT_CHROMA_CHUNK_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_128rect_chroma_chunk_hits() -> usize {
+    INTRABC_128RECT_CHROMA_CHUNK_HITS.with(|c| c.get())
+}
+
+/// Current value of [`INTRABC_128RECT_CHUNK_SHAPE`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_128rect_chunk_shape() -> usize {
+    INTRABC_128RECT_CHUNK_SHAPE.with(|c| c.get())
+}
+
+/// Zeroes [`INTRABC_128RECT_CHROMA_CHUNK_HITS`] and
+/// [`INTRABC_128RECT_CHUNK_SHAPE`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_128rect_chroma_chunk_hits() {
+    INTRABC_128RECT_CHROMA_CHUNK_HITS.with(|c| c.set(0));
+    INTRABC_128RECT_CHUNK_SHAPE.with(|c| c.set(0));
 }
 
 /// Current value of [`INTRABC_VARTX_HITS`].
@@ -12460,8 +12495,16 @@ fn decode_intrabc_128rect(
         );
     }
     let (px, py) = (mi_c * MI, mi_r * MI);
-    let (cpx, cpy) = (px / 2, py / 2);
-    let (cw, ch) = (bw / 2, bh / 2);
+    // lane-av1-ibc128chunk: the block's chroma PLANE BLOCK is per-axis
+    // `(bw >> ss_x) x (bh >> ss_y)` -- 4:2:0 halves both (this fn's
+    // `mv_to_q4(cpy, dv_row, ss_y(fctx))` calls two lines below already
+    // scaled the DV on the y axis by ITS OWN subsampling, so the hardcoded
+    // `/2` origin and extent made the prediction window half as tall as
+    // the motion vector asked for), 4:2:2 is HALF-WIDTH and FULL-HEIGHT,
+    // 4:4:4 is luma-sized. At ss (1,1) every value below is the old
+    // `bw / 2, bh / 2` line-for-line.
+    let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));
+    let (cw, ch) = (bw >> ss_x(fctx), bh >> ss_y(fctx));
     // The square strides the proven INTER path lays its residual grids,
     // prediction windows and `TxParams` at (see [`decode_intrabc_rect`]'s r2
     // note): 128/64 here.
@@ -12617,12 +12660,35 @@ fn decode_intrabc_128rect(
                 // TX_32X32 chroma unit per plane per chunk at 4:2:0, raster
                 // within the chunk, plane-major inside the chunk.
                 let cu_tx = 32usize;
-                let chunk_chroma = cside * 64 / side;
-                let unit_luma = cu_tx * (side / cside);
+                // lane-av1-ibc128chunk: a 64x64 mu chunk's chroma plane
+                // block is PER-AXIS `(64 >> ss_x) x (64 >> ss_y)` -- 32x32 at
+                // 4:2:0, TWO STACKED TX_32X32 at 4:2:2 (the chunk's chroma
+                // plane block is 32x64 there), four at 4:4:4. The old
+                // `chunk_chroma = cside * 64 / side` walked a
+                // `chroma_side`-SQUARE chunk, i.e. the 4:2:0 count on both
+                // axes: at 4:2:2 it read HALF the chroma units of a chunk
+                // (one 32x32 at the chunk's top-left instead of two), left
+                // the chunk's lower 32 chroma rows with no residual at all,
+                // and stamped every unit's entropy context over a 16x16-mi
+                // luma span instead of 16x8. The same defect and the same
+                // per-axis repair as `decode_inter_block`'s
+                // `chunk_chroma_w/chunk_chroma_h` (lane-av1-422bigblock,
+                // witnessed on `422_sb128_3f.obu`).
+                let chunk_chroma_w = (64usize) >> ss_x(fctx);
+                let chunk_chroma_h = (64usize) >> ss_y(fctx);
+                // The unit's own footprint on the LUMA mi grid, per axis:
+                // `(32 << ss) px` = `(32 << ss) / MI` mi -- 16x16 at 4:2:0,
+                // 16x8 at 4:2:2, 8x8 at 4:4:4. `around_mi_rect` reads and
+                // `record_mi_chroma` stamp exactly the unit's own cells.
+                let unit_luma_w = cu_tx << ss_x(fctx);
+                let unit_luma_h = cu_tx << ss_y(fctx);
+                INTRABC_128RECT_CHUNK_SHAPE.with(|c| {
+                    c.set((chunk_chroma_w << 8) | chunk_chroma_h);
+                });
                 let chunk_w_mi = 16.min(max_w_mi.saturating_sub(cc * 16));
                 let chunk_h_mi = 16.min(max_h_mi.saturating_sub(cr * 16));
-                let units_x = chunk_w_mi / (unit_luma / MI);
-                let units_y = chunk_h_mi / (unit_luma / MI);
+                let units_x = chunk_w_mi / (unit_luma_w / MI);
+                let units_y = chunk_h_mi / (unit_luma_h / MI);
                 if lossless(fctx) {
                     // TX_4X4 chroma units over this chunk (lane-lossless2's
                     // walk, shared with the inter 128 path).
@@ -12630,8 +12696,8 @@ fn decode_intrabc_128rect(
                         dec, cdfs, neighbours, u, v,
                         Pred::Inline(&pred_u, cside), Pred::Inline(&pred_v, cside),
                         (mi_r, mi_c), (cpx, cpy),
-                        (cc * chunk_chroma, cr * chunk_chroma),
-                        (chunk_chroma, chunk_chroma),
+                        (cc * chunk_chroma_w, cr * chunk_chroma_h),
+                        (chunk_chroma_w, chunk_chroma_h),
                         (cw, ch),
                         cside, 0, base_q_idx,
                         &mut u_units, &mut v_units, fctx,
@@ -12654,15 +12720,16 @@ fn decode_intrabc_128rect(
                     for ur in 0..units_y {
                         for uc in 0..units_x {
                             let unit_mi = (
-                                mi_r + cr * 16 + ur * (unit_luma / MI),
-                                mi_c + cc * 16 + uc * (unit_luma / MI),
+                                mi_r + cr * 16 + ur * (unit_luma_h / MI),
+                                mi_c + cc * 16 + uc * (unit_luma_w / MI),
                             );
                             // Per unit, AFTER the earlier units' stamps: this
                             // unit's coefficient context must see them.
-                            let cu_around = neighbours.around_mi(unit_mi, unit_luma);
+                            let cu_around =
+                                neighbours.around_mi_rect(unit_mi, unit_luma_w, unit_luma_h);
                             if crate::envflags::env_flag!("EC_ECDUMP") {
                                 for p in 1..3 {
-                                    let ab: Vec<String> = (0..unit_luma / MI)
+                                    let ab: Vec<String> = (0..unit_luma_w / MI)
                                         .map(|k| {
                                             format!(
                                                 "{:?}/{}",
@@ -12671,7 +12738,7 @@ fn decode_intrabc_128rect(
                                             )
                                         })
                                         .collect();
-                                    let lf: Vec<String> = (0..unit_luma / MI)
+                                    let lf: Vec<String> = (0..unit_luma_h / MI)
                                         .map(|k| {
                                             format!(
                                                 "{:?}/{}",
@@ -12687,8 +12754,8 @@ fn decode_intrabc_128rect(
                                 }
                             }
                             let (cu_x, cu_y) = (
-                                cpx + cc * chunk_chroma + uc * cu_tx,
-                                cpy + cr * chunk_chroma + ur * cu_tx,
+                                cpx + cc * chunk_chroma_w + uc * cu_tx,
+                                cpy + cr * chunk_chroma_h + ur * cu_tx,
                             );
                             // `av1_get_tx_type` (blockd.h:1291): an inter
                             // block's chroma unit never codes a tx_type; it
@@ -12709,9 +12776,12 @@ fn decode_intrabc_128rect(
                                         && unit_rel_mi.1 < lc + lw / MI
                                 })
                                 .map(|(_, _, _, _, t)| t);
+                            // The prediction window is the block's own square
+                            // `cside` buffer with the unit's true per-axis
+                            // position inside it.
                             let cu_pred = src.offset(
-                                (cr * chunk_chroma + ur * cu_tx) * cside
-                                    + cc * chunk_chroma
+                                (cr * chunk_chroma_h + ur * cu_tx) * cside
+                                    + cc * chunk_chroma_w
                                     + uc * cu_tx,
                             );
                             let cu_grid = read_inter_plane(
@@ -12736,8 +12806,8 @@ fn decode_intrabc_128rect(
                             // coefficient context.
                             neighbours.record_mi_chroma(
                                 unit_mi,
-                                unit_luma,
-                                unit_luma,
+                                unit_luma_w,
+                                unit_luma_h,
                                 plane_idx,
                                 &cu_grid,
                             );
@@ -12749,6 +12819,7 @@ fn decode_intrabc_128rect(
                                 );
                             }
                             hit!(CHROMA_SPLIT_TX_HITS);
+                            INTRABC_128RECT_CHROMA_CHUNK_HITS.with(|c| c.set(c.get() + 1));
                             // lane-av1-ibcrect: per-unit chroma context -- the
                             // end-of-block record's composed-grid re-stamp
                             // must not stand (replayed below).
@@ -12758,9 +12829,9 @@ fn decode_intrabc_128rect(
                                 cside * cside,
                             );
                             for rr in 0..cu_tx {
-                                let start = (cr * chunk_chroma + ur * cu_tx + rr)
+                                let start = (cr * chunk_chroma_h + ur * cu_tx + rr)
                                     * cside
-                                    + cc * chunk_chroma
+                                    + cc * chunk_chroma_w
                                     + uc * cu_tx;
                                 dst[start..start + cu_tx]
                                     .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
@@ -12815,27 +12886,37 @@ fn decode_intrabc_128rect(
         let cu = if lossless(fctx) { 4usize } else { 32usize };
         // The unit's own footprint on the LUMA mi grid (the chroma context
         // bands are luma-mi indexed, [`Self::record_mi_chroma`]'s
-        // convention): 8 px x2 per TX_4X4 unit, 64 px per TX_32X32 one.
-        let unit_luma = cu * 2;
-        // Raster over the block's chroma plane, `chunk_chroma` per mu chunk
-        // (the same extents the read loop above laid the composed grid out
-        // at) -- a unit the frame edge clipped codes nothing and carries no
-        // composed samples beyond the clip, so it replays as the zero state
-        // exactly like libaom's uncoded unit.
-        let chunk_chroma = cside * 64 / side;
-        let (rows, cols) = ((ch / chunk_chroma).max(1), (cw / chunk_chroma).max(1));
+        // convention), PER AXIS: `cu << ss` px, i.e. 8 px per TX_4X4 unit and
+        // 64 px per TX_32X32 one at 4:2:0 -- 4 px / 32 px at 4:2:2.
+        let unit_luma_w = cu << ss_x(fctx);
+        let unit_luma_h = cu << ss_y(fctx);
+        // Raster over the block's chroma plane, one mu chunk per axis step at
+        // its own per-axis chroma extent (the same extents the read loop
+        // above laid the composed grid out at) -- a unit the frame edge
+        // clipped codes nothing and carries no composed samples beyond the
+        // clip, so it replays as the zero state exactly like libaom's
+        // uncoded unit. lane-av1-ibc128chunk: the old `chunk_chroma = cside *
+        // 64 / side` cut the replay's step to the 4:2:0 square on BOTH axes,
+        // so at 4:2:2 it walked a 32-row step down a 64-row chunk and
+        // re-stamped a 16x16-mi span over an 8-row-tall unit.
+        let chunk_chroma_w = (64usize) >> ss_x(fctx);
+        let chunk_chroma_h = (64usize) >> ss_y(fctx);
+        let (rows, cols) = ((ch / chunk_chroma_h).max(1), (cw / chunk_chroma_w).max(1));
         for cr in 0..rows {
             for cc in 0..cols {
-                let unit_mi = (mi_r + cr * (unit_luma / MI), mi_c + cc * (unit_luma / MI));
+                let unit_mi = (
+                    mi_r + cr * (unit_luma_h / MI),
+                    mi_c + cc * (unit_luma_w / MI),
+                );
                 for (plane_idx, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
                     let mut unit = Vec::with_capacity(cu * cu);
                     for rr in 0..cu {
-                        let start =
-                            (cr * chunk_chroma + rr) * cside + cc * chunk_chroma;
+                        let start = (cr * chunk_chroma_h + rr) * cside
+                            + cc * chunk_chroma_w;
                         unit.extend_from_slice(&grid[start..start + cu]);
                     }
                     neighbours.record_mi_chroma(
-                        unit_mi, unit_luma, unit_luma, plane_idx, &unit,
+                        unit_mi, unit_luma_w, unit_luma_h, plane_idx, &unit,
                     );
                 }
             }
