@@ -591,17 +591,20 @@ const PROVEN: &[(&str, &str)] = &[
 /// A gate named `..._decodes_pixel_exact` that cannot decode has failed, and
 /// swallowing the error keeps the suite green while the gate proves nothing --
 /// the same vacuum as a gate whose feature never fires, arrived at from the
-/// other side. These four predate the attempt-loop pattern the newer gates use
-/// (encode several fixtures, require at least one to decode, hard-assert the
-/// firing count). They are pinned here so the set cannot grow while they are
-/// converted one at a time.
+/// other side. The list is the exact pin of the gates still shaped that way, so
+/// the set cannot grow; a converted gate is DELETED from it.
+///
+/// lane-av1skipfix: emptied. The last four (`filter_intra`, the two
+/// `deblocking` gates, and `gradients_stream_with_cdef`) were converted to the
+/// attempt-loop pattern -- several recipes, at least one required to decode, the
+/// feature counter hard-asserted on a pixel-compared attempt, a decode error on
+/// every attempt a hard failure carrying its refusal text. None of the four had
+/// a genuinely absent capability: every recipe family decoded, the refusals the
+/// old arms swallowed were a named *screen-content* refusal on one recipe and a
+/// stale premise on the CDEF gate (a single-superblock frame cannot make libaom
+/// write `cdef_bits > 0`, so the old recipe never read a `cdef_idx` at all).
 #[cfg(test)]
-const GATES_THAT_SKIP_ON_A_DECODE_ERROR: &[&str] = &[
-    "a_real_aomenc_filter_intra_stream_decodes_pixel_exact",
-    "a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact",
-    "a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact",
-    "a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact",
-];
+const GATES_THAT_SKIP_ON_A_DECODE_ERROR: &[&str] = &[];
 
 #[cfg(test)]
 mod tests {
