@@ -2592,8 +2592,30 @@ mod count_vacuity_tests {
         // A CEILING on the unpinned population, so a NEW site cannot be added
         // silently. Lower it as sites are fixed; a fix that does not lower it is
         // still a fix, but a NEW site is an immediate red.
+        //
+        // lane-av1pinspec: 43 -> 2. Each of the 41 fixes adds the ENCODE's own
+        // frame count as an `assert_eq!` ABOVE the `ffmpeg_decode_sequence*`
+        // call (`-frames:v 1` / `-vframes 1` / `--limit=N` / a helper's `frames`
+        // parameter / the arm tuple's `frame_count` / the wire's own OBU frame
+        // headers), so the count handed to the oracle is a value already proven
+        // against the encode instead of read off our decode. The two that remain
+        // are the two that are not a count to fix:
+        //   * `an_svt_screen_palette_block_with_a_split_transform_decodes_exactly`
+        //     reads the path `EC_AV1_SVT1_STREAM` names, and that crop is not
+        //     committed to `fixtures/`, so no `--limit`, no `-frames:v` and no
+        //     frame count exists anywhere in the tree for it. The doc comment's
+        //     "12-frame stream" is prose about one capture and the env var
+        //     accepts any file, so asserting 12 would pin a number nothing can
+        //     check. Counting the stream's own OBU frame headers with
+        //     `Av1Parser` would derive one, and is left on the table
+        //     deliberately: the gate SKIPs on any box without that env var, so
+        //     such an assert would ship unexercised.
+        //   * a `///` DOC COMMENT quoting the pre-r4 body of
+        //     `pinned_lr_sgr_stream_call_unique_dump`, which this line-based
+        //     scan cannot tell from code. The gate it describes already spends
+        //     `FRAMES` and asserts `pics.len() == FRAMES`.
+        const UNPINNED_CEILING: usize = 2;
         let unpinned = s.iter().filter(|x| x.pinned_by.is_none()).count();
-        const UNPINNED_CEILING: usize = 43;
         assert!(
             unpinned <= UNPINNED_CEILING,
             "{unpinned} unpinned count site(s), ceiling is {UNPINNED_CEILING} -- a new one \
