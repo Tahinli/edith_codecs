@@ -20432,6 +20432,42 @@ struct PlaneBuf<'a> {
 /// (lane-av1refs: the same "empty slot" case `GOLDEN_FRAME` already
 /// refused by name, now generic across `LAST2`/`LAST3`/`GOLDEN`/`BWDREF`/
 /// `ALTREF2`/`ALTREF`).
+// lane-av1pixprobe: env-gated one-sample write probe -- `EC_AV1_PIXPROBE=x,y`
+// prints one PIXWRITE line per reconstruction store landing on that sample,
+// naming the store site, the value it replaces and the one it leaves. Re-anchored
+// from `lane-av1-ibcwrite` @ 25f5c729 onto the main-shape sites (the two mc stores
+// now live in `reconstruct_mc_rect`).
+static PIXPROBE_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("EC_AV1_PIXPROBE").is_some());
+
+static PIXPROBE: std::sync::LazyLock<Option<(usize, usize)>> = std::sync::LazyLock::new(|| {
+    crate::envflags::var("EC_AV1_PIXPROBE").ok().and_then(|v| {
+        let (x, y) = v.split_once(',')?;
+        Some((
+            x.trim().parse::<usize>().ok()?,
+            y.trim().parse::<usize>().ok()?,
+        ))
+    })
+});
+
+#[inline]
+fn pix_write(
+    site: &str,
+    bx: usize,
+    by: usize,
+    bside: usize,
+    x: usize,
+    y: usize,
+    prev: u16,
+    val: u16,
+) {
+    if *PIXPROBE_ON && Some((x, y)) == *PIXPROBE {
+        eprintln!(
+            "PIXWRITE {site} block=({bx},{by})+{bside} px=({x},{y}) prev={prev} val={val} at {}",
+            std::panic::Location::caller()
+        );
+    }
+}
 
 impl PlaneBuf<'_> {
     /// Sets this plane's own tile pixel origin ([`Self::tile_x0`]/
@@ -20636,6 +20672,16 @@ impl PlaneBuf<'_> {
                     base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, sample_max(fctx));
                 }
                 let sample = (base + residual[idx]).clamp(0, sample_max(fctx)) as u16;
+                pix_write(
+                    "reconstruct_rect",
+                    x,
+                    y,
+                    bw,
+                    x + col,
+                    y + row,
+                    self.data[(y + row) * self.width + x + col],
+                    sample,
+                );
                 self.data.to_mut()[(y + row) * self.width + x + col] = sample;
             }
         }
@@ -20782,6 +20828,16 @@ impl PlaneBuf<'_> {
                     base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, sample_max(fctx));
                 }
                 let sample = (base + residual[idx]).clamp(0, sample_max(fctx)) as u16;
+                pix_write(
+                    "reconstruct",
+                    x,
+                    y,
+                    side,
+                    x + col,
+                    y + row,
+                    self.data[(y + row) * self.width + x + col],
+                    sample,
+                );
                 self.data.to_mut()[(y + row) * self.width + x + col] = sample;
             }
         }
@@ -36522,8 +36578,10 @@ impl PlaneBuf<'_> {
                 let dst = (y + row) * self.width + x;
                 let pred = &prediction[src..src + w];
                 let out = &mut self.data.to_mut()[dst..dst + w];
-                for (o, &p) in out.iter_mut().zip(pred) {
-                    *o = i32::from(p).clamp(0, max) as u16;
+                for (col, (o, &p)) in out.iter_mut().zip(pred).enumerate() {
+                    let v = i32::from(p).clamp(0, max) as u16;
+                    pix_write("mc_copy", x, y, w, x + col, y + row, *o, v);
+                    *o = v;
                 }
             }
             return;
@@ -36535,8 +36593,10 @@ impl PlaneBuf<'_> {
             let pred = &prediction[src..src + w];
             let res = &residual[src..src + w];
             let out = &mut self.data.to_mut()[dst..dst + w];
-            for ((o, &p), &r) in out.iter_mut().zip(pred).zip(res) {
-                *o = (i32::from(p) + r).clamp(0, max) as u16;
+            for (col, ((o, &p), &r)) in out.iter_mut().zip(pred).zip(res).enumerate() {
+                let v = (i32::from(p) + r).clamp(0, max) as u16;
+                pix_write("mc_add", x, y, w, x + col, y + row, *o, v);
+                *o = v;
             }
         }
     }

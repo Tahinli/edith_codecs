@@ -1984,7 +1984,9 @@ pub(crate) fn predict_compound_intermediate_kern(
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
     if crate::envflags::env_flag!("EC_MC_TRACE") {
-        eprintln!("EC_MC_COMP x_q4={x_q4} y_q4={y_q4} w={block_w} h={block_h} hk={h_kind:?} vk={v_kind:?}");
+        eprintln!(
+            "EC_MC_COMP x_q4={x_q4} y_q4={y_q4} w={block_w} h={block_h} hk={h_kind:?} vk={v_kind:?}"
+        );
     }
 
     let (v_wide, v_narrow) = v_kind.tables();
@@ -2129,7 +2131,7 @@ pub(crate) fn diffwtd_mask(
     let round = INTER_POST_ROUND + bd.saturating_sub(8) - round_delta(bd);
     for i in 0..mask.len() {
         let diff = round2((pred0[i] - pred1[i]).abs(), round);
-        let m = (38 + diff / 16).clamp(0, 64);
+        let m = (38 + diff / 16).clamp(0, 64) as u8;
         mask[i] = if inv { (64 - m) as u8 } else { m as u8 };
     }
 }
@@ -2239,11 +2241,223 @@ fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
     assert!(dst.iter().all(|&v| v == 100), "{dst:?}");
 }
 
+/// lane-av1c10: the whole compound pipeline -- two
+/// [`predict_compound_intermediate`] taps through every combine this crate
+/// ships ([`combine_compound`] dist-wtd and (8,8), [`diffwtd_mask`] both
+/// inverses, [`blend_masked_compound`]) -- vs faithful transcriptions of the
+/// libaom C at the same inputs, over all 16x16 phase pairs at 8 and 10 bits.
+///
+/// The C twins keep the CONV_BUF biased (`sum = dot + (1 << (bd + FILTER_BITS
+/// - 1))` horizontally, `1 << offset_bits` vertically -- `convolve.c`
+/// `av1_highbd_dist_wtd_convolve_2d_c`); this crate's intermediates are
+/// unbiased, so each transcription adds the constant bias
+/// `(1 << (bd + 4)) + (1 << (bd + 3))` (= `(1 << (offset_bits - round_1)) +
+/// (1 << (offset_bits - round_1 - 1))`) before its combine and subtracts it
+/// where libaom does. The diffwtd transcription is `diffwtd_mask_d16`
+/// (reconinter.c:301): `round = 2*FILTER_BITS - round_0 - round_1 + (bd-8)`;
+/// the blend is `aom_highbd_blend_a64_d16_mask_c` (blend_a64_mask.c):
+/// `((m*c0 + (64-m)*c1) >> 6) - bias`, one `ROUND_POWER_OF_TWO` by
+/// `round_bits`, `negative_to_zero`, clip. A 10-bit-only wrong constant in
+/// any of the three -- the exact shape of the compound rounding defect the
+/// cwarp-r1 charter named (and of the `(bd - 8)` diffwtd term that landed
+/// without a 10-bit gate behind it) -- fails here per phase, no aomenc stream
+/// needed.
+#[cfg(test)]
+mod libaom_transcription {
+    use super::{
+        InterpFilterKind, REF_NO_SCALE, blend_masked_compound, combine_compound, diffwtd_mask,
+        predict_compound_intermediate,
+    };
+
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as u32
+    }
+
+    /// `ROUND_POWER_OF_TWO` on the C `int` domain: arithmetic shift of
+    /// `value + half` (halves round toward +inf, negatives included).
+    fn c_round(value: i32, shift: u32) -> i32 {
+        (value + (1 << (shift - 1))) >> shift
+    }
+
+    /// `av1_highbd_dist_wtd_convolve_2d_c` for both taps (biased domain) plus
+    /// its `do_average` finish: dist-wtd two-weight split, or the plain
+    /// `>> 1` average.
+    #[allow(clippy::too_many_arguments)]
+    fn libaom_compound_2d(
+        reference: &[u16],
+        stride: usize,
+        (x0_q4, y0_q4): (i32, i32),
+        (x1_q4, y1_q4): (i32, i32),
+        w: usize,
+        h: usize,
+        hf: &[i32; 8],
+        vf: &[i32; 8],
+        fwd: i32,
+        bck: i32,
+        bd: u32,
+        dist_wtd: bool,
+    ) -> Vec<u16> {
+        let rd = if bd > 10 { bd - 10 } else { 0 };
+        let round_0 = 3 + rd;
+        let round_1 = 7u32;
+        let offset_bits = (bd + 14 - round_0) as i32;
+        let bias =
+            (1 << (offset_bits - round_1 as i32)) + (1 << (offset_bits - round_1 as i32 - 1));
+        let round_bits = 14 - round_0 - round_1;
+        let mut out = vec![0u16; w * h];
+        let mut conv = vec![0i32; w * h];
+        for (tap, (x_q4, y_q4)) in [(0usize, (x0_q4, y0_q4)), (1usize, (x1_q4, y1_q4))] {
+            // horizontal, biased
+            let mut im = vec![0i32; (h + 7) * w];
+            for y in 0..h + 7 {
+                for x in 0..w {
+                    let mut sum = 1i32 << (bd + 7 - 1);
+                    for (k, &t) in hf.iter().enumerate() {
+                        let sx = (x_q4.div_euclid(16) + x as i32 + k as i32 - 3) as usize;
+                        let sy = (y_q4.div_euclid(16) + y as i32 - 3) as usize;
+                        sum += t * i32::from(reference[sy * stride + sx]);
+                    }
+                    im[y * w + x] = c_round(sum, round_0);
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let mut sum = 1i32 << offset_bits;
+                    for (k, &t) in vf.iter().enumerate() {
+                        sum += t * im[(y + k) * w + x];
+                    }
+                    let res = c_round(sum, round_1);
+                    if tap == 0 {
+                        conv[y * w + x] = res;
+                    } else {
+                        let mut tmp = if dist_wtd {
+                            (conv[y * w + x] * fwd + res * bck) >> 4 // DIST_PRECISION_BITS
+                        } else {
+                            (conv[y * w + x] + res) >> 1
+                        };
+                        tmp -= bias;
+                        let v = c_round(tmp, round_bits).max(0) as u32;
+                        out[y * w + x] = v.min((1u32 << bd) - 1) as u16;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `diffwtd_mask_d16` on the biased conv bufs.
+    fn libaom_diffwtd(c0: &[i32], c1: &[i32], inv: bool, bd: u32, round_0: u32) -> Vec<u8> {
+        let round = (14 - round_0 - 7 + (bd - 8)) as i32;
+        c0.iter()
+            .zip(c1)
+            .map(|(&a, &b)| {
+                let diff = c_round((a - b).abs(), round.unsigned_abs());
+                let m = (38 + diff / 16).clamp(0, 64) as u8;
+                if inv { 64 - m } else { m }
+            })
+            .collect()
+    }
+
+    /// `aom_highbd_blend_a64_d16_mask_c`, subw == subh == 0, biased domain.
+    fn libaom_blend(c0: &[i32], c1: &[i32], mask: &[u8], bd: u32, round_0: u32) -> Vec<u16> {
+        let bias = (1i32 << (bd + 4)) + (1i32 << (bd + 3));
+        let round_bits = 14 - round_0 - 7;
+        c0.iter()
+            .zip(c1)
+            .zip(mask)
+            .map(|((&a, &b), &m)| {
+                let res = ((i32::from(m) * a + (64 - i32::from(m)) * b) >> 6) - bias;
+                let v = c_round(res, round_bits).max(0) as u32;
+                v.min((1u32 << bd) - 1) as u16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compound_pipeline_matches_the_libaom_transcription_at_8_and_10_bits() {
+        let fctx = &crate::decode::FrameCtx::new();
+        for bd in [8u32, 10u32] {
+            crate::decode::set_bit_depth(bd as u8, fctx);
+            let max = (1u16 << bd) - 1;
+            let (wide, _narrow) = InterpFilterKind::Regular.tables();
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(bd);
+            let reference: Vec<u16> = (0..48 * 48)
+                .map(|_| (lcg(&mut state) % (u32::from(max) + 1)) as u16)
+                .collect();
+            let rd = if bd > 10 { bd - 10 } else { 0 };
+            let round_0 = 3 + rd;
+            let bias = (1i32 << (bd + 4)) + (1i32 << (bd + 3));
+            for &dist_wtd in &[false, true] {
+                let (fwd, bck) = if dist_wtd { (9, 7) } else { (8, 8) };
+                for xf in 0..16i32 {
+                    for yf in 0..16i32 {
+                        let (mv0, mv1) = ((16 * 8 + xf, 16 * 8 + yf), (16 * 10 + xf, 16 * 7 + yf));
+                        let (hf, vf) = (&wide[xf as usize], &wide[yf as usize]);
+                        let mut p0 = vec![0i32; 64];
+                        let mut p1 = vec![0i32; 64];
+                        for (mv, dst) in [(mv0, &mut p0), (mv1, &mut p1)] {
+                            predict_compound_intermediate(
+                                &reference,
+                                48,
+                                48,
+                                48,
+                                mv.0,
+                                mv.1,
+                                REF_NO_SCALE,
+                                8,
+                                8,
+                                InterpFilterKind::Regular,
+                                InterpFilterKind::Regular,
+                                dst,
+                                fctx,
+                            );
+                        }
+                        let mut got = vec![0u16; 64];
+                        combine_compound(&p0, &p1, fwd, bck, &mut got, fctx);
+                        let want = libaom_compound_2d(
+                            &reference, 48, mv0, mv1, 8, 8, hf, vf, fwd, bck, bd, dist_wtd,
+                        );
+                        assert_eq!(
+                            got, want,
+                            "combine bd {bd} dist_wtd {dist_wtd} phase ({xf},{yf})"
+                        );
+
+                        let c0: Vec<i32> = p0.iter().map(|&v| v + bias).collect();
+                        let c1: Vec<i32> = p1.iter().map(|&v| v + bias).collect();
+                        for inv in [false, true] {
+                            let mut mask = vec![0u8; 64];
+                            diffwtd_mask(&p0, &p1, inv, &mut mask, fctx);
+                            assert_eq!(
+                                mask,
+                                libaom_diffwtd(&c0, &c1, inv, bd, round_0),
+                                "diffwtd bd {bd} inv {inv} phase ({xf},{yf})"
+                            );
+                        }
+                        let mask: Vec<u8> = (0..64).map(|_| (lcg(&mut state) % 65) as u8).collect();
+                        let mut blended = vec![0u16; 64];
+                        // main shape: the branch's `subsampled: bool` split into
+                        // the plane's own `subw`/`subh` shifts; luma is (0, 0).
+                        blend_masked_compound(&p0, &p1, &mask, 8, 8, 8, 0, 0, &mut blended, fctx);
+                        assert_eq!(
+                            blended,
+                            libaom_blend(&c0, &c1, &mask, bd, round_0),
+                            "blend bd {bd} phase ({xf},{yf})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        predict, predict_scaled, predict_with_filter, predict_with_filters, InterpFilterKind,
-        REF_NO_SCALE,
+        InterpFilterKind, REF_NO_SCALE, predict, predict_scaled, predict_with_filter,
+        predict_with_filters,
     };
 
     /// Regression pin for the lane-av1flake ±1 defect: a real aomenc chroma
