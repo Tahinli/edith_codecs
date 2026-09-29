@@ -43597,4 +43597,203 @@ pub(crate) mod tests {
         }
         assert!(seen, "{name}: no sequence header parsed");
     }
+    /// lane-whtshape: a LOSSLESS 4:4:4 frame whose rect intra-BC blocks used
+    /// to code their chroma plane block as ONE rect transform unit -- a shape
+    /// libaom cannot code. `read_tx_mode` (`av1/decoder/decodeframe.c:140`)
+    /// returns `ONLY_4X4` for a `coded_lossless` frame BEFORE it looks at the
+    /// `tx_mode` symbol, `read_tx_size` (`:1117`) returns `TX_4X4` before it
+    /// looks at a tree, `get_vartx_max_txsize` (`av1/common/blockd.h:1447`)
+    /// returns `TX_4X4` for EVERY plane of a lossless block, and of
+    /// `av1/common/idct.c`'s `highbd_inv_txfm_add_*_c` only the 4x4 one carries
+    /// a `lossless` branch -- the rest fall through to the IDCT, because there
+    /// is no non-4x4 lossless inverse transform to dispatch to.
+    ///
+    /// The 8x4 unit that resulted reached the lossless Walsh-Hadamard path,
+    /// where a `debug_assert_eq!` named it in DEBUG and the RELEASE build died
+    /// one frame later with an opaque `range end index 8 out of range for slice
+    /// of length 0` (measured, not assumed -- see
+    /// lanes/whtshape.report.md r1).
+    ///
+    /// The witness is `fixtures/ll444_sb64_1to4_lossless.obu` (51107 bytes,
+    /// sha256 `fdb6467987095b99c8eb51b48743691d906b2d99d069f71f1d51b1abb6d2056e`),
+    /// encoded with the instrumented oracle
+    /// (`scripts/build-aom-oracle.sh`'s `aomenc`, 4:4:4 10-bit, `--lossless=1
+    /// --profile=1 --i444 --enable-rect-partitions=1
+    /// --enable-1to4-partitions=1 --min-partition-size=4 --max-partition-size=64
+    /// --sb-size=64 --tune-content=screen --enable-intrabc=1 --enable-palette=1
+    /// --cq-level=60 --enable-tx-size-search=0 --cpu-used=0 --limit=2`) over
+    /// `ffmpeg -f lavfi -i testsrc2=size=256x256:rate=25:duration=1 -pix_fmt
+    /// yuv444p10le -f rawvideo`. 4:2:0 cannot produce the shape at all -- its
+    /// smallest lossless chroma plane block is already 4x4 -- which is why the
+    /// 4:4:4 10-bit header is asserted.
+    ///
+    /// Four assertions, each with its own failure:
+    ///
+    /// 1. the route fired: `INTRABC_RECT_LOSSLESS_CHROMA4_HITS` is EXCLUSIVE to
+    ///    the per-4x4 chroma walk (no other caller walks a rect intra-BC
+    ///    block's chroma), so `>= 1` cannot be satisfied by the old
+    ///    single-unit read;
+    /// 2. NO non-4x4 lossless transform unit was reconstructed
+    ///    (`LOSSLESS_WHT_SPLIT_UNITS` delta 0) -- the shape-total WHT entry is
+    ///    not quietly papering over a caller that is still wrong;
+    /// 3. the stream DECODES both frames (before the fix the same bytes were a
+    ///    RELEASE panic and a Golomb-tail refusal in DEBUG); and
+    /// 4. a PIXEL comparison against the instrumented oracle's own
+    ///    `EC_AV1_FINAL_DUMP`, in DECODE order.
+    ///
+    /// **(4) is a PREFIX floor, not an exactness claim, and it says so.**
+    /// Measured against the oracle, decode-order frame 0 (the key frame) is
+    /// byte-exact on all three planes for its first 32992 of 65536 samples --
+    /// the whole frame above row 128, plus row 128 out to column 224. The
+    /// first differing sample there is (x=224, y=128) on Y, U and V alike: the
+    /// first column PAST the 16x8 lossless intra-BC block at mi (32, 52),
+    /// whose own 16x8 luma and chroma are byte-exact -- so the fork is at the
+    /// block boundary, in the block that FOLLOWS it. Decode-order frame 1 (the
+    /// inter frame) is exact to 55008 on luma and to 9378 on chroma. Both forks
+    /// are a SEPARATE defect this lane does not own; each is named with its
+    /// measurement in lanes/whtshape.report.md r3. Asserting "our output is
+    /// wrong by exactly N" would encode those defects as expected behaviour;
+    /// the per-frame, per-plane floor is the honest form, and it only grows.
+    #[test]
+    fn a_444_lossless_sb64_intrabc_rect_chroma_walks_4x4_units() {
+        const NAME: &str = "a_444_lossless_sb64_intrabc_rect_chroma_walks_4x4_units";
+        const FIXTURE: &str = "ll444_sb64_1to4_lossless.obu";
+        const FIXTURE_LEN: usize = 51107;
+        const FIXTURE_FNV: u64 = 0x7664_6a62_ddd3_4df2;
+        const FRAMES: usize = 2;
+        const PLANE: usize = 256 * 256;
+        /// Per decode-order frame, per plane (0=Y, 1=U, 2=V), the number of
+        /// leading samples MEASURED byte-exact against the oracle's
+        /// `EC_AV1_FINAL_DUMP`; the first differing sample is exactly this
+        /// index on that plane. Key frame: the whole frame above row 128 plus
+        /// row 128 out to column 224. Inter frame: luma exact to (224, 214),
+        /// chroma diverging early at (162, 36).
+        const EXACT_PREFIX: [[usize; 3]; 2] = [[32992, 32992, 32992], [55008, 9378, 9378]];
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("fixtures/{FIXTURE}"));
+        let stream = read_pin(&obu, FIXTURE_LEN, FIXTURE_FNV, NAME);
+        assert_444_header(&stream, NAME, 10);
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_intrabc_rect_lossless_chroma4_hits();
+        let split_before = crate::decode::lossless_wht_split_units();
+        let wht_before = crate::decode::lossless_wht_units();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned witness was refused: {e}"));
+        let chroma4 = crate::decode::intrabc_rect_lossless_chroma4_hits();
+        let split = crate::decode::lossless_wht_split_units() - split_before;
+        let wht = crate::decode::lossless_wht_units() - wht_before;
+
+        assert!(
+            chroma4 > 0,
+            "{NAME}: no LOSSLESS rect intra-BC block walked its chroma as 4x4 units \
+             -- the corrected route never ran, so this gate is measuring the old \
+             single rect unit (class gate-blind-to-feature)"
+        );
+        assert_eq!(
+            split, 0,
+            "{NAME}: {split} 4x4 WHT unit(s) were reconstructed inside a LOSSLESS \
+             transform unit that was itself not 4x4 -- a caller is still sizing a \
+             lossless unit wrongly and the shape-total WHT entry is hiding it"
+        );
+        assert!(
+            wht > 0,
+            "{NAME}: no lossless WHT unit ran at all -- vacuous"
+        );
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+
+        if !aomdec_path().is_file() {
+            eprintln!(
+                "{NAME}: {chroma4} lossless rect intra-BC block(s) walked 4x4 chroma \
+                 units, {wht} WHT units, 0 split; no oracle aomdec at {}, pixel arm \
+                 skipped",
+                aomdec_path().display()
+            );
+            return;
+        }
+        // The oracle's own final-frame dumps, in DECODE order, against ours.
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let in_obu = dir.join("in.obu");
+        std::fs::write(&in_obu, &stream).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&in_obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        let shown = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the second decode was refused: {e}"))
+            .len();
+        set_final_dump_prefix(None);
+        let count = |prefix: &std::path::Path| -> usize {
+            let mut n = 0usize;
+            while std::path::PathBuf::from(format!("{}.f{n}", prefix.display())).is_file() {
+                n += 1;
+            }
+            n
+        };
+        let oracle_frames = count(&aom_prefix);
+        let our_frames = count(&ours_prefix);
+        assert_eq!(
+            our_frames, oracle_frames,
+            "{NAME}: decoded {our_frames} frames in decode order, the oracle decoded \
+             {oracle_frames}"
+        );
+        for i in 0..oracle_frames {
+            let want =
+                std::fs::read(format!("{}.f{i}", aom_prefix.display())).expect("oracle dump");
+            let got = std::fs::read(format!("{}.f{i}", ours_prefix.display())).expect("our dump");
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{NAME}: decode-order frame {i} is {} bytes, the oracle's is {}",
+                got.len(),
+                want.len()
+            );
+            assert_eq!(
+                got.len(),
+                3 * PLANE * 2,
+                "{NAME}: decode-order frame {i} is not three 256x256 16-bit planes"
+            );
+            for (plane, name) in [(0usize, "Y"), (1, "U"), (2, "V")] {
+                let at = plane * PLANE * 2;
+                let floor = EXACT_PREFIX[i.min(EXACT_PREFIX.len() - 1)][plane].min(PLANE);
+                if got[at..at + floor * 2] == want[at..at + floor * 2] {
+                    continue;
+                }
+                let first = (0..floor)
+                    .find(|&s| got[at + s * 2..at + s * 2 + 2] != want[at + s * 2..at + s * 2 + 2])
+                    .unwrap_or(floor);
+                panic!(
+                    "{NAME}: decode-order frame {i} plane {name} diverges from the oracle at \
+                     sample {first} of {PLANE} (x={}, y={}) -- the exact prefix this gate pins \
+                     is {floor} and it only grows; the rest is the OPEN defect named in \
+                     lanes/whtshape.report.md r3",
+                    first % 256,
+                    first / 256
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "{NAME}: {chroma4} lossless rect intra-BC block(s) walked 4x4 chroma units, \
+             {wht} WHT units, 0 split; {oracle_frames} decode-order frame(s) ({shown} shown) \
+             byte-exact against the oracle up to the per-frame, per-plane exact prefix \
+             -- the tail is the OPEN r3 defect, not an assertion"
+        );
+    }
 }
