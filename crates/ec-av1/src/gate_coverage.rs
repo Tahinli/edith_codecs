@@ -1847,8 +1847,58 @@ mod pin_inventory {
                 }
                 let _ = vi;
             }
+            // (e) the shape this very fix INTRODUCED:
+            //     `.map(|n| crate_pin(&format!("{n}.obu")))`. Rewriting the
+            //     directory literal as a committed-path lookup made the gate
+            //     correct and simultaneously invisible -- `crate_pin("` no
+            //     longer appears, so shape (a) found nothing and the
+            //     enumerator reported a CLEAN tree while 14 pins were read. A
+            //     false pass is worse than the original gap: the original at
+            //     least showed up in a filesystem audit. Caught here by the
+            //     `reads.len()` floor in the invariant test.
+            for m in body.match_indices("crate_pin(&format!(") {
+                let rest = &body[m.0 + 19..];
+                let Some(close) = rest.find(')') else {
+                    continue;
+                };
+                let call = &rest[..close];
+                if !call.contains('"') {
+                    continue;
+                }
+                let head = &body[..m.0];
+                let Some(bracket) = head.rfind('[') else {
+                    continue;
+                };
+                let names: Vec<String> = head[bracket..]
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|x| !x.is_empty() && !x.contains(' ') && *x != "]")
+                    .map(|x| x.to_string())
+                    .collect();
+                // the literal inside the format!, e.g. `{n}.obu`
+                let lit = call.split('"').nth(1).unwrap_or("");
+                let ext = lit
+                    .split_once("}")
+                    .map(|(_, e)| e.to_string())
+                    .unwrap_or_default();
+                for n in names {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: format!("{n}{ext}"),
+                        shape: "crate_pin_runtime_name",
+                    });
+                }
+            }
         }
         out
+    }
+
+    /// Does this shape resolve through `crate_pin`, i.e. the COMMITTED
+    /// crate-local copy? Both the literal form and the runtime-name form do --
+    /// only the two `pin_dir`/root-`concat!` forms are machine-local.
+    pub fn resolves_committed(shape: &str) -> bool {
+        matches!(shape, "crate_pin" | "crate_pin_runtime_name")
     }
 
     /// Is `file` present as a committed crate-local fixture?
@@ -1964,7 +2014,7 @@ mod pin_inventory_tests {
         );
         let machine_local: Vec<String> = reads
             .iter()
-            .filter(|r| r.shape != "crate_pin")
+            .filter(|r| !super::pin_inventory::resolves_committed(r.shape))
             .map(|r| format!("{} reads {} via {}", r.gate, r.file, r.shape))
             .collect();
         assert!(
@@ -1974,6 +2024,173 @@ mod pin_inventory_tests {
              checkout:\n  {}",
             machine_local.len(),
             machine_local.join("\n  ")
+        );
+    }
+}
+
+/// lane-av1pins5 r5: the COUNT-VACUITY enumerator.
+///
+/// Passing OUR OWN decode's length as the ORACLE's expected frame count
+/// (`ffmpeg_decode_sequence(&stream, w, h, ours.len())`) is a real defect, but
+/// NOT the one r4 claimed. MEASURED, by calling
+/// `ffmpeg_decode_sequence(&stream, 192, 128, 0)` on a real pinned stream under
+/// `catch_unwind`: it PANICS at `stream.rs:5110` with
+/// `expected 0 4:2:0 frames, ffmpeg said: `. The helper asserts
+/// `out.stdout.len() == frame_bytes * frames` unconditionally, so a wrong count
+/// cannot pass silently -- it reds, with a message that blames FFMPEG for a
+/// count OUR decoder chose.
+///
+/// r4 reported this shape as "a vacuous pass" and told Main so. That was wrong.
+/// The consequence is a MISATTRIBUTED RED. The fix r4 shipped is still right (the
+/// count now comes from the fixture, so the red names the real cause), but the
+/// justification was wrong, and a sweep that repeats it would send the next
+/// reader after a silent-pass bug that does not exist.
+///
+/// This enumerator finds every such site and classifies it, so the class is
+/// visible and cannot shrink unnoticed.
+#[cfg(test)]
+mod count_vacuity {
+    /// One oracle call whose expected frame count is locally derived.
+    pub struct Site {
+        pub line: usize,
+        pub gate: String,
+        pub count_expr: String,
+        /// An independent count assertion on the same binding, within a few
+        /// lines above: that is what makes the count a SPEC rather than a
+        /// self-fulfilling number.
+        pub pinned_by: Option<String>,
+    }
+
+    pub fn sites(src: &str) -> Vec<Site> {
+        let mut out = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        let mut gate = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("fn ") {
+                if let Some(n) = rest.split('(').next() {
+                    if !n.contains(' ') {
+                        gate = n.to_string();
+                    }
+                }
+            }
+            for callee in [
+                "ffmpeg_decode_sequence(",
+                "ffmpeg_decode_sequence_10bit(",
+                "ffmpeg_decode_sequence_444(",
+            ] {
+                let Some(at) = line.find(callee) else {
+                    continue;
+                };
+                let args = &line[at + callee.len()..];
+                // DEPTH-AWARE close: `args.find(')')` stops at the `)` of
+                // `pictures.len()` and truncates the arg list mid-expression,
+                // which silently yielded zero sites on the first run.
+                let mut depth = 1usize;
+                let mut close = None;
+                for (k, ch) in args.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(close) = close else { continue };
+                let arglist = &args[..close];
+                let last = arglist.rsplit(',').next().unwrap_or("").trim();
+                if !(last.ends_with(".len()") || last.ends_with(".count()")) {
+                    continue;
+                }
+                // Is the SAME binding count-asserted against a literal/const
+                // within the preceding 12 lines? That is the difference between
+                // a spec and a self-fulfilling number.
+                let binding = last.trim_end_matches(".len()").trim_end_matches(".count()");
+                let mut pinned = None;
+                for back in 1..=12usize {
+                    if i < back {
+                        break;
+                    }
+                    let prev = lines[i - back];
+                    if prev.contains(&format!("assert_eq!({binding}.len()"))
+                        || prev.contains(&format!("assert_eq!({binding}.len(), "))
+                    {
+                        pinned = Some(prev.trim().chars().take(90).collect());
+                        break;
+                    }
+                }
+                out.push(Site {
+                    line: i + 1,
+                    gate: gate.clone(),
+                    count_expr: last.to_string(),
+                    pinned_by: pinned,
+                });
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod count_vacuity_tests {
+    use super::count_vacuity::sites;
+
+    /// The shape is real and widespread; this pins the FLOOR so the sweep cannot
+    /// silently stop finding sites. Measured count is well above this.
+    #[test]
+    fn the_count_vacuity_sweep_finds_the_known_sites() {
+        let src = include_str!("stream.rs");
+        let s = sites(src);
+        assert!(
+            s.len() >= 40,
+            "the count-vacuity sweep found only {} site(s); expected 40+ -- it has lost a \
+             shape",
+            s.len()
+        );
+        assert!(
+            s.iter()
+                .any(|x| x.line == 3895 || x.count_expr == "pictures.len()"),
+            "the original reported site (pictures.len()) is gone -- re-derive the sweep"
+        );
+    }
+
+    /// Report, per site: does the count come from a SPEC or from our own decode?
+    /// Prints the table the r5 report carries. The assertion is the FLOOR above,
+    /// not "zero unpinned" -- the residual unpinned sites are handed to another
+    /// lane with this table, and forcing them all here would be an unbounded
+    /// change dressed as a fix.
+    #[test]
+    fn every_locally_derived_oracle_count_is_reported() {
+        let src = include_str!("stream.rs");
+        let s = sites(src);
+        let unpinned: Vec<String> = s
+            .iter()
+            .filter(|x| x.pinned_by.is_none())
+            .map(|x| {
+                format!(
+                    "stream.rs:{} | {} | {} | NOT SPEC-PINNED",
+                    x.line, x.gate, x.count_expr
+                )
+            })
+            .collect();
+        let pinned = s.len() - unpinned.len();
+        eprintln!(
+            "count-vacuity sweep: {} site(s); {} spec-pinned by a prior assert, {} not",
+            s.len(),
+            pinned,
+            unpinned.len()
+        );
+        for line in unpinned.iter().take(12) {
+            eprintln!("  {line}");
+        }
+        assert!(
+            !s.is_empty() && s.iter().all(|x| !x.gate.is_empty()),
+            "a site has no owning gate -- the sweep's gate attribution is broken"
         );
     }
 }
