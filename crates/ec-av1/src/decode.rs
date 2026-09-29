@@ -39141,6 +39141,49 @@ thread_local! {
     /// the number that says the route changed an answer.
     pub(crate) static CHROMA_QUAD_LEAF_TX_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+thread_local! {
+    /// lane-av1f9singleland: the SINGLE-REFERENCE copy of
+    /// [`CHROMA_QUAD_LEAF_TX_HITS`], and the half of its
+    /// [`CHROMA_QUAD_LEAF_TX_DIFF_HITS`] that belongs to that arm.
+    ///
+    /// Why a separate pair rather than trusting the shared counters: the
+    /// shared ones are bumped from BOTH arms of the four-unit 4:4:4 chroma
+    /// arm, so a green witness on them says nothing about which arm produced
+    /// the hits. `decode_inter_block` has two textually parallel copies of
+    /// that arm -- the compound prediction arm (the `build` closure) and the
+    /// single-reference arm -- and a refactor can delete or revert either one
+    /// while the other keeps the shared total non-zero. Measured on the pinned
+    /// witness `fixtures/444_quad_leaf_tx_type.obu`: 96 units resolve through
+    /// the covering leaf, and 88 of them are the single-reference arm's, so
+    /// the shared counter is 92% single-reference and the compound arm alone
+    /// would be a 4-unit sample of the route it appears to witness.
+    pub(crate) static CHROMA_QUAD_LEAF_TX_SINGLEREF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Of [`CHROMA_QUAD_LEAF_TX_SINGLEREF_HITS`], how many resolved a type
+    /// that DIFFERS from the block-level one. This is the arm's own non-vacuity
+    /// bar: a route count alone stays green through a no-op resolve, because
+    /// on a block whose four luma leaves all agree the per-quadrant value and
+    /// the block-level one are the same answer. Mutating only the
+    /// single-reference arm's `Some(cu_tx_type)` back to `Some(luma_tx_type)`
+    /// turns the witness red with 777 bytes differing in decode-order frame 1.
+    pub(crate) static CHROMA_QUAD_LEAF_TX_SINGLEREF_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`CHROMA_QUAD_LEAF_TX_SINGLEREF_HITS`]: single-reference-arm chroma units
+/// that took their type from the covering luma leaf.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_quad_leaf_tx_singleref_hits() -> usize {
+    CHROMA_QUAD_LEAF_TX_SINGLEREF_HITS.with(std::cell::Cell::get)
+}
+
+/// [`CHROMA_QUAD_LEAF_TX_SINGLEREF_DIFF_HITS`]: of those, the units whose
+/// covering leaf's type differs from the block-level one.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_quad_leaf_tx_singleref_diff_hits() -> usize {
+    CHROMA_QUAD_LEAF_TX_SINGLEREF_DIFF_HITS.with(std::cell::Cell::get)
+}
 
 /// [`CHROMA_QUAD_LEAF_TX_HITS`]: chroma units that took their type from the
 /// covering luma leaf.
@@ -42964,8 +43007,14 @@ fn decode_inter_block(
                                     .unwrap_or(luma_tx_type);
                                 if covering_leaf_tx_type(&leaf_tx_types, cu_rel_mi).is_some() {
                                     hit!(CHROMA_QUAD_LEAF_TX_HITS);
+                                    hit!(CHROMA_QUAD_LEAF_TX_SINGLEREF_HITS);
+                                    // lane-av1f9singleland: this arm's own
+                                    // non-vacuity number -- the shared
+                                    // DIFFERS counter below cannot say which
+                                    // arm changed an answer.
                                     if cu_tx_type != luma_tx_type {
                                         hit!(CHROMA_QUAD_LEAF_TX_DIFF_HITS);
+                                        hit!(CHROMA_QUAD_LEAF_TX_SINGLEREF_DIFF_HITS);
                                     }
                                 }
                                 let cu_grid = read_inter_plane(
