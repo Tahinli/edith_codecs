@@ -45,7 +45,8 @@ import re
 import subprocess
 import sys
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ROOT = os.environ.get("PIN_AUDIT_ROOT") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), ".."))
 
 
 def sources():
@@ -107,6 +108,86 @@ def tracked(path):
         stderr=subprocess.DEVNULL,
     )
     return "yes" if r.returncode == 0 else "no"
+
+
+
+SELFTEST_CRATE = "__pin_audit_selftest__"
+
+
+def self_test():
+    """A POSITIVE CONTROL for the census itself, in the exact shape that cost a
+    gate: a doc comment reproducing the forbidden root literal, sitting between
+    two gates, one of which reads crate_pin.
+
+    It runs the REAL pipeline -- a synthetic crate written into the tree, the
+    normal scan, the normal records -- because a control that re-implements the
+    decision order would pass while the real path is broken, which is the failure
+    this control exists to catch. Losing a gate to a comment is SILENT: the
+    census count drops and nothing goes red, so only a control that asserts the
+    count can see it.
+    """
+    # Build the synthetic tree in a temp dir and point the scan at it, so the
+    # control runs even where the staged tree is read-only.
+    import tempfile
+    sandbox = tempfile.mkdtemp(prefix="pin-audit-selftest-")
+    saved_root = globals()["ROOT"]
+    globals()["ROOT"] = sandbox
+    d = os.path.join(sandbox, "crates", SELFTEST_CRATE, "src")
+    os.makedirs(d, exist_ok=True)
+    body = """//! self-test crate, removed by the audit itself.
+pub fn helper() {}
+
+#[test]
+fn selftest_a_reads_a_pin() {
+    // Reproduces the forbidden literal verbatim, INSIDE this gate's captured
+    // span -- exactly the shape that cost a real gate: fn_bodies runs a body
+    // from its `fn` line to the NEXT `fn` line, so a comment between two gates
+    // belongs to the earlier one.
+    // concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/selftest.obu")
+    let p = crate_pin("golden3-pin.obu");
+    helper();
+    assert!(!p.as_os_str().is_empty());
+}
+
+#[test]
+fn selftest_b_reads_a_pin() {
+    let p = crate_pin("sbpart-pin.obu");
+    helper();
+    assert!(!p.as_os_str().is_empty());
+}
+"""
+    path = os.path.join(d, "lib.rs")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        rows = []
+        for c, p in sources():
+            text = open(p, encoding="utf-8", errors="replace").read()
+            rel = os.path.relpath(p, ROOT)
+            for line, name, b, attrs in fn_bodies(text):
+                if not any(a.startswith("#[test") for a in attrs):
+                    continue
+                if not name.startswith("selftest_"):
+                    continue
+                code = re.sub(r"/\*.*?\*/", "", b, flags=re.S)
+                code = "\n".join(x.split("//", 1)[0] for x in code.splitlines())
+                kind = "root-literal" if (ROOT_RE.search(code) or JOIN_RE.search(code)) else "crate_pin"
+                rows.append((name, kind))
+        bad = [r for r in rows if r[1] != "crate_pin"]
+        missing = [n for n in ("selftest_a_reads_a_pin", "selftest_b_reads_a_pin")
+                   if n not in [r[0] for r in rows]]
+        ok = not bad and not missing
+        for n, k in sorted(rows):
+            print("SELFTEST\t{}\t{}".format(n, k))
+        if ok:
+            print("SELFTEST\tPASS\ta doc comment between two gates left both counted as crate_pin")
+        else:
+            print("SELFTEST\tFAIL\treclassified={} missing={}".format(bad, missing))
+        return 0 if ok else 1
+    finally:
+        globals()["ROOT"] = saved_root
+        import shutil
+        shutil.rmtree(sandbox, ignore_errors=True)
 
 
 def main():
@@ -287,4 +368,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(self_test())
     sys.exit(main())
