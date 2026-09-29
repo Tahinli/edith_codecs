@@ -80,7 +80,7 @@ walk had no exactness evidence. Measured exact, and gated.
 | **lossy** | **D (H1, H2)** | **D (H1)** | **y → gate C** |
 | tile columns (2) | **D (H3)** | – | – |
 | tile rows (2) | **D (H4)** | – | – |
-| superres | – | – | – |
+| superres | Y (`a_444_lossy_superres_stream_decodes_pixel_exact`, plus `…_mode1_den9_…` and `…_mode2_random_denom_…`) | – | – |
 | odd coded dims | – | – | – |
 
 ¹ 12-bit 4:4:4 is reachable only from a source smooth enough that aomenc
@@ -335,9 +335,11 @@ screen-tools refusal and call it a 4:4:4 result.
 
 ## 4. Not measured (budget), stated so nobody reads silence as coverage
 
-12-bit tiles at 4:2:0; 12-bit superres; 4:4:4 superres; 4:4:4 odd coded
-dimensions; 4:4:4 at 10/12-bit with tiles; 12-bit 4:4:4 lossless; 4:4:0
-(`ss 0,1`) at any depth. Suite staging and the full-suite run are Main's.
+12-bit tiles at 4:2:0; 12-bit superres; 4:4:4 superres **(closed since, at
+8-bit only — lane-av1superpin, see the correction in §6.5; 10/12-bit still
+open)**; 4:4:4 odd coded dimensions; 4:4:4 at 10/12-bit with tiles; 12-bit
+4:4:4 lossless; 4:4:0 (`ss 0,1`) at any depth. Suite staging and the
+full-suite run are Main's.
 
 ## 5. Handoffs, in the order a follow-up lane should take them
 
@@ -435,12 +437,42 @@ H2's stream is entropy-clean) or to H2 (lossy, tx-search-gated).
 
 | cell | stream | bytes | sha256 | verdict vs aomdec |
 |---|---|---|---|---|
-| 4:4:4 **superres** 256x128 (`--superres-mode=1`) | `sr444` | 15239 | `06621606…` | **DIVERGENT** from f2, 76404 samples, first (f2, s192) = Y(192,0) |
+| 4:4:4 **superres** 256x128 (`--superres-mode=1`, **no denominator flag**) | `sr444` | 15239 | `06621606…` | **NOT A SUPERRES CELL.** This is the sweep's own bytes (15239 B, sha256 `06621606…`), and every one of its four PARSED frame headers reads `use_superres=false denom=8` — `--superres-mode=1` without `--superres-denominator` is a **no-op**, byte-identical to the no-flag control. The DIVERGENT verdict itself stands (from f2, 76404 samples, first (f2, s192) = Y(192,0)) but it is **H1, the 1:4 inter-strip own-extent class**, not a superres defect — the same class as the 130x122 row below and gated by `a_444_lossy_rect4_strip_stream_decodes_pixel_exact_at_odd_and_wide_geometries` (second arm is these exact 15239 bytes). The real 4:4:4 superres cells need a denominator; they are byte-exact 4/4 and gated — see `lanes/av1superpin.report.md`. |
 | 4:4:4 **odd coded dims 66x66** | `odd444_66x66` | 5938 | `973eddf4…` | **EXACT 4/4** — new exact cell |
-| 4:4:4 **odd coded dims 130x122** | `odd444_130x122` | 8945 | `c87ac65b…` | **DIVERGENT** from f3, 11521 samples, first (f3, s2208) = Y(128,16) |
+| 4:4:4 **odd coded dims 130x122** | `odd444_130x122` | 8945 | `c87ac65b…` | **CORRECTED: was "DIVERGENT from f3, 11521 samples, first (f3, s2208) = Y(128,16)"; now EXACT 4/4** — the same H1 1:4-inter-strip chroma class, gated by `a_444_lossy_rect4_strip_stream_decodes_pixel_exact_at_odd_and_wide_geometries` (first arm = these exact 8945 bytes). Localised in `lanes/av1444edge.report.md` §2-§3: the pre-filter reconstruction already carries the identical first wrong sample, and the one-commit fix is lane-av1444rect's `f92776ba` |
 
-Note the aomenc flag is `--superres-mode=1`; there is no `--enable-superres`
-in this build (`aomenc --help | grep -i superres`).
+Note the aomenc flag is `--superres-mode=1` and there is no
+`--enable-superres` in this build (`aomenc --help | grep -i superres`) —
+but **that flag alone does nothing**, which is what made the row above a
+phantom cell. Read on:
+
+**Correction (lane-av1superpin): the flag above does nothing on its own.**
+There is indeed no `--enable-superres` in this build, and
+`--superres-mode=1` is accepted — but libaom picks the denominator itself
+(`get_superres_denom_for_qindex`, `av1/encoder/superres_scale.c:143`), which
+returns `SCALE_NUMERATOR` (8) unless the frame is a KF/ARF update AND the
+horizontal-energy test passes. On a smooth `testsrc2` source it returns 8,
+so the flag is a no-op and the stream is byte-identical to the no-flag
+control. Three routes actually produce a scaled stream (measured on this
+oracle, libaom `v3.13.3-7-g9bb526a`; the version comes from the source tree
+`scripts/build-aom-oracle.sh` builds, because `--version` is not an accepted
+flag on that build):
+
+1. `--superres-mode=1 --superres-denominator=<9..16>` — the denominator is
+   honoured and appears verbatim in the parsed header.
+2. `--superres-mode=2` (random) — scales with **no** denominator flag, and
+   **ignores** `--superres-denominator` entirely: denominators 9, 12 and 16
+   all produce the same stream. Its denominator is chosen **per frame** (at
+   256x128: 11, 14, 15, 9 across the four frames), so a single-denominator
+   reading of a mode-2 stream is wrong by construction.
+3. `--superres-mode=3` and `=4` are no-ops at every denominator tried, at
+   every bit depth — consistent with the committed census gate's own finding.
+
+**Always read the verdict out of the stream's own parsed frame header**
+(`use_superres`, `superres_denom`, `upscaled_width`, coded `frame_width`),
+never out of the flag. `--resize-mode` is a different feature and is never a
+superres witness: it downsizes the FRAME (`frame=171x85 upscaled=171`),
+whereas superres keeps `frame_width < upscaled_width`.
 
 The 130x122 stream is the interesting one: 66x66 is exact at the same
 settings, so the 4:4:4 partial-frame walk is right at one odd geometry and
@@ -482,11 +514,20 @@ that is ever hand-built.
 ### 6.5 Matrix deltas and the honest "not measured" list
 
 Matrix changes (§1): 4:4:4 row gains `odd dims 66x66 → y` (exact this lane),
-`superres → D`, `10/12-bit tiles → D`, `12-bit lossless → D`; 4:2:0 row gains
+`10/12-bit tiles → D`, `12-bit lossless → D`; 4:2:0 row gains
 `12-bit tiles + superres → y`. The tile-ROWS cells for 4:4:4 stay as they
 are — the 8-bit one is now Mustafa's EXACT (tile rows genuinely enabled at
 geometries with a second SB row), and the 10/12-bit ones are the untiled
 control above.
+
+**Correction (lane-av1superpin): the 4:4:4 row's superres cell reads `Y` at
+8-bit, not `D`.** This lane's `superres → D` was written from a stream that
+never scaled (§6.2: `--superres-mode=1` with no denominator is a no-op, and
+the divergence recorded against it is H1, now fixed and gated). With an
+explicit denominator — or `--superres-mode=2`, which chooses its own — the
+4:4:4 superres class is byte-exact 4/4 at coded widths 128, 171, 186 and 228,
+gated at `denom 12`, `denom 9` and mode 2. See `lanes/av1superpin.report.md`.
+10/12-bit stays `–`: still not measured.
 
 Still not measured after this round: 4:4:4 at 10/12 bits with **tile rows
 actually enabled** (needs a >= 256-high geometry — trap 2); 4:4:4 superres at
@@ -495,6 +536,11 @@ actually enabled** (needs a >= 256-high geometry — trap 2); 4:4:4 superres at
 witness; 4:4:0 at any depth (unproducible, §6.4); 4:2:2 (ss 1,0) beyond the
 existing probe-bypass row.
 
+Re-checked and **unchanged** by lane-av1superpin: "4:4:4 superres at 10/12
+bits" is still open. That lane measured 8-bit only — every fixture it pinned
+parses `bit_depth = 8` from its own sequence header — so this entry stands as
+written.
+
 ### 6.6 Handed to other lanes
 
 - The 4:4:4 **lossless chroma** divergences at 8/10/12 bits with and without
@@ -502,8 +548,14 @@ existing probe-bypass row.
   **Kaan-2** with H3 — same format, same unit family, and this round shows the
   class is not tile-specific and not depth-specific, which narrows it.
 - The 4:4:4 **130x122** odd-dimension divergence and the 4:4:4 **superres**
-  divergence are unassigned; neither reduces to a known class on the evidence
-  here, and neither has a discriminator run.
+  divergence were unassigned here. Both are now closed by
+  lane-av1444edge: they are **one class — H1**, the 1:4 inter-strip own-chroma-
+  extent gather at `ss (0,0)`, discriminator-run and fixed by `f92776ba`
+  (lane-av1444rect), and gated by
+  `a_444_lossy_rect4_strip_stream_decodes_pixel_exact_at_odd_and_wide_geometries`
+  — whose second arm is these exact 15239 bytes. The "superres" name in the
+  row was a mislabel; the stream never scaled. Real 4:4:4 superres coverage
+  is separate and lives in lane-av1superpin.
 - Recorded from Mustafa-2 and folded into the matrix above: a hardcoded 4:2:0
   luma footprint at the lossless 16x4/4x16 chroma-pair walk
   (`Reach::of_tu` mis-answering at `ss 0,0`), same shape class as the wave's
