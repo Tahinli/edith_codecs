@@ -214,12 +214,12 @@ while IFS= read -r pin; do
 done < <(find "$ROOT"/crates/*/fixtures -maxdepth 1 -type f 2>/dev/null |
     sed "s#^$ROOT/##" | sort)
 
-# Known-absent pins that no source literal reached still belong in the
-# manifest: a missing pin must be a row, not a gap.
-for p in fixtures/ll444-lossless-key.obu fixtures/golden3-pin.obu fixtures/sbpart-pin.obu; do
-    grep -qP "^\Q$p\E\t" "$tmp" && continue
-    row "$p" "(named absent pin)" "$(absent_pin "$p")" absent-pin >>"$tmp"
-done
+# A known-absent pin is annotated where a source literal actually REACHES for
+# it (pass 1, above: `absent_pin` supplies the provenance and the `absent-pin`
+# status). Nothing is injected here: a pin no code references any more is not
+# a gap in the library, it is a deleted reference, and inventing a row for it
+# would keep a stale claim alive. A pin that IS referenced and IS absent still
+# gets a row, because pass 1 emits one for every literal.
 
 # Which tests consume the fetched vector sets, and does anything need the
 # .tar.gz blobs? The fleet sync excluded them deliberately, so a test that
