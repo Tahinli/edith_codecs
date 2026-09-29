@@ -270,10 +270,75 @@ sentence in a comment.
 ## Notes for the merge owner
 
 * `scripts/fixture-library.tsv` is regenerated. `required_by` line attributions
-  moved because the edits shifted lines; the row **set** is identical, verified
-  by `diff <(cut -f1,3 | sort -u)` against the pre-change manifest.
+  moved because the edits shifted lines, and three paths carry fewer duplicate
+  rows than before — §6 has the measurement, the per-path deltas, and the proof
+  that the unique path set (159) is identical on both sides. The row set
+  relevant to `RESOLVE` did not change.
 * The lane worktree needs `scripts/link-fixtures.sh` (or `EC_FIXTURES`) before
   the clip gates can do anything; a `git archive` staging excludes the
   gitignored root `fixtures/`, which is the staging gap the wave-3c-b owner
   measured. After this commit that staging is no longer silent: the clip gates
   are RED under the require envs instead of green.
+
+## 6. Reconciling `GREEN (295 rows)` against `GREEN (305 rows)`
+
+Both measured on the SAME library (`$LIB`, the clip is 3320956 B) — the branch
+worktree's `fixtures` is a symlink to the same directory the primary checkout
+holds as a real dir, so staging shape differs by a symlink and nothing else.
+
+```
+branch tip (lane-av1clipprobe), root = symlink to $LIB
+  verify-fixture-library: GREEN (295 rows)      scripts/fixture-library.tsv: 295 rows
+f33b9d41 (primary), root = real dir
+  verify-fixture-library: GREEN (305 rows)      scripts/fixture-library.tsv: 305 rows
+```
+
+**The unique path set is IDENTICAL — 159 paths on both sides:**
+
+```
+$ diff <(grep -v '^#' base/scripts/fixture-library.tsv    | cut -f1 | sort -u) \
+       <(grep -v '^#' branch/scripts/fixture-library.tsv | cut -f1 | sort -u)
+(empty)
+```
+
+So no path left `RESOLVE`. The 10-row difference is entirely DUPLICATE rows —
+one row per call site for a path that several sites read — and it falls on
+exactly three paths, all still present:
+
+| path | base rows | branch rows | delta |
+|---|---|---|---|
+| `fixtures` (the root) | 14 | 10 | −4 |
+| `fixtures/video/h264-1080p-23.976-8bit.mp4` | 11 | 6 | −5 |
+| `fixtures/video/h264-2160p-23.976-8bit.mp4` | 5 | 4 | −1 |
+| | | | **−10** |
+
+Cause: those sites used to spell the root out (`…join("../../fixtures")`,
+`…join("../../fixtures/video/h264-1080p-23.976-8bit.mp4")`), one literal per
+site, one row per literal. They now call the resolver, and the resolver
+emits one row per call site plus ONE directory row per file (not per call).
+`required_by` for those three paths is therefore coarser: the forensic
+"which gate reads this" attribution is thinner for 3 paths, while the
+existence/non-emptiness check `RESOLVE` performs is unchanged. Every other
+difference in the row-level diff is a 1:1 line-attribution shift from the
+edits (`stream.rs:8153` → `8156`, `encode.rs:20345` → `21588`, …).
+
+**Does my `gen-fixture-library.sh` change alter the row set on a properly staged
+tree? No — it is a byte-exact no-op there.** Measured on a throwaway worktree at
+`f33b9d41`, staged with the same `$LIB`, running THIS LANE'S generator over the
+BASE source:
+
+```
+gen-fixture-library: 305 rows -> /tmp/… (191 unnamed media literals, 4 unreferenced committed pins)
+unique path set vs the base's committed manifest: IDENTICAL
+rows: base=305  branchgen=305
+full row diff: (empty)
+```
+
+The two new passes (1b and the directory row) are scoped to lines that call
+`library_fixture::require/require_at/path`, and no such line exists at
+`f33b9d41`, so they emit nothing. The 295 is caused by the SOURCE edits alone.
+
+I am confident about the branch manifest: it is what this branch's generator
+produces from this branch's source on a properly staged tree, which is the only
+definition that keeps DRIFT meaningful. The merge note stands — on a
+`fixture-library.tsv` conflict take this lane's version and re-run the verifier.
