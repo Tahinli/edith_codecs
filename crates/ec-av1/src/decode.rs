@@ -2890,6 +2890,30 @@ pub(crate) fn lossless_wht_units() -> usize {
     LOSSLESS_WHT_UNITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// lane-whtshape: 4x4 Walsh-Hadamard units reconstructed as part of a LOSSLESS
+/// transform unit that was itself NOT 4x4 -- a shape libaom cannot code.
+/// `read_tx_mode` (`av1/decoder/decodeframe.c:140`) returns `ONLY_4X4` for a
+/// `coded_lossless` frame before it looks at the `tx_mode` symbol,
+/// `read_tx_size` (`:1117`) returns `TX_4X4` before it looks at a tree,
+/// `get_vartx_max_txsize` (`av1/common/blockd.h:1447`) returns `TX_4X4` for
+/// EVERY plane of a lossless block, and of `av1/common/idct.c`'s
+/// `highbd_inv_txfm_add_*_c` only `highbd_inv_txfm_add_4x4_c` carries a
+/// `lossless` branch -- every other size falls through to the IDCT, because
+/// there is no non-4x4 lossless inverse transform to dispatch to. So one of
+/// these is a CALLER sizing a lossless unit wrongly, not a bitstream shape;
+/// read as a before/after delta around one decode it names the caller. Must
+/// read 0 on a stream whose lossless unit geometry is right. Atomic: the
+/// wavefront workers run the transform on their own threads.
+static LOSSLESS_WHT_SPLIT_UNITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// [`LOSSLESS_WHT_SPLIT_UNITS`] -- total over the process, read as a
+/// before/after delta around one decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lossless_wht_split_units() -> usize {
+    LOSSLESS_WHT_SPLIT_UNITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl TxParams {
     /// The one copy of the produce-the-residual code: the inline path calls it
     /// on the parse thread, the wavefront worker calls it on its own, so both
@@ -2897,10 +2921,34 @@ impl TxParams {
     fn run(self, grid: &[i32]) -> Vec<i32> {
         let residual = if self.lossless {
             LOSSLESS_WHT_UNITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            debug_assert_eq!((self.w, self.h), (4, 4));
-            debug_assert_eq!(self.tx_type, TxType::DctDct);
-            crate::transform::dequant_and_inverse_wht4x4(
+            // lane-whtshape: a non-4x4 unit here is this decoder's own
+            // transform-unit geometry being wrong (see
+            // [`LOSSLESS_WHT_SPLIT_UNITS`] for the libaom evidence). It used
+            // to be stopped by a `debug_assert_eq!` that RELEASE never ran:
+            // the 4x4 WHT returned 16 values for a `w * h` block and the
+            // release build died one frame later in the strided copy with an
+            // opaque `range end index 8 out of range for slice of length 0`
+            // that never named lossless or the transform. Counted, and
+            // reconstructed as the raster of 4x4 WHT units
+            // ([`crate::transform::dequant_and_inverse_wht`]) instead: total,
+            // the same in both profiles, and the 4x4 fast path is the same
+            // single call it always was. The old
+            // `debug_assert_eq!(self.tx_type, TxType::DctDct)` is gone with
+            // it: the WHT takes no tx_type (libaom's `av1_iwht4x4_add` does
+            // not either), and `av1_get_tx_type` already answers `DCT_DCT` on
+            // every plane of a lossless block, so asserting an argument
+            // nothing reads was a debug-only panic on a value release
+            // ignores.
+            if self.w != 4 || self.h != 4 {
+                LOSSLESS_WHT_SPLIT_UNITS.fetch_add(
+                    self.w.div_ceil(4) * self.h.div_ceil(4),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            crate::transform::dequant_and_inverse_wht(
                 grid,
+                self.w,
+                self.h,
                 self.bit_depth,
                 self.q_idx,
                 self.dc_delta,
@@ -4634,6 +4682,17 @@ thread_local! {
     /// invisible to every gate because they only counted CODED strips.
     static INTRABC_RECT_SKIPPED_HITS: std::cell::Cell<[usize; 2]> =
         const { std::cell::Cell::new([0, 0]) };
+    /// lane-whtshape: LOSSLESS rect intrabc blocks whose chroma plane block
+    /// [`decode_intrabc_rect`] walked as a `(cw/4) * (ch/4)` PLANE-MAJOR
+    /// raster of TX_4X4 units -- the shape libaom's lossless geometry codes
+    /// (`read_tx_size` returns `TX_4X4` for EVERY plane of a lossless block,
+    /// `get_vartx_max_txsize` likewise, and `read_tx_mode` forced the frame's
+    /// `ONLY_4X4`) -- instead of the single rect unit, which is what put a
+    /// non-4x4 unit on the lossless Walsh-Hadamard path. EXCLUSIVE to this arm:
+    /// no other caller walks a rect intrabc block's chroma, so `>= 1` cannot
+    /// be satisfied by any older route.
+    static INTRABC_RECT_LOSSLESS_CHROMA4_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// lane-av1-intrabc r4: coded (`skip == 0`) rect intrabc blocks reconstructed,
@@ -4663,6 +4722,18 @@ pub(crate) fn reset_intrabc_rect_hits() {
     INTRABC_RECT_VARTX_HITS.with(|c| c.set(0));
     INTRABC_RECT_CODED_HITS.with(|c| c.set([0, 0]));
     INTRABC_RECT_SKIPPED_HITS.with(|c| c.set([0, 0]));
+}
+
+/// lane-whtshape: [`INTRABC_RECT_LOSSLESS_CHROMA4_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_rect_lossless_chroma4_hits() -> usize {
+    INTRABC_RECT_LOSSLESS_CHROMA4_HITS.with(|c| c.get())
+}
+
+/// lane-whtshape: zeroes [`INTRABC_RECT_LOSSLESS_CHROMA4_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_rect_lossless_chroma4_hits() {
+    INTRABC_RECT_LOSSLESS_CHROMA4_HITS.with(|c| c.set(0));
 }
 
 /// Current value of [`INTRABC_RECT_VARTX_HITS`].
@@ -13255,12 +13326,34 @@ fn decode_intrabc_rect(
         });
     }
     let (px, py) = (mi_c * MI, mi_r * MI);
-    let (cpx, cpy) = (px / 2, py / 2);
+    // lane-whtshape: a LOSSLESS block's chroma plane block is
+    // `bw >> ss_x` by `bh >> ss_y` at its own origin -- `av1_get_max_uv_txsize`
+    // is `ss_size_lookup[bsize]` (no halving of its own), so at 4:4:4 that is
+    // the block's OWN footprint, not the 4:2:0 halving the lossy arm hard-codes.
+    // Measured on this lane's 4:4:4 lossless witness: with the halving, a
+    // 16x8 intrabc block's chroma plane block came out 8x4 and the lossless
+    // walk below coded 2 units per plane where libaom codes 8.
+    //
+    // Scoped to `lossless` ON PURPOSE. The 4:2:0 halving is right at 4:2:0,
+    // and every pinned 4:4:4 stream that reaches this helper does so LOSSY
+    // (measured: zero pinned fixtures decode a LOSSLESS intrabc rect block),
+    // whose footprint is a separate, already-named open cell --
+    // lanes/av1444rect.report.md's 4:4:4 intra-BC chroma. This lane must not
+    // move it, and a lossless-only split here changes no green pin either way.
+    let (cpx, cpy) = if lossless(fctx) {
+        (px >> ss_x(fctx), py >> ss_y(fctx))
+    } else {
+        (px / 2, py / 2)
+    };
     // `av1_get_max_uv_txsize(bw x bh)`: 4:2:0 halves the footprint and the
     // halved shape's own `max_txsize_rect_lookup` entry IS that size for every
     // shape this helper is called at, so the uv plane block is ONE unit --
     // the same call `decode_token_recon_block`'s own chroma loop makes.
-    let (cw, ch) = (bw / 2, bh / 2);
+    let (cw, ch) = if lossless(fctx) {
+        (bw >> ss_x(fctx), bh >> ss_y(fctx))
+    } else {
+        (bw / 2, bh / 2)
+    };
     // lane-av1-intrabc r2: the square stride the proven INTER path uses
     // (`side`). The residual grids, the prediction windows AND
     // `TxParams::stride` are all laid out at it -- the block's own width
@@ -13350,6 +13443,10 @@ fn decode_intrabc_rect(
     let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
     let luma_tx_type: TxType;
     let (luma_grid, u_grid, v_grid);
+    // lane-whtshape: the LOSSLESS chroma walk's composed plane-major grids,
+    // kept so their per-4x4 slices can be re-stamped over the whole-block
+    // record in the tail. `None` on every other arm.
+    let mut ll_chroma: Option<(Vec<i32>, Vec<i32>)> = None;
     if skip {
         // No residual syntax at all: the prediction IS the block.
         // Residual stride is `side` (and `cside`), not `bw`: reconstruct_mc_rect indexes
@@ -13572,43 +13669,95 @@ fn decode_intrabc_rect(
                     around[1] = c[1];
                     around[2] = c[2];
                 }
-                let (ug, _) = read_inter_plane_rect(
-                    dec,
-                    cdfs,
-                    rect_inter_chroma_set(cw, ch)?,
-                    (cw, ch),
-                    cside,
-                    1,
-                    around[1],
-                    0,
-                    u,
-                    cpx,
-                    cpy,
-                    Pred::Inline(&pred_u, cside),
-                    Some(luma_tx_type),
-                    None,
-                    fctx,
-                )?;
-                u_grid = embed_grid_stride(&ug, cw, ch, cside);
-                let (vg, _) = read_inter_plane_rect(
-                    dec,
-                    cdfs,
-                    rect_inter_chroma_set(cw, ch)?,
-                    (cw, ch),
-                    cside,
-                    2,
-                    around[2],
-                    0,
-                    v,
-                    cpx,
-                    cpy,
-                    Pred::Inline(&pred_v, cside),
-                    Some(luma_tx_type),
-                    None,
-                    fctx,
-                )?;
-                v_grid = embed_grid_stride(&vg, cw, ch, cside);
-                luma_grid = Grid::Zero(side * side);
+                if lossless(fctx) {
+                    // lane-whtshape: at lossless libaom codes TX_4X4 on EVERY
+                    // plane of a block -- `read_tx_size` returns `TX_4X4` for a
+                    // lossless block before it looks at a tree, `read_tx_mode`
+                    // already forced `ONLY_4X4` for the frame, and
+                    // `get_vartx_max_txsize` returns `TX_4X4` for every plane
+                    // -- so this block's chroma plane block is a
+                    // `(cw/4) * (ch/4)` raster of 4x4 units, PLANE-MAJOR
+                    // (`decode_token_recon_block`: every U unit, then every V
+                    // unit), not the single rect unit the two
+                    // `read_inter_plane_rect` calls below read. That single
+                    // 8x4 unit is what reached the lossless WHT with the wrong
+                    // shape (the `debug_assert_eq!((w, h), (4, 4))` this lane
+                    // replaced). Same helper, same walk, as the inter 8x8 and
+                    // 128 paths.
+                    hit!(INTRABC_RECT_LOSSLESS_CHROMA4_HITS);
+                    let mut uo = vec![0i32; cside * cside];
+                    let mut vo = vec![0i32; cside * cside];
+                    read_inter_chroma_lossless(
+                        dec,
+                        cdfs,
+                        neighbours,
+                        u,
+                        v,
+                        Pred::Inline(&pred_u, cside),
+                        Pred::Inline(&pred_v, cside),
+                        (mi_r, mi_c),
+                        (cpx, cpy),
+                        (0, 0),
+                        (cw, ch),
+                        (cw, ch),
+                        cside,
+                        0,
+                        base_q_idx,
+                        &mut uo,
+                        &mut vo,
+                        fctx,
+                    )?;
+                    // The per-unit walk stamped every unit's own coefficient
+                    // context, but the whole-block `record_split_luma_rect_mi`
+                    // in the tail rewrites every chroma cell with ONE composed
+                    // state, which drops the per-unit DC signs and levels (class
+                    // `override-slot-on-one-arm` -- the same one
+                    // `decode_rect_split`'s `ll_chroma_units` replay exists
+                    // for). The grids are kept here and replayed AFTER that
+                    // record, from the same 4x4 slices, so the same states.
+                    u_grid = embed_grid_stride(&Grid::Own(uo.clone()), cw, ch, cside);
+                    v_grid = embed_grid_stride(&Grid::Own(vo.clone()), cw, ch, cside);
+                    ll_chroma = Some((uo, vo));
+                    luma_grid = Grid::Zero(side * side);
+                } else {
+                    let (ug, _) = read_inter_plane_rect(
+                        dec,
+                        cdfs,
+                        rect_inter_chroma_set(cw, ch)?,
+                        (cw, ch),
+                        cside,
+                        1,
+                        around[1],
+                        0,
+                        u,
+                        cpx,
+                        cpy,
+                        Pred::Inline(&pred_u, cside),
+                        Some(luma_tx_type),
+                        None,
+                        fctx,
+                    )?;
+                    u_grid = embed_grid_stride(&ug, cw, ch, cside);
+                    let (vg, _) = read_inter_plane_rect(
+                        dec,
+                        cdfs,
+                        rect_inter_chroma_set(cw, ch)?,
+                        (cw, ch),
+                        cside,
+                        2,
+                        around[2],
+                        0,
+                        v,
+                        cpx,
+                        cpy,
+                        Pred::Inline(&pred_v, cside),
+                        Some(luma_tx_type),
+                        None,
+                        fctx,
+                    )?;
+                    v_grid = embed_grid_stride(&vg, cw, ch, cside);
+                    luma_grid = Grid::Zero(side * side);
+                }
             }
         }
     }
@@ -13636,6 +13785,29 @@ fn decode_intrabc_rect(
             DC_PRED,
             &[&luma_grid, &u_grid, &v_grid],
         );
+    }
+    // lane-whtshape: replay the LOSSLESS walk's per-4x4 chroma states over
+    // the whole-block record above, so the NEXT block reads the per-unit DC
+    // signs and levels libaom's plane-major walk left behind instead of one
+    // composed state for the whole plane block.
+    if let Some((uo, vo)) = ll_chroma {
+        for (plane_idx, comp) in [(1usize, &uo), (2, &vo)] {
+            for ur in 0..ch / 4 {
+                for uc in 0..cw / 4 {
+                    let mut unit = Vec::with_capacity(16);
+                    for r in 0..4 {
+                        unit.extend_from_slice(&comp[(ur * 4 + r) * cside + uc * 4..][..4]);
+                    }
+                    neighbours.record_mi_chroma(
+                        (mi_r + ur * (4 >> ss_y(fctx)), mi_c + uc * (4 >> ss_x(fctx))),
+                        4 << ss_x(fctx),
+                        4 << ss_y(fctx),
+                        plane_idx,
+                        &Grid::Own(unit),
+                    );
+                }
+            }
+        }
     }
     neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
     neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);

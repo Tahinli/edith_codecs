@@ -186,7 +186,7 @@ impl Lane for [i32; 8] {
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod simd {
-    use super::{inverse_dct_n, Lane, COS_BITS};
+    use super::{COS_BITS, Lane, inverse_dct_n};
     use std::arch::x86_64::*;
 
     /// Eight `i32` lanes in one AVX2 register.
@@ -2717,7 +2717,9 @@ mod tests {
         inverse_adst16(&mut t, 16);
         assert_eq!(
             t,
-            [32, 73, 28, 6, -45, -28, 111, -52, 135, -54, 85, -67, 305, 190, 102, 145]
+            [
+                32, 73, 28, 6, -45, -28, 111, -52, 135, -54, 85, -67, 305, 190, 102, 145
+            ]
         );
     }
 
@@ -2737,7 +2739,9 @@ mod tests {
         inverse_identity(&mut t16, 16);
         assert_eq!(
             t16,
-            [283, -141, 71, 20, -8, 170, -34, 23, 42, -113, 93, -14, 62, 3, -198, 124]
+            [
+                283, -141, 71, 20, -8, 170, -34, 23, 42, -113, 93, -14, 62, 3, -198, 124
+            ]
         );
 
         let mut t32 = [0i32; 32];
@@ -3152,6 +3156,92 @@ pub fn dequant_and_inverse_wht4x4(
     })
 }
 
+/// lane-whtshape: the lossless inverse transform for a unit of ANY shape.
+///
+/// libaom never codes a lossless transform unit that is not 4x4, and it says
+/// so in two places this decoder already mirrors:
+///
+/// * `read_tx_mode` (`av1/decoder/decodeframe.c:140`) returns `ONLY_4X4`
+///   for a `coded_lossless` frame BEFORE it looks at the `tx_mode` symbol, so
+///   a lossless frame has no var-tx tree at all; and
+/// * `av1_get_tx_size` (`av1/common/blockd.h`) returns `TX_4X4` for EVERY
+///   plane of a lossless block before it looks at a tree.
+///
+/// The WHT dispatch proves the same from the other side: of
+/// `av1/common/idct.c`'s `highbd_inv_txfm_add_{4x8,8x4,16x4,...}_c`, ONLY
+/// `highbd_inv_txfm_add_4x4_c` carries a lossless branch
+/// (`idct.c:50`: `if (lossless) { av1_highbd_iwht4x4_add(...); return; }`).
+/// Every other size falls straight through to the IDCT network -- libaom has
+/// no lossless inverse transform for a non-4x4 unit to dispatch to, because
+/// `read_tx_mode`/`av1_get_tx_size` make that unit unreachable.
+///
+/// So a non-4x4 `lossless: true` [`TxParams`](crate::decode::TxParams) is
+/// never a bitstream libaom could have produced: it is THIS decoder's own
+/// transform-unit geometry being wrong. The function is nevertheless TOTAL
+/// (it used to be a `debug_assert_eq!` plus a 16-value result for a
+/// `w * h` block, which panicked one frame later in RELEASE with an opaque
+/// `range end index .. out of range for slice of length 0`): a unit is
+/// reconstructed as the raster of 4x4 WHT units that libaom's lossless
+/// geometry would have produced for that footprint -- the same numbers, in
+/// the same places, the correct per-4x4 caller would have written. The 4x4
+/// case is the same single call it always was, so the lossless fast path is
+/// bit-for-bit unchanged.
+///
+/// `w`/`h` need not be multiples of four: a partial tile is zero-filled, so
+/// no shape panics and no shape returns a buffer the caller cannot index.
+/// Returns the same empty-grid marker as [`dequant_and_inverse_wht4x4`].
+pub fn dequant_and_inverse_wht(
+    levels: &[i32],
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    dc_delta: i32,
+    ac_delta: i32,
+) -> Vec<i32> {
+    if w == 4 && h == 4 {
+        return dequant_and_inverse_wht4x4(levels, bit_depth, q_idx, dc_delta, ac_delta);
+    }
+    if crate::decode::is_zero_grid(levels) {
+        return Vec::new();
+    }
+    let mut out = vec![0i32; w * h];
+    let mut tile = [0i32; 16];
+    for ty in 0..h.div_ceil(4) {
+        for tx in 0..w.div_ceil(4) {
+            for r in 0..4 {
+                for c in 0..4 {
+                    let (sy, sx) = (ty * 4 + r, tx * 4 + c);
+                    tile[r * 4 + c] = if sy < h && sx < w {
+                        levels[sy * w + sx]
+                    } else {
+                        0
+                    };
+                }
+            }
+            let res = dequant_and_inverse_wht4x4(&tile, bit_depth, q_idx, dc_delta, ac_delta);
+            // An all-zero tile dequantizes to the same empty marker a 4x4
+            // caller passes straight through, and `out` is already zero --
+            // copying out of it would index an empty slice.
+            if res.is_empty() {
+                continue;
+            }
+            for r in 0..4 {
+                let (sy, sx) = (ty * 4 + r, tx * 4);
+                if sy >= h {
+                    continue;
+                }
+                for c in 0..4 {
+                    if sx + c < w {
+                        out[sy * w + sx + c] = res[r * 4 + c];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod lossless_tx_tests {
     /// The WHT is its own inverse up to the `UNIT_QUANT_SHIFT` scaling: a
@@ -3215,6 +3305,133 @@ mod lossless_tx_tests {
                 "levels={levels:?}"
             );
         }
+    }
+
+    /// lane-whtshape: the shape-total lossless entry must be EXACTLY the
+    /// per-4x4 raster libaom's lossless geometry produces -- the same numbers
+    /// in the same places that a caller walking `(w/4) * (h/4)` real TX_4X4
+    /// units would have written. Comparing against independently-composed
+    /// per-unit [`super::dequant_and_inverse_wht4x4`] calls is what makes the
+    /// split a total, not a guess.
+    #[test]
+    fn a_non_4x4_lossless_unit_is_the_raster_of_4x4_wht_units() {
+        let mut state = 0x0bad_c0deu32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 19) as i32 % 2001) - 1000
+        };
+        // A `w x h` coefficient grid is ROW-MAJOR at width `w`, so a 4x4 tile
+        // at `(tx * 4, ty * 4)` is a strided gather, not a contiguous run --
+        // the reference below gathers it the same way the split does.
+        let tile_of = |levels: &[i32], w: usize, tx: usize, ty: usize| -> Vec<i32> {
+            let mut t = vec![0i32; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    t[r * 4 + c] = levels[(ty * 4 + r) * w + tx * 4 + c];
+                }
+            }
+            t
+        };
+        for &(w, h) in &[(8usize, 4usize), (4, 8), (8, 8), (16, 4), (4, 16), (16, 16)] {
+            let levels: Vec<i32> = (0..w * h).map(|_| next()).collect();
+            let got = super::dequant_and_inverse_wht(&levels, w, h, 10, 0, 0, 0);
+            let mut want = vec![0i32; w * h];
+            for ty in 0..h / 4 {
+                for tx in 0..w / 4 {
+                    let unit = super::dequant_and_inverse_wht4x4(
+                        &tile_of(&levels, w, tx, ty),
+                        10,
+                        0,
+                        0,
+                        0,
+                    );
+                    // An all-zero tile is the empty marker on both sides; the
+                    // output is already zero there.
+                    if unit.is_empty() {
+                        continue;
+                    }
+                    for r in 0..4 {
+                        let dst = (ty * 4 + r) * w + tx * 4;
+                        want[dst..dst + 4].copy_from_slice(&unit[r * 4..][..4]);
+                    }
+                }
+            }
+            assert_eq!(got.len(), w * h, "{w}x{h}: residual length");
+            assert_eq!(got, want, "{w}x{h}: split differs from the 4x4 raster");
+        }
+    }
+
+    /// A grid whose non-zero coefficients sit in ONE tile: every other tile is
+    /// all zero, so it dequantizes to the empty marker rather than to 16
+    /// zeros. Copying out of that marker is an index panic -- the split has to
+    /// leave those samples at zero, exactly as a per-unit caller would.
+    #[test]
+    fn a_lossless_split_whose_other_tiles_are_all_zero_still_reconstructs() {
+        // Row 0 columns 0, 1 and 2 of an 8-wide grid: all three land in the
+        // LEFT 4x4 tile, so the right tile is all zero and dequantizes to the
+        // empty marker rather than to 16 zeros.
+        let mut levels = vec![0i32; 8 * 4];
+        levels[0] = 400;
+        levels[1] = -240;
+        levels[2] = 88;
+        let got = super::dequant_and_inverse_wht(&levels, 8, 4, 10, 0, 0, 0);
+        assert_eq!(got.len(), 32, "8x4 residual length");
+        let mut want = vec![0i32; 32];
+        for (tx, ty) in [(0usize, 0usize), (1, 0)] {
+            let mut t = vec![0i32; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    t[r * 4 + c] = levels[(ty * 4 + r) * 8 + tx * 4 + c];
+                }
+            }
+            let unit = super::dequant_and_inverse_wht4x4(&t, 10, 0, 0, 0);
+            if unit.is_empty() {
+                continue;
+            }
+            for r in 0..4 {
+                let dst = (ty * 4 + r) * 8 + tx * 4;
+                want[dst..dst + 4].copy_from_slice(&unit[r * 4..][..4]);
+            }
+        }
+        assert_eq!(got, want, "a partially-zero 8x4 lossless grid");
+        assert!(
+            got.iter().any(|&v| v != 0),
+            "the fixture's non-zero tile produced an all-zero residual -- the arm is vacuous"
+        );
+    }
+
+    /// The 4x4 fast path is the same single call it has always been: a
+    /// lossless unit that IS 4x4 must produce byte-identical numbers with and
+    /// without the shape dispatch, so no currently-green lossless pin moves.
+    #[test]
+    fn the_4x4_lossless_fast_path_is_unchanged() {
+        let mut state = 0x5eed_1234u32;
+        for _ in 0..64 {
+            let levels: Vec<i32> = (0..16)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((state >> 19) as i32 % 2001) - 1000
+                })
+                .collect();
+            assert_eq!(
+                super::dequant_and_inverse_wht(&levels, 4, 4, 8, 0, 0, 0),
+                super::dequant_and_inverse_wht4x4(&levels, 8, 0, 0, 0),
+                "levels={levels:?}"
+            );
+        }
+    }
+
+    /// The empty-grid marker contract is the one every residual caller
+    /// branches on (`TxParams::run` passes it straight through as "this unit
+    /// codes nothing"): a shape that is not 4x4 must keep it, or a skipped
+    /// 8x4 unit would hand its caller a 32-long zero buffer it then re-adds
+    /// onto the prediction twice.
+    #[test]
+    fn a_non_4x4_all_zero_lossless_unit_keeps_the_empty_marker() {
+        assert!(
+            super::dequant_and_inverse_wht(&[0i32; 32], 8, 4, 10, 0, 0, 0).is_empty(),
+            "an all-zero 8x4 lossless unit must stay the empty marker"
+        );
     }
 }
 
