@@ -1074,3 +1074,156 @@ else:
     print("dump byte-count check: every narrowing rung already checks its bytes")
 open(path, "w").write(s)
 PYN
+
+# --- rung 16: EC_PREDOUT8, the 8-bit predicted block (lane-av1cmpaudit) ----
+# This rung lived ONLY in the hand-patched oracle tree -- `instrument-aom-
+# oracle.sh` never transcribed it -- so a rebuild from this script silently
+# dropped it (class: instrument that lives only in a build tree, the same
+# reason rung 13 exists). It is transcribed here at BOTH 8-bit prediction
+# sites in reconintra.c: the non-directional early-return path (DC, SMOOTH*,
+# PAETH) and the directional / filter-intra tail. lane-av1cmpaudit also grew
+# `mode=` on both: without it, an agreeing-top / disagreeing-bottom pattern
+# on a non-directional unit could not be attributed to a mode at all.
+# `mode=` sits after `txh=`, matching EC_PREDND's own field order; every
+# pre-existing field keeps its position.
+#
+# Idempotent, and an UPGRADE as well as an install: the oracle tree's git HEAD
+# already carries the rung WITHOUT `mode=`, so the script has to rewrite that
+# form too, not just insert the block into a pristine upstream file.
+I="$SRC/av1/common/reconintra.c"
+[ -f "$I" ] || { echo "no oracle source at $I" >&2; exit 1; }
+
+python3 - "$I" <<'PYRI'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+if 'EC_PREDOUT8' not in s:
+    # Pristine upstream: insert the rung at both 8-bit prediction sites.
+    nd_old = """    build_non_directional_intra_predictors(ref, ref_stride, dst, dst_stride,
+                                           mode, tx_size, n_top_px, n_left_px);
+    return;
+  }"""
+    nd_new = """    build_non_directional_intra_predictors(ref, ref_stride, dst, dst_stride,
+                                           mode, tx_size, n_top_px, n_left_px);
+    /* EC_INSTRUMENTED_PREDOUT8 (non-directional, 8-bit) */
+    if (getenv("EC_PRED")) {
+      long ec_sum = 0;
+      for (int r = 0; r < txhpx; ++r)
+        for (int c = 0; c < txwpx; ++c) ec_sum += dst[r * dst_stride + c];
+      fprintf(stderr, "EC_PREDOUT8 mi_row=%d mi_col=%d plane=%d row_off=%d col_off=%d txw=%d txh=%d mode=%d sum=%ld row0=", xd->mi_row, xd->mi_col, plane, row_off, col_off, txwpx, txhpx, mode, ec_sum);
+      for (int c = 0; c < txwpx && c < 8; ++c) fprintf(stderr, "%d,", dst[c]);
+      fprintf(stderr, " col0=");
+      for (int r = 0; r < txhpx && r < 8; ++r) fprintf(stderr, "%d,", dst[r * dst_stride]);
+      fprintf(stderr, "\\n");
+    }
+    return;
+  }"""
+    assert nd_old in s, "non-directional intra predictor tail moved"
+    s = s.replace(nd_old, nd_new, 1)
+
+    dir_old = """  build_directional_and_filter_intra_predictors(
+      ref, ref_stride, dst, dst_stride, mode, p_angle, filter_intra_mode,
+      tx_size, disable_edge_filter, n_top_px, n_topright_px, n_left_px,
+      n_bottomleft_px, intra_edge_filter_type);
+}"""
+    dir_new = """  build_directional_and_filter_intra_predictors(
+      ref, ref_stride, dst, dst_stride, mode, p_angle, filter_intra_mode,
+      tx_size, disable_edge_filter, n_top_px, n_topright_px, n_left_px,
+      n_bottomleft_px, intra_edge_filter_type);
+  /* EC_INSTRUMENTED_PREDOUT8 (directional / filter-intra, 8-bit) */
+  if (getenv("EC_PRED")) {
+    long ec_sum = 0;
+    for (int r = 0; r < txhpx; ++r)
+      for (int c = 0; c < txwpx; ++c) ec_sum += dst[r * dst_stride + c];
+    fprintf(stderr, "EC_PREDOUT8 mi_row=%d mi_col=%d plane=%d row_off=%d col_off=%d txw=%d txh=%d mode=%d sum=%ld row0=", mi_row, mi_col, plane, row_off, col_off, txwpx, txhpx, mode, ec_sum);
+    for (int c = 0; c < txwpx && c < 8; ++c) fprintf(stderr, "%d,", dst[c]);
+    fprintf(stderr, " col0=");
+    for (int r = 0; r < txhpx && r < 8; ++r) fprintf(stderr, "%d,", dst[r * dst_stride]);
+    fprintf(stderr, "\\n");
+  }
+}"""
+    assert dir_old in s, "directional intra predictor tail moved"
+    s = s.replace(dir_old, dir_new, 1)
+    open(path, "w").write(s)
+    print("EC_PREDOUT8 installed (both 8-bit paths, with mode=)")
+    sys.exit(0)
+
+# Already present: upgrade the rung to carry `mode=` if it does not yet.
+nd_fmt_old = 'txw=%d txh=%d sum=%ld row0=", xd->mi_row'
+nd_fmt_new = 'txw=%d txh=%d mode=%d sum=%ld row0=", xd->mi_row'
+dir_fmt_old = 'txw=%d txh=%d sum=%ld row0=", mi_row'
+dir_fmt_new = 'txw=%d txh=%d mode=%d sum=%ld row0=", mi_row'
+upgraded = 0
+arg_old = "col_off, txwpx, txhpx, ec_sum);"
+arg_new = "col_off, txwpx, txhpx, mode, ec_sum);"
+if nd_fmt_old in s:
+    s = s.replace(nd_fmt_old, nd_fmt_new, 1)
+    assert arg_old in s, "EC_PREDOUT8 non-directional argument list moved"
+    s = s.replace(arg_old, arg_new, 1)
+    upgraded += 1
+if dir_fmt_old in s:
+    s = s.replace(dir_fmt_old, dir_fmt_new, 1)
+    assert arg_old in s, "EC_PREDOUT8 directional argument list moved"
+    s = s.replace(arg_old, arg_new, 1)
+    upgraded += 1
+if upgraded:
+    open(path, "w").write(s)
+    print("EC_PREDOUT8 upgraded to mode= (%d site(s))" % upgraded)
+else:
+    print("EC_PREDOUT8 already carries mode= (no-op)")
+PYRI
+
+# --- rung 17: EC_PREDND, the hbd twin of EC_PREDOUT8 (lane-av1cmpaudit) ----
+# The 10/12-bit non-directional twin of rung 16, and like it this rung lived
+# ONLY in the hand-patched oracle tree. Without it a rebuild drops the only
+# prediction probe that fires on a high-bitdepth stream -- rung 16 and the
+# pre-existing EC_PREDOUT both sit after the `is_hbd` early return and print
+# nothing there. EC_PREDND already carried `mode=`, so unlike rung 16 this one
+# is an INSTALL-ONLY rung: it is inserted into a pristine upstream file and is
+# a no-op on the already-instrumented tree.
+I="$SRC/av1/common/reconintra.c"
+[ -f "$I" ] || { echo "no oracle source at $I" >&2; exit 1; }
+
+python3 - "$I" <<'PYND'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_PREDND" in s:
+    print("EC_PREDND already instrumented (no-op)")
+    sys.exit(0)
+
+old = """      highbd_build_non_directional_intra_predictors(
+          ref, ref_stride, dst, dst_stride, mode, tx_size, n_top_px, n_left_px,
+          xd->bd);
+      return;
+    }"""
+new = """      highbd_build_non_directional_intra_predictors(
+          ref, ref_stride, dst, dst_stride, mode, tx_size, n_top_px, n_left_px,
+          xd->bd);
+      /* EC_INSTRUMENTED_PREDND (non-directional, high bitdepth) */
+      if (getenv("EC_PRED")) {
+        const int ec_mi_row = -xd->mb_to_top_edge >> (3 + MI_SIZE_LOG2);
+        const int ec_mi_col = -xd->mb_to_left_edge >> (3 + MI_SIZE_LOG2);
+        const uint16_t *d16 = CONVERT_TO_SHORTPTR(dst);
+        long sum = 0;
+        for (int r = 0; r < txhpx; ++r)
+          for (int c = 0; c < txwpx; ++c) sum += d16[r * dst_stride + c];
+        fprintf(stderr,
+                "EC_PREDND mi_row=%d mi_col=%d plane=%d row_off=%d col_off=%d "
+                "txw=%d txh=%d mode=%d n_top=%d n_left=%d sum=%ld row0=",
+                ec_mi_row, ec_mi_col, plane, row_off, col_off, txwpx, txhpx,
+                mode, n_top_px, n_left_px, sum);
+        for (int c = 0; c < txwpx && c < 8; ++c) fprintf(stderr, "%d,", d16[c]);
+        fprintf(stderr, " col0=");
+        for (int r = 0; r < txhpx && r < 8; ++r)
+          fprintf(stderr, "%d,", d16[r * dst_stride]);
+        fprintf(stderr, "\\n");
+      }
+      return;
+    }"""
+assert old in s, "highbd non-directional intra predictor tail moved"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("EC_PREDND instrumented (non-directional, high bitdepth)")
+PYND
