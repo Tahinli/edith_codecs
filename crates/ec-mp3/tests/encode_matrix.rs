@@ -45,6 +45,30 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
 }
 
+/// Fixture-presence probe for the encoder matrix corpus.
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that regenerates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape.
+fn require_fixture(path: &Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
+
 fn workdir(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ec-mp3-{}-{test}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create work dir");
@@ -360,11 +384,15 @@ fn vbr_mean_bitrate_tracks_quality_on_music() {
 #[test]
 fn encodes_above_the_incumbent_bar() {
     let dir = fixtures().join("audio");
+    // Probe first, assert inside the helper, and only then take the empty-list
+    // branch: under EC_REQUIRE_FIXTURES the assert fires instead of a silent
+    // skip that leaves every row below running zero times.
+    if !require_fixture(&dir, "scripts/gen-fixtures.sh") {
+        return;
+    }
     let mut sources: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
+        .unwrap_or_else(|e| panic!("read fixture dir {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
             let name = p.file_name().map(|n| n.to_string_lossy().to_string());
             name.is_some_and(|n| n.starts_with("wav16-") || n.starts_with("mp3src-"))
@@ -376,10 +404,17 @@ fn encodes_above_the_incumbent_bar() {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         name.contains("mono") || name.contains("stereo")
     });
-    if sources.is_empty() {
-        eprintln!("no WAV fixtures: run scripts/gen-fixtures.sh");
-        return;
-    }
+    // The corpus is eight committed WAVs (four `mp3src-*`, four `wav16-*`),
+    // all produced by `scripts/gen-fixtures.sh`. Fewer than all eight means
+    // the library drifted, not that the rows passed.
+    assert!(
+        sources.len() >= 8,
+        "only {} of the 8 mp3 encoder-matrix WAV fixtures are present in {} -- \
+         regenerate with: scripts/gen-fixtures.sh",
+        sources.len(),
+        dir.display()
+    );
+    let mut decoded_rows = 0usize;
     let work = workdir("encode");
     println!(
         "{:<30} {:>5} {:>6} {:>3} {:>9} {:>8} {:>9}",
@@ -390,6 +425,7 @@ fn encodes_above_the_incumbent_bar() {
         let Some((pcm, rate, channels)) = read_wav(source) else {
             continue;
         };
+        decoded_rows += 1;
         for kbps in BITRATES {
             let bar = bar_for(&source.file_name().unwrap().to_string_lossy(), kbps);
             let bytes = encode(&pcm, rate, channels, kbps);
@@ -455,6 +491,14 @@ fn encodes_above_the_incumbent_bar() {
             }
         }
     }
+    // A present-but-unreadable WAV takes the `read_wav` skip above, so the
+    // corpus count alone would leave this green having measured nothing.
+    assert!(
+        decoded_rows == sources.len(),
+        "only {decoded_rows} of {} fixtures decoded; a present fixture that \
+         ffmpeg cannot read is a broken fixture, not a passing row",
+        sources.len()
+    );
     assert!(failures.is_empty(), "{failures:#?}");
 }
 

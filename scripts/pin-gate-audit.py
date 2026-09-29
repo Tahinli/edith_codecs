@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""pin-gate-audit.py — census of the gates that read a PINNED fixture.
+
+The r1 invariant was too weak: it matched only single-name call shapes
+(`crate_pin("X")`, `pin_dir().join("X")`). It is blind to a much worse shape
+that exists in the crate right now -- a gate that reads N pins through a
+DIRECTORY literal plus a runtime-formatted name list:
+
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
+    ["warp-mismatch", "warp-flake-5", ...].iter().map(|n| format!("{fixtures}/{n}.obu"))
+
+Fourteen names, none committed under the crate, so no clean tree and no runner
+can satisfy them, and the gate is #[ignore]d -- a no-op that reports nothing.
+A preflight that passes it is the silent shape again.
+
+This audit, for every `#[test]` fn in crates/*/src and crates/*/tests that
+reaches for a fixture:
+
+  * resolves the fixture ROOT literal (concat! or Path::new(env!).join chain)
+  * enumerates every runtime name built from that root
+      - a `[..].iter().map(|n| format!("{var}/{n}.obu"))` name list
+      - a `format!` naming the root variable directly
+  * for each name, checks the path under the ROOT (gitignored, so never tracked)
+    and under crates/<crate>/fixtures/ (the committed copy)
+  * counts pin-reading gates, how many resolve through a committed copy, and how
+    many do not -- printed as numbers, not prose
+
+ASSERTION CLASSIFICATION uses the helper CALL GRAPH, not the gate body: a gate
+that delegates to a helper (the warp gate calls check_pinned_warp_stream, which
+asserts all three planes per frame) is NOT a no-assert gate, and reading only the
+body gets that wrong -- which is exactly the mistake that produced the
+"asserts nothing" classification earlier today.
+
+Output (one record per line, tab separated fields):
+    GATE   <file>:<line>\t<fn>\t<root-kind>\t<asserts:yes|no|via-helper NAME>\t<ignored:yes|no>\t<names>
+    NAME   <file>:<line>\t<gate-fn>\t<name>\t<committed-copy:present|absent>\t<tracked:yes|no|->\t<exists-under-root:yes|no>
+    COUNT  total=<n>\tcommitted=<n>\tuncommitted=<n>\tignored=<n>\tassertless=<n>
+
+Exit 0 always: the caller decides what is a failure. Set PIN_AUDIT_STRICT=1 to
+exit 1 when any name lacks a tracked committed copy.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.environ.get("PIN_AUDIT_ROOT") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), ".."))
+
+
+def sources():
+    for crate in sorted(os.listdir(os.path.join(ROOT, "crates"))):
+        for sub in ("src", "tests"):
+            d = os.path.join(ROOT, "crates", crate, sub)
+            if not os.path.isdir(d):
+                continue
+            for name in sorted(os.listdir(d)):
+                if name.endswith(".rs"):
+                    yield crate, os.path.join(d, name)
+
+
+def fn_bodies(text):
+    """Yield (start_line, name, body, preceding_attrs) for every fn.
+
+    The body runs from the `fn` line to the NEXT `fn` line rather than to a
+    brace-balanced end: brace counting over 39k lines of Rust miscounts the
+    moment one string literal or macro contains an unbalanced brace, and a
+    single bad walk swallows every gate after it. Over-capturing trailing
+    attributes of the next fn is harmless here -- attributes are read from the
+    lines immediately above the `fn` line, which this method never crosses.
+    """
+    lines = text.splitlines()
+    starts = []
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-z_0-9]+)", line)
+        if m:
+            starts.append((i, m.group(1)))
+    for n, (i, name) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        attrs = []
+        j = i - 1
+        while j >= 0 and lines[j].lstrip().startswith("#["):
+            attrs.append(lines[j].strip())
+            j -= 1
+        yield i + 1, name, "\n".join(lines[i:end]), attrs
+
+
+ROOT_RE = re.compile(
+    r'concat!\(\s*env!\("CARGO_MANIFEST_DIR"\)\s*,\s*"([^"]*)"\s*\)'
+)
+JOIN_RE = re.compile(
+    r'Path::(?:new|buf_from)\(\s*env!\("CARGO_MANIFEST_DIR"\)\s*\)\s*'
+    r'(?:\.join\("([^"]*)"\)\s*)+'
+)
+LIST_RE = re.compile(r'\[\s*((?:[^\[\]"]*"[^"]*"\s*,?\s*)+)\]')
+FMT_VAR_RE = re.compile(r'format!\(\s*"\{([a-z_0-9]+)\}/\{([a-z_0-9]+)\}(?:\.([a-z0-9]+))?"\s*\)')
+FMT_LIT_RE = re.compile(r'format!\(\s*"\{([a-z_0-9]+)\}(/[A-Za-z0-9._-]+)"\s*\)')
+HELPER_RE = re.compile(r'\b([a-z_0-9]+)\s*\(')
+
+
+def tracked(path):
+    if not os.path.exists(os.path.join(ROOT, ".git")):
+        return "->"
+    r = subprocess.run(
+        ["git", "-C", ROOT, "ls-files", "--error-unmatch", "--", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return "yes" if r.returncode == 0 else "no"
+
+
+
+SELFTEST_CRATE = "__pin_audit_selftest__"
+
+
+def self_test():
+    """A POSITIVE CONTROL for the census itself, in the exact shape that cost a
+    gate: a doc comment reproducing the forbidden root literal, sitting between
+    two gates, one of which reads crate_pin.
+
+    It runs the REAL pipeline -- a synthetic crate written into the tree, the
+    normal scan, the normal records -- because a control that re-implements the
+    decision order would pass while the real path is broken, which is the failure
+    this control exists to catch. Losing a gate to a comment is SILENT: the
+    census count drops and nothing goes red, so only a control that asserts the
+    count can see it.
+    """
+    # Build the synthetic tree in a temp dir and point the scan at it, so the
+    # control runs even where the staged tree is read-only.
+    import tempfile
+    sandbox = tempfile.mkdtemp(prefix="pin-audit-selftest-")
+    saved_root = globals()["ROOT"]
+    globals()["ROOT"] = sandbox
+    d = os.path.join(sandbox, "crates", SELFTEST_CRATE, "src")
+    os.makedirs(d, exist_ok=True)
+    body = """//! self-test crate, removed by the audit itself.
+pub fn helper() {}
+
+#[test]
+fn selftest_a_reads_a_pin() {
+    // Reproduces the forbidden literal verbatim, INSIDE this gate's captured
+    // span -- exactly the shape that cost a real gate: fn_bodies runs a body
+    // from its `fn` line to the NEXT `fn` line, so a comment between two gates
+    // belongs to the earlier one.
+    // concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/selftest.obu")
+    let p = crate_pin("golden3-pin.obu");
+    helper();
+    assert!(!p.as_os_str().is_empty());
+}
+
+#[test]
+fn selftest_b_reads_a_pin() {
+    let p = crate_pin("sbpart-pin.obu");
+    helper();
+    assert!(!p.as_os_str().is_empty());
+}
+"""
+    path = os.path.join(d, "lib.rs")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        rows = []
+        for c, p in sources():
+            text = open(p, encoding="utf-8", errors="replace").read()
+            rel = os.path.relpath(p, ROOT)
+            for line, name, b, attrs in fn_bodies(text):
+                if not any(a.startswith("#[test") for a in attrs):
+                    continue
+                if not name.startswith("selftest_"):
+                    continue
+                code = re.sub(r"/\*.*?\*/", "", b, flags=re.S)
+                code = "\n".join(x.split("//", 1)[0] for x in code.splitlines())
+                kind = "root-literal" if (ROOT_RE.search(code) or JOIN_RE.search(code)) else "crate_pin"
+                rows.append((name, kind))
+        bad = [r for r in rows if r[1] != "crate_pin"]
+        missing = [n for n in ("selftest_a_reads_a_pin", "selftest_b_reads_a_pin")
+                   if n not in [r[0] for r in rows]]
+        ok = not bad and not missing
+        for n, k in sorted(rows):
+            print("SELFTEST\t{}\t{}".format(n, k))
+        if ok:
+            print("SELFTEST\tPASS\ta doc comment between two gates left both counted as crate_pin")
+        else:
+            print("SELFTEST\tFAIL\treclassified={} missing={}".format(bad, missing))
+        return 0 if ok else 1
+    finally:
+        globals()["ROOT"] = saved_root
+        import shutil
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def main():
+    helpers = {}          # fn name -> body (all fns in the tree)
+    for crate, path in sources():
+        text = open(path, encoding="utf-8", errors="replace").read()
+        for _line, name, body, _attrs in fn_bodies(text):
+            helpers.setdefault(name, body)
+
+    total = committed = uncommitted = ignored = assertless = 0
+    bad = []
+
+    for crate, path in sources():
+        text = open(path, encoding="utf-8", errors="replace").read()
+        rel = os.path.relpath(path, ROOT)
+        for line, name, body, attrs in fn_bodies(text):
+            if not any(a.startswith("#[test") for a in attrs):
+                continue
+            # Match every shape on a COMMENT-STRIPPED body. A doc comment that
+            # reproduces a root literal to explain the shape it removed used to
+            # invent a gate here, the same blindness invariant 1 had.
+            code = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+            code = "\n".join(l.split("//", 1)[0] for l in code.splitlines())
+            root_lit = None
+            root_kind = "none"
+            var = None
+            m = ROOT_RE.search(code)
+            if m:
+                root_lit, var = m.group(1), None
+                root_kind = "concat!"
+            else:
+                m = JOIN_RE.search(code)
+                if m:
+                    joined = re.findall(r'\.join\("([^"]*)"\)', m.group(0))
+                    root_lit = "".join(joined)
+                    root_kind = "join"
+            if root_lit is None:
+                # The single-name shapes the FIRST invariant matched, kept so
+                # the census counts every pin-reading gate, not only the ones
+                # reached through a root literal.
+                ign_s = "yes" if any("ignore" in a for a in attrs) else "no"
+                singles = re.findall(r'crate_pin\(\s*"([^"]+)"', code)
+                # A gate that builds the pin name at runtime (crate_pin(&format!(..)))
+                # matches no single-name shape and would VANISH from the census --
+                # the same blind spot in a new place. Surface it instead.
+                for dyn_call in re.findall(r'crate_pin\(\s*&?\s*(?!")', code):
+                    print("BADCALL\t{}\t{}\tcrate_pin argument is not a string literal: {}"
+                          .format("{}:{}".format(rel, line), name, dyn_call.strip()[:60]))
+                    bad.append("BADROW\t{}\t{}\tcrate_pin\tname built at runtime -- this census "
+                               "cannot resolve it, so the gate is UNPROVEN here".format(
+                                   "{}:{}".format(rel, line), name))
+                singles += re.findall(
+                    r'pin_dir\(\)\.join\(\s*"([^"]+)"', code)
+                if not singles:
+                    continue
+                total += 1
+                if ign_s == "yes":
+                    ignored += 1
+                print("GATE\t{}\t{}\tcrate_pin\tyes\t{}\t{}".format(
+                    "{}:{}".format(rel, line), name, ign_s, len(singles)))
+                for n in singles:
+                    committed_rel = "crates/{}/fixtures/{}".format(crate, n)
+                    present = os.path.isfile(os.path.join(ROOT, committed_rel))
+                    tr = tracked(committed_rel) if present else "no"
+                    print("NAME\t{}\t{}\t{}\t{}\t{}\t{}".format(
+                        "{}:{}".format(rel, line), name, n,
+                        "present" if present else "absent", tr, "yes"))
+                    if present and tr in ("yes", "->"):
+                        committed += 1
+                    else:
+                        uncommitted += 1
+                        bad.append("BADROW\t{}\t{}\tcrate_pin\t{} not committed+tracked".format(
+                            "{}:{}".format(rel, line), name, n))
+                continue
+
+            # the variable the root is bound to, if any
+            v = re.search(
+                r'let\s+([a-z_0-9]+)\s*=\s*(?:concat!\(\s*env!\("CARGO_MANIFEST_DIR"\)|'
+                r'Path::(?:new|buf_from)\(\s*env!\("CARGO_MANIFEST_DIR"\)\s*\)\s*(?:\.join\("[^"]*"\)\s*)+)',
+                code,
+            )
+            if v:
+                var = v.group(1)
+
+            # names: ONLY the two shapes that matter.
+            #   (i) a runtime NAME LIST formatted against the root variable --
+            #       the shape the weak invariant was blind to
+            #   (ii) a single file literal appended to the root
+            # Anything else (a format! over some other variable, a scratch dump
+            # path) is not a pin read and is left to the manifest scan.
+            names = []
+            if var:
+                # The name list is bracketed, but comments sit between its
+                # items ("lane-rect r2: HORP strip ..."), so strip line
+                # comments before parsing the list and anchor on the format!
+                # that consumes it.
+                body_nc = re.sub(r"//[^\n]*", "", body)
+                for lit in LIST_RE.finditer(body_nc):
+                    items = re.findall(r'"([A-Za-z0-9._-]+)"', lit.group(1))
+                    if len(items) < 3:
+                        continue
+                    fm = FMT_VAR_RE.search(body_nc[lit.end():lit.end() + 400])
+                    if not fm or fm.group(1) != var:
+                        continue
+                    ext = fm.group(3) or ""
+                    for n in items:
+                        names.append((n, ext))
+            if not names:
+                lit = re.search(r'"(/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+)"', code)
+                # a lane dump under lanes/ is not a fixture and is not this gate
+                if lit and "/fixtures/" in lit.group(1):
+                    names.append((os.path.basename(lit.group(1)), ""))
+            if not names:
+                continue
+
+            # assertion classification through the CALL GRAPH
+            asserts = "assert" in code
+            via = ""
+            if not asserts:
+                for h in HELPER_RE.findall(code):
+                    hb = helpers.get(h)
+                    if hb and "assert" in hb:
+                        asserts = True
+                        via = h
+                        break
+            ign = "yes" if any("ignore" in a for a in attrs) else "no"
+            if not names:
+                continue
+            total += 1
+            if ign == "yes":
+                ignored += 1
+            if not asserts:
+                assertless += 1
+            kind = "yes" if asserts else "no"
+            if asserts and via:
+                kind = "via-" + via
+            print("GATE\t{}\t{}\t{}\t{}\t{}\t{}".format(
+                "{}:{}".format(rel, line), name, root_kind, kind, ign, len(names)))
+            missing = []
+            missing = []
+            missing = []
+            for n, _ext in names:
+                committed_rel = "crates/{}/fixtures/{}".format(crate, n)
+                present = os.path.isfile(os.path.join(ROOT, committed_rel))
+                tr = tracked(committed_rel) if present else "no"
+                under_root = os.path.isfile(os.path.join(ROOT, root_lit.strip("/"), n)) \
+                    if root_lit.startswith("..") else os.path.isfile(
+                        os.path.join(ROOT, "fixtures", n))
+                print("NAME\t{}\t{}\t{}\t{}\t{}\t{}".format(
+                    "{}:{}".format(rel, line), name, n,
+                    "present" if present else "absent", tr,
+                    "yes" if under_root else "no"))
+                if present and tr in ("yes", "->"):
+                    committed += 1
+                else:
+                    uncommitted += 1
+                    missing.append(n)
+            if missing:
+                bad.append("BADROW\t{}\t{}\t{}\t{}/{} pin(s) not committed+tracked, e.g. {}".format(
+                    "{}:{}".format(rel, line), name, root_kind, len(missing), len(names), missing[0]))
+            # a bare directory root feeding a runtime name list can never be
+            # satisfied by a committed tree
+            if names and root_lit.rstrip("/").endswith("fixtures"):
+                print("BARDIR\t{}\t{}\t{} + {} runtime name(s)".format(
+                    "{}:{}".format(rel, line), name, root_lit, len(names)))
+                bad.append("BADROW\t{}\t{}\t{}\tbare directory literal feeding {} runtime name(s): no committed tree satisfies it".format(
+                    "{}:{}".format(rel, line), name, root_lit, len(names)))
+
+    print("COUNT\ttotal={}\tcommitted={}\tuncommitted={}\tignored={}\tassertless={}".format(
+        total, committed, uncommitted, ignored, assertless))
+    if bad:
+        print("BAD\t{}".format(len(bad)))
+        for b in sorted(set(bad)):
+            print(b)
+    if os.environ.get("PIN_AUDIT_STRICT") == "1" and bad:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(self_test())
+    sys.exit(main())

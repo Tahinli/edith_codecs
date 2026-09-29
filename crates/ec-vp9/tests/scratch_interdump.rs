@@ -27,6 +27,30 @@
 mod ivf;
 
 use ec_vp9::decode::Decoder;
+/// Fixture-presence probe for the inter-frame IVF this gate parses (the
+/// `INTER_IVF` path, or its generated `/tmp/inter1.ivf` default).
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and how to regenerate it, so a host whose fixture library drifted reports
+/// RED instead of a green SKIP (class: gate-skips-on-its-own-failure; model
+/// `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape.
+fn require_fixture(path: &std::path::Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
 
 #[test]
 fn inter_syntax_dump() {
@@ -43,17 +67,25 @@ fn inter_syntax_dump() {
     } else {
         expect_raw
             .split(',')
-            .map(|t| t.trim().parse().expect("INTER_EXPECT entries are block counts"))
+            .map(|t| {
+                t.trim()
+                    .parse()
+                    .expect("INTER_EXPECT entries are block counts")
+            })
             .collect()
     };
-    let Ok(bytes) = std::fs::read(&path) else {
+    if !require_fixture(
+        std::path::Path::new(&path),
+        "INTER_IVF=<file>; the default is generated, not committed \
+         (ffmpeg -f lavfi -i testsrc2=... -c:v libvpx-vp9 -f ivf)",
+    ) {
         assert!(
             explicit.is_none(),
             "INTER_IVF={path} was set explicitly but the file does not exist"
         );
-        println!("SKIP: fixture {path} not found - set INTER_IVF=<file> to run");
         return;
-    };
+    }
+    let bytes = std::fs::read(&path).expect("fixture presence was just probed");
     let (_fourcc, w, h, frames) = ivf::parse_ivf(&bytes);
     println!("IVF {w}x{h} frames={}", frames.len());
     let mut dec = Decoder::new();

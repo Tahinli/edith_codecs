@@ -38,6 +38,33 @@ fn have_ffmpeg() -> bool {
         .unwrap_or(false)
 }
 
+/// Fixture-presence probe for the generated HE-AAC matrix under
+/// `<repo>/.cache/heaac-fixtures` (`scripts/aac-tables/make-heaac-fixtures.sh`).
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that regenerates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape. The `~/Music` / `~/Downloads` / `~/Videos`
+/// scans in this file are host corpora, not the committed fixture library, and
+/// keep their plain skip.
+fn require_fixture(path: &Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
+
 /// A film's audio track is hours long; the correlation only needs a bounded
 /// window near the start, so both sides cap how much they ever decode.
 const MAX_SAMPLES: usize = 1_000_000;
@@ -2444,11 +2471,7 @@ fn synthetic_heaac_matrix() {
     let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
         .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let dir = PathBuf::from(dir);
-    if !dir.is_dir() {
-        eprintln!(
-            "SKIP: {} absent -- run scripts/aac-tables/make-heaac-fixtures.sh first",
-            dir.display()
-        );
+    if !require_fixture(&dir, "scripts/aac-tables/make-heaac-fixtures.sh") {
         return;
     }
     unsafe {
@@ -2477,6 +2500,10 @@ fn synthetic_heaac_matrix() {
     // samples at the doubled/full output rate) both land well inside it,
     // not right at the edge the way the plain (LAG_MAX=4000) search did.
     const WIDE_LAG_MAX: i64 = 20_000;
+    // Floor: the matrix is 2 rates x 4 bitrates x 2 profiles. Without a count
+    // the whole test is green having probed nothing, which is the same
+    // false-green this file's `require_fixture` exists to kill.
+    let mut probed = 0usize;
     for rate in [48_000u32, 44_100] {
         for br in ["32k", "48k", "64k", "96k"] {
             // LC first: its winning lag is the pure container/decoder
@@ -2485,10 +2512,10 @@ fn synthetic_heaac_matrix() {
             let mut lc_lag: Option<i64> = None;
             for (profile, prefix) in [("LC", "lc"), ("HE", "heaac")] {
                 let path = dir.join(format!("{prefix}_{rate}_{br}.m4a"));
-                if !path.exists() {
-                    eprintln!("SKIP {}: missing", path.display());
+                if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
                     continue;
                 }
+                probed += 1;
                 let before = ec_aac::sbr_sideinfo_log().len();
                 let Some((ours, _sbr, our_rate)) = our_decode(&path, 0) else {
                     eprintln!("SKIP {}: could not decode", path.display());
@@ -2733,6 +2760,11 @@ fn synthetic_heaac_matrix() {
             }
         }
     }
+    assert!(
+        probed >= 16,
+        "only {probed} of 16 HE-AAC matrix fixtures were present -- rerun \
+         scripts/aac-tables/make-heaac-fixtures.sh"
+    );
 }
 
 fn candidates() -> Vec<Candidate> {
@@ -3756,11 +3788,11 @@ fn sbr_header_feature_table() {
     let fixtures = std::env::var("EC_AAC_HEAAC_FIXTURES")
         .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let fixtures = PathBuf::from(fixtures);
-    if fixtures.is_dir() {
+    if require_fixture(&fixtures, "scripts/aac-tables/make-heaac-fixtures.sh") {
         for rate in [48_000u32, 44_100] {
             for br in ["32k", "48k", "64k", "96k"] {
                 let p = fixtures.join(format!("heaac_{rate}_{br}.m4a"));
-                if p.exists() {
+                if require_fixture(&p, "scripts/aac-tables/make-heaac-fixtures.sh") {
                     rows.push(Row {
                         label: format!("synth-{rate}-{br}"),
                         path: p,
@@ -3770,11 +3802,6 @@ fn sbr_header_feature_table() {
                 }
             }
         }
-    } else {
-        eprintln!(
-            "SKIP synthetic rows: {} absent -- run scripts/aac-tables/make-heaac-fixtures.sh first",
-            fixtures.display()
-        );
     }
     if rows.is_empty() {
         eprintln!("SKIP: no real HE-AAC files and no synthetic fixtures found");
@@ -4044,10 +4071,8 @@ fn per_au_low_band_divergence() {
     let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
         .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let failing = PathBuf::from(&dir).join("heaac_44100_48k.m4a");
-    if failing.exists() {
+    if require_fixture(&failing, "scripts/aac-tables/make-heaac-fixtures.sh") {
         per_au_low_band_probe("synthetic 44100 48k (failing)", &failing, 0);
-    } else {
-        eprintln!("SKIP synthetic 44100 48k: {} absent", failing.display());
     }
 }
 
@@ -4094,7 +4119,20 @@ fn probe_explicit_config_and_wide_lag() {
         (planes, rate)
     }
 
-    for (label, path, aac_stream, ffmpeg_stream, core_sf_index, core_rate, ext_rate, channels) in [
+    // `synthetic` marks the case as coming from the committed fixture library
+    // (`scripts/aac-tables/make-heaac-fixtures.sh`); the FMJ row is a
+    // `~/Downloads` host corpus and keeps its plain skip.
+    for (
+        label,
+        path,
+        aac_stream,
+        ffmpeg_stream,
+        core_sf_index,
+        core_rate,
+        ext_rate,
+        channels,
+        synthetic,
+    ) in [
         (
             "FMJ",
             format!(
@@ -4107,6 +4145,7 @@ fn probe_explicit_config_and_wide_lag() {
             24_000u32,
             48_000u32,
             2u16,
+            false,
         ),
         (
             "heaac_44100_48k",
@@ -4120,10 +4159,15 @@ fn probe_explicit_config_and_wide_lag() {
             44_100,
             0, // filled below from parsed cfg's own extension_sample_rate
             2,
+            true,
         ),
     ] {
         let path = PathBuf::from(path);
-        if !path.exists() {
+        if synthetic {
+            if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
+                continue;
+            }
+        } else if !path.exists() {
             eprintln!("SKIP {label}: {} absent", path.display());
             continue;
         }
@@ -4334,8 +4378,7 @@ fn coupled_cpe_channel_swap_probe() {
     let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
         .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let path = PathBuf::from(&dir).join("heaac_44100_48k.m4a");
-    if !path.exists() {
-        eprintln!("SKIP: {} absent", path.display());
+    if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
         return;
     }
     let Some((ours, sbr, out_rate)) = our_decode(&path, 0) else {
@@ -4682,11 +4725,15 @@ fn sbr441_family_sample_drift_probe() {
     let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
         .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let home = std::env::var("HOME").unwrap_or_default();
-    let cases: [(&str, PathBuf, i64); 3] = [
+    // `synthetic` marks the rows served by the committed fixture library
+    // (`scripts/aac-tables/make-heaac-fixtures.sh`); the Nikbinler control is
+    // a `~/Music` host corpus and keeps its plain skip.
+    let cases: [(&str, PathBuf, i64, bool); 3] = [
         (
             "heaac_44100_48k (FAIL family)",
             PathBuf::from(&dir).join("heaac_44100_48k.m4a"),
             -4674,
+            true,
         ),
         (
             "heaac_48000_48k (48k control)",
@@ -4695,6 +4742,7 @@ fn sbr441_family_sample_drift_probe() {
             // (below) -- 0 was a bad guess, true fixed lag is -4673, same
             // as the failing family's.
             -4673,
+            true,
         ),
         (
             "Nikbinler (44.1k control)",
@@ -4704,11 +4752,16 @@ fn sbr441_family_sample_drift_probe() {
             // from an earlier probe, not its full-chain-vs-ffmpeg-reference
             // lag, which is +385.
             385,
+            false,
         ),
     ];
-    for (label, path, seed_lag) in cases {
+    for (label, path, seed_lag, synthetic) in cases {
         println!("\n=== {label}: {} ===", path.display());
-        if !path.exists() {
+        if synthetic {
+            if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
+                continue;
+            }
+        } else if !path.exists() {
             eprintln!("SKIP {label}: {} absent", path.display());
             continue;
         }
@@ -4802,8 +4855,7 @@ fn sbr_hf_window_band_probe() {
     let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
         .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let path = PathBuf::from(&dir).join("heaac_48000_64k.m4a");
-    if !path.exists() {
-        eprintln!("SKIP: {} absent", path.display());
+    if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
         return;
     }
     const LAG: i64 = -4673;
