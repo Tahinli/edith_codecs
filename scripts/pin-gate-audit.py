@@ -142,19 +142,31 @@ def main():
                 # The single-name shapes the FIRST invariant matched, kept so
                 # the census counts every pin-reading gate, not only the ones
                 # reached through a root literal.
+                ign_s = "yes" if any("ignore" in a for a in attrs) else "no"
                 singles = re.findall(r'crate_pin\(\s*"([^"]+)"', body)
+                # A gate that builds the pin name at runtime (crate_pin(&format!(..)))
+                # matches no single-name shape and would VANISH from the census --
+                # the same blind spot in a new place. Surface it instead.
+                for dyn_call in re.findall(r'crate_pin\(\s*&?\s*(?!")', body):
+                    print("BADCALL\t{}\t{}\tcrate_pin argument is not a string literal: {}"
+                          .format("{}:{}".format(rel, line), name, dyn_call.strip()[:60]))
+                    bad.append("BADROW\t{}\t{}\tcrate_pin\tname built at runtime -- this census "
+                               "cannot resolve it, so the gate is UNPROVEN here".format(
+                                   "{}:{}".format(rel, line), name))
                 singles += re.findall(
                     r'pin_dir\(\)\.join\(\s*"([^"]+)"', body)
                 if not singles:
                     continue
                 total += 1
+                if ign_s == "yes":
+                    ignored += 1
                 for n in singles:
                     committed_rel = "crates/{}/fixtures/{}".format(crate, n)
                     present = os.path.isfile(os.path.join(ROOT, committed_rel))
                     tr = tracked(committed_rel) if present else "no"
                     total_names = 1
-                    print("GATE\t{}\t{}\tcrate_pin\tyes\tno\t{}".format(
-                        "{}:{}".format(rel, line), name, len(singles)))
+                    print("GATE\t{}\t{}\tcrate_pin\tyes\t{}\t{}".format(
+                        "{}:{}".format(rel, line), name, ign_s, len(singles)))
                     print("NAME\t{}\t{}\t{}\t{}\t{}\t{}".format(
                         "{}:{}".format(rel, line), name, n,
                         "present" if present else "absent", tr, "yes"))
