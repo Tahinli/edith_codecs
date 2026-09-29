@@ -321,7 +321,16 @@ if ! "$ROOT/scripts/gen-fixture-library.sh" "$regen" >/dev/null 2>&1; then
     echo "FAIL: scripts/gen-fixture-library.sh did not run" >&2
     exit 1
 fi
-if ! diff -u <(grep -v '^#' "$MANIFEST") <(grep -v '^#' "$regen") >"$patch" 2>&1; then
+# The `tracked` column is COMMITTED provenance: it is computed in a git tree.
+# A runner host has no .git, so a regeneration there cannot recompute it and
+# would emit 'no-git' for every committed pin -- a drift on all 37 pin rows that
+# says nothing about the host's library. Off-git the column is normalised on both
+# sides, and the tracked invariant falls back to the committed value (as its own
+# message already says).
+drift_norm() { grep -v '^#' "$1" | awk -F'\t' -v OFS='\t' 'BEGIN{off=1} $1 ~ /^crates\/.*\/fixtures\//{if(off && $6!="-") $6="-"} {print}'; }
+OFFGIT=0
+[ -e "$ROOT/.git" ] || OFFGIT=1
+if ! diff -u <(drift_norm "$MANIFEST") <(drift_norm "$regen") >"$patch" 2>&1; then
     if [ "$REQUIRE" != 0 ]; then
         echo "FAIL: this tree's library does not match what the code reaches" >&2
         echo "      (DRIFT: the committed manifest's rows differ from a regeneration" >&2
