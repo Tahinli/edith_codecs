@@ -2040,6 +2040,16 @@ mod pin_inventory_tests {
 /// cannot pass silently -- it reds, with a message that blames FFMPEG for a
 /// count OUR decoder chose.
 ///
+/// TWO DEFECT CLASSES, DO NOT CONFLATE THEM (lane-av1pins5 r6):
+///   * MISATTRIBUTED RED -- a wrong count reds, and the old message blamed
+///     ffmpeg for a number OUR decoder chose. This is what these sites are.
+///     `ffmpeg_decode_sequence`'s `stdout.len() == frame_bytes * frames` assert
+///     is unconditional, so it cannot pass silently.
+///   * SILENT PASS -- the compare is skipped or truncated and the gate reports
+///     green. A DIFFERENT defect with a DIFFERENT fix, and r4 mislabelled these
+///     sites as belonging to it. If you are reading this to decide what to fix,
+///     fix the message and the count SOURCE; do not go looking for a silent pass.
+///
 /// r4 reported this shape as "a vacuous pass" and told Main so. That was wrong.
 /// The consequence is a MISATTRIBUTED RED. The fix r4 shipped is still right (the
 /// count now comes from the fixture, so the red names the real cause), but the
@@ -2059,18 +2069,28 @@ mod count_vacuity {
         /// lines above: that is what makes the count a SPEC rather than a
         /// self-fulfilling number.
         pub pinned_by: Option<String>,
+        /// Does this gate actually COMPARE PIXELS (so a wrong count would
+        /// corrupt a verdict), or is it a report-only probe?
+        pub pixel_comparing: bool,
+        /// A frame count already in scope that is a SPEC rather than a
+        /// self-fulfilling number -- e.g. the `FRAMES` the gate encoded, or a
+        /// count asserted on the pinned stream. `Some(..)` means the fix is a
+        /// one-line swap at this site.
+        pub fixable_from: Option<String>,
     }
 
     pub fn sites(src: &str) -> Vec<Site> {
         let mut out = Vec::new();
         let lines: Vec<&str> = src.lines().collect();
         let mut gate = String::new();
+        let mut fn_start = 0usize;
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim_start();
             if let Some(rest) = t.strip_prefix("fn ") {
                 if let Some(n) = rest.split('(').next() {
                     if !n.contains(' ') {
                         gate = n.to_string();
+                        fn_start = i;
                     }
                 }
             }
@@ -2111,16 +2131,118 @@ mod count_vacuity {
                 // within the preceding 12 lines? That is the difference between
                 // a spec and a self-fulfilling number.
                 let binding = last.trim_end_matches(".len()").trim_end_matches(".count()");
+                // Match the assertion across a LINE BREAK: rustfmt puts
+                //   assert_eq!(
+                //       frames.len(),
+                // so requiring `assert_eq!(frames.len()` on one line missed
+                // every multi-line spelling and inflated the unpinned count.
+                let want = format!("{binding}.len()");
                 let mut pinned = None;
-                for back in 1..=12usize {
+                for back in 1..=14usize {
                     if i < back {
                         break;
                     }
-                    let prev = lines[i - back];
-                    if prev.contains(&format!("assert_eq!({binding}.len()"))
-                        || prev.contains(&format!("assert_eq!({binding}.len(), "))
+                    let prev = lines[i - back].trim_start();
+                    if !prev.starts_with("assert") || !prev.contains('(') {
+                        continue;
+                    }
+                    // rustfmt splits `assert_eq!(` from its first argument, so
+                    // the binding is on THIS line or the NEXT one.
+                    let here = prev.contains(&want);
+                    let next = lines
+                        .get(i - back + 1)
+                        .map(|l| l.trim_start().contains(&want))
+                        .unwrap_or(false);
+                    if here || next {
+                        pinned = Some(prev.chars().take(60).collect());
+                        break;
+                    }
+                }
+                // Pixel-comparing? A gate that compares planes is the only
+                // place a wrong count corrupts a verdict; a report-only probe
+                // just prints.
+                // Bound to THIS fn only. Slicing to EOF matched a later gate's
+                // `const FRAMES` and its `assert_eq!(got.y`, which reported all
+                // 48 sites as pixel-comparing with a spec in scope -- the same
+                // over-broad-scope bug the class keeps teaching.
+                // Brace-depth walk, not `find("\n    }")`: a gate with an
+                // early 4-space `}` (a bare block, a `match` arm tail) truncated
+                // the slice and made the compare-detection read false.
+                // STRING-AWARE brace walk. Counting raw bytes counts a `}`
+                // inside a format string as a closing brace, which truncated the
+                // body and made every compare-detection read false -- the same
+                // trap that made stream.rs look 2 braces short in the first
+                // review of this wave.
+                let bytes = src.as_bytes();
+                let mut depth = 0i32;
+                let mut started = false;
+                let mut fn_end = src.len();
+                let mut in_str = false;
+                let mut in_line_comment = false;
+                let mut k = fn_start;
+                while k < bytes.len() {
+                    let c = bytes[k];
+                    if in_line_comment {
+                        if c == b'\n' {
+                            in_line_comment = false;
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    if in_str {
+                        if c == b'\\' {
+                            k += 2;
+                            continue;
+                        }
+                        if c == b'"' {
+                            in_str = false;
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    match c {
+                        b'"' => in_str = true,
+                        b'/' if bytes.get(k + 1) == Some(&b'/') => {
+                            in_line_comment = true;
+                            k += 1;
+                        }
+                        b'{' => {
+                            depth += 1;
+                            started = true;
+                        }
+                        b'}' => {
+                            depth -= 1;
+                            if started && depth == 0 {
+                                fn_end = k + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                let body = &src[fn_start..fn_end];
+                // APPROXIMATE, and known to be so: the body slice is a
+                // hand-rolled brace walk, and this crate's compare idioms vary
+                // enough that the column under-reports. The LINE, GATE and
+                // COUNT EXPR columns are exact (line-based scan, no body
+                // slicing); treat `pixel_comparing` as a hint, not a verdict.
+                // Idiom-tolerant: this crate spells the compare every which way
+                // (`assert_eq!(got.y, want.y)`, `assert_eq!(g, w)`,
+                // `let ok = ours.y == ref_f.y`, `ours.y, want.y`), so match the
+                // PLANE inside an assertion, not one fixed spelling.
+                let pixel_comparing = body.contains("assert")
+                    && (body.contains(".y,")
+                        || body.contains(".y ==")
+                        || body.contains(".y)")
+                        || body.contains("vs ffmpeg"));
+                // A SPEC already in scope for this gate?
+                let mut fixable = None;
+                for cand in ["FRAMES", "frame_count", "NFRAMES", "frames_expected"] {
+                    if body.contains(&format!("const {cand}"))
+                        || body.contains(&format!("let {cand}"))
                     {
-                        pinned = Some(prev.trim().chars().take(90).collect());
+                        fixable = Some(cand.to_string());
                         break;
                     }
                 }
@@ -2129,6 +2251,8 @@ mod count_vacuity {
                     gate: gate.clone(),
                     count_expr: last.to_string(),
                     pinned_by: pinned,
+                    pixel_comparing,
+                    fixable_from: fixable,
                 });
             }
         }
@@ -2185,8 +2309,19 @@ mod count_vacuity_tests {
             pinned,
             unpinned.len()
         );
-        for line in unpinned.iter().take(12) {
+        for line in unpinned.iter() {
             eprintln!("  {line}");
+        }
+        // The table Main asked for, as columns the guard itself computes.
+        for x in s.iter().filter(|x| x.pinned_by.is_none()) {
+            eprintln!(
+                "ROW {} | {} | {} | pixel_comparing={} | spec_in_scope={}",
+                x.line,
+                x.gate,
+                x.count_expr,
+                x.pixel_comparing,
+                x.fixable_from.clone().unwrap_or_else(|| "-".into())
+            );
         }
         assert!(
             !s.is_empty() && s.iter().all(|x| !x.gate.is_empty()),

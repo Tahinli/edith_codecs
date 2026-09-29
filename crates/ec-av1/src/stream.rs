@@ -5290,6 +5290,57 @@ pub(crate) mod tests {
     }
 
     /// Decodes `frames` concatenated 4:2:0 frames out of one AV1 OBU stream.
+    /// The frame-count diagnostic shared by the three `ffmpeg_decode_sequence*`
+    /// helpers (lane-av1pins5 r6).
+    ///
+    /// Before this, a caller that passed its OWN decode's length as the expected
+    /// count got `expected N 4:2:0 frames, ffmpeg said: ` -- with an EMPTY tail,
+    /// because ffmpeg ran at `-v error` and succeeded. The message named ffmpeg,
+    /// said nothing about where `N` came from, and sent the next reader hunting
+    /// ffmpeg for a count ffmpeg never chose.
+    ///
+    /// The class is MISATTRIBUTED RED, not silent pass: the helper's
+    /// `out.stdout.len() == frame_bytes * frames` assert fires unconditionally, so
+    /// a wrong count cannot pass -- it just fails while blaming the wrong
+    /// component. (Measured: `ffmpeg_decode_sequence(&s, 192, 128, 0)` panics
+    /// here, not silently.) Naming the real cause is the whole fix; no caller has
+    /// to change to benefit.
+    fn frame_count_diagnosis(
+        format: &str,
+        frames: usize,
+        width: usize,
+        height: usize,
+        frame_bytes: usize,
+        got: usize,
+        stderr: &[u8],
+    ) -> String {
+        let actual = if frame_bytes == 0 {
+            0
+        } else {
+            got / frame_bytes
+        };
+        let leftover = if frame_bytes == 0 {
+            got
+        } else {
+            got % frame_bytes
+        };
+        format!(
+            "FRAME COUNT MISMATCH ({format} {width}x{height}): the caller passed \
+             `frames={frames}`, ffmpeg produced {actual} frame(s) ({got} bytes, \
+             {leftover} byte(s) not a whole frame, at {frame_bytes} B/frame).\n\
+             `frames` is the EXPECTED count the CALLER asserted -- it is NOT measured \
+             from ffmpeg, so it never had ffmpeg's agreement. If it came from our own \
+             decode_stream(), this is OUR decoder disagreeing with ffmpeg about how many \
+             frames the stream holds, and the fix is on OUR side, not ffmpeg's. ffmpeg \
+             itself exited cleanly{}.",
+            if stderr.is_empty() {
+                " with no diagnostics (`-v error`)"
+            } else {
+                ""
+            }
+        )
+    }
+
     fn ffmpeg_decode_sequence(
         stream: &[u8],
         width: usize,
@@ -5312,8 +5363,16 @@ pub(crate) mod tests {
         assert_eq!(
             out.stdout.len(),
             frame_bytes * frames,
-            "expected {frames} 4:2:0 frames, ffmpeg said: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "{}",
+            frame_count_diagnosis(
+                "4:2:0",
+                frames,
+                width,
+                height,
+                frame_bytes,
+                out.stdout.len(),
+                &out.stderr
+            )
         );
         (0..frames)
             .map(|i| {
@@ -5406,8 +5465,16 @@ pub(crate) mod tests {
         assert_eq!(
             out.stdout.len(),
             frame_bytes * frames,
-            "expected {frames} 4:2:0 10-bit frames, ffmpeg said: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "{}",
+            frame_count_diagnosis(
+                "4:2:0 10-bit",
+                frames,
+                width,
+                height,
+                frame_bytes,
+                out.stdout.len(),
+                &out.stderr
+            )
         );
         fn le16(bytes: &[u8]) -> Vec<u16> {
             bytes
@@ -6811,8 +6878,16 @@ pub(crate) mod tests {
         assert_eq!(
             out.stdout.len(),
             frame_bytes * frames,
-            "expected {frames} 4:4:4 frames, ffmpeg said: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "{}",
+            frame_count_diagnosis(
+                "4:4:4",
+                frames,
+                width,
+                height,
+                frame_bytes,
+                out.stdout.len(),
+                &out.stderr
+            )
         );
         (0..frames)
             .map(|i| {
