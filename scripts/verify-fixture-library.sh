@@ -303,12 +303,27 @@ if ! command -v python3 >/dev/null; then
     echo "FAIL [invariant 4]: python3 is required for the pin-gate audit and is absent" >&2
     fail=1
 else
+    selftest_out=$(mktemp)
     audit=$("$ROOT/scripts/pin-gate-audit.py" 2>&1)
     if [ $? -ne 0 ] && [ -z "$audit" ]; then
         echo "FAIL [invariant 4]: scripts/pin-gate-audit.py did not run" >&2
         fail=1
     fi
     echo "$audit" | awk -F'\t' '/^COUNT/{print "  pin gates: "$2" "$3" "$4" "$5" "$6}' >&2
+    # The census's own POSITIVE CONTROL. Losing a gate to a doc comment is
+    # SILENT -- the count drops and nothing goes red -- so a control that only
+    # proved "the scanner finds a bad literal" would not catch it. This one
+    # plants the exact shape: a comment reproducing the forbidden literal
+    # inside a gate that reads crate_pin.
+    if ! "$ROOT/scripts/pin-gate-audit.py" --self-test >"$selftest_out" 2>&1; then
+        echo "FAIL [invariant 4]: the census self-test did not pass -- a doc comment" >&2
+        echo "      can reclassify a pin-reading gate into a branch that counts" >&2
+        echo "      nothing, which loses the gate SILENTLY. Fix the scanner first." >&2
+        sed 's/^/  /' "$selftest_out" >&2
+        fail=1
+    else
+        note "  invariant 4: census self-test passed (a comment cannot steal a gate)"
+    fi
     badrows=$(echo "$audit" | awk -F'\t' '/^BADROW/{print "  "$2":"$3"  "$4"  "$5}')
     bardir=$(echo "$audit" | awk -F'\t' '/^BARDIR/{print "  "$2":"$3"  "$4"  "$5}')
     absent=$(echo "$audit" | awk -F'\t' '/^NAME/ && $4=="absent"{print "  "$2":"$3"  "$4}')
@@ -376,7 +391,7 @@ echo "           EXTRACTED sets, so the blobs are not required at test time" >&2
 # --- DRIFT ----------------------------------------------------------------
 regen=$(mktemp)
 patch=$(mktemp)
-trap 'rm -f "$regen" "$patch"' EXIT
+trap 'rm -f "$regen" "$patch" ${selftest_out:-} ' EXIT
 if ! "$ROOT/scripts/gen-fixture-library.sh" "$regen" >/dev/null 2>&1; then
     echo "FAIL: scripts/gen-fixture-library.sh did not run" >&2
     exit 1
