@@ -2397,10 +2397,29 @@ mod count_vacuity_tests {
         // moved from "the site is still there" to "the fix is still in place AND
         // the dominant remaining shape is still found", so the sweep cannot go
         // quiet by either route.
+        // The GENERAL rule, not the one literal r7 fixed. Every decode-derived
+        // count expression is banned at the gate r7 fixed, so a future edit that
+        // reintroduces the shape under a different binding name is caught, and so
+        // the guard does not go quiet as the OTHER sites are fixed later.
+        const DECODE_DERIVED: &[&str] = &["pictures.len()", "decoded.len()", "frames.len()"];
         assert!(
-            !s.iter().any(|x| x.count_expr == "pictures.len()"),
-            "3895 regressed: a site is passing `pictures.len()` as the oracle's expected \
-             count again -- our decode's length must never be the expected value"
+            !s.iter().any(|x| x.gate
+                == "a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact"
+                && DECODE_DERIVED.contains(&x.count_expr.as_str())),
+            "the r7 fix regressed: {} is passing a decode-derived count as the oracle's \
+             expected count again -- our decode's length is the thing UNDER TEST and \
+             must never be the expected value",
+            "a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact"
+        );
+        // A CEILING on the unpinned population, so a NEW site cannot be added
+        // silently. Lower it as sites are fixed; a fix that does not lower it is
+        // still a fix, but a NEW site is an immediate red.
+        let unpinned = s.iter().filter(|x| x.pinned_by.is_none()).count();
+        const UNPINNED_CEILING: usize = 43;
+        assert!(
+            unpinned <= UNPINNED_CEILING,
+            "{unpinned} unpinned count site(s), ceiling is {UNPINNED_CEILING} -- a new one \
+             was added (lower the ceiling only when a site is actually fixed)"
         );
         assert!(
             s.iter().any(|x| x.count_expr == "frames.len()"),

@@ -924,3 +924,150 @@ reasoning per row.** Every unclassifiable row in this table carries the sentence
 that disqualified it, so a reader can disagree with a bucket instead of
 inheriting it — and the one `?` in the table is more useful than a confident
 guess would have been.
+
+---
+
+# r7 closeout — rebased onto main, ledger handed forward
+
+Rebased onto main `97b4ee04`. **One conflict worth recording:** the fixture-preflight
+lane had, independently, already landed the r5 work — the 14 pins are committed
+under `crates/ec-av1/fixtures/` and `pinned_warp_stream_decodes_pixel_exact` was
+rewired to `crate_pin` with **string literals**, which is a better shape than my
+`crate_pin(&format!("{n}.ext"))`: a literal is resolvable name-by-name, so it does
+not create the shape-(e) blind spot at all. All three conflicted hunks resolved to
+main's side; my duplicate pin commit became a no-op.
+
+**Ownership, settled:** main's `scripts/pin-gate-audit.py` owns the standalone
+census (a human/agent runs it); `pin_inventory` in `gate_coverage.rs` owns the
+CI-enforced invariant (it fails the suite when a pin is uncommitted). Different
+jobs, same question, both run.
+
+`git diff main --stat`: **3 files, 1215 insertions, 8 deletions** — pure additions.
+`gate_coverage` 18, `refusal_inventory` 19, `count_vacuity` 2, `pin_inventory` 3,
+`cargo check --all-targets` **0 warnings**.
+
+## 1. Merge readiness
+
+| | |
+|---|---|
+| branch | `lane-av1pins5` (canonical), rebased onto main `97b4ee04` |
+| diff vs main | 3 files, +1215 / −8 — additions only |
+| test-count delta | branch carries +5 CI tests over main (pin_inventory 3, count_vacuity 2); the 18/19 gate_coverage/refusal_inventory totals include the preflight lane's |
+| sweep floor | holds: 61 sites ≥ 40; unpinned ceiling 43 holds |
+| warnings | 0 |
+
+## 2. The class note — stop the next reader chasing a nonexistent bug
+
+**A wrong count here cannot pass silently.** `ffmpeg_decode_sequence`'s
+`out.stdout.len() == frame_bytes * frames` assert is unconditional, so a wrong
+count REDS. The defect is a **misattributed red**: the old message
+(`expected N 4:2:0 frames, ffmpeg said: <empty>`) named ffmpeg for a count ffmpeg
+never chose. `frame_count_diagnosis` — the class-level fix — reports the caller's
+count, ffmpeg's actual count, the byte arithmetic, and states that the fix is on
+OUR side. That single change converts the class from confusing to diagnosable
+without touching a caller. **This, not the 38 sites, is what the branch is for.**
+
+## 3. The three detection bugs, each of which produced a plausible clean output
+
+1. **A line index handed to a byte-offset walk** (r7). The sweep computed each
+   gate's body by indexing `src.as_bytes()` with a LINE number. 40 of 44 rows read
+   "unclassified" — and "unclassified" looks like a finding, not a bug.
+2. **`assert_eq!` split by rustfmt** (r6). The lookback required
+   `assert_eq!(frames.len()` on one line, but rustfmt emits `assert_eq!(` then
+   `frames.len(),` on the next. Every multi-line spelling was missed, inflating the
+   unpinned count 48 → 44 once a two-line window was used.
+3. **A `}` inside a format string counted as a closing brace** (r6). The body walk
+   counted raw bytes, so a brace in a message truncated the slice and every
+   compare-detection read false. Same trap that made `stream.rs` look two braces
+   short in the first review of this wave.
+
+Each was caught by a floor or a synthetic-input capability test, and each would
+have survived an honest-looking table. The rules they earn: **walk offsets in the
+units you index; match a call across the line breaks rustfmt introduces; and never
+count braces without skipping string literals.** A scanner column derived from a
+hand-rolled slice is a hypothesis, not a measurement.
+
+## 4. The ledger — 43 sites, handed forward
+
+| file:line | gate | count expr before | bucket | candidate | spec_in_scope | disposition |
+|---|---|---|---|---|---|---|
+| stream.rs:5631 | `an_svt_screen_palette_block_with_a_split_transform_decodes_exactly` | `decoded.len()` | a | candidate=- | spec_in_scope=- | deferred(bucket a first: count from the PIN) |
+| stream.rs:10513 | `a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:10732 | `rect_tx_tool_gate` | `decoded.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:10734 | `rect_tx_tool_gate` | `decoded.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:11212 | `a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:11383 | `a_16x4_intrabc_pair_strip_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:11455 | `a_lossless_16x4_chroma_pair_repairs_the_measured_site` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:11838 | `a_coded_rect_intrabc_block_reconstructs_in_both_orientations` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:11981 | `a_coded_rect_intrabc_block_reconstructs_in_both_orientations` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:12224 | `an_sb128_screen_stream_with_intrabc_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:12226 | `an_sb128_screen_stream_with_intrabc_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:12612 | `a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal` | `frames.len()` | c | candidate=- | spec_in_scope=- | report-only (census/probe asserts no verdict) |
+| stream.rs:12687 | `an_intrabc_vartx_census_measures_the_mixed_leaf_refusal` | `frames.len()` | c | candidate=- | spec_in_scope=- | report-only (census/probe asserts no verdict) |
+| stream.rs:12791 | `a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:13093 | `an_intrabc_block_under_tx_mode_select_decodes_pixel_exact` | `frames.len()` | ? | candidate=- | spec_in_scope=- | UNCLASSIFIED - needs a reader |
+| stream.rs:13154 | `a_real_aomenc_stream_with_cdf_update_disabled_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:13360 | `a_real_aomenc_rect_strip_palette_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:13362 | `a_real_aomenc_rect_strip_palette_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:15497 | `first_diff` | `decoded.len()` | c | candidate=- | spec_in_scope=- | report-only (census/probe asserts no verdict) |
+| stream.rs:27636 | `a_real_aomenc_stream_with_a_coded_rect_strip_below_16x16_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:27764 | `a_real_aomenc_stream_whose_square_block_reads_a_sub16_neighbours_mode_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:27933 | `a_real_aomenc_stream_whose_chroma_edge_filter_reads_a_sub16_neighbours_uv_mode_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:27935 | `a_real_aomenc_stream_whose_chroma_edge_filter_reads_a_sub16_neighbours_uv_mode_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:28129 | `a_real_aomenc_sb128_stream_whose_skipped_cfl_and_1to4_chroma_pairs_decode_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:28131 | `a_real_aomenc_sb128_stream_whose_skipped_cfl_and_1to4_chroma_pairs_decode_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:28456 | `a_real_aomenc_stream_with_ab_partitions_below_16x16_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:28458 | `a_real_aomenc_stream_with_ab_partitions_below_16x16_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:28609 | `sweep_rectx_recipes` | `frames.len()` | c | candidate=- | spec_in_scope=- | report-only (census/probe asserts no verdict) |
+| stream.rs:29212 | `a_real_aomenc_stream_with_a_32_level_ab_partition_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:30646 | `a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly` | `pics.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:30744 | `a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly` | `pics.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:38033 | `edge32_gate` | `decoded.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:38035 | `edge32_gate` | `decoded.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:41761 | `a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:41763 | `a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:41998 | `the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:42000 | `the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:42167 | `a_real_aomenc_band_stream_seed46_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:42169 | `a_real_aomenc_band_stream_seed46_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:42376 | `a_real_aomenc_stream_whose_frame_edge_partition_bit_is_horz_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:42378 | `a_real_aomenc_stream_whose_frame_edge_partition_bit_is_horz_decodes_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=- | deferred(bucket b: count from the ENCODER) |
+| stream.rs:42602 | `a_real_aomenc_rect_inter_block_predicts_chroma_with_the_narrow_kernel_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=FRAMES | deferred(bucket b: count from the ENCODER) |
+| stream.rs:42604 | `a_real_aomenc_rect_inter_block_predicts_chroma_with_the_narrow_kernel_pixel_exact` | `frames.len()` | b | candidate=- | spec_in_scope=FRAMES | deferred(bucket b: count from the ENCODER) |
+
+TOTALS: a=1 b=37 c=4 ?=1  total=43
+
+Totals: **a=1, b=37, c=4, ?=1**.
+
+**The `?` row is genuinely unclassified**, not a guess:
+`an_intrabc_block_under_tx_mode_select_decodes_pixel_exact` neither drives aomenc
+in its own body nor reads from disk, and is not a probe. It most likely encodes
+through a path the helper list does not name. Left as `?` with the reason rather
+than assigned a bucket I cannot justify.
+
+**Per-gate recipe.** Bucket **a** first (1 site): take the count from the pinned
+stream's recorded frame count or a length assert on the pinned bytes. Then bucket
+**b** (37 sites): bind the encoder's frame count to a named const at the encode
+call and pass that, exactly as `stream.rs:3895` does (`const ENCODED_FRAMES: usize
+= 40;` from its own `encode_aomenc_stream(source, w, h, 40, …)`). Where the encode
+is inside a `cq`/`depth` loop, the count is the helper's frame-count argument and
+must be read from that call — the sweep's `candidate` column resolves for only one
+gate, which is exactly why these were not bulk-edited. Bucket **c**: leave; a
+census reports and asserts no verdict, so a wrong count there is not a wrong count.
+
+**DISPOSITION: deferred(needs a lane that classifies by READING each gate, bucket a
+then bucket b).** Not a merge blocker: with `frame_count_diagnosis` in place, a
+wrong count is now loud and self-explaining, so the 43 are diagnosable rather than
+mysterious.
+
+## 5. The guard, generalized
+
+The r7 anchor asserted one literal (`pictures.len()`) at the fixed gate, which
+would go quiet as other sites are fixed. It now asserts the **general** rule:
+
+* no **decode-derived** count (`pictures.len()` / `decoded.len()` / `frames.len()`)
+  may reappear at the gate r7 fixed, under any binding name; and
+* an **unpinned ceiling** of 43 — a NEW site is an immediate red, and the ceiling
+  is lowered as sites are actually fixed.
+
+The `>= 40` floor on total sites stays, so the class cannot shrink unnoticed.
