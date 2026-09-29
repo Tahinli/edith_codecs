@@ -7266,9 +7266,18 @@ pub(crate) mod tests {
                 "{NAME}: U extent must be luma-sized at 4:4:4 -- the replay steps mi \
                  cells through this grid"
             );
-            assert_eq!(f.v.len(), W * H, "{NAME}: V extent must be luma-sized at 4:4:4");
+            assert_eq!(
+                f.v.len(),
+                W * H,
+                "{NAME}: V extent must be luma-sized at 4:4:4"
+            );
         }
-        if aomdec_path().is_file() {
+        // lane-3c-a: the oracle-presence scan (wave 3b, 7a865ee7) rejects a
+        // bare `aomdec_path().is_file()` outside the probe that owns it -- this
+        // gate would otherwise report green under EC_AV1_REQUIRE_AOMENC=1 with
+        // the pixel compare never run. `aomdec_available` carries both the
+        // env-escape assertion and the SKIP line, so the else-arm is dropped.
+        if aomdec_available(NAME) {
             let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
             assert_eq!(
                 decoded, FRAMES,
@@ -7278,17 +7287,17 @@ pub(crate) mod tests {
                 "{NAME}: {decoded} frames byte-exact vs aomdec ({hidden} hidden), \
                  {walked} lossless chroma replays"
             );
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
 
         // Control: whole square blocks have no multi-unit plane block to step.
         let ctrl = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/ll444_128root_lossless.obu");
-        let ctrl_stream = read_pin(&ctrl, 63429, 0xf07d_47fc_fd51_2658, &format!("{NAME} control"));
+        let ctrl_stream = read_pin(
+            &ctrl,
+            63429,
+            0xf07d_47fc_fd51_2658,
+            &format!("{NAME} control"),
+        );
         crate::decode::reset_intrabc_rect_lossless_chroma4_hits();
         let _ = decode_stream(&ctrl_stream)
             .unwrap_or_else(|e| panic!("{NAME}: the control arm no longer decodes cleanly: {e}"));
