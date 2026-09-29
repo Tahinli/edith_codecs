@@ -1699,3 +1699,782 @@ mod tests {
         );
     }
 }
+
+/// lane-av1pins5 r5: the PIN INVENTORY.
+///
+/// The r3 inventory this replaces matched only two call shapes --
+/// `crate_pin("X")` and `pin_dir().join("X")` -- both SINGLE-NAME. A gate that
+/// reads a whole DIRECTORY of pins through a `concat!` literal and then formats
+/// a name at runtime (`format!("{fixtures}/{n}.obu")`) matched neither, so
+/// `pinned_warp_stream_decodes_pixel_exact` and its 14 uncommitted pins were
+/// invisible to it, and r3 reported "the machine-local-pin population is zero".
+/// It was not. This enumerator resolves all four shapes.
+///
+/// Ownership, stated because two lanes touch this: THIS scanner owns the
+/// ENUMERATION (which gates read which pins, from source). The fixture-preflight
+/// lane owns the FILE INVENTORY on a runner (does each referenced path exist on
+/// the box). Different questions; both must agree, and this one is the stricter of
+/// the two because it fails on an uncommitted pin whether or not some runner
+/// happens to have a copy.
+#[cfg(test)]
+mod pin_inventory {
+    /// One pin a gate reads, and where it came from.
+    pub struct PinRead {
+        pub gate: String,
+        pub file: String,
+        pub shape: &'static str,
+    }
+
+    /// Split `src` into `(fn_name, body)` for every `fn name(` at the gate indent.
+    fn gate_bodies(src: &str) -> Vec<(String, &'static str)> {
+        let mut out = Vec::new();
+        let mut cur: Option<(String, usize)> = None;
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("fn ") {
+                if let Some(name) = rest.split('(').next() {
+                    if !name.contains(' ') {
+                        cur = Some((name.to_string(), i));
+                    }
+                }
+            }
+            // A `#[test]`/`#[ignore]` line is never a closing brace, so the fn
+            // ends at the first line that is exactly four-space `}`.
+            if let Some((name, start)) = &cur {
+                if i > *start && line == "    }" {
+                    let body = src
+                        .lines()
+                        .skip(*start)
+                        .take(i - *start + 1)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push((name.clone(), &*Box::leak(body.into_boxed_str())));
+                    cur = None;
+                }
+            }
+        }
+        out
+    }
+
+    /// Every pin every gate reads, across all four shapes.
+    pub fn pins_read(src: &str) -> Vec<PinRead> {
+        let mut out = Vec::new();
+        for (gate, body) in gate_bodies(src) {
+            // (a) crate_pin("X") and (b) pin_dir().join("X") -- single name.
+            for m in body.match_indices("crate_pin(\"") {
+                let rest = &body[m.0 + 11..];
+                if let Some(e) = rest.find('"') {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: rest[..e].to_string(),
+                        shape: "crate_pin",
+                    });
+                }
+            }
+            for m in body.match_indices("pin_dir().join(\"") {
+                let rest = &body[m.0 + 16..];
+                if let Some(e) = rest.find('"') {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: rest[..e].to_string(),
+                        shape: "pin_dir_machine_local",
+                    });
+                }
+            }
+            // (c) a whole-file concat! literal to a named pin:
+            //     concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/X.obu")
+            for m in body.match_indices("/../../fixtures/") {
+                let rest = &body[m.0 + 16..];
+                if let Some(e) = rest.find('"') {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: rest[..e].to_string(),
+                        shape: "concat_literal_machine_local",
+                    });
+                }
+            }
+            // (d) the shape that hid 14 pins: a DIRECTORY literal bound to a
+            //     local, plus a runtime `format!("{var}/{n}.ext")` over a
+            //     literal name array. Resolve the array's names.
+            for (vi, line) in body.lines().enumerate() {
+                let tl = line.trim();
+                // `let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");`
+                // -> the bound name is whatever sits between `let ` and the `=`.
+                let var = match (
+                    tl.find("concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../fixtures\")"),
+                    tl.find('='),
+                ) {
+                    (Some(a), Some(eq)) if eq < a => tl[4..eq].trim().to_string(),
+                    _ => continue,
+                };
+                if var.is_empty() {
+                    continue;
+                }
+                // `format!("{fixtures}/{n}.obu")` -- built by concatenation, not
+                // by `format!`: escaping `{{`/`}}` to emit literal braces here is
+                // exactly the bug that made this shape resolve to 0 pins on the
+                // first run of the scanner.
+                let marker = ["format!(\"", "{", &var, "}/{n}"].concat();
+                let Some(pos) = body.find(&marker) else {
+                    continue;
+                };
+                // Walk back from the format! to the `[ ... ].iter()` array and
+                // take every quoted name in it.
+                let head = &body[..pos];
+                let Some(bracket) = head.rfind('[') else {
+                    continue;
+                };
+                let names: Vec<String> = head[bracket..]
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|s| !s.is_empty() && !s.contains(' ') && *s != "]")
+                    .map(|s| s.to_string())
+                    .collect();
+                // `.obu` -- SLICE up to the closing quote. (Stringifying the
+                // `find` index instead produced names like `warp-mismatch4`.)
+                let tail = &body[pos + marker.len()..];
+                let ext = tail
+                    .find('"')
+                    .map(|e| tail[..e].to_string())
+                    .unwrap_or_default();
+                for n in names {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: format!("{n}{ext}"),
+                        shape: "concat_dir_runtime_name",
+                    });
+                }
+                let _ = vi;
+            }
+            // (e) the shape this very fix INTRODUCED:
+            //     `.map(|n| crate_pin(&format!("{n}.obu")))`. Rewriting the
+            //     directory literal as a committed-path lookup made the gate
+            //     correct and simultaneously invisible -- `crate_pin("` no
+            //     longer appears, so shape (a) found nothing and the
+            //     enumerator reported a CLEAN tree while 14 pins were read. A
+            //     false pass is worse than the original gap: the original at
+            //     least showed up in a filesystem audit. Caught here by the
+            //     `reads.len()` floor in the invariant test.
+            for m in body.match_indices("crate_pin(&format!(") {
+                let rest = &body[m.0 + 19..];
+                let Some(close) = rest.find(')') else {
+                    continue;
+                };
+                let call = &rest[..close];
+                if !call.contains('"') {
+                    continue;
+                }
+                let head = &body[..m.0];
+                let Some(bracket) = head.rfind('[') else {
+                    continue;
+                };
+                let names: Vec<String> = head[bracket..]
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|x| !x.is_empty() && !x.contains(' ') && *x != "]")
+                    .map(|x| x.to_string())
+                    .collect();
+                // the literal inside the format!, e.g. `{n}.obu`
+                let lit = call.split('"').nth(1).unwrap_or("");
+                let ext = lit
+                    .split_once("}")
+                    .map(|(_, e)| e.to_string())
+                    .unwrap_or_default();
+                for n in names {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: format!("{n}{ext}"),
+                        shape: "crate_pin_runtime_name",
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Does this shape resolve through `crate_pin`, i.e. the COMMITTED
+    /// crate-local copy? Both the literal form and the runtime-name form do --
+    /// only the two `pin_dir`/root-`concat!` forms are machine-local.
+    pub fn resolves_committed(shape: &str) -> bool {
+        matches!(shape, "crate_pin" | "crate_pin_runtime_name")
+    }
+
+    /// Is `file` present as a committed crate-local fixture?
+    pub fn is_committed(file: &str) -> bool {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(file)
+            .is_file()
+    }
+}
+
+#[cfg(test)]
+mod pin_inventory_tests {
+    use super::pin_inventory::{is_committed, pins_read};
+
+    /// The scanner must be able to SEE the directory-literal shape. Run over a
+    /// SYNTHETIC source, not the live tree: r5 removed that shape from
+    /// `pinned_warp_stream_decodes_pixel_exact`, so a test that asserted it
+    /// against the live file would rot the moment the fix landed -- which is
+    /// precisely how a scanner loses its edge and reports a clean tree again.
+    /// A capability test must have its own input.
+    #[test]
+    fn the_pin_scanner_sees_the_directory_literal_shape() {
+        let synthetic = r#"
+    #[test]
+    fn a_gate_using_the_old_shape() {
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
+        let paths: Vec<String> = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
+            Ok(p) => vec![p],
+            Err(_) => [
+                "warp-mismatch",
+                "ii-flake-1",
+                "rect-flake-3",
+            ]
+            .iter()
+            .map(|n| format!("{fixtures}/{n}.obu"))
+            .collect(),
+        };
+        for path in paths {
+            check(&path);
+        }
+    }
+"#;
+        let reads = pins_read(synthetic);
+        let names: Vec<&str> = reads.iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["warp-mismatch.obu", "ii-flake-1.obu", "rect-flake-3.obu"],
+            "the directory-literal + runtime-name shape resolved to {names:?} -- a scanner \
+             that cannot see this shape is how 14 uncommitted pins survived three rounds"
+        );
+        assert!(
+            reads.iter().all(|r| r.shape == "concat_dir_runtime_name"),
+            "the synthetic pins were attributed to the wrong shape: {:?}",
+            reads.iter().map(|r| r.shape).collect::<Vec<_>>()
+        );
+    }
+
+    /// The other three shapes resolve too -- same reasoning, same synthetic input,
+    /// so the capability survives the tree being fixed.
+    #[test]
+    fn the_pin_scanner_sees_every_shape() {
+        let synthetic = r#"
+    #[test]
+    fn shapes() {
+        let a = crate_pin("golden3-pin.obu");
+        let b = pin_dir().join("sbpart-pin.obu");
+        let c = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/x.obu"));
+    }
+"#;
+        let mut names: Vec<String> = pins_read(synthetic)
+            .iter()
+            .map(|r| format!("{}|{}", r.file, r.shape))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "golden3-pin.obu|crate_pin",
+                "sbpart-pin.obu|pin_dir_machine_local",
+                "x.obu|concat_literal_machine_local",
+            ],
+            "shape coverage changed: {names:?}"
+        );
+    }
+
+    /// THE INVARIANT, on the live tree: every pin a gate reads is a COMMITTED
+    /// crate-local copy, and NO gate reads through a machine-local shape. This is
+    /// the check the r3 manifest could not express.
+    #[test]
+    fn every_pin_a_gate_reads_is_committed_under_the_crate() {
+        let src = include_str!("stream.rs");
+        let reads = pins_read(src);
+        assert!(
+            reads.len() >= 20,
+            "the enumerator found only {} pin reads in stream.rs -- it has lost a shape, \
+             which is the failure mode that let 14 pins go unseen",
+            reads.len()
+        );
+        let uncommitted: Vec<String> = reads
+            .iter()
+            .filter(|r| !is_committed(&r.file))
+            .map(|r| format!("{}:{} ({})", r.gate, r.file, r.shape))
+            .collect();
+        assert!(
+            uncommitted.is_empty(),
+            "{} pin(s) a gate reads have no committed copy under \
+             crates/ec-av1/fixtures/ -- each resolves only on a machine whose \
+             gitignored root fixtures/ happens to be populated, so a clean checkout \
+             silently skips or panics:\n  {}",
+            uncommitted.len(),
+            uncommitted.join("\n  ")
+        );
+        let machine_local: Vec<String> = reads
+            .iter()
+            .filter(|r| !super::pin_inventory::resolves_committed(r.shape))
+            .map(|r| format!("{} reads {} via {}", r.gate, r.file, r.shape))
+            .collect();
+        assert!(
+            machine_local.is_empty(),
+            "{} pin read(s) still resolve through a machine-local shape instead of \
+             `crate_pin` (the committed crate-local copy), so they break on a clean \
+             checkout:\n  {}",
+            machine_local.len(),
+            machine_local.join("\n  ")
+        );
+    }
+}
+
+/// lane-av1pins5 r5: the COUNT-VACUITY enumerator.
+///
+/// Passing OUR OWN decode's length as the ORACLE's expected frame count
+/// (`ffmpeg_decode_sequence(&stream, w, h, ours.len())`) is a real defect, but
+/// NOT the one r4 claimed. MEASURED, by calling
+/// `ffmpeg_decode_sequence(&stream, 192, 128, 0)` on a real pinned stream under
+/// `catch_unwind`: it PANICS at `stream.rs:5110` with
+/// `expected 0 4:2:0 frames, ffmpeg said: `. The helper asserts
+/// `out.stdout.len() == frame_bytes * frames` unconditionally, so a wrong count
+/// cannot pass silently -- it reds, with a message that blames FFMPEG for a
+/// count OUR decoder chose.
+///
+/// TWO DEFECT CLASSES, DO NOT CONFLATE THEM (lane-av1pins5 r6):
+///   * MISATTRIBUTED RED -- a wrong count reds, and the old message blamed
+///     ffmpeg for a number OUR decoder chose. This is what these sites are.
+///     `ffmpeg_decode_sequence`'s `stdout.len() == frame_bytes * frames` assert
+///     is unconditional, so it cannot pass silently.
+///   * SILENT PASS -- the compare is skipped or truncated and the gate reports
+///     green. A DIFFERENT defect with a DIFFERENT fix, and r4 mislabelled these
+///     sites as belonging to it. If you are reading this to decide what to fix,
+///     fix the message and the count SOURCE; do not go looking for a silent pass.
+///
+/// r4 reported this shape as "a vacuous pass" and told Main so. That was wrong.
+/// The consequence is a MISATTRIBUTED RED. The fix r4 shipped is still right (the
+/// count now comes from the fixture, so the red names the real cause), but the
+/// justification was wrong, and a sweep that repeats it would send the next
+/// reader after a silent-pass bug that does not exist.
+///
+/// This enumerator finds every such site and classifies it, so the class is
+/// visible and cannot shrink unnoticed.
+#[cfg(test)]
+mod count_vacuity {
+    /// One oracle call whose expected frame count is locally derived.
+    pub struct Site {
+        pub line: usize,
+        pub gate: String,
+        pub count_expr: String,
+        /// An independent count assertion on the same binding, within a few
+        /// lines above: that is what makes the count a SPEC rather than a
+        /// self-fulfilling number.
+        pub pinned_by: Option<String>,
+        /// Does this gate actually COMPARE PIXELS (so a wrong count would
+        /// corrupt a verdict), or is it a report-only probe?
+        pub pixel_comparing: bool,
+        /// The fix bucket, by READING the gate (r7). `Some(b)` where
+        ///   a = pinned stream on disk -> take the count from the PIN
+        ///   b = live aomenc encode    -> take it from the ENCODE's frame count;
+        ///                                      our decode's length is the thing
+        ///                                      UNDER TEST and must never be the
+        ///                                      expected value
+        ///   c = census/probe          -> report only, never fix
+        /// `None` = could not classify, and the reason is in `bucket_reason`.
+        pub bucket: Option<&'static str>,
+        pub bucket_reason: String,
+        /// The numeric frame count found in this gate's own encode call, when
+        /// one is visible -- the value the compare should assert instead.
+        pub candidate: Option<String>,
+        /// A frame count already in scope that is a SPEC rather than a
+        /// self-fulfilling number -- e.g. the `FRAMES` the gate encoded, or a
+        /// count asserted on the pinned stream. `Some(..)` means the fix is a
+        /// one-line swap at this site.
+        pub fixable_from: Option<String>,
+    }
+
+    /// A census/probe/diagnostic gate: it reports, it does not assert a verdict.
+    fn is_probe(gate: &str) -> bool {
+        [
+            "census",
+            "probe",
+            "sweep",
+            "first_diff",
+            "scratch",
+            "rectx",
+            "diagnostic",
+        ]
+        .iter()
+        .any(|m| gate.contains(m))
+    }
+
+    /// Encode helpers a gate can drive INDIRECTLY. The r7 extraction found 21 of
+    /// the 25 bucket-b gates encode through one of these, not through
+    /// `aomenc_path()` directly -- which is why a first pass that only looked for
+    /// `aomenc_path()` classified 6 gates "unclassified" that plainly encode.
+    fn enc_helpers(body: &str) -> Vec<&'static str> {
+        const NAMES: &[&str] = &[
+            "encode_aomenc_stream",
+            "screen_intrabc_stream_at_depth",
+            "screen_intrabc_stream_with",
+            "libaom_encode_with",
+            "libaom_encode",
+            "run_multi_tile_gate",
+            "edge32_gate",
+            "rect_tx_tool_gate",
+            "the_chroma_rect_gates",
+            "restore_gate",
+            "cdef_gate",
+            "warp_gate",
+            "superres_gate",
+            "grain_gate",
+            "sgate",
+        ];
+        NAMES
+            .iter()
+            .copied()
+            .filter(|n| body.contains(&format!("{n}(")))
+            .collect()
+    }
+
+    pub fn sites(src: &str) -> Vec<Site> {
+        let mut out = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        // LINE index -> BYTE offset. The body walk indexes `src.as_bytes()`, so
+        // handing it a line number walks from the wrong place entirely and every
+        // body-dependent classification reads "unclassified". Same bug I hit in
+        // the Python classifier one step earlier.
+        let mut offsets: Vec<usize> = Vec::with_capacity(lines.len());
+        {
+            let mut o = 0usize;
+            for l in &lines {
+                offsets.push(o);
+                o += l.len() + 1;
+            }
+        }
+        let mut gate = String::new();
+        let mut fn_start = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("fn ") {
+                if let Some(n) = rest.split('(').next() {
+                    if !n.contains(' ') {
+                        gate = n.to_string();
+                        fn_start = offsets[i];
+                    }
+                }
+            }
+            for callee in [
+                "ffmpeg_decode_sequence(",
+                "ffmpeg_decode_sequence_10bit(",
+                "ffmpeg_decode_sequence_444(",
+            ] {
+                let Some(at) = line.find(callee) else {
+                    continue;
+                };
+                let args = &line[at + callee.len()..];
+                // DEPTH-AWARE close: `args.find(')')` stops at the `)` of
+                // `pictures.len()` and truncates the arg list mid-expression,
+                // which silently yielded zero sites on the first run.
+                let mut depth = 1usize;
+                let mut close = None;
+                for (k, ch) in args.char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(close) = close else { continue };
+                let arglist = &args[..close];
+                let last = arglist.rsplit(',').next().unwrap_or("").trim();
+                if !(last.ends_with(".len()") || last.ends_with(".count()")) {
+                    continue;
+                }
+                // Is the SAME binding count-asserted against a literal/const
+                // within the preceding 12 lines? That is the difference between
+                // a spec and a self-fulfilling number.
+                let binding = last.trim_end_matches(".len()").trim_end_matches(".count()");
+                // Match the assertion across a LINE BREAK: rustfmt puts
+                //   assert_eq!(
+                //       frames.len(),
+                // so requiring `assert_eq!(frames.len()` on one line missed
+                // every multi-line spelling and inflated the unpinned count.
+                let want = format!("{binding}.len()");
+                let mut pinned = None;
+                for back in 1..=14usize {
+                    if i < back {
+                        break;
+                    }
+                    let prev = lines[i - back].trim_start();
+                    if !prev.starts_with("assert") || !prev.contains('(') {
+                        continue;
+                    }
+                    // rustfmt splits `assert_eq!(` from its first argument, so
+                    // the binding is on THIS line or the NEXT one.
+                    let here = prev.contains(&want);
+                    let next = lines
+                        .get(i - back + 1)
+                        .map(|l| l.trim_start().contains(&want))
+                        .unwrap_or(false);
+                    if here || next {
+                        pinned = Some(prev.chars().take(60).collect());
+                        break;
+                    }
+                }
+                // Pixel-comparing? A gate that compares planes is the only
+                // place a wrong count corrupts a verdict; a report-only probe
+                // just prints.
+                // Bound to THIS fn only. Slicing to EOF matched a later gate's
+                // `const FRAMES` and its `assert_eq!(got.y`, which reported all
+                // 48 sites as pixel-comparing with a spec in scope -- the same
+                // over-broad-scope bug the class keeps teaching.
+                // Brace-depth walk, not `find("\n    }")`: a gate with an
+                // early 4-space `}` (a bare block, a `match` arm tail) truncated
+                // the slice and made the compare-detection read false.
+                // STRING-AWARE brace walk. Counting raw bytes counts a `}`
+                // inside a format string as a closing brace, which truncated the
+                // body and made every compare-detection read false -- the same
+                // trap that made stream.rs look 2 braces short in the first
+                // review of this wave.
+                let bytes = src.as_bytes();
+                let mut depth = 0i32;
+                let mut started = false;
+                let mut fn_end = src.len();
+                let mut in_str = false;
+                let mut in_line_comment = false;
+                let mut k = fn_start;
+                while k < bytes.len() {
+                    let c = bytes[k];
+                    if in_line_comment {
+                        if c == b'\n' {
+                            in_line_comment = false;
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    if in_str {
+                        if c == b'\\' {
+                            k += 2;
+                            continue;
+                        }
+                        if c == b'"' {
+                            in_str = false;
+                        }
+                        k += 1;
+                        continue;
+                    }
+                    match c {
+                        b'"' => in_str = true,
+                        b'/' if bytes.get(k + 1) == Some(&b'/') => {
+                            in_line_comment = true;
+                            k += 1;
+                        }
+                        b'{' => {
+                            depth += 1;
+                            started = true;
+                        }
+                        b'}' => {
+                            depth -= 1;
+                            if started && depth == 0 {
+                                fn_end = k + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                let body = &src[fn_start..fn_end];
+                // APPROXIMATE, and known to be so: the body slice is a
+                // hand-rolled brace walk, and this crate's compare idioms vary
+                // enough that the column under-reports. The LINE, GATE and
+                // COUNT EXPR columns are exact (line-based scan, no body
+                // slicing); treat `pixel_comparing` as a hint, not a verdict.
+                // Idiom-tolerant: this crate spells the compare every which way
+                // (`assert_eq!(got.y, want.y)`, `assert_eq!(g, w)`,
+                // `let ok = ours.y == ref_f.y`, `ours.y, want.y`), so match the
+                // PLANE inside an assertion, not one fixed spelling.
+                let pixel_comparing = body.contains("assert")
+                    && (body.contains(".y,")
+                        || body.contains(".y ==")
+                        || body.contains(".y)")
+                        || body.contains("vs ffmpeg"));
+                // A SPEC already in scope for this gate?
+                let mut fixable = None;
+                for cand in ["FRAMES", "frame_count", "NFRAMES", "frames_expected"] {
+                    if body.contains(&format!("const {cand}"))
+                        || body.contains(&format!("let {cand}"))
+                    {
+                        fixable = Some(cand.to_string());
+                        break;
+                    }
+                }
+                // Bucket by READING the gate. A census/probe reports and never
+                // asserts, so its count is not a verdict and is left alone. A
+                // gate that drives aomenc takes the count from the ENCODE -- our
+                // decode's length is what is under test, so using it as the
+                // expected value is circular. A gate that reads a stream from
+                // disk takes it from that stream.
+                // The candidate fix: the numeric frame count in this gate's own
+                // encode call. For bucket (b) that number IS the encoder's frame
+                // count, so it is the spec the compare should assert.
+                let candidate = enc_helpers(body).first().and_then(|h| {
+                    let at = body.find(&format!("{h}("))?;
+                    let open = at + h.len() + 1;
+                    let seg = &body[open..(open + 400).min(body.len())];
+                    let close = seg.find(';')?;
+                    let nums: Vec<&str> = seg[..close]
+                        .split(',')
+                        .map(|x| x.trim())
+                        .filter(|x| !x.is_empty() && x.chars().all(|c| c.is_ascii_digit()))
+                        .collect();
+                    nums.last().map(|x| x.to_string())
+                });
+                let (bucket, bucket_reason) = if is_probe(&gate) {
+                    (
+                        Some("c"),
+                        "census/probe: reports, does not assert a verdict".to_string(),
+                    )
+                } else if body.contains("aomenc_path()") || !enc_helpers(body).is_empty() {
+                    (
+                        Some("b"),
+                        "live aomenc encode: count belongs to the encoder".to_string(),
+                    )
+                } else if body.contains("fs::read") || body.contains("crate_pin") {
+                    (
+                        Some("a"),
+                        "stream read from disk: count belongs to the pin".to_string(),
+                    )
+                } else {
+                    (
+                        None,
+                        "unclassified: no aomenc drive, no disk read, and not a probe -- \
+                         needs a reader"
+                            .to_string(),
+                    )
+                };
+                out.push(Site {
+                    line: i + 1,
+                    gate: gate.clone(),
+                    count_expr: last.to_string(),
+                    pinned_by: pinned,
+                    pixel_comparing,
+                    fixable_from: fixable,
+                    bucket,
+                    bucket_reason,
+                    candidate,
+                });
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod count_vacuity_tests {
+    use super::count_vacuity::sites;
+
+    /// The shape is real and widespread; this pins the FLOOR so the sweep cannot
+    /// silently stop finding sites. Measured count is well above this.
+    #[test]
+    fn the_count_vacuity_sweep_finds_the_known_sites() {
+        let src = include_str!("stream.rs");
+        let s = sites(src);
+        assert!(
+            s.len() >= 40,
+            "the count-vacuity sweep found only {} site(s); expected 40+ -- it has lost a \
+             shape",
+            s.len()
+        );
+        // r7: the first reported site (3895, `pictures.len()`) is FIXED -- it now
+        // asserts `ENCODED_FRAMES`, the encode's own count. The anchor therefore
+        // moved from "the site is still there" to "the fix is still in place AND
+        // the dominant remaining shape is still found", so the sweep cannot go
+        // quiet by either route.
+        // The GENERAL rule, not the one literal r7 fixed. Every decode-derived
+        // count expression is banned at the gate r7 fixed, so a future edit that
+        // reintroduces the shape under a different binding name is caught, and so
+        // the guard does not go quiet as the OTHER sites are fixed later.
+        const DECODE_DERIVED: &[&str] = &["pictures.len()", "decoded.len()", "frames.len()"];
+        assert!(
+            !s.iter().any(|x| x.gate
+                == "a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact"
+                && DECODE_DERIVED.contains(&x.count_expr.as_str())),
+            "the r7 fix regressed: {} is passing a decode-derived count as the oracle's \
+             expected count again -- our decode's length is the thing UNDER TEST and \
+             must never be the expected value",
+            "a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact"
+        );
+        // A CEILING on the unpinned population, so a NEW site cannot be added
+        // silently. Lower it as sites are fixed; a fix that does not lower it is
+        // still a fix, but a NEW site is an immediate red.
+        let unpinned = s.iter().filter(|x| x.pinned_by.is_none()).count();
+        const UNPINNED_CEILING: usize = 43;
+        assert!(
+            unpinned <= UNPINNED_CEILING,
+            "{unpinned} unpinned count site(s), ceiling is {UNPINNED_CEILING} -- a new one \
+             was added (lower the ceiling only when a site is actually fixed)"
+        );
+        assert!(
+            s.iter().any(|x| x.count_expr == "frames.len()"),
+            "the dominant `frames.len()` shape is no longer found -- the sweep has lost a \
+             shape, not gained a fix"
+        );
+    }
+
+    /// Report, per site: does the count come from a SPEC or from our own decode?
+    /// Prints the table the r5 report carries. The assertion is the FLOOR above,
+    /// not "zero unpinned" -- the residual unpinned sites are handed to another
+    /// lane with this table, and forcing them all here would be an unbounded
+    /// change dressed as a fix.
+    #[test]
+    fn every_locally_derived_oracle_count_is_reported() {
+        let src = include_str!("stream.rs");
+        let s = sites(src);
+        let unpinned: Vec<String> = s
+            .iter()
+            .filter(|x| x.pinned_by.is_none())
+            .map(|x| {
+                format!(
+                    "stream.rs:{} | {} | {} | NOT SPEC-PINNED",
+                    x.line, x.gate, x.count_expr
+                )
+            })
+            .collect();
+        let pinned = s.len() - unpinned.len();
+        eprintln!(
+            "count-vacuity sweep: {} site(s); {} spec-pinned by a prior assert, {} not",
+            s.len(),
+            pinned,
+            unpinned.len()
+        );
+        for line in unpinned.iter() {
+            eprintln!("  {line}");
+        }
+        // The table Main asked for, as columns the guard itself computes.
+        for x in s.iter().filter(|x| x.pinned_by.is_none()) {
+            eprintln!(
+                "ROW {} | {} | {} | bucket={} | candidate={} | spec_in_scope={} | {} | \
+                 pixel_comparing={}",
+                x.line,
+                x.gate,
+                x.count_expr,
+                x.bucket.unwrap_or("?"),
+                x.candidate.clone().unwrap_or_else(|| "-".into()),
+                x.fixable_from.clone().unwrap_or_else(|| "-".into()),
+                x.bucket_reason,
+                x.pixel_comparing
+            );
+        }
+        assert!(
+            !s.is_empty() && s.iter().all(|x| !x.gate.is_empty()),
+            "a site has no owning gate -- the sweep's gate attribution is broken"
+        );
+    }
+}
