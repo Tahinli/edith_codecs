@@ -5019,9 +5019,77 @@ pub(crate) mod tests {
         bytes
     }
 
+    /// The bit depth the stream's OWN sequence header declares, read from
+    /// the bytes rather than taken from the gate's name or recipe (class
+    /// `helper-packs-u16-for-an-8-bit-stream`: aomdec's `--rawvideo`
+    /// writes 8 bits per sample for an 8-bit stream and 16 bits LE for a
+    /// high-bitdepth one, so a u16 packer turns every 8-bit compare into a
+    /// raw-SIZE failure that never looks at a sample).
+    fn stream_bit_depth(stream: &[u8], name: &str) -> u8 {
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: OBU at byte {pos} does not parse: {e:?}"));
+            pos += obu.total_size;
+        }
+        probe
+            .sequence_header()
+            .unwrap_or_else(|| panic!("{name}: the stream carries no sequence header OBU"))
+            .color_config
+            .bit_depth
+    }
+
+    /// Packs decoded planes the way `aomdec --rawvideo` writes them for
+    /// `bit_depth`: 1 byte per sample at 8-bit, 2 bytes little-endian at
+    /// 10/12-bit. Plane order is Y, U, V at the frame's own subsampled
+    /// shape, which is exactly what rawvideo emits.
+    fn pack_rawvideo(decoded: &[Pic], bit_depth: u8, name: &str) -> Vec<u8> {
+        let mut ours: Vec<u8> = Vec::new();
+        for (fi, f) in decoded.iter().enumerate() {
+            for p in [&f.y, &f.u, &f.v] {
+                if bit_depth == 8 {
+                    for &s in p {
+                        assert!(
+                            s <= 0xff,
+                            "{name}: decode-order frame {fi} carries the sample {s}, which an \
+                             8-bit stream cannot hold -- the stream is not the one this gate thinks \
+                             it is"
+                        );
+                        ours.push(s as u8);
+                    }
+                } else {
+                    for &s in p {
+                        ours.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+            }
+        }
+        ours
+    }
+
     /// Decodes `stream` and the oracle's `aomdec --rawvideo` output and
     /// requires every sample of every frame to agree, in decode order.
-    fn assert_rawvideo_matches(obu: &std::path::Path, stream: &[u8], name: &str, frames: usize) {
+    ///
+    /// `bit_depth` is the depth the CALLER believes the stream has; it is
+    /// asserted against the stream's own sequence header, so a gate that
+    /// hands this an 8-bit stream under a 10-bit label fails here by name
+    /// instead of dying on a raw-size mismatch that reads like a pixel bug.
+    fn assert_rawvideo_matches(
+        obu: &std::path::Path,
+        stream: &[u8],
+        name: &str,
+        frames: usize,
+        bit_depth: u8,
+    ) {
+        let actual_depth = stream_bit_depth(stream, name);
+        assert_eq!(
+            actual_depth, bit_depth,
+            "{name}: the stream's sequence header says {actual_depth}-bit, the gate passed \
+             {bit_depth}-bit -- aomdec's --rawvideo writes {actual_depth} bits per sample for it, \
+             so packing for {bit_depth} compares nothing"
+        );
         let dir = std::env::temp_dir().join(format!("ec-av1-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -5043,15 +5111,20 @@ pub(crate) mod tests {
         let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
         let _ = std::fs::remove_dir_all(&dir);
         let decoded = decode_stream(stream).expect("decode for comparison");
-        let mut ours: Vec<u8> = Vec::with_capacity(ref_raw.len());
-        for f in &decoded {
-            for p in [&f.y, &f.u, &f.v] {
-                for s in p {
-                    ours.extend_from_slice(&s.to_le_bytes());
-                }
-            }
-        }
-        assert_eq!(ours.len(), ref_raw.len(), "{name}: raw sizes differ");
+        let ours = pack_rawvideo(&decoded, bit_depth, name);
+        assert_eq!(
+            ours.len(),
+            ref_raw.len(),
+            "{name}: {bit_depth}-bit raw sizes differ -- ours packs {} bytes ({} samples at \
+             {} bit/sample), aomdec wrote {}",
+            ours.len(),
+            decoded
+                .iter()
+                .map(|f| f.y.len() + f.u.len() + f.v.len())
+                .sum::<usize>(),
+            bit_depth,
+            ref_raw.len()
+        );
         assert_eq!(decoded.len(), frames, "{name}: frame count");
         let first = ours
             .iter()
@@ -5065,6 +5138,115 @@ pub(crate) mod tests {
             ours.iter().zip(&ref_raw).filter(|(a, b)| a != b).count(),
             first
         );
+    }
+
+    /// lane-av1rawhelper: `assert_rawvideo_matches` used to pack our samples
+    /// as `u16` for EVERY stream, while `aomdec --rawvideo` writes 8 bits
+    /// per sample for an 8-bit stream. An 8-bit caller therefore died on a
+    /// raw-SIZE assertion (2359296 vs 1179648) without comparing a single
+    /// sample, and a high-bitdepth caller was the only one that could work.
+    ///
+    /// Two arms, both on a real `aomenc` 8-bit stream:
+    ///
+    /// 1. the correct label compares real samples -- the byte counts it
+    ///    walks equal the oracle's, so every `u8` in the 8-bit pack is
+    ///    zipped against a real oracle byte;
+    /// 2. a WRONG label fails by name, quoting both depths and the fact that
+    ///    the pack would compare nothing, rather than by size. Arm 2 is what
+    ///    keeps arm 1 from being a green that a reverted check would also
+    ///    give.
+    #[test]
+    fn the_rawvideo_helper_compares_real_samples_at_the_streams_own_bit_depth() {
+        const NAME: &str = "the_rawvideo_helper_compares_real_samples_at_the_streams_own_bit_depth";
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() || !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no aomenc/aomdec oracle or no ffmpeg");
+            return;
+        }
+        let (w, h) = (192usize, 128usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &gradients_source(7, w, h, "duration=0.24:rate=25"),
+                "-pix_fmt",
+                "yuv420p",
+                "-t",
+                "0.24",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{NAME}: ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=40",
+            "--cpu-used=2",
+            "--threads=1",
+            "--row-mt=0",
+            "--limit=6",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "{NAME}: aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        assert_eq!(
+            stream_bit_depth(&stream, NAME),
+            8,
+            "{NAME}: the fixture must really be 8-bit, or this gate measures nothing"
+        );
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-raw8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, &stream).expect("writing the stream");
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the 8-bit stream no longer decodes: {e}"))
+            .len();
+        assert!(frames > 0, "{NAME}: nothing decoded");
+
+        // ARM 2 first: the wrong label must be refused BY NAME. A helper that
+        // packed u16 unconditionally got this far and then failed on size.
+        let wrong = std::panic::catch_unwind(|| {
+            assert_rawvideo_matches(&obu, &stream, NAME, frames, 10);
+        });
+        let boom = wrong
+            .err()
+            .map(|e| e.downcast_ref::<String>().cloned().unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            boom.contains("sequence header says 8-bit") && boom.contains("compares nothing"),
+            "{NAME}: a 10-bit label on an 8-bit stream must be refused by the depth check \
+             naming both depths; the panic read: {boom}"
+        );
+
+        // ARM 1: the correct label compares real samples. The pre-fix helper
+        // reached a size mismatch here (ours 2x the oracle); reaching the
+        // sample compare is what this arm proves.
+        assert_rawvideo_matches(&obu, &stream, NAME, frames, 8);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("{NAME}: {frames} 8-bit frame(s) byte-identical to aomdec --rawvideo");
     }
 
     fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -6886,7 +7068,7 @@ pub(crate) mod tests {
         let _ = decode_stream(&ctrl_stream)
             .unwrap_or_else(|e| panic!("{NAME}: the control arm no longer decodes cleanly: {e}"));
         if aomdec_path().is_file() {
-            assert_rawvideo_matches(&ctrl, &ctrl_stream, NAME, FRAMES);
+            assert_rawvideo_matches(&ctrl, &ctrl_stream, NAME, FRAMES, 10);
         } else {
             eprintln!(
                 "SKIP {NAME} control aomdec arm: no oracle aomdec at {}",
@@ -6980,7 +7162,7 @@ pub(crate) mod tests {
             assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
         }
         if aomdec_path().is_file() {
-            assert_rawvideo_matches(&obu, &stream, NAME, FRAMES);
+            assert_rawvideo_matches(&obu, &stream, NAME, FRAMES, 10);
         } else {
             eprintln!(
                 "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
@@ -23795,10 +23977,10 @@ pub(crate) mod tests {
     /// delta=2). `GOLDEN_FRAME` refuses by name until this decodes exact.
     ///
     /// LIVE since lane-av1pinslive r3. The old shape was the worst of the
-    /// class: a `concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/...")`
-    /// literal, which points at the GITIGNORED root and can therefore never be
-    /// satisfied by a committed pin, combined with a bare `.expect()`. The
-    /// bytes are now committed at
+    /// class: a `concat!` of `CARGO_MANIFEST_DIR` with the GITIGNORED
+    /// repo-root `fixtures/` directory, which no committed pin can satisfy,
+    /// combined with a bare `.expect()`.
+    /// The bytes are now committed at
     /// `crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu` (152 bytes;
     /// sha256 `81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be`,
     /// recovered byte-for-byte from the runner library).
@@ -31197,59 +31379,67 @@ pub(crate) mod tests {
     /// clamping; ii-flake-1..8: interintra neighbours excluded from
     /// warp-sample gathering, ref_frame[1] == INTRA_FRAME in the mi grid).
     /// `EC_AV1_GATE_DUMP_PIN` overrides to a single stream.
-    /// Deterministic and static -- `#[ignore]`d because the gitignored
-    /// fixtures dir may be absent; run manually.
+    ///
+    /// Un-`#[ignore]`d with the pin shape fixed: the fourteen pins are COMMITTED
+    /// under `crates/ec-av1/fixtures/`, so the gate runs on a clean checkout
+    /// and carries `warp_selected_hits` 0 -> 113 over the set instead of
+    /// skipping GREEN having read nothing.
     #[test]
-    #[ignore = "reads pinned fixture paths under the gitignored fixtures dir; run manually"]
     fn pinned_warp_stream_decodes_pixel_exact() {
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_warp_stream_decodes_pixel_exact: no ffmpeg");
             return;
         }
-        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
-        let paths: Vec<String> = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
-            Ok(p) => vec![p],
-            Err(_) => [
-                "warp-mismatch",
-                "warp-flake-5",
-                "warp-flake-7",
-                "ii-flake-1",
-                "ii-flake-2",
-                "ii-flake-3",
-                "ii-flake-5",
-                "ii-flake-6",
-                "ii-flake-7",
-                "ii-flake-8",
+        // Every pin is COMMITTED under `crates/ec-av1/fixtures/` and named by a
+        // string literal, which is the convention every other pinned gate here
+        // uses and the only shape the pin census can resolve name-by-name. The
+        // old shape -- one GITIGNORED root directory literal plus a runtime
+        // name list formatted against it -- can never be satisfied by a
+        // committed tree, so this gate skipped GREEN having tested nothing.
+        let pins = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
+            Ok(p) => vec![std::path::PathBuf::from(p)],
+            Err(_) => vec![
+                crate_pin("warp-mismatch.obu"),
+                crate_pin("warp-flake-5.obu"),
+                crate_pin("warp-flake-7.obu"),
+                crate_pin("ii-flake-1.obu"),
+                crate_pin("ii-flake-2.obu"),
+                crate_pin("ii-flake-3.obu"),
+                crate_pin("ii-flake-5.obu"),
+                crate_pin("ii-flake-6.obu"),
+                crate_pin("ii-flake-7.obu"),
+                crate_pin("ii-flake-8.obu"),
                 // switchable_interp missing from reset_counts (counter
                 // saturation slowed the adaptation rate) -- unrelated to
                 // interintra, caught by the same gate.
-                "ii-flake-9",
+                crate_pin("ii-flake-9.obu"),
                 // lane-rect r2: HORZ strip rect defects (mvstack size_h,
                 // warp sample/projection dims, OBMC overlap, deblock tx-h).
-                "rect-flake-1",
+                crate_pin("rect-flake-1.obu"),
                 // scan_row/scan_col weight `inc` min'd by the wrong candidate
                 // axis (width vs height) -- ties reordered DRL entry 1 for a
                 // block under a 32x16 strip, and suppressed the -5 extended
                 // row scan.
-                "rect-flake-2",
+                crate_pin("rect-flake-2.obu"),
                 // overlappable_left stepped the vertical walk by the
                 // neighbour's WIDTH: a 32x16 left strip swallowed the strip
                 // below it, blending the wrong OBMC prediction there.
-                "rect-flake-3",
-            ]
-            .iter()
-            .map(|n| format!("{fixtures}/{n}.obu"))
-            .collect(),
+                crate_pin("rect-flake-3.obu"),
+            ],
         };
-        for path in paths {
-            eprintln!("pin: {path}");
+        for path in pins {
+            eprintln!("pin: {}", path.display());
             check_pinned_warp_stream(&path);
         }
     }
 
-    fn check_pinned_warp_stream(path: &str) {
+    fn check_pinned_warp_stream(path: &std::path::Path) {
         use crate::decode::warp_selected_hits;
-        let stream = std::fs::read(path).expect("reading pinned stream");
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let stream = require_pin(path, &name);
         let before = warp_selected_hits();
         let frames = decode_stream(&stream).expect("pinned stream must decode");
         eprintln!(
