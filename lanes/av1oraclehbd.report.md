@@ -296,3 +296,131 @@ Re-ran the full pairing after wiring the checker: `av112bit-key.obu` (12-bit)
 and `palette_screen_witness_10bit.obu` (10-bit), all four rungs, oracle vs
 decoder — all `IDENTICAL` (30720 B and 73728 B). The checker only reads
 `ftell`; it cannot move a byte.
+
+## 9. Round 3 — the SHARED oracle is fixed too (this is where the harm lived)
+
+The private copy was never the problem. `~/.cache/aom-oracle` shipped the same
+four broken rungs, so **every lane that ever paired against them on a 10/12-bit
+stream got a 0-byte file**, and a 0-byte file reads downstream as "the oracle has
+no data for this stage".
+
+### 9.1 Zero-window swap (a live lane was using it)
+
+`ps` showed `~/.cache/cargo-target-av1lm444corr` running
+`a_10bit_film_frames_with_frame_edge_mv_clamping_decode_pixel` with the shared
+`aomenc` exec'd 0 s earlier, so a plain `ninja -C build aomdec` would have
+truncated the shared binary in place for the ~3 s of the link. Instead:
+
+1. `ln build/aomdec build/aomdec.prefix-20260929-054321` (hardlink backup, no
+   path gap) and `cp src/av1/decoder/decodeframe.c revert/decodeframe.c.prefix-20260929-054321`;
+2. the repaired `decodeframe.c` copied into the shared src (a file no running
+   process reads);
+3. `ninja -C build libaom.a` only (2.6 s) — the shared `aomdec` path is never
+   written;
+4. the link command from `ninja -t commands aomdec` re-run with
+   `-o ~/.cache/tmp/hbd-swap/aomdec.new`, so the new binary was built and
+   fully verified OFF-PATH;
+5. one `mv` (`rename(2)`, same filesystem): inode 177294570 (old) -> 177592760
+   (new). A concurrent exec gets either the old inode or the new one, never a
+   partial file.
+
+**Revert, one command each:**
+
+```
+mv ~/.cache/aom-oracle/build/aomdec.prefix-20260929-054321 ~/.cache/aom-oracle/build/aomdec
+git -C ~/.cache/aom-oracle/src checkout -- av1/decoder/decodeframe.c
+```
+
+(The source revert is enough on its own for any future re-derivation;
+ `ninja -C ~/.cache/aom-oracle/build aomdec` then rebuilds. `av1/common/reconintra.c`
+ was already modified before this lane and was not touched.)
+
+### 9.2 Verified on the SHARED binary, after the flip
+
+`~/.cache/aom-oracle/build/aomdec`, five rungs, exit codes and sizes:
+
+| fixture | PREFILT | POSTDEBLOCK | PREFILT_WIDE | POSTCDEF | FINAL (rung 12) |
+|---|---|---|---|---|---|
+| `av112bit-key.obu` (12-bit) | 0, 30720 B | 0, 30720 B | 0, 30720 B | 0, 30720 B | 0, 61440 B |
+| `palette_screen_witness_10bit.obu` (10-bit) | 0, 73728 B | 0, 73728 B | 0, 73728 B | 0, 73728 B | 0, 147456 B |
+
+Byte-identical to the decoder's own `as u8` rows (decode_probe, same env var):
+8/8 `IDENTICAL` (4 rungs x 2 fixtures).
+
+8-bit no-op on the shared pair — new binary vs the hardlinked OLD one:
+`422_allskip_2f.obu` 32768 B and `golden4-pin.obu` 6144 B, all five rungs,
+**10/10 `IDENTICAL`**, both exit 0. Nothing that was correct at 8 bit moved.
+
+### 9.3 The loudness is live in the shared tree too
+
+The deliberate-mismatch mutant was also built OFF-PATH from the shared source
+(mutated `decodeframe.c` -> object compiled to a scratch path -> `ar r` into a
+*copy* of `libaom.a` -> linked to `aomdec.mutant`), so the shared path never
+held an aborting oracle. One dropped luma row in PREFILT:
+
+```
+12-bit: exit 134  EC_DUMP_ABORT rung=EC_AV1_PREFILT_DUMP bit_depth=12 hbd=1 expect=30720 wrote=30560
+ 8-bit: exit 134  EC_DUMP_ABORT rung=EC_AV1_PREFILT_DUMP bit_depth=8  hbd=0 expect=6144  wrote=6080
+```
+
+(First attempt at this proof silently passed because `ar q` APPENDS a
+duplicate member instead of replacing it and the linker took the first — `ar r`
+ is the replace verb. Worth knowing before anyone repeats the trick.)
+
+### 9.4 `check-aom-oracle-rungs.sh` against the shared source
+
+`bash scripts/check-aom-oracle-rungs.sh ~/.cache/aom-oracle/src`:
+
+```
+ok   legacy u8 row loops left in the derived file               0
+ok   ec_dump_narrow_row call sites (4 rungs x 3 planes)         12
+ok   ec_dump_finish call sites (one per narrowing rung)         4
+ok   byte-count check wired into EC_AV1_PREFILT_DUMP            1
+ok   byte-count check wired into EC_AV1_POSTDEBLOCK_DUMP        1
+ok   byte-count check wired into EC_AV1_PREFILT_WIDE_DUMP       1
+ok   byte-count check wired into EC_AV1_POSTCDEF_DUMP           1
+ok   rung 12 still converts plane pointers                      1
+ok   rung 12 not routed through the narrowing checker           0
+ok   instrument-aom-oracle.sh derives the depth-correct, byte-checked rungs (base v3.13.3)
+```
+
+### 9.5 Who could have been misled — the naming
+
+**Waves merged today: nobody.** Wave 3a (`3eec02c8`: av1cmpaudit, av1leftwit,
+av1lossy128x96, av1pinslive, av1txsearch) and wave 3b (`c6112723`:
+av1rawhelper, av1oracleskip r1+r2+r3) — of those seven lanes:
+
+- `lane-av1cmpaudit` NAMES `EC_AV1_PREFILT_DUMP` once, to record that the
+  decode-order dump rungs "have no in-repo consumer" and that the stale-dump
+  hazard there is manual-only. It paired against none of them.
+- `lane-av1rawhelper` names `EC_AV1_PREFILT_DUMP` twice, only as the contract
+  `examples/dump_yuv.rs` documents itself against. Its gate is
+  `assert_rawvideo_matches` — `aomdec --rawvideo` plus rung 12 — which is
+  depth-correct and unaffected.
+- `lane-av1oracleskip` is the aomenc-**SKIP** class (`have_aomenc()` returning
+  empty and a gate calling that green). No dump-rung pairing.
+- the other four wave-3a reports do not mention the four rungs at all.
+
+**No automated gate ever paired them**: `grep` over `crates/` and `tools/` finds
+the four names only in doc comments and in the decoder-side definitions in
+`decode.rs` — no test sets those env vars. The exposure was always a manual
+ladder procedure, which is also why it survived so long.
+
+**Historical users, and why their conclusions stand**: the rungs were used by
+earlier 8-bit lanes (av1444edge, av1444, av1444sb, av1422filter, av1422kf,
+av1422kf2, av1422stripwrite, av1lrflush, av1intrapred, av1wavefront,
+av1seglvl, hgkf-r2, tiny-r4, sub8-r5, mergefix-r4, sb128c-r4/r5, band63-r1,
+golomb-r9, mc64-r1, inter4-r4, txselect-r2, sqchroma-r1, superres-r6). At
+8 bit the old rungs were correct, and §9.2's 10/10 byte-identity against the
+backed-up old binary is the direct proof that their output did not change.
+The one report that both sweeps HBD cells and uses the rungs is
+`av1formatsweep`; its two `EC_AV1_PREFILT_DUMP` pairing claims (lines 238, 290)
+are on 8-bit 4:4:4 `testsrc2` streams, not on its 10/12-bit cells, and its
+HBD cells pair through rung 12.
+
+**The honest limit of that sweep**: it is name-based over `lanes/*.md` plus a
+targeted read of every report that mentions both a rung and an HBD marker. It
+is not a line-by-line audit of every historical report. What it does establish
+mechanically is the thing that matters: a 0-byte dump only ever occurred on a
+10/12-bit stream, and any lane that paired on one would have seen a rung that
+exited 139 — a value no report in `lanes/` quotes as a result.
