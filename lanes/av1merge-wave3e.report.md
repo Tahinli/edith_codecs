@@ -13,14 +13,27 @@ Nothing pushed. Lane-private `CARGO_TARGET_DIR=/home/tahinli/.cache/tgt/merge3e`
 | 3 | `lane-chromahalvings` | `f33b9d41` (wave-3c-b, **stale**) | `69e80133` | — | — | — | — |
 | — | `lane-chromahalvings-r3` | — | `149b2ad8` | already an ancestor of `main` | — | — | — |
 
-Branch 3 is HELD: `69e80133`'s own message is "4 sites wrong at 4:4:4, all
-reachable, **none fixed here**" — the fix Main is waiting on from Volkan-2
-(`decode_intrabc_owned_rect`'s extent plus its ten `px/2, py/2` prediction
-origins, with a gate separating the two halves) is not on the branch yet. Its
+Branch 3 is **deferred(next wave)**, not merged. `69e80133`'s own message is
+"4 sites wrong at 4:4:4, all reachable, **none fixed here**" — the fix Main is
+waiting on from Volkan-2 (`decode_intrabc_owned_rect`'s extent plus its ten
+`px/2, py/2` prediction origins, with a gate separating the two halves) is not
+on the branch yet, so there is nothing to land and no region to resolve. Its
 base is also five merges behind, so it needs a re-rebase before it is a merge
 candidate at all. `lane-chromahalvings-r3` is already in `main`
 (`git merge-base main lane-chromahalvings-r3` == its own tip), so there is
-nothing to fetch from it.
+nothing to fetch from it either. When it lands, the region to watch is
+`decode_intrabc_owned_rect`'s `bw/2, bh/2` (verified untouched by txsizeaudit
+above) plus whatever it does to the ten `px/2, py/2` prediction origins in the
+same function.
+
+**Counts are per module, not one combined filter.** Running the four guard
+modules as a single `cargo test -- gate_coverage refusal_inventory
+count_vacuity pin_inventory` reports fewer than the sum of the four
+per-module runs, because libtest's multiple positional patterns are a union of
+substrings over test NAMES, not a set of module selectors — a test whose name
+matches two of the four is counted once. The per-module numbers in §5 and §6
+(18 + 19 + 2 + 3 = 42 before merge #2, 18 + 20 + 2 + 3 = 43 after) are the
+ones to quote; the combined figure is a union, not a sum.
 
 ## 2. Conflicts and how each was resolved
 
@@ -88,8 +101,16 @@ intra-in-inter fix `4bfe8d8e` has never been merged and lands with this branch;
 `av1tilerows.report.md`'s because its 38 lines are that lane's own edit, not a
 swallowed file.
 
+**Foreign files, the strongest form of the check.** For each merge the diff
+against the first parent is compared BYTE-FOR-BYTE against the branch's own
+delta with `cmp`, not read with `--stat` and eyeballed. `git diff --stat` alone
+proves the file SET; it cannot prove the hunks, so a 3-way apply that silently
+restored a removed line would still print the same stat. `cmp` on the two
+diffs is what actually rules that out, and it is cheap.
+
 **Silent line restoration.** Removal counts, per hot file, merge against
 branch:
+
 
 | file | merge `grep -c '^-[^-]'` | branch | verdict |
 |---|---|---|---|
@@ -107,6 +128,22 @@ diffs are not byte-identical for merge #2, and the difference is entirely hunk
 ordering and context, because the first parent now carries pins5's `stream.rs`
 and `gate_coverage.rs`; the `--stat` and the per-file removal counts above are
 the shape evidence.
+
+**Behavioural scope of the 305-line `decode.rs` change.** The removals are not
+only C1; they include the collapsed 4:2:0 arm of the intra-in-inter walk that
+`4bfe8d8e` rewrote. The scoped family that covers that route, with the oracle
+forced on, is green on the merged tree:
+
+```
+$ EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib -- intra_in_inter interintra
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 755 filtered out; finished in 27.77s
+```
+
+7/0, including the new 4:4:4 128-root per-mu-chunk gate and the 4:2:0
+`a_real_aomenc_stream_with_interintra_decodes_pixel_exact` that the collapsed arm
+used to serve. Not a substitute for the full suite, which is Main's, but it is
+the family that would red first if the arm had been dropped instead of
+rewritten.
 
 ## 4. A ref hazard found and NOT walked into
 
@@ -136,6 +173,14 @@ The worktree `~/.cache/wt/av1txsizeaudit` is checked out on
 `lane-av1txsizeaudit-r5` at `c0727d64`, so the tip in the worktree and the tip
 in the ref disagree. I merged the **sha** after checking both. Reported to Main;
 the ref wants repointing or deleting before any later wave merges it by name.
+
+
+**Resolved, not left as a hazard.** Main repointed the ref after this was
+reported (`git branch -f lane-av1txsizeaudit c0727d64`), so
+`lane-av1txsizeaudit` is now an ancestor of `main` and a later wave merging
+that NAME gets the correct tree. Recorded because the failure mode is silent
+until it is not: a ref that lags a rebase by a whole history line still
+resolves, still merges, and produces a plausible-looking commit.
 
 ## 5. Branch 1 — `lane-av1pins5`
 
@@ -252,3 +297,8 @@ alone could not have told this apart from a rename or a loss, which is why both
 
 Both `--no-ff`, exactly two parents each. `origin/main` unchanged — nothing
 pushed.
+
+`d587f53f` (this report's first cut) is `origin/main`: Main verified the
+partial on the pushed tree and pushed it. `lane-av1txsizeaudit` has since been
+repointed to `c0727d64`, so the ref hazard in section 4 is closed for later
+waves. Nothing in this wave's second cut has been pushed.
