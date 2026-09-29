@@ -312,25 +312,26 @@ by the `a_lossless_444_*` set; the intrabc_rect arm by
 
 ## 7. Gap row — `decode_intra_sub8_leaf` has no `chroma_422` arm
 
-`crates/ec-av1/src/decode.rs:45606`, body ends at `46434`. It carries a
+`crates/ec-av1/src/decode.rs:45594`, body ends at `46422`. It carries a
 `chroma_444` branch set and **zero** `chroma_422` mentions inside the body
 (`awk 'NR>=45606 && NR<=46400' | grep -c chroma_422` → `0`; the two
-`chroma_422` mentions at 45406/45418 belong to the enclosing
+`chroma_422` mentions at 45394/45406 belong to the enclosing
 `decode_intra_split`, not to this function).
 
 The 4:4:4 branches it owns, and what each falls back to at 4:2:2:
 
 | line | what the `chroma_444` arm does | what 4:2:2 gets instead |
 | --- | --- | --- |
-| 46095 | `let chroma_444 = ss_x == 0 && ss_y == 0` | `false` at (1,0) |
-| 46098 | `unit_x, unit_y = (px, py)` | `(cpx, cpy)` — the 4:2:0 double halving; at (1,0) the width halves and the height does not |
-| 46100-46105 | `reach_c` = the piece's own rect reach at 4:4:4 | `group_reach` (a 8x8 group reach) |
-| 46107 | `band_r, band_c` from `lmi` | from `r, c` (the group) |
-| 46113-46114 | `smooth_uv_neighbour` sampled at `lmi` | sampled at `gr, gc` |
-| 46127 | `record_uv_mode_mi(lmi, w_mi, h_mi)` | `record_uv_mode_mi(gr, gc, 2, 2)` — a 2x2 group stamp |
-| 46134 | `cfl_src_rect(px, py, bw, bh)` | not taken |
-| 46146, 46210 | the non-square 4:4:4 unit shape arms | not taken |
-| 46352 | chroma per-unit gather at `lmi` with a 4-px step | at `group_mi` with an 8-px step |
+| 46083 | `let chroma_444 = ss_x == 0 && ss_y == 0` | `false` at (1,0) |
+| 46086 | `unit_x, unit_y = (px, py)` | `(cpx, cpy)` — the 4:2:0 double halving; at (1,0) the width halves and the height does not |
+| 46088-46093 | `reach_c` = the piece's own rect reach at 4:4:4 | `group_reach` (an 8x8 group reach) |
+| 46095 | `band_r, band_c` from `lmi` | from `r, c` (the group) |
+| 46101-46102 | `smooth_uv_neighbour` sampled at `lmi` | sampled at `gr, gc` |
+| 46115 | `record_uv_mode_mi(lmi, w_mi, h_mi)` | `record_uv_mode_mi(gr, gc, 2, 2)` — a 2x2 group stamp |
+| 46122 | `cfl_src_rect(px, py, bw, bh)` | not taken |
+| 46134, 46198 | the non-square 4:4:4 unit shape arms | not taken |
+| 46340-46341 | chroma per-unit gather at `lmi` with a 4-px step | at `group_mi` with an 8-px step |
+| 46399 | the 4:4:4 publish/stamp half | the `!chroma_444 && !chroma_422` fallbacks (45394/45406 in the enclosing `decode_intra_split`) |
 
 The shape the missing arm would have to be: at 4:2:2 `ss_size_lookup` maps an
 8x4 block to `BLOCK_INVALID` (common_data.c:38) and no `TX_4X8` chroma unit
@@ -340,14 +341,14 @@ exists, so a 4:2:2 sub-8 leaf's chroma is coded CHUNKED, exactly the
 
 **Caller set — exactly two sites, and BOTH are already 4:2:2-aware:**
 
-1. `decode.rs:44736` — the `BLOCK_4X4` leaf of the sub-8x8 intra-in-inter split
+1. `decode.rs:44724` — the `BLOCK_4X4` leaf of the sub-8x8 intra-in-inter split
    arm. It passes
    `has_chroma = chroma_444 || (cmi & 1 == 1 && chroma_422) || i == 3`
    (libaom's `is_chroma_reference`, `av1_common_int.h:1459`: BOTH odd-column
    pieces at 4:2:2).
-2. `decode.rs:46622` — the `(bw, bh)` 8x8/4x8/8x4 piece. It passes
+2. `decode.rs:46610` — the `(bw, bh)` 8x8/4x8/8x4 piece. It passes
    `has_chroma = piece_is_chroma_ref(i)`, and `piece_is_chroma_ref`
-   (decode.rs:46546) has an explicit `else if chroma_422 { !vert || ((gc + i) & 1) == 1 }`
+   (decode.rs:46534) has an explicit `else if chroma_422 { !vert || ((gc + i) & 1) == 1 }`
    branch.
 
 So the callers compute the 4:2:2 chroma-reference rule correctly and the leaf
