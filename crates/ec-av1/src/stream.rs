@@ -21373,9 +21373,9 @@ pub(crate) mod tests {
     /// leaf push back behind `if side > 64` (the pre-`6c33f204` state) turns
     /// it red with the same 777 bytes.
     #[test]
-    fn the_pinned_444_quadrant_witness_is_the_single_reference_arms_and_not_only_the_compound_arms() {
-        const NAME: &str =
-            "the_pinned_444_quadrant_witness_is_the_single_reference_arms_and_not_only_the_compound_arms";
+    fn the_pinned_444_quadrant_witness_is_the_single_reference_arms_and_not_only_the_compound_arms()
+    {
+        const NAME: &str = "the_pinned_444_quadrant_witness_is_the_single_reference_arms_and_not_only_the_compound_arms";
         const FIXTURE_LEN: usize = 27933;
         const FIXTURE_FNV: u64 = 0x85fa_830b_8800_90df;
         let _gate_lock = lock_gate_counters();
@@ -49612,6 +49612,127 @@ pub(crate) mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// lane-av1ibcfork: the SECOND 4:4:4 intra-BC witness, and the one the
+    /// entropy investigation was chartered against. `444_intrabc_rect4_witness.obu`
+    /// reaches `decode_intrabc_owned_rect`'s SKIP arm once -- the 64x32 block at
+    /// mi (40,80) -- and is byte-exact on all three planes.
+    ///
+    /// Why a second witness and not a repeat of
+    /// `a_444_intrabc_owned_rect_strip_sizes_its_chroma_plane_block_and_decodes`
+    /// (which pins `r512.obu`): the skip arm's defect was a wrong PLACE, not a
+    /// wrong size, and the two shapes produce DIFFERENT symptoms. `r512.obu`'s
+    /// 128-root strips fail as a sizing error inside the coefficient walk; this
+    /// witness's 64x32 skip block read no coefficient at all, so the only
+    /// symptom was pixels -- a 32x16 window committed at (px/2, py/2) =
+    /// (160,80) over a region another block had already reconstructed, and its
+    /// own 64x32 footprint at (320,160) left unwritten. Measured before the
+    /// ss correction: U 72945 / V 64865 of 307200 wrong, first at (160,80) on
+    /// both planes, luma byte-exact; the two 8x8-cell difference components
+    /// were 8 cells at x[160,192) y[80,96) and 1182 cells over the whole
+    /// x[320,640) y[160,480) quadrant -- one wrong-place write, not two.
+    ///
+    /// Full byte-exactness, not a prefix. That is possible only because
+    /// `lane-av1chromarect` (the ss-derived extent and origins, this function
+    /// included -- the skip arm was where the defect was first reached) and
+    /// `lane-av1chromadc` (the per-unit windowed chroma override) both landed;
+    /// before them this witness carried the open tail
+    /// `lanes/ibc444c.report.md` r2 recorded. The 4:2:0 twin is asserted
+    /// byte-exact in the same run, where `>> ss_x` IS `/ 2`.
+    #[test]
+    fn a_444_intrabc_rect4_witness_is_byte_exact_after_the_skip_arm_footprint() {
+        const NAME: &str = "a_444_intrabc_rect4_witness_is_byte_exact_after_the_skip_arm_footprint";
+        const F444: &str = "444_intrabc_rect4_witness.obu";
+        const F444_LEN: usize = 1016;
+        const F420: &str = "420_intrabc_rect4_witness.obu";
+        const F420_LEN: usize = 890;
+        const PLANE: usize = 640 * 480;
+        let read = |file: &str, len: usize| -> Vec<u8> {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("fixtures/{file}"));
+            let data =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("{NAME}: reading {file}: {e}"));
+            assert_eq!(data.len(), len, "{NAME}: {file} is pinned at {len} bytes");
+            data
+        };
+        let stream444 = read(F444, F444_LEN);
+        let stream420 = read(F420, F420_LEN);
+        assert_444_header(&stream444, NAME, 8);
+
+        let _guard = lock_gate_counters();
+        if !aomdec_available(NAME) {
+            eprintln!("{NAME}: SKIP -- no aomdec; run scripts/build-aom-oracle.sh");
+            return;
+        }
+        // 4:2:0 identity FIRST and in full: `>> ss_x` is `/ 2` at ss=1, so
+        // this arm is the measurement, not a claim about it.
+        decode_all_frames_vs_oracle(&stream420, &format!("{NAME}-420"));
+
+        crate::decode::reset_ibc_owned_rect_chroma_footprint_444_hits();
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let in_obu = dir.join("in.obu");
+        std::fs::write(&in_obu, &stream444).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&in_obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        let _ = decode_stream(&stream444).expect("second decode");
+        set_final_dump_prefix(None);
+        let hits = crate::decode::ibc_owned_rect_chroma_footprint_444_hits();
+        assert!(
+            hits > 0,
+            "{NAME}: no rect intra-BC block committed a 4:4:4 chroma plane block -- the \
+             ss-derived footprint never ran, so this gate is measuring a hardcoded halving \
+             (class gate-blind-to-feature)"
+        );
+        let aom_dump = std::fs::read(format!("{}.f0", aom_prefix.display())).expect("oracle dump");
+        let our_dump = std::fs::read(format!("{}.f0", ours_prefix.display())).expect("our dump");
+        assert_eq!(aom_dump.len(), 3 * PLANE, "{NAME}: 8-bit 4:4:4 640x480");
+        assert_eq!(
+            our_dump.len(),
+            aom_dump.len(),
+            "{NAME}: our frame is {} bytes, the oracle's is {}",
+            our_dump.len(),
+            aom_dump.len()
+        );
+        for (plane, name) in [(0usize, "Y"), (1, "U"), (2, "V")] {
+            let at = plane * PLANE;
+            if our_dump[at..at + PLANE] == aom_dump[at..at + PLANE] {
+                continue;
+            }
+            let first = (0..PLANE)
+                .find(|&s| our_dump[at + s] != aom_dump[at + s])
+                .unwrap_or(PLANE);
+            panic!(
+                "{NAME}: plane {name} diverges from the oracle at sample {first} of {PLANE} \
+                 (x={}, y={}) -- this gate pins FULL byte-exactness on all three planes",
+                first % 640,
+                first / 640
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "{NAME}: {hits} rect intra-BC block(s) committed a 4:4:4 chroma plane block; \
+             4:2:0 twin byte-exact; 4:4:4 byte-exact on all three planes \
+             (307200 samples each)"
+        );
     }
 
     /// lane-av1chromadc: a SKIPPED 64x64 square block at 4:4:4 has a 64x64
