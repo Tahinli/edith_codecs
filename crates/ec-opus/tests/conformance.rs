@@ -412,11 +412,31 @@ const VECTORS: [&str; 12] = [
 /// MUST stay within the `opus_compare` threshold (quality >= 0).
 #[test]
 fn rfc6716_test_vectors() {
+    // A missing test vector made this gate skip GREEN having decoded nothing —
+    // the "gate skips on its own failure" class. The root `fixtures/` tree is
+    // gitignored, so `git worktree add` hands every lane worktree a tree without
+    // it. `EC_REQUIRE_FIXTURES=1` turns a missing vector into a hard failure
+    // naming the exact path and the command that produces it; unset, the skip
+    // is kept and now says what it skipped. Set it in every batch run.
+    let base = vectors_dir();
     let mut table = Vec::new();
     for name in VECTORS {
-        let path = vectors_dir().join(format!("{name}.bit"));
+        let path = base.join(format!("{name}.bit"));
         if !path.exists() {
-            eprintln!("{name}: missing, skipped (run scripts/fetch-vectors.sh)");
+            assert!(
+                std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+                "RFC 6716 test vector {name} missing at {} — this gate would prove \
+                 nothing. A worktree has no gitignored root `fixtures/`: run \
+                 scripts/link-fixtures.sh, or fetch it with scripts/fetch-vectors.sh.",
+                path.display()
+            );
+            eprintln!(
+                "SKIP RFC 6716 test vector {name} missing at {} — this gate proved \
+                 nothing; run scripts/link-fixtures.sh, or fetch it with \
+                 scripts/fetch-vectors.sh (or set EC_REQUIRE_FIXTURES=1 to make this \
+                 a failure).",
+                path.display()
+            );
             continue;
         }
         let packets = read_vector(&path);
@@ -1595,7 +1615,14 @@ fn ogg_opus_round_trip_duration_is_exact() {
     let packets = encode_packets(&mut enc, &pcm, 2);
     let path = temp_path("duration.opus");
     let pre_skip = enc.look_ahead(960);
-    write_ogg_opus(&path, &packets, opus_head(2, pre_skip as u16, None), 2, total, pre_skip as i64);
+    write_ogg_opus(
+        &path,
+        &packets,
+        opus_head(2, pre_skip as u16, None),
+        2,
+        total,
+        pre_skip as i64,
+    );
     let probe = Command::new("ffprobe")
         .args([
             "-v",
@@ -2380,7 +2407,14 @@ fn oracle_decode(
         return None;
     }
     let path = temp_path(&format!("{name}.opus"));
-    write_ogg_opus(&path, packets, opus_head(1, pre_skip as u16, None), 1, samples, pre_skip as i64);
+    write_ogg_opus(
+        &path,
+        packets,
+        opus_head(1, pre_skip as u16, None),
+        1,
+        samples,
+        pre_skip as i64,
+    );
     let out = Command::new("ffmpeg")
         .args(["-v", "warning", "-c:a", "libopus", "-i"])
         .arg(&path)
@@ -2557,7 +2591,10 @@ fn hybrid_layers_align() {
         (plb - phb).abs() <= 3,
         "layers misaligned: LB +{plb} vs HB +{phb}"
     );
-    assert!((phb - delay).abs() <= 2, "HB peak +{phb}, look_ahead {delay}");
+    assert!(
+        (phb - delay).abs() <= 2,
+        "HB peak +{phb}, look_ahead {delay}"
+    );
 }
 
 /// 20 ms FB hybrid at 32 kbps: decodes in our decoder range-exactly, tracks
@@ -2845,7 +2882,12 @@ fn ffmpeg_encode_libopus(src: &Path, kbps: u32, out: &Path, secs: f64) {
 /// file — and the correlation is computed inline without per-lag allocations.
 /// The delay lands the peak at a positive lag; the symmetric scan keeps the
 /// gate honest if a reference decoder shifts the other way.
-fn align_to_source(source: &[f32], decoded: &[f32], channels: usize, max_lag: usize) -> (i32, Vec<f32>) {
+fn align_to_source(
+    source: &[f32],
+    decoded: &[f32],
+    channels: usize,
+    max_lag: usize,
+) -> (i32, Vec<f32>) {
     let sf = source.len() / channels;
     let df = decoded.len() / channels;
     let scan_frames = sf.min(df).min(48000 * 10);
@@ -2881,7 +2923,11 @@ fn align_to_source(source: &[f32], decoded: &[f32], channels: usize, max_lag: us
     }
     // Build a source-length aligned copy using the chosen lag.
     let mut aligned = vec![0.0f32; sf * channels];
-    let i0 = if best_lag < 0 { (-best_lag) as usize } else { 0 };
+    let i0 = if best_lag < 0 {
+        (-best_lag) as usize
+    } else {
+        0
+    };
     let j0 = if best_lag < 0 { 0 } else { best_lag as usize };
     let len = sf.saturating_sub(i0).min(df.saturating_sub(j0));
     for i in 0..len {
@@ -3017,7 +3063,9 @@ fn sadie64_persecond_diag() {
     let (_, ours_aligned) = align_to_source(&source_pcm, &ours_dec, CHANNELS, MAX_LAG);
 
     // Per-second correlation for both
-    let n_frames = (source_frames).min(ours_aligned.len() / CHANNELS).min(ref_aligned.len() / CHANNELS);
+    let n_frames = (source_frames)
+        .min(ours_aligned.len() / CHANNELS)
+        .min(ref_aligned.len() / CHANNELS);
     let sec_samples = 48000usize;
     let frames_per_sec = sec_samples / FRAME; // 50
 
@@ -3034,11 +3082,19 @@ fn sadie64_persecond_diag() {
                 let s = source_pcm[(start + i) * CHANNELS + ch] as f64;
                 let o = ours_aligned[(start + i) * CHANNELS + ch] as f64;
                 let r = ref_aligned[(start + i) * CHANNELS + ch] as f64;
-                sxy_o += s * o; sxx_o += s * s; syy_o += o * o;
-                sxy_r += s * r; sxx_r += s * s; syy_r += r * r;
+                sxy_o += s * o;
+                sxx_o += s * s;
+                syy_o += o * o;
+                sxy_r += s * r;
+                sxx_r += s * s;
+                syy_r += r * r;
             }
-            if sxx_o > 0.0 && syy_o > 0.0 { acc_o += sxy_o / (sxx_o * syy_o).sqrt(); }
-            if sxx_r > 0.0 && syy_r > 0.0 { acc_r += sxy_r / (sxx_r * syy_r).sqrt(); }
+            if sxx_o > 0.0 && syy_o > 0.0 {
+                acc_o += sxy_o / (sxx_o * syy_o).sqrt();
+            }
+            if sxx_r > 0.0 && syy_r > 0.0 {
+                acc_r += sxy_r / (sxx_r * syy_r).sqrt();
+            }
         }
         let co = acc_o / CHANNELS as f64;
         let cr = acc_r / CHANNELS as f64;
@@ -3054,10 +3110,19 @@ fn sadie64_persecond_diag() {
     let mut out_str = String::new();
     out_str.push_str("# sadie@64k per-second diagnostic (r1, current code)\n");
     out_str.push_str("# 120s cap, 20ms frames, VBR constrained, 48kHz stereo\n");
-    out_str.push_str(&format!("# total frames: ours={} ref={}\n", diags.len(), ref_payload.len()));
+    out_str.push_str(&format!(
+        "# total frames: ours={} ref={}\n",
+        diags.len(),
+        ref_payload.len()
+    ));
     let total_corr_o: f64 = sec_rows.iter().map(|r| r.1).sum::<f64>() / sec_rows.len() as f64;
     let total_corr_r: f64 = sec_rows.iter().map(|r| r.2).sum::<f64>() / sec_rows.len() as f64;
-    out_str.push_str(&format!("# avg corr: ours={:.4} ref={:.4} gap={:+.4}\n\n", total_corr_o, total_corr_r, total_corr_r - total_corr_o));
+    out_str.push_str(&format!(
+        "# avg corr: ours={:.4} ref={:.4} gap={:+.4}\n\n",
+        total_corr_o,
+        total_corr_r,
+        total_corr_r - total_corr_o
+    ));
 
     // Per-second summary table
     out_str.push_str("# sec\tcorr_ours\tcorr_ref\tgap\tavg_trim\tdual_n\tint_typ\tavg_B_ours\tavg_B_ref\ttf_chng_n\ttrans_n\n");
@@ -3067,19 +3132,35 @@ fn sadie64_persecond_diag() {
         let sec_diags = &diags[f0..f1.min(diags.len())];
         let avg_trim: f64 = if !sec_diags.is_empty() {
             sec_diags.iter().map(|d| d.alloc_trim as f64).sum::<f64>() / sec_diags.len() as f64
-        } else { -1.0 };
+        } else {
+            -1.0
+        };
         let dual_n = sec_diags.iter().filter(|d| d.dual_stereo).count();
         let int_typ = if !sec_diags.is_empty() {
             sec_diags.iter().map(|d| d.intensity).max().unwrap_or(0)
-        } else { 0 };
+        } else {
+            0
+        };
         let avg_b_o: f64 = if !sec_diags.is_empty() {
-            sec_diags.iter().map(|d| d.nb_compressed as f64).sum::<f64>() / sec_diags.len() as f64
-        } else { 0.0 };
+            sec_diags
+                .iter()
+                .map(|d| d.nb_compressed as f64)
+                .sum::<f64>()
+                / sec_diags.len() as f64
+        } else {
+            0.0
+        };
         let ref_f0 = f0.min(ref_payload.len());
         let ref_f1 = f1.min(ref_payload.len());
         let avg_b_r: f64 = if ref_f1 > ref_f0 {
-            ref_payload[ref_f0..ref_f1].iter().map(|&b| b as f64).sum::<f64>() / (ref_f1 - ref_f0) as f64
-        } else { 0.0 };
+            ref_payload[ref_f0..ref_f1]
+                .iter()
+                .map(|&b| b as f64)
+                .sum::<f64>()
+                / (ref_f1 - ref_f0) as f64
+        } else {
+            0.0
+        };
         // tf_changed: count bands where tf_res != 0 (we don't have tf_res in diag,
         // but is_transient tells us if short blocks were used)
         let trans_n = sec_diags.iter().filter(|d| d.is_transient).count();
@@ -3103,10 +3184,23 @@ fn sadie64_persecond_diag() {
             let f5: Vec<String> = (0..5).map(|i| format!("{}", d.fine_quant[i])).collect();
             out_str.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                fi, fi * 20, d.nb_compressed, b_ref,
-                d.is_transient as u8, d.short_blocks, d.intra as u8, d.silence as u8,
-                d.lm, d.start, d.coded_bands, d.intensity, d.dual_stereo as u8,
-                d.alloc_trim, d.vbr_reservoir, p5.join(","), f5.join(",")
+                fi,
+                fi * 20,
+                d.nb_compressed,
+                b_ref,
+                d.is_transient as u8,
+                d.short_blocks,
+                d.intra as u8,
+                d.silence as u8,
+                d.lm,
+                d.start,
+                d.coded_bands,
+                d.intensity,
+                d.dual_stereo as u8,
+                d.alloc_trim,
+                d.vbr_reservoir,
+                p5.join(","),
+                f5.join(",")
             ));
         }
         out_str.push('\n');
@@ -3116,30 +3210,50 @@ fn sadie64_persecond_diag() {
     out_str.push_str("# --- global stats ---\n");
     let trim_hist: Vec<(i32, usize)> = {
         let mut h = std::collections::HashMap::new();
-        for d in &diags { *h.entry(d.alloc_trim).or_insert(0) += 1; }
+        for d in &diags {
+            *h.entry(d.alloc_trim).or_insert(0) += 1;
+        }
         let mut v: Vec<_> = h.into_iter().collect();
         v.sort();
         v
     };
     out_str.push_str(&format!("# alloc_trim histogram: {:?}\n", trim_hist));
     let dual_count = diags.iter().filter(|d| d.dual_stereo).count();
-    out_str.push_str(&format!("# dual_stereo frames: {}/{}\n", dual_count, diags.len()));
+    out_str.push_str(&format!(
+        "# dual_stereo frames: {}/{}\n",
+        dual_count,
+        diags.len()
+    ));
     let trans_count = diags.iter().filter(|d| d.is_transient).count();
-    out_str.push_str(&format!("# transient frames: {}/{}\n", trans_count, diags.len()));
+    out_str.push_str(&format!(
+        "# transient frames: {}/{}\n",
+        trans_count,
+        diags.len()
+    ));
     let intensity_hist: Vec<(usize, usize)> = {
         let mut h = std::collections::HashMap::new();
-        for d in &diags { *h.entry(d.intensity).or_insert(0) += 1; }
+        for d in &diags {
+            *h.entry(d.intensity).or_insert(0) += 1;
+        }
         let mut v: Vec<_> = h.into_iter().collect();
         v.sort();
         v
     };
     out_str.push_str(&format!("# intensity histogram: {:?}\n", intensity_hist));
-    let avg_b_ours: f64 = diags.iter().map(|d| d.nb_compressed as f64).sum::<f64>() / diags.len() as f64;
-    let avg_b_ref: f64 = ref_payload.iter().map(|&b| b as f64).sum::<f64>() / ref_payload.len() as f64;
-    out_str.push_str(&format!("# avg bytes/frame: ours={:.1} ref={:.1}\n", avg_b_ours, avg_b_ref));
+    let avg_b_ours: f64 =
+        diags.iter().map(|d| d.nb_compressed as f64).sum::<f64>() / diags.len() as f64;
+    let avg_b_ref: f64 =
+        ref_payload.iter().map(|&b| b as f64).sum::<f64>() / ref_payload.len() as f64;
+    out_str.push_str(&format!(
+        "# avg bytes/frame: ours={:.1} ref={:.1}\n",
+        avg_b_ours, avg_b_ref
+    ));
     let ours_kbps = ours_bytes.iter().map(|&b| b as f64).sum::<f64>() * 8.0 / seconds / 1000.0;
     let ref_kbps = ref_payload.iter().map(|&b| b as f64).sum::<f64>() * 8.0 / seconds / 1000.0;
-    out_str.push_str(&format!("# realised kbps: ours={:.1} ref={:.1}\n", ours_kbps, ref_kbps));
+    out_str.push_str(&format!(
+        "# realised kbps: ours={:.1} ref={:.1}\n",
+        ours_kbps, ref_kbps
+    ));
 
     let out_path = lanes_dir.join("opus-64-r1.seconds.txt");
     fs::write(&out_path, out_str).unwrap();
@@ -3160,7 +3274,10 @@ fn encoder_library_gate_vs_libopus() {
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
         ("sadie", "~/Music/sadie.wav"),
         ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
-        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+        (
+            "hein",
+            "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3",
+        ),
     ];
     let only: Vec<String> = std::env::var("SWEEP_ONLY")
         .unwrap_or_default()
@@ -3198,7 +3315,9 @@ fn encoder_library_gate_vs_libopus() {
         for &kbps in &[64u32, 96u32] {
             // Reference: ffmpeg libopus, VBR on, realised rate from file size.
             ffmpeg_encode_libopus(src, kbps, &scratch, SECS);
-            let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+            let ref_bytes = fs::metadata(&scratch)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0);
             let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
             let (ref_dec, ref_ch) = decode_ogg(&scratch);
             assert_eq!(ref_ch, CHANNELS, "{tag}@{kbps}: ref not stereo");
@@ -3206,8 +3325,7 @@ fn encoder_library_gate_vs_libopus() {
 
             // Ours: ec-opus encoder at the reference's realised rate, decoded
             // by our own decoder; payload bytes give the realised rate.
-            let mut enc =
-                Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
+            let mut enc = Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
             enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
             enc.set_vbr_constrained(true);
             let (ours_dec, ours_bytes) = roundtrip_own(&mut enc, &source_pcm, CHANNELS, FRAME);
@@ -3233,7 +3351,11 @@ fn encoder_library_gate_vs_libopus() {
             let q_ref = opus_compare(&s_i, &r_i, CHANNELS);
             let err_ours = opus_compare_err(&s_i, &o_i, CHANNELS);
             let err_ref = opus_compare_err(&s_i, &r_i, CHANNELS);
-            let err_ratio = if err_ref > 0.0 { err_ours / err_ref } else { f64::INFINITY };
+            let err_ratio = if err_ref > 0.0 {
+                err_ours / err_ref
+            } else {
+                f64::INFINITY
+            };
 
             let corr_ours = corr_interleaved(&source_pcm, &ours_aligned, CHANNELS);
             let corr_ref = corr_interleaved(&source_pcm, &ref_aligned, CHANNELS);
@@ -3271,8 +3393,10 @@ fn encoder_library_gate_vs_libopus() {
     let mut table = String::new();
     table.push_str("# ec-opus encoder vs ffmpeg libopus — encoders-only gate (r1)\n");
     table.push_str("# both bitstreams decoded by ec-opus; 120s cap; VBR; 48kHz stereo\n");
-    table.push_str("# source\tkbps\tours_kbps\tref_kbps\trate%\tcorr_ours\tcorr_ref\tgap\t\
-                    Q_ours\tQ_ref\terr_ratio\tminsec_ours\tminsec_ref\tdrop_ours\tdrop_ref\n");
+    table.push_str(
+        "# source\tkbps\tours_kbps\tref_kbps\trate%\tcorr_ours\tcorr_ref\tgap\t\
+                    Q_ours\tQ_ref\terr_ratio\tminsec_ours\tminsec_ref\tdrop_ours\tdrop_ref\n",
+    );
     for r in &rows {
         table.push_str(r);
         table.push('\n');
@@ -3335,8 +3459,18 @@ fn ffmpeg_decode_pcm_mono(path: &Path, secs: f64) -> Vec<f32> {
         .args(["-v", "error", "-i"])
         .arg(path)
         .args([
-            "-vn", "-t", &format!("{secs}"), "-ac", "1", "-ar", "48000", "-f", "f32le",
-            "-acodec", "pcm_f32le", "-",
+            "-vn",
+            "-t",
+            &format!("{secs}"),
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
         ])
         .output()
         .expect("ffmpeg runs");
@@ -3359,8 +3493,21 @@ fn ffmpeg_encode_libopus_mono_voip(src: &Path, kbps: u32, out: &Path, secs: f64)
         .args(["-y", "-v", "error", "-i"])
         .arg(src)
         .args([
-            "-vn", "-t", &format!("{secs}"), "-ac", "1", "-ar", "48000", "-c:a", "libopus",
-            "-application", "voip", "-b:a", &format!("{kbps}k"), "-vbr", "on",
+            "-vn",
+            "-t",
+            &format!("{secs}"),
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-c:a",
+            "libopus",
+            "-application",
+            "voip",
+            "-b:a",
+            &format!("{kbps}k"),
+            "-vbr",
+            "on",
         ])
         .arg(out)
         .output()
@@ -3475,7 +3622,9 @@ fn silk_library_gate_vs_libopus() {
 
         // Reference: ffmpeg libopus, mono, voip, VBR; realised rate from size.
         ffmpeg_encode_libopus_mono_voip(&src, kbps, &ref_ogg, SECS);
-        let ref_bytes = fs::metadata(&ref_ogg).map(|m| m.len() as usize).unwrap_or(0);
+        let ref_bytes = fs::metadata(&ref_ogg)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
         // SYMMETRY: ref decoded through ffmpeg libopus (the reference decoder),
         // NOT our own decoder — so both sides cross the same decoder. (r1 used
@@ -3526,17 +3675,24 @@ fn silk_library_gate_vs_libopus() {
             pre_skip,
         );
         let ours_dec = ffmpeg_decode(&ours_ogg, CHANNELS).expect("ffmpeg libopus decode of ours");
-        let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+        let ours_trim: Vec<f32> = ours_dec
+            .into_iter()
+            .take(source_frames * CHANNELS)
+            .collect();
         let (lag_ours, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
 
         // Own-decoder aligned (extra column: decoder drift visibility).
-        let ours_own_trim: Vec<f32> =
-            ours_own_dec.into_iter().take(source_frames * CHANNELS).collect();
+        let ours_own_trim: Vec<f32> = ours_own_dec
+            .into_iter()
+            .take(source_frames * CHANNELS)
+            .collect();
         let (_, ours_own_aligned) = align_to_source(&source_pcm, &ours_own_trim, CHANNELS, MAX_LAG);
 
         // LAG GATE: a lag at the scan bound is an invalid measurement, not a result.
         if (lag_ours as i64).abs() >= MAX_LAG as i64 {
-            lag_violations.push(format!("{tag}: ours lag {lag_ours} hit scan bound {MAX_LAG}"));
+            lag_violations.push(format!(
+                "{tag}: ours lag {lag_ours} hit scan bound {MAX_LAG}"
+            ));
         }
         if (lag_ref as i64).abs() >= MAX_LAG as i64 {
             lag_violations.push(format!("{tag}: ref lag {lag_ref} hit scan bound {MAX_LAG}"));
@@ -3555,7 +3711,11 @@ fn silk_library_gate_vs_libopus() {
         let q_ref = opus_compare(&s_i, &r_i, CHANNELS);
         let err_ours = opus_compare_err(&s_i, &o_i, CHANNELS);
         let err_ref = opus_compare_err(&s_i, &r_i, CHANNELS);
-        let err_ratio = if err_ref > 0.0 { err_ours / err_ref } else { f64::INFINITY };
+        let err_ratio = if err_ref > 0.0 {
+            err_ours / err_ref
+        } else {
+            f64::INFINITY
+        };
 
         // Primary corr: band-limited reference. Secondary: full-band source.
         let corr_ours_bl = corr_interleaved(&ref_source, &ours_aligned, CHANNELS);
@@ -3672,7 +3832,9 @@ fn silk_silkq_persecond_diag() {
 
     // Reference: ffmpeg libopus mono voip VBR at 12k; realised rate from size.
     ffmpeg_encode_libopus_mono_voip(&src, KBPS, &ref_ogg, SECS);
-    let ref_bytes = fs::metadata(&ref_ogg).map(|m| m.len() as usize).unwrap_or(0);
+    let ref_bytes = fs::metadata(&ref_ogg)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
     let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
     let ref_dec = ffmpeg_decode(&ref_ogg, CHANNELS).expect("ffmpeg libopus decode of ref");
     let ref_trim: Vec<f32> = ref_dec.into_iter().take(source_frames * CHANNELS).collect();
@@ -3711,11 +3873,16 @@ fn silk_silkq_persecond_diag() {
         let len = enc.encode_float(block, FRAME, &mut out).expect("encode");
         let d = enc.last_silk_diag().cloned();
         ours_bytes.push(len);
-        if let Some(d) = d { diags.push(d); }
+        if let Some(d) = d {
+            diags.push(d);
+        }
         let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
         ours_dec.extend_from_slice(&buf[..n * CHANNELS]);
     }
-    let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+    let ours_trim: Vec<f32> = ours_dec
+        .into_iter()
+        .take(source_frames * CHANNELS)
+        .collect();
     let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
 
     // Per-second correlation ours vs ref against the full-band source (matches
@@ -3736,11 +3903,23 @@ fn silk_silkq_persecond_diag() {
             let s = source_pcm[start + i] as f64;
             let o = ours_aligned[start + i] as f64;
             let r = ref_aligned[start + i] as f64;
-            sxy_o += s * o; sxx_o += s * s; syy_o += o * o;
-            sxy_r += s * r; sxx_r += s * s; syy_r += r * r;
+            sxy_o += s * o;
+            sxx_o += s * s;
+            syy_o += o * o;
+            sxy_r += s * r;
+            sxx_r += s * s;
+            syy_r += r * r;
         }
-        let co = if sxx_o > 0.0 && syy_o > 0.0 { sxy_o / (sxx_o * syy_o).sqrt() } else { 0.0 };
-        let cr = if sxx_r > 0.0 && syy_r > 0.0 { sxy_r / (sxx_r * syy_r).sqrt() } else { 0.0 };
+        let co = if sxx_o > 0.0 && syy_o > 0.0 {
+            sxy_o / (sxx_o * syy_o).sqrt()
+        } else {
+            0.0
+        };
+        let cr = if sxx_r > 0.0 && syy_r > 0.0 {
+            sxy_r / (sxx_r * syy_r).sqrt()
+        } else {
+            0.0
+        };
         sec_rows.push((sec_idx, co, cr, cr - co));
         start += sec_samples;
         sec_idx += 1;
@@ -3752,13 +3931,20 @@ fn silk_silkq_persecond_diag() {
     let mut out_str = String::new();
     out_str.push_str("# sadie@12k SILK per-second diagnostic (r1)\n");
     out_str.push_str("# mono, 120s cap, 20ms frames, VBR constrained, 48kHz, Application::Voip\n");
-    out_str.push_str(&format!("# total frames: ours={} ref={}\n", diags.len(), ref_payload.len()));
+    out_str.push_str(&format!(
+        "# total frames: ours={} ref={}\n",
+        diags.len(),
+        ref_payload.len()
+    ));
     let avg_o: f64 = sec_rows.iter().map(|r| r.1).sum::<f64>() / sec_rows.len().max(1) as f64;
     let avg_r: f64 = sec_rows.iter().map(|r| r.2).sum::<f64>() / sec_rows.len().max(1) as f64;
     let gap_avg = avg_r - avg_o;
     out_str.push_str(&format!(
         "# avg corr: ours={:.4} ref={:.4} gap={:+.4}  ref_kbps={:.1} ours_kbps={:.1}\n\n",
-        avg_o, avg_r, gap_avg, ref_kbps,
+        avg_o,
+        avg_r,
+        gap_avg,
+        ref_kbps,
         ours_bytes.iter().map(|&b| b as f64).sum::<f64>() * 8.0 / seconds / 1000.0
     ));
 
@@ -3770,27 +3956,45 @@ fn silk_silkq_persecond_diag() {
         let sd = &diags[f0..f1.min(diags.len())];
         let gain_mean: f64 = if !sd.is_empty() {
             sd.iter().map(|d| d.gain_idx[0] as f64).sum::<f64>() / sd.len() as f64
-        } else { -1.0 };
+        } else {
+            -1.0
+        };
         let voiced_n = sd.iter().filter(|d| d.voiced).count();
         let nlsf_int = if !sd.is_empty() {
             sd.iter().map(|d| d.nlsf_interp).max().unwrap_or(0)
-        } else { 0 };
+        } else {
+            0
+        };
         let avg_b_o: f64 = if !sd.is_empty() {
             sd.iter().map(|d| d.bytes as f64).sum::<f64>() / sd.len() as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let ref_f0 = f0.min(ref_payload.len());
         let ref_f1 = f1.min(ref_payload.len());
         let avg_b_r: f64 = if ref_f1 > ref_f0 {
-            ref_payload[ref_f0..ref_f1].iter().map(|&b| b as f64).sum::<f64>()
+            ref_payload[ref_f0..ref_f1]
+                .iter()
+                .map(|&b| b as f64)
+                .sum::<f64>()
                 / (ref_f1 - ref_f0) as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let ltp_mean: f64 = if !sd.is_empty() {
             sd.iter().map(|d| d.ltp_gain as f64).sum::<f64>() / sd.len() as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let pitch_mean: f64 = if !sd.is_empty() {
-            sd.iter().filter(|d| d.voiced).map(|d| d.pitch_l[0] as f64).sum::<f64>()
+            sd.iter()
+                .filter(|d| d.voiced)
+                .map(|d| d.pitch_l[0] as f64)
+                .sum::<f64>()
                 / sd.iter().filter(|d| d.voiced).count().max(1) as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         out_str.push_str(&format!(
             "{}\t{:.4}\t{:.4}\t{:+.4}\t{:.1}\t{}\t{}\t{:.1}\t{:.1}\t{:.3}\t{:.1}\n",
             s, co, cr, g, gain_mean, voiced_n, nlsf_int, avg_b_o, avg_b_r, ltp_mean, pitch_mean
@@ -3809,9 +4013,18 @@ fn silk_silkq_persecond_diag() {
             let b_ref = ref_payload.get(fi).copied().unwrap_or(0);
             out_str.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\n",
-                fi, fi * 20, d.bytes, b_ref,
-                d.voiced as u8, d.signal_type, d.gain_idx[0], d.lag_index,
-                d.pitch_l[0], d.nlsf_interp, d.ltp_gain, d.nb_subfr
+                fi,
+                fi * 20,
+                d.bytes,
+                b_ref,
+                d.voiced as u8,
+                d.signal_type,
+                d.gain_idx[0],
+                d.lag_index,
+                d.pitch_l[0],
+                d.nlsf_interp,
+                d.ltp_gain,
+                d.nb_subfr
             ));
         }
         out_str.push('\n');
@@ -3820,10 +4033,16 @@ fn silk_silkq_persecond_diag() {
     // Global stats.
     out_str.push_str("# --- global stats ---\n");
     let voiced_count = diags.iter().filter(|d| d.voiced).count();
-    out_str.push_str(&format!("# voiced frames: {}/{}\n", voiced_count, diags.len()));
+    out_str.push_str(&format!(
+        "# voiced frames: {}/{}\n",
+        voiced_count,
+        diags.len()
+    ));
     let gain_hist: Vec<(i8, usize)> = {
         let mut h = std::collections::HashMap::new();
-        for d in &diags { *h.entry(d.gain_idx[0]).or_insert(0) += 1; }
+        for d in &diags {
+            *h.entry(d.gain_idx[0]).or_insert(0) += 1;
+        }
         let mut v: Vec<_> = h.into_iter().collect();
         v.sort();
         v
@@ -3831,16 +4050,24 @@ fn silk_silkq_persecond_diag() {
     out_str.push_str(&format!("# gain_idx[0] histogram: {:?}\n", gain_hist));
     let nlsf_hist: Vec<(i32, usize)> = {
         let mut h = std::collections::HashMap::new();
-        for d in &diags { *h.entry(d.nlsf_interp).or_insert(0) += 1; }
+        for d in &diags {
+            *h.entry(d.nlsf_interp).or_insert(0) += 1;
+        }
         let mut v: Vec<_> = h.into_iter().collect();
         v.sort();
         v
     };
     out_str.push_str(&format!("# nlsf_interp histogram: {:?}\n", nlsf_hist));
-    let avg_b_ours: f64 = diags.iter().map(|d| d.bytes as f64).sum::<f64>() / diags.len().max(1) as f64;
-    let avg_b_ref: f64 = ref_payload.iter().map(|&b| b as f64).sum::<f64>() / ref_payload.len().max(1) as f64;
-    out_str.push_str(&format!("# avg bytes/frame: ours={:.1} ref={:.1}\n", avg_b_ours, avg_b_ref));
-    let ltp_mean_all: f64 = diags.iter().map(|d| d.ltp_gain as f64).sum::<f64>() / diags.len().max(1) as f64;
+    let avg_b_ours: f64 =
+        diags.iter().map(|d| d.bytes as f64).sum::<f64>() / diags.len().max(1) as f64;
+    let avg_b_ref: f64 =
+        ref_payload.iter().map(|&b| b as f64).sum::<f64>() / ref_payload.len().max(1) as f64;
+    out_str.push_str(&format!(
+        "# avg bytes/frame: ours={:.1} ref={:.1}\n",
+        avg_b_ours, avg_b_ref
+    ));
+    let ltp_mean_all: f64 =
+        diags.iter().map(|d| d.ltp_gain as f64).sum::<f64>() / diags.len().max(1) as f64;
     out_str.push_str(&format!("# mean ltp_gain: {:.4}\n", ltp_mean_all));
 
     let out_path = lanes_dir.join("opus-silkq-r1.seconds.txt");
@@ -3902,25 +4129,37 @@ fn silk_silkq_oracle() {
         ours_packets.push(out[..len].to_vec());
     }
 
-
     let ours_ix = collect_indices(&ours_packets);
     let ref_ix = collect_indices(&ref_packets);
 
-    eprintln!("ours frames: {}  ref frames: {}", ours_ix.len(), ref_ix.len());
+    eprintln!(
+        "ours frames: {}  ref frames: {}",
+        ours_ix.len(),
+        ref_ix.len()
+    );
 
     // Print side-by-side for target seconds (50 frames/sec at 20ms).
     let frames_per_sec = 50usize;
     let mut out_str = String::new();
     out_str.push_str("# sadie@12k SILK oracle: ours vs ffmpeg-libopus indices (r1)\n");
     out_str.push_str("# mono, 120s, 20ms frames, VBR constrained, 48kHz, Application::Voip\n");
-    out_str.push_str(&format!("# ours_frames={} ref_frames={}\n", ours_ix.len(), ref_ix.len()));
+    out_str.push_str(&format!(
+        "# ours_frames={} ref_frames={}\n",
+        ours_ix.len(),
+        ref_ix.len()
+    ));
     out_str.push_str("# sig: 0=unvoiced 2=voiced | per: LTP codebook | nlsf_i: 4=nointerp\n");
     out_str.push_str("# gains/ltp are 4 subframe indices; lag/contour only for voiced\n\n");
 
     for &sec in TARGET_SECS {
         let start = sec * frames_per_sec;
         let end = start + frames_per_sec;
-        out_str.push_str(&format!("=== second {} (frames {}–{}) ===\n", sec, start, end - 1));
+        out_str.push_str(&format!(
+            "=== second {} (frames {}–{}) ===\n",
+            sec,
+            start,
+            end - 1
+        ));
         out_str.push_str("frame  side sig qoff gains[4]        nlsf_i lag  cont per ltp[4]         ltpscl seed bytes\n");
         for f in start..end {
             let ours = ours_ix.get(f);
@@ -3948,7 +4187,10 @@ fn silk_silkq_oracle() {
                             "-".to_string()
                         };
                         let ltp_str = if voiced {
-                            format!("[{},{},{},{}]", ix.ltp_index[0], ix.ltp_index[1], ix.ltp_index[2], ix.ltp_index[3])
+                            format!(
+                                "[{},{},{},{}]",
+                                ix.ltp_index[0], ix.ltp_index[1], ix.ltp_index[2], ix.ltp_index[3]
+                            )
                         } else {
                             "[-,-,-,-]".to_string()
                         };
@@ -3990,14 +4232,26 @@ fn silk_silkq_oracle() {
     for i in 0..n {
         let (o, ob) = &ours_ix[i];
         let (r, rb) = &ref_ix[i];
-        if o.signal_type != r.signal_type { sig_mismatch += 1; }
-        if o.quant_offset_type != r.quant_offset_type { qoff_mismatch += 1; }
-        for k in 0..4 { gain_diff_sum += (o.gains[k] as i64 - r.gains[k] as i64).abs(); }
-        if o.nlsf_interp_coef_q2 != r.nlsf_interp_coef_q2 { nlsf_interp_diff += 1; }
+        if o.signal_type != r.signal_type {
+            sig_mismatch += 1;
+        }
+        if o.quant_offset_type != r.quant_offset_type {
+            qoff_mismatch += 1;
+        }
+        for k in 0..4 {
+            gain_diff_sum += (o.gains[k] as i64 - r.gains[k] as i64).abs();
+        }
+        if o.nlsf_interp_coef_q2 != r.nlsf_interp_coef_q2 {
+            nlsf_interp_diff += 1;
+        }
         if o.signal_type == 2 && r.signal_type == 2 {
             voiced_both += 1;
-            if o.per_index != r.per_index { ltp_per_mismatch += 1; }
-            for k in 0..4 { ltp_idx_diff_sum += (o.ltp_index[k] as i64 - r.ltp_index[k] as i64).abs(); }
+            if o.per_index != r.per_index {
+                ltp_per_mismatch += 1;
+            }
+            for k in 0..4 {
+                ltp_idx_diff_sum += (o.ltp_index[k] as i64 - r.ltp_index[k] as i64).abs();
+            }
             lag_diff_sum += (o.lag_index as i64 - r.lag_index as i64).abs();
         }
         bytes_ours += *ob as u64;
@@ -4005,15 +4259,45 @@ fn silk_silkq_oracle() {
     }
     out_str.push_str("=== divergence summary (all frames) ===\n");
     out_str.push_str(&format!("frames compared: {}\n", n));
-    out_str.push_str(&format!("signal_type mismatch: {} ({:.1}%)\n", sig_mismatch, 100.0 * sig_mismatch as f64 / n as f64));
-    out_str.push_str(&format!("quant_offset mismatch: {} ({:.1}%)\n", qoff_mismatch, 100.0 * qoff_mismatch as f64 / n as f64));
-    out_str.push_str(&format!("avg |gain diff| per subframe: {:.2}\n", gain_diff_sum as f64 / (n as f64 * 4.0)));
-    out_str.push_str(&format!("nlsf_interp mismatch: {} ({:.1}%)\n", nlsf_interp_diff, 100.0 * nlsf_interp_diff as f64 / n as f64));
+    out_str.push_str(&format!(
+        "signal_type mismatch: {} ({:.1}%)\n",
+        sig_mismatch,
+        100.0 * sig_mismatch as f64 / n as f64
+    ));
+    out_str.push_str(&format!(
+        "quant_offset mismatch: {} ({:.1}%)\n",
+        qoff_mismatch,
+        100.0 * qoff_mismatch as f64 / n as f64
+    ));
+    out_str.push_str(&format!(
+        "avg |gain diff| per subframe: {:.2}\n",
+        gain_diff_sum as f64 / (n as f64 * 4.0)
+    ));
+    out_str.push_str(&format!(
+        "nlsf_interp mismatch: {} ({:.1}%)\n",
+        nlsf_interp_diff,
+        100.0 * nlsf_interp_diff as f64 / n as f64
+    ));
     out_str.push_str(&format!("voiced_both: {}\n", voiced_both));
-    out_str.push_str(&format!("  LTP per_index mismatch: {} ({:.1}%)\n", ltp_per_mismatch, 100.0 * ltp_per_mismatch as f64 / voiced_both.max(1) as f64));
-    out_str.push_str(&format!("  avg |ltp_index diff| per subframe: {:.2}\n", ltp_idx_diff_sum as f64 / (voiced_both.max(1) as f64 * 4.0)));
-    out_str.push_str(&format!("  avg |lag diff|: {:.2}\n", lag_diff_sum as f64 / voiced_both.max(1) as f64));
-    out_str.push_str(&format!("total bytes: ours={} ref={} ratio={:.3}\n", bytes_ours, bytes_ref, bytes_ours as f64 / bytes_ref.max(1) as f64));
+    out_str.push_str(&format!(
+        "  LTP per_index mismatch: {} ({:.1}%)\n",
+        ltp_per_mismatch,
+        100.0 * ltp_per_mismatch as f64 / voiced_both.max(1) as f64
+    ));
+    out_str.push_str(&format!(
+        "  avg |ltp_index diff| per subframe: {:.2}\n",
+        ltp_idx_diff_sum as f64 / (voiced_both.max(1) as f64 * 4.0)
+    ));
+    out_str.push_str(&format!(
+        "  avg |lag diff|: {:.2}\n",
+        lag_diff_sum as f64 / voiced_both.max(1) as f64
+    ));
+    out_str.push_str(&format!(
+        "total bytes: ours={} ref={} ratio={:.3}\n",
+        bytes_ours,
+        bytes_ref,
+        bytes_ours as f64 / bytes_ref.max(1) as f64
+    ));
 
     let out_path = lanes_dir.join("opus-silkq-r1.oracle.txt");
     fs::write(&out_path, &out_str).unwrap();
@@ -4059,14 +4343,7 @@ fn collect_indices(packets: &[Vec<u8>]) -> Vec<(ec_opus::SilkDecIndices, usize)>
                 continue;
             }
             let mut dec = ec_opus::RangeDecoder::new(frame_data);
-            let _ = silk.decode(
-                &mut dec,
-                &mut silk_pcm,
-                payload_ms,
-                internal_rate,
-                1,
-                first,
-            );
+            let _ = silk.decode(&mut dec, &mut silk_pcm, payload_ms, internal_rate, 1, first);
             let ix = silk.last_indices();
             let bytes = frame_data.len();
             results.push((ix, bytes));
@@ -4110,7 +4387,9 @@ fn silk_spectral_divergence_12k() {
 
     // Reference: ffmpeg libopus mono voip at 12k, decoded by ffmpeg libopus.
     ffmpeg_encode_libopus_mono_voip(&src, KBPS, &ref_ogg, SECS);
-    let ref_bytes = fs::metadata(&ref_ogg).map(|m| m.len() as usize).unwrap_or(0);
+    let ref_bytes = fs::metadata(&ref_ogg)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
     let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
     let ref_dec = ffmpeg_decode(&ref_ogg, CHANNELS).expect("ffmpeg libopus decode of ref");
     let ref_trim: Vec<f32> = ref_dec.into_iter().take(source_frames * CHANNELS).collect();
@@ -4156,7 +4435,10 @@ fn silk_spectral_divergence_12k() {
     let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
     let ours_dec = ffmpeg_decode(&ours_ogg, CHANNELS).expect("ffmpeg libopus decode of ours");
     let _ = fs::remove_file(&ours_ogg);
-    let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+    let ours_trim: Vec<f32> = ours_dec
+        .into_iter()
+        .take(source_frames * CHANNELS)
+        .collect();
     let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
 
     // opus_compare totals, per-band eb², per-frame ef² — both vs the source.
@@ -4178,9 +4460,27 @@ fn silk_spectral_divergence_12k() {
     let mut bands_o = Vec::new();
     let mut bands_r = Vec::new();
     let mut scratch_ps = Vec::new();
-    band_energy(&as_f64(&s_i), CHANNELS, nframes, &mut Some(&mut bands_s), &mut scratch_ps);
-    band_energy(&as_f64(&o_i), CHANNELS, nframes, &mut Some(&mut bands_o), &mut scratch_ps);
-    band_energy(&as_f64(&r_i), CHANNELS, nframes, &mut Some(&mut bands_r), &mut scratch_ps);
+    band_energy(
+        &as_f64(&s_i),
+        CHANNELS,
+        nframes,
+        &mut Some(&mut bands_s),
+        &mut scratch_ps,
+    );
+    band_energy(
+        &as_f64(&o_i),
+        CHANNELS,
+        nframes,
+        &mut Some(&mut bands_o),
+        &mut scratch_ps,
+    );
+    band_energy(
+        &as_f64(&r_i),
+        CHANNELS,
+        nframes,
+        &mut Some(&mut bands_r),
+        &mut scratch_ps,
+    );
 
     // Oracle indices both sides; FFT frame xi -> 20 ms packet index.
     let ours_ix = collect_indices(&ours_packets);
@@ -4213,7 +4513,11 @@ fn silk_spectral_divergence_12k() {
         }
         dol /= nframes as f64;
         drl /= nframes as f64;
-        let ratio = if eb2_r[bi] > 0.0 { eb2_o[bi] / eb2_r[bi] } else { f64::INFINITY };
+        let ratio = if eb2_r[bi] > 0.0 {
+            eb2_o[bi] / eb2_r[bi]
+        } else {
+            f64::INFINITY
+        };
         report.push_str(&format!(
             "{:5} {:5} {:6} {:+.3} {:+.3} {:.3e} {:.3e} {:>7} {:5.1}% {:5.1}%\n",
             bi,
@@ -4318,7 +4622,10 @@ fn silk_spectral_divergence_12k() {
         "# tail: top-1% ({k} frames) carry {:.2}% of ours' Σef2 vs {:.2}% of ref's; \
          50% of ours' err sits in the worst {half_o} frames ({:.2}%) \
          vs ref's worst {half_r} ({:.2}%)\n",
-        100.0 * sh1_o, 100.0 * sh1_r, 100.0 * halff_o, 100.0 * halff_r
+        100.0 * sh1_o,
+        100.0 * sh1_r,
+        100.0 * halff_o,
+        100.0 * halff_r
     ));
     // De-tailed: drop each side's worst 50 frames (of 24k FFT frames/pkt-mapped).
     let clip50 = |ef2: &[f64]| -> f64 {
@@ -4351,7 +4658,11 @@ fn silk_spectral_divergence_12k() {
         if i >= pkt_ef2.len() {
             break;
         }
-        let mean = if pkt_cnt[i] > 0 { pkt_ef2[i] / pkt_cnt[i] as f64 } else { 0.0 };
+        let mean = if pkt_cnt[i] > 0 {
+            pkt_ef2[i] / pkt_cnt[i] as f64
+        } else {
+            0.0
+        };
         if ix.gains[0] >= 60 {
             g_hi.0 += mean;
             g_hi.1 += 1;
@@ -4373,12 +4684,28 @@ fn silk_spectral_divergence_12k() {
          >20 bytes: mean ef2 {:.3e}\n",
         g_hi.1,
         g_hi.1 + g_lo.1,
-        if g_hi.1 > 0 { g_hi.0 / g_hi.1 as f64 } else { f64::NAN },
-        if g_lo.1 > 0 { g_lo.0 / g_lo.1 as f64 } else { f64::NAN },
+        if g_hi.1 > 0 {
+            g_hi.0 / g_hi.1 as f64
+        } else {
+            f64::NAN
+        },
+        if g_lo.1 > 0 {
+            g_lo.0 / g_lo.1 as f64
+        } else {
+            f64::NAN
+        },
         b_lo.1,
         b_lo.1 + b_hi.1,
-        if b_lo.1 > 0 { b_lo.0 / b_lo.1 as f64 } else { f64::NAN },
-        if b_hi.1 > 0 { b_hi.0 / b_hi.1 as f64 } else { f64::NAN },
+        if b_lo.1 > 0 {
+            b_lo.0 / b_lo.1 as f64
+        } else {
+            f64::NAN
+        },
+        if b_hi.1 > 0 {
+            b_hi.0 / b_hi.1 as f64
+        } else {
+            f64::NAN
+        },
     ));
 
     let out_path = lanes_dir.join("opus-silkq-r2.bands.txt");
@@ -4415,7 +4742,10 @@ fn opus_compare_harness() {
     );
     let err = opus_compare_err(&x, &y, channels);
     let q = opus_compare(&x, &y, channels);
-    println!("HARNESS err={err:.6} Q={q:.4} ch={channels} n={}", x.len() / channels);
+    println!(
+        "HARNESS err={err:.6} Q={q:.4} ch={channels} n={}",
+        x.len() / channels
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4454,10 +4784,12 @@ fn opus_compare_harness_ours() {
     let mut d_i16 = vec![0i16; n * channels];
     for i in 0..n {
         for ch in 0..channels {
-            s_i16[i * channels + ch] =
-                (src_f32[i * channels + ch] * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
-            d_i16[i * channels + ch] =
-                (aligned[i * channels + ch] * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+            s_i16[i * channels + ch] = (src_f32[i * channels + ch] * 32768.0)
+                .round()
+                .clamp(-32768.0, 32767.0) as i16;
+            d_i16[i * channels + ch] = (aligned[i * channels + ch] * 32768.0)
+                .round()
+                .clamp(-32768.0, 32767.0) as i16;
         }
     }
     fs::write(&out_src, bytemap(&s_i16)).unwrap();
@@ -4465,9 +4797,7 @@ fn opus_compare_harness_ours() {
     let err = opus_compare_err(&s_i16, &d_i16, channels);
     let q = opus_compare(&s_i16, &d_i16, channels);
     let c = corr_interleaved(&src_f32[..n * channels], &aligned, channels);
-    println!(
-        "HARNESS_OURS lag={lag} corr={c:.4} err={err:.6} Q={q:.4} kbps={kbps} n={n}"
-    );
+    println!("HARNESS_OURS lag={lag} corr={c:.4} err={err:.6} Q={q:.4} kbps={kbps} n={n}");
 }
 
 fn bytemap(p: &[i16]) -> Vec<u8> {
@@ -4533,7 +4863,8 @@ fn opus_compare_err_pinned_against_c() {
 
     // Case 2: mild perturbation (+0.5 dB on L, quiet 1500 Hz partial on L).
     let gain = 10f64.powf(0.5 / 10.0);
-    let lp: Vec<f64> = t.iter()
+    let lp: Vec<f64> = t
+        .iter()
         .zip(b0.iter())
         .map(|(&tt, &bv)| bv * gain + 0.02 * (2.0 * std::f64::consts::PI * 1500.0 * tt).sin())
         .collect();
@@ -4575,7 +4906,10 @@ fn spectral_divergence_vs_libopus() {
     const FRAME: usize = 960;
     const CHANNELS: usize = 2;
     const MAX_LAG: usize = 2000;
-    let kbps_env: u32 = std::env::var("SWEEP_KBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+    let kbps_env: u32 = std::env::var("SWEEP_KBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(96);
     #[allow(non_snake_case)]
     let KBPS: u32 = kbps_env;
 
@@ -4586,7 +4920,10 @@ fn spectral_divergence_vs_libopus() {
         ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
         ("her", "~/Music/Her Nerdeysen.mp3"),
         ("sadie", "~/Music/sadie.wav"),
-        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+        (
+            "hein",
+            "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3",
+        ),
     ];
     let only: Vec<String> = std::env::var("SWEEP_ONLY")
         .unwrap_or_else(|_| "naz,dl8a".to_owned())
@@ -4622,13 +4959,15 @@ fn spectral_divergence_vs_libopus() {
 
         // Reference: ffmpeg libopus at 96k, VBR, decoded by our decoder.
         ffmpeg_encode_libopus(src, KBPS, &scratch, SECS);
-        let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+        let ref_bytes = fs::metadata(&scratch)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
         let ref_pkts: Vec<Vec<u8>> = ogg_packets(&fs::read(&scratch).unwrap())
             .into_iter()
             .skip(2)
             .collect();
-         let (ref_dec, ref_ch) = decode_ogg(&scratch);
+        let (ref_dec, ref_ch) = decode_ogg(&scratch);
         assert_eq!(ref_ch, CHANNELS, "{tag}: ref not stereo");
         let (_, ref_aligned) = align_to_source(&source_pcm, &ref_dec, CHANNELS, MAX_LAG);
 
@@ -4641,16 +4980,18 @@ fn spectral_divergence_vs_libopus() {
         let mut dbuf = vec![0.0f32; 5760 * CHANNELS];
         let mut ours_dec = Vec::new();
         let mut first_pkts: Vec<Vec<u8>> = Vec::new();
-         let mut diags = Vec::new();
+        let mut diags = Vec::new();
         let mut ours_bytes = 0usize;
         for block in source_pcm.chunks(FRAME * CHANNELS) {
             let mut padded = block.to_vec();
             padded.resize(FRAME * CHANNELS, 0.0);
-            let len = enc.encode_float(&padded, FRAME, &mut packet).expect("encode");
+            let len = enc
+                .encode_float(&padded, FRAME, &mut packet)
+                .expect("encode");
             if first_pkts.len() < 10 {
                 first_pkts.push(packet[..len].to_vec());
             }
-             ours_bytes += len;
+            ours_bytes += len;
             let n = dec.decode_float(&packet[..len], &mut dbuf).expect("decode");
             ours_dec.extend_from_slice(&dbuf[..n * CHANNELS]);
             diags.push(enc.last_celt_diag().clone());
@@ -4674,7 +5015,10 @@ fn spectral_divergence_vs_libopus() {
             "{tag}@{KBPS}k transient frames: ours {ours_tr}/{} ref {ref_tr}/{ref_n}",
             diags.len()
         );
-        let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+        let ours_trim: Vec<f32> = ours_dec
+            .into_iter()
+            .take(source_frames * CHANNELS)
+            .collect();
         let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
         let ours_i16 = to_i16(&ours_aligned);
         let ref_i16 = to_i16(&ref_aligned);
@@ -4700,9 +5044,27 @@ fn spectral_divergence_vs_libopus() {
         let mut bands_o = Vec::new();
         let mut bands_r = Vec::new();
         let mut scratch_ps = Vec::new();
-        band_energy(&as_f64(&s_i), CHANNELS, nframes, &mut Some(&mut bands_s), &mut scratch_ps);
-        band_energy(&as_f64(&o_i), CHANNELS, nframes, &mut Some(&mut bands_o), &mut scratch_ps);
-        band_energy(&as_f64(&r_i), CHANNELS, nframes, &mut Some(&mut bands_r), &mut scratch_ps);
+        band_energy(
+            &as_f64(&s_i),
+            CHANNELS,
+            nframes,
+            &mut Some(&mut bands_s),
+            &mut scratch_ps,
+        );
+        band_energy(
+            &as_f64(&o_i),
+            CHANNELS,
+            nframes,
+            &mut Some(&mut bands_o),
+            &mut scratch_ps,
+        );
+        band_energy(
+            &as_f64(&r_i),
+            CHANNELS,
+            nframes,
+            &mut Some(&mut bands_r),
+            &mut scratch_ps,
+        );
 
         report.push_str(&format!(
             "\n# source {tag} @{KBPS}k: ours {ours_kbps:.1} kbps, ref {ref_kbps:.1} kbps; \
@@ -4800,11 +5162,9 @@ fn spectral_divergence_vs_libopus() {
             let dual = fr.iter().filter(|d| d.dual_stereo).count();
             let intra = fr.iter().filter(|d| d.intra).count();
             let cbb_min = fr.iter().map(|d| d.coded_bands).min().unwrap_or(0);
-            let cbb_mean =
-                fr.iter().map(|d| d.coded_bands).sum::<usize>() as f64 / dn as f64;
+            let cbb_mean = fr.iter().map(|d| d.coded_bands).sum::<usize>() as f64 / dn as f64;
             let int_mean = fr.iter().map(|d| d.intensity).sum::<usize>() as f64 / dn as f64;
-            let bits =
-                fr.iter().map(|d| d.nb_compressed).sum::<usize>() as f64 * 8.0 / dn as f64;
+            let bits = fr.iter().map(|d| d.nb_compressed).sum::<usize>() as f64 * 8.0 / dn as f64;
             report.push_str(&format!(
                 "{}\t{:.3e}\t{}/{}\t{}\t{}\t{}\t{}/{}\t{}/{}\t{:.0}\n",
                 s,
@@ -4829,8 +5189,7 @@ fn spectral_divergence_vs_libopus() {
             let dual = diags.iter().filter(|d| d.dual_stereo).count();
             let intra = diags.iter().filter(|d| d.intra).count();
             let cbb_min = diags.iter().map(|d| d.coded_bands).min().unwrap_or(0);
-            let cbb_mean =
-                diags.iter().map(|d| d.coded_bands).sum::<usize>() as f64 / dn as f64;
+            let cbb_mean = diags.iter().map(|d| d.coded_bands).sum::<usize>() as f64 / dn as f64;
             let int_mean = diags.iter().map(|d| d.intensity).sum::<usize>() as f64 / dn as f64;
             let bits =
                 diags.iter().map(|d| d.nb_compressed).sum::<usize>() as f64 * 8.0 / dn as f64;
@@ -4854,9 +5213,14 @@ fn spectral_divergence_vs_libopus() {
         // frame each window lands in.
         let mut byf: Vec<(usize, f64)> = ef2_o.iter().cloned().enumerate().collect();
         byf.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        report.push_str("# top-8 metric windows by ours ef²: offset_ms ours ref | enc frame diag\n");
+        report
+            .push_str("# top-8 metric windows by ours ef²: offset_ms ours ref | enc frame diag\n");
         for &(xi, v) in &byf[..byf.len().min(8)] {
-            let rv = if xi < ef2_r.len() { ef2_r[xi] } else { f64::NAN };
+            let rv = if xi < ef2_r.len() {
+                ef2_r[xi]
+            } else {
+                f64::NAN
+            };
             let ms = xi * WIN_STEP * 1000 / 48000;
             let eidx = xi * WIN_STEP / FRAME;
             let d = diags.get(eidx);
@@ -4882,9 +5246,8 @@ fn spectral_divergence_vs_libopus() {
         }
 
         // Startup behavior: first 10 encoder frames.
-        report.push_str(
-            "# first encoder frames: idx trans intra silence cbb_hz int_hz dual bytes\n",
-        );
+        report
+            .push_str("# first encoder frames: idx trans intra silence cbb_hz int_hz dual bytes\n");
         for (i, d) in diags.iter().take(10).enumerate() {
             report.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -4901,11 +5264,12 @@ fn spectral_divergence_vs_libopus() {
 
         // Per-window per-band ln-energies for the metric windows 12..=20
         // (+120..+200 ms): the leak's shape, band by band.
-        report.push_str(
-            "# windows 12..=20: win +ms band lo-hi | lnE src/ours/ref, ch L then R\n",
-        );
+        report.push_str("# windows 12..=20: win +ms band lo-hi | lnE src/ours/ref, ch L then R\n");
         // WIN_CENTRE=<window index> recentres the dump on another window.
-        let wc: usize = std::env::var("WIN_CENTRE").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let wc: usize = std::env::var("WIN_CENTRE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
         for xi in wc.saturating_sub(4)..=wc + 4 {
             if xi >= nframes {
                 break;
@@ -4951,7 +5315,8 @@ fn spectral_divergence_vs_libopus() {
                     g.total_bits,
                 ));
                 for (ch, name) in [(0usize, 'L'), (1usize, 'R')] {
-                    let band = &g.old_band_e[ch * ec_opus::celt::NB_BANDS..(ch + 1) * ec_opus::celt::NB_BANDS];
+                    let band = &g.old_band_e
+                        [ch * ec_opus::celt::NB_BANDS..(ch + 1) * ec_opus::celt::NB_BANDS];
                     let e: Vec<String> = band.iter().map(|v| format!("{v:+6.1}")).collect();
                     frames_all.push_str(&format!("  {name} {}\n", e.join(" ")));
                 }
@@ -5021,8 +5386,12 @@ fn celt_silence_then_attack_decodes_bounded() {
 fn naz_startup_hop_energies() {
     const CH: usize = 2;
     // HOP_SRC / HOP_MS pick another source and window centre (diagnostic).
-    let src_s = std::env::var("HOP_SRC").unwrap_or_else(|_| "~/Music/naz_aglama_ben_aglarim.mp4".into());
-    let centre_ms: f64 = std::env::var("HOP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(42.5);
+    let src_s =
+        std::env::var("HOP_SRC").unwrap_or_else(|_| "~/Music/naz_aglama_ben_aglarim.mp4".into());
+    let centre_ms: f64 = std::env::var("HOP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(42.5);
     let src = shellexpand(&src_s);
     if !src.exists() {
         return;
@@ -5030,7 +5399,10 @@ fn naz_startup_hop_energies() {
     let secs = (centre_ms / 1000.0 + 1.0).max(2.0);
     let pcm = ffmpeg_decode_pcm(&src, secs);
     let scratch = std::env::temp_dir().join("ec-opus-naz-startup.opus");
-    let kbps: u32 = std::env::var("HOP_KBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+    let kbps: u32 = std::env::var("HOP_KBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(96);
     ffmpeg_encode_libopus(&src, kbps, &scratch, secs);
     let (ref_dec, _) = decode_ogg(&scratch);
     let (lag_r, ref_al) = align_to_source(&pcm, &ref_dec, CH, 2000);
@@ -5048,11 +5420,22 @@ fn naz_startup_hop_energies() {
         ours_dec.extend_from_slice(&buf[..m * CH]);
         let e = enc.last_celt_diag().clone();
         let d = dec.last_celt_diag().clone();
-        frames_diag.push((n, e.is_transient, e.intra, d.tf_res.clone(), d.anti_collapse));
+        frames_diag.push((
+            n,
+            e.is_transient,
+            e.intra,
+            d.tf_res.clone(),
+            d.anti_collapse,
+        ));
     }
     let (lag_o, ours_al) = align_to_source(&pcm, &ours_dec, CH, 2000);
     let first = |v: &[f32]| v.iter().position(|x| x.abs() > 1e-4).map(|i| i / CH);
-    println!("lag ref {lag_r} ours {lag_o}; first>1e-4: src {:?} ours {:?} ref {:?}", first(&pcm), first(&ours_al), first(&ref_al));
+    println!(
+        "lag ref {lag_r} ours {lag_o}; first>1e-4: src {:?} ours {:?} ref {:?}",
+        first(&pcm),
+        first(&ours_al),
+        first(&ref_al)
+    );
     let e = |v: &[f32], h: usize| -> f64 {
         let a = (h * 120 * CH).min(v.len());
         let b = ((h + 1) * 120 * CH).min(v.len());
@@ -5061,12 +5444,21 @@ fn naz_startup_hop_energies() {
     let hc = (centre_ms / 2.5) as usize;
     for f in (hc / 8).saturating_sub(1)..=(hc / 8 + 1) {
         if let Some((n, t, i, tf, ac)) = frames_diag.get(f) {
-            println!("frame {f} ({:.1} ms): bytes {n} trans {t} intra {i} ac {ac} tf {tf:?}", f as f64 * 20.0);
+            println!(
+                "frame {f} ({:.1} ms): bytes {n} trans {t} intra {i} ac {ac} tf {tf:?}",
+                f as f64 * 20.0
+            );
         }
     }
     println!("hop(ms)\tsrc\tours\tref");
     for h in hc.saturating_sub(8)..hc + 8 {
-        println!("{:.1}\t{:.3e}\t{:.3e}\t{:.3e}", h as f64 * 2.5, e(&pcm, h), e(&ours_al, h), e(&ref_al, h));
+        println!(
+            "{:.1}\t{:.3e}\t{:.3e}\t{:.3e}",
+            h as f64 * 2.5,
+            e(&pcm, h),
+            e(&ours_al, h),
+            e(&ref_al, h)
+        );
     }
 }
 
@@ -5083,9 +5475,18 @@ fn celt_click_peak_offset() {
         enc.set_mode(Some(ec_opus::Mode::Celt));
         enc.set_bitrate(bps);
         let (dec, _) = roundtrip_own(&mut enc, &click, 1, 960);
-        let p = dec.iter().enumerate().max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap()).unwrap().0;
+        let p = dec
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+            .unwrap()
+            .0;
         let d = enc.last_celt_diag().clone();
-        println!("celt click {bps}: peak +{} (lm {})", p as i64 - at as i64, d.lm);
+        println!(
+            "celt click {bps}: peak +{} (lm {})",
+            p as i64 - at as i64,
+            d.lm
+        );
     }
 }
 
@@ -5148,7 +5549,9 @@ fn short_block_bits_vs_libopus() {
 
         // Reference: ffmpeg libopus at KBPS, VBR.
         ffmpeg_encode_libopus(src, KBPS, &scratch, SECS);
-        let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+        let ref_bytes = fs::metadata(&scratch)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
         let ref_pkts: Vec<Vec<u8>> = ogg_packets(&fs::read(&scratch).unwrap())
             .into_iter()
@@ -5183,7 +5586,9 @@ fn short_block_bits_vs_libopus() {
         for block in source_pcm.chunks(FRAME * CHANNELS) {
             let mut padded = block.to_vec();
             padded.resize(FRAME * CHANNELS, 0.0);
-            let len = enc.encode_float(&padded, FRAME, &mut packet).expect("encode");
+            let len = enc
+                .encode_float(&padded, FRAME, &mut packet)
+                .expect("encode");
             ours_bytes += len;
             let toc = ec_opus::Toc::new(packet[0]);
             if dec.decode_float(&packet[..len], &mut dbuf).is_ok() && toc.mode() != Mode::Silk {
@@ -5200,10 +5605,14 @@ fn short_block_bits_vs_libopus() {
         ));
 
         for (label, is_trans) in [("LONG", false), ("SHORT", true)] {
-            let ours_t: Vec<&ec_opus::celt::CeltDecDiag> =
-                ours_diags.iter().filter(|d| d.transient == is_trans).collect();
-            let ref_t: Vec<&ec_opus::celt::CeltDecDiag> =
-                ref_diags.iter().filter(|d| d.transient == is_trans).collect();
+            let ours_t: Vec<&ec_opus::celt::CeltDecDiag> = ours_diags
+                .iter()
+                .filter(|d| d.transient == is_trans)
+                .collect();
+            let ref_t: Vec<&ec_opus::celt::CeltDecDiag> = ref_diags
+                .iter()
+                .filter(|d| d.transient == is_trans)
+                .collect();
             let on = ours_t.len();
             let rn = ref_t.len();
             if on == 0 && rn == 0 {
@@ -5236,19 +5645,18 @@ fn short_block_bits_vs_libopus() {
                     ours_t.iter().map(|d| d.fine_quant[i] as f64).sum::<f64>() / on.max(1) as f64;
                 let rm: f64 =
                     ref_t.iter().map(|d| d.fine_quant[i] as f64).sum::<f64>() / rn.max(1) as f64;
-                report.push_str(&format!(
-                    "{}\t{:.2}\t{:.2}\n",
-                    CELT_EBANDS[i] * 240,
-                    om,
-                    rm
-                ));
+                report.push_str(&format!("{}\t{:.2}\t{:.2}\n", CELT_EBANDS[i] * 240, om, rm));
             }
 
             // Aggregate stats.
-            let mean = |v: &[&ec_opus::celt::CeltDecDiag], f: &dyn Fn(&ec_opus::celt::CeltDecDiag) -> f64| -> f64 {
+            let mean = |v: &[&ec_opus::celt::CeltDecDiag],
+                        f: &dyn Fn(&ec_opus::celt::CeltDecDiag) -> f64|
+             -> f64 {
                 v.iter().map(|d| f(d)).sum::<f64>() / v.len().max(1) as f64
             };
-            let mean_band_hz = |v: &[&ec_opus::celt::CeltDecDiag], f: &dyn Fn(&ec_opus::celt::CeltDecDiag) -> usize| -> f64 {
+            let mean_band_hz = |v: &[&ec_opus::celt::CeltDecDiag],
+                                f: &dyn Fn(&ec_opus::celt::CeltDecDiag) -> usize|
+             -> f64 {
                 let m = v.iter().map(|d| f(d)).sum::<usize>() / v.len().max(1);
                 CELT_EBANDS[m] as f64 * 240.0
             };
@@ -5292,16 +5700,22 @@ fn short_block_bits_vs_libopus() {
             ));
             report.push_str("# mean dynalloc boost per band (1/8 bit) ours / ref\n");
             for b in 0..nb {
-                let mo = mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.offsets[b] as f64);
-                let mr = mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.offsets[b] as f64);
+                let mo = mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| {
+                    d.offsets[b] as f64
+                });
+                let mr = mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| {
+                    d.offsets[b] as f64
+                });
                 if mo != 0.0 || mr != 0.0 {
                     report.push_str(&format!("{}\t{:.1}\t{:.1}\n", CELT_EBANDS[b] * 240, mo, mr));
                 }
             }
             report.push_str(&format!(
                 "# alloc_trim mean: ours {:.2} ref {:.2}\n",
-                mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.alloc_trim as f64),
-                mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.alloc_trim as f64),
+                mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.alloc_trim
+                    as f64),
+                mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.alloc_trim
+                    as f64),
             ));
             report.push_str(&format!(
                 "# coded_bands mean Hz: ours {:.0} ref {:.0}\n",
@@ -5320,8 +5734,10 @@ fn short_block_bits_vs_libopus() {
             ));
             report.push_str(&format!(
                 "# total_bits mean: ours {:.0} ref {:.0}\n",
-                mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.total_bits as f64),
-                mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.total_bits as f64),
+                mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.total_bits
+                    as f64),
+                mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.total_bits
+                    as f64),
             ));
             report.push_str(&format!(
                 "# balance mean: ours {:.0} ref {:.0}\n",
@@ -5394,7 +5810,9 @@ fn err_map_vs_libopus() {
 
     // Reference: ffmpeg libopus, VBR — the gate's path.
     ffmpeg_encode_libopus(&src, kbps_env, &scratch, SECS);
-    let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+    let ref_bytes = fs::metadata(&scratch)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
     let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
     let (ref_dec, ref_ch) = decode_ogg(&scratch);
     assert_eq!(ref_ch, CH, "ref not stereo");
@@ -5422,7 +5840,11 @@ fn err_map_vs_libopus() {
             let toc = ec_opus::Toc::new(p[0]);
             let got = d.decode_float(p, &mut buf).unwrap_or(0);
             if toc.mode() != Mode::Silk {
-                ref_fd.push(FD { sample: at, enc: None, dec: d.last_celt_diag().clone() });
+                ref_fd.push(FD {
+                    sample: at,
+                    enc: None,
+                    dec: d.last_celt_diag().clone(),
+                });
             }
             at += got;
         }
@@ -5466,7 +5888,11 @@ fn err_map_vs_libopus() {
 
     // 1 s windows.
     let nwin = hop_o.len() / HOPS_PER_WIN;
-    let sum = |h: &[f64], w: usize| h[w * HOPS_PER_WIN..(w + 1) * HOPS_PER_WIN].iter().sum::<f64>();
+    let sum = |h: &[f64], w: usize| {
+        h[w * HOPS_PER_WIN..(w + 1) * HOPS_PER_WIN]
+            .iter()
+            .sum::<f64>()
+    };
     let tot_o: f64 = hop_o.iter().sum();
     let tot_r: f64 = hop_r.iter().sum();
     let mut wins: Vec<(usize, f64, f64, f64)> = (0..nwin)
@@ -5501,9 +5927,9 @@ fn err_map_vs_libopus() {
             f.dec.spread,
             f.dec.anti_collapse as u8,
             f.dec.total_bits,
-        ) + &e.map(|e| format!(
-            " | ENC sb{} vbr{}", e.short_blocks, e.vbr_reservoir
-        )).unwrap_or_default()
+        ) + &e
+            .map(|e| format!(" | ENC sb{} vbr{}", e.short_blocks, e.vbr_reservoir))
+            .unwrap_or_default()
     };
     let ref_at = |s: usize| -> Option<&FD> {
         let i = ref_fd.partition_point(|f| f.sample <= s);
@@ -5570,13 +5996,19 @@ fn err_map_vs_libopus() {
                         )
                     })
                     .collect();
-                out.push_str(&format!("  Δlog2E L {}\n           R {}\n", d0.join(" "), d1.join(" ")));
+                out.push_str(&format!(
+                    "  Δlog2E L {}\n           R {}\n",
+                    d0.join(" "),
+                    d1.join(" ")
+                ));
             }
         }
     }
 
     // The single worst ours window, frame by frame: where do decisions diverge.
-    let worst = (0..nwin).max_by(|&a, &b| wins[a].1.total_cmp(&wins[b].1)).unwrap();
+    let worst = (0..nwin)
+        .max_by(|&a, &b| wins[a].1.total_cmp(&wins[b].1))
+        .unwrap();
     out.push_str(&format!(
         "\n== WORST WINDOW t={}..{}s, ALL FRAMES (OUR | REF) ==\n",
         worst,
@@ -5584,7 +6016,9 @@ fn err_map_vs_libopus() {
     ));
     for fi in worst * 50..(worst + 1) * 50 {
         let our = ours_fd.get(fi).map(&fmt_fd).unwrap_or_else(|| "-".into());
-        let rf = ref_at(fi * FRAME + 480).map(&fmt_fd).unwrap_or_else(|| "-".into());
+        let rf = ref_at(fi * FRAME + 480)
+            .map(&fmt_fd)
+            .unwrap_or_else(|| "-".into());
         out.push_str(&format!("f{fi}: OUR {our}\n     REF {rf}\n"));
     }
 
@@ -5600,31 +6034,53 @@ fn err_map_vs_libopus() {
 #[ignore]
 fn frame_decisions_vs_libopus() {
     const CH: usize = 2;
-    let src_s = std::env::var("FRAME_SRC")
-        .unwrap_or_else(|_| "~/Music/naz_aglama_ben_aglarim.mp4".into());
+    let src_s =
+        std::env::var("FRAME_SRC").unwrap_or_else(|_| "~/Music/naz_aglama_ben_aglarim.mp4".into());
     let src = shellexpand(&src_s);
     if !src.exists() {
         eprintln!("SKIP: missing {}", src.display());
         return;
     }
-    let kbps: u32 = std::env::var("FRAME_KBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-    let from: usize = std::env::var("FRAME_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let to: usize = std::env::var("FRAME_TO").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    let kbps: u32 = std::env::var("FRAME_KBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let from: usize = std::env::var("FRAME_FROM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let to: usize = std::env::var("FRAME_TO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
     let secs = (to as f64 * 0.02 + 1.0).max(2.0);
     let pcm = ffmpeg_decode_pcm(&src, secs);
     let scratch = std::env::temp_dir().join("ec-opus-frame-dec.opus");
     ffmpeg_encode_libopus(&src, kbps, &scratch, secs);
-    let ref_pkts: Vec<Vec<u8>> =
-        ogg_packets(&fs::read(&scratch).unwrap()).into_iter().skip(2).collect();
+    let ref_pkts: Vec<Vec<u8>> = ogg_packets(&fs::read(&scratch).unwrap())
+        .into_iter()
+        .skip(2)
+        .collect();
 
     let show = |tag: &str, f: usize, bytes: usize, d: &ec_opus::celt::CeltDecDiag| {
-        let e: Vec<String> = d.old_band_e[..NB_BANDS_DIAG].iter().map(|v| format!("{v:.1}")).collect();
+        let e: Vec<String> = d.old_band_e[..NB_BANDS_DIAG]
+            .iter()
+            .map(|v| format!("{v:.1}"))
+            .collect();
         println!(
             "f{f} {tag}: bytes {bytes} sil {} intra {} trans {} ac {} trim {} spread {} cb {} \
              tf {:?} pulses {:?} fine {:?} E {}",
-            d.silence, d.intra, d.transient, d.anti_collapse, d.alloc_trim, d.spread,
-            d.coded_bands, &d.tf_res[..NB_BANDS_DIAG], &d.pulses[..NB_BANDS_DIAG],
-            &d.fine_quant[..NB_BANDS_DIAG], e.join(",")
+            d.silence,
+            d.intra,
+            d.transient,
+            d.anti_collapse,
+            d.alloc_trim,
+            d.spread,
+            d.coded_bands,
+            &d.tf_res[..NB_BANDS_DIAG],
+            &d.pulses[..NB_BANDS_DIAG],
+            &d.fine_quant[..NB_BANDS_DIAG],
+            e.join(",")
         );
     };
 
@@ -5635,7 +6091,11 @@ fn frame_decisions_vs_libopus() {
         let ok = !p.is_empty()
             && ec_opus::Toc::new(p[0]).mode() != Mode::Silk
             && d.decode_float(p, &mut buf).is_ok();
-        ref_rows.push(if ok { Some((p.len(), d.last_celt_diag().clone())) } else { None });
+        ref_rows.push(if ok {
+            Some((p.len(), d.last_celt_diag().clone()))
+        } else {
+            None
+        });
     }
 
     // Encode at the reference's REALISED rate, like the library gate does:
@@ -5654,7 +6114,11 @@ fn frame_decisions_vs_libopus() {
         let n = enc.encode_float(block, 960, &mut out).unwrap();
         let ok = ec_opus::Toc::new(out[0]).mode() != Mode::Silk
             && dec.decode_float(&out[..n], &mut buf).is_ok();
-        ours_rows.push(if ok { Some((n, dec.last_celt_diag().clone())) } else { None });
+        ours_rows.push(if ok {
+            Some((n, dec.last_celt_diag().clone()))
+        } else {
+            None
+        });
     }
 
     if to - from <= 40 {
@@ -5675,9 +6139,10 @@ fn frame_decisions_vs_libopus() {
     let mut agg = [(0usize, [0.0f64; 8]); 2];
     let mut trans_diff = 0usize;
     for f in from..to {
-        let (Some((no, o)), Some((nr, r))) =
-            (ours_rows.get(f).and_then(|x| x.as_ref()), ref_rows.get(f).and_then(|x| x.as_ref()))
-        else {
+        let (Some((no, o)), Some((nr, r))) = (
+            ours_rows.get(f).and_then(|x| x.as_ref()),
+            ref_rows.get(f).and_then(|x| x.as_ref()),
+        ) else {
             continue;
         };
         if o.transient != r.transient {
@@ -5690,10 +6155,14 @@ fn frame_decisions_vs_libopus() {
         let a = &mut agg[slot];
         a.0 += 1;
         for (k, v) in [
-            *no as f64, *nr as f64,
-            o.alloc_trim as f64, r.alloc_trim as f64,
-            tf(o), tf(r),
-            f64::from(u8::from(o.anti_collapse)), f64::from(u8::from(r.anti_collapse)),
+            *no as f64,
+            *nr as f64,
+            o.alloc_trim as f64,
+            r.alloc_trim as f64,
+            tf(o),
+            tf(r),
+            f64::from(u8::from(o.anti_collapse)),
+            f64::from(u8::from(r.anti_collapse)),
         ]
         .into_iter()
         .enumerate()
@@ -5711,7 +6180,14 @@ fn frame_decisions_vs_libopus() {
         println!(
             "{name} n={n}: bytes o {:.1} r {:.1} | trim o {:.2} r {:.2} | mean tf_res o {:.3} \
              r {:.3} | anti_collapse o {:.2} r {:.2}",
-            m(0), m(1), m(2), m(3), m(4), m(5), m(6), m(7)
+            m(0),
+            m(1),
+            m(2),
+            m(3),
+            m(4),
+            m(5),
+            m(6),
+            m(7)
         );
     }
 }
@@ -5731,7 +6207,11 @@ fn analysis_music_prob_separates_speech_from_music() {
     const FRAME: usize = 960;
     const CHANNELS: usize = 2;
     let sources: &[(&str, &str, bool)] = &[
-        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3", false),
+        (
+            "hein",
+            "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3",
+            false,
+        ),
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4", true),
         ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3", true),
     ];
@@ -5782,7 +6262,10 @@ fn analysis_music_prob_separates_speech_from_music() {
                 bw_hist[(d.analysis_bandwidth.clamp(0, 20)) as usize] += 1;
             }
         }
-        assert!(valid * 10 > n * 9, "{tag}: analysis valid on only {valid}/{n} frames");
+        assert!(
+            valid * 10 > n * 9,
+            "{tag}: analysis valid on only {valid}/{n} frames"
+        );
         let bw: Vec<String> = bw_hist
             .iter()
             .enumerate()
@@ -5817,7 +6300,12 @@ fn analysis_music_prob_separates_speech_from_music() {
     let speech: Vec<_> = means.iter().filter(|m| !m.1).collect();
     let music: Vec<_> = means.iter().filter(|m| m.1).collect();
     for s in &speech {
-        assert!(s.2 < 0.5, "{}: speech music_prob {:.3} should be < 0.5", s.0, s.2);
+        assert!(
+            s.2 < 0.5,
+            "{}: speech music_prob {:.3} should be < 0.5",
+            s.0,
+            s.2
+        );
         for m in &music {
             assert!(
                 m.2 - s.2 > 0.2,
@@ -5830,6 +6318,11 @@ fn analysis_music_prob_separates_speech_from_music() {
         }
     }
     for m in &music {
-        assert!(m.2 > 0.5, "{}: music music_prob {:.3} should be > 0.5", m.0, m.2);
+        assert!(
+            m.2 > 0.5,
+            "{}: music music_prob {:.3} should be > 0.5",
+            m.0,
+            m.2
+        );
     }
 }
