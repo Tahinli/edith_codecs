@@ -37,6 +37,11 @@ fn main() {
         let (sc, dp) = ec_av1::decode::troy_chroma_counters();
         println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
         println!(
+            "ibc128: mu_chroma={} intra128={}",
+            ec_av1::decode::intra_128_in_inter_mu_chroma_hits(),
+            ec_av1::decode::intra_128_in_inter_hits()
+        );
+        println!(
             "chroma422_square: {}",
             ec_av1::decode::chroma422_square_hits()
         );

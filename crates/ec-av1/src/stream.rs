@@ -37484,6 +37484,198 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1ibc128arm: the INTRA-in-inter 128x128 root's mu-chunk chroma
+    /// arm (`decode_inter_block`'s `side > 64` arm, the intra half of the
+    /// inter pair the sibling gate above names) must code the mu chunk's
+    /// chroma as a PER-UNIT walk at every subsampling, and at 4:4:4 each
+    /// 64x64 mu chunk is FOUR TX_32X32 units per plane, not one.
+    ///
+    /// **The defect.** The arm hardcoded `cu_tx = 32`, `luma_span = cu_tx *
+    /// 2` and the chroma origin `cc * cu_tx` -- the 4:2:0 arithmetic, where a
+    /// mu chunk's chroma plane block is `64 >> 1 == 32` square and the whole
+    /// chunk IS one TX_32X32 unit. At 4:4:4 the chunk's chroma is 64x64, so
+    /// the arm (a) read one 32x32 unit where libaom codes four, (b) stamped
+    /// the unit's entropy context over the 4:2:0 64x64 luma span rather than
+    /// the unit's own 32x32, and (c) placed chunk 1's unit at `cpx + 32`
+    /// instead of `cpx + 64`, i.e. back inside chunk 0's samples.
+    ///
+    /// **`av1_get_max_uv_txsize` is NOT the source of a 64x64 chroma unit.**
+    /// `blockd.h:1371` is `av1_get_adjusted_tx_size(max_txsize_rect_lookup[
+    /// get_plane_block_size(bsize, ss_x, ss_y)])`, and `av1_get_adjusted_tx_size`
+    /// (`blockd.h:1361`) takes NO subsampling argument -- it maps TX_64X64 /
+    /// TX_64X32 / TX_32X64 to TX_32X32 UNCONDITIONALLY, so even at ss (0,0)
+    /// (where `get_plane_block_size` returns BLOCK_128X128 and the lookup
+    /// entry is TX_64X64) the answer is TX_32X32. Measured on this gate's own
+    /// stream against the oracle's `EC_TRACE_COEFF`: every chroma read of the
+    /// 128x128 intra-in-inter root is `tx_size=3` (TX_32X32), four per plane
+    /// per mu chunk at (row,col) (0,0) (0,8) (8,0) (8,8).
+    ///
+    /// **The recipe** (128x256, 3 frames). `--sb-size=128` with
+    /// `--min-partition-size=64 --max-partition-size=128` keeps the
+    /// superblock root resolvable to `PARTITION_NONE`, and the noise-on-
+    /// gradient content is what makes the encoder's RD pick INTRA over inter
+    /// for a whole 128 root on an inter frame (a clean `testsrc2` stream
+    /// never does -- measured over 24 recipe/cell combinations, three of
+    /// which fired and none of them `testsrc2`):
+    /// ```text
+    /// ffmpeg -f lavfi -i "gradients=size=128x256:c0=..:c1=..:c2=..:c3=..:\
+    /// seed=63:duration=0.12:rate=25,noise=all_seed=63:alls=6:allf=t" \
+    ///        -pix_fmt yuv444p -t 0.12 -f yuv4mpegpipe - | \
+    /// aomenc --codec=av1 --profile=1 --passes=1 --end-usage=q --cq-level=62 \
+    ///        --cpu-used=0 --threads=1 --row-mt=0 --sb-size=128 --limit=3 \
+    ///        --max-partition-size=128 --min-partition-size=64 \
+    ///        --enable-rect-partitions=0 --enable-ab-partitions=0 \
+    ///        --enable-1to4-partitions=0 --enable-palette=0 \
+    ///        --enable-intrabc=0 --deltaq-mode=0 --enable-tx-size-search=0 \
+    ///        --obu -o out.obu -
+    /// ```
+    /// Both `rate=25` and the frame limit are load-bearing: `gradients`' and
+    /// `noise`' patterns are time-parameterised, so a different rate or a
+    /// different `--limit` emits a different stream (and at `--limit=2` this
+    /// recipe stops choosing the shape at all -- measured, 0 fires).
+    ///
+    /// Non-vacuity, three ways: the sequence header is asserted really to be
+    /// 4:4:4 (`subsampling_x == subsampling_y == 0`) and 128-superblock;
+    /// `intra_128_in_inter_mu_chroma_hits()` must be non-zero, so the arm
+    /// really ran; and every decode-order frame is compared byte-for-byte
+    /// against the oracle by [`decode_all_frames_vs_oracle`], which panics on
+    /// a refusal or any differing byte. Red before the fix (the ss-aware
+    /// arithmetic and the per-unit walk reverted, the counter kept): decode-
+    /// order frame 2 differs in 44649 of 98304 bytes while the counter still
+    /// reads 4 -- the red is on PIXELS, not on the counter.
+    #[test]
+    fn a_real_aomenc_444_intra_in_inter_128_root_codes_chroma_per_mu_chunk_unit_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_444_intra_in_inter_128_root_codes_chroma_per_mu_chunk_unit_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc/aomdec");
+            return;
+        }
+        let (width, height) = (128usize, 256usize);
+        let source = format!(
+            "{},noise=all_seed=63:alls=6:allf=t",
+            gradients_source(63, width, height, "duration=0.12:rate=25")
+        );
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-pix_fmt",
+                "yuv444p",
+                "-t",
+                "0.12",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{NAME}: ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--profile=1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=62",
+            "--cpu-used=0",
+            "--threads=1",
+            "--row-mt=0",
+            "--sb-size=128",
+            "--limit=3",
+            "--max-partition-size=128",
+            "--min-partition-size=64",
+            "--enable-rect-partitions=0",
+            "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0",
+            "--enable-palette=0",
+            "--enable-intrabc=0",
+            "--deltaq-mode=0",
+            "--enable-tx-size-search=0",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "{NAME}: aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        // The gate is only about 4:4:4 at a 128 superblock, so assert the
+        // parsed sequence header really is that before anything else: a
+        // stream that silently came back 4:2:0 would leave this arm
+        // unexercised while every other assert below still passed.
+        let header = {
+            let mut parser = ec_av1_syntax::Av1Parser::new();
+            let mut pos = 0usize;
+            while let Ok(obu) = parser.parse_obu(&stream[pos..]) {
+                pos += obu.total_size;
+                if pos >= stream.len() {
+                    break;
+                }
+            }
+            parser.sequence_header().map(|q| {
+                (
+                    q.use_128x128_superblock,
+                    q.color_config.subsampling_x,
+                    q.color_config.subsampling_y,
+                    q.color_config.mono_chrome,
+                )
+            })
+        };
+        assert_eq!(
+            header,
+            Some((true, 0, 0, false)),
+            "{NAME}: the encoder did not write a 4:4:4 (ss 0/0, non-mono) 128x128-superblock \
+             sequence header -- the flags never arrived, so the arm this gate names is not \
+             the one under test"
+        );
+        let before = (
+            crate::decode::intra_128_in_inter_hits(),
+            crate::decode::intra_128_in_inter_mu_chroma_hits(),
+        );
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        let (roots, units) = (
+            crate::decode::intra_128_in_inter_hits() - before.0,
+            crate::decode::intra_128_in_inter_mu_chroma_hits() - before.1,
+        );
+        assert!(
+            frames >= 3,
+            "{NAME}: only {frames} decode-order frames ({hidden} hidden), the recipe asks for 3"
+        );
+        assert!(
+            roots >= 1,
+            "{NAME}: no INTRA-coded 128x128 root inside an inter frame -- the recipe stopped \
+             exercising the shape this gate names"
+        );
+        // One mu chunk per arm firing, and at 4:4:4 FOUR units per plane per
+        // chunk (two 64x64 mu chunks per 128 root, two planes each).
+        assert!(
+            units >= 4,
+            "{NAME}: only {units} mu-chunk chroma reads across {roots} intra-in-inter 128 \
+             root(s) -- the per-unit walk this gate names never fired (a 4:4:4 64x64 mu chunk \
+             is FOUR TX_32X32 units per plane, not one)"
+        );
+        eprintln!(
+            "{NAME}: {frames} decode-order frames pixel-exact ({hidden} hidden), \
+             intra_128_in_inter={roots} mu_chunk_chroma_reads={units}"
+        );
+    }
+
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level
     /// partition decision is genuinely HORZ/VERT (not NONE/SPLIT) must
     /// decode pixel-exact through [`crate::decode::decode_block_rect64`] --

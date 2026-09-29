@@ -1826,6 +1826,72 @@ mod tests {
         );
     }
 
+    /// lane-av1txsizeaudit r2 -- the one value in `ec-av1` whose correct form
+    /// is provable against libaom but whose *observable effect* is nil, so a
+    /// pixel gate is impossible and this source scan is the only instrument
+    /// that can catch a regression.
+    ///
+    /// `decode.rs`'s `suppress_internal_lf_edges` publishes the skipped 128
+    /// root's own chroma extent into `uv_tx_grid`, so the deblocker's
+    /// alignment gate (`x0 & (tx - 1)`) sees no internal transform edge. The
+    /// correct extent is the block's own CHROMA footprint,
+    /// `w_mi * MI >> ss_x` per axis -- `av1_setup_dst_planes`'s
+    /// `get_plane_block_size(bsize, ss_x, ss_y)`, which at ss (0,0) is the
+    /// block itself, so **128 and not 64** for a 128x128 root at 4:4:4. The
+    /// site carried a hardcoded `w_mi * MI / 2`, which is right at 4:2:0 by
+    /// the `>> 1 == / 2` identity and half the truth everywhere else; its
+    /// sibling `fill_lf_grid_rect` had already been repaired to
+    /// `(w_mi * MI) >> ss_x(fctx)`.
+    ///
+    /// **No pixel gate can exist for this, and that is measured, not assumed.**
+    /// The widening defeats the alignment gate, but every edge it lets
+    /// through then meets the SAME libaom rule applied at the correct place --
+    /// `edge_params_body`'s spec-7.14.2 / `set_lpf_parameters` term
+    /// `!pu_edge && cur_ref != 0 && pv_ref != 0 && skip_at && skip_at`, which
+    /// holds for every internal edge because both cells are the same skipped
+    /// block. Over 26 frames / 2 555 904 samples of five 4:4:4
+    /// `--sb-size=128` streams that fire the arm 30 times, `64` and `128` both
+    /// decode pixel-exact against `aomdec` and differ from each other in not
+    /// one sample. The masking is TOTAL: the method is only ever called for a
+    /// block that is itself skipped, so no input exists on which one side of
+    /// an internal edge is not skipped. Hence: source scan, not pixels.
+    ///
+    /// This also pins the `fctx` threading, because `Neighbours` carries no
+    /// subsampling of its own -- a sibling lane reached the same site and
+    /// recorded it as unfixable for exactly that reason.
+    #[test]
+    fn the_skipped_128_root_chroma_suppression_publishes_the_blocks_own_per_axis_chroma_extent() {
+        let src = include_str!("decode.rs");
+        let start = src
+            .find("fn suppress_internal_lf_edges(")
+            .expect("suppress_internal_lf_edges is gone");
+        let body_start = start + src[start..].find('{').expect("no body");
+        let body = &src[body_start..body_start + src[body_start..].find("\n    }").expect("no end")];
+
+        assert!(
+            body.contains("((w_mi * MI) >> ss_x(fctx))") && body.contains("((h_mi * MI) >> ss_y(fctx))"),
+            "suppress_internal_lf_edges must publish the block's own chroma extent per axis \
+             -- `w_mi * MI >> ss_x(fctx)`, not a hardcoded `/2`"
+        );
+        for stale in ["w_mi * MI / 2", "h_mi * MI / 2"] {
+            assert!(
+                !body.contains(stale),
+                "suppress_internal_lf_edges grew `{stale}` again: correct at 4:2:0 by the \
+                 `>> 1 == / 2` identity, half the truth at 4:4:4"
+            );
+        }
+        // The subsampling is not reachable from `self` -- `Neighbours` has no
+        // `fctx` field -- so the per-axis shift needs a threaded parameter.
+        // Without this the body cannot compile, which is how a future edit
+        // would try to reintroduce a literal.
+        let sig_end = src[start..body_start].to_string();
+        assert!(
+            sig_end.contains("fctx: &FrameCtx"),
+            "suppress_internal_lf_edges takes no fctx, so the per-axis shift has nothing to read \
+             -- `Neighbours` carries no subsampling of its own; thread the frame context in"
+        );
+    }
+
     /// lane-av1-refusalaudit, ENUMERATION for "a 64-axis strip whose chroma
     /// unit has no coefficient table" -- [`decode_block_rect64`]'s `_` arm,
     /// reached only for depth-0, non-skip, non-lossless superblock-level

@@ -5560,6 +5560,23 @@ pub fn intra_128_in_inter_hits() -> usize {
 }
 
 thread_local! {
+    /// lane-av1ibc128arm: how many 64x64 mu-chunk CHROMA units the
+    /// intra-in-inter 128x128 root read (`decode_inter_block`'s
+    /// `side > 64` mu-chunk arm, the INTRA half of the inter pair). Every
+    /// unit is one `read_plane` on U and one on V, so the counter is the
+    /// gate's proof the arm ran at all -- no committed 4:4:4 fixture
+    /// reached it before this lane.
+    pub(crate) static INTRA_128_IN_INTER_MU_CHROMA_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_128_IN_INTER_MU_CHROMA_HITS`], for a gate's
+/// before/after delta.
+pub fn intra_128_in_inter_mu_chroma_hits() -> usize {
+    INTRA_128_IN_INTER_MU_CHROMA_HITS.with(std::cell::Cell::get)
+}
+
+thread_local! {
     static INTER_SB_NONE_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
@@ -9227,13 +9244,39 @@ impl Neighbours {
     /// `curr_skipped = mbmi->skip_txfm && is_inter_block(mbmi)`. Widening this
     /// block's published transform extent to its own size is exactly that
     /// suppression for the deblocker's `x0 % tx != 0` test -- the only shape
-    /// that needs it is the 128 root, whose chroma extent (64) is the one
+    /// that needs it is the 128 root, whose chroma extent is the one
     /// [`Self::fill_lf_grid_rect`]'s TX_32X32 cap narrows. An INTRA block is
     /// never suppressed (libaom's `is_inter_block` term), so this is called
     /// only from the skipped-inter branch.
-    fn suppress_internal_lf_edges(&mut self, at_mi: (usize, usize), w_mi: usize, h_mi: usize) {
+    ///
+    /// The extent is the block's own CHROMA footprint, `w_mi * MI >> ss_x` per
+    /// axis -- `av1_setup_dst_planes`'s `get_plane_block_size(bsize, ss_x,
+    /// ss_y)` (`common_data.c:38`, which at ss (0,0) is BLOCK_128X128
+    /// itself, so 128 and not 64). This used to be a hardcoded `w_mi * MI / 2`,
+    /// correct at 4:2:0 by the `>> 1 == / 2` identity and half the truth at
+    /// 4:4:4; lane-av1txsizeaudit r2 replaced it with the per-axis shift, the
+    /// form its sibling `fill_lf_grid_rect` already used. The `fctx` is
+    /// threaded in for it: `Neighbours` carries no subsampling of its own, so
+    /// no format guard was possible inside this method until now.
+    ///
+    /// **MEASURED INERT, and do not go looking for a pixel regression.** The
+    /// widening defeats the deblocker's alignment gate (`x0 & (tx - 1)`), but
+    /// every edge it lets through then meets the SAME libaom rule applied at
+    /// the correct place, `edge_params_body`'s spec-7.14.2 / libaom
+    /// `set_lpf_parameters` term `!pu_edge && cur_ref != 0 && pv_ref != 0 &&
+    /// skip_at && skip_at`. Inside one skipped block both cells are that same
+    /// block, so all four terms hold and the edge dies there too. The masking
+    /// is TOTAL, not incidental: this method is only ever called for a block
+    /// that is itself skipped, so no input exists on which one side of an
+    /// internal edge is not skipped. Measured over 26 frames / 2 555 904
+    /// samples across five 4:4:4 `--sb-size=128` streams that fire this arm
+    /// 30 times: `64` and `128` both decode pixel-exact against aomdec, and
+    /// differ from each other in not one sample. The gate for this value is
+    /// therefore a source scan, not a pixel gate --
+    /// `refusal_inventory::the_skipped_128_root_chroma_suppression_publishes_the_blocks_own_per_axis_chroma_extent`.
+    fn suppress_internal_lf_edges(&mut self, at_mi: (usize, usize), w_mi: usize, h_mi: usize, fctx: &FrameCtx) {
         let (mi_r, mi_c) = at_mi;
-        let (uv_w, uv_h) = ((w_mi * MI / 2).max(4) as u8, (h_mi * MI / 2).max(4) as u8);
+        let (uv_w, uv_h) = (((w_mi * MI) >> ss_x(fctx)).max(4) as u8, ((h_mi * MI) >> ss_y(fctx)).max(4) as u8);
         for rr in 0..h_mi {
             let start = (mi_r + rr) * self.skip_grid_cols_mi + mi_c;
             fill_span(&mut self.uv_tx_grid, start, w_mi, uv_w);
@@ -43179,30 +43222,51 @@ fn decode_inter_block(
                         continue;
                     }
                     let (cr, cc) = chunk;
-                    // `av1_get_max_uv_txsize(BLOCK_128X128)` =
-                    // `av1_get_adjusted_tx_size(TX_64X64)` = TX_32X32.
+                    hit!(INTRA_128_IN_INTER_MU_CHROMA_HITS);
+                    // The unit's CHROMA size, its LUMA footprint, the
+                    // CHUNK's chroma extent and the unit's ORIGIN inside the
+                    // chunk are four different quantities; this arm had the
+                    // last three as one 4:2:0 literal and read ONE unit per
+                    // mu chunk at every subsampling.
+                    //
+                    // `cu_tx` is TX_32X32 at EVERY subsampling.
+                    // `av1_get_max_uv_txsize` (blockd.h:1371) is
+                    // `av1_get_adjusted_tx_size(max_txsize_rect_lookup[
+                    // get_plane_block_size(bsize, ss_x, ss_y)])`, and
+                    // `av1_get_adjusted_tx_size` (blockd.h:1361) takes NO
+                    // subsampling argument: it maps TX_64X64 / TX_64X32 /
+                    // TX_32X64 to TX_32X32 UNCONDITIONALLY, so even at ss (0,0)
+                    // (where `get_plane_block_size` returns BLOCK_128X128 and
+                    // the lookup entry is TX_64X64) the answer is TX_32X32.
                     let cu_tx = 32usize;
-                    let luma_span = cu_tx * 2;
-                    let cu_mi = (at_mi.0 + cr * 16, at_mi.1 + cc * 16);
-                    let cu_around = neighbours.around_mi(cu_mi, luma_span);
-                    let (cu_x, cu_y) = (cpx + cc * cu_tx, cpy + cr * cu_tx);
-                    let cu_reach = crate::decode::tu_reach(
-                        side,
-                        side,
-                        cc * luma_span,
-                        cr * luma_span,
-                        luma_span,
-                        reach,
-                        px,
-                        py,
-                        y.width,
-                        y.height,
-                        fctx,
-                    );
+                    // The unit's own footprint on the LUMA grid, per axis
+                    // (`cu_tx << ss`): 64 luma px (16 mi) at 4:2:0, 32 luma px
+                    // (8 mi) at 4:4:4. This is the ss-aware form the repaired
+                    // siblings at decode.rs:17598 / 17685 use (`ox <<
+                    // ss_x(fctx)`, never `ox * 2`), and it is the size
+                    // `around_mi` / `record_mi_chroma` want.
+                    let unit_luma_w = cu_tx << ss_x(fctx);
+                    let unit_luma_h = cu_tx << ss_y(fctx);
+                    // The CHUNK's own extent, per axis: a mu chunk is a
+                    // 64x64 LUMA region at every subsampling, so on the luma
+                    // grid this is a literal 64, and its CHROMA plane block is
+                    // `64 >> ss` square. At 4:2:0 that is 32x32 = the one unit
+                    // this arm always coded; at 4:4:4 it is 64x64 = FOUR
+                    // TX_32X32 units. Measured on the gate's own 4:4:4 stream
+                    // against the oracle's `EC_TRACE_COEFF`: every chroma read
+                    // of a 128x128 intra-in-inter root is `tx_size=3`
+                    // (TX_32X32), and each 64x64 mu chunk contributes FOUR per
+                    // plane at (row,col) (0,0) (0,8) (8,0) (8,8) -- never a
+                    // TX_64X64 chroma unit.
+                    let chunk_luma = 64usize;
+                    let chunk_chroma_w = chunk_luma >> ss_x(fctx);
+                    let chunk_chroma_h = chunk_luma >> ss_y(fctx);
+                    let units_w = chunk_chroma_w / cu_tx;
+                    let units_h = chunk_chroma_h / cu_tx;
                     let cu_scan = default_scan(cu_tx);
                     if lossless(fctx) {
-                        // lane-lossless2: 8x8 TX_4X4 units per plane in this
-                        // chunk, not one TX_32X32 unit.
+                        // lane-lossless2: TX_4x4 units over this chunk's
+                        // chroma, not TX_32X32 ones.
                         read_intra_chroma_lossless(
                             dec,
                             cdfs,
@@ -43214,8 +43278,8 @@ fn decode_inter_block(
                             (cpx, cpy),
                             side,
                             (chroma_side, chroma_side),
-                            (cc * cu_tx, cr * cu_tx),
-                            (cu_tx, cu_tx),
+                            (cc * chunk_chroma_w, cr * chunk_chroma_h),
+                            (chunk_chroma_w, chunk_chroma_h),
                             chroma_side,
                             reach,
                             (y.width, y.height),
@@ -43232,79 +43296,126 @@ fn decode_inter_block(
                         mu_chroma = true;
                         continue;
                     }
+                    // Plane-major per chunk (libaom's plane loop is outermost
+                    // inside the mu walk); within a plane the units walk raster.
                     for plane_idx in 1..3 {
                         let buf: &mut PlaneBuf<'static> =
                             if plane_idx == 1 { &mut *u } else { &mut *v };
-                        let cu_grid = if skip {
-                            push_intra(
-                                plane_idx,
-                                cu_x,
-                                cu_y,
-                                cu_tx,
-                                uv_predict_mode,
-                                angle_delta_uv,
-                                cu_reach,
-                                &ZERO_RESIDUAL[..cu_tx * cu_tx],
-                                None,
-                                None,
-                                smooth_neighbor_uv,
-                                fctx,
-                            );
-                            Grid::Zero(cu_tx * cu_tx)
-                        } else {
-                            read_plane(
-                                dec,
-                                cdfs,
-                                chroma_set,
-                                &cu_scan,
-                                plane_idx,
-                                cu_around[plane_idx],
-                                mode,
-                                uv_predict_mode,
-                                angle_delta_uv,
-                                cu_reach,
-                                buf,
-                                cu_x,
-                                cu_y,
-                                cu_tx,
-                                cu_tx,
-                                base_q_idx,
-                                // CfL is refused above 32x32
-                                // (`is_cfl_allowed`), so never here.
-                                None,
-                                None,
-                                // The uv plane block (64x64) is larger than
-                                // the unit (32x32): `get_txb_ctx`'s offset-10
-                                // rows, +3 on the `txb_skip_chroma_32` table
-                                // (lane-sb128b r3).
-                                Some(3),
-                                smooth_neighbor_uv,
-                                fctx,
-                            )?
-                        };
-                        // Immediately, so the NEXT chunk's unit reads this
-                        // one's coefficient context.
-                        neighbours
-                            .record_mi_chroma(cu_mi, luma_span, luma_span, plane_idx, &cu_grid);
-                        hit!(CHROMA_SPLIT_TX_HITS);
-                        // lane-dpm1: the two INTER mu-chunk sites set this and this
-                        // INTRA-in-inter one did not, so the whole-block chroma
-                        // record below re-stamped all four 32x32 units with the
-                        // TOP-LEFT unit's level and the next block read a txb_skip
-                        // row libaom never selects (class `override-slot-on-one-arm`).
-                        mu_chroma = true;
-                        let dst = mu_units(
-                            if plane_idx == 1 {
-                                &mut u_units
-                            } else {
-                                &mut v_units
-                            },
-                            chroma_side * chroma_side,
-                        );
-                        for rr in 0..cu_tx {
-                            let start = (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
-                            dst[start..start + cu_tx]
-                                .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
+                        for ur in 0..units_h {
+                            for uc in 0..units_w {
+                                // The unit's own mi origin: the chunk's
+                                // (16x16 mi) plus the unit's offset inside it.
+                                let unit_mi = (
+                                    at_mi.0 + cr * 16 + ur * (unit_luma_h / MI),
+                                    at_mi.1 + cc * 16 + uc * (unit_luma_w / MI),
+                                );
+                                // The unit's own entropy-cell span, so the
+                                // NEXT unit of this chunk reads THIS one's
+                                // state and the next chunk reads the last.
+                                let cu_around = neighbours.around_mi(unit_mi, unit_luma_w);
+                                let (cu_x, cu_y) = (
+                                    cpx + cc * chunk_chroma_w + uc * cu_tx,
+                                    cpy + cr * chunk_chroma_h + ur * cu_tx,
+                                );
+                                let cu_reach = crate::decode::tu_reach(
+                                    side,
+                                    side,
+                                    cc * chunk_luma + uc * unit_luma_w,
+                                    cr * chunk_luma + ur * unit_luma_h,
+                                    unit_luma_w,
+                                    reach,
+                                    px,
+                                    py,
+                                    y.width,
+                                    y.height,
+                                    fctx,
+                                );
+                                let cu_grid = if skip {
+                                    push_intra(
+                                        plane_idx,
+                                        cu_x,
+                                        cu_y,
+                                        cu_tx,
+                                        uv_predict_mode,
+                                        angle_delta_uv,
+                                        cu_reach,
+                                        &ZERO_RESIDUAL[..cu_tx * cu_tx],
+                                        None,
+                                        None,
+                                        smooth_neighbor_uv,
+                                        fctx,
+                                    );
+                                    Grid::Zero(cu_tx * cu_tx)
+                                } else {
+                                    read_plane(
+                                        dec,
+                                        cdfs,
+                                        chroma_set,
+                                        &cu_scan,
+                                        plane_idx,
+                                        cu_around[plane_idx],
+                                        mode,
+                                        uv_predict_mode,
+                                        angle_delta_uv,
+                                        cu_reach,
+                                        buf,
+                                        cu_x,
+                                        cu_y,
+                                        cu_tx,
+                                        cu_tx,
+                                        base_q_idx,
+                                        // CfL is refused above 32x32
+                                        // (`is_cfl_allowed`), so never here.
+                                        None,
+                                        None,
+                                        // The uv plane block is larger than
+                                        // the unit: `get_txb_ctx`'s offset-10
+                                        // rows, +3 on the `txb_skip_chroma_32`
+                                        // table (lane-sb128b r3).
+                                        Some(3),
+                                        smooth_neighbor_uv,
+                                        fctx,
+                                    )?
+                                };
+                                // Immediately, so the NEXT unit reads this
+                                // one's coefficient context.
+                                neighbours.record_mi_chroma(
+                                    unit_mi,
+                                    unit_luma_w,
+                                    unit_luma_h,
+                                    plane_idx,
+                                    &cu_grid,
+                                );
+                                hit!(CHROMA_SPLIT_TX_HITS);
+                                // lane-dpm1: the two INTER mu-chunk sites set
+                                // this and this INTRA-in-inter one did not, so
+                                // the whole-block chroma record below re-stamped
+                                // all four 32x32 units with the TOP-LEFT unit's
+                                // level and the next block read a txb_skip row
+                                // libaom never selects (class
+                                // `override-slot-on-one-arm`).
+                                mu_chroma = true;
+                                let dst = mu_units(
+                                    if plane_idx == 1 {
+                                        &mut u_units
+                                    } else {
+                                        &mut v_units
+                                    },
+                                    chroma_side * chroma_side,
+                                );
+                                // The ASSEMBLED grid stays at the square
+                                // `chroma_side` stride the block tail's
+                                // re-stamp indexes; the unit's true per-axis
+                                // position inside its chunk is what changes.
+                                for rr in 0..cu_tx {
+                                    let start = (cr * chunk_chroma_h + ur * cu_tx + rr)
+                                        * chroma_side
+                                        + cc * chunk_chroma_w
+                                        + uc * cu_tx;
+                                    dst[start..start + cu_tx]
+                                        .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
+                                }
+                            }
                         }
                     }
                 }
@@ -44183,7 +44294,7 @@ fn decode_inter_block(
     // way; only the 128 root gets four TX_64X64 leaves regardless of `skip`.
     let skip_inter_128 = skip && is_inter && write_w.max(write_h) > 64;
     if skip_inter_128 {
-        neighbours.suppress_internal_lf_edges((rmi, cmi), write_w / MI, write_h / MI);
+        neighbours.suppress_internal_lf_edges((rmi, cmi), write_w / MI, write_h / MI, fctx);
     }
     if let Some(leaves) = (!skip_inter_128).then_some(()).and(vartx_leaves.as_ref()) {
         for &(row, col, tw, th) in leaves {
