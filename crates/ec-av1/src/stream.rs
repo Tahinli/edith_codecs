@@ -9114,6 +9114,22 @@ pub(crate) mod tests {
     /// the machine's scratchpad is reaped -- three gates sat at `rc=0` having
     /// tested nothing for exactly that reason (lane-av1pins). Falls back to
     /// `pin_dir()` so a locally re-captured stream still overrides.
+    /// Read a pin that a gate cannot proceed without. A missing pin is a
+    /// HARD failure naming the path and the generator, never a raw io panic
+    /// and never a silent skip: `EC_AV1_GATE_DUMP_PIN` points the gate at a
+    /// freshly captured stream, and a runner without the committed copy must
+    /// say so instead of reporting green having tested nothing.
+    fn require_pin(path: &std::path::Path, name: &str) -> Vec<u8> {
+        std::fs::read(path).unwrap_or_else(|e| {
+            panic!(
+                "no pinned bytes at {} ({e}) -- set EC_AV1_GATE_DUMP_PIN to a freshly \
+             captured stream, or restore the committed copy at \
+             crates/ec-av1/fixtures/{name}",
+                path.display()
+            )
+        })
+    }
+
     fn crate_pin(name: &str) -> std::path::PathBuf {
         let in_crate = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
@@ -23727,22 +23743,22 @@ pub(crate) mod tests {
     /// `EC_AV1_GATE_DUMP=$SP/golden4-pin.obu` off
     /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
     /// (seed 43, frame 3 luma) the round the GOLDEN mask lifted. Deterministic
-    /// and static -- `#[ignore]`d, run manually.
+    /// and static.
+    ///
+    /// LIVE since lane-av1pinslive r3: the bytes are committed at
+    /// `crates/ec-av1/fixtures/golden4-pin.obu` (137 bytes; sha256
+    /// `1754023e44e46edaebc2c05065bf1c65db1a41354577cbf71c0e8ebe737ae14a`,
+    /// recovered byte-for-byte from the runner library), so the old
+    /// "reads a pinned fixture path outside the repo" reason is false. Costs
+    /// ~0.10 s, touches no process-global, reads `non_last_ref_hits` for
+    /// diagnostic output only (never asserted), and calls no aomenc.
     #[test]
-    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
     fn pinned_golden4_stream_decodes_pixel_exact() {
         use crate::decode::non_last_ref_hits;
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| pin_dir().join("golden4-pin.obu"));
-        let Ok(stream) = std::fs::read(&path) else {
-            eprintln!(
-                "SKIP pinned_golden4_stream_decodes_pixel_exact: no pinned bytes at {} \
-                 -- re-capture with EC_AV1_GATE_DUMP off the cdf-forwarding gate",
-                path.display()
-            );
-            return;
-        };
+            .unwrap_or_else(|_| crate_pin("golden4-pin.obu"));
+        let stream = require_pin(&path, "golden4-pin.obu");
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_golden4_stream_decodes_pixel_exact: no ffmpeg");
             return;
@@ -23765,15 +23781,22 @@ pub(crate) mod tests {
     /// by the forwarding gate once film grain is out of the way (1/20 real
     /// aomenc streams, frame 3 luma, apply_grain=false, `non_last_ref_hits`
     /// delta=2). `GOLDEN_FRAME` refuses by name until this decodes exact.
+    ///
+    /// LIVE since lane-av1pinslive r3. The old shape was the worst of the
+    /// class: a `concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/...")`
+    /// literal, which points at the GITIGNORED root and can therefore never be
+    /// satisfied by a committed pin, combined with a bare `.expect()`. The
+    /// bytes are now committed at
+    /// `crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu` (152 bytes;
+    /// sha256 `81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be`,
+    /// recovered byte-for-byte from the runner library).
     #[test]
-    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
     fn pinned_golden7_stream_decodes_pixel_exact() {
         use crate::decode::non_last_ref_hits;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/golden7-forwarding-mismatch.obu"
-        );
-        let stream = std::fs::read(path).expect("reading pinned stream");
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate_pin("golden7-forwarding-mismatch.obu"));
+        let stream = require_pin(&path, "golden7-forwarding-mismatch.obu");
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_golden7_stream_decodes_pixel_exact: no ffmpeg");
             return;
@@ -30268,10 +30291,23 @@ pub(crate) mod tests {
     /// to get the real window on stderr, call-uniquely keyed to `xqd ==
     /// [-16,-32]` rather than any coordinate.
     #[test]
-    #[ignore = "reads a pinned fixture under the gitignored fixtures dir; run manually with EC_LR_CALL_DUMP=1"]
+    // Stays `#[ignore]`d, and here are FACTS, not a judgement: (1) this gate
+    // asserts NOTHING -- it `eprintln!`s per-frame mismatch counts and returns,
+    // so it cannot go red on a decode regression and un-ignoring it would add a
+    // test that reports pass unconditionally; (2) its bytes ARE now committed
+    // at `crates/ec-av1/fixtures/lr-sgr-r7.obu` (192 bytes; sha256
+    // `6b95b20e3377430ffae0b2ce86fad9502e0dedf13cd6c38ab7f5af4a8b21f33d`,
+    // recovered byte-for-byte from the runner library), so the old "reads a
+    // pinned fixture under the gitignored fixtures dir" reason is false; (3) it
+    // yields a window only with `EC_LR_CALL_DUMP=1`, a debugging session rather
+    // than a suite run. What would close it: give it the pixel asserts its
+    // siblings have, then un-ignore.
+    #[ignore = "diagnostic only -- asserts nothing, so it cannot fail on a decode regression; run with --ignored and EC_LR_CALL_DUMP=1 for the Sgrproj window"]
     fn pinned_lr_sgr_stream_call_unique_dump() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/lr-sgr-r7.obu");
-        let stream = std::fs::read(path).expect("reading pinned lr-sgr-r7.obu");
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate_pin("lr-sgr-r7.obu"));
+        let stream = require_pin(&path, "lr-sgr-r7.obu");
         let pics = decode_stream(&stream).expect("pinned lr-sgr-r7.obu must decode");
         if have_ffmpeg() {
             let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
@@ -33203,11 +33239,19 @@ pub(crate) mod tests {
             eprintln!("SKIP a_real_aomenc_stream_with_film_grain_decodes_pixel_exact: no ffmpeg");
             return;
         }
-        let data = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/golden6-mismatch.obu"
-        ))
-        .unwrap();
+        // lane-av1pinslive r3: this gate was LIVE while reading a GITIGNORED
+        // pin through a `concat!` literal and `.unwrap()` -- a clean checkout
+        // with no runner library PANICKED here rather than skipping. The bytes
+        // are now committed at `crates/ec-av1/fixtures/golden6-mismatch.obu`
+        // (452 bytes; sha256
+        // `c56909b98542192b03f3a945e153475aa57a58a1586bf166513297296cb225b3`,
+        // recovered byte-for-byte from the runner library).
+        let data = require_pin(
+            &std::env::var("EC_AV1_GATE_DUMP_PIN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| crate_pin("golden6-mismatch.obu")),
+            "golden6-mismatch.obu",
+        );
         // Truncate right after the first `Frame` OBU (the key frame): every
         // byte up to there is sequence header + frame-0, which is a complete,
         // independently decodable single-frame stream.
@@ -46333,9 +46377,8 @@ pub(crate) mod tests {
                 h + v
             };
             crate::decode::reset_rect4_inter_own_chroma444_hits();
-            let frames = decode_stream(&stream).unwrap_or_else(|e| {
-                panic!("{NAME}: {fixture} no longer decodes cleanly: {e}")
-            });
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: {fixture} no longer decodes cleanly: {e}"));
             let own_chroma = crate::decode::rect4_inter_own_chroma444_hits();
             let strips = {
                 let (h, v, _, _) = crate::decode::inter16_rect4_counters();
@@ -46747,8 +46790,9 @@ pub(crate) mod tests {
         let _guard = lock_gate_counters();
         let before_sr = crate::superres::superres_hits();
         let before_scaled = crate::mc::predict_scaled_hits();
-        let frames = decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{name}: the pinned 4:4:4 superres stream was refused: {e}"));
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{name}: the pinned 4:4:4 superres stream was refused: {e}")
+        });
         let scaled_up = crate::superres::superres_hits() - before_sr;
         let scaled_mc = crate::mc::predict_scaled_hits() - before_scaled;
         assert!(
@@ -46914,9 +46958,21 @@ pub(crate) mod tests {
         }
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=256x128:rate=25",
-                "-frames:v", "4", "-pix_fmt", "yuv444p", "-strict", "-1", "-f",
-                "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=256x128:rate=25",
+                "-frames:v",
+                "4",
+                "-pix_fmt",
+                "yuv444p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -46928,10 +46984,11 @@ pub(crate) mod tests {
             "{NAME}: ffmpeg refused to generate the y4m source: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let pinned =
-            std::fs::read(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/444_lossy_superres_mode2_256x128.obu"))
-                .expect("pinned fixture disappeared between the two reads");
+        let pinned = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/444_lossy_superres_mode2_256x128.obu"),
+        )
+        .expect("pinned fixture disappeared between the two reads");
         for extra in [
             vec![],
             vec!["--superres-denominator=9"],
