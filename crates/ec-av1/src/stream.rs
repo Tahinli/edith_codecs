@@ -43597,4 +43597,496 @@ pub(crate) mod tests {
         }
         assert!(seen, "{name}: no sequence header parsed");
     }
+
+    /// lane-av1tilemeasure: the per-frame facts a tiling / superres / odd-size
+    /// cell's OWN claim needs, read off the parsed stream.
+    ///
+    /// Every gate below asserts its cell through this, never through the
+    /// aomenc flag that was supposed to produce it. `lanes/av1formatsweep.
+    /// report.md` trap 2 is exactly that failure: `--tile-rows=1` below 256px
+    /// high at `--sb-size=128` leaves the stream byte-identical, so a gate
+    /// that trusted the flag would report an untiled decode as a tile-row
+    /// decode (and the sweep's own 10/12-bit "tile rows" numbers were that).
+    #[derive(Debug, Clone, Copy)]
+    struct FrameFacts {
+        tile_cols: u32,
+        tile_rows: u32,
+        use_superres: bool,
+        coded_w: u32,
+        coded_h: u32,
+        upscaled_w: u32,
+        mi_cols: u32,
+        mi_rows: u32,
+    }
+
+    fn frame_facts(stream: &[u8], name: &str) -> Vec<FrameFacts> {
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut out: Vec<FrameFacts> = Vec::new();
+        while pos < stream.len() {
+            let obu = parser
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: aomenc OBU does not parse: {e:?}"));
+            if obu.total_size == 0 {
+                break;
+            }
+            pos += obu.total_size;
+            if let ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) = obu.kind {
+                out.push(FrameFacts {
+                    tile_cols: h.tile_info.cols,
+                    tile_rows: h.tile_info.rows,
+                    use_superres: h.use_superres,
+                    coded_w: h.frame_width,
+                    coded_h: h.frame_height,
+                    upscaled_w: h.upscaled_width,
+                    mi_cols: h.mi_cols,
+                    mi_rows: h.mi_rows,
+                });
+            }
+        }
+        assert!(
+            !out.is_empty(),
+            "{name}: the stream carries no frame header"
+        );
+        out
+    }
+
+    /// lane-av1tilemeasure: 12-BIT 4:2:0 with tile ROWS genuinely enabled, and
+    /// with a 2x2 tile grid. `gate_coverage.rs` records that the multi-tile
+    /// 2D grid is covered "at both bit depths" -- meaning 8 and 10; 12 was the
+    /// gap, and the sweep's 12-bit "tile rows" cell (t420_12_row) never
+    /// encoded an untiled control, so nobody could say which stream it had
+    /// measured.
+    ///
+    /// Recipe (per arm): `mandelbrot 256x256` + `-vf gblur=sigma=6`
+    /// yuv420p12le 6 frames (the 12-bit screen-tools refusal fires on a sharp
+    /// source -- H6), `aomenc --codec=av1 --passes=1 --end-usage=q
+    /// --cq-level=20 --cpu-used=2 --enable-palette=0 --enable-intrabc=0
+    /// --threads=1 --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 --limit=6
+    /// --input-bit-depth=12 --bit-depth=12 --obu -o - -` plus `--tile-rows=1`
+    /// (arm 1) or `--tile-columns=1 --tile-rows=1` (arm 2).
+    ///
+    /// NON-VACUITY, in the order a reader should check it:
+    /// 1. the sequence header is `ss (1,1)` at 12 bits
+    ///    (`odd_dim_header_mi_grid`);
+    /// 2. EVERY frame header's parsed `tile_info` is 1x2 / 2x2 -- the trap-2
+    ///    guard: an untiled stream fails here before a pixel is read;
+    /// 3. `decode::tile_hits()` advances by at least one hit per tile per
+    ///    frame, so tile 1 (and the second ROW) really decoded rather than the
+    ///    first tile being decoded twice;
+    /// 4. every decoded plane is 256*256 samples -- a truncated or
+    ///    quarter-extent decode fails the shape assert;
+    /// 5. `decode_all_frames_vs_oracle` asserts the decode-order frame COUNT
+    ///    and each frame's byte LENGTH against the instrumented `aomdec`
+    ///    before any sample is compared (a prefix compare is not a compare --
+    ///    the same report's trap 1).
+    #[test]
+    fn a_real_aomenc_12bit_stream_with_two_tile_rows_and_a_two_by_two_tile_grid_decodes_pixel_exact()
+     {
+        const NAME: &str = "a_real_aomenc_12bit_stream_with_two_tile_rows_and_a_two_by_two_tile_grid_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let arms: [(&str, &[&str], u32, u32); 2] = [
+            ("two tile rows", &["--tile-rows=1"], 1, 2),
+            (
+                "a 2x2 tile grid",
+                &["--tile-columns=1", "--tile-rows=1"],
+                2,
+                2,
+            ),
+        ];
+        for (label, tiles, want_cols, want_rows) in arms {
+            let mut extra = vec![
+                "--cq-level=20",
+                "--cpu-used=2",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+            ];
+            extra.extend_from_slice(tiles);
+            let stream = chroma_format_stream(256, 256, "yuv420p12le", 12, 6, &extra, 1);
+            odd_dim_header_mi_grid(&stream, NAME, 12);
+            let facts = frame_facts(&stream, NAME);
+            assert_eq!(
+                facts.len(),
+                6,
+                "{NAME} ({label}): expected six frame headers, parsed {}",
+                facts.len()
+            );
+            for (i, f) in facts.iter().enumerate() {
+                assert_eq!(
+                    (f.tile_cols, f.tile_rows),
+                    (want_cols, want_rows),
+                    "{NAME} ({label}): decode-order frame {i} parses tile_info {}x{}, not \
+                     {want_cols}x{want_rows} -- the aomenc tile flag was a NO-OP at this \
+                     geometry, so this arm would be measuring an untiled stream",
+                    f.tile_cols,
+                    f.tile_rows
+                );
+            }
+            let before_tiles = crate::decode::tile_hits();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME} ({label}): refused the stream: {e}"));
+            let tile_hits = crate::decode::tile_hits() - before_tiles;
+            assert!(
+                tile_hits >= facts.len() * (want_cols * want_rows) as usize,
+                "{NAME} ({label}): tile_hits advanced by {tile_hits} over {} frames of a \
+                 {}x{} grid -- not every tile decoded",
+                facts.len(),
+                want_cols,
+                want_rows
+            );
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(
+                    f.y.len(),
+                    256 * 256,
+                    "{NAME} ({label}): frame {i} luma plane is {} samples, not 256x256",
+                    f.y.len()
+                );
+            }
+            let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert!(
+                frames_decoded >= 6,
+                "{NAME} ({label}): {frames_decoded} decode-order frames"
+            );
+            eprintln!(
+                "{NAME} ({label}): {frames_decoded} frames byte-exact vs aomdec, tiles \
+                 {want_cols}x{want_rows} confirmed on every frame header, tile_hits {tile_hits}"
+            );
+        }
+    }
+
+    /// lane-av1tilemeasure: 4:4:4 SUPERRES at 8, 10 and 12 bits. The sweep's
+    /// superres row was `--superres-mode=1` alone, and measured that recipe
+    /// at 4:4:4 8 bits: this lane re-encoded it and read `use_superres` on
+    /// every frame header -- ZERO frames carried it, so that cell never
+    /// exercised the upscaler at all (the same "an aomenc flag is not
+    /// evidence" trap as tile rows, one axis over). libaom only signals
+    /// `use_superres` when a DENOMINATOR is given, so the arms here spell
+    /// `--superres-denominator=12 --superres-kf-denominator=12` and the
+    /// header says `use_superres=1` on all four frames.
+    ///
+    /// Recipe: `testsrc2 128x128` yuv444p10le (12-bit: the gblur'd
+    /// `mandelbrot`, H6) 4 frames, `aomenc --codec=av1 --passes=1
+    /// --end-usage=q --cq-level=20 --cpu-used=2 --enable-palette=0
+    /// --enable-intrabc=0 --superres-mode=1 --superres-denominator=12
+    /// --superres-kf-denominator=12 --threads=1 --row-mt=0 --lag-in-frames=0
+    /// --kf-max-dist=100 --limit=4 --input-bit-depth=N --bit-depth=N --obu
+    /// -o - -`. Coded width comes out 85px, upscaled to 128.
+    ///
+    /// NON-VACUITY: `ss (0,0)` at the claimed depth; EVERY frame header has
+    /// `use_superres` with a coded width strictly below the upscaled one (a
+    /// stream without it fails here, not at the pixel compare);
+    /// `superres::superres_hits()` advances once per frame (the upscaler
+    /// really ran); every decoded plane is the UPSCALED 128x128 -- a decoder
+    /// that forgot the upsample would hand back 85x128 and fail the shape
+    /// assert, and at `ss (0,0)` the chroma planes must be full resolution
+    /// too; then the length-asserting `aomdec` compare.
+    #[test]
+    fn a_real_aomenc_444_superres_stream_at_8_10_and_12_bit_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_444_superres_stream_at_8_10_and_12_bit_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        for (depth, pix_fmt, smooth) in [
+            (8usize, "yuv444p", 0u8),
+            (10, "yuv444p10le", 0),
+            (12, "yuv444p12le", 1),
+        ] {
+            let stream = chroma_format_stream(
+                128,
+                128,
+                pix_fmt,
+                depth,
+                4,
+                &[
+                    "--cq-level=20",
+                    "--cpu-used=2",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--superres-mode=1",
+                    "--superres-denominator=12",
+                    "--superres-kf-denominator=12",
+                ],
+                smooth,
+            );
+            assert_444_header(&stream, NAME, depth);
+            let facts = frame_facts(&stream, NAME);
+            for (i, f) in facts.iter().enumerate() {
+                assert!(
+                    f.use_superres,
+                    "{NAME} ({depth}-bit): decode-order frame {i} has use_superres=0 -- the \
+                     superres cell would be measuring an ordinary 4:4:4 stream"
+                );
+                assert!(
+                    f.coded_w < f.upscaled_w,
+                    "{NAME} ({depth}-bit): frame {i} codes {}px and upscaled_width says {}px",
+                    f.coded_w,
+                    f.upscaled_w
+                );
+                assert_eq!(f.upscaled_w, 128, "{NAME} ({depth}-bit): upscaled width");
+            }
+            let before_sr = crate::superres::superres_hits();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME} ({depth}-bit): refused the stream: {e}"));
+            let superres_hits = crate::superres::superres_hits() - before_sr;
+            assert!(
+                superres_hits >= facts.len(),
+                "{NAME} ({depth}-bit): superres_hits advanced by {superres_hits} over {} \
+                 frames -- the upscaler never ran",
+                facts.len()
+            );
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(
+                    f.y.len(),
+                    128 * 128,
+                    "{NAME} ({depth}-bit): frame {i} luma is {} samples -- a superres decode \
+                     must hand back the UPSCALED 128x128, not the 85px coded width",
+                    f.y.len()
+                );
+                assert_eq!(
+                    f.u.len(),
+                    128 * 128,
+                    "{NAME} ({depth}-bit): frame {i} chroma is {} samples -- at 4:4:4 the chroma \
+                     plane is full resolution at the upscaled size",
+                    f.u.len()
+                );
+            }
+            let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert!(
+                frames_decoded >= 4,
+                "{NAME} ({depth}-bit): {frames_decoded} decode-order frames"
+            );
+            eprintln!(
+                "{NAME} ({depth}-bit): {frames_decoded} frames byte-exact vs aomdec, \
+                 use_superres on every frame, superres_hits {superres_hits}"
+            );
+        }
+    }
+
+    /// lane-av1tilemeasure: 4:4:4 at PARTIAL and ODD coded dimensions,
+    /// 8/10/12 bits -- and a correction to what the sweep's "odd dims" cell
+    /// was measuring.
+    ///
+    /// **The sweep's odd-dimension 4:4:4 cells were not odd.** 66x66,
+    /// 130x122 and 194x130 are even in BOTH axes; what they are is "not a
+    /// multiple of 8", the same class as the 4:2:0 row the sweep measured as
+    /// "even, not a multiple of 8". This gate's own assert said so out loud
+    /// on its first run: `the 66x66 arm is even in BOTH axes`. The genuinely
+    /// odd arms are the two 12-bit ones, and they are producible only at 12
+    /// bits: at 8 and 10 bits aomenc rounds a 4:4:4 odd size DOWN to even
+    /// (`67x67` -> coded 66x66, `131x131` -> coded 130x130, both measured),
+    /// the same rounding the sweep proved for 4:2:0. 12-bit (seq_profile 2)
+    /// keeps 67x67 and 65x67 odd, and both decode byte-exact.
+    ///
+    /// The sweep's 130x122 DIVERGENT verdict is also corrected here: this
+    /// lane re-encoded the identical stream (the bytes reproduce the
+    /// sweep's sha256 `c87ac65b…`) and it is byte-exact against `aomdec`.
+    /// That published verdict came from the prefix compare the same report
+    /// documents as its trap 1.
+    ///
+    /// Recipe per arm: `testsrc2 WxH` yuv444p[10le|12le] 4 frames (12-bit:
+    /// the gblur'd `mandelbrot`, H6), `aomenc --codec=av1 --passes=1
+    /// --end-usage=q --cq-level=20 --cpu-used=2 --enable-palette=0
+    /// --enable-intrabc=0 --threads=1 --row-mt=0 --lag-in-frames=0
+    /// --kf-max-dist=100 --limit=4 --obu -o - -` (plus `--input-bit-depth` /
+    /// `--bit-depth` above 8).
+    ///
+    /// NON-VACUITY: `ss (0,0)` at the claimed depth; the arm is not a
+    /// multiple of 8 in some axis, and the `odd` flag says whether an axis is
+    /// odd, so an arm cannot quietly become the cell next door; EVERY frame
+    /// header's coded width and height are exactly the claimed sizes -- a
+    ///omenc rounding would make the arm measure a different geometry and fails
+    /// here rather than at the pixel compare; the mode-info grid is PARTIAL
+    /// (`mi_cols*8 > width` or `mi_rows*8 > height`), the partial-plane walk
+    /// the cell exists for; every decoded plane is exactly `width*height` (at
+    /// `ss (0,0)` the chroma planes are full resolution, so a 4:2:0 extent or
+    /// a truncated decode fails the shape assert); then the
+    /// length-asserting `aomdec` compare.
+    #[test]
+    fn a_real_aomenc_444_partial_and_odd_coded_dimension_streams_decode_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_444_partial_and_odd_coded_dimension_streams_decode_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        // (width, height, bit depth, smooth source, an axis is odd)
+        let arms: [(usize, usize, usize, u8, bool); 10] = [
+            (66, 66, 8, 0, false),
+            (98, 66, 8, 0, false),
+            (130, 122, 8, 0, false),
+            (66, 66, 10, 0, false),
+            (194, 130, 10, 0, false),
+            (130, 122, 10, 0, false),
+            (66, 66, 12, 1, false),
+            (130, 122, 12, 1, false),
+            (67, 67, 12, 1, true),
+            (65, 67, 12, 1, true),
+        ];
+        for (w, h, depth, smooth, odd) in arms {
+            assert!(
+                w % 8 != 0 || h % 8 != 0,
+                "{NAME}: the {w}x{h} arm is a multiple of 8 -- it is not a partial-size cell"
+            );
+            assert_eq!(
+                w % 2 == 1 || h % 2 == 1,
+                odd,
+                "{NAME}: the {w}x{h} arm's `odd` flag is wrong"
+            );
+            let pix_fmt = match depth {
+                8 => "yuv444p",
+                10 => "yuv444p10le",
+                _ => "yuv444p12le",
+            };
+            let stream = chroma_format_stream(
+                w,
+                h,
+                pix_fmt,
+                depth,
+                4,
+                &[
+                    "--cq-level=20",
+                    "--cpu-used=2",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                ],
+                smooth,
+            );
+            assert_444_header(&stream, NAME, depth);
+            let facts = frame_facts(&stream, NAME);
+            for (i, f) in facts.iter().enumerate() {
+                assert_eq!(
+                    (f.coded_w as usize, f.coded_h as usize),
+                    (w, h),
+                    "{NAME} ({w}x{h} {depth}-bit): decode-order frame {i} codes {}x{} -- the arm \
+                     is not measuring the geometry it names",
+                    f.coded_w,
+                    f.coded_h
+                );
+                assert!(
+                    f.mi_cols as usize * 8 > w || f.mi_rows as usize * 8 > h,
+                    "{NAME} ({w}x{h} {depth}-bit): frame {i} has a {}x{} mode-info grid, which \
+                     covers the frame exactly -- the partial-plane walk never runs",
+                    f.mi_cols,
+                    f.mi_rows
+                );
+            }
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME} ({w}x{h} {depth}-bit): refused: {e}"));
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(
+                    f.y.len(),
+                    w * h,
+                    "{NAME} ({w}x{h} {depth}-bit): frame {i} luma is {} samples",
+                    f.y.len()
+                );
+                assert_eq!(
+                    f.u.len(),
+                    w * h,
+                    "{NAME} ({w}x{h} {depth}-bit): frame {i} chroma is {} samples -- at 4:4:4 \
+                     the chroma plane is full resolution even at an odd coded size",
+                    f.u.len()
+                );
+            }
+            let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert!(
+                frames_decoded >= 4,
+                "{NAME} ({w}x{h} {depth}-bit): {frames_decoded} decode-order frames"
+            );
+            eprintln!(
+                "{NAME}: {w}x{h} {depth}-bit codes exactly as named (odd axis: {odd}), \
+                 {frames_decoded} frames byte-exact vs aomdec"
+            );
+        }
+    }
+
+    /// lane-av1tilemeasure: the H3 CONTROL -- 4:4:4 LOSSLESS 8-bit with NO
+    /// tiles -- beside its two-tile-column sibling at the same geometry. The
+    /// sweep's H3 named a 90-chroma-sample divergence on a lossless 4:4:4
+    /// tile-column stream; the control it never encoded is the untiled stream
+    /// at the same size, and without it "tiles cause it" and "4:4:4 lossless
+    /// chroma causes it" are the same sentence. Measured here: BOTH arms are
+    /// byte-exact against the oracle at 256x128, so at THIS geometry the
+    /// defect does not reproduce with or without tiles; the first 4:4:4
+    /// lossless fork measured in this lane is at 192x192 (34 chroma samples,
+    /// first U(90,25)), where the tiled and untiled streams diverge at the
+    /// very same sample -- see `lanes/av1tilemeasure.report.md`.
+    ///
+    /// Recipe per arm: `testsrc2 256x128` yuv444p 6 frames, `aomenc
+    /// --codec=av1 --lossless=1 --passes=1 --end-usage=q --threads=1
+    /// --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 --limit=6
+    /// --enable-palette=0 --enable-intrabc=0 --obu -o - -`, plus
+    /// `--tile-columns=1` on the sibling.
+    ///
+    /// NON-VACUITY: `ss (0,0)` at 8 bits; every frame header's parsed
+    /// `tile_info` is 1x1 for the control and 2x1 for the sibling (so the
+    /// control cannot silently become a tiled stream, which is the whole
+    /// point of the arm); `decode::rect_split_lossless_chroma444_hits()`
+    /// advances, i.e. a lossless strip really walked its chroma as 4:4:4 4x4
+    /// units; then the length-asserting `aomdec` compare.
+    #[test]
+    fn a_lossless_444_8bit_untiled_control_and_its_two_tile_column_sibling_decode_pixel_exact() {
+        const NAME: &str = "a_lossless_444_8bit_untiled_control_and_its_two_tile_column_sibling_decode_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let arms: [(&str, &[&str], u32, u32); 2] = [
+            (
+                "untiled control",
+                &["--lossless=1", "--enable-palette=0", "--enable-intrabc=0"],
+                1,
+                1,
+            ),
+            (
+                "two tile columns",
+                &[
+                    "--lossless=1",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--tile-columns=1",
+                ],
+                2,
+                1,
+            ),
+        ];
+        for (label, flags, want_cols, want_rows) in arms {
+            let stream = chroma_format_stream(256, 128, "yuv444p", 8, 6, flags, 0);
+            assert_444_header(&stream, NAME, 8);
+            let facts = frame_facts(&stream, NAME);
+            for (i, f) in facts.iter().enumerate() {
+                assert_eq!(
+                    (f.tile_cols, f.tile_rows),
+                    (want_cols, want_rows),
+                    "{NAME} ({label}): decode-order frame {i} parses tile_info {}x{}, not \
+                     {want_cols}x{want_rows}",
+                    f.tile_cols,
+                    f.tile_rows
+                );
+            }
+            let before_444 = crate::decode::rect_split_lossless_chroma444_hits();
+            let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert!(
+                crate::decode::rect_split_lossless_chroma444_hits() > before_444,
+                "{NAME} ({label}) went blind: no lossless strip walked its chroma as 4:4:4 4x4 \
+                 units, so the cell never reached the 4:4:4 chroma path"
+            );
+            assert!(
+                frames_decoded >= 6,
+                "{NAME} ({label}): {frames_decoded} decode-order frames"
+            );
+            eprintln!(
+                "{NAME} ({label}): {frames_decoded} frames byte-exact vs aomdec, tiles \
+                 {want_cols}x{want_rows} confirmed on every frame header"
+            );
+        }
+    }
 }
