@@ -310,10 +310,24 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     // therefore never prove this tool by naming the flag, only by proving a
     // rect transform unit fired (`rect_partition_hits` /
     // `rect_coeff_tu_hits`, which lane-rect1d's gate does assert).
-    (
-        "enable-rect-tx",
-        "never spelled; rect transforms reach the decoder only through partition shape, never through a gate that names the tool",
-    ),
+    // `enable-rect-tx` LEFT this list on 2026-09-29 (merge wave 2,
+    // lane-av1toolgates). Both halves of the reason recorded above still hold
+    // as statements about the FLAG, and the second is exactly why the closing
+    // evidence is a parsed shape and not a spelling: `enable_rect_tx` has no
+    // sequence-header bit, so a decoder path can never be proven by naming the
+    // flag -- only by proving a rect transform unit fired.
+    // `a_real_aomenc_8bit_stream_with_a_rect_transform_decodes_pixel_exact`
+    // (and its 10-bit twin) now spell `--enable-rect-tx=1` in their OWN test
+    // bodies -- inline on purpose, because a helper-owned recipe collapses
+    // both gates into one helper segment that `is_ten_bit` files 10-bit, and
+    // the 8-bit hole would stay open -- and prove the tool on the PARSED
+    // shape: `rect_partition_hits()` and `rect_coeff_tu_hits()` are both
+    // asserted > 0 over arms that decoded AND pixel-compared, and each
+    // counter is mutation-proven red on its own message.
+    // Census on the merged tree (`print_never_exercised_per_bit_depth`):
+    // 255 real-aomenc gate bodies, NEVER_EXERCISED derived EMPTY at 8 bits
+    // and at 10 bits -- 0 of 26 tools -- so this list is empty on the same
+    // evidence, not by deletion of a claim.
 ];
 
 #[cfg(test)]
@@ -371,10 +385,13 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // compared attempts, 10 of them 1D). The gate also hard-asserts
     // `compared_class1 > 0`, so its "passes =1 at both depths" is backed by an
     // arrival assert, not just a spelling.
-    (
-        "enable-dual-filter",
-        "exercised at 8 bits only, by a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact (=1, asserts dual_filter_diff_hits moved); no 10-bit gate spells =1 -- that gate calls inter_sb_none_gate with ten_bit=false. Retire by adding its 10-bit arm",
-    ),
+    // `enable-dual-filter` LEFT this list on 2026-09-29 (merge wave 2,
+    // lane-av1dualfilter10), by exactly the 10-bit arm the note above names.
+    // `a_real_aomenc_10bit_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact`
+    // spells `--enable-dual-filter=1` in its own body and hard-asserts the
+    // arrival counter `decode::dual_filter_diff_hits()` moved at 10 BITS, so
+    // the entry is closed at the depth it was held open at, not by a spelling
+    // alone.
     // `enable-flip-idtx` LEFT this list on 2026-09-02 (lane-rect1d r1):
     // `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact`
     // passes `=1` at both depths and pixel-compares six 10-bit decodes, so the
@@ -392,7 +409,14 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // screen recipes run at 10 bits and hard-assert a decoded intrabc block
     // per depth (4-6 per arm), every frame pixel-compared against ffmpeg's own
     // 10-bit decode.
-    ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
+    // `enable-rect-tx` LEFT this list on 2026-09-29 (merge wave 2,
+    // lane-av1toolgates), together with its 8-bit twin, by
+    // `a_real_aomenc_10bit_stream_with_a_rect_transform_decodes_pixel_exact`:
+    // the depth is spelled in the test's OWN body, which is what files it in
+    // the 10-bit bucket, and the witness is the parsed shape
+    // (`rect_partition_hits()` / `rect_coeff_tu_hits()` > 0 over arms that
+    // decoded AND pixel-compared). See the 8-bit list for why the flag alone
+    // could never have been the evidence.
 ];
 
 /// [`DEFAULT_ON_TOOLS`] entries no 8-bit gate spells on, with the reason.
