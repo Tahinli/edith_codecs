@@ -1531,4 +1531,171 @@ mod tests {
             "expected the literal `=1` gates to still be there, found {pinned}"
         );
     }
+
+    /// lane-av1oracleskip: the ORACLE-PRESENCE SCAN — the mechanical
+    /// anti-regression for the skip class this lane closed.
+    ///
+    /// Why a scan and not a review rule: the r2 sweep found FIVE gates that
+    /// had been added with the bare `if aomdec_path().is_file() { …compare… }`
+    /// shape AFTER the first fix had already routed thirteen sites — every one
+    /// of them compiled, passed review and reported green with the oracle
+    /// compare silently skipped, under `EC_AV1_REQUIRE_AOMENC=1`. A guard
+    /// written the old way re-opens the class the moment it merges, so the
+    /// only thing that holds is a check that reads the source itself.
+    ///
+    /// The rule: a TOOL PRESENCE CHECK (`aomenc_path().is_file()`,
+    /// `aomdec_path().is_file()`, `affine_aomenc_path().is_file()`, plain or
+    /// `!…` inverted) may appear ONLY
+    ///   1. inside the body of the probe that owns that path
+    ///      (`have_aomenc`, `aomdec_available`, `have_affine_aomenc`) — that
+    ///      is where the assert-last and the env escape live, and
+    ///   2. inside an `assert!` (the deliberate hard-failure form), or
+    ///   3. in a comment, which cannot execute.
+    /// Anything else is a skip with no env escape, and the test fails naming
+    /// the exact `file:line`.
+    ///
+    /// THE FLOOR. A source scan that matches nothing is the false-pass shape
+    /// this crate has been bitten by twice (a `format!` brace escape, and
+    /// `args.find(')')` stopping at the wrong paren), so the scan refuses to
+    /// pass unless it actually inspected a plausible number of sites: the
+    /// count is printed and asserted against `MIN_SITES`. A probe that moved
+    /// out of the scan's reach, or a matcher broken by a rename, reds here
+    /// instead of reporting a clean bill of health.
+    #[test]
+    fn no_tool_presence_check_outside_its_probe() {
+        /// Below this, the scan is not looking at the tree it thinks it is.
+        /// Five is the STRUCTURAL floor: three probes (whose existence the span
+        /// assert below already pins) plus the two hard `assert!` sites. Doc
+        /// comments mentioning the old shape come and go with the prose, so
+        /// they are counted but never load-bearing here.
+        const MIN_SITES: usize = 5;
+        /// (file, the line that opens the probe owning that path)
+        const PROBES: &[(&str, &str)] = &[
+            ("stream.rs", "fn have_aomenc()"),
+            ("stream.rs", "fn aomdec_available("),
+            ("stream.rs", "fn have_affine_aomenc()"),
+        ];
+        const PATHS: &[&str] = &[
+            "aomenc_path().is_file()",
+            "aomdec_path().is_file()",
+            "affine_aomenc_path().is_file()",
+        ];
+        let files: [(&str, &str); 3] = [
+            ("stream.rs", include_str!("stream.rs")),
+            ("decode.rs", include_str!("decode.rs")),
+            ("encode.rs", include_str!("encode.rs")),
+        ];
+
+        // The line range each probe body owns: from its opener to the first
+        // following line that closes it at column 0.
+        let mut probe_spans: Vec<(usize, usize)> = Vec::new();
+        for (name, src) in files {
+            let lines: Vec<&str> = src.lines().collect();
+            for (probe_file, opener) in PROBES {
+                if *probe_file != name {
+                    continue;
+                }
+                let Some(start) = lines.iter().position(|l| l.contains(opener)).map(|i| i + 1)
+                else {
+                    continue;
+                };
+                let end = lines
+                    .iter()
+                    .skip(start)
+                    .position(|l| l.trim_end() == "}")
+                    .map(|off| start + off)
+                    .unwrap_or(lines.len());
+                probe_spans.push((start, end));
+            }
+        }
+        assert!(
+            probe_spans.len() == PROBES.len(),
+            "the oracle-presence scan recognised {} of the {} probe bodies it is meant to \
+             exempt ({probe_spans:?}); a renamed or moved probe would silently exempt every \
+             site in the crate, so it reds here",
+            probe_spans.len(),
+            PROBES.len()
+        );
+
+        let mut sites = 0usize;
+        let mut allowed = 0usize;
+        let mut per_pattern: BTreeMap<&str, usize> = PATHS.iter().map(|p| (*p, 0)).collect();
+        let mut offenders: Vec<String> = Vec::new();
+        for (name, src) in files {
+            for (i, line) in src.lines().enumerate() {
+                // LONGEST match wins: `affine_aomenc_path().is_file()` CONTAINS
+                // `aomenc_path().is_file()`, so a first-match scan credits the
+                // affine probe's line to the aomenc pattern and the per-pattern
+                // floor below reds on a pattern that is very much present. (It
+                // did, on the first run of this test — which is the floor
+                // earning its place.)
+                let Some(path) = PATHS
+                    .iter()
+                    .filter(|p| line.contains(**p))
+                    .max_by_key(|p| p.len())
+                else {
+                    continue;
+                };
+                sites += 1;
+                *per_pattern.get_mut(path).expect("pattern came from PATHS") += 1;
+                let lineno = i + 1;
+                let trimmed = line.trim_start();
+                let in_probe = probe_spans
+                    .iter()
+                    .any(|(start, end)| lineno >= *start && lineno <= *end);
+                let in_assert = trimmed.starts_with("assert!")
+                    || trimmed.starts_with("aomdec_path().is_file(),")
+                    || trimmed.starts_with("aomenc_path().is_file(),")
+                    || trimmed.starts_with("affine_aomenc_path().is_file(),");
+                let in_comment = trimmed.starts_with("//");
+                if in_probe || in_assert || in_comment {
+                    allowed += 1;
+                } else {
+                    offenders.push(format!(
+                        "{name}:{lineno}: {}\n      a tool presence check outside its probe — \
+                         route it through the probe that owns this path (`have_aomenc`, \
+                         `aomdec_available`, `have_affine_aomenc`): a bare `{path}` skips the \
+                         gate with NO env escape, so under EC_AV1_REQUIRE_AOMENC=1 the gate still \
+                         reports green with the oracle compare never run.",
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        println!(
+            "oracle-presence scan: {sites} site(s) inspected, {allowed} in a probe / assert / \
+             comment, {} offender(s); per pattern {per_pattern:?}",
+            offenders.len()
+        );
+        // PER-PATTERN floor: a total count can hide one broken matcher (mutate
+        // ONE pattern and the other two still add up), so each of the three
+        // path patterns must be found at least once -- which the probe bodies
+        // guarantee, since each probe contains its own path's presence check.
+        let never_matched: Vec<&str> = per_pattern
+            .iter()
+            .filter(|(_, n)| **n == 0)
+            .map(|(p, _)| *p)
+            .collect();
+        assert!(
+            never_matched.is_empty(),
+            "the oracle-presence scan matched NOTHING for {never_matched:?}: that pattern is \
+             stale (renamed helper, `exists()` instead of `is_file()`, a `format!` escape) and \
+             the gates it was meant to police would pass unreviewed. Matched per pattern: \
+             {per_pattern:?}"
+        );
+        assert!(
+            sites >= MIN_SITES,
+            "the oracle-presence scan inspected only {sites} site(s), below its floor of \
+             {MIN_SITES}: the matcher has stopped matching this tree (renamed path helper, a \
+             `format!` escape, a moved probe), and with no floor this would pass while scanning \
+             nothing — the false-pass shape this crate has been bitten by twice"
+        );
+        assert!(
+            offenders.is_empty(),
+            "{} bare tool presence check(s) outside a probe — each one is a gate that can report \
+             green without running the oracle compare:\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
 }
