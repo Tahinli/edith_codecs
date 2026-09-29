@@ -6301,6 +6301,14 @@ thread_local! {
     /// lane-av1-ibc444rect: unskipped intrabc 8x4/4x8 leaves whose chroma a
     /// lossless 4:4:4 frame walked as per-4x4 [`TxbSet::Chroma4`] units.
     static INTRABC_RECT8_LOSSLESS_CHROMA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1loss444kf: 4:4:4 lossless sub-8x8 RECT (8x4 / 4x8) leaf chroma
+    /// units whose libaom-faithful block-relative reach
+    /// ([`Reach::of_tu`] over the leaf's own bsize) differs from the
+    /// standalone-BLOCK_4X4 lookup that used to answer for them. Zero means
+    /// no stream reached a rect leaf where the two disagree -- a gate
+    /// asserting the reach fix must see this nonzero, or the fixture never
+    /// exercised the fixed path.
+    static SUB8_CHROMA444_LOSSLESS_TU_REACH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
@@ -6341,6 +6349,19 @@ pub fn intrabc_rect8_lossless_luma_hits() -> usize {
 /// chroma as per-4x4 [`TxbSet::Chroma4`] units (lane-av1-ibc444rect).
 pub fn intrabc_rect8_lossless_chroma_hits() -> usize {
     INTRABC_RECT8_LOSSLESS_CHROMA_HITS.with(|c| c.get())
+}
+
+/// How many 4:4:4 lossless sub-8x8 RECT leaf chroma units took the
+/// block-relative reach libaom's `has_bottom_left` gives, where the
+/// standalone-BLOCK_4X4 lookup that used to answer disagreed
+/// (lane-av1loss444kf). Zero on a stream with no such leaf.
+pub fn sub8_chroma444_lossless_tu_reach_hits() -> usize {
+    SUB8_CHROMA444_LOSSLESS_TU_REACH_HITS.with(|c| c.get())
+}
+
+/// Gate-side reset for [`SUB8_CHROMA444_LOSSLESS_TU_REACH_HITS`].
+pub fn reset_sub8_chroma444_tu_reach_hits() {
+    SUB8_CHROMA444_LOSSLESS_TU_REACH_HITS.with(|c| c.set(0));
 }
 
 /// Gate-side reset for the two lane-av1-ibc444rect counters above.
@@ -9903,9 +9924,7 @@ impl Neighbours {
             fill_span(&mut self.uv_owner, row * stride + mi_c, n, owner);
         }
         if crate::envflags::env_flag!("EC_LEFTSSY") {
-            eprintln!(
-                "EC_LEAF mi=({mi_r},{mi_c}) wh=({mi_w},{mi_h}) uv_mode={uv_mode}"
-            );
+            eprintln!("EC_LEAF mi=({mi_r},{mi_c}) wh=({mi_w},{mi_h}) uv_mode={uv_mode}");
         }
     }
 
@@ -24237,7 +24256,28 @@ fn sub8_leaf_chroma444(
                             );
                             set_palette_pred(pb, fctx);
                             let unit_around = neighbours.around_mi_rect((umi_r, umi_c), 4, 4);
-                            let unit_reach = Reach::of(4, upx, upy, y.width, y.height, fctx);
+                            // lane-av1loss444kf: libaom asks
+                            // `has_top_right`/`has_bottom_left` with the
+                            // LEAF's bsize, this unit's `(col_off, row_off)`
+                            // and `tx_size` -- not as a standalone BLOCK_4X4
+                            // at the unit's own position. A 4x8 leaf's FIRST
+                            // unit has its bottom-left pixels inside the
+                            // block's own second row (already reconstructed),
+                            // which `has_bottom_left`'s
+                            // `row_off + count < plane_bh_unit` early-out
+                            // answers TRUE; the 4x4 table answered false, so
+                            // `PlaneBuf::edges` replicated the last left
+                            // sample and the unit predicted from a fabricated
+                            // edge (the 4:4:4 lossless key frame's 49-sample
+                            // chroma damage at (196,200)-(204,200)). The
+                            // 4:2:2 twin of this arm was fixed the same way
+                            // (lane-av1-422kf2); this is its 4:4:4 twin.
+                            let unit_reach = Reach::of_tu(bw, bh, uc * 4, ur * 4, 4, 4, reach);
+                            if !square
+                                && unit_reach != Reach::of(4, upx, upy, y.width, y.height, fctx)
+                            {
+                                hit!(SUB8_CHROMA444_LOSSLESS_TU_REACH_HITS);
+                            }
                             let grid = read_plane(
                                 dec,
                                 cdfs,
@@ -24418,7 +24458,15 @@ fn sub8_leaf_chroma444(
                         let (umi_r, umi_c) = (lmi.0 + ur, lmi.1 + uc);
                         let (upx, upy) = (px + uc * 4, py + ur * 4);
                         let unit_around = neighbours.around_mi_rect((umi_r, umi_c), 4, 4);
-                        let unit_reach = Reach::of(4, upx, upy, y.width, y.height, fctx);
+                        // lane-av1loss444kf: the block-relative answer, not
+                        // a standalone BLOCK_4X4 lookup at the unit's own
+                        // position -- see the intrabc twin above for the
+                        // libaom citation and the measured damage.
+                        let unit_reach = Reach::of_tu(bw, bh, uc * 4, ur * 4, 4, 4, reach);
+                        if !square && unit_reach != Reach::of(4, upx, upy, y.width, y.height, fctx)
+                        {
+                            hit!(SUB8_CHROMA444_LOSSLESS_TU_REACH_HITS);
+                        }
                         let grid = read_plane(
                             dec,
                             cdfs,
@@ -28618,9 +28666,8 @@ fn read_block_tx_size_rect(
         let full_h_mi = bh / MI;
         if max_w_mi != full_w_mi || max_h_mi != full_h_mi {
             LOSSLESS_EDGE_CLIPPED.with(|c| c.set(c.get() + 1));
-            LOSSLESS_EDGE_CLIP_UNITS.with(|c| {
-                c.set(c.get() + (full_w_mi * full_h_mi - max_w_mi * max_h_mi))
-            });
+            LOSSLESS_EDGE_CLIP_UNITS
+                .with(|c| c.set(c.get() + (full_w_mi * full_h_mi - max_w_mi * max_h_mi)));
         }
         let mut leaves = Vec::with_capacity(max_w_mi * max_h_mi);
         for row in 0..max_h_mi {
