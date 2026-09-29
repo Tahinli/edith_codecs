@@ -7,7 +7,7 @@
 # string literal in the same file (manifest rows, vectors.sha256 names,
 # format! interpolation); such names are only covered through their parent
 # directory, which the verifier requires to exist AND be non-empty.
-# 189 media-name literal(s) in this tree resolved under no enumerated
+# 188 media-name literal(s) in this tree resolved under no enumerated
 # fixture directory and are therefore not listed individually.
 #
 # FIXTURE ROOT: worktree-relative, deliberately NOT an absolute path. A
@@ -25,7 +25,7 @@
 #   The three fleet hosts carry the EXTRACTED vector sets (~470 files) and the
 #   sync deliberately excluded the .tar.gz blobs; nothing in crates/ reads a
 #   blob, so the extracted directories are the whole requirement.
-#   Unreferenced committed pins carried as rows: 7
+#   Unreferenced committed pins carried as rows: 4
 crates/ec-av1/fixtures/420_intrabc_rect4_witness.obu	crates/ec-av1/src/stream.rs:7823	captured	-	ok	yes	d01352af5059919cdce733abdcbae8e8240ac3c2a6190fa1bd96d3c6f945b979
 crates/ec-av1/fixtures/422_allskip_2f.obu	crates/ec-av1/src/stream.rs:2311	captured	-	ok	yes	ba4932c14f95971b5f25321b04abce80c9fdd5de4b1fe6fffcdad82aaea87ce1
 crates/ec-av1/fixtures/422_intrabc_sb128_strip_notxsearch.obu	crates/ec-av1/src/stream.rs:2373	captured	-	ok	yes	80dd0d4e93fd6c3d4b7188a43e69d9638f2bece38edfab60ff3582628314b5ec
@@ -35,71 +35,76 @@ crates/ec-av1/fixtures/422_residual_compound_warp_nolr_16f.obu	crates/ec-av1/src
 crates/ec-av1/fixtures/422_sb128_3f.obu	crates/ec-av1/src/stream.rs:2312	captured	-	ok	yes	0b851799d99cb4d141a7d042138a3999aad7e0fb24d69c670bca1d38c286dce9
 crates/ec-av1/fixtures/444_intrabc_rect4_witness.obu	crates/ec-av1/src/stream.rs:7817	captured	-	ok	yes	7fe888edf18caa74bdb415f0de643dc59963e87e0255d77191200b7a62eb2542
 crates/ec-av1/fixtures/444_leaf8_oob.obu	crates/ec-av1/src/stream.rs:8242	captured	-	ok	yes	72bed2791d1ceba8be7926a052c7838c5d96d4f9d56d28fb69789a753d3593af
-crates/ec-av1/fixtures/444_lossy_rect4_inter_witness.obu	crates/ec-av1/src/stream.rs:20856	captured	-	ok	yes	77f727e76d81fe48cd03709f799131677c04869b163e18d78e96bc742ec69153
+crates/ec-av1/fixtures/444_lossy_rect4_inter_witness.obu	crates/ec-av1/src/stream.rs:20872	captured	-	ok	yes	77f727e76d81fe48cd03709f799131677c04869b163e18d78e96bc742ec69153
 crates/ec-av1/fixtures/444_lossy_rect4_inter_witness.obu	crates/ec-av1/src/stream.rs:7407	captured	-	ok	yes	77f727e76d81fe48cd03709f799131677c04869b163e18d78e96bc742ec69153
-crates/ec-av1/fixtures/444_lossy_rect4_odd_130x122.obu	crates/ec-av1/src/stream.rs:46385	captured	-	ok	yes	c87ac65b77579afd2938669b0cbe3ec44c3abf775c0223cacb9d14b8c2eee27c
-crates/ec-av1/fixtures/444_lossy_rect4_wide_256x128.obu	crates/ec-av1/src/stream.rs:46393	captured	-	ok	yes	06621606c11ae805f784a1c9736db6301a925a4fa3154e2fc38db1df7ad9b826
-crates/ec-av1/fixtures/444_lossy_superres_256x128_d12_10bit.obu	crates/ec-av1/src/stream.rs:14247	captured	-	ok	yes	95b49d7aa81843399ee3aa64bdadfec8f4037bcc3f861923c9b2da3bc868b223
-crates/ec-av1/fixtures/444_lossy_superres_256x128_d12_12bit.obu	crates/ec-av1/src/stream.rs:14294	captured	-	ok	yes	973bf374c0185c4e6301509ce834cef01318e6cdb9488fd258118d7ec89bdd04
-crates/ec-av1/fixtures/444_lossy_superres_256x128_d12.obu	crates/ec-av1/src/stream.rs:46537	captured	-	ok	yes	450caa3e31526a8973b9f64d5030a2f11b87bd60fac07aef121cb62af9bf85ff
-crates/ec-av1/fixtures/444_lossy_superres_256x128_d9_12bit.obu	crates/ec-av1/src/stream.rs:14321	captured	-	ok	yes	898c775108495b998cb5ec9b08e194d4656ed0140aa8e7e7236892d468bbad99
-crates/ec-av1/fixtures/444_lossy_superres_256x128_d9.obu	crates/ec-av1/src/stream.rs:46927	captured	-	ok	yes	3d619ee0fda3d9bb9cf8ff0541ba00ea5d83ae38cd8eec1322f8dbbbe6a5ec96
-crates/ec-av1/fixtures/444_lossy_superres_mode2_256x128_10bit.obu	crates/ec-av1/src/stream.rs:14362	captured	-	ok	yes	699398aba58fb53b80e05d3d214eb746a3c91945e01da6b47488513f20b55668
-crates/ec-av1/fixtures/444_lossy_superres_mode2_256x128_12bit.obu	crates/ec-av1/src/stream.rs:14409	captured	-	ok	yes	18aa8b3124ab10672f22577a8eea81e44141a3d0bb506104aee2f950254a2e9f
-crates/ec-av1/fixtures/444_lossy_superres_mode2_256x128.obu	crates/ec-av1/src/stream.rs:46984	captured	-	ok	yes	c18496cf3b7db0feca9aa904024cec2115be80b5b94f87c848ac52f9b32ffd97
-crates/ec-av1/fixtures/444_lossy_superres_mode2_256x128.obu	crates/ec-av1/src/stream.rs:47033	captured	-	ok	yes	c18496cf3b7db0feca9aa904024cec2115be80b5b94f87c848ac52f9b32ffd97
-crates/ec-av1/fixtures/444_quad_leaf_tx_type.obu	crates/ec-av1/src/stream.rs:20619	captured	-	ok	yes	a06c9f7a0862252f6ab7ebdcec340d0602e730e38089365f14747db37f8e78d5
-crates/ec-av1/fixtures/444_rect_strip_leaf_tx_type.obu	crates/ec-av1/src/stream.rs:20714	captured	-	ok	yes	06174a66e92aaeb751a8e86db59711fcb1f18d74bde2d77e1ef1be7983eb7c80
-crates/ec-av1/fixtures/444_sb128rect_lr_witness.obu	crates/ec-av1/src/stream.rs:14471	captured	-	ok	yes	27825e14633a4b23e37d48a2acdc7f5d814ca4fadd0b8797d72a1ffb34061e80
-crates/ec-av1/fixtures/444_sb128rect_lr_witness.obu	crates/ec-av1/src/stream.rs:20749	captured	-	ok	yes	27825e14633a4b23e37d48a2acdc7f5d814ca4fadd0b8797d72a1ffb34061e80
+crates/ec-av1/fixtures/444_lossy_rect4_odd_130x122.obu	crates/ec-av1/src/stream.rs:46570	captured	-	ok	yes	c87ac65b77579afd2938669b0cbe3ec44c3abf775c0223cacb9d14b8c2eee27c
+crates/ec-av1/fixtures/444_lossy_rect4_wide_256x128.obu	crates/ec-av1/src/stream.rs:46578	captured	-	ok	yes	06621606c11ae805f784a1c9736db6301a925a4fa3154e2fc38db1df7ad9b826
+crates/ec-av1/fixtures/444_lossy_superres_256x128_d12_10bit.obu	crates/ec-av1/src/stream.rs:14263	captured	-	ok	yes	95b49d7aa81843399ee3aa64bdadfec8f4037bcc3f861923c9b2da3bc868b223
+crates/ec-av1/fixtures/444_lossy_superres_256x128_d12_12bit.obu	crates/ec-av1/src/stream.rs:14310	captured	-	ok	yes	973bf374c0185c4e6301509ce834cef01318e6cdb9488fd258118d7ec89bdd04
+crates/ec-av1/fixtures/444_lossy_superres_256x128_d12.obu	crates/ec-av1/src/stream.rs:46722	captured	-	ok	yes	450caa3e31526a8973b9f64d5030a2f11b87bd60fac07aef121cb62af9bf85ff
+crates/ec-av1/fixtures/444_lossy_superres_256x128_d9_12bit.obu	crates/ec-av1/src/stream.rs:14337	captured	-	ok	yes	898c775108495b998cb5ec9b08e194d4656ed0140aa8e7e7236892d468bbad99
+crates/ec-av1/fixtures/444_lossy_superres_256x128_d9.obu	crates/ec-av1/src/stream.rs:47112	captured	-	ok	yes	3d619ee0fda3d9bb9cf8ff0541ba00ea5d83ae38cd8eec1322f8dbbbe6a5ec96
+crates/ec-av1/fixtures/444_lossy_superres_mode2_256x128_10bit.obu	crates/ec-av1/src/stream.rs:14378	captured	-	ok	yes	699398aba58fb53b80e05d3d214eb746a3c91945e01da6b47488513f20b55668
+crates/ec-av1/fixtures/444_lossy_superres_mode2_256x128_12bit.obu	crates/ec-av1/src/stream.rs:14425	captured	-	ok	yes	18aa8b3124ab10672f22577a8eea81e44141a3d0bb506104aee2f950254a2e9f
+crates/ec-av1/fixtures/444_lossy_superres_mode2_256x128.obu	crates/ec-av1/src/stream.rs:47169	captured	-	ok	yes	c18496cf3b7db0feca9aa904024cec2115be80b5b94f87c848ac52f9b32ffd97
+crates/ec-av1/fixtures/444_lossy_superres_mode2_256x128.obu	crates/ec-av1/src/stream.rs:47218	captured	-	ok	yes	c18496cf3b7db0feca9aa904024cec2115be80b5b94f87c848ac52f9b32ffd97
+crates/ec-av1/fixtures/444_quad_leaf_tx_type.obu	crates/ec-av1/src/stream.rs:20635	captured	-	ok	yes	a06c9f7a0862252f6ab7ebdcec340d0602e730e38089365f14747db37f8e78d5
+crates/ec-av1/fixtures/444_rect_strip_leaf_tx_type.obu	crates/ec-av1/src/stream.rs:20730	captured	-	ok	yes	06174a66e92aaeb751a8e86db59711fcb1f18d74bde2d77e1ef1be7983eb7c80
+crates/ec-av1/fixtures/444_sb128rect_lr_witness.obu	crates/ec-av1/src/stream.rs:14487	captured	-	ok	yes	27825e14633a4b23e37d48a2acdc7f5d814ca4fadd0b8797d72a1ffb34061e80
+crates/ec-av1/fixtures/444_sb128rect_lr_witness.obu	crates/ec-av1/src/stream.rs:20765	captured	-	ok	yes	27825e14633a4b23e37d48a2acdc7f5d814ca4fadd0b8797d72a1ffb34061e80
 crates/ec-av1/fixtures/444_sb128rect_lr_witness.obu	crates/ec-av1/src/stream.rs:7201	captured	-	ok	yes	27825e14633a4b23e37d48a2acdc7f5d814ca4fadd0b8797d72a1ffb34061e80
 crates/ec-av1/fixtures/444_sb128rect_lr_witness.obu	crates/ec-av1/src/stream.rs:7914	captured	-	ok	yes	27825e14633a4b23e37d48a2acdc7f5d814ca4fadd0b8797d72a1ffb34061e80
 crates/ec-av1/fixtures/av112bit-compound-masked.obu	(committed pin: NO source reference found)	captured	-	ok	yes	83625de2ed347d457eb67f9781eed3fea598ef035f29bbc311d7025fe178c691
 crates/ec-av1/fixtures/av112bit-compound.obu	(committed pin: NO source reference found)	captured	-	ok	yes	a839cff534b89d5cd52681dd43a7dedc10131d8dd7725bdfa5502d6bc4421740
 crates/ec-av1/fixtures/av112bit-inter.obu	(committed pin: NO source reference found)	captured	-	ok	yes	e679d577e61b4a8bc99685355cca8c0473cfb637284b07786a6c53b1755553d9
 crates/ec-av1/fixtures/av112bit-key.obu	(committed pin: NO source reference found)	captured	-	ok	yes	c74f62b57f71f7c36c49ea1feeb482786a2650e5c7f66610949b5f65fbbed8d1
-crates/ec-av1/fixtures/av1_192x128_8bit_intra64_in_inter.obu	crates/ec-av1/src/stream.rs:20552	captured	-	ok	yes	e4cff46cb1700527c68efc866db27a2835705e949d646f73f0c9df577d594bd6
-crates/ec-av1/fixtures/av1_192x128_8bit_intra64_in_inter.obu	crates/ec-av1/src/stream.rs:20652	captured	-	ok	yes	e4cff46cb1700527c68efc866db27a2835705e949d646f73f0c9df577d594bd6
-crates/ec-av1/fixtures/av1_192x128_8bit_intra64_in_inter.obu	crates/ec-av1/src/stream.rs:20884	captured	-	ok	yes	e4cff46cb1700527c68efc866db27a2835705e949d646f73f0c9df577d594bd6
-crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:14474	regenerated	scripts/gen-fixtures.sh	ok	-	-
-crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:14523	regenerated	scripts/gen-fixtures.sh	ok	-	-
-crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:14580	regenerated	scripts/gen-fixtures.sh	ok	-	-
+crates/ec-av1/fixtures/av1_192x128_8bit_intra64_in_inter.obu	crates/ec-av1/src/stream.rs:20568	captured	-	ok	yes	e4cff46cb1700527c68efc866db27a2835705e949d646f73f0c9df577d594bd6
+crates/ec-av1/fixtures/av1_192x128_8bit_intra64_in_inter.obu	crates/ec-av1/src/stream.rs:20668	captured	-	ok	yes	e4cff46cb1700527c68efc866db27a2835705e949d646f73f0c9df577d594bd6
+crates/ec-av1/fixtures/av1_192x128_8bit_intra64_in_inter.obu	crates/ec-av1/src/stream.rs:20900	captured	-	ok	yes	e4cff46cb1700527c68efc866db27a2835705e949d646f73f0c9df577d594bd6
+crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:14490	regenerated	scripts/gen-fixtures.sh	ok	-	-
+crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:14539	regenerated	scripts/gen-fixtures.sh	ok	-	-
+crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:14596	regenerated	scripts/gen-fixtures.sh	ok	-	-
 crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:2315	regenerated	scripts/gen-fixtures.sh	ok	-	-
 crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:2379	regenerated	scripts/gen-fixtures.sh	ok	-	-
 crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:2594	regenerated	scripts/gen-fixtures.sh	ok	-	-
 crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:2673	regenerated	scripts/gen-fixtures.sh	ok	-	-
-crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:43872	regenerated	scripts/gen-fixtures.sh	ok	-	-
-crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:43949	regenerated	scripts/gen-fixtures.sh	ok	-	-
+crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:43973	regenerated	scripts/gen-fixtures.sh	ok	-	-
+crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:44050	regenerated	scripts/gen-fixtures.sh	ok	-	-
+crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:45072	regenerated	scripts/gen-fixtures.sh	ok	-	-
 crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:9120	regenerated	scripts/gen-fixtures.sh	ok	-	-
-crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:9131	regenerated	scripts/gen-fixtures.sh	ok	-	-
-crates/ec-av1/fixtures/filter_intra_8x16_strip_seed49.obu	crates/ec-av1/src/stream.rs:38608	captured	-	ok	yes	6f837e47ad0a67f31c3998aa789cf0811e7540ac2114981853a0148744cb76c2
-crates/ec-av1/fixtures/gm_small_side_witness.obu	crates/ec-av1/src/stream.rs:43877	captured	-	ok	yes	f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca
-crates/ec-av1/fixtures/gm_small_side_witness.obu	crates/ec-av1/src/stream.rs:43954	captured	-	ok	yes	f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca
-crates/ec-av1/fixtures/gm_small_side_witness.obu	crates/ec-av1/src/stream.rs:44037	captured	-	ok	yes	f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca
-crates/ec-av1/fixtures/golden3-pin.obu	crates/ec-av1/src/stream.rs:23700	captured	-	ok	yes	11c9d5331cffa6614c8265ad5fa685d5ce9155db8439949b48ec4a652ace95cf
-crates/ec-av1/fixtures/golden4-pin.obu	crates/ec-av1/src/stream.rs:23747	recovered-original	-	ok	yes	1754023e44e46edaebc2c05065bf1c65db1a41354577cbf71c0e8ebe737ae14a
-crates/ec-av1/fixtures/golden6-mismatch.obu	(committed pin: NO source reference found)	recovered-original	-	ok	yes	c56909b98542192b03f3a945e153475aa57a58a1586bf166513297296cb225b3
-crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu	(committed pin: NO source reference found)	recovered-original	-	ok	yes	81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be
-crates/ec-av1/fixtures/grain_cdef_lr_128x128.obu	crates/ec-av1/src/stream.rs:14577	captured	-	ok	yes	06f210b87b5c79eb729c559050e073abbe226c4dad1df3dcaa113b03011ad732
-crates/ec-av1/fixtures/hg_arf_witness.obu	crates/ec-av1/src/stream.rs:14462	captured	-	ok	yes	7f3b060da5aa9c537633e760c4af71316237db7692f6ae0d459bd2c2dd867d37
-crates/ec-av1/fixtures/hg_arf_witness.obu	crates/ec-av1/src/stream.rs:43099	captured	-	ok	yes	7f3b060da5aa9c537633e760c4af71316237db7692f6ae0d459bd2c2dd867d37
-crates/ec-av1/fixtures/hg_arf_witness.obu	crates/ec-av1/src/stream.rs:43181	captured	-	ok	yes	7f3b060da5aa9c537633e760c4af71316237db7692f6ae0d459bd2c2dd867d37
-crates/ec-av1/fixtures/hg_head_key_frame.obu	crates/ec-av1/src/stream.rs:14715	captured	-	ok	yes	53c311dec790bb2413afdde92cb24de498a7c4f66f6f0c7f4f5910ab0d2c65dc
-crates/ec-av1/fixtures/hg_head_mvclamp_witness.obu	crates/ec-av1/src/stream.rs:44119	captured	-	ok	yes	451a9b138995e636f22308847a123b5c8621d4908cd93772cf5bbf2b37df39d7
-crates/ec-av1/fixtures/hg_intra14_witness.obu	crates/ec-av1/src/stream.rs:42928	captured	-	ok	yes	0eff603bf1608e47faf5e6729670c4c77cf5c674dbad3a1533ac6660151fd90e
-crates/ec-av1/fixtures/hg_kf900.obu	crates/ec-av1/src/stream.rs:14857	captured	-	ok	yes	a273ae99328388be14a1ff8fa1c5a6d391a9948159eaef120e1b50e02015eb83
-crates/ec-av1/fixtures/hg_kf900.obu	crates/ec-av1/src/stream.rs:44894	captured	-	ok	yes	a273ae99328388be14a1ff8fa1c5a6d391a9948159eaef120e1b50e02015eb83
-crates/ec-av1/fixtures/hg_rect64_intra16x4_witness.obu	crates/ec-av1/src/stream.rs:43017	captured	-	ok	yes	c9e721088766163b9dbeb9fa8dd8b257ff0ec7f9157fc350de4d3c33cd9ec4e4
-crates/ec-av1/fixtures/hg_ss300_key_frame.obu	crates/ec-av1/src/stream.rs:14806	captured	-	ok	yes	7e3ddf0d602f9496b2f7eb11f051fd4a045020e094d5bc02f83825e2c494ef12
-crates/ec-av1/fixtures/hg_ss600_key_frame.obu	crates/ec-av1/src/stream.rs:14898	captured	-	ok	yes	36de46676ed7de7049d4dabe8571d8cd31c8a1f53d72011c0ee532a7c6725cd6
-crates/ec-av1/fixtures/intra128_in_inter_screen_witness.obu	crates/ec-av1/src/stream.rs:43599	captured	-	ok	yes	c84a493f90327f5d2bea038a42e87cbfe56762b5c6a856d76b4bff9797c5ea09
-crates/ec-av1/fixtures/intra128_in_inter_witness2.obu	crates/ec-av1/src/stream.rs:43531	captured	-	ok	yes	cace4cc3a5ba4dc5f8c7c219e87c9052351e832cad3d7f4c8ffe09288a6d7ccf
-crates/ec-av1/fixtures/intra128_in_inter_witness2.obu	crates/ec-av1/src/stream.rs:43876	captured	-	ok	yes	cace4cc3a5ba4dc5f8c7c219e87c9052351e832cad3d7f4c8ffe09288a6d7ccf
-crates/ec-av1/fixtures/intra128_in_inter_witness2.obu	crates/ec-av1/src/stream.rs:43953	captured	-	ok	yes	cace4cc3a5ba4dc5f8c7c219e87c9052351e832cad3d7f4c8ffe09288a6d7ccf
-crates/ec-av1/fixtures/intra128_in_inter_witness.obu	crates/ec-av1/src/stream.rs:43435	captured	-	ok	yes	dd41fc39367a3d38bf8a8a8106dc30d91b716b2a9123fdfa4716930f4f98caf9
-crates/ec-av1/fixtures/intra14_256x192_10bit.obu	crates/ec-av1/src/stream.rs:42253	captured	-	ok	yes	ab6fae0a256af6410e8200f10827a3e965dee7b2d7ab63710e94968bddab23a2
-crates/ec-av1/fixtures/intra14_256x192_8bit.obu	crates/ec-av1/src/stream.rs:42261	captured	-	ok	yes	5e50eb6d4492e806a2803988d92bd47f069ca54e02c06344d5500c6b72deb861
-crates/ec-av1/fixtures/intrabc_tx4_chroma_kf.obu	crates/ec-av1/src/stream.rs:12040	captured	-	ok	yes	bc699af4a6e7c1c5657f041e8cbdf2d3d899ddb80ec2a549a950b7cebb5b41bd
+crates/ec-av1/fixtures	crates/ec-av1/src/stream.rs:9147	regenerated	scripts/gen-fixtures.sh	ok	-	-
+crates/ec-av1/fixtures/filter_intra_8x16_strip_seed49.obu	crates/ec-av1/src/stream.rs:38709	captured	-	ok	yes	6f837e47ad0a67f31c3998aa789cf0811e7540ac2114981853a0148744cb76c2
+crates/ec-av1/fixtures/gm_small_side_witness.obu	crates/ec-av1/src/stream.rs:43978	captured	-	ok	yes	f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca
+crates/ec-av1/fixtures/gm_small_side_witness.obu	crates/ec-av1/src/stream.rs:44055	captured	-	ok	yes	f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca
+crates/ec-av1/fixtures/gm_small_side_witness.obu	crates/ec-av1/src/stream.rs:44138	captured	-	ok	yes	f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca
+crates/ec-av1/fixtures/gm_small_side_witness.obu	crates/ec-av1/src/stream.rs:45067	captured	-	ok	yes	f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca
+crates/ec-av1/fixtures/golden3-pin.obu	crates/ec-av1/src/stream.rs:23718	captured	-	ok	yes	11c9d5331cffa6614c8265ad5fa685d5ce9155db8439949b48ec4a652ace95cf
+crates/ec-av1/fixtures/golden4-pin.obu	crates/ec-av1/src/stream.rs:23772	recovered-original	-	ok	yes	1754023e44e46edaebc2c05065bf1c65db1a41354577cbf71c0e8ebe737ae14a
+crates/ec-av1/fixtures/golden4-pin.obu	crates/ec-av1/src/stream.rs:23773	recovered-original	-	ok	yes	1754023e44e46edaebc2c05065bf1c65db1a41354577cbf71c0e8ebe737ae14a
+crates/ec-av1/fixtures/golden6-mismatch.obu	crates/ec-av1/src/stream.rs:33319	recovered-original	-	ok	yes	c56909b98542192b03f3a945e153475aa57a58a1586bf166513297296cb225b3
+crates/ec-av1/fixtures/golden6-mismatch.obu	crates/ec-av1/src/stream.rs:33320	recovered-original	-	ok	yes	c56909b98542192b03f3a945e153475aa57a58a1586bf166513297296cb225b3
+crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu	crates/ec-av1/src/stream.rs:23810	recovered-original	-	ok	yes	81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be
+crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu	crates/ec-av1/src/stream.rs:23811	recovered-original	-	ok	yes	81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be
+crates/ec-av1/fixtures/grain_cdef_lr_128x128.obu	crates/ec-av1/src/stream.rs:14593	captured	-	ok	yes	06f210b87b5c79eb729c559050e073abbe226c4dad1df3dcaa113b03011ad732
+crates/ec-av1/fixtures/hg_arf_witness.obu	crates/ec-av1/src/stream.rs:14478	captured	-	ok	yes	7f3b060da5aa9c537633e760c4af71316237db7692f6ae0d459bd2c2dd867d37
+crates/ec-av1/fixtures/hg_arf_witness.obu	crates/ec-av1/src/stream.rs:43200	captured	-	ok	yes	7f3b060da5aa9c537633e760c4af71316237db7692f6ae0d459bd2c2dd867d37
+crates/ec-av1/fixtures/hg_arf_witness.obu	crates/ec-av1/src/stream.rs:43282	captured	-	ok	yes	7f3b060da5aa9c537633e760c4af71316237db7692f6ae0d459bd2c2dd867d37
+crates/ec-av1/fixtures/hg_head_key_frame.obu	crates/ec-av1/src/stream.rs:14731	captured	-	ok	yes	53c311dec790bb2413afdde92cb24de498a7c4f66f6f0c7f4f5910ab0d2c65dc
+crates/ec-av1/fixtures/hg_head_mvclamp_witness.obu	crates/ec-av1/src/stream.rs:44220	captured	-	ok	yes	451a9b138995e636f22308847a123b5c8621d4908cd93772cf5bbf2b37df39d7
+crates/ec-av1/fixtures/hg_intra14_witness.obu	crates/ec-av1/src/stream.rs:43029	captured	-	ok	yes	0eff603bf1608e47faf5e6729670c4c77cf5c674dbad3a1533ac6660151fd90e
+crates/ec-av1/fixtures/hg_kf900.obu	crates/ec-av1/src/stream.rs:14873	captured	-	ok	yes	a273ae99328388be14a1ff8fa1c5a6d391a9948159eaef120e1b50e02015eb83
+crates/ec-av1/fixtures/hg_kf900.obu	crates/ec-av1/src/stream.rs:44998	captured	-	ok	yes	a273ae99328388be14a1ff8fa1c5a6d391a9948159eaef120e1b50e02015eb83
+crates/ec-av1/fixtures/hg_rect64_intra16x4_witness.obu	crates/ec-av1/src/stream.rs:43118	captured	-	ok	yes	c9e721088766163b9dbeb9fa8dd8b257ff0ec7f9157fc350de4d3c33cd9ec4e4
+crates/ec-av1/fixtures/hg_ss300_key_frame.obu	crates/ec-av1/src/stream.rs:14822	captured	-	ok	yes	7e3ddf0d602f9496b2f7eb11f051fd4a045020e094d5bc02f83825e2c494ef12
+crates/ec-av1/fixtures/hg_ss600_key_frame.obu	crates/ec-av1/src/stream.rs:14914	captured	-	ok	yes	36de46676ed7de7049d4dabe8571d8cd31c8a1f53d72011c0ee532a7c6725cd6
+crates/ec-av1/fixtures/intra128_in_inter_screen_witness.obu	crates/ec-av1/src/stream.rs:43700	captured	-	ok	yes	c84a493f90327f5d2bea038a42e87cbfe56762b5c6a856d76b4bff9797c5ea09
+crates/ec-av1/fixtures/intra128_in_inter_witness2.obu	crates/ec-av1/src/stream.rs:43632	captured	-	ok	yes	cace4cc3a5ba4dc5f8c7c219e87c9052351e832cad3d7f4c8ffe09288a6d7ccf
+crates/ec-av1/fixtures/intra128_in_inter_witness2.obu	crates/ec-av1/src/stream.rs:43977	captured	-	ok	yes	cace4cc3a5ba4dc5f8c7c219e87c9052351e832cad3d7f4c8ffe09288a6d7ccf
+crates/ec-av1/fixtures/intra128_in_inter_witness2.obu	crates/ec-av1/src/stream.rs:44054	captured	-	ok	yes	cace4cc3a5ba4dc5f8c7c219e87c9052351e832cad3d7f4c8ffe09288a6d7ccf
+crates/ec-av1/fixtures/intra128_in_inter_witness.obu	crates/ec-av1/src/stream.rs:43536	captured	-	ok	yes	dd41fc39367a3d38bf8a8a8106dc30d91b716b2a9123fdfa4716930f4f98caf9
+crates/ec-av1/fixtures/intra14_256x192_10bit.obu	crates/ec-av1/src/stream.rs:42354	captured	-	ok	yes	ab6fae0a256af6410e8200f10827a3e965dee7b2d7ab63710e94968bddab23a2
+crates/ec-av1/fixtures/intra14_256x192_8bit.obu	crates/ec-av1/src/stream.rs:42362	captured	-	ok	yes	5e50eb6d4492e806a2803988d92bd47f069ca54e02c06344d5500c6b72deb861
+crates/ec-av1/fixtures/intrabc_tx4_chroma_kf.obu	crates/ec-av1/src/stream.rs:12056	captured	-	ok	yes	bc699af4a6e7c1c5657f041e8cbdf2d3d899ddb80ec2a549a950b7cebb5b41bd
 crates/ec-av1/fixtures/ll444_128root_lossless.obu	crates/ec-av1/src/stream.rs:6828	captured	-	ok	yes	bbffb979d20d581deb271aac75b7ee779dde57c024524ed6b1389356f55ca0fa
 crates/ec-av1/fixtures/ll444_128root_lossless.obu	crates/ec-av1/src/stream.rs:6948	captured	-	ok	yes	bbffb979d20d581deb271aac75b7ee779dde57c024524ed6b1389356f55ca0fa
 crates/ec-av1/fixtures/ll444_defaultp_inter_strip.obu	crates/ec-av1/src/stream.rs:8090	captured	-	ok	yes	1e6dd4e05038c8d51e2c8d29f8c337130c4fea0aed629415535e6e53af9a2c72
@@ -108,29 +113,31 @@ crates/ec-av1/fixtures/ll444-lossless-key.obu	crates/ec-av1/src/stream.rs:6525	c
 crates/ec-av1/fixtures/ll444_minp64_128root_control.obu	crates/ec-av1/src/stream.rs:6879	captured	-	ok	yes	4cadce41e1f8967567b32f5cf8abaa46ffdf4fd6d4afe784c8d99a7f6bf1ae4c
 crates/ec-av1/fixtures/ll444_minp64_128root_control.obu	crates/ec-av1/src/stream.rs:6993	captured	-	ok	yes	4cadce41e1f8967567b32f5cf8abaa46ffdf4fd6d4afe784c8d99a7f6bf1ae4c
 crates/ec-av1/fixtures/ll444_minp64_inter.obu	crates/ec-av1/src/stream.rs:6677	captured	-	ok	yes	5a070fa351a3f2109de855234f2b3d0a872970f3e7f658db21f65c12eeb135b4
-crates/ec-av1/fixtures/ll444_minp8_inter.obu	crates/ec-av1/src/stream.rs:20809	captured	-	ok	yes	04fb6d38de5382e647bfb70b6a17802f1fccc5502e6698c0394167891f2b27dc
+crates/ec-av1/fixtures/ll444_minp8_inter.obu	crates/ec-av1/src/stream.rs:20825	captured	-	ok	yes	04fb6d38de5382e647bfb70b6a17802f1fccc5502e6698c0394167891f2b27dc
 crates/ec-av1/fixtures/ll444_minp8_inter.obu	crates/ec-av1/src/stream.rs:7058	captured	-	ok	yes	04fb6d38de5382e647bfb70b6a17802f1fccc5502e6698c0394167891f2b27dc
-crates/ec-av1/fixtures/ll444_rect16x4_chroma_reach.obu	crates/ec-av1/src/stream.rs:11114	captured	-	ok	yes	382e67c0cc0988d14c500a62f5c3457a3f3b5f76d05acce2f655b1089bb8e7e3
-crates/ec-av1/fixtures/ll444_sb64_1to4_lossless.obu	crates/ec-av1/src/stream.rs:46194	captured	-	ok	yes	fdb6467987095b99c8eb51b48743691d906b2d99d069f71f1d51b1abb6d2056e
+crates/ec-av1/fixtures/ll444_rect16x4_chroma_reach.obu	crates/ec-av1/src/stream.rs:11130	captured	-	ok	yes	382e67c0cc0988d14c500a62f5c3457a3f3b5f76d05acce2f655b1089bb8e7e3
+crates/ec-av1/fixtures/ll444_sb64_1to4_lossless.obu	crates/ec-av1/src/stream.rs:46379	captured	-	ok	yes	fdb6467987095b99c8eb51b48743691d906b2d99d069f71f1d51b1abb6d2056e
 crates/ec-av1/fixtures/lossless_sb128_rect_kf.obu	crates/ec-av1/src/stream.rs:8338	captured	-	ok	yes	013b07979c8be999c70d47f32768c2bf959be086a893f60dde1b0f5e35d4f475
-crates/ec-av1/fixtures/lr-sgr-r7.obu	(committed pin: NO source reference found)	recovered-original	-	ok	yes	6b95b20e3377430ffae0b2ce86fad9502e0dedf13cd6c38ab7f5af4a8b21f33d
-crates/ec-av1/fixtures/palette_screen_leaf8_witness.obu	crates/ec-av1/src/stream.rs:43775	captured	-	ok	yes	8d036606116913c82b774286bb0a3efe616d54151784897ba62b13d12fdef06e
-crates/ec-av1/fixtures/palette_screen_strip16_witness_10bit.obu	crates/ec-av1/src/stream.rs:43819	captured	-	ok	yes	aaabbb001d87f61ee534fd17c2d558ad906d1c33d357decb86cfd26e593da0db
-crates/ec-av1/fixtures/palette_screen_witness_10bit.obu	crates/ec-av1/src/stream.rs:14464	captured	-	ok	yes	a60a8bc132e5db7bed3eb46e03e9ed9828811bdffb96914958f3c94b107c3cda
-crates/ec-av1/fixtures/palette_screen_witness_10bit.obu	crates/ec-av1/src/stream.rs:43694	captured	-	ok	yes	a60a8bc132e5db7bed3eb46e03e9ed9828811bdffb96914958f3c94b107c3cda
-crates/ec-av1/fixtures/palette_screen_witness.obu	crates/ec-av1/src/stream.rs:14463	captured	-	ok	yes	635a512b866f0fab7d45eb4f94f2a5b15008fe5a5317ac1ca45ffd3381198b8b
-crates/ec-av1/fixtures/palette_screen_witness.obu	crates/ec-av1/src/stream.rs:43100	captured	-	ok	yes	635a512b866f0fab7d45eb4f94f2a5b15008fe5a5317ac1ca45ffd3381198b8b
-crates/ec-av1/fixtures/palette_screen_witness.obu	crates/ec-av1/src/stream.rs:43693	captured	-	ok	yes	635a512b866f0fab7d45eb4f94f2a5b15008fe5a5317ac1ca45ffd3381198b8b
-crates/ec-av1/fixtures/rect64_dq_drift.obu	crates/ec-av1/src/stream.rs:39427	captured	-	ok	yes	094e51bb21b6caccc905417e95a03f9131b448071567d0b14ec8850799ea2501
-crates/ec-av1/fixtures/sbpart-pin.obu	crates/ec-av1/src/stream.rs:39510	captured	-	ok	yes	62238fc077f45d89745d4d254b9c0465464003529da3b42d0a65631fbb7e16e9
-crates/ec-av1/fixtures/superres_alltools_sb128_320x180.obu	crates/ec-av1/src/stream.rs:14524	captured	-	ok	yes	e2b515ce487acd2d720d5a000a6f26e66fd03ef2b1a4cb12daa6fdf31a55d519
-crates/ec-av1/fixtures/superres_alltools_sb128_320x180.obu	crates/ec-av1/src/stream.rs:14576	captured	-	ok	yes	e2b515ce487acd2d720d5a000a6f26e66fd03ef2b1a4cb12daa6fdf31a55d519
-crates/ec-av1/fixtures/superres_alltools_sb128_320x180.obu	crates/ec-av1/src/stream.rs:14679	captured	-	ok	yes	e2b515ce487acd2d720d5a000a6f26e66fd03ef2b1a4cb12daa6fdf31a55d519
-crates/ec-av1/fixtures/superres_kf_cdef_lr_64x64.obu	crates/ec-av1/src/stream.rs:14000	captured	-	ok	yes	5912e251bcd5d0f284f647616f91b19b579238c16fa85c0294a06548088d7336
-crates/ec-av1/fixtures/troy_kf2700.obu	crates/ec-av1/src/stream.rs:14753	captured	-	ok	yes	16981094eaab516bd1007b0a47d1fc653fbb58b7e18a40af6c12d934bf96fe63
-crates/ec-av1/fixtures/troy_sb128_inter_witness.obu	crates/ec-av1/src/stream.rs:43272	captured	-	ok	yes	09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc
-crates/ec-av1/fixtures/troy_sb128_inter_witness.obu	crates/ec-av1/src/stream.rs:43875	captured	-	ok	yes	09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc
-crates/ec-av1/fixtures/troy_sb128_inter_witness.obu	crates/ec-av1/src/stream.rs:43952	captured	-	ok	yes	09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc
+crates/ec-av1/fixtures/lr-sgr-r7.obu	crates/ec-av1/src/stream.rs:30337	recovered-original	-	ok	yes	6b95b20e3377430ffae0b2ce86fad9502e0dedf13cd6c38ab7f5af4a8b21f33d
+crates/ec-av1/fixtures/lr-sgr-r7.obu	crates/ec-av1/src/stream.rs:30338	recovered-original	-	ok	yes	6b95b20e3377430ffae0b2ce86fad9502e0dedf13cd6c38ab7f5af4a8b21f33d
+crates/ec-av1/fixtures/palette_screen_leaf8_witness.obu	crates/ec-av1/src/stream.rs:43876	captured	-	ok	yes	8d036606116913c82b774286bb0a3efe616d54151784897ba62b13d12fdef06e
+crates/ec-av1/fixtures/palette_screen_strip16_witness_10bit.obu	crates/ec-av1/src/stream.rs:43920	captured	-	ok	yes	aaabbb001d87f61ee534fd17c2d558ad906d1c33d357decb86cfd26e593da0db
+crates/ec-av1/fixtures/palette_screen_witness_10bit.obu	crates/ec-av1/src/stream.rs:14480	captured	-	ok	yes	a60a8bc132e5db7bed3eb46e03e9ed9828811bdffb96914958f3c94b107c3cda
+crates/ec-av1/fixtures/palette_screen_witness_10bit.obu	crates/ec-av1/src/stream.rs:43795	captured	-	ok	yes	a60a8bc132e5db7bed3eb46e03e9ed9828811bdffb96914958f3c94b107c3cda
+crates/ec-av1/fixtures/palette_screen_witness.obu	crates/ec-av1/src/stream.rs:14479	captured	-	ok	yes	635a512b866f0fab7d45eb4f94f2a5b15008fe5a5317ac1ca45ffd3381198b8b
+crates/ec-av1/fixtures/palette_screen_witness.obu	crates/ec-av1/src/stream.rs:43201	captured	-	ok	yes	635a512b866f0fab7d45eb4f94f2a5b15008fe5a5317ac1ca45ffd3381198b8b
+crates/ec-av1/fixtures/palette_screen_witness.obu	crates/ec-av1/src/stream.rs:43794	captured	-	ok	yes	635a512b866f0fab7d45eb4f94f2a5b15008fe5a5317ac1ca45ffd3381198b8b
+crates/ec-av1/fixtures/rect64_dq_drift.obu	crates/ec-av1/src/stream.rs:39528	captured	-	ok	yes	094e51bb21b6caccc905417e95a03f9131b448071567d0b14ec8850799ea2501
+crates/ec-av1/fixtures/sbpart-pin.obu	crates/ec-av1/src/stream.rs:39611	captured	-	ok	yes	62238fc077f45d89745d4d254b9c0465464003529da3b42d0a65631fbb7e16e9
+crates/ec-av1/fixtures/superres_alltools_sb128_320x180.obu	crates/ec-av1/src/stream.rs:14540	captured	-	ok	yes	e2b515ce487acd2d720d5a000a6f26e66fd03ef2b1a4cb12daa6fdf31a55d519
+crates/ec-av1/fixtures/superres_alltools_sb128_320x180.obu	crates/ec-av1/src/stream.rs:14592	captured	-	ok	yes	e2b515ce487acd2d720d5a000a6f26e66fd03ef2b1a4cb12daa6fdf31a55d519
+crates/ec-av1/fixtures/superres_alltools_sb128_320x180.obu	crates/ec-av1/src/stream.rs:14695	captured	-	ok	yes	e2b515ce487acd2d720d5a000a6f26e66fd03ef2b1a4cb12daa6fdf31a55d519
+crates/ec-av1/fixtures/superres_kf_cdef_lr_64x64.obu	crates/ec-av1/src/stream.rs:14016	captured	-	ok	yes	5912e251bcd5d0f284f647616f91b19b579238c16fa85c0294a06548088d7336
+crates/ec-av1/fixtures/troy_kf2700.obu	crates/ec-av1/src/stream.rs:14769	captured	-	ok	yes	16981094eaab516bd1007b0a47d1fc653fbb58b7e18a40af6c12d934bf96fe63
+crates/ec-av1/fixtures/troy_sb128_inter_witness.obu	crates/ec-av1/src/stream.rs:43373	captured	-	ok	yes	09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc
+crates/ec-av1/fixtures/troy_sb128_inter_witness.obu	crates/ec-av1/src/stream.rs:43976	captured	-	ok	yes	09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc
+crates/ec-av1/fixtures/troy_sb128_inter_witness.obu	crates/ec-av1/src/stream.rs:44053	captured	-	ok	yes	09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc
+crates/ec-av1/fixtures/troy_sb128_inter_witness.obu	crates/ec-av1/src/stream.rs:45068	captured	-	ok	yes	09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc
 fixtures/audio/aac-adts-5.1-44100.aac	crates/ec-aac/tests/oracle.rs:151	regenerated	scripts/gen-fixtures.sh	ok	-	2b615b45e7c45136e2d477bd5ed489822ddadcb5f1b7fe2da0a66dcc288881b4
 fixtures/audio/aac-adts-5.1-48000.aac	crates/ec-aac/tests/oracle.rs:152	regenerated	scripts/gen-fixtures.sh	ok	-	f416a2059766b6ce751bdf272836897c191073ca9f4f302552e949eeeeb01a44
 fixtures/audio/aac-adts-5.1-48000.aac	crates/ec-probe/tests/matrix.rs:95	regenerated	scripts/gen-fixtures.sh	ok	-	f416a2059766b6ce751bdf272836897c191073ca9f4f302552e949eeeeb01a44
@@ -224,7 +231,8 @@ fixtures	crates/ec-av1/src/encode.rs:21143	regenerated	scripts/gen-fixtures.sh	o
 fixtures	crates/ec-av1/src/encode.rs:21525	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-av1/src/encode.rs:22076	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-av1/src/encode.rs:22632	regenerated	scripts/gen-fixtures.sh	ok	-	-
-fixtures	crates/ec-av1/src/stream.rs:31116	regenerated	scripts/gen-fixtures.sh	ok	-	-
+fixtures/...	crates/ec-av1/src/stream.rs:23798	regenerated	scripts/gen-fixtures.sh	missing	-	-
+fixtures	crates/ec-av1/src/stream.rs:31209	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-av1/src/stream.rs:9118	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-flac/tests/encode_matrix.rs:48	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-matroska/tests/matroska.rs:92	regenerated	scripts/gen-fixtures.sh	ok	-	-
@@ -232,9 +240,6 @@ fixtures	crates/ec-mp3/tests/decode_matrix.rs:19	regenerated	scripts/gen-fixture
 fixtures	crates/ec-mp3/tests/encode_matrix.rs:45	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-mp4/tests/mp4.rs:19	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-vorbis/tests/oracle.rs:18	regenerated	scripts/gen-fixtures.sh	ok	-	-
-fixtures/golden6-mismatch.obu	crates/ec-av1/src/stream.rs:33218	regenerated	none (prose provenance only)	ok	-	c56909b98542192b03f3a945e153475aa57a58a1586bf166513297296cb225b3
-fixtures/golden7-forwarding-mismatch.obu	crates/ec-av1/src/stream.rs:23784	regenerated	none (prose provenance only)	ok	-	81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be
-fixtures/lr-sgr-r7.obu	crates/ec-av1/src/stream.rs:30283	regenerated	none (prose provenance only)	ok	-	6b95b20e3377430ffae0b2ce86fad9502e0dedf13cd6c38ab7f5af4a8b21f33d
 fixtures/stills	crates/ec-image/tests/differential.rs:24	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures/stills	crates/ec-image/tests/fuzz.rs:15	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures/subs	crates/ec-subs/tests/real_library.rs:15	regenerated	scripts/gen-fixtures.sh	ok	-	-
@@ -254,7 +259,7 @@ fixtures/video/h264-1080p-23.976-8bit.mp4	crates/ec-av1/src/encode.rs:21231	rege
 fixtures/video/h264-1080p-23.976-8bit.mp4	crates/ec-av1/src/encode.rs:21530	regenerated	scripts/gen-fixtures.sh	ok	-	db7275c361b07985088e80337a6c8c144d232d12f4d57cb84645effe27195784
 fixtures/video/h264-1080p-23.976-8bit.mp4	crates/ec-av1/src/encode.rs:22090	regenerated	scripts/gen-fixtures.sh	ok	-	db7275c361b07985088e80337a6c8c144d232d12f4d57cb84645effe27195784
 fixtures/video/h264-1080p-23.976-8bit.mp4	crates/ec-av1/src/encode.rs:22634	regenerated	scripts/gen-fixtures.sh	ok	-	db7275c361b07985088e80337a6c8c144d232d12f4d57cb84645effe27195784
-fixtures/video/h264-1080p-23.976-8bit.mp4	crates/ec-av1/src/stream.rs:44622	regenerated	scripts/gen-fixtures.sh	ok	-	db7275c361b07985088e80337a6c8c144d232d12f4d57cb84645effe27195784
+fixtures/video/h264-1080p-23.976-8bit.mp4	crates/ec-av1/src/stream.rs:44723	regenerated	scripts/gen-fixtures.sh	ok	-	db7275c361b07985088e80337a6c8c144d232d12f4d57cb84645effe27195784
 fixtures/video/h264-1080p-60-8bit.mp4	crates/ec-av1/src/encode.rs:20454	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures/video/h264-2160p-23.976-8bit.mp4	crates/ec-av1/src/encode.rs:21232	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures/video/h264-2160p-23.976-8bit.mp4	crates/ec-av1/src/encode.rs:21531	regenerated	scripts/gen-fixtures.sh	ok	-	-
