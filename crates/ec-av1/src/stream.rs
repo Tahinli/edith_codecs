@@ -7184,6 +7184,152 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1lm444loss-corr: the MI STEP at which `decode_intrabc_rect`'s
+    /// lossless chroma replay walks the plane block.
+    ///
+    /// `lane-whtshape` (`f541d062`, merged `afa13bcf`) gave this route the
+    /// per-TX_4X4 lossless chroma walk and the tail replay that re-stamps
+    /// each unit's own coefficient context over the whole-block record. The
+    /// replay stepped by `4 >> ss_y(fctx)` mi cells, which is 4:2:0-only
+    /// arithmetic: at ss (1,1) it reads 2 and the ss-aware form
+    /// `(4 << ss_y) / MI` also reads 2, so 4:2:0 agrees by construction; at
+    /// ss (0,0) it reads 4 mi, i.e. 16 luma px per 4x4 chroma unit, where the
+    /// unit covers `4 << 0` = 4 luma px = ONE mi. Every replayed unit was
+    /// therefore stamped at 4x its own mi origin on a 4:4:4 lossless frame,
+    /// writing over cells that belong to other blocks.
+    ///
+    /// This gate is the WIRNESS stream, not a vacuous one. The 4:2:0
+    /// 4x4-identity is stated in the step's own comment and measured by the
+    /// `4:2:0` arm of the lane's invariant battery, not asserted here --
+    /// a 4:2:0 stream cannot fail this gate, by construction, and pretending
+    /// otherwise would be a floor on wrong output.
+    ///
+    /// Fixture `ll444_intrabc_rect_l2.obu`, 121844 bytes, sha256
+    /// `f0de080edce35d34cdd628b71f63dc452f946e8328352b69d3c1da090a54ec67`:
+    /// `testsrc2 512x128 yuv444p`, aomenc `--lossless=1 --cpu-used=2
+    /// --lag-in-frames=0 --kf-max-dist=100 --limit=6`, 6 frames. On main's
+    /// step this stream is 10604 samples wrong in the KEY frame, first at
+    /// byte 33216 (Y(64,448)) -- the corrupted chroma context desyncs the
+    /// following luma, which is why the first divergence is luma at all.
+    ///
+    /// Assertions:
+    ///
+    /// 1. `(subsampling_x, subsampling_y, bit_depth) == (0, 0, 8)` from the
+    ///    stream's OWN parsed sequence header. At (1,1) the corrected step
+    ///    and the old one are the same number, so without this every
+    ///    assertion below would pass on a stream that cannot fail.
+    /// 2. `intrabc_rect_lossless_chroma4_hits()` (lane-whtshape's own
+    ///    counter) is nonzero -- the replayed arm really ran, so the
+    ///    corrected expression was evaluated.
+    /// 3. the U and V plane extents are luma-sized, which is the geometry
+    ///    the step indexes into.
+    /// 4. `decode_all_frames_vs_oracle`: decode-order frame-count parity,
+    ///    then byte-exactness on every frame.
+    ///
+    /// Control: the sibling 128x96 4:4:4 lossless pin, whose blocks are
+    /// whole and square, must not take the lossless chroma walk at all --
+    /// its chroma plane block IS one TX_4X4, so there is no step to replay.
+    #[test]
+    fn a_lossless_444_intrabc_rect_replay_steps_by_the_units_own_mi_footprint() {
+        const NAME: &str = "a_lossless_444_intrabc_rect_replay_steps_by_the_units_own_mi_footprint";
+        const W: usize = 512;
+        const H: usize = 128;
+        const FRAMES: usize = 6;
+
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_intrabc_rect_l2.obu");
+        let stream = read_pin(&obu, 121844, 0x38bf_968e_979c_7a0a, NAME);
+        assert_eq!(
+            subsampled_header_shape(&stream, NAME),
+            (0, 0, 8),
+            "{NAME}: the stream is not 8-bit 4:4:4 -- at ss (1,1) the corrected \
+             step and the 4:2:0-only one are the SAME number (2 mi), so this gate \
+             cannot fail on a 4:2:0 stream and would prove nothing there"
+        );
+        let _guard = lock_gate_counters();
+        crate::decode::reset_intrabc_rect_lossless_chroma4_hits();
+        let h0 = crate::decode::intrabc_rect_lossless_chroma4_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
+        let walked = crate::decode::intrabc_rect_lossless_chroma4_hits() - h0;
+        assert!(
+            walked > 0,
+            "{NAME}: lane-whtshape's lossless per-TX_4X4 chroma walk never ran, so the \
+             replayed MI step -- the thing this gate exists for -- was never evaluated"
+        );
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for f in &frames {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+            assert_eq!(
+                f.u.len(),
+                W * H,
+                "{NAME}: U extent must be luma-sized at 4:4:4 -- the replay steps mi \
+                 cells through this grid"
+            );
+            assert_eq!(f.v.len(), W * H, "{NAME}: V extent must be luma-sized at 4:4:4");
+        }
+        if aomdec_path().is_file() {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert_eq!(
+                decoded, FRAMES,
+                "{NAME}: decoded {decoded} frames in decode order, expected {FRAMES}"
+            );
+            eprintln!(
+                "{NAME}: {decoded} frames byte-exact vs aomdec ({hidden} hidden), \
+                 {walked} lossless chroma replays"
+            );
+        } else {
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
+        }
+
+        // Control: whole square blocks have no multi-unit plane block to step.
+        let ctrl = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_128root_lossless.obu");
+        let ctrl_stream = read_pin(&ctrl, 63429, 0xf07d_47fc_fd51_2658, &format!("{NAME} control"));
+        crate::decode::reset_intrabc_rect_lossless_chroma4_hits();
+        let _ = decode_stream(&ctrl_stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the control arm no longer decodes cleanly: {e}"));
+        assert_eq!(
+            crate::decode::intrabc_rect_lossless_chroma4_hits(),
+            0,
+            "{NAME} control: the lossless chroma walk ran on a stream of whole square \
+             blocks -- there is no multi-unit chroma plane block to replay, so the \
+             corrected step is not exercised there at all"
+        );
+    }
+
+    /// `(subsampling_x, subsampling_y, bit_depth)` out of the stream's OWN
+    /// sequence header. A gate that claims to exercise a subsampling-specific
+    /// path must assert this from the parsed header, not from the recipe that
+    /// produced the fixture: the recipe can drift (or a wrong `--pix_fmt`
+    /// argument can silently produce a different subsampling) and every other
+    /// assertion would then pass vacuously.
+    fn subsampled_header_shape(stream: &[u8], name: &str) -> (u8, u8, usize) {
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut shape = None;
+        while pos < stream.len() {
+            let obu = parser
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: OBU does not parse: {e:?}"));
+            if obu.total_size == 0 {
+                break;
+            }
+            pos += obu.total_size;
+            if let ObuKind::SequenceHeader(seq) = obu.kind {
+                shape = Some((
+                    seq.color_config.subsampling_x,
+                    seq.color_config.subsampling_y,
+                    seq.color_config.bit_depth as usize,
+                ));
+            }
+        }
+        shape.unwrap_or_else(|| panic!("{name}: no sequence header parsed"))
+    }
+
     /// lane-av1llpredgate2: the debug-exact pin for the ss-aware
     /// `obmc_skip_chroma_above` decision (lane-av1-llpred2). Fixture is the
     /// llpred/llpred2 reports' stream pinned into `fixtures/`: testsrc2

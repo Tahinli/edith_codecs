@@ -13892,7 +13892,26 @@ fn decode_intrabc_rect(
                         unit.extend_from_slice(&comp[(ur * 4 + r) * cside + uc * 4..][..4]);
                     }
                     neighbours.record_mi_chroma(
-                        (mi_r + ur * (4 >> ss_y(fctx)), mi_c + uc * (4 >> ss_x(fctx))),
+                        // lane-av1lm444loss-corr: the MI STEP between chroma
+                        // units is that same footprint expressed in luma mi
+                        // cells, `(4 << ss) / MI` -- which is exactly what
+                        // `decode_inter_block`'s reference `mu_chroma_units`
+                        // construction writes (decode.rs:43688,
+                        // `at.0 + cr * ((cu << ss_y(fctx)) / MI)` with
+                        // `cu = 4` on a lossless frame). The `4 >> ss_y` form
+                        // this replaces is 4:2:0-only arithmetic that happens
+                        // to agree there: at ss (1,1) it is `4 >> 1` = 2 mi
+                        // and the footprint form is `(4 << 1) / 4` = 2 mi, the
+                        // SAME value, so 4:2:0 is unchanged by construction.
+                        // At ss (0,0) it is `4 >> 0` = 4 mi -- four luma mi
+                        // (16 luma px) per 4x4 chroma unit, where a TX_4X4
+                        // chroma unit covers `4 << 0` = 4 luma px = ONE mi.
+                        // The step therefore lands every replayed unit at 4x
+                        // its own mi row/column on a 4:4:4 lossless frame, and
+                        // the whole block's per-unit states are stamped over
+                        // cells that belong to other blocks (or to nothing).
+                        (mi_r + ur * ((4 << ss_y(fctx)) / MI),
+                         mi_c + uc * ((4 << ss_x(fctx)) / MI)),
                         4 << ss_x(fctx),
                         4 << ss_y(fctx),
                         plane_idx,
