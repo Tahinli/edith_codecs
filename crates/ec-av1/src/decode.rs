@@ -27565,9 +27565,37 @@ fn read_block_tx_size(
     // `read_block_tx_size` (`decodeframe.c`) sends a lossless block down the
     // `read_tx_size` arm, which returns TX_4X4 before it reads anything.
     if lossless(fctx) {
-        let mut leaves = Vec::new();
-        for row in 0..side / MI {
-            for col in 0..side / MI {
+        // lane-av1lm444loss: libaom CLIPS the transform-unit grid at the frame
+        // edge -- `max_block_high`/`max_block_wide` (`av1_common_int.h:1565`,
+        // `:1579`) fold `mb_to_bottom_edge`/`mb_to_right_edge` into
+        // `block_size_high/wide` before `>> MI_SIZE_LOG2`, so a block that
+        // hangs off the bottom/right codes only the units INSIDE the frame.
+        // `decode_token_recon_block`'s mu walk then bounds every chunk with
+        // `unit_height = ROUND_POWER_OF_TWO(AOMMIN(mu_blocks_high + row,
+        // max_blocks_high), ss_y)`, so the out-of-frame units are never read.
+        //
+        // The unclipped `side / MI` grid is correct arithmetic for a block that
+        // FITS, which is every block of a frame whose height and width are
+        // multiples of the superblock -- so this reads identically on all of
+        // those, and only differs on the partial edge block. Measured on the
+        // 128x96 4:4:4 lossless pin (one 128 root per inter frame, frame 32
+        // mi = 24 tx rows tall): the unclipped grid read 32 rows where the
+        // oracle read 24 -- 256 extra luma units per inter frame (1024 vs
+        // the oracle's 768), the `EC_SYMR` ladder's first fork landing exactly
+        // at that row-24 boundary (`plane=0` luma where the oracle had moved
+        // to `plane=1`), and the pixel diff growing 5596 -> 33561 wrong
+        // samples over the six frames.
+        let side_mi = side / MI;
+        let max_w_mi = side_mi.min(mi_cols.saturating_sub(at_mi.1));
+        let max_h_mi = side_mi.min(mi_rows.saturating_sub(at_mi.0));
+        if max_w_mi != side_mi || max_h_mi != side_mi {
+            LOSSLESS_EDGE_CLIPPED.with(|c| c.set(c.get() + 1));
+            LOSSLESS_EDGE_CLIP_UNITS
+                .with(|c| c.set(c.get() + (side_mi * side_mi - max_w_mi * max_h_mi)));
+        }
+        let mut leaves = Vec::with_capacity(max_w_mi * max_h_mi);
+        for row in 0..max_h_mi {
+            for col in 0..max_w_mi {
                 leaves.push((row, col, 4, 4));
             }
         }
@@ -28047,9 +28075,24 @@ fn read_block_tx_size_rect(
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Option<Vec<(usize, usize, usize, usize)>>> {
     if lossless(fctx) {
-        let mut leaves = Vec::new();
-        for row in 0..bh / MI {
-            for col in 0..bw / MI {
+        // lane-av1lm444loss: the same frame-edge clip as the square builder
+        // above -- `max_block_high`/`max_block_wide` bound a rect block's
+        // transform grid by the part of it inside the frame, so a 1:4 strip
+        // hanging off the bottom codes only its in-frame rows. Identical
+        // arithmetic for a block that fits.
+        let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(at_mi.1));
+        let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(at_mi.0));
+        let full_w_mi = bw / MI;
+        let full_h_mi = bh / MI;
+        if max_w_mi != full_w_mi || max_h_mi != full_h_mi {
+            LOSSLESS_EDGE_CLIPPED.with(|c| c.set(c.get() + 1));
+            LOSSLESS_EDGE_CLIP_UNITS.with(|c| {
+                c.set(c.get() + (full_w_mi * full_h_mi - max_w_mi * max_h_mi))
+            });
+        }
+        let mut leaves = Vec::with_capacity(max_w_mi * max_h_mi);
+        for row in 0..max_h_mi {
+            for col in 0..max_w_mi {
                 leaves.push((row, col, 4, 4));
             }
         }
@@ -32310,6 +32353,19 @@ thread_local! {
     /// 128x96 4:4:4 lossless stream, 1536 per inter frame (768 per plane),
     /// against the oracle's 1536.
     pub(crate) static MU_CHUNK_WALK_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1lm444loss: lossless blocks whose transform-unit grid was
+    /// CLIPPED at the frame edge -- `max_block_high`/`max_block_wide` cut the
+    /// grid short of the block's own `side / MI`, so libaom codes fewer TX_4X4
+    /// units than the block is wide/tall. Zero on any frame whose height and
+    /// width are multiples of the superblock, so a gate cannot look armed by
+    /// merely decoding.
+    pub(crate) static LOSSLESS_EDGE_CLIPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1lm444loss: the transform units that clip REMOVED -- the
+    /// `(side / MI - clipped) * (side / MI)` overflow the pre-fix walk read
+    /// past the frame bottom/right edge. On the 128x96 4:4:4 lossless pin this
+    /// is 256 per inter frame (8 unclipped luma rows x 32 columns), and 0 on a
+    /// frame that fits.
+    pub(crate) static LOSSLESS_EDGE_CLIP_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`MU_CHUNK_WALKS`], for a gate's own before/after delta.
@@ -32328,6 +32384,19 @@ pub(crate) fn mu_chunk_walk_units() -> usize {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn mu_chunk_order_hits() -> usize {
     MU_CHUNK_ORDER_HITS.with(std::cell::Cell::get)
+}
+/// [`LOSSLESS_EDGE_CLIPPED`] -- lossless blocks whose TX grid the frame-edge
+/// clip shortened, for a gate's own before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lossless_edge_clipped() -> usize {
+    LOSSLESS_EDGE_CLIPPED.with(std::cell::Cell::get)
+}
+
+/// [`LOSSLESS_EDGE_CLIP_UNITS`] -- transform units the clip removed, i.e. the
+/// ones the unclipped pre-fix walk read past the frame edge.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lossless_edge_clip_units() -> usize {
+    LOSSLESS_EDGE_CLIP_UNITS.with(std::cell::Cell::get)
 }
 
 /// [`CHROMA_SPLIT_TX_HITS`], for a gate's own before/after delta.
