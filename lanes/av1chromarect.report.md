@@ -314,7 +314,7 @@ by the `a_lossless_444_*` set; the intrabc_rect arm by
 
 `crates/ec-av1/src/decode.rs:45594`, body ends at `46422`. It carries a
 `chroma_444` branch set and **zero** `chroma_422` mentions inside the body
-(`awk 'NR>=45606 && NR<=46400' | grep -c chroma_422` → `0`; the two
+(`awk 'NR>=45594 && NR<=46422' | grep -c chroma_422` → `0`; the two
 `chroma_422` mentions at 45394/45406 belong to the enclosing
 `decode_intra_split`, not to this function).
 
