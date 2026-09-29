@@ -468,6 +468,42 @@ mutation proof. A second pointer was added at
 `cargo test` run-line still naming the deleted test -- a stale instruction left
 by the deletion, caught by grepping for the name after the cut.
 
+### GENERAL RULE -- when a dead gate may be deleted, and when it may not
+
+> A gate whose precondition is unreachable is dead weight ONLY when BOTH of its
+> halves are covered elsewhere. Here the pixel half is covered four times at
+> the same geometry with the same own-reconstruction compare, and the
+> precondition is covered by an invariant test that BOUNDS THE DOMAIN (stack
+> sizes 0..=4) rather than sampling it -- `best_new_mv_syntax` breaks at
+> `entries.len() <= idx`, so indices 3/4 are unreachable at any stack size.
+> Had the pixel compare been unique, keeping the test with a fact-stating
+> ignore string would have been the honest call; a deleted unique assertion is
+> not recoverable from a report.
+
+The asymmetry is the whole rule. `#[ignore]` is nearly free -- a gate that
+cannot fire is inert, and its doc comment still tells the next lane what was
+tried. Deletion is not free and is not reversible from prose: once the function
+is gone, the only surviving record of what it asserted is this report, and
+nobody re-derives a coverage claim from a report. So the bar for deletion is
+not "the assert cannot fire"; it is "the assert cannot fire AND everything
+else the test did is provably done elsewhere". Check every other assertion in
+the doomed test before cutting it, not just the one that is broken.
+
+### GENERAL RULE -- a deletion leaves references behind
+
+> Grep the name you removed, after you remove it.
+
+Cutting `a_128_superblock_clip_whose_drl_index_the_write_time_stack_cannot_carry_decodes_exact`
+left a live `cargo test ... --nocapture` run-line in a sibling gate's doc
+comment (`encode.rs:18619`) pointing at a test that no longer exists -- a
+reviewer following it would get an empty run and a filter matching nothing,
+with nothing in the output to say the gate had been retired on purpose. The
+deletion looked complete because the symbol search came back with only the two
+doc mentions I had written myself. It took grepping the bare name (not the
+`fn` signature) to find the stale instruction. Same class as the other
+doc-drift traps in this repo: a rename or removal is not done until the
+prose points at what now exists.
+
 **What was deliberately NOT removed.** `note_drl_clamp` and `DRL_CLAMP_HITS`
 stay. They are unreachable today, but they are the tripwire for the owning fix
 (`deferred(unblock: the DRL owner widens `best_new_mv_syntax`'s offer set past
