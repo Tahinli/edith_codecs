@@ -125,39 +125,48 @@ enum On {
 /// written, and the real-stream PANIC hiding behind that pin was found by
 /// lane-ab16, not by this guard. `--loopfilter-control=0`,
 /// `--tile-columns=0` and a `--cpu-used` high enough to switch a search off are
-/// the same shape.
+/// the same shape. `enable-tx-size-search` has since been SETTLED, in both
+/// directions -- see the entry below and `print_tx_size_search_census`.
 ///
 /// The "all 49" count is GONE as of 2026-09-29 (lane-av1distwtd r2) and is
-/// deliberately not replaced by a number: the tool is no longer pinned off
-/// tree-wide, so any count would be a snapshot that rots the same way.
-/// Measured on this tree for the record: 113 of the 146 selected gate bodies
-/// name it, 88 pass `=0`, 15 pass `=1`, and 9 build the value into a
-/// `format!` variable the census cannot see -- so the historical claim no
-/// longer holds in EITHER direction, and the `enable-tx-size-search` entry
-/// below is a live question, not a settled one.
+/// deliberately not replaced by a number here: it is a snapshot that rots
+/// every time a recipe changes. The live count is a TEST
+/// ([`print_tx_size_search_census`], below), not prose, so it cannot go stale
+/// silently -- re-run it and read the numbers rather than trusting a comment.
 ///
 /// Each entry is `(tool, spellings, aomenc default, what counts as on)`. The
 /// "defaulted means unknown" rule of [`NEVER_EXERCISED`] applies unchanged: a
 /// default of `1` does not prove the encoder picked the tool for any stream, so
 /// only a gate that spells an on-value at that bit depth retires an entry.
-    // lane-av1distwtd r3: `enable-tx-size-search` is the one DEFAULT_ON_TOOLS
-    // entry the r2 audit could NOT settle, and the reason is a THIRD detector
-    // limit rather than a coverage fact. After the r3 call-resolving fix, 113
-    // of the 230 selected gates name it: 88 pass `=0`, 15 pass `=1`, and 9
-    // build the value into a `format!`/`String` variable that neither
-    // `flags_in` nor `settings_in` can see, because both scan for a literal
-    // `"--flag=value"` inside one segment.
-    //
-    // WHAT WOULD SETTLE IT, for whoever takes it next -- the method, not a
-    // guess: extend `flags_in`/`settings_in` to resolve a local binding, the
-    // same way `gate_bodies` now resolves calls. Concretely, when a segment
-    // contains `let <name> = format!("--enable-tx-size-search={tx_search}")`
-    // (or a `String::from`/`to_string` of the same shape), record the
-    // TEMPLATE and bind the variable's value at each use site. Re-count, and
-    // only then decide whether the tool is a live hole. Until that exists the
-    // count above is a floor, not a measurement: 9 gates are unclassified in
-    // an unknown direction, and an unknown direction is exactly the failure
-    // mode this file exists to prevent.
+// `enable-tx-size-search` SETTLED 2026-09-29 (lane-av1txsearch), by
+// measurement rather than by a name-shaped guess. The r3 note here said the
+// count was a FLOOR: 9 gate bodies built the flag into a `format!`
+// variable that neither `flags_in` nor `settings_in` could see, because
+// both scan for a literal `"--flag=value"` inside one segment. The method
+// r3 asked for is now [`spelling_values`] -> [`bound_values`], and it
+// resolves all of them; `print_tx_size_search_census` asserts the
+// unresolvable count is ZERO, so the floor cannot come back unnoticed.
+//
+// THE ENTRY IS RETIRED, on an ARRIVAL ASSERT rather than on the spelling.
+// `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact`
+// spells `--enable-tx-size-search=1` as a literal and hard-asserts
+// `compared_tx_depths > 0` -- "never produced a nonzero tx depth on a
+// compared attempt -- the flag did not arrive". `tx_depth` is read ONLY
+// under the frame header's `tx_mode_select` bit (spec 5.11.16,
+// `decode.rs`: the read is guarded by `tx_select_inter`), so a nonzero
+// counter IS the parsed tx-size-search behaviour, not a proxy for it.
+// Measured run of that gate on this tree (aom 3.13.3): 12 pixel-exact
+// decodes, 0 named refusals, 6 of the 12 at 10 BIT, 219 rect coefficient
+// TUs on compared attempts, and `flag arrival: ... tx depths 53` -- so the
+// tool is exercised at BOTH depths, and the assertion is not vacuous.
+//
+// The `tx_select_inter_gate` twins
+// (`a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact{,_10bit}`)
+// are the stronger witness still: they DELIBERATELY omit the flag
+// ("DELIBERATELY ABSENT: --enable-tx-size-search=0") and assert
+// `decode::txfm_split_hits()` moved, proving the var-tx `txfm_split` tree
+// of spec 5.11.17 is read -- an inter transform is then a recursive split
+// tree, which is the whole content of the tool.
 #[cfg(test)]
 const DEFAULT_ON_TOOLS: &[(&str, &[&str], &str, On)] = &[
     (
@@ -410,8 +419,8 @@ const NEVER_ON_10BIT: &[(&str, &str)] = &[];
 #[cfg(test)]
 mod tests {
     use super::{
-        On, ALIASES, DEFAULT_ON_TOOLS, NEVER_EXERCISED, NEVER_EXERCISED_10BIT,
-        NEVER_EXERCISED_8BIT, NEVER_ON_10BIT, NEVER_ON_8BIT, TOOL_UNIVERSE,
+        ALIASES, DEFAULT_ON_TOOLS, NEVER_EXERCISED, NEVER_EXERCISED_8BIT, NEVER_EXERCISED_10BIT,
+        NEVER_ON_8BIT, NEVER_ON_10BIT, On, TOOL_UNIVERSE,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -570,24 +579,262 @@ mod tests {
         here
     }
 
-    /// Whether a gate body spells one [`DEFAULT_ON_TOOLS`] entry on / off.
-    fn default_on_state(gate: &str, spellings: &[&str], on: On) -> Option<bool> {
-        let here = settings_in(gate);
+    /// The values a `--<flag>={var}` TEMPLATE can take in one gate body, from
+    /// the local binding of `var`.
+    ///
+    /// lane-av1txsearch: `settings_in` reads a `--flag=value` string LITERAL,
+    /// so a flag a gate builds with `format!` was invisible to it -- 10 gate
+    /// bodies spell `--enable-tx-size-search` only this way, and the census
+    /// filed them as "defaulted", i.e. unknown in BOTH directions. The
+    /// bindings that actually exist in `stream.rs` are four shapes, and each
+    /// is resolved from the gate's own text rather than from the variable's
+    /// name:
+    ///
+    /// 1. `let <var> = if <attempt> == 0 { "0" } else { "1" };` -- an
+    ///    attempt-indexed arm; the QUOTED values in the initializer are
+    ///    collected. Bare integers in the initializer (`attempt % 2`) are
+    ///    deliberately NOT read as flag values.
+    /// 2. `for <var> in [0usize, 1]` / `["0", "1"]` -- a loop over both
+    ///    values; every element of the array is collected.
+    /// 3. `for (<var>, <other>) in [("1", 8u8), ("0", 8u8), ...]` -- a
+    ///    tuple-destructured loop; only the element at `<var>`'s POSITION is
+    ///    collected from each tuple, so the arm table's bit-depth column is
+    ///    not read as a flag value.
+    /// 4. `u8::from(<a>.<field>)` over a struct-literal arm table whose
+    ///    `field: true` / `field: false` rows are the flag values.
+    ///
+    /// `None` means the binding is NOT in this body -- the variable is a
+    /// parameter of a shared helper and its value is bound at the CALL SITE,
+    /// which lives in a different `#[`-segment. That is a real limit of a
+    /// per-segment census and is reported as unknown rather than guessed:
+    /// inferring the value from the variable's name is the exact failure this
+    /// function exists to remove.
+    fn bound_values(body: &str, var: &str) -> Option<BTreeSet<char>> {
+        // Quoted single digits: `"0"`, `"1"`.
+        let quoted_digits = |t: &str| -> BTreeSet<char> {
+            let mut out = BTreeSet::new();
+            let mut at = 0usize;
+            while let Some(rel) = t[at..].find('"') {
+                let start = at + rel + 1;
+                let Some(end) = t[start..].find('"') else {
+                    break;
+                };
+                let literal = &t[start..start + end];
+                if literal.len() == 1 {
+                    if let Some(c) = literal.chars().next() {
+                        if c.is_ascii_digit() {
+                            out.insert(c);
+                        }
+                    }
+                }
+                at = start + end + 1;
+            }
+            out
+        };
+        // Bare integer literals: `0usize`, `1`, `8u8`. Whole tokens only, so
+        // `10u8` contributes nothing rather than a bogus `1`.
+        let bare_digits = |t: &str| -> BTreeSet<char> {
+            let mut out = BTreeSet::new();
+            let bytes = t.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if !bytes[i].is_ascii_digit() {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let clean_before = start == 0 || !is_ident_byte(bytes[start - 1]);
+                // A typed literal's suffix (`0usize`, `8u8`, `1u32`) belongs to
+                // the same token, so a run of LOWERCASE letters right after
+                // the digit is a type, not a different identifier. Anything
+                // else -- a multi-digit `10u8`, a camelCase `1x` -- is not a
+                // flag value and is rejected.
+                let rest = &t[i..];
+                let suffix = rest
+                    .bytes()
+                    .take_while(|b| b.is_ascii_lowercase() || *b == b'_')
+                    .count();
+                let clean_after = i >= bytes.len()
+                    || !is_ident_byte(bytes[i])
+                    || (suffix > 0
+                        && i + suffix < bytes.len()
+                        && !is_ident_byte(bytes[i + suffix]));
+                if clean_before && clean_after && i - start == 1 {
+                    out.insert(bytes[start] as char);
+                }
+            }
+            out
+        };
+        // Split a comma-separated list at TOP level only, so `("1", 8u8)`
+        // stays one element.
+        fn split_top<'a>(t: &'a str) -> Vec<&'a str> {
+            let mut out = Vec::new();
+            let (mut depth, mut start) = (0i32, 0usize);
+            for (i, c) in t.char_indices() {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        out.push(t[start..i].trim());
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            if start < t.len() {
+                out.push(t[start..].trim());
+            }
+            out
+        }
+        // The body of the `[...]` that FOLLOWS `head` in `text`. Scoped to
+        // the header rather than searching from the start of the body: a
+        // gate's first `[` may be an unrelated array, and brackets that do
+        // not balance across a whole gate body would leave the depth count
+        // never returning to zero.
+        fn loop_array_after<'a>(text: &'a str, head: &str) -> Option<&'a str> {
+            let at = text.find(head)? + head.len();
+            let open = at + text[at..].find('[')?;
+            let mut depth = 0i32;
+            for (i, c) in text[open..].char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(&text[open + 1..open + i]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let mut found: Option<BTreeSet<char>> = None;
+        let mut merge = |set: BTreeSet<char>| match &mut found {
+            Some(all) => all.extend(set),
+            None => found = Some(set),
+        };
+        // (1) `let <var> = if ... { "0" } else { "1" };` -- quoted values only.
+        if let Some(at) = body.find(&format!("let {var} =")) {
+            let init = &body[at..];
+            let end = init.find(';').unwrap_or(init.len());
+            merge(quoted_digits(&init[..end]));
+        }
+        // (2) `for <var> in [...]` -- every element of the array.
+        if let Some(array) = loop_array_after(body, &format!("for {var} in ")) {
+            merge(bare_digits(array));
+            merge(quoted_digits(array));
+        }
+        // (3) `for (<var>, ...) in [(...), ...]` -- only `<var>`'s column.
+        if let Some(at) = body.find("for (") {
+            let head = &body[at..];
+            if let Some(close) = head.find(')') {
+                let pattern = &head["for (".len()..close];
+                if let Some(pos) = pattern.split(',').position(|p| p.trim() == var) {
+                    let header = format!("for ({pattern}) in ");
+                    if let Some(array) = loop_array_after(body, &header) {
+                        let mut set: BTreeSet<char> = BTreeSet::new();
+                        for tuple in split_top(array) {
+                            let Some(inner) =
+                                tuple.strip_prefix('(').and_then(|t| t.strip_suffix(')'))
+                            else {
+                                continue;
+                            };
+                            let fields = split_top(inner);
+                            let Some(field) = fields.get(pos) else {
+                                continue;
+                            };
+                            set.extend(bare_digits(field));
+                            set.extend(quoted_digits(field));
+                        }
+                        merge(set);
+                    }
+                }
+            }
+        }
+        // (4) `u8::from(<a>.<field>)` over a struct-literal arm table.
+        for (i, _) in body.match_indices("u8::from(") {
+            let arg = &body[i + "u8::from(".len()..];
+            let Some(close) = arg.find(')') else { continue };
+            let field = arg[..close].rsplit('.').next().unwrap_or_default().trim();
+            if field.is_empty() || !field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let mut set = BTreeSet::new();
+            for (row, value) in [("true", '1'), ("false", '0')] {
+                if body.contains(&format!("{field}: {row}")) {
+                    set.insert(value);
+                }
+            }
+            merge(set);
+        }
+        found
+    }
+
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// Values of one [`DEFAULT_ON_TOOLS`] spelling in one gate body: the
+    /// literal `--<spelling>=<digit>` spellings plus every value a `format!`
+    /// template built from a local binding resolves to.
+    ///
+    /// A gate that reaches BOTH values counts ON, not off: it builds a `=1`
+    /// stream on some attempt, which is what the census asks for. This is the
+    /// file's standing "any spelling that says on wins" rule
+    /// (`--tile-columns=0 --tile-rows=1` is a multi-tile stream), now applied
+    /// across a loop's arms as well as across spellings.
+    fn spelling_values(gate: &str, spelling: &str) -> BTreeSet<char> {
+        let mut out = BTreeSet::new();
+        // A literal `"--<spelling>=<digit>"`: the needle ends at the `=`, so
+        // the value starts AT the needle's length, not three characters in.
+        let literal = format!("\"--{spelling}=");
+        for (i, _) in gate.match_indices(&literal) {
+            let rest = &gate[i + literal.len()..];
+            let Some(end) = rest.find('"') else { continue };
+            if let Some(c) = rest[..end].chars().next() {
+                if c.is_ascii_digit() {
+                    out.insert(c);
+                }
+            }
+        }
+        // A template `format!("--<spelling>={<var>}")`: the placeholder name
+        // is the part between the braces, and its VALUE is whatever the
+        // binding of `<var>` in this same body reaches.
+        let template = format!("format!(\"--{spelling}=");
+        for (i, _) in gate.match_indices(&template) {
+            let rest = &gate[i + template.len()..];
+            let Some(end) = rest.find('"') else { continue };
+            let Some(var) = rest[..end]
+                .strip_prefix('{')
+                .and_then(|v| v.strip_suffix('}'))
+            else {
+                continue;
+            };
+            if var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                out.extend(bound_values(gate, var).unwrap_or_default());
+            }
+        }
+        out
+    }
+
+    /// Whether a gate body spells one [`DEFAULT_ON_TOOLS`] entry on / off,
+    /// over [`spelling_values`] -- so a `format!`-built flag is classified
+    /// instead of being filed as "defaulted".
+    fn resolved_on_state(gate: &str, spellings: &[&str], on: On) -> Option<bool> {
         let mut state = None;
         for spelling in spellings {
-            let Some(value) = here.get(*spelling) else {
-                continue;
-            };
-            let Ok(value) = value.parse::<u32>() else {
-                continue;
-            };
-            let is_on = match on {
-                On::NonZero => value != 0,
-                On::AtMost(limit) => value <= limit,
-            };
-            // Any spelling that says "on" wins: --tile-columns=0 --tile-rows=1
-            // is a multi-tile stream.
-            state = Some(state.unwrap_or(false) || is_on);
+            for c in spelling_values(gate, spelling) {
+                let value = c.to_digit(10).unwrap_or(0);
+                let is_on = match on {
+                    On::NonZero => value != 0,
+                    On::AtMost(limit) => value <= limit,
+                };
+                state = Some(state.unwrap_or(false) || is_on);
+            }
         }
         state
     }
@@ -746,9 +993,7 @@ mod tests {
         // it to the 8-bit bucket, not just the 10-bit one.
         let flip = gates
             .iter()
-            .find(|b| {
-                b.contains("a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform")
-            })
+            .find(|b| b.contains("a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform"))
             .expect("the flip-idtx gate must be seen");
         assert!(
             covers_both_depths(flip),
@@ -901,9 +1146,12 @@ mod tests {
             .collect();
         let mut per_tool = BTreeMap::new();
         for &(tool, spellings, _, on) in DEFAULT_ON_TOOLS {
+            // lane-av1txsearch: `resolved_on_state`, not `default_on_state` --
+            // the literal-only reader filed every `format!`-built flag as
+            // "defaulted", which is unknown rather than measured.
             let states: Vec<Option<bool>> = gates
                 .iter()
-                .map(|g| default_on_state(g, spellings, on))
+                .map(|g| resolved_on_state(g, spellings, on))
                 .collect();
             let turned_on = states.iter().filter(|s| **s == Some(true)).count();
             let turned_off = states.iter().filter(|s| **s == Some(false)).count();
@@ -997,5 +1245,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// lane-av1txsearch: the `enable-tx-size-search` census, MEASURED rather
+    /// than floored. Prints, per gate body, the values the resolver reads for
+    /// the flag -- literal spellings and `format!` templates alike -- and the
+    /// three-way split at the end. Re-run it after any gate recipe change:
+    ///
+    /// `cargo test -p ec-av1 --lib gate_coverage::tests::print_tx_size_search_census -- --nocapture`
+    #[test]
+    fn print_tx_size_search_census() {
+        const TOOL: &str = "enable-tx-size-search";
+        let (zero, one, both, unresolvable, unnamed) = {
+            let (mut zero, mut one, mut both, mut unresolvable, mut unnamed) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            for gate in gate_bodies() {
+                let values = spelling_values(gate, TOOL);
+                let name = gate
+                    .split("fn ")
+                    .nth(1)
+                    .and_then(|s| s.split('(').next())
+                    .unwrap_or("<segment>")
+                    .to_owned();
+                let state = match (values.contains(&'0'), values.contains(&'1')) {
+                    (false, false) => {
+                        unnamed += 1;
+                        "not named (defaulted)"
+                    }
+                    (true, false) => {
+                        zero += 1;
+                        "=0"
+                    }
+                    (false, true) => {
+                        one += 1;
+                        "=1"
+                    }
+                    (true, true) => {
+                        both += 1;
+                        "=0 and =1 (one arm each)"
+                    }
+                };
+                let via = if gate.contains(&format!("format!(\"--{TOOL}=")) {
+                    " [format! template resolved]"
+                } else {
+                    ""
+                };
+                let helper = if gate.contains(&format!("format!(\"--{TOOL}=")) && values.is_empty()
+                {
+                    " [UNRESOLVED: variable is a shared helper's parameter]"
+                } else {
+                    ""
+                };
+                if !helper.is_empty() {
+                    unresolvable += 1;
+                    unnamed -= 1;
+                }
+                println!("{name}: {state}{via}{helper}");
+            }
+            (zero, one, both, unresolvable, unnamed)
+        };
+        let total = gate_bodies().len();
+        println!(
+            "enable-tx-size-search over {total} census-selected gate bodies: \
+             =0 only {zero}, =1 only {one}, both {both}, unresolvable {unresolvable}, \
+             not named {unnamed}"
+        );
+        assert_eq!(
+            unresolvable, 0,
+            "{unresolvable} gate bodies build --{TOOL} into a variable this census cannot bind -- \
+             the count is a floor again, and an unknown direction is the failure mode this file \
+             exists to prevent"
+        );
+    }
+
+    /// lane-av1txsearch: the RED-BEFORE proof for the template resolver, in
+    /// both directions, on the gate bodies that actually exist.
+    ///
+    /// Direction 1 -- a `format!`-built value MOVES the classification. Each
+    /// case below takes a real gate body, mutates only the bound value, and
+    /// asserts the resolved state changed. A resolver that found nothing
+    /// would read every one of these as "not named" and fail all four.
+    ///
+    /// Direction 2 -- a spelling the LITERAL reader already saw still
+    /// classifies. Without this half, a resolver that overwrote the literal
+    /// path would pass direction 1 while losing the 15 `=1` gates the census
+    /// already counted.
+    #[test]
+    fn the_resolver_binds_a_format_built_flag_in_both_directions() {
+        let gates = gate_bodies();
+        let find = |needle: &str| -> &'static str {
+            gates
+                .iter()
+                .copied()
+                .find(|b| b.contains(needle))
+                .unwrap_or_else(|| panic!("no gate body contains {needle:?}"))
+        };
+        // Direction 1, one per template shape.
+        let cases = [
+            (
+                "format!(\"--enable-tx-size-search={txs}\")",
+                "for txs in [0usize, 1]",
+                "for txs in [0usize, 0]",
+                "a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact",
+            ),
+            (
+                "format!(\"--enable-tx-size-search={tx_search}\")",
+                "if attempt % 2 == 0 { \"0\" } else { \"1\" }",
+                "if attempt % 2 == 0 { \"0\" } else { \"0\" }",
+                "a_real_aomenc_inter_sequence_with_a_coded_rectangular_residual_decodes_pixel_exact",
+            ),
+            (
+                "format!(\"--enable-tx-size-search={tx_search}\")",
+                "for (tx_search, bit_depth) in [(\"1\", 8u8), (\"0\", 8u8), (\"1\", 10u8)]",
+                "for (tx_search, bit_depth) in [(\"0\", 8u8), (\"0\", 8u8), (\"0\", 10u8)]",
+                "a_real_aomenc_stream_with_filter_intra_on_a_sub8_rect_leaf_decodes_pixel_exact",
+            ),
+        ];
+        for (template, from, to, name) in cases {
+            let body = find(name);
+            assert!(
+                body.contains(template),
+                "{name} does not spell {template}, so this case proves nothing"
+            );
+            assert!(
+                body.contains(from),
+                "{name} does not contain the source binding {from:?}"
+            );
+            let before = spelling_values(body, "enable-tx-size-search");
+            let mutated = body.replace(from, to);
+            assert_ne!(
+                mutated, body,
+                "the mutation {from:?} -> {to:?} changed nothing"
+            );
+            let after = spelling_values(&mutated, "enable-tx-size-search");
+            assert_eq!(
+                before,
+                BTreeSet::from(['0', '1']),
+                "{name}: the unmutated body should resolve to both values, got {before:?}"
+            );
+            assert_eq!(
+                after,
+                BTreeSet::from(['0']),
+                "{name}: mutating the bound value {from:?} -> {to:?} did not move the \
+                 classification (still {after:?}) -- the resolver is not reading the binding"
+            );
+        }
+        // Direction 2: every gate the LITERAL reader already classified as
+        // `=1` still is. Asserted as CONTAINMENT, not equality: a segment may
+        // spell the flag twice (`=0` in the base recipe, `=1` as the per-arm
+        // override), and the old reader took the last one while the resolver
+        // takes the set. The claim being pinned is "still on", which is the
+        // direction a regression would lose.
+        let mut pinned = 0usize;
+        for gate in &gates {
+            if !gate.contains("\"--enable-tx-size-search=1\"") {
+                continue;
+            }
+            pinned += 1;
+            assert!(
+                spelling_values(gate, "enable-tx-size-search").contains(&'1'),
+                "a gate that literally spells --enable-tx-size-search=1 is no longer \
+                 classified on: {:?}",
+                &gate[..gate.len().min(80)]
+            );
+        }
+        assert!(
+            pinned >= 10,
+            "expected the literal `=1` gates to still be there, found {pinned}"
+        );
     }
 }
