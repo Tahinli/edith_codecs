@@ -250,6 +250,25 @@ fn selftest_b_reads_a_pin() {
     helper();
     assert!(!p.as_os_str().is_empty());
 }
+
+// The SECOND shape, the one that made this audit RED on a tree with no real
+// violation in it: a scanner capability test whose INPUT is embedded source.
+// The phantom gate below carries the `selftest_` prefix on purpose -- the
+// filter above would drop a differently-named one and the control would pass
+// for the wrong reason.
+#[test]
+fn selftest_c_embeds_a_raw_string_input() {
+    let synthetic = r#"
+    #[test]
+    fn selftest_phantom_inside_a_raw_string() {
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/phantom.obu");
+        check(&fixtures);
+    }
+"#;
+    let p = crate_pin("embedded-pin.obu");
+    helper();
+    assert!(!synthetic.is_empty() && !p.as_os_str().is_empty());
+}
 """
     path = os.path.join(d, "lib.rs")
     try:
@@ -266,17 +285,24 @@ fn selftest_b_reads_a_pin() {
                     continue
                 code = code_of(b)
                 kind = "root-literal" if (ROOT_RE.search(code) or JOIN_RE.search(code)) else "crate_pin"
-                rows.append((name, kind))
+                singles = re.findall(r'crate_pin\(\s*"([^"]+)"', code)
+                rows.append((name, kind, singles))
         bad = [r for r in rows if r[1] != "crate_pin"]
         missing = [n for n in ("selftest_a_reads_a_pin", "selftest_b_reads_a_pin")
                    if n not in [r[0] for r in rows]]
-        ok = not bad and not missing
-        for n, k in sorted(rows):
-            print("SELFTEST\t{}\t{}".format(n, k))
+        phantom = [r for r in rows if r[0] == "selftest_phantom_inside_a_raw_string"]
+        leaked = [r for r in rows if any("phantom" in s for s in r[2])]
+        missing = missing + ["selftest_c_embeds_a_raw_string_input"] \
+            if "selftest_c_embeds_a_raw_string_input" not in [r[0] for r in rows] else missing
+        ok = not bad and not missing and not phantom and not leaked
+        for n, k, s in sorted(rows):
+            print("SELFTEST\t{}\t{}\t{}".format(n, k, ",".join(s)))
         if ok:
-            print("SELFTEST\tPASS\ta doc comment between two gates left both counted as crate_pin")
+            print("SELFTEST\tPASS\ta doc comment between two gates left both counted as "
+                  "crate_pin, and a raw-string input did not become a gate")
         else:
-            print("SELFTEST\tFAIL\treclassified={} missing={}".format(bad, missing))
+            print("SELFTEST\tFAIL\tphantom_gate_counted={} phantom_name_leaked={} "
+                  "reclassified={} missing={}".format(phantom, leaked, bad, missing))
         return 0 if ok else 1
     finally:
         globals()["ROOT"] = saved_root
