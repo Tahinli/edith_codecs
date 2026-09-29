@@ -23977,10 +23977,10 @@ pub(crate) mod tests {
     /// delta=2). `GOLDEN_FRAME` refuses by name until this decodes exact.
     ///
     /// LIVE since lane-av1pinslive r3. The old shape was the worst of the
-    /// class: a `concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/...")`
-    /// literal, which points at the GITIGNORED root and can therefore never be
-    /// satisfied by a committed pin, combined with a bare `.expect()`. The
-    /// bytes are now committed at
+    /// class: a `concat!` of `CARGO_MANIFEST_DIR` with the GITIGNORED
+    /// repo-root `fixtures/` directory, which no committed pin can satisfy,
+    /// combined with a bare `.expect()`.
+    /// The bytes are now committed at
     /// `crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu` (152 bytes;
     /// sha256 `81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be`,
     /// recovered byte-for-byte from the runner library).
@@ -31379,59 +31379,67 @@ pub(crate) mod tests {
     /// clamping; ii-flake-1..8: interintra neighbours excluded from
     /// warp-sample gathering, ref_frame[1] == INTRA_FRAME in the mi grid).
     /// `EC_AV1_GATE_DUMP_PIN` overrides to a single stream.
-    /// Deterministic and static -- `#[ignore]`d because the gitignored
-    /// fixtures dir may be absent; run manually.
+    ///
+    /// Un-`#[ignore]`d with the pin shape fixed: the fourteen pins are COMMITTED
+    /// under `crates/ec-av1/fixtures/`, so the gate runs on a clean checkout
+    /// and carries `warp_selected_hits` 0 -> 113 over the set instead of
+    /// skipping GREEN having read nothing.
     #[test]
-    #[ignore = "reads pinned fixture paths under the gitignored fixtures dir; run manually"]
     fn pinned_warp_stream_decodes_pixel_exact() {
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_warp_stream_decodes_pixel_exact: no ffmpeg");
             return;
         }
-        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
-        let paths: Vec<String> = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
-            Ok(p) => vec![p],
-            Err(_) => [
-                "warp-mismatch",
-                "warp-flake-5",
-                "warp-flake-7",
-                "ii-flake-1",
-                "ii-flake-2",
-                "ii-flake-3",
-                "ii-flake-5",
-                "ii-flake-6",
-                "ii-flake-7",
-                "ii-flake-8",
+        // Every pin is COMMITTED under `crates/ec-av1/fixtures/` and named by a
+        // string literal, which is the convention every other pinned gate here
+        // uses and the only shape the pin census can resolve name-by-name. The
+        // old shape -- one GITIGNORED root directory literal plus a runtime
+        // name list formatted against it -- can never be satisfied by a
+        // committed tree, so this gate skipped GREEN having tested nothing.
+        let pins = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
+            Ok(p) => vec![std::path::PathBuf::from(p)],
+            Err(_) => vec![
+                crate_pin("warp-mismatch.obu"),
+                crate_pin("warp-flake-5.obu"),
+                crate_pin("warp-flake-7.obu"),
+                crate_pin("ii-flake-1.obu"),
+                crate_pin("ii-flake-2.obu"),
+                crate_pin("ii-flake-3.obu"),
+                crate_pin("ii-flake-5.obu"),
+                crate_pin("ii-flake-6.obu"),
+                crate_pin("ii-flake-7.obu"),
+                crate_pin("ii-flake-8.obu"),
                 // switchable_interp missing from reset_counts (counter
                 // saturation slowed the adaptation rate) -- unrelated to
                 // interintra, caught by the same gate.
-                "ii-flake-9",
+                crate_pin("ii-flake-9.obu"),
                 // lane-rect r2: HORZ strip rect defects (mvstack size_h,
                 // warp sample/projection dims, OBMC overlap, deblock tx-h).
-                "rect-flake-1",
+                crate_pin("rect-flake-1.obu"),
                 // scan_row/scan_col weight `inc` min'd by the wrong candidate
                 // axis (width vs height) -- ties reordered DRL entry 1 for a
                 // block under a 32x16 strip, and suppressed the -5 extended
                 // row scan.
-                "rect-flake-2",
+                crate_pin("rect-flake-2.obu"),
                 // overlappable_left stepped the vertical walk by the
                 // neighbour's WIDTH: a 32x16 left strip swallowed the strip
                 // below it, blending the wrong OBMC prediction there.
-                "rect-flake-3",
-            ]
-            .iter()
-            .map(|n| format!("{fixtures}/{n}.obu"))
-            .collect(),
+                crate_pin("rect-flake-3.obu"),
+            ],
         };
-        for path in paths {
-            eprintln!("pin: {path}");
+        for path in pins {
+            eprintln!("pin: {}", path.display());
             check_pinned_warp_stream(&path);
         }
     }
 
-    fn check_pinned_warp_stream(path: &str) {
+    fn check_pinned_warp_stream(path: &std::path::Path) {
         use crate::decode::warp_selected_hits;
-        let stream = std::fs::read(path).expect("reading pinned stream");
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let stream = require_pin(path, &name);
         let before = warp_selected_hits();
         let frames = decode_stream(&stream).expect("pinned stream must decode");
         eprintln!(
