@@ -35,9 +35,13 @@ mod envflags;
 mod film_grain;
 mod filter_search;
 pub mod frame;
+// Test-only: the real-library fixture root and the one presence probe every
+// gate that needs a clip routes through.
 mod gate_coverage;
 mod hits;
 pub mod intra;
+#[cfg(test)]
+mod library_fixture;
 pub mod mc;
 pub mod motion;
 mod motion_field;
@@ -49,13 +53,13 @@ pub mod probe;
 pub mod qm;
 pub mod quant;
 mod refusal_inventory;
-pub mod speed;
 mod restoration;
 pub mod sequence;
-mod superres;
+pub mod speed;
 pub mod stream;
-mod timeline;
+mod superres;
 pub mod tile;
+mod timeline;
 pub mod transform;
 mod warp;
 mod wedge;
