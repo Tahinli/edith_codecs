@@ -1699,3 +1699,281 @@ mod tests {
         );
     }
 }
+
+/// lane-av1pins5 r5: the PIN INVENTORY.
+///
+/// The r3 inventory this replaces matched only two call shapes --
+/// `crate_pin("X")` and `pin_dir().join("X")` -- both SINGLE-NAME. A gate that
+/// reads a whole DIRECTORY of pins through a `concat!` literal and then formats
+/// a name at runtime (`format!("{fixtures}/{n}.obu")`) matched neither, so
+/// `pinned_warp_stream_decodes_pixel_exact` and its 14 uncommitted pins were
+/// invisible to it, and r3 reported "the machine-local-pin population is zero".
+/// It was not. This enumerator resolves all four shapes.
+///
+/// Ownership, stated because two lanes touch this: THIS scanner owns the
+/// ENUMERATION (which gates read which pins, from source). The fixture-preflight
+/// lane owns the FILE INVENTORY on a runner (does each referenced path exist on
+/// the box). Different questions; both must agree, and this one is the stricter of
+/// the two because it fails on an uncommitted pin whether or not some runner
+/// happens to have a copy.
+#[cfg(test)]
+mod pin_inventory {
+    /// One pin a gate reads, and where it came from.
+    pub struct PinRead {
+        pub gate: String,
+        pub file: String,
+        pub shape: &'static str,
+    }
+
+    /// Split `src` into `(fn_name, body)` for every `fn name(` at the gate indent.
+    fn gate_bodies(src: &str) -> Vec<(String, &'static str)> {
+        let mut out = Vec::new();
+        let mut cur: Option<(String, usize)> = None;
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("fn ") {
+                if let Some(name) = rest.split('(').next() {
+                    if !name.contains(' ') {
+                        cur = Some((name.to_string(), i));
+                    }
+                }
+            }
+            // A `#[test]`/`#[ignore]` line is never a closing brace, so the fn
+            // ends at the first line that is exactly four-space `}`.
+            if let Some((name, start)) = &cur {
+                if i > *start && line == "    }" {
+                    let body = src
+                        .lines()
+                        .skip(*start)
+                        .take(i - *start + 1)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push((name.clone(), &*Box::leak(body.into_boxed_str())));
+                    cur = None;
+                }
+            }
+        }
+        out
+    }
+
+    /// Every pin every gate reads, across all four shapes.
+    pub fn pins_read(src: &str) -> Vec<PinRead> {
+        let mut out = Vec::new();
+        for (gate, body) in gate_bodies(src) {
+            // (a) crate_pin("X") and (b) pin_dir().join("X") -- single name.
+            for m in body.match_indices("crate_pin(\"") {
+                let rest = &body[m.0 + 11..];
+                if let Some(e) = rest.find('"') {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: rest[..e].to_string(),
+                        shape: "crate_pin",
+                    });
+                }
+            }
+            for m in body.match_indices("pin_dir().join(\"") {
+                let rest = &body[m.0 + 16..];
+                if let Some(e) = rest.find('"') {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: rest[..e].to_string(),
+                        shape: "pin_dir_machine_local",
+                    });
+                }
+            }
+            // (c) a whole-file concat! literal to a named pin:
+            //     concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/X.obu")
+            for m in body.match_indices("/../../fixtures/") {
+                let rest = &body[m.0 + 16..];
+                if let Some(e) = rest.find('"') {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: rest[..e].to_string(),
+                        shape: "concat_literal_machine_local",
+                    });
+                }
+            }
+            // (d) the shape that hid 14 pins: a DIRECTORY literal bound to a
+            //     local, plus a runtime `format!("{var}/{n}.ext")` over a
+            //     literal name array. Resolve the array's names.
+            for (vi, line) in body.lines().enumerate() {
+                let tl = line.trim();
+                // `let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");`
+                // -> the bound name is whatever sits between `let ` and the `=`.
+                let var = match (
+                    tl.find("concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../fixtures\")"),
+                    tl.find('='),
+                ) {
+                    (Some(a), Some(eq)) if eq < a => tl[4..eq].trim().to_string(),
+                    _ => continue,
+                };
+                if var.is_empty() {
+                    continue;
+                }
+                // `format!("{fixtures}/{n}.obu")` -- built by concatenation, not
+                // by `format!`: escaping `{{`/`}}` to emit literal braces here is
+                // exactly the bug that made this shape resolve to 0 pins on the
+                // first run of the scanner.
+                let marker = ["format!(\"", "{", &var, "}/{n}"].concat();
+                let Some(pos) = body.find(&marker) else {
+                    continue;
+                };
+                // Walk back from the format! to the `[ ... ].iter()` array and
+                // take every quoted name in it.
+                let head = &body[..pos];
+                let Some(bracket) = head.rfind('[') else {
+                    continue;
+                };
+                let names: Vec<String> = head[bracket..]
+                    .split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|s| !s.is_empty() && !s.contains(' ') && *s != "]")
+                    .map(|s| s.to_string())
+                    .collect();
+                // `.obu` -- SLICE up to the closing quote. (Stringifying the
+                // `find` index instead produced names like `warp-mismatch4`.)
+                let tail = &body[pos + marker.len()..];
+                let ext = tail
+                    .find('"')
+                    .map(|e| tail[..e].to_string())
+                    .unwrap_or_default();
+                for n in names {
+                    out.push(PinRead {
+                        gate: gate.clone(),
+                        file: format!("{n}{ext}"),
+                        shape: "concat_dir_runtime_name",
+                    });
+                }
+                let _ = vi;
+            }
+        }
+        out
+    }
+
+    /// Is `file` present as a committed crate-local fixture?
+    pub fn is_committed(file: &str) -> bool {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(file)
+            .is_file()
+    }
+}
+
+#[cfg(test)]
+mod pin_inventory_tests {
+    use super::pin_inventory::{is_committed, pins_read};
+
+    /// The scanner must be able to SEE the directory-literal shape. Run over a
+    /// SYNTHETIC source, not the live tree: r5 removed that shape from
+    /// `pinned_warp_stream_decodes_pixel_exact`, so a test that asserted it
+    /// against the live file would rot the moment the fix landed -- which is
+    /// precisely how a scanner loses its edge and reports a clean tree again.
+    /// A capability test must have its own input.
+    #[test]
+    fn the_pin_scanner_sees_the_directory_literal_shape() {
+        let synthetic = r#"
+    #[test]
+    fn a_gate_using_the_old_shape() {
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
+        let paths: Vec<String> = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
+            Ok(p) => vec![p],
+            Err(_) => [
+                "warp-mismatch",
+                "ii-flake-1",
+                "rect-flake-3",
+            ]
+            .iter()
+            .map(|n| format!("{fixtures}/{n}.obu"))
+            .collect(),
+        };
+        for path in paths {
+            check(&path);
+        }
+    }
+"#;
+        let reads = pins_read(synthetic);
+        let names: Vec<&str> = reads.iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["warp-mismatch.obu", "ii-flake-1.obu", "rect-flake-3.obu"],
+            "the directory-literal + runtime-name shape resolved to {names:?} -- a scanner \
+             that cannot see this shape is how 14 uncommitted pins survived three rounds"
+        );
+        assert!(
+            reads.iter().all(|r| r.shape == "concat_dir_runtime_name"),
+            "the synthetic pins were attributed to the wrong shape: {:?}",
+            reads.iter().map(|r| r.shape).collect::<Vec<_>>()
+        );
+    }
+
+    /// The other three shapes resolve too -- same reasoning, same synthetic input,
+    /// so the capability survives the tree being fixed.
+    #[test]
+    fn the_pin_scanner_sees_every_shape() {
+        let synthetic = r#"
+    #[test]
+    fn shapes() {
+        let a = crate_pin("golden3-pin.obu");
+        let b = pin_dir().join("sbpart-pin.obu");
+        let c = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/x.obu"));
+    }
+"#;
+        let mut names: Vec<String> = pins_read(synthetic)
+            .iter()
+            .map(|r| format!("{}|{}", r.file, r.shape))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "golden3-pin.obu|crate_pin",
+                "sbpart-pin.obu|pin_dir_machine_local",
+                "x.obu|concat_literal_machine_local",
+            ],
+            "shape coverage changed: {names:?}"
+        );
+    }
+
+    /// THE INVARIANT, on the live tree: every pin a gate reads is a COMMITTED
+    /// crate-local copy, and NO gate reads through a machine-local shape. This is
+    /// the check the r3 manifest could not express.
+    #[test]
+    fn every_pin_a_gate_reads_is_committed_under_the_crate() {
+        let src = include_str!("stream.rs");
+        let reads = pins_read(src);
+        assert!(
+            reads.len() >= 20,
+            "the enumerator found only {} pin reads in stream.rs -- it has lost a shape, \
+             which is the failure mode that let 14 pins go unseen",
+            reads.len()
+        );
+        let uncommitted: Vec<String> = reads
+            .iter()
+            .filter(|r| !is_committed(&r.file))
+            .map(|r| format!("{}:{} ({})", r.gate, r.file, r.shape))
+            .collect();
+        assert!(
+            uncommitted.is_empty(),
+            "{} pin(s) a gate reads have no committed copy under \
+             crates/ec-av1/fixtures/ -- each resolves only on a machine whose \
+             gitignored root fixtures/ happens to be populated, so a clean checkout \
+             silently skips or panics:\n  {}",
+            uncommitted.len(),
+            uncommitted.join("\n  ")
+        );
+        let machine_local: Vec<String> = reads
+            .iter()
+            .filter(|r| r.shape != "crate_pin")
+            .map(|r| format!("{} reads {} via {}", r.gate, r.file, r.shape))
+            .collect();
+        assert!(
+            machine_local.is_empty(),
+            "{} pin read(s) still resolve through a machine-local shape instead of \
+             `crate_pin` (the committed crate-local copy), so they break on a clean \
+             checkout:\n  {}",
+            machine_local.len(),
+            machine_local.join("\n  ")
+        );
+    }
+}
