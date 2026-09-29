@@ -131,7 +131,8 @@ s = s.replace(old_sig, new_sig, 1)
 # DEPTH ASSUMPTION (lane-av1oraclerungdepth): this rung writes 1 byte per
 # sample and has NO YV12_FLAG_HIGHBITDEPTH check. That is deliberate -- it is
 # byte-paired with our own EC_AV1_PREFILT_DUMP, which narrows 10/12-bit to u8
-# on purpose (decode.rs:35263-35273, `p.data.iter().map(|&s| s as u8)`).
+# on purpose (decode.rs:20048-20054, `p.data.iter().map(|&s| s as u8)` in
+# `dump_stage`).
 # TRAP: on an HBD stream the file is EXACTLY HALF w*h*2 = w*h bytes, which
 # reads like a truncated/short decode, not a decoder bug. For HBD use rung 12
 # EC_AV1_FINAL_DUMP (:730) -- it IS depth-correct (u8 / u16 LE).
@@ -327,8 +328,8 @@ PYI
 # --- rung 6: post-deblock, pre-superres row dump ------------------------
 # DEPTH ASSUMPTION (lane-av1oraclerungdepth): 1 byte per sample, NO
 # YV12_FLAG_HIGHBITDEPTH check. Deliberate -- byte-paired with our
-# EC_AV1_POSTDEBLOCK_DUMP, which narrows to u8 (decode.rs:35336,
-# `dump_stage(..., &y, &u, &v)` over the u16 planes; same at :53126).
+# EC_AV1_POSTDEBLOCK_DUMP, which narrows to u8 (decode.rs:20048-20054,
+# `dump_stage(..., &y, &u, &v)` over the u16 planes; same closure at :53489).
 # TRAP: on an HBD stream the file is EXACTLY HALF w*h*2, which reads like a
 # truncated/short decode, not a decoder bug. For HBD use rung 12
 # EC_AV1_FINAL_DUMP (:730) -- depth-correct (u8 / u16 LE).
@@ -395,8 +396,8 @@ PYD
 # be told apart from a margin-region deblock bug.
 # DEPTH ASSUMPTION (lane-av1oraclerungdepth): 1 byte per sample, NO
 # YV12_FLAG_HIGHBITDEPTH check. Deliberate -- byte-paired with our
-# EC_AV1_PREFILT_WIDE_DUMP, which narrows to u8 (decode.rs:19734-19762,
-# `dump_prefilter_wide`; same body duplicated at :53048). TRAP: on an HBD
+# EC_AV1_PREFILT_WIDE_DUMP, which narrows to u8 (decode.rs:20078-20090,
+# `dump_prefilter_wide`; same closure at :53489). TRAP: on an HBD
 # stream the file is EXACTLY HALF w*h*2, which reads like a truncated/short
 # decode, not a decoder bug. For HBD use rung 12 EC_AV1_FINAL_DUMP (:730) --
 # depth-correct (u8 / u16 LE).
@@ -904,9 +905,9 @@ PYST
 # transcribed here (class: instrument that lives only in a build tree).
 # DEPTH ASSUMPTION (lane-av1oraclerungdepth): 1 byte per sample, NO
 # YV12_FLAG_HIGHBITDEPTH check. Deliberate -- byte-paired with our
-# EC_AV1_POSTCDEF_DUMP, which narrows to u8 (decode.rs:35356; same at
-# :53148). TRAP: on an HBD stream the file is EXACTLY HALF w*h*2, which reads
-# like a truncated/short decode, not a decoder bug. For HBD use rung 12
+# EC_AV1_POSTCDEF_DUMP, which narrows to u8 (decode.rs:20048-20054; same
+# closure at :53489). TRAP: on an HBD stream the file is EXACTLY HALF w*h*2,
+# which reads like a truncated/short decode, not a decoder bug. For HBD use rung 12
 # EC_AV1_FINAL_DUMP (:730) -- depth-correct (u8 / u16 LE).
 # OBSERVED 2026-09-29 (HBD build, av112bit-key.obu): the 1-byte fwrite SIGSEGVs
 # (exit 139); where it survives it writes 30720 B where 61440 B is expected --
