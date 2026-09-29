@@ -6492,41 +6492,36 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        // lane-av1skipfix: this arm used to be a bare SKIP, so on any box
-        // without the pin (the root `fixtures/` directory is GITIGNORED --
-        // `.gitignore:2` -- so a fresh clone, and every linked worktree, can
-        // never have it) the gate reported green having decoded nothing.
-        // `EC_REQUIRE_FIXTURES=1` -- the repo-wide fixture env, same as the
-        // ec-h264/ec-flac/ec-opus conformance gates -- or this crate's own
-        // `EC_AV1_REQUIRE_AOMENC=1` turns it into a hard failure naming the
-        // missing pin, the exact regeneration recipe and the
-        // `EC_AV1_PIN_DIR` override, so a batch run cannot report green off it.
-        let pin = pin_dir().join("ll444-lossless-key.obu");
-        let stream = match std::fs::read(&pin) {
-            Ok(stream) => stream,
-            Err(e) => {
-                assert!(
-                    std::env::var_os("EC_REQUIRE_FIXTURES").is_none()
-                        && std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
-                    "{NAME}: the pinned 4:4:4 lossless key frame is missing at {} ({e}). \
-                     This gate would prove nothing. A worktree has no gitignored root \
-                     `fixtures/`: run scripts/link-fixtures.sh. No script generates this \
-                     pin -- regenerate it with `testsrc2 128x96` yuv444p 6 frames, aomenc \
-                     --profile=1 --lossless=1 --enable-palette=0 --enable-intrabc=0, cut to \
-                     the key frame's OBUs -- or point EC_AV1_PIN_DIR at a directory that has it.",
-                    pin.display()
-                );
-                eprintln!(
-                    "SKIP {NAME}: no pinned bytes at {} ({e}) -- this gate decoded nothing \
-                     and proves nothing; run scripts/link-fixtures.sh, or regenerate with \
-                     `testsrc2 128x96` yuv444p 6 frames, aomenc --profile=1 --lossless=1 \
-                     --enable-palette=0 --enable-intrabc=0, cut to the key frame's OBUs \
-                     (or set EC_REQUIRE_FIXTURES=1 to make this a failure).",
-                    pin.display()
-                );
-                return;
-            }
-        };
+        // lane-av1pins: committed at crates/ec-av1/fixtures/ll444-lossless-key.obu
+        // (7845 bytes; sha256
+        // f496ef0a1171c2bc66d411cc60db05db547dcdb49cd834d4e0543de9db441374),
+        // re-encoded 2026-09-29 from the recipe this very SKIP line records --
+        // `testsrc2 128x96` yuv444p 6 frames, aomenc --profile=1 --lossless=1
+        // --enable-palette=0 --enable-intrabc=0 --bit-depth=8 --cpu-used=0
+        // --threads=1 --row-mt=0 --lag-in-frames=0 --kf-max-dist=100, --limit=1
+        // so the key frame's OBUs are the whole stream (no OBU surgery needed).
+        //
+        // lane-av1skipfix: reading the pin from the GITIGNORED root
+        // `fixtures/` (`pin_dir()`) is what made this gate report green having
+        // decoded nothing -- a fresh clone, and every linked worktree, can
+        // never have that directory. The pin is now COMMITTED under the crate
+        // (the home the other pins use) and read through `CARGO_MANIFEST_DIR`,
+        // so a missing file is a REPO DEFECT and fails unconditionally: there
+        // is no environment left to escape, which is strictly stronger than
+        // the `EC_REQUIRE_FIXTURES` / `EC_AV1_REQUIRE_AOMENC` opt-in hard
+        // fail this arm used to carry.
+        let pin = crate_pin("ll444-lossless-key.obu");
+        let stream = std::fs::read(&pin).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: the pinned 4:4:4 lossless key frame is missing at {} ({e}). A \
+                 COMMITTED pin that is absent is a repo defect and this gate would prove \
+                 nothing. No script generates it -- regenerate it with `testsrc2 128x96` \
+                 yuv444p 6 frames, aomenc --profile=1 --lossless=1 --enable-palette=0 \
+                 --enable-intrabc=0 --bit-depth=8 --cpu-used=0 --threads=1 --row-mt=0 \
+                 --lag-in-frames=0 --kf-max-dist=100 --limit=1, and commit the result.",
+                pin.display()
+            )
+        });
         // Blindness guard: the pinned fixture must really be a lossless frame.
         let mut parser = Av1Parser::new();
         let mut pos = 0usize;
@@ -8989,6 +8984,23 @@ pub(crate) mod tests {
             .join("../../fixtures")
             .canonicalize()
             .unwrap_or_else(|_| std::path::PathBuf::from("fixtures"))
+    }
+
+    /// A COMMITTED pin: `crates/ec-av1/fixtures/<name>`, which travels in the
+    /// tarball and is therefore present on every runner. `pin_dir()` resolves
+    /// to the gitignored root `fixtures/`, so a pin written there is lost when
+    /// the machine's scratchpad is reaped -- three gates sat at `rc=0` having
+    /// tested nothing for exactly that reason (lane-av1pins). Falls back to
+    /// `pin_dir()` so a locally re-captured stream still overrides.
+    fn crate_pin(name: &str) -> std::path::PathBuf {
+        let in_crate = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(name);
+        if in_crate.is_file() {
+            in_crate
+        } else {
+            pin_dir().join(name)
+        }
     }
 
     fn have_aomenc() -> bool {
@@ -23443,19 +23455,33 @@ pub(crate) mod tests {
     /// `EC_AV1_GATE_DUMP=$SP/golden3-pin.obu` off
     /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
     /// (seed 47, frame 1 U). Deterministic and static -- no aomenc/ffmpeg
-    /// re-encode involved, only re-decodes the fixed bytes on disk, so it is
-    /// `#[ignore]`d (the file only exists on this machine's scratchpad) but
-    /// gives a fast red/green loop for the actual fix.
+    /// re-encode involved, only re-decodes fixed bytes on disk. Still
+    /// `#[ignore]`d: it is a BISECT aid, not a suite gate. What changed under
+    /// lane-av1pins is WHERE the bytes live -- they are now committed at
+    /// `crates/ec-av1/fixtures/golden3-pin.obu` instead of a scratchpad that
+    /// tmpfs reaps, so the gate does real work on any runner.
+    ///
+    /// The original capture (2026-08-28, `bec27414`) is NOT reproducible: it
+    /// predates `5ae053d3` "route all 20 gradients gate fixtures through
+    /// seed-derived colours", so `gradients_source` still left c4..c7 to
+    /// ffmpeg's `random` default then. This is a FRESH capture from the same
+    /// recipe family at seed 42, which IS byte-reproducible now: the command is
+    /// in `lanes/av1pins.report.md`, and the stream's FNV-1a-64
+    /// (`89c4089148d51c04`; 159 bytes; sha256
+    /// `11c9d5331cffa6614c8265ad5fa685d5ce9155db8439949b48ec4a652ace95cf`) is
+    /// the `stream_hash` the live
+    /// `a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`
+    /// prints for that seed -- which is what proves the recipe is that gate's.
     #[test]
-    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    #[ignore = "bisect aid, not a suite gate; run it with --ignored"]
     fn pinned_golden3_stream_decodes_pixel_exact() {
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| pin_dir().join("golden3-pin.obu"));
+            .unwrap_or_else(|_| crate_pin("golden3-pin.obu"));
         let Ok(stream) = std::fs::read(&path) else {
             eprintln!(
                 "SKIP pinned_golden3_stream_decodes_pixel_exact: no pinned bytes at {} \
-                 -- re-capture with EC_AV1_GATE_DUMP off the cdf-forwarding gate",
+                 -- the committed copy is crates/ec-av1/fixtures/golden3-pin.obu",
                 path.display()
             );
             return;
@@ -23466,11 +23492,25 @@ pub(crate) mod tests {
         }
         let frames = decode_stream(&stream).expect("pinned stream must decode");
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 4);
+        assert_eq!(
+            frames.len(),
+            ffmpeg_frames.len(),
+            "pinned stream decoded {} frames, ffmpeg {} -- a length mismatch would \
+             make the zip below compare a mis-paired set",
+            frames.len(),
+            ffmpeg_frames.len()
+        );
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned)");
             assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned)");
             assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned)");
         }
+        eprintln!(
+            "pinned_golden3_stream_decodes_pixel_exact: {} frame(s) byte-exact vs ffmpeg \
+             from {}",
+            frames.len(),
+            path.display()
+        );
     }
 
     /// lane-av1golden4: reproduces the pinned mismatch bytes captured by
@@ -39177,16 +39217,27 @@ pub(crate) mod tests {
     /// aomenc/ffmpeg re-encode), same pattern as `pinned_golden3/4_stream_
     /// decodes_pixel_exact` -- fast red/green loop for the bisect, and lets
     /// `EC_AV1_TRACE=1` be set for one run without re-driving the encoder.
+    ///
+    /// lane-av1pins: the bytes are now committed at
+    /// `crates/ec-av1/fixtures/sbpart-pin.obu` (238 bytes; sha256
+    /// `62238fc077f45d89745d4d254b9c0465464003529da3b42d0a65631fbb7e16e9`),
+    /// re-encoded 2026-09-29 from the source gate's own recipe
+    /// (`a_real_aomenc_stream_with_rect_screen_content_decodes_pixel_exact`:
+    /// smptebars 192x128, single frame, `--sb-size=64 --enable-palette=1
+    /// --min-partition-size=16 --max-partition-size=64`, cq=55). The command
+    /// is in `lanes/av1pins.report.md`. That gate's source list has no
+    /// 192x128 cell, so this pin is a 192x128 re-run of its recipe, not a
+    /// replay of the original mismatch bytes.
     #[test]
-    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    #[ignore = "bisect aid, not a suite gate; run it with --ignored"]
     fn pinned_sbpart_stream_decodes_pixel_exact() {
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| pin_dir().join("sbpart-pin.obu"));
+            .unwrap_or_else(|_| crate_pin("sbpart-pin.obu"));
         let Ok(stream) = std::fs::read(&path) else {
             eprintln!(
                 "SKIP pinned_sbpart_stream_decodes_pixel_exact: no pinned bytes at {} \
-                 -- re-capture with EC_AV1_GATE_DUMP off the sbpart gate",
+                 -- the committed copy is crates/ec-av1/fixtures/sbpart-pin.obu",
                 path.display()
             );
             return;
@@ -39197,6 +39248,14 @@ pub(crate) mod tests {
         }
         let frames = decode_stream(&stream).expect("pinned stream must decode");
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 192, 128, 1);
+        assert_eq!(
+            frames.len(),
+            ffmpeg_frames.len(),
+            "pinned stream decoded {} frames, ffmpeg {} -- a length mismatch would \
+             make the zip below compare a mis-paired set",
+            frames.len(),
+            ffmpeg_frames.len()
+        );
         let (width, height) = (192usize, 128usize);
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             if std::env::var_os("EC_SBPART_DIAG").is_some() {
@@ -41791,25 +41850,33 @@ pub(crate) mod tests {
     #[test]
     // r1 `#[ignore]`d this gate on "every stream with an intra 1:4 strip also
     // hits the inter rect-strip refusal". r2 merged main 18bf7dc (lane-r14
-    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts now
-    // decode whole and reach the pixel compare (0 before), one of them firing
-    // 64x16=4 16x64=3. But the compare fails on a defect this lane does not
-    // own -- MEASURED (r2, $HOME/.cache/intra14-r2-*.log):
-    //   * seeds 46 and 54 fire ZERO 1:4 strips (`intra_rect4_strip_in_inter_hits`
-    //     delta 0/0/0/0) and mismatch ffmpeg the same way as the firing seed 52:
-    //     decode-order frame 3/4 luma ~3.7-4.5k samples, max |d| 6..17, then
-    //     frames 5-7 drift to ~24k samples, max |d| ~220 as the references
-    //     carry the error forward.
-    //   * with `--enable-1to4-partitions=0` aomenc emits a BYTE-IDENTICAL
-    //     stream at this recipe (same hits, same per-frame diff counts), so
-    //     the 1:4 shape is not the discriminator either.
-    // i.e. this mandelbrot 192x128 source has a pre-existing INTER-frame
-    // pixel defect on this tree (r1 already recorded it as "open, NOT mine"
-    // with rect partitions off; it is now this gate's blocker). testsrc2 at
-    // 192x128 decodes pixel-exact on the same recipe but fires no 1:4 strip
-    // in 4 of 12 attempts that decode whole. So the gate stays `#[ignore]`d
-    // rather than weakened: a source whose baseline is exact AND that fires
-    // an intra 1:4 strip has not been found yet.
+    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts
+    // decode whole and reach the pixel compare (0 before), one firing
+    // 64x16=4 16x64=3 -- and the compare FAILED on an unowned inter-frame
+    // defect (mandelbrot 192x128, luma ~3.7-4.5k samples on frames 3/4
+    // drifting to ~24k, max |d| ~220 on frames 5-7).
+    //
+    // lane-av1pins RE-RAN this gate in RELEASE on a21f3680 (the seven-lane
+    // merged tree) and BOTH halves of that r2 record are now stale:
+    //   * THE PIXEL BLOCKER IS GONE. The gate's own tally reads
+    //     `counted-exact=0 uncounted-exact=40 named-refusals=0 (attempts 40)`
+    //     at both bit depths, and there is NOT ONE mismatch line anywhere in
+    //     the full run log -- no frame 3/4 luma counts, no max |d|, no drift.
+    //     40/40 streams now compare pixel-exact. (The 10-bit arm is identical:
+    //     same 40/40, same zero-mismatch log.)
+    //   * THE RECIPE NO LONGER FIRES THE FEATURE. Every one of the 42
+    //     counted attempts reads `64x16=0 16x64=0 32x8=0 8x32=0`. The gate has
+    //     regressed from r2's "fires sometimes, compare fails" to "never
+    //     fires", so the assertion now trips on its non-vacuity precondition
+    //     (stream.rs:40653) rather than on any pixel.
+    // So the reason these gates stay `#[ignore]`d is the RECIPE, exactly as
+    // the `#[ignore]` string says -- NOT the mandelbrot defect, which the
+    // string never claimed and which is no longer reproducing. Kept ignored
+    // rather than un-ignored: a source whose baseline is exact AND that fires
+    // a 32-level intra 1:4 strip in an inter frame still does not exist.
+    // (Corrected 2026-09-29: the comment above previously recorded the r2
+    // state and would have had a reader re-filing these as blocked on the
+    // mandelbrot defect, which is wrong on this tree.)
     #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a 32-level intra 1:4 strip in an inter frame -- class gate-blind-to-feature"]
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact() {
         intra_rect4_in_inter_gate(8);
@@ -41819,25 +41886,33 @@ pub(crate) mod tests {
     #[test]
     // r1 `#[ignore]`d this gate on "every stream with an intra 1:4 strip also
     // hits the inter rect-strip refusal". r2 merged main 18bf7dc (lane-r14
-    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts now
-    // decode whole and reach the pixel compare (0 before), one of them firing
-    // 64x16=4 16x64=3. But the compare fails on a defect this lane does not
-    // own -- MEASURED (r2, $HOME/.cache/intra14-r2-*.log):
-    //   * seeds 46 and 54 fire ZERO 1:4 strips (`intra_rect4_strip_in_inter_hits`
-    //     delta 0/0/0/0) and mismatch ffmpeg the same way as the firing seed 52:
-    //     decode-order frame 3/4 luma ~3.7-4.5k samples, max |d| 6..17, then
-    //     frames 5-7 drift to ~24k samples, max |d| ~220 as the references
-    //     carry the error forward.
-    //   * with `--enable-1to4-partitions=0` aomenc emits a BYTE-IDENTICAL
-    //     stream at this recipe (same hits, same per-frame diff counts), so
-    //     the 1:4 shape is not the discriminator either.
-    // i.e. this mandelbrot 192x128 source has a pre-existing INTER-frame
-    // pixel defect on this tree (r1 already recorded it as "open, NOT mine"
-    // with rect partitions off; it is now this gate's blocker). testsrc2 at
-    // 192x128 decodes pixel-exact on the same recipe but fires no 1:4 strip
-    // in 4 of 12 attempts that decode whole. So the gate stays `#[ignore]`d
-    // rather than weakened: a source whose baseline is exact AND that fires
-    // an intra 1:4 strip has not been found yet.
+    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts
+    // decode whole and reach the pixel compare (0 before), one firing
+    // 64x16=4 16x64=3 -- and the compare FAILED on an unowned inter-frame
+    // defect (mandelbrot 192x128, luma ~3.7-4.5k samples on frames 3/4
+    // drifting to ~24k, max |d| ~220 on frames 5-7).
+    //
+    // lane-av1pins RE-RAN this gate in RELEASE on a21f3680 (the seven-lane
+    // merged tree) and BOTH halves of that r2 record are now stale:
+    //   * THE PIXEL BLOCKER IS GONE. The gate's own tally reads
+    //     `counted-exact=0 uncounted-exact=40 named-refusals=0 (attempts 40)`
+    //     at both bit depths, and there is NOT ONE mismatch line anywhere in
+    //     the full run log -- no frame 3/4 luma counts, no max |d|, no drift.
+    //     40/40 streams now compare pixel-exact. (The 10-bit arm is identical:
+    //     same 40/40, same zero-mismatch log.)
+    //   * THE RECIPE NO LONGER FIRES THE FEATURE. Every one of the 42
+    //     counted attempts reads `64x16=0 16x64=0 32x8=0 8x32=0`. The gate has
+    //     regressed from r2's "fires sometimes, compare fails" to "never
+    //     fires", so the assertion now trips on its non-vacuity precondition
+    //     (stream.rs:40653) rather than on any pixel.
+    // So the reason these gates stay `#[ignore]`d is the RECIPE, exactly as
+    // the `#[ignore]` string says -- NOT the mandelbrot defect, which the
+    // string never claimed and which is no longer reproducing. Kept ignored
+    // rather than un-ignored: a source whose baseline is exact AND that fires
+    // a 32-level intra 1:4 strip in an inter frame still does not exist.
+    // (Corrected 2026-09-29: the comment above previously recorded the r2
+    // state and would have had a reader re-filing these as blocked on the
+    // mandelbrot defect, which is wrong on this tree.)
     #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a 32-level intra 1:4 strip in an inter frame -- class gate-blind-to-feature"]
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit() {
         intra_rect4_in_inter_gate(10);
