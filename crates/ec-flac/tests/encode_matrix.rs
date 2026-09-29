@@ -20,6 +20,30 @@ struct Source {
     bits: u32,
 }
 
+/// Fixture-presence probe for the encoder matrix corpus.
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that regenerates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape.
+fn require_fixture(path: &Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
 }
@@ -124,7 +148,12 @@ fn matrix() -> Vec<Source> {
     let audio = fixtures().join("audio");
     let vectors = fixtures().join("vectors/flac-xiph/flac-test-files-main/subset");
     let mut paths: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&audio) {
+    // Probe first, assert inside the helper, and only then take the empty-list
+    // branch: under EC_REQUIRE_FIXTURES the assert fires instead of a silent
+    // skip that leaves every loop below running zero times.
+    if require_fixture(&audio, "scripts/gen-fixtures.sh") {
+        let entries = std::fs::read_dir(&audio)
+            .unwrap_or_else(|e| panic!("read fixture dir {}: {e}", audio.display()));
         let mut found: Vec<PathBuf> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
@@ -136,13 +165,15 @@ fn matrix() -> Vec<Source> {
         paths.append(&mut found);
     }
     // Depth coverage the generated fixtures do not have: 24- and 20-bit.
-    for name in [
-        "28 - high resolution audio, default settings.flac",
-        "37 - 20 bit per sample.flac",
-    ] {
-        let p = vectors.join(name);
-        if p.exists() {
-            paths.push(p);
+    if require_fixture(&vectors, "scripts/fetch-vectors.sh") {
+        for name in [
+            "28 - high resolution audio, default settings.flac",
+            "37 - 20 bit per sample.flac",
+        ] {
+            let p = vectors.join(name);
+            if p.exists() {
+                paths.push(p);
+            }
         }
     }
     paths.iter().filter_map(|p| probe(p)).collect()
@@ -155,6 +186,12 @@ fn encoded_streams_decode_back_bit_exact_through_ffmpeg() {
         eprintln!("skipped: fixtures not generated");
         return;
     }
+    // Non-empty floor: the loop below must run, not zero times.
+    assert!(
+        sources.len() >= 5,
+        "encoder matrix holds {} usable sources, expected at least 5",
+        sources.len()
+    );
     let dir = workdir("roundtrip");
     let config = EncoderConfig::default();
     let mut failures = Vec::new();
@@ -227,10 +264,18 @@ fn encoded_streams_decode_back_bit_exact_through_ffmpeg() {
 
 #[test]
 fn our_streams_survive_a_probe_and_state_their_shape() {
-    let Some(source) = matrix().into_iter().find(|s| s.channels == 6) else {
-        eprintln!("skipped: no 5.1 fixture");
+    // The 5.1 source this test needs is a named fixture, not a shape we hope the
+    // matrix happens to contain: probe it first so EC_REQUIRE_FIXTURES fails on
+    // a drifted library instead of skipping.
+    let surround = fixtures().join("audio/flac-5.1-44100.flac");
+    if !require_fixture(&surround, "scripts/gen-fixtures.sh") {
         return;
-    };
+    }
+    let source = matrix()
+        .into_iter()
+        .find(|s| s.channels == 6)
+        .or_else(|| probe(&surround))
+        .expect("5.1 source in the encoder matrix");
     let dir = workdir("probe");
     let pcm = ffmpeg_pcm(&source.path, source.bits);
     let samples = samples_from_pcm(&pcm, source.bits);

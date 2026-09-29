@@ -9,6 +9,30 @@
 mod ivf;
 
 use ec_vp9::decode::Decoder;
+/// Fixture-presence probe for the 120-frame 1080p corpus IVF
+/// `corpus_1080p_60fps_matches_ffmpeg_past_frame_72` decodes.
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that regenerates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape.
+fn require_fixture(path: &std::path::Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
 
 /// Generate a GOP fixture with libvpx: 6 frames of testsrc2 at 320x240,
 /// `-g 10` so frames 1..5 are inter frames.
@@ -137,17 +161,14 @@ fn inter_gop_with_tile_columns_matches_ffmpeg() {
 /// TAIL slot set (`write_tx_context`), and the next row of blocks read it
 /// as an entropy context. Every shown frame must match ffmpeg.
 ///
-/// Media-gated: the corpus fixture is not versioned, so the witness skips
-/// when `fixtures/bitstreams/vp9-1080p-60-8bit.ivf` is absent.
+/// Media-gated: the corpus fixture is not versioned, so the witness prints
+/// SKIP when `fixtures/bitstreams/vp9-1080p-60-8bit.ivf` is absent -- and goes
+/// RED instead under `EC_REQUIRE_FIXTURES=1`.
 #[test]
 fn corpus_1080p_60fps_matches_ffmpeg_past_frame_72() {
-    let Some(dir) = ivf::fixture_dir() else {
-        println!("SKIP: fixtures/bitstreams absent (media-gated witness)");
-        return;
-    };
-    let path = dir.join("vp9-1080p-60-8bit.ivf");
-    if !path.exists() {
-        println!("SKIP: {} absent (media-gated witness)", path.display());
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/bitstreams/vp9-1080p-60-8bit.ivf");
+    if !require_fixture(&path, "scripts/gen-bitstream-fixtures.sh") {
         return;
     }
     let shown = compare(&path);
