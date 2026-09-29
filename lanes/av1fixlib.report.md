@@ -116,13 +116,16 @@ All four are reported on every run; the count is always printed.
    three regenerated pins land today.
 4. **The pin-reading gate census** above, including the bare-directory verdict.
 
-**Exit status is split, deliberately.** The LIBRARY verdict (mode i, mode ii,
+**Exit status is split, deliberately, and the flip is one character away.** The LIBRARY verdict (mode i, mode ii,
 drift) decides the exit under `EC_REQUIRE_FIXTURES=1`. The four code-shape
 invariants fail only under `EC_FIXTURE_SHAPE_STRICT=1`. A shape violation is a
 defect in a file this preflight does not own — two live sites in `crates/ec-av1`
 — and a batch that cannot start because another crate has two open lines helps
 nobody. Nothing is hidden: the count is printed every run, the sites are named
-every run, and one env var makes them fatal.
+every run, and `--strict` (or `EC_FIXTURE_SHAPE_STRICT=1`) makes them fatal.
+Measured exit codes: default 0 / renamed+set 1 / renamed+unset 0 / no-root 1 /
+`--strict` 1. The default flips to fatal the moment the two `crates/ec-av1`
+violations below are fixed; nothing else needs to change.
 
 ## 4. Proof
 
@@ -200,10 +203,25 @@ That is the measured blind spot, not a sync failure.
   a host asserts the committed value instead of recomputing what it cannot know.
 - The recovered-pin self-validation has two halves. This script decides the hash
   half — every `recovered-original` row must hash to its recorded sha256, and a
-  re-encode fails it. The behavioural half is `pinned_golden7`'s
-  `non_last_ref_hits` 0→2, recorded in the gate's own doc, and it is **not
-  executed here**: `cargo test -p ec-av1 pinned_golden7` is the command, and
-  ec-av1 is owned elsewhere. That is the one claim in this report I did not run.
+  re-encode fails it. **The behavioural half now runs too:**
+
+  ```
+  CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1fixlib EC_NOMEMGUARD=1 \
+    cargo test -p ec-av1 --lib -- \
+      --exact stream::tests::pinned_golden7_stream_decodes_pixel_exact \
+      --include-ignored --nocapture
+  non_last_ref_hits before=0 after=2
+  test stream::tests::pinned_golden7_stream_decodes_pixel_exact ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 745 filtered out
+  ```
+
+  The recovered pin reproduces exactly the 0→2 its doc records — the
+  self-validation a re-encode cannot pass. Two notes for whoever repeats it: the
+  test is LIVE in the merged tree (no `#[ignore]`), so `--include-ignored` is
+  belt-and-braces, and a lane-scoped `CARGO_TARGET_DIR` is REQUIRED — the shared
+  `$HOME/.cache/cargo-target` held a stale `ec_av1` binary from another worktree
+  of the same package, and its panic pointed at a line that does not exist in
+  this source.
 - `pinned_lr_sgr_stream_call_unique_dump` stays `#[ignore]`d for a true reason:
   it prints per-frame mismatch counts and asserts nothing.
 

@@ -52,8 +52,15 @@ ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 MANIFEST=$ROOT/scripts/fixture-library.tsv
 FIXTURES=${EC_FIXTURES:-$ROOT/fixtures}
 REQUIRE=${EC_REQUIRE_FIXTURES:-0}
-# Code-shape invariants fail only when explicitly made fatal.
+# Code-shape invariants fail only when explicitly made fatal: `scripts/
+# verify-fixture-library.sh --strict` or EC_FIXTURE_SHAPE_STRICT=1. The default
+# flips to fatal when the last live violation is fixed.
 SHAPE=${EC_FIXTURE_SHAPE_STRICT:-0}
+# `--strict` on the command line is the same switch, so the default can be
+# flipped with a one-character edit the moment the last shape violation lands.
+case " $* " in
+    *" --strict "*) SHAPE=1 ;;
+esac
 LINK_SCRIPT=$ROOT/scripts/link-fixtures.sh
 
 fail=0
