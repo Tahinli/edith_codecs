@@ -28242,6 +28242,13 @@ fn read_inter_rect_chroma(
     (write_chroma_w, write_chroma_h): (usize, usize),
     chroma_side: usize,
     mode_for_tx: usize,
+    // lane-av1chrtx: this block's coded luma transform leaves, `(row, col,
+    // tw, th, tx_type)` -- the same list the 4:4:4 four-unit arms resolve
+    // through `covering_leaf_tx_type`. This sibling used to hand EVERY unit
+    // the block-level `luma_tx_type` (the top-left leaf's type), so a rect
+    // inter block whose chroma plane splits (`nx*ny > 1`) over MIXED var-tx
+    // leaves read the wrong type per unit.
+    leaf_tx_types: &[(usize, usize, usize, usize, TxType)],
     luma_tx_type: TxType,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, Grid, Vec<((usize, usize), usize, Grid, usize, usize)>)> {
@@ -28267,7 +28274,12 @@ fn read_inter_rect_chroma(
     let invalid_ss_plane =
         ss_x(fctx) == 1 && ss_y(fctx) == 0 && (write_chroma_w, write_chroma_h) == (4, 32);
     let (uw, uh) = if invalid_ss_plane { (4, 8) } else { (uw, uh) };
-    let inherit_tx_type = Some(luma_tx_type);
+    // lane-av1chrtx: `inherit_tx_type` is resolved PER UNIT below, not once
+    // for the block -- `av1_get_tx_type` (blockd.h:1287-1297) reads
+    // `xd->tx_type_map` at the chroma unit's own position scaled back to
+    // luma, so a unit sitting over a luma leaf that coded NOTHING takes that
+    // leaf's `DCT_DCT` stamp (`decodetxb.c:199-203`), not the block-level
+    // (top-left leaf) type.
     let (nx, ny) = (write_chroma_w / uw, write_chroma_h / uh);
     let multi = nx * ny > 1;
     let set = rect_inter_chroma_set(uw, uh)?;
@@ -28305,6 +28317,7 @@ fn read_inter_rect_chroma(
                     at_mi.0 + cu_row * (span_y / MI),
                     at_mi.1 + cu_col * (span_x / MI),
                 );
+                let unit_rel_mi = (cu_mi.0 - at_mi.0, cu_mi.1 - at_mi.1);
                 let cu_around = if multi {
                     // lane-av1422ctxgather: at ss (1,0) the unit's above
                     // span covers `uw` chroma px = `2*uw` luma mi columns,
@@ -28324,6 +28337,16 @@ fn read_inter_rect_chroma(
                 };
                 let (cu_x, cu_y) = (cpx + cu_col * uw, cpy + cu_row * uh);
                 let cu_pred = src.offset(cu_row * uh * chroma_side + cu_col * uw);
+                let inherit_tx_type =
+                    if let Some(t) = covering_leaf_tx_type(leaf_tx_types, unit_rel_mi) {
+                        hit!(CHROMA_RECT_LEAF_TX_HITS);
+                        if Some(t) != Some(luma_tx_type) {
+                            hit!(CHROMA_RECT_LEAF_TX_DIFF_HITS);
+                        }
+                        Some(t)
+                    } else {
+                        Some(luma_tx_type)
+                    };
                 let cu_grid = read_inter_plane_rect(
                     dec,
                     cdfs,
@@ -37984,6 +38007,39 @@ pub(crate) fn chroma_quad_leaf_tx_diff_hits() -> usize {
     CHROMA_QUAD_LEAF_TX_DIFF_HITS.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// lane-av1chrtx: chroma units of a RECT inter block
+    /// ([`read_inter_rect_chroma`], the sibling of the 4:4:4 four-unit arms)
+    /// that resolved their `tx_type` from the luma leaf covering their OWN
+    /// quadrant instead of the block-level one. A SEPARATE counter from
+    /// [`CHROMA_QUAD_LEAF_TX_HITS`] on purpose: that one gates a 4:2:0 control
+    /// that must stay at exactly 0, and this route IS reachable at 4:2:0, so
+    /// sharing the counter would destroy that control's meaning.
+    pub(crate) static CHROMA_RECT_LEAF_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Of those, how many resolved a type that DIFFERS from the block-level
+    /// one -- the condition that changes pixels. A route counter alone fires
+    /// on every multi-unit rect chroma read, including the blocks whose
+    /// leaves all agree (the exact shape a no-op fix looks green on).
+    pub(crate) static CHROMA_RECT_LEAF_TX_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`CHROMA_RECT_LEAF_TX_HITS`]: rect chroma units that took their type from
+/// the covering luma leaf.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_rect_leaf_tx_hits() -> usize {
+    CHROMA_RECT_LEAF_TX_HITS.with(std::cell::Cell::get)
+}
+
+/// [`CHROMA_RECT_LEAF_TX_DIFF_HITS`]: of those, the units whose covering
+/// leaf's type differs from the block-level one.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_rect_leaf_tx_diff_hits() -> usize {
+    CHROMA_RECT_LEAF_TX_DIFF_HITS.with(std::cell::Cell::get)
+}
+
 fn decode_inter_block(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -39915,6 +39971,7 @@ fn decode_inter_block(
                         (write_chroma_w, write_chroma_h),
                         chroma_stride,
                         mode_for_tx,
+                        &leaf_tx_types,
                         luma_tx_type,
                         fctx,
                     )?;
@@ -41707,6 +41764,7 @@ fn decode_inter_block(
                         (write_chroma_w, write_chroma_h),
                         chroma_stride,
                         mode_for_tx,
+                        &leaf_tx_types,
                         luma_tx_type,
                         fctx,
                     )?;
