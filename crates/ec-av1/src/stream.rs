@@ -9126,6 +9126,22 @@ pub(crate) mod tests {
     /// the machine's scratchpad is reaped -- three gates sat at `rc=0` having
     /// tested nothing for exactly that reason (lane-av1pins). Falls back to
     /// `pin_dir()` so a locally re-captured stream still overrides.
+    /// Read a pin that a gate cannot proceed without. A missing pin is a
+    /// HARD failure naming the path and the generator, never a raw io panic
+    /// and never a silent skip: `EC_AV1_GATE_DUMP_PIN` points the gate at a
+    /// freshly captured stream, and a runner without the committed copy must
+    /// say so instead of reporting green having tested nothing.
+    fn require_pin(path: &std::path::Path, name: &str) -> Vec<u8> {
+        std::fs::read(path).unwrap_or_else(|e| {
+            panic!(
+                "no pinned bytes at {} ({e}) -- set EC_AV1_GATE_DUMP_PIN to a freshly \
+             captured stream, or restore the committed copy at \
+             crates/ec-av1/fixtures/{name}",
+                path.display()
+            )
+        })
+    }
+
     fn crate_pin(name: &str) -> std::path::PathBuf {
         let in_crate = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
@@ -23675,11 +23691,14 @@ pub(crate) mod tests {
     /// `EC_AV1_GATE_DUMP=$SP/golden3-pin.obu` off
     /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
     /// (seed 47, frame 1 U). Deterministic and static -- no aomenc/ffmpeg
-    /// re-encode involved, only re-decodes fixed bytes on disk. Still
-    /// `#[ignore]`d: it is a BISECT aid, not a suite gate. What changed under
-    /// lane-av1pins is WHERE the bytes live -- they are now committed at
-    /// `crates/ec-av1/fixtures/golden3-pin.obu` instead of a scratchpad that
-    /// tmpfs reaps, so the gate does real work on any runner.
+    /// re-encode involved, only re-decodes fixed bytes on disk. What changed
+    /// under lane-av1pinslive is that the gate is LIVE: the bytes are committed
+    /// at `crates/ec-av1/fixtures/golden3-pin.obu` instead of a scratchpad that
+    /// tmpfs reaps, so it runs in the ordinary suite on any runner that has
+    /// ffmpeg (guarded by `have_ffmpeg()`, so `EC_AV1_REQUIRE_FFMPEG=1` turns
+    /// its absence into a hard failure rather than a silent skip). It costs
+    /// ~0.15 s, touches no process-global, and reads no counter -- none of the
+    /// conditions that make this crate ignore its other manual gates.
     ///
     /// The original capture (2026-08-28, `bec27414`) is NOT reproducible: it
     /// predates `5ae053d3` "route all 20 gradients gate fixtures through
@@ -23693,7 +23712,6 @@ pub(crate) mod tests {
     /// `a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`
     /// prints for that seed -- which is what proves the recipe is that gate's.
     #[test]
-    #[ignore = "bisect aid, not a suite gate; run it with --ignored"]
     fn pinned_golden3_stream_decodes_pixel_exact() {
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
@@ -23737,22 +23755,22 @@ pub(crate) mod tests {
     /// `EC_AV1_GATE_DUMP=$SP/golden4-pin.obu` off
     /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
     /// (seed 43, frame 3 luma) the round the GOLDEN mask lifted. Deterministic
-    /// and static -- `#[ignore]`d, run manually.
+    /// and static.
+    ///
+    /// LIVE since lane-av1pinslive r3: the bytes are committed at
+    /// `crates/ec-av1/fixtures/golden4-pin.obu` (137 bytes; sha256
+    /// `1754023e44e46edaebc2c05065bf1c65db1a41354577cbf71c0e8ebe737ae14a`,
+    /// recovered byte-for-byte from the runner library), so the old
+    /// "reads a pinned fixture path outside the repo" reason is false. Costs
+    /// ~0.10 s, touches no process-global, reads `non_last_ref_hits` for
+    /// diagnostic output only (never asserted), and calls no aomenc.
     #[test]
-    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
     fn pinned_golden4_stream_decodes_pixel_exact() {
         use crate::decode::non_last_ref_hits;
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| pin_dir().join("golden4-pin.obu"));
-        let Ok(stream) = std::fs::read(&path) else {
-            eprintln!(
-                "SKIP pinned_golden4_stream_decodes_pixel_exact: no pinned bytes at {} \
-                 -- re-capture with EC_AV1_GATE_DUMP off the cdf-forwarding gate",
-                path.display()
-            );
-            return;
-        };
+            .unwrap_or_else(|_| crate_pin("golden4-pin.obu"));
+        let stream = require_pin(&path, "golden4-pin.obu");
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_golden4_stream_decodes_pixel_exact: no ffmpeg");
             return;
@@ -23775,15 +23793,22 @@ pub(crate) mod tests {
     /// by the forwarding gate once film grain is out of the way (1/20 real
     /// aomenc streams, frame 3 luma, apply_grain=false, `non_last_ref_hits`
     /// delta=2). `GOLDEN_FRAME` refuses by name until this decodes exact.
+    ///
+    /// LIVE since lane-av1pinslive r3. The old shape was the worst of the
+    /// class: a `concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/...")`
+    /// literal, which points at the GITIGNORED root and can therefore never be
+    /// satisfied by a committed pin, combined with a bare `.expect()`. The
+    /// bytes are now committed at
+    /// `crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu` (152 bytes;
+    /// sha256 `81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be`,
+    /// recovered byte-for-byte from the runner library).
     #[test]
-    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
     fn pinned_golden7_stream_decodes_pixel_exact() {
         use crate::decode::non_last_ref_hits;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/golden7-forwarding-mismatch.obu"
-        );
-        let stream = std::fs::read(path).expect("reading pinned stream");
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate_pin("golden7-forwarding-mismatch.obu"));
+        let stream = require_pin(&path, "golden7-forwarding-mismatch.obu");
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_golden7_stream_decodes_pixel_exact: no ffmpeg");
             return;
@@ -30277,35 +30302,103 @@ pub(crate) mod tests {
     /// `EC_LR_CALL_DUMP=1` set (see `restoration.rs`'s `apply_sgrproj_stripe`)
     /// to get the real window on stderr, call-uniquely keyed to `xqd ==
     /// [-16,-32]` rather than any coordinate.
+    /// lane-av1pinslive r4: this gate asserted NOTHING. It `eprintln!`d per-frame
+    /// mismatch flags and returned, so it could not go red on a decode regression
+    /// -- which is why r3 left it `#[ignore]`d on that fact rather than un-ignoring
+    /// it. It now carries the same three things its three siblings have: a pinned
+    /// FRAME COUNT, a length assert before the zip, and per-plane per-frame pixel
+    /// asserts. The diagnostic print is kept, and now runs BEFORE the asserts so a
+    /// failure still names the shape of the divergence.
+    ///
+    /// The frame count is the substantive fix. The old body passed `pics.len()` as
+    /// ffmpeg's EXPECTED count:
+    ///     let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
+    /// so a decoder that emitted ZERO frames asked ffmpeg for zero frames, the zip
+    /// compared no pairs, and the gate passed having proved nothing -- the exact
+    /// vacuous-pass shape the `cmpaudit` lane swept elsewhere in this crate. The
+    /// count now comes from the FIXTURE (`FRAMES`), so losing the frame reds on the
+    /// count instead of comparing nothing.
+    ///
+    /// On "does it compare only frame 0": the loop always visited every frame; this
+    /// pin simply holds one (`frame 0` was the only line the pre-r4 run printed).
+    /// The loop is unchanged in that respect and still visits every frame it gets.
+    ///
+    /// The `EC_LR_CALL_DUMP=1` window is unchanged and still needs that env -- but
+    /// it is a debugging session layered on a real gate now, not the gate itself.
     #[test]
-    #[ignore = "reads a pinned fixture under the gitignored fixtures dir; run manually with EC_LR_CALL_DUMP=1"]
     fn pinned_lr_sgr_stream_call_unique_dump() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/lr-sgr-r7.obu");
-        let stream = std::fs::read(path).expect("reading pinned lr-sgr-r7.obu");
+        const NAME: &str = "pinned_lr_sgr_stream_call_unique_dump";
+        const W: usize = 192;
+        const H: usize = 128;
+        /// Measured: the pre-r4 run printed `frame 0` and no other frame line.
+        const FRAMES: usize = 1;
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate_pin("lr-sgr-r7.obu"));
+        let stream = require_pin(&path, "lr-sgr-r7.obu");
         let pics = decode_stream(&stream).expect("pinned lr-sgr-r7.obu must decode");
-        if have_ffmpeg() {
-            let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
-            for (i, (got, want)) in pics.iter().zip(&reference).enumerate() {
-                let y_mismatch = got.y != want.y;
-                let u_mismatch = got.u != want.u;
-                let v_mismatch = got.v != want.v;
-                eprintln!(
-                    "frame {i}: y_mismatch={y_mismatch} u_mismatch={u_mismatch} v_mismatch={v_mismatch}"
-                );
-                if y_mismatch {
-                    let n = got.y.iter().zip(&want.y).filter(|(a, b)| a != b).count();
-                    eprintln!("  {n} luma bytes differ / {}", got.y.len());
-                }
-                if v_mismatch {
-                    let w = 96usize; // chroma plane width (192/2)
-                    for (idx, (a, b)) in got.v.iter().zip(&want.v).enumerate() {
-                        if a != b {
-                            eprintln!("  V[{},{}] got={a} want={b}", idx / w, idx % w);
-                        }
+        assert_eq!(
+            pics.len(),
+            FRAMES,
+            "{NAME}: decoded {} frame(s), the pinned stream holds {FRAMES} -- a short \
+             decode would otherwise ask ffmpeg for the same short count and compare \
+             nothing",
+            pics.len()
+        );
+        for f in &pics {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP {NAME}: no ffmpeg -- the pixel compare IS this gate's claim, so it \
+                 proves nothing here; set EC_AV1_REQUIRE_FFMPEG=1 to make that a hard \
+                 failure instead"
+            );
+            return;
+        }
+        let reference = ffmpeg_decode_sequence(&stream, W, H, FRAMES);
+        assert_eq!(
+            reference.len(),
+            FRAMES,
+            "{NAME}: ffmpeg returned {} frame(s), expected {FRAMES}",
+            reference.len()
+        );
+        for (i, (got, want)) in pics.iter().zip(&reference).enumerate() {
+            let y_mismatch = got.y != want.y;
+            let u_mismatch = got.u != want.u;
+            let v_mismatch = got.v != want.v;
+            eprintln!(
+                "frame {i}: y_mismatch={y_mismatch} u_mismatch={u_mismatch} v_mismatch={v_mismatch}"
+            );
+            if y_mismatch {
+                let n = got.y.iter().zip(&want.y).filter(|(a, b)| a != b).count();
+                eprintln!("  {n} luma bytes differ / {}", got.y.len());
+            }
+            if v_mismatch {
+                let w = 96usize; // chroma plane width (192/2)
+                for (idx, (a, b)) in got.v.iter().zip(&want.v).enumerate() {
+                    if a != b {
+                        eprintln!("  V[{},{}] got={a} want={b}", idx / w, idx % w);
                     }
                 }
             }
+            assert_eq!(
+                got.y, want.y,
+                "{NAME} frame {i} luma vs ffmpeg (pinned lr-sgr)"
+            );
+            assert_eq!(
+                got.u, want.u,
+                "{NAME} frame {i} U vs ffmpeg (pinned lr-sgr)"
+            );
+            assert_eq!(
+                got.v, want.v,
+                "{NAME} frame {i} V vs ffmpeg (pinned lr-sgr)"
+            );
         }
+        eprintln!(
+            "{NAME}: {FRAMES} frame(s) byte-exact vs ffmpeg from {}",
+            path.display()
+        );
     }
 
     /// lane-realworld r2: `read_cdef` (spec 5.11.56) ported -- per-superblock
@@ -33213,11 +33306,19 @@ pub(crate) mod tests {
             eprintln!("SKIP a_real_aomenc_stream_with_film_grain_decodes_pixel_exact: no ffmpeg");
             return;
         }
-        let data = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/golden6-mismatch.obu"
-        ))
-        .unwrap();
+        // lane-av1pinslive r3: this gate was LIVE while reading a GITIGNORED
+        // pin through a `concat!` literal and `.unwrap()` -- a clean checkout
+        // with no runner library PANICKED here rather than skipping. The bytes
+        // are now committed at `crates/ec-av1/fixtures/golden6-mismatch.obu`
+        // (452 bytes; sha256
+        // `c56909b98542192b03f3a945e153475aa57a58a1586bf166513297296cb225b3`,
+        // recovered byte-for-byte from the runner library).
+        let data = require_pin(
+            &std::env::var("EC_AV1_GATE_DUMP_PIN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| crate_pin("golden6-mismatch.obu")),
+            "golden6-mismatch.obu",
+        );
         // Truncate right after the first `Frame` OBU (the key frame): every
         // byte up to there is sequence header + frame-0, which is a complete,
         // independently decodable single-frame stream.
@@ -39492,7 +39593,8 @@ pub(crate) mod tests {
     /// decodes_pixel_exact` -- fast red/green loop for the bisect, and lets
     /// `EC_AV1_TRACE=1` be set for one run without re-driving the encoder.
     ///
-    /// lane-av1pins: the bytes are now committed at
+    /// LIVE since lane-av1pinslive (it was `#[ignore]`d from lane-sbpart r4
+    /// only because the bytes lived in a scratchpad). Bytes committed at
     /// `crates/ec-av1/fixtures/sbpart-pin.obu` (238 bytes; sha256
     /// `62238fc077f45d89745d4d254b9c0465464003529da3b42d0a65631fbb7e16e9`),
     /// re-encoded 2026-09-29 from the source gate's own recipe
@@ -39503,7 +39605,6 @@ pub(crate) mod tests {
     /// 192x128 cell, so this pin is a 192x128 re-run of its recipe, not a
     /// replay of the original mismatch bytes.
     #[test]
-    #[ignore = "bisect aid, not a suite gate; run it with --ignored"]
     fn pinned_sbpart_stream_decodes_pixel_exact() {
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
@@ -44870,14 +44971,17 @@ pub(crate) mod tests {
     /// every subsampling until this lane.
     ///
     /// The read is only observable when the two cells hold DIFFERENT blocks --
-    /// a left neighbour at most 1 mi tall. Measured over every committed
-    /// fixture and ~1000 swept aomenc encodes (report table), that never
-    /// happens on a decode-path read: `uv_mode_grid` runs down a left mi
-    /// column always have EVEN length, because libaom only starts a block on
-    /// an odd mi row with an 8-px strip, and the 4-px `HORZ_4` strips aomenc
-    /// does pick all land inside one mi row. So the term is a proven no-op on
-    /// today's material, and this gate pins BOTH halves of that statement:
-    /// the arm runs thousands of times, and it never changes an answer.
+    /// a left neighbour at most 1 mi tall (1 mi = 4 luma px, so a 4x4/8x4/16x4
+    /// /32x4/64x4 leaf). lane-av1leftwit measured that shape off a per-cell
+    /// owner stamp instead of the mode value: `uv_left_1mi_split_hits()` counts
+    /// decode-path reads whose two cells were written by DIFFERENT blocks, and
+    /// it is NOT zero -- five committed fixtures carry it (15 reads in all,
+    /// `lanes/av1leftwit.report.md`). What no committed fixture shows is the two
+    /// blocks DISAGREEING on `uv_mode`, which is what `mode_diff`/`smooth_diff`
+    /// below measure. So this gate pins both halves honestly: the arm runs
+    /// thousands of times, the shape it needs is genuinely reached, and the
+    /// term has not yet been seen to change an answer. Its exactness arms are
+    /// what would decide the shipped read if a DIFF bucket ever went non-zero.
     ///
     /// A non-zero DIFF bucket is not a failure here -- it is the first stream
     /// that witnesses the term, and the exactness arms below are what then
@@ -44923,6 +45027,87 @@ pub(crate) mod tests {
             "{NAME}: {reads} left-reference reads, +ss_y changed the mode {mode_diff} \
              and the smooth boolean {smooth_diff} times, all three planes pixel-exact"
         );
+    }
+
+    /// lane-av1leftwit: the `+ss_y` term's SHAPE is reachable on the decode
+    /// path, and this is the gate that says so.
+    ///
+    /// lane-av1leftref shipped the left read's `+ss_y` row term with the
+    /// argument that the shape it needs -- a left neighbour at most 1 mi tall,
+    /// so the cell this decoder read and the cell libaom reads belong to
+    /// different blocks -- is "structurally absent, because aomenc never starts
+    /// a block on an odd mi row". Both halves of that are wrong. libaom's
+    /// `PARTITION_HORZ_4` puts its `i == 0` child on the PARENT's own mi row
+    /// (`decode_partition`, `av1/decoder/decodeframe.c`: `mi_row + i * bw / 4`),
+    /// and a 16x16 parent sits on a 4-mi grid, so a 1-mi-tall leaf at an EVEN
+    /// row is what the syntax asks for, not forbids. And the shape is measured
+    /// in the corpus: these two fixtures each present it to a real decode-path
+    /// read.
+    ///
+    /// The counter is `decode::uv_left_1mi_split_hits()`, incremented only
+    /// where `decode_path` is true -- the snapping form every decode call site
+    /// uses -- so the 16x4/4x16 pair witness's counter-only mirror (which
+    /// reads an odd mi row and feeds `RECT4_16_UV_PAIR_FILT_HITS`) cannot
+    /// inflate it. `UV_LEFT_SS_Y_READS` alone would prove nothing: it counts
+    /// every read with a left neighbour, whether or not the two cells differ.
+    ///
+    /// NON-VACUITY: the `uv_owner` stamp the counter turns on was removed for
+    /// one build; both arms fell to 0 and this gate failed on the census
+    /// (report §5), so a decoder that stops recording which block owns a cell
+    /// fails here instead of passing vacuously. It is deliberately NOT a
+    /// mutation of the `+ss_y` term itself: the term's own mutation leaves
+    /// these reads untouched, which is the honest limit of what the fixture
+    /// set can decide (the kf900 gate above owns the exactness side).
+    #[test]
+    fn a_committed_4to20_stream_presents_a_one_mi_left_neighbour_to_a_decode_path_read() {
+        const NAME: &str =
+            "a_committed_4to20_stream_presents_a_one_mi_left_neighbour_to_a_decode_path_read";
+        // (fixture, frames, width, height, measured split-owner reads)
+        let arms: [(&str, usize, usize, usize, usize); 2] = [
+            ("gm_small_side_witness.obu", 33, 1920, 792, 5),
+            ("troy_sb128_inter_witness.obu", 15, 1920, 792, 7),
+        ];
+        for (fixture, want_frames, width, height, want_split) in arms {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(fixture);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            let before_split = crate::decode::uv_left_1mi_split_hits();
+            let before_reads = crate::decode::uv_left_ss_y_reads();
+            let before_mode = crate::decode::uv_left_ss_y_mode_diff_hits();
+            let before_smooth = crate::decode::uv_left_ss_y_smooth_diff_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => panic!("{NAME}: {fixture} refused: {e}"),
+            };
+            let split = crate::decode::uv_left_1mi_split_hits() - before_split;
+            assert_eq!(frames.len(), want_frames, "{NAME}: {fixture} frame count");
+            assert!(
+                frames
+                    .iter()
+                    .all(|f| (f.width, f.height) == (width, height)),
+                "{NAME}: {fixture} is not {width}x{height}"
+            );
+            assert_eq!(
+                split, want_split,
+                "{NAME}: {fixture} presented {split} 1-mi-tall left neighbours to \
+                 a decode-path read, measured {want_split} -- the census this \
+                 gate pins moved"
+            );
+            // Printed, not asserted: `== 0` would pin an accident, and a
+            // non-zero value is the first WITNESS of the term rather than a
+            // failure (that is what the kf900 gate above then decides against
+            // the oracle).
+            eprintln!(
+                "{NAME}: {fixture}: {split} 1-mi-tall left neighbours in \
+                 {} decode-path reads, +ss_y changed the mode {} and the smooth \
+                 boolean {} times",
+                crate::decode::uv_left_ss_y_reads() - before_reads,
+                crate::decode::uv_left_ss_y_mode_diff_hits() - before_mode,
+                crate::decode::uv_left_ss_y_smooth_diff_hits() - before_smooth,
+            );
+        }
     }
 
     /// lane-av1formatsweep: the ODD CODED DIMENSION cell -- a frame whose
@@ -47094,5 +47279,193 @@ pub(crate) mod tests {
             pinned.len(),
             heads.iter().map(|h| h.superres_denom).collect::<Vec<_>>()
         );
+    }
+
+    /// lane-av1lossy128x96: the 128x96 sibling of the pinned 128x128 witness
+    /// `a_pinned_444_inter_stream_chroma_units_inherit_their_own_quadrants_tx_type`
+    /// (commit 6c33f204). That fix closed the "4:4:4 lossy + TX size search"
+    /// divergence (H2) for the 128x128 twin; the 128x96 geometry -- two whole
+    /// 64x64 roots over a frame whose second block row is only 32 rows tall,
+    /// which is why it exercises BOTH chroma planes and a partial block row --
+    /// was left ungated, and it is the geometry the sweep measured the
+    /// U+V form of the defect on (608 wrong samples from decode-order frame 2).
+    ///
+    /// Measured for this lane on the fix's parent `4155c7c7`: decode-order
+    /// frames 2 and 3 differ from the oracle in 608 and 692 samples (luma
+    /// exact, U and V wrong), entropy bit-identical; at HEAD and at `6c33f204`
+    /// all four frames are byte-exact. So the defect is FIXED and this gate is
+    /// the pin that keeps it fixed.
+    ///
+    /// Recipe (encoded LIVE, no fixture): `testsrc2 128x96:rate=25` yuv444p
+    /// 4 frames, `aomenc --profile=1 --codec=av1 --passes=1 --end-usage=q
+    /// --cq-level=20 --cpu-used=2 --sb-size=64 --min-partition-size=64
+    /// --max-partition-size=64 --enable-tx-size-search=1 --threads=1 --row-mt=0
+    /// --lag-in-frames=0 --kf-max-dist=100 --limit=4 --obu -o - -`.
+    /// Search ON: 21830 B, sha256 `7380bcbbfb791c6a369850357211223e20fab959423135951f6eb43ffbfcfebd`,
+    /// fnv1a64 `0x1ba3fe9a4335bdbb`. Control arm, same recipe with
+    /// `--enable-tx-size-search=0`: 21296 B, sha256
+    /// `347edcc9f4899fb05b15174b82d37f6562dcc6fe7691af0ed9ba4efd6cc878c6`,
+    /// fnv1a64 `0x2f87d8e98c9db686`.
+    ///
+    /// NON-VACUITY, and the search flag is NOT the assert: the recipe SPELLS
+    /// `--enable-tx-size-search=1` (aomenc keeps the FIRST occurrence, and a
+    /// flag left defaulted is "unknown", not "on"), and then
+    /// 1. every frame header's PARSED `tx_mode` is `TxMode::Select`
+    ///    (`TX_MODE_SELECT`) -- the searched transform mode is really in the
+    ///    bitstream, not merely requested. The control arm asserts the
+    ///    opposite (`TxMode::Largest`), so neither arm can pass on the other's
+    ///    stream;
+    /// 2. the sequence header is `ss (0,0)` at 8 bits (`assert_444_header`),
+    ///    and the stream is byte-identical to the recorded encode (length +
+    ///    fnv1a64), so an aomenc that stopped producing this cell fails here
+    ///    rather than silently measuring something else;
+    /// 3. `decode::chroma_quad_leaf_tx_diff_hits()` strictly increases on the
+    ///    search arm -- the number that says the per-quadrant resolve CHANGED
+    ///    an answer, which is the defect itself. It must be exactly 0 on the
+    ///    search-off control: with no var-tx there is no four-leaf luma tree,
+    ///    so the arm is unreachable and a counter that fired there would be
+    ///    counting something else;
+    /// 4. every decoded plane is 128*96 (at `ss (0,0)` chroma is full
+    ///    resolution, so a subsampled extent fails the shape assert);
+    /// 5. `decode_all_frames_vs_oracle` asserts the decode-order frame COUNT
+    ///    and each frame's byte LENGTH before any sample is compared.
+    ///
+    /// Red-before: reverting ONLY the per-quadrant resolve in
+    /// `decode_inter_block`'s 64x64 four-unit chroma arm (the `covering_leaf_tx_type`
+    /// call back to the block-level `first_tx_type`, counters and this gate
+    /// untouched) turns this gate red on decode-order frame 2 with 608 bytes
+    /// differing, and green again on restore.
+    #[test]
+    fn a_real_aomenc_444_whole_64_root_tx_size_search_stream_decodes_pixel_exact_at_128x96() {
+        const NAME: &str =
+            "a_real_aomenc_444_whole_64_root_tx_size_search_stream_decodes_pixel_exact_at_128x96";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        // (label, --enable-tx-size-search, parsed tx mode, bytes, fnv1a64)
+        let arms: [(&str, &str, TxMode, usize, u64); 2] = [
+            (
+                "tx size search on",
+                "1",
+                TxMode::Select,
+                21830,
+                0x1ba3_fe9a_4335_bdbb,
+            ),
+            (
+                "tx size search off (control)",
+                "0",
+                TxMode::Largest,
+                21296,
+                0x2f87_d8e9_8c9d_b686,
+            ),
+        ];
+        for (label, search, want_mode, want_len, want_fnv) in arms {
+            let search_flag = format!("--enable-tx-size-search={search}");
+            let stream = chroma_format_stream(
+                128,
+                96,
+                "yuv444p",
+                8,
+                4,
+                &[
+                    "--profile=1",
+                    "--cq-level=20",
+                    "--cpu-used=2",
+                    "--sb-size=64",
+                    "--min-partition-size=64",
+                    "--max-partition-size=64",
+                    &search_flag,
+                ],
+                0,
+            );
+            assert_444_header(&stream, NAME, 8);
+            assert_eq!(
+                stream.len(),
+                want_len,
+                "{NAME} ({label}): aomenc produced {} bytes, not the recorded {want_len} -- the \
+                 recipe no longer makes this cell",
+                stream.len()
+            );
+            assert_eq!(
+                fnv1a64(&stream),
+                want_fnv,
+                "{NAME} ({label}): the encoded bytes moved"
+            );
+            // PARSED, not requested: the transform mode the bitstream carries.
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut modes: Vec<TxMode> = Vec::new();
+            while pos < stream.len() {
+                let obu = parser
+                    .parse_obu(&stream[pos..])
+                    .unwrap_or_else(|e| panic!("{NAME}: aomenc OBU does not parse: {e:?}"));
+                if obu.total_size == 0 {
+                    break;
+                }
+                pos += obu.total_size;
+                if let ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) = obu.kind {
+                    modes.push(h.tx_mode);
+                }
+            }
+            assert_eq!(
+                modes.len(),
+                4,
+                "{NAME} ({label}): four frame headers expected"
+            );
+            for (i, mode) in modes.iter().enumerate() {
+                assert_eq!(
+                    *mode, want_mode,
+                    "{NAME} ({label}): decode-order frame {i} carries tx_mode {mode:?}, not \
+                     {want_mode:?} -- the searched-transform claim is about the bitstream"
+                );
+            }
+            let diff0 = crate::decode::chroma_quad_leaf_tx_diff_hits();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME} ({label}): refused the stream: {e}"));
+            let diff = crate::decode::chroma_quad_leaf_tx_diff_hits() - diff0;
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(
+                    f.y.len(),
+                    128 * 96,
+                    "{NAME} ({label}): frame {i} luma is {} samples, not 128x96",
+                    f.y.len()
+                );
+                assert_eq!(
+                    f.u.len(),
+                    128 * 96,
+                    "{NAME} ({label}): frame {i} U is {} samples -- at 4:4:4 the chroma plane is \
+                     full resolution",
+                    f.u.len()
+                );
+            }
+            // Pixel compare FIRST: it is the informative failure (it names the
+            // decode-order frame and the sample), and the counter assert below
+            // is the guard that says WHY the cell is not vacuous.
+            let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert!(
+                frames_decoded >= 4,
+                "{NAME} ({label}): {frames_decoded} decode-order frames"
+            );
+            if label.starts_with("tx size search on") {
+                assert!(
+                    diff >= 2,
+                    "{NAME}: the per-quadrant tx_type resolve never CHANGED an answer (diff \
+                     {diff}) -- on this stream the four-leaf luma tree under a searched transform \
+                     is exactly what makes the block-level value wrong"
+                );
+            } else {
+                assert_eq!(
+                    diff, 0,
+                    "{NAME}: the four-unit 4:4:4 chroma arm fired with tx size search OFF \
+                     ({diff} resolves) -- the counter is not measuring the searched path"
+                );
+            }
+            eprintln!(
+                "{NAME} ({label}): {frames_decoded} frames byte-exact vs aomdec, tx_mode \
+                 {want_mode:?} on every frame, quad-tx resolves that differed {diff}"
+            );
+        }
     }
 }
