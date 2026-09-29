@@ -86,6 +86,101 @@ def fn_bodies(text):
         yield i + 1, name, "\n".join(lines[i:end]), attrs
 
 
+RAW_STR_OPEN_RE = re.compile(r'(?:b?r|rb)(#*)"')
+CHAR_RE = re.compile(r"'(?:\\.|[^\\'])'")
+
+
+def _blank(out, lo, hi):
+    """Blank [lo, hi) in place, preserving newlines so line numbers survive."""
+    for k in range(lo, hi):
+        if out[k] != "\n":
+            out[k] = " "
+
+
+def mask_embedded_source(text):
+    """Blank the INTERIOR of every string literal that SPANS LINES.
+
+    THE RULE: a match inside a string literal that spans lines is not a gate.
+    Rust has no line-spanning non-raw string, so a literal containing a newline
+    is EMBEDDED SOURCE -- the input to a scanner's own capability test, or a
+    doc blob. `pin_inventory_tests` holds exactly that: a `r#"..."#` whose body
+    is a synthetic gate reproducing the forbidden `/../../fixtures` root, fed
+    to `pins_read` as DATA. Read as code it is a live violation, and it made
+    this audit red on a tree with no real violation in it -- the audit reading
+    its own test data, the mirror of the class the same script already fixed
+    for prose ("a doc comment reproducing a root literal invented a gate").
+
+    Why this rule and not a path allowlist: a path allowlist is a second list
+    of places to remember, and the next scanner test lands somewhere else.
+    The property that actually separates the two cases is structural -- a real
+    pin read names a path in a single-line literal; only test data wraps Rust
+    source across lines -- and that property is checkable, not a location.
+
+    Why it cannot hide a real violation: a non-raw literal aborts on the first
+    newline, so it can only ever blank within one line, and a one-line literal
+    holds no Rust source. A char literal is matched only when it really closes
+    within three characters, so a LIFETIME (`&'a str`) is not mistaken for the
+    start of a string and cannot swallow the rest of a line.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        m = RAW_STR_OPEN_RE.match(text, i)
+        if m:
+            close = '"' + m.group(1)
+            end = text.find(close, m.end())
+            if end == -1:
+                i = m.end()
+                continue
+            if "\n" in text[m.end():end]:
+                _blank(out, m.end(), end)
+            i = end + len(close)
+            continue
+        if text[i] == '"':
+            j = i + 1
+            closed = None
+            while j < n:
+                c = text[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == '"':
+                    closed = j
+                    break
+                if c == "\n":
+                    break
+                j += 1
+            if closed is not None:
+                i = closed + 1
+            else:
+                i += 1
+            continue
+        c = CHAR_RE.match(text, i)
+        i = c.end() if c else i + 1
+    return "".join(out)
+
+
+def code_of(body):
+    """Comment-stripped, embedded-source-masked body -- the thing the shapes
+    are matched against. Comment stripping removes PROSE reproducing a shape;
+    this removes SOURCE reproducing a shape."""
+    code = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    code = "\n".join(l.split("//", 1)[0] for l in code.splitlines())
+    return mask_embedded_source(code)
+
+
+def read_source(path):
+    """Read a Rust source with every line-spanning string literal's interior
+    blanked. The mask has to happen at FILE level, not per body: `fn_bodies`
+    finds `fn` lines by regex, so a synthetic gate inside a test's `r#"..."#`
+    input is picked up as if it were a real fn, and its body -- the raw
+    string's own text -- is then scanned as CODE. Masking first means that
+    region is blank before any gate attribution happens, which is the only
+    place the distinction can be made."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return mask_embedded_source(fh.read())
+
+
 ROOT_RE = re.compile(
     r'concat!\(\s*env!\("CARGO_MANIFEST_DIR"\)\s*,\s*"([^"]*)"\s*\)'
 )
@@ -162,15 +257,14 @@ fn selftest_b_reads_a_pin() {
             fh.write(body)
         rows = []
         for c, p in sources():
-            text = open(p, encoding="utf-8", errors="replace").read()
+            text = read_source(p)
             rel = os.path.relpath(p, ROOT)
             for line, name, b, attrs in fn_bodies(text):
                 if not any(a.startswith("#[test") for a in attrs):
                     continue
                 if not name.startswith("selftest_"):
                     continue
-                code = re.sub(r"/\*.*?\*/", "", b, flags=re.S)
-                code = "\n".join(x.split("//", 1)[0] for x in code.splitlines())
+                code = code_of(b)
                 kind = "root-literal" if (ROOT_RE.search(code) or JOIN_RE.search(code)) else "crate_pin"
                 rows.append((name, kind))
         bad = [r for r in rows if r[1] != "crate_pin"]
@@ -193,7 +287,7 @@ fn selftest_b_reads_a_pin() {
 def main():
     helpers = {}          # fn name -> body (all fns in the tree)
     for crate, path in sources():
-        text = open(path, encoding="utf-8", errors="replace").read()
+        text = read_source(path)
         for _line, name, body, _attrs in fn_bodies(text):
             helpers.setdefault(name, body)
 
@@ -201,7 +295,7 @@ def main():
     bad = []
 
     for crate, path in sources():
-        text = open(path, encoding="utf-8", errors="replace").read()
+        text = read_source(path)
         rel = os.path.relpath(path, ROOT)
         for line, name, body, attrs in fn_bodies(text):
             if not any(a.startswith("#[test") for a in attrs):
@@ -209,8 +303,7 @@ def main():
             # Match every shape on a COMMENT-STRIPPED body. A doc comment that
             # reproduces a root literal to explain the shape it removed used to
             # invent a gate here, the same blindness invariant 1 had.
-            code = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
-            code = "\n".join(l.split("//", 1)[0] for l in code.splitlines())
+            code = code_of(body)
             root_lit = None
             root_kind = "none"
             var = None
@@ -283,8 +376,12 @@ def main():
                 # The name list is bracketed, but comments sit between its
                 # items ("lane-rect r2: HORP strip ..."), so strip line
                 # comments before parsing the list and anchor on the format!
-                # that consumes it.
-                body_nc = re.sub(r"//[^\n]*", "", body)
+                # that consumes it. It is `code` and not `body` that feeds
+                # this: `code` is the comment-stripped, embedded-source-masked
+                # text, and reading the RAW body here re-imported the shape
+                # out of a scanner test's own `r#"..."#` input -- the same
+                # gate resurrected through a different match.
+                body_nc = code
                 for lit in LIST_RE.finditer(body_nc):
                     items = re.findall(r'"([A-Za-z0-9._-]+)"', lit.group(1))
                     if len(items) < 3:

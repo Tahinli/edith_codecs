@@ -195,8 +195,17 @@ fi
 # the difference. One such comment in crates/ec-av1 read as a live violation for
 # a whole round (found by the lane that fixed the real ones).
 forbidden=$(python3 - "$ROOT" <<'PYEOF'
-import os, re, sys
+import importlib.util, os, re, sys
 root = sys.argv[1]
+# SINGLE-SOURCE the rule: this scan (invariant 1) and the census (invariant 4,
+# scripts/pin-gate-audit.py) must not disagree about what counts as a gate, or
+# fixing one leaves the other red. Both strip comments AND mask line-spanning
+# string literals -- prose reproducing a shape and SOURCE reproducing a shape
+# are both data, not a gate.
+spec = importlib.util.spec_from_file_location(
+    "pin_gate_audit", os.path.join(root, "scripts", "pin-gate-audit.py"))
+audit = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(audit)
 pat = re.compile(r'concat!\(\s*env!\("CARGO_MANIFEST_DIR"\)\s*,\s*"/\.\./\.\./fixtures/[^/"]*\.')
 for crate in sorted(os.listdir(os.path.join(root, "crates"))):
     for sub in ("src", "tests"):
@@ -213,7 +222,7 @@ for crate in sorted(os.listdir(os.path.join(root, "crates"))):
                 except OSError:
                     continue
                 text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-                for i, line in enumerate(text.splitlines(), 1):
+                for i, line in enumerate(audit.mask_embedded_source(text).splitlines(), 1):
                     code = line.split("//", 1)[0]
                     if pat.search(code):
                         print("{}:{}:{}".format(os.path.relpath(p, root), i, line.strip()))
