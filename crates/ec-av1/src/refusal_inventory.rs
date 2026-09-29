@@ -627,9 +627,55 @@ const PROVEN: &[(&str, &str)] = &[
 #[cfg(test)]
 const GATES_THAT_SKIP_ON_A_DECODE_ERROR: &[&str] = &[];
 
+/// Source text with Rust's line continuations dropped and every whitespace run
+/// collapsed to one space -- the form rustc gives a multi-line literal -- so a
+/// refusal written across three source lines is still findable in a body, and
+/// a gate's quote of it still matches the guard's spelling.
+#[cfg(test)]
+fn squash_source(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for (i, c) in s.char_indices() {
+        if c == '\\' {
+            let rest = &s[i + 1..];
+            if rest.contains('\n')
+                && rest
+                    .chars()
+                    .take_while(|c| *c != '\n')
+                    .all(|c| c == ' ' || c == '\t' || c == '\r')
+            {
+                continue;
+            }
+        }
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(c);
+    }
+    out
+}
+
+/// Does `src` carry `refusal`?
+///
+/// Lane-av1refusalspan: a proving gate quotes the refusal it proves, and this
+/// is how it pins that quote to the guard that still carries the string. Both
+/// sides are squashed, so a literal written over two lines with a `\`
+/// continuation still matches.
+#[cfg(test)]
+pub(crate) fn pins_refusal(src: &str, refusal: &str) -> bool {
+    squash_source(src).contains(&squash_source(refusal))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, PROVEN, REFUSALS};
+    use super::{
+        CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, PROVEN, REFUSALS, squash_source,
+    };
     use std::collections::BTreeSet;
 
     /// Every distinct `unsupported(...)` reason on the decode path.
@@ -1134,6 +1180,13 @@ mod tests {
     /// comment on `read_golomb`.
     #[test]
     fn read_golomb_reads_every_value_a_conformant_stream_can_carry() {
+        // lane-av1refusalspan: this gate is the PROOF for the refusal below, so
+        // it names it and pins its guard site.
+        const REFUSAL: &str = "a Golomb tail longer than this decoder reads";
+        assert!(
+            super::pins_refusal(include_str!("decode.rs"), REFUSAL),
+            "this gate proves {REFUSAL:?}, but that string is no longer in decode.rs"
+        );
         let roundtrip = |value: u32| -> ec_core::Result<u32> {
             let mut enc = crate::msac::SymbolEncoder::new();
             crate::tile::write_golomb(&mut enc, value);
@@ -1377,6 +1430,17 @@ mod tests {
     #[test]
     fn every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table() {
         let src = include_str!("decode.rs");
+        // lane-av1refusalspan: this gate is the PROOF for both refusals below,
+        // so it names both and pins both guard sites.
+        for refusal in [
+            "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
+            "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
+        ] {
+            assert!(
+                super::pins_refusal(&src, refusal),
+                "this gate proves {refusal:?}, but that string is no longer in decode.rs"
+            );
+        }
 
         // (1) The caller set. Each call's enclosing function is the last
         // top-level `fn` before it.
@@ -1937,6 +2001,14 @@ mod tests {
     ///   [`no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax`].
     #[test]
     fn no_128_root_half_reads_a_cfl_filter_intra_or_palette_symbol() {
+        // lane-av1refusalspan: this gate is the PROOF for the refusal below, so
+        // it names it (the full leading clause, which is the whole clause the
+        // inventory row's anchor reads) and pins its guard site.
+        const REFUSAL: &str = "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block";
+        assert!(
+            include_str!("decode.rs").contains(REFUSAL),
+            "this gate proves {REFUSAL:?}, but that string is no longer in decode.rs"
+        );
         let src = include_str!("decode.rs");
         // The 128-root call site's own `cfl` argument, with the comment that
         // explains it -- the two lines are matched together so that reordering
@@ -2122,34 +2194,425 @@ mod tests {
         );
     }
 
-    /// Every entry of [`PROVEN`] must still name a live refusal and a test
-    /// that exists, and the count it prints is the inventory's numerator.
+    /// Lane-av1refusalspan: the files a proving gate may live in.
+    const GATE_SOURCES: [(&str, &str); 3] = [
+        ("decode.rs", include_str!("decode.rs")),
+        ("stream.rs", include_str!("stream.rs")),
+        ("refusal_inventory.rs", include_str!("refusal_inventory.rs")),
+    ];
+
+    /// Lane-av1refusalspan: every offset in `src` of a line that DEFINES
+    /// `fn <gate>(` -- and nothing that merely names it.
+    ///
+    /// "The gate" is a function, so the first thing the anchor needs is the
+    /// function's own definition. The window rule this replaced took the first
+    /// `fn <gate>(` the file happened to contain, and a comment or a string
+    /// produces one. A definition is a line whose text before the keyword is
+    /// whitespace and qualifiers only (`pub`, `pub(crate)`, `async`, ...).
+    fn gate_definitions(src: &str, gate: &str) -> Vec<usize> {
+        src.match_indices(&format!("fn {gate}("))
+            .map(|(at, _)| at)
+            .filter(|at| {
+                let line_start = src[..*at].rfind('\n').map_or(0, |i| i + 1);
+                src[line_start..*at].split_whitespace().all(|word| {
+                    matches!(
+                        word,
+                        "pub" | "async" | "const" | "unsafe" | "extern" | "default"
+                    ) || (word.starts_with("pub(") && word.ends_with(')'))
+                })
+            })
+            .collect()
+    }
+
+    /// The number of leading-whitespace columns on the line holding `at`.
+    fn leading_indent(src: &str, at: usize) -> usize {
+        let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+        let line = &src[line_start..at];
+        line.len() - line.trim_start().len()
+    }
+
+    /// The offset of the `"` that closes the string literal opening at `open`.
+    fn closing_quote(b: &[u8], open: usize) -> Option<usize> {
+        let mut i = open + 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'"' => return Some(i),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    /// The offsets of the `{` that opens the body of the function defined at
+    /// `gate_at` and of the `}` that closes it; `None` when the body is never
+    /// closed.
+    ///
+    /// This walks Rust, not lines. A brace inside a string literal, a raw
+    /// string, a byte string, a char literal, a lifetime, a line comment or a
+    /// (nestable) block comment is not a brace -- counting one is exactly how a
+    /// "bounded" window becomes the rest of the file.
+    fn body_braces(src: &str, gate_at: usize) -> Option<(usize, usize)> {
+        let b = src.as_bytes();
+        let mut i = gate_at;
+        let mut depth = 0usize;
+        let mut open = None;
+        let mut last: Option<usize> = None;
+        while i < b.len() {
+            // Every arm advances `i`, including the ones that `continue`. A spin
+            // here would hang the suite instead of failing it, which is the one
+            // outcome a boundary finder must never have.
+            if let Some(last) = last {
+                debug_assert!(i > last, "body_braces: an arm must advance the cursor");
+            }
+            last = Some(i);
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    i = src[i..].find('\n').map_or(b.len(), |n| i + n + 1);
+                    continue;
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    let mut nesting = 1usize;
+                    i += 2;
+                    while i < b.len() && nesting > 0 {
+                        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                            nesting += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                            nesting -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                b'r' if b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#') => {
+                    let mut j = i + 1;
+                    while b.get(j) == Some(&b'#') {
+                        j += 1;
+                    }
+                    if b.get(j) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let hashes = j - i - 1;
+                    let mut end = None;
+                    for k in (j + 1..b.len()).chain(std::iter::once(b.len() - 1)) {
+                        if b[k] == b'"' && b[k + 1..].iter().take(hashes).all(|c| *c == b'#') {
+                            end = Some(k);
+                            break;
+                        }
+                    }
+                    i = end? + 1;
+                    continue;
+                }
+                b'"' => {
+                    i = closing_quote(b, i)? + 1;
+                    continue;
+                }
+                b'b' if b.get(i + 1) == Some(&b'"') => {
+                    i = closing_quote(b, i + 1)? + 1;
+                    continue;
+                }
+                // A lifetime (`'a`, `'static`) is not a char literal: it has no
+                // closing quote on its line, and reading one as a literal would
+                // hide real code from the scan.
+                b'\'' => {
+                    let rest = &b[i + 1..];
+                    let from = if rest.first() == Some(&b'\\') { 2 } else { 0 };
+                    match rest[from..]
+                        .iter()
+                        .take_while(|c| **c != b'\n')
+                        .position(|c| *c == b'\'')
+                    {
+                        Some(k) => i += from + k + 2,
+                        None => i += 1,
+                    }
+                    continue;
+                }
+                b'{' => {
+                    open = open.or(Some(i));
+                    depth += 1;
+                }
+                b'}' => {
+                    // A closer seen BEFORE the body opened is not ours (it can
+                    // only come from a signature or a type ascription the scan
+                    // mis-read); ignore it rather than underflowing `depth`.
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            return open.map(|o| (o, i));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// The text of the body of the function defined at `gate_at`, or `None`
+    /// when that body is never closed.
+    fn function_body<'a>(src: &'a str, gate_at: usize) -> Option<&'a str> {
+        let (open, close) = body_braces(src, gate_at)?;
+        src.get(open..=close)
+    }
+
+    /// The first line of `body` that defines another function at `indent`
+    /// columns of leading whitespace -- the first sign that a boundary
+    /// over-reached into a neighbour.
+    fn sibling_fn(body: &str, indent: usize) -> Option<&str> {
+        body.lines().skip(1).find(|line| {
+            let lead = line.len() - line.trim_start().len();
+            lead == indent && {
+                let t = line.trim_start();
+                t.starts_with("fn ") || t.starts_with("pub fn ")
+            }
+        })
+    }
+
+    /// Lane-av1refusalspan: the proving gate's OWN body -- the text from the
+    /// `{` that opens it to the `}` that closes it.
+    ///
+    /// Every failure mode here is a FAILURE (`Err`), never a wider window. The
+    /// rule this replaced -- "the body ends at the next `fn` at the same
+    /// indentation, or at end of file" -- ended at end of file constantly (a
+    /// top-level `#[test] fn` in `decode.rs` has its next same-indent `fn`
+    /// tens of thousands of lines away), and one row's 27,427-line "body" was
+    /// satisfied by the CHROMA sibling's string seven lines down.
+    fn gate_body(gate: &str) -> Result<&'static str, String> {
+        let mut hits: Vec<(&str, usize, &'static str)> = Vec::new();
+        for (file, src) in GATE_SOURCES {
+            for at in gate_definitions(src, gate) {
+                hits.push((file, at, src));
+            }
+        }
+        match hits.as_slice() {
+            [] => Err(format!(
+                "{gate} is not defined in decode.rs, stream.rs or refusal_inventory.rs"
+            )),
+            [only] => {
+                let (file, at, src) = *only;
+                let body = function_body(src, at).ok_or_else(|| {
+                    format!(
+                        "{file}:{at}: the body of {gate}() is never closed -- a missing \
+                         boundary is a FAILURE, not a window that runs on into the next \
+                         function"
+                    )
+                })?;
+                if let Some(leak) = sibling_fn(body, leading_indent(src, at)) {
+                    return Err(format!(
+                        "{file}:{at}: the extracted body of {gate}() still contains {} -- the \
+                         boundary over-reached into a neighbour",
+                        leak.trim()
+                    ));
+                }
+                Ok(body)
+            }
+            many => Err(format!(
+                "{gate} is defined {} times ({}), so 'its body' is ambiguous",
+                many.len(),
+                many.iter()
+                    .map(|(file, at, _)| format!("{file}:{at}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// The refusal's leading clause: what a gate may quote when it does not
+    /// quote the whole string -- everything up to the first `(` (the qualifier
+    /// that varies per call site), else up to the first `:`, else the whole
+    /// string.
+    fn leading_clause(reason: &str) -> String {
+        let cut = reason
+            .find('(')
+            .or_else(|| reason.find(':'))
+            .unwrap_or(reason.len());
+        reason[..cut].trim_end().to_owned()
+    }
+
+    /// Every entry of [`PROVEN`] must still name a live refusal, and the gate
+    /// it names must REFERENCE that refusal inside its OWN body.
+    ///
+    /// Lane-av1refusalspan: the boundary is the gate's closing brace (see
+    /// [`gate_body`]); a boundary that cannot be found fails the row.
     #[test]
     fn every_proven_refusal_names_a_test_that_exists() {
         let found = decode_path_refusals();
-        let sources = [
-            include_str!("stream.rs"),
-            include_str!("decode.rs"),
-            include_str!("refusal_inventory.rs"),
-        ];
+        let mut whole = 0usize;
+        let mut clause = 0usize;
+        let mut neither: Vec<&str> = Vec::new();
+        let mut unanchored: Vec<String> = Vec::new();
+        let mut unbounded: Vec<String> = Vec::new();
         for (reason, gate) in PROVEN {
             assert!(
                 found.contains(*reason),
-                "{reason:?} is listed as proven but is no longer a decode-path refusal --                  drop it from PROVEN (the capability landed) or fix the string"
+                "{reason:?} is listed as proven but is no longer a decode-path refusal -- \
+                 drop it from PROVEN (the capability landed) or fix the string"
             );
-            assert!(
-                sources
-                    .iter()
-                    .any(|src| src.contains(&format!("fn {gate}("))),
-                "{reason:?} names the proving test {gate}, which exists in neither stream.rs \
-                 nor decode.rs"
-            );
+            // A missing boundary is a FAILURE for the row, never a wider window.
+            let body = match gate_body(gate) {
+                Ok(body) => body,
+                Err(why) => {
+                    unbounded.push(format!("{reason:?} names {gate}: {why}"));
+                    continue;
+                }
+            };
+            let flat = squash_source(body);
+            if flat.contains(&squash_source(reason)) {
+                whole += 1;
+            } else if flat.contains(&squash_source(&leading_clause(reason))) {
+                clause += 1;
+            } else {
+                neither.push(reason);
+                unanchored.push(format!("{reason:?} names {gate}"));
+            }
         }
+        // The anchor-strength line, measured over BODIES. The window rule this
+        // replaced made these numbers a distribution over "whatever the window
+        // happened to reach", which is a different question.
+        eprintln!(
+            "anchor strength: {whole} rows quote the WHOLE refusal string, {clause} quote its \
+             LEADING CLAUSE, {} match neither: {neither:?}",
+            PROVEN.len() - whole - clause
+        );
         eprintln!(
             "refusal inventory: {} refusals + {} capability claims, {} proven",
             REFUSALS.len(),
             CAPABILITY_CLAIMS.len(),
             PROVEN.len()
         );
+        assert!(
+            unbounded.is_empty(),
+            "these rows name a gate whose body could not be bounded, so nothing was proved \
+             about them -- a missing boundary is a failure, not a window that runs on:\n\
+             {unbounded:#?}\n\
+             The boundary is the gate's own closing brace. If the gate really is there, the \
+             finder is wrong: fix the finder, never the verdict."
+        );
+        assert!(
+            unanchored.is_empty(),
+            "these rows name a gate that never references the refusal inside its OWN body -- a \
+             test that does not use the string it is said to prove is not a proof:\n\
+             {unanchored:#?}\n\
+             Name a gate that quotes the refusal (or its leading clause), or write one."
+        );
+    }
+
+    /// Lane-av1refusalspan, non-vacuity of the BOUNDARY (not of the anchor):
+    /// a neighbour's function must be unreachable from a gate's body, and a
+    /// body that is not closed must fail rather than run on.
+    #[test]
+    fn a_gate_body_is_bounded_by_its_own_closing_brace() {
+        let marker = "a rectangular chroma transform whose size has no coefficient table";
+        let src = format!(
+            "fn this_gate() {{\n    let _ = 1;\n}}\n\nfn next_gate() {{\n    let _ = \"{marker}\";\n}}\n\nfn tail() {{}}\n"
+        );
+        let this = gate_body_in(&src, "this_gate").expect("the gate has a boundary");
+        assert!(this.contains("let _ = 1;"), "own text: {this:?}");
+        assert!(
+            !this.contains(marker),
+            "leaked into the neighbour: {this:?}"
+        );
+        let next = gate_body_in(&src, "next_gate").expect("the neighbour has a boundary");
+        assert!(next.contains(marker));
+        assert!(!next.contains("let _ = 1;"));
+        // The last function in a file has no following `fn` to stop at: the
+        // boundary must still close, exactly on its own brace.
+        assert_eq!(gate_body_in(&src, "tail").as_deref(), Ok("{}"));
+        // A brace inside a string or a char literal is not a brace. If the scan
+        // counted one, this body would run past its own `}` into `next_gate`
+        // -- the over-reach the `sibling_fn` invariant exists to catch, and the
+        // failure mode that made the old window 27,427 lines long.
+        let with_braces_in_literals = format!(
+            "fn this_gate() {{\n    let _ = \"{{\";\n    let _ = '}}';\n    // {{\n    /* }} */\n}}\n\nfn next_gate() {{\n    let _ = \"{marker}\";\n}}\n"
+        );
+        let bounded = gate_body_in(&with_braces_in_literals, "this_gate");
+        assert!(
+            bounded.as_deref().is_ok_and(|b| !b.contains(marker)),
+            "a brace in a literal moved the boundary: {bounded:?}"
+        );
+        // A body whose closing brace is missing (a half-finished edit) is a
+        // FAILURE. The rule it replaced sliced to end of file and carried on.
+        let truncated =
+            format!("fn this_gate() {{\n    let _ = 1;\n\nfn next_gate() {{\n    let _ = 2;\n}}\n");
+        assert!(gate_body_in(&truncated, "this_gate").is_err());
+    }
+
+    /// Lane-av1refusalspan: the boundary is load-bearing on the REAL sources,
+    /// not only on the synthetic pair above -- every named gate resolves to
+    /// exactly one function whose body holds no other function, and the last
+    /// function in each of the three files terminates correctly.
+    #[test]
+    fn every_named_gate_body_is_bounded_in_these_files() {
+        let mut resolved = 0usize;
+        for (reason, gate) in PROVEN {
+            let body =
+                gate_body(gate).unwrap_or_else(|why| panic!("{reason:?} names {gate}: {why}"));
+            assert!(
+                body.ends_with('}'),
+                "{gate}'s body does not end on its closing brace"
+            );
+            resolved += 1;
+        }
+        assert_eq!(resolved, PROVEN.len());
+        for (file, src) in GATE_SOURCES {
+            let last = last_fn_name(src).unwrap_or_else(|| panic!("{file} has no function"));
+            let at = gate_definitions(src, &last)
+                .last()
+                .copied()
+                .unwrap_or_else(|| panic!("{file}: no definition of {last}"));
+            let body = function_body(src, at)
+                .unwrap_or_else(|| panic!("{file}: the last function {last}() has no boundary"));
+            assert!(sibling_fn(body, leading_indent(src, at)).is_none());
+        }
+    }
+
+    /// Lane-av1refusalspan: the invariant that catches a boundary that
+    /// over-reaches. Tested on its own text, so it cannot be satisfied by the
+    /// scanner happening to be right on the current sources.
+    #[test]
+    fn a_body_carrying_another_function_is_refused() {
+        assert!(sibling_fn("{\n    let _ = 1;\n}\n\nfn neighbour() {\n}\n", 0).is_some());
+        assert!(sibling_fn("{\n    let _ = 1;\n}\n", 0).is_none());
+        // A nested `fn` is deeper-indented and does belong to the body.
+        assert!(sibling_fn("{\n    fn helper() {}\n}\n", 0).is_none());
+    }
+
+    /// Lane-av1refusalspan: `gate_body` over ONE file, so the boundary tests
+    /// above can drive it with text that cannot occur in this crate.
+    fn gate_body_in<'a>(src: &'a str, gate: &str) -> Result<&'a str, String> {
+        let defs = gate_definitions(src, gate);
+        match defs.as_slice() {
+            [] => Err(format!("{gate} is not defined here")),
+            [at] => {
+                let body = function_body(src, *at).ok_or_else(|| {
+                    format!("the body of {gate}() is never closed -- boundary missing")
+                })?;
+                if let Some(leak) = sibling_fn(body, leading_indent(src, *at)) {
+                    return Err(format!("boundary over-reached into {}", leak.trim()));
+                }
+                Ok(body)
+            }
+            many => Err(format!("{gate} is defined {} times", many.len())),
+        }
+    }
+
+    /// The name of the last function defined in `src` -- the boundary rule's
+    /// hard case, since nothing follows it to stop at.
+    fn last_fn_name(src: &str) -> Option<String> {
+        src.lines()
+            .filter_map(|line| {
+                let t = line.trim_start();
+                if !(t.starts_with("fn ") || t.starts_with("pub fn ")) {
+                    return None;
+                }
+                Some(t.trim_start_matches("pub fn ").trim_start_matches("fn "))
+            })
+            .filter_map(|head| head.split_once('(').map(|(head, _)| head.trim().to_owned()))
+            .last()
     }
 }
