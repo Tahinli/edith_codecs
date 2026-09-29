@@ -437,6 +437,15 @@ impl<'a> SymbolDecoder<'a> {
         SYMR_MI.with(|c| c.set((mi_r, mi_c)));
     }
 
+    /// The `(mi_row, mi_col)` the enclosing block reader last stamped, READ
+    /// back. `set_symr_mi` only writes; a per-unit interval rung needs to print
+    /// the mi, and a coefficient read carries none of its own -- without this a
+    /// ladder cannot be attributed to the block that read it. A copy, not a
+    /// borrow: the rungs call it from a `&SymbolDecoder`.
+    pub(crate) fn symr_mi() -> (i64, i64) {
+        SYMR_MI.with(std::cell::Cell::get)
+    }
+
     /// `EC_SYMR=1` dumps every symbol read's PRE state (before the read and
     /// before the adaptation) together with the symbol and the post-read
     /// range, so a divergence against a reference decoder can be bisected
