@@ -34,6 +34,11 @@ fn main() {
         if !cfg!(feature = "gate-counters") {
             println!("counters disabled (built without the gate-counters feature)");
         }
+        let [a444, a422, s420, r420] = ec_av1::decode::cfl_ac_arm_hits();
+        println!(
+            "cfl_ac: 444={a444} 422={a422} 420sq={s420} 420rect={r420} q3_at={}",
+            ec_av1::decode::cfl_ac_q3_at_hits()
+        );
         let (sc, dp) = ec_av1::decode::troy_chroma_counters();
         println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
         println!(
