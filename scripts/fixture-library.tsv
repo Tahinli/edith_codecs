@@ -231,7 +231,6 @@ fixtures	crates/ec-av1/src/encode.rs:21143	regenerated	scripts/gen-fixtures.sh	o
 fixtures	crates/ec-av1/src/encode.rs:21525	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-av1/src/encode.rs:22076	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-av1/src/encode.rs:22632	regenerated	scripts/gen-fixtures.sh	ok	-	-
-fixtures/...	crates/ec-av1/src/stream.rs:23798	regenerated	scripts/gen-fixtures.sh	missing	-	-
 fixtures	crates/ec-av1/src/stream.rs:31209	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-av1/src/stream.rs:9118	regenerated	scripts/gen-fixtures.sh	ok	-	-
 fixtures	crates/ec-flac/tests/encode_matrix.rs:48	regenerated	scripts/gen-fixtures.sh	ok	-	-

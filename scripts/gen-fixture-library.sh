@@ -101,6 +101,7 @@ is_fixture_literal() { # $1 = literal without quotes
         *[[:space:]]* | *'{'* | *'}'* | *'$'* | *'%'* | *'*'* | *'?'* | \
         *'('* | *')'* | *','* | *'='* | *';'* | *':'*) return 1 ;;
         *.sh | *.py | *.md | *.tsv) return 1 ;;   # a script name, not a path
+        *'...'*) return 1 ;;                      # an ellipsis placeholder, not a path
         /home/* | /Users/* | /tmp/*) return 1 ;;  # developer path, not the library
     esac
     [[ $lit == *fixtures* || $lit == */vectors/* ]] || return 1
