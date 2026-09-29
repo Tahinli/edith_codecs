@@ -435,3 +435,127 @@ The class rule this lane earns, in the shape Main is adopting as a batch rule: a
 a **judgement** ("bisect aid", "not a suite gate"). A judgement cannot be checked
 against reality, so it cannot go stale loudly — and that is exactly how the r1
 reason survived into a tree where it was false.
+
+---
+
+# r4 — the last assert-free gate, and two corrections to my own r3 claims
+
+Branch `lane-av1pinslive`, rebased onto main `aa0ac8c2`. Commit `9a29c974`.
+Tests only, no decoder change.
+
+## 1. What changed
+
+`pinned_lr_sgr_stream_call_unique_dump` now asserts. r3 left it `#[ignore]`d on the
+fact that it asserted nothing; that is fixed and the ignore is gone.
+
+**The substantive fix is the frame count, not the asserts.** The old body passed
+*our own decode's length* as ffmpeg's expected count:
+
+```rust
+let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
+```
+
+so a decoder emitting **zero** frames asked ffmpeg for zero frames, the zip compared
+no pairs, and the gate passed having proved nothing — the `cmpaudit` vacuous-pass
+shape, in the one gate that was already `#[ignore]`d for asserting nothing. The count
+now comes from the fixture (`FRAMES = 1`, measured), so a lost frame reds on the
+count.
+
+Also added, matching the three sibling pins: a dimensions assert per frame, an
+explicit `reference.len() == FRAMES` before the zip, and per-plane per-frame pixel
+asserts. **The diagnostic print is kept** and now runs *before* the asserts, so a
+failure still names the shape of the divergence.
+
+### On "does it compare only frame 0?" — it does not
+
+The loop always visited every frame; it is unchanged in that respect. This pin
+simply holds **one** frame, which is why the pre-r4 run printed `frame 0` and
+nothing else. So that particular worry is unfounded, and the real gap was the
+vacuous count above.
+
+## 2. Red-before, on a pixel assertion
+
+**Method used: mutating the decoder arithmetic the pin exercises**, not a faked
+expectation — `restoration.rs::apply_sgrproj_stripe`, `+1` on its first output
+sample. The pin is a loop-restoration stream, so Sgrproj is on its path.
+
+```
+frame 0: y_mismatch=false u_mismatch=true v_mismatch=true
+panicked at crates/ec-av1/src/stream.rs:30374:13:
+  assertion `left == right` failed:
+  pinned_lr_sgr_stream_call_unique_dump frame 0 U vs ffmpeg (pinned lr-sgr)
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+```
+
+It reds on a **pixel** assert, not on a shape or counter assert. Worth recording:
+the mutation landed in a **chroma** plane, so the gate caught it on the U assert
+while luma stayed clean — a luma-only compare would have missed it entirely. That is
+the capability the three per-plane asserts buy.
+
+Reverted (`git status` on `restoration.rs` empty) and the gate returns green.
+
+The **count** assert is proven separately: setting `FRAMES = 2` reds at
+`stream.rs:30328` with *"decoded 1 frame(s), the pinned stream holds 2 -- a short
+decode would otherwise ask ffmpeg for the same short count and compare nothing"* —
+on the count, not on a pixel. Both halves proven independently.
+
+## 3. Plain-run evidence
+
+```
+cargo test -p ec-av1 --lib --release -- --exact stream::tests::pinned_lr_sgr_stream_call_unique_dump --test-threads=1 --nocapture
+  frame 0: y_mismatch=false u_mismatch=false v_mismatch=false
+  pinned_lr_sgr_stream_call_unique_dump: 1 frame(s) byte-exact vs ffmpeg from .../crates/ec-av1/fixtures/lr-sgr-r7.obu
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 741 filtered out; finished in 0.10s
+```
+
+`#[ignore]` in `stream.rs` **37 → 36**. `gate_coverage` 10 passed,
+`refusal_inventory` 15 passed.
+
+The ignore was never justified by cost: it measured 0.10 s under `--ignored` too.
+The only honest reason it carried was the missing asserts, which is now gone.
+
+## 4. TWO CORRECTIONS TO MY OWN r3 CLAIMS
+
+Both are scanner blind spots of mine, found by auditing the class after this change.
+Neither is a new defect in the tree; both are wrong things I told you.
+
+**Correction 1 — "the machine-local-pin population is zero in ec-av1" is FALSE.**
+It is zero for the gates I fixed, and there is **one more pin gate with 14
+uncommitted pins**:
+
+`pinned_warp_stream_decodes_pixel_exact` (still `#[ignore]`d, reason *"reads pinned
+fixture paths under the gitignored fixtures dir; run manually"*) reads **14 pins** —
+`warp-mismatch`, `warp-flake-5`, `warp-flake-7`, `ii-flake-1/2/3/5/6/7/8/9`,
+`rect-flake-1/2/3` — through a **directory** `concat!(env!("CARGO_MANIFEST_DIR"),
+"/../../fixtures")` literal plus a name list, and formats `{fixtures}/{n}.obu` at
+runtime. **0 of 14 are committed under the crate.**
+
+My r3 scanner matched only `crate_pin("X")` and `pin_dir().join("X")` — *single-name*
+call shapes. A directory literal plus a runtime-formatted name list does not match
+either, so this gate was invisible to it. The r3 invariant I proposed to the preflight
+lane ("every `crate_pin("X")` must have `crates/ec-av1/fixtures/X` in the tree") is
+**too weak to catch this**, and the preflight lane should be told so: the scan must
+also resolve `concat!` directory literals and any `{fixtures}/{n}` runtime format.
+
+**Correction 2 — "4 ignored gates assert nothing" is wrong for one of them.**
+My body-only scan reported `pinned_warp_stream_decodes_pixel_exact` as assert-free.
+It is not: the gate delegates to `check_pinned_warp_stream` (`stream.rs:31226`),
+which carries `assert_eq!` on all three planes per frame. The scan looked at the gate
+body and missed the delegation.
+
+The other three are correct and are diagnostics **by name**:
+`probe_tiny_fixture_trace`, `scratch_decode_pinned_stream_once`,
+`scratch_isolate_pinned_mismatch` — 0 asserts each, all `probe_*`/`scratch_*`.
+
+So the accurate statement is: **no ignored gate named `pinned_*` asserts nothing**,
+after this change — but that took checking the helpers, not the bodies.
+
+## 5. State
+
+`lane-av1pinslive`, four work commits on top of `aa0ac8c2`. `cargo check -p ec-av1
+--all-targets` clean, no warnings. Not pushed; main untouched.
+
+Follow-on handed back rather than folded in: the 14 `pinned_warp` pins, which are
+the same defect as r3's four and want the same `crate_pin` + committed-copy
+treatment. Not verified: a full `cargo test -p ec-av1` run (project-wide validation
+is Main's).
