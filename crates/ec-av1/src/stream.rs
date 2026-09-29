@@ -46423,6 +46423,159 @@ pub(crate) mod tests {
         }
     }
 
+    /// Decode-order frame 0 only, against the oracle's own
+    /// `EC_AV1_FINAL_DUMP` for that frame: how many SAMPLES differ, and the
+    /// first one as `(plane, x, y, ours, oracle)`.
+    ///
+    /// lane-av1loss444kf: the 4:4:4 lossless 256x256 cell's inter frames carry a
+    /// SEPARATE, already-diagnosed walk defect (the per-mu-chunk lossless
+    /// chroma span, `lanes/av1loss444mm.report.md` r1), so a whole-stream
+    /// byte-exactness assert cannot name this one. `aomdec --limit=1` stops
+    /// after the key frame, which is exactly the frame the reach fix moves.
+    #[allow(clippy::type_complexity)]
+    fn key_frame_diffs(
+        stream: &[u8],
+        name: &str,
+    ) -> (usize, Option<(usize, usize, usize, u8, u8)>) {
+        let dir = std::env::temp_dir().join(format!("ec-av1-{name}-kf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, stream).expect("writing the stream");
+        let aom_prefix = dir.join("aomkf");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "--limit=1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{name}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ours_prefix = dir.join("ourskf");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        let decoded = decode_stream(stream);
+        set_final_dump_prefix(None);
+        decoded.unwrap_or_else(|e| panic!("{name}: this decoder refused the stream: {e}"));
+        let want = std::fs::read(format!("{}.f0", aom_prefix.display())).expect(
+            "the oracle wrote no decode-order frame 0 -- rung 12 of \
+                     scripts/instrument-aom-oracle.sh is missing",
+        );
+        let got = std::fs::read(format!("{}.f0", ours_prefix.display()))
+            .expect("this decoder wrote no decode-order frame 0");
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{name}: our key frame is {} bytes, the oracle's is {}",
+            got.len(),
+            want.len()
+        );
+        let side = (want.len() / 3).isqrt();
+        let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        let first = got.iter().zip(&want).position(|(a, b)| a != b).map(|at| {
+            // the dump is plane after plane (Y, U, V), so the in-plane
+            // offset is what carries the x/y split
+            let plane = at / (side * side);
+            let in_plane = at % (side * side);
+            (plane, in_plane % side, in_plane / side, got[at], want[at])
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        (differing, first)
+    }
+
+    /// lane-av1loss444kf: the 4:4:4 lossless 256x256 key frame's 49-sample
+    /// chroma damage, and the `Reach` a transform unit inside a sub-8x8 RECT
+    /// leaf must be given.
+    ///
+    /// The cell: `testsrc2 256x256 rate=25` yuv444p, 6 frames,
+    /// `aomenc --lossless=1 --enable-palette=0 --enable-intrabc=0` -- **109215
+    /// bytes, sha256 `4563a01f1778600020ffa9f15bc05f5559321cf5712b99a29ed7192675dee6a4`,
+    /// fnv1a64 `0xbbb56442f393a9b2`**. Its key frame decodes with **21 U + 28 V
+    /// samples wrong** (U over x 196..207 / y 200..203, V over x 196..206),
+    /// luma exact, entropy bit-locked over all 81933 of its symbol reads and
+    /// its 12288 transform units at identical absolute `(plane, x, y)`.
+    ///
+    /// The defect: libaom's `has_bottom_left` (`reconintra.c:381`) is asked
+    /// with the **leaf's** `bsize`, the unit's `(row_off, col_off)` and
+    /// `tx_size` -- and its first branch inside the left column is
+    /// `if (row_off + bottom_left_count_unit < plane_bh_unit) return 1;`, the
+    /// block's OWN next row, already reconstructed. A 4x8 leaf's first TX_4X4
+    /// unit therefore HAS four bottom-left samples. `sub8_leaf_chroma444`
+    /// instead looked a standalone `BLOCK_4X4` up at the unit's own position
+    /// (`Reach::of(4, upx, upy, ..)`), which answers false there, so
+    /// [`PlaneBuf::edges`] replicated the last left sample out to the edge's
+    /// full `bw + bh` reach and the unit predicted D203/CFL from a fabricated
+    /// edge. The 4:2:2 twin of the same function was fixed this way already
+    /// (lane-av1-422kf2, whose comment names the old lookup); this is its
+    /// 4:4:4 twin, still carrying the stale copy.
+    ///
+    /// Non-vacuity, in order:
+    /// 1. the live re-encode's length AND fnv1a64 -- a recipe or encoder drift
+    ///    fails here instead of passing as this cell;
+    /// 2. [`assert_444_header`] -- at 4:2:0 the arm is unreachable (every
+    ///    caller of `sub8_leaf_chroma444` sits behind `chroma_444`) and every
+    ///    assert below would pass for free;
+    /// 3. [`key_frame_diffs`] == 0 samples, with the first differing sample
+    ///    NAMED in the failure so a regression is a location, not a count;
+    /// 4. [`crate::decode::sub8_chroma444_lossless_tu_reach_hits`] rose over
+    ///    the decode -- the units where the block-relative answer and the
+    ///    standalone one disagree, which is what makes this a witness of the
+    ///    FIXED path and not of a stream that merely has rect leaves.
+    #[test]
+    fn a_lossless_444_sub8_rect_leaf_chroma_reach_decodes_the_key_frame_pixel_exact() {
+        const NAME: &str = "lossless-444-sub8-rect-leaf-chroma-reach";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let stream = chroma_format_stream(
+            256,
+            256,
+            "yuv444p",
+            8,
+            6,
+            &["--lossless=1", "--enable-palette=0", "--enable-intrabc=0"],
+            0,
+        );
+        assert_eq!(
+            (stream.len(), fnv1a64(&stream)),
+            (109215, 0xbbb5_6442_f393_a9b2),
+            "{NAME}: the pinned 4:4:4 lossless 256x256 cell is {} bytes / fnv1a64 {:#x}, \
+             not 109215 / 0xbbb56442f393a9b2 -- the recipe or the encoder drifted, so a \
+             result here is not a result about this cell",
+            stream.len(),
+            fnv1a64(&stream)
+        );
+        assert_444_header(&stream, NAME, 8);
+        crate::decode::reset_sub8_chroma444_tu_reach_hits();
+        let (differing, first) = key_frame_diffs(&stream, NAME);
+        assert_eq!(
+            differing, 0,
+            "{NAME}: the 4:4:4 lossless key frame differs from aomdec in {differing} samples \
+             (first {first:?} as (plane, x, y, ours, oracle)) -- a sub-8x8 RECT leaf's chroma \
+             unit must be given the reach libaom's has_bottom_left computes for the LEAF, not a \
+             standalone BLOCK_4X4 lookup at the unit's own position"
+        );
+        let reach_hits = crate::decode::sub8_chroma444_lossless_tu_reach_hits();
+        assert!(
+            reach_hits > 0,
+            "{NAME}: went blind -- not one 4:4:4 lossless rect-leaf chroma unit had the \
+             block-relative reach disagree with the standalone BLOCK_4X4 lookup, so the cell \
+             never reached the fixed path and the byte-exactness above proves nothing about it"
+        );
+        eprintln!(
+            "{NAME}: key frame byte-exact vs aomdec (0 of 196608 samples differ), {reach_hits} \
+             rect-leaf chroma unit(s) took the block-relative reach"
+        );
+    }
+
     /// lane-av1distwtd: the gate that pays the `enable-dist-wtd-comp` entry in
     /// `gate_coverage.rs`'s [`NEVER_EXERCISED_8BIT`], and corrects its stated
     /// reason. The entry said "distance-weighted compound is unimplemented" --
