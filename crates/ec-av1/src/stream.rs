@@ -1837,6 +1837,10 @@ fn decode_frame(
     // 4:2:0 one never inherits the wrong plane count.
     crate::decode::set_mono(seq.mono_chrome, fctx);
     crate::decode::set_subsampling(seq.subsampling_x, seq.subsampling_y, fctx);
+    // lane-av1readcensus: the 4:4:4 coefficient-unit census is armed here,
+    // off the same sequence-header subsampling -- at 4:2:0/4:2:2 every census
+    // counter reads zero, so a 4:2:0 control can assert exactly that.
+    crate::decode::set_census_444(seq.subsampling_x, seq.subsampling_y);
     // lane-av1txr: spec 5.9.2 `disable_cdf_update` -- a frame that sets it
     // codes every tile symbol against the CDFs it started with, so the tile
     // readers must not adapt (libaom `decodeframe.c:2909`:
@@ -19267,6 +19271,240 @@ pub(crate) mod tests {
             (0, 0),
             "{NAME}: the 4:2:0 control fired the 4:4:4 four-unit route ({c_quad} units, {c_diff} \
              differing) -- the counter is not specific to the route it claims to witness"
+        );
+    }
+
+    /// lane-av1chrtx: the SIBLING of lane-av1444chr's four-unit arm -- a RECT
+    /// inter block's chroma plane, read by `read_inter_rect_chroma`. That
+    /// helper was left handing every unit the block-level `luma_tx_type`
+    /// (the top-left leaf's type) after the four-unit arms were pointed at
+    /// `covering_leaf_tx_type`, so a rect block whose chroma plane splits
+    /// (`nx*ny > 1`) over MIXED var-tx leaves read the wrong type per unit.
+    ///
+    /// The witness is pinned into `fixtures/`: `testsrc2 256x256` yuv444p 3
+    /// frames, aomenc `--profile=1 --cq-level=30 --cpu-used=0 --sb-size=64
+    /// --min-partition-size=32 --max-partition-size=64 --enable-tx-size-search=1
+    /// --passes=1 --end-usage=q --threads=1 --row-mt=0 --lag-in-frames=0
+    /// --kf-max-dist=100 --limit=3 --obu`; 26839 bytes, sha256
+    /// `06174a66e92aaeb751a8e86db59711fcb1f18d74bde2d77e1ef1be7983eb7c80`.
+    /// Its one qualifying block is the 32x64 inter strip at mi(32,48): a
+    /// 4:4:4 chroma plane of (32,64) = TWO TX_32X32 units, over a luma tree
+    /// of five leaves -- `Idtx` (32x32) on top, then `VDct`/`DctDct`/`HDct`/
+    /// `VDct` 16x16 leaves. The lower chroma unit therefore inherits `VDct`
+    /// where the block-level value is `Idtx`.
+    ///
+    /// Getting a witness at all took a bounded hunt (200+ encodes): `multi`
+    /// is false by construction at 4:2:0 (a `side <= 64` block's chroma plane
+    /// is at most 32x32 = one unit), so the arm needs 4:4:4 AND a rect block
+    /// that keeps a 64-px axis, AND `--cpu-used=0` with `--min-partition-size=32`
+    /// to make aomenc actually pick the 32x64 strip.
+    ///
+    /// The non-vacuity bar is the DIFFERS counter, not the route counter: the
+    /// control below is a committed 4:4:4 rect stream where the route fires
+    /// and still changes nothing, because that block's leaves agree.
+    #[test]
+    fn a_pinned_444_rect_inter_stream_resolves_each_chroma_unit_from_its_own_luma_leaf() {
+        const NAME: &str =
+            "a_pinned_444_rect_inter_stream_resolves_each_chroma_unit_from_its_own_luma_leaf";
+        const FIXTURE_LEN: usize = 26839;
+        const FIXTURE_FNV: u64 = 0xc77f_310c_036d_ff73;
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP {NAME}: no aomenc/aomdec oracle at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_rect_strip_leaf_tx_type.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let hits0 = crate::decode::chroma_rect_leaf_tx_hits();
+        let diff0 = crate::decode::chroma_rect_leaf_tx_diff_hits();
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        let hits = crate::decode::chroma_rect_leaf_tx_hits() - hits0;
+        let diff = crate::decode::chroma_rect_leaf_tx_diff_hits() - diff0;
+        assert_eq!(
+            frames, 3,
+            "{NAME}: expected 3 decode-order frames ({hidden} hidden)"
+        );
+        assert!(
+            hits >= 2 * diff && hits > 0,
+            "{NAME}: no rect chroma unit took its type from the covering luma leaf (hits {hits}, \
+             differs {diff}) -- the corrected route never ran"
+        );
+        assert!(
+            diff >= 2,
+            "{NAME}: the per-unit resolve never CHANGED an answer (diff {diff}; measured 2 on this \
+             stream, one per chroma plane). A route counter alone is not a witness: the control \
+             below fires it and changes nothing."
+        );
+        eprintln!(
+            "{NAME}: rect chroma units resolved from their own leaf {hits}, of which {diff} differed"
+        );
+
+        // Control: a committed 4:4:4 rect stream where the SAME route fires
+        // and every resolved type equals the block-level one -- the shape a
+        // no-op fix would also be green on.
+        let control = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/444_sb128rect_lr_witness.obu"),
+        )
+        .unwrap_or_else(|e| panic!("{NAME}: reading the rect-strip control: {e}"));
+        let c_hits0 = crate::decode::chroma_rect_leaf_tx_hits();
+        let c_diff0 = crate::decode::chroma_rect_leaf_tx_diff_hits();
+        let c_frames = decode_stream(&control)
+            .unwrap_or_else(|e| panic!("{NAME}: the rect-strip control no longer decodes: {e}"))
+            .len();
+        let c_hits = crate::decode::chroma_rect_leaf_tx_hits() - c_hits0;
+        let c_diff = crate::decode::chroma_rect_leaf_tx_diff_hits() - c_diff0;
+        assert!(
+            c_frames > 0,
+            "{NAME}: the rect-strip control decoded no frames"
+        );
+        assert!(
+            c_hits > 0 && c_diff == 0,
+            "{NAME}: the rect-strip control fired the route {c_hits} times with {c_diff} differing \
+             types -- expected the single-unit/same-type shape (route fires, nothing changes)"
+        );
+    }
+
+    /// lane-av1readcensus: the 4:4:4 coefficient-UNIT census, pinned.
+    ///
+    /// The lane report `av1444rect` round 4 left an unexplained signal: 636
+    /// square chroma reads against the oracle's 1086, and 2052 luma reads
+    /// against its 1309, recorded as "most likely a counting-shape difference"
+    /// with no evidence either way. This gate is that evidence.
+    ///
+    /// Measured on this arm (`ll444_minp8_inter`, pixel-exact against aomdec
+    /// on every plane of every frame -- see
+    /// `a_lossless_444_min_partition8_inter_stream_decodes_sample_exact`),
+    /// pairing each of our 11292 walked units with the oracle's
+    /// `av1_read_coeffs_txb` call BY `post_rng` (the msac state after the
+    /// unit) rather than by plane label or walk position: EVERY unit pairs,
+    /// and no unit's plane, shape, eob or all-zero flag differs. The per-plane
+    /// split is equal too -- 3764 units per plane on both sides, of which
+    /// 975 / 1793 / 1859 coded coefficients. So on a pixel-exact arm there is
+    /// no asymmetry to explain at all; the round-4 numbers came from
+    /// `444_intrabc_rect4_witness`, an arm that DIVERGES (390380 of 921600
+    /// samples wrong), where our surplus is the divergence itself.
+    ///
+    /// What this gate pins is the walk's OBJECT SHAPE on the pixel-exact arm:
+    /// a change to the number or plane split of coefficient units this decoder
+    /// walks shows up here as an intentional diff, not as the next lane's
+    /// mystery signal. The 4:2:0 control asserts the census is inert there.
+    #[test]
+    fn a_pixel_exact_444_stream_walks_the_same_coefficient_units_the_oracle_does() {
+        const NAME: &str =
+            "a_pixel_exact_444_stream_walks_the_same_coefficient_units_the_oracle_does";
+        const FIXTURE_LEN: usize = 34037;
+        const FIXTURE_FNV: u64 = 0x2c8f_4a2c_c025_52da;
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP {NAME}: no aomenc/aomdec oracle at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/ll444_minp8_inter.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+        let delta = |now: [usize; 3], before: [usize; 3]| {
+            [now[0] - before[0], now[1] - before[1], now[2] - before[2]]
+        };
+
+        let u0 = crate::decode::census_444_units();
+        let c0 = crate::decode::census_444_coded();
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        assert_eq!(
+            frames + hidden,
+            8,
+            "{NAME}: expected 8 decode-order frames (6 shown + 2 hidden)"
+        );
+        let walked = delta(crate::decode::census_444_units(), u0);
+        let coded = delta(crate::decode::census_444_coded(), c0);
+
+        // The oracle's own census on the same stream, paired by post_rng:
+        // 3764 units per plane, 975 / 1793 / 1859 of them coded.
+        assert_eq!(
+            walked,
+            [3764, 3764, 3764],
+            "{NAME}: the 4:4:4 unit walk changed -- {walked:?} against the oracle's \
+             [3764, 3764, 3764] (measured by post_rng pairing, every unit matching). A change \
+             here is a WALK-SHAPE change: re-measure against aomdec before assuming it is a bug"
+        );
+        assert_eq!(
+            coded,
+            [975, 1793, 1859],
+            "{NAME}: the coded-unit split changed -- {coded:?} against the oracle's [975, 1793, 1859]"
+        );
+        assert!(
+            walked.iter().all(|&v| v > 0) && coded.iter().all(|&v| v > 0),
+            "{NAME}: an all-zero plane split means the census did not run, not that the walk is empty"
+        );
+
+        // A SECOND pixel-exact arm, with a MIXED unit-shape mix -- the pinned
+        // lossless stream above is all TX_4X4 (min-partition-8), so on its own
+        // it would not notice a var-tx walk that started folding 8x8/4x8
+        // leaves. This one walks 4x4/8x8/8x4/4x8/4x16/16x4/8x16/16x16, and
+        // the oracle's census on it pairs unit-for-unit by post_rng with no
+        // shape, plane, eob or all-zero difference: 1373 units, 629 luma and
+        // 372 per chroma plane, of which 130 / 253 / 278 coded.
+        let path2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_lossy_rect4_inter_witness.obu");
+        let stream2 = std::fs::read(&path2)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path2.display()));
+        let m0 = crate::decode::census_444_units();
+        let mc0 = crate::decode::census_444_coded();
+        let (frames2, hidden2) = decode_all_frames_vs_oracle(&stream2, NAME);
+        assert!(
+            frames2 + hidden2 > 0,
+            "{NAME}: the mixed-shape 4:4:4 arm decoded no frames"
+        );
+        let walked2 = delta(crate::decode::census_444_units(), m0);
+        let coded2 = delta(crate::decode::census_444_coded(), mc0);
+        assert_eq!(
+            walked2,
+            [629, 372, 372],
+            "{NAME}: the mixed-shape 4:4:4 walk changed -- {walked2:?} against the oracle's \
+             [629, 372, 372]. The all-4x4 arm above cannot see a var-tx fold; this one can"
+        );
+        assert_eq!(
+            coded2,
+            [130, 253, 278],
+            "{NAME}: the mixed-shape coded-unit split changed -- {coded2:?} against the oracle's \
+             [130, 253, 278]"
+        );
+
+        // 4:2:0 control: the census is a 4:4:4 question and must not fire.
+        let control = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/av1_192x128_8bit_intra64_in_inter.obu"),
+        )
+        .unwrap_or_else(|e| panic!("{NAME}: reading the 4:2:0 control: {e}"));
+        let k0 = crate::decode::census_444_units();
+        let kc0 = crate::decode::census_444_coded();
+        let k_frames = decode_stream(&control)
+            .unwrap_or_else(|e| panic!("{NAME}: the 4:2:0 control no longer decodes: {e}"))
+            .len();
+        assert!(k_frames > 0, "{NAME}: the 4:2:0 control decoded no frames");
+        assert_eq!(
+            delta(crate::decode::census_444_units(), k0),
+            [0, 0, 0],
+            "{NAME}: the 4:4:4 census fired on the 4:2:0 control"
+        );
+        assert_eq!(
+            delta(crate::decode::census_444_coded(), kc0),
+            [0, 0, 0],
+            "{NAME}: the 4:4:4 coded-unit census fired on the 4:2:0 control"
         );
     }
 
@@ -39529,7 +39767,6 @@ pub(crate) mod tests {
             "{NAME}: no attempt decoded a depth-1 1:4 split strip -- the recipe no longer \
              covers the shape this round fixed"
         );
-        eprintln!("{NAME}: {depth1_decoded} depth-1 1:4 split strips decoded pixel-exact");
     }
 
     /// The chroma-rect gate's fixture + aomenc recipe for one attempt, shared

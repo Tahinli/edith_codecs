@@ -2275,6 +2275,119 @@ pub(crate) fn rect_class1_hits() -> usize {
     RECT_CLASS1_HITS.with(|c| c.get())
 }
 
+// lane-av1readcensus: the PER-UNIT coefficient census -- one unit counted
+// per `read_coeffs`/`read_coeffs_rect` call, i.e. per object this decoder
+// actually walks, which is the unit the round-4 `av1444rect` count measured
+// (636 square chroma reads against the oracle's 1086). The counters are
+// 4:4:4-ONLY (`CENSUS_444`, set per frame beside `set_subsampling`), so a
+// 4:2:0 control reads `(0, 0, 0)` -- a walk-shape change at 4:2:0 is another
+// lane's business, and this census must not fire there.
+thread_local! {
+    /// Per-plane unit counts, `[luma, u, v]`, at 4:4:4 only.
+    static CENSUS_444_UNITS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Of [`CENSUS_444_UNITS`], the units that coded at least one coefficient
+    /// (`txb_skip == 0`) -- the per-plane split is only comparable against
+    /// the oracle's when both sides count all-zero units the same way.
+    static CENSUS_444_CODED: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Sequential unit index, so a trace line names its own position in the
+    /// frame's walk rather than relying on line order alone.
+    static CENSUS_UNIT_N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The plane the units read from here on belong to. A thread-local rather
+    /// than a `read_coeffs` parameter because the three luma call sites
+    /// (`decode_rect_split`, `decode_block_rect64`, `read_inter_plane_rect`)
+    /// are not this lane's to edit and would each grow an argument; the
+    /// plane-owning readers stamp it once on entry instead.
+    static CENSUS_PLANE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 4:4:4 (`subsampling_x == 0 && subsampling_y == 0`) for the frame being
+    /// decoded, set per frame from [`crate::stream`].
+    static CENSUS_444: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Current `[luma, u, v]` 4:4:4 coefficient-unit counts.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn census_444_units() -> [usize; 3] {
+    CENSUS_444_UNITS.with(|c| c.get())
+}
+
+/// Current `[luma, u, v]` 4:4:4 counts of units that coded coefficients.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn census_444_coded() -> [usize; 3] {
+    CENSUS_444_CODED.with(|c| c.get())
+}
+
+/// lane-av1readcensus: arms the 4:4:4 census for the frame about to decode,
+/// called once per frame from [`crate::stream`]'s decode loop beside
+/// [`set_subsampling`]. At 4:2:0 (or 4:2:2) every census counter stays zero --
+/// the walk-shape question this census answers is a 4:4:4 one.
+pub(crate) fn set_census_444(ss_x: u8, ss_y: u8) {
+    CENSUS_444.with(|c| c.set(ss_x == 0 && ss_y == 0));
+}
+
+/// lane-av1readcensus: the plane the units read from here on belong to,
+/// stamped by the plane-owning readers ([`read_plane`], [`read_inter_plane`],
+/// [`read_inter_plane_rect`]) on entry.
+pub(crate) fn set_census_plane(plane: usize) {
+    CENSUS_PLANE.with(|c| c.set(plane));
+}
+
+/// lane-av1readcensus: is the per-unit census trace on? Shares
+/// [`coeff_trace_on`]'s per-frame narrowing so one frame's walk can be
+/// dumped without the rest of the stream.
+fn census_trace_on() -> bool {
+    if !crate::envflags::env_flag!("EC_CENSUS_UNIT") {
+        return false;
+    }
+    match COEFF_TRACE_FRAME.with(|c| c.get()) {
+        None => true,
+        Some(w) if w >= usize::MAX - 1 => true,
+        Some(w) => COEFF_TRACE_CUR.with(|c| c.get()) == w,
+    }
+}
+
+/// lane-av1readcensus: one line per coefficient unit this decoder walks, the
+/// twin of the oracle's `EC_COEFF` / `EC_COEFF_VAL` bracket around each
+/// `av1_read_coeffs_txb` call. Pair the two sides by `post_rng` (or by `n`),
+/// never by plane label or by walk position -- the walk order is exactly what
+/// the census is measuring.
+fn census_unit(
+    w: usize,
+    h: usize,
+    tx_type: TxType,
+    eob: usize,
+    all_zero: bool,
+    entry_rng: u32,
+    dec: &SymbolDecoder,
+) {
+    let plane = CENSUS_PLANE.with(|c| c.get()).min(2);
+    let coded = usize::from(!all_zero);
+    CENSUS_UNIT_N.with(|c| c.set(c.get() + 1));
+    hit_do! {
+        CENSUS_444_UNITS.with(|c| {
+            if CENSUS_444.with(|on| on.get()) {
+                let mut v = c.get();
+                v[plane] += 1;
+                c.set(v);
+            }
+        });
+        CENSUS_444_CODED.with(|c| {
+            if CENSUS_444.with(|on| on.get()) {
+                let mut v = c.get();
+                v[plane] += coded;
+                c.set(v);
+            }
+        });
+    }
+    if !census_trace_on() {
+        return;
+    }
+    let n = CENSUS_UNIT_N.with(|c| c.get()) - 1;
+    let post_rng = dec.debug_state().0;
+    eprintln!(
+        "EC_CENSUS_UNIT side=ours n={n} plane={plane} w={w} h={h} tx={tx_type:?} eob={eob} \
+         all_zero={all_zero} entry_rng={entry_rng} post_rng={post_rng}"
+    );
+}
+
 // As [`FILTER_INTRA_RECT_HITS`], counting only the strips BELOW 16x16
 // (8x16/16x8 leaves of a 16x16 HORZ/VERT partition, lane-fistrip r1) -- the
 // shapes whose `use_filter_intra` symbol had no CDF class before this round.
@@ -7561,6 +7674,11 @@ fn read_coeffs(
 ) -> Result<(Grid, TxType)> {
     let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     let side = coding.side;
+    // lane-av1readcensus: this unit's own entry state, so the census line
+    // carries the pre-read rng and pairs against the oracle's `EC_COEFF`
+    // (which prints `r->ec.rng` before the same `txb_skip` read).
+    let census_entry_rng = dec.debug_state().0;
+    let (census_w, census_h) = rect_shape.unwrap_or((side, side));
     if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") {
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
@@ -7603,6 +7721,15 @@ fn read_coeffs(
     if all_zero {
         // lane-coefgrid: the all-zero unit (60% of the 4K segment's) names the
         // shared zero grid instead of allocating and zeroing its own.
+        census_unit(
+            census_w,
+            census_h,
+            TxType::DctDct,
+            0,
+            true,
+            census_entry_rng,
+            dec,
+        );
         return Ok((Grid::Zero(side * side), TxType::DctDct));
     }
     let mut grid = vec![0i32; side * side];
@@ -7811,6 +7938,15 @@ fn read_coeffs(
         }
         grid[pos] = if negative { -level } else { level };
     }
+    census_unit(
+        census_w,
+        census_h,
+        tx_type,
+        eob,
+        false,
+        census_entry_rng,
+        dec,
+    );
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -7832,18 +7968,31 @@ fn read_coeffs_rect(
     skip_ctx: usize,
     sign_ctx: usize,
     default_tx_type: TxType,
+    // lane-av1chrtx: the plane this unit belongs to (0 luma, 1 U, 2 V) --
+    // printed by the two `EC_COEFF_STEP` traces below, which hardcoded
+    // `plane=0` and so mis-attributed a CHROMA read as a luma one in two
+    // independent lane reports.
+    plane: usize,
 ) -> Result<(Grid, TxType)> {
     let rect_trace = coeff_trace_on();
     let entry_rng = dec.debug_state().0;
+    // lane-av1readcensus: this reader is handed the real plane (lane-av1chrtx
+    // threaded it in for the `EC_COEFF_STEP` traces), so it stamps the census
+    // plane itself rather than inheriting whichever reader did last. The
+    // luma-only readers (`decode_rect_split`, `decode_block_rect64`,
+    // `read_inter_plane_rect`'s corner) are all plane 0 -- the stamp's initial
+    // value -- and the other plane-owning readers stamp on entry.
+    set_census_plane(plane);
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if rect_trace {
         eprintln!(
-            "EC_COEFF_STEP tag=all_zero plane=0 ctx={skip_ctx} entry={entry_rng} all_zero={} rng={}",
+            "EC_COEFF_STEP tag=all_zero plane={plane} ctx={skip_ctx} entry={entry_rng} all_zero={} rng={}",
             all_zero as i32,
             dec.debug_state().0
         );
     }
     if all_zero {
+        census_unit(w, h, TxType::DctDct, 0, true, entry_rng, dec);
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
     let mut grid = vec![0i32; w * h];
@@ -7864,7 +8013,7 @@ fn read_coeffs_rect(
         })?;
         if rect_trace {
             eprintln!(
-                "EC_COEFF_STEP tag=tx_type plane=0 rng={}",
+                "EC_COEFF_STEP tag=tx_type plane={plane} rng={}",
                 dec.debug_state().0
             );
         }
@@ -8047,6 +8196,7 @@ fn read_coeffs_rect(
             nz.join(",")
         );
     }
+    census_unit(w, h, tx_type, eob, false, entry_rng, dec);
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -8076,11 +8226,25 @@ fn read_chroma_coeffs_rect(
     sign_ctx: usize,
     default_tx_type: TxType,
     fctx: &crate::decode::FrameCtx,
+    // lane-av1chrtx: the plane index, threaded to `read_coeffs_rect`'s
+    // `EC_COEFF_STEP` traces (they used to print a hardcoded `plane=0`, so a
+    // V-plane read was indistinguishable from a luma one in the log).
+    plane: usize,
 ) -> Result<(Grid, TxType)> {
     if mono(fctx) {
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
-    read_coeffs_rect(dec, coding, scan, w, h, skip_ctx, sign_ctx, default_tx_type)
+    read_coeffs_rect(
+        dec,
+        coding,
+        scan,
+        w,
+        h,
+        skip_ctx,
+        sign_ctx,
+        default_tx_type,
+        plane,
+    )
 }
 
 /// What one coded block leaves behind for the blocks that read it as a
@@ -11537,6 +11701,7 @@ fn decode_rect_split(
                     tu_skip_ctx,
                     dc_sign_ctx(tu_around.2),
                     TxType::DctDct,
+                    0,
                 )?;
                 let residual = dequant_and_inverse_typed_wh(
                     &tu_grid,
@@ -11962,6 +12127,7 @@ fn decode_rect_split(
                             skip_ctx,
                             dc_sign_ctx(cu_around[plane_idx].2),
                             default_tx,
+                            plane_idx,
                         )?;
                         let residual = dequant_and_inverse_typed_wh(
                             &levels,
@@ -12046,6 +12212,7 @@ fn decode_rect_split(
                 skip_ctx,
                 dc_sign_ctx(around[plane_idx].2),
                 default_tx,
+                plane_idx,
             )?;
             // The same delta_q proof the unsplit rect64 path records
             // (lane-rectsplit r4: lifting the split-transform refusal moved
@@ -14510,6 +14677,7 @@ fn decode_block_rect(
                 0,
                 dc_sign_ctx(around[0].2),
                 TxType::DctDct,
+                0,
             )?;
             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 let (rng, _) = dec.debug_state();
@@ -14558,6 +14726,7 @@ fn decode_block_rect(
                 dc_sign_ctx(around[1].2),
                 u_default_tx,
                 fctx,
+                1,
             )?;
             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 let (rng, _) = dec.debug_state();
@@ -14605,6 +14774,7 @@ fn decode_block_rect(
                 dc_sign_ctx(around[2].2),
                 v_default_tx,
                 fctx,
+                2,
             )?;
             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 let (rng, _) = dec.debug_state();
@@ -15087,6 +15257,7 @@ fn decode_leaf_rect(
             0,
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
+            0,
         )?;
         if crate::envflags::env_flag!("EC_AV1_RECTX_TRACE") {
             let nz: Vec<(usize, i32)> = l_levels
@@ -15141,6 +15312,7 @@ fn decode_leaf_rect(
             dc_sign_ctx(around[1].2),
             u_default_tx,
             fctx,
+            1,
         )?;
         u_levels = u_l;
         let u_residual = dequant_and_inverse_typed_wh(
@@ -15185,6 +15357,7 @@ fn decode_leaf_rect(
             dc_sign_ctx(around[2].2),
             v_default_tx,
             fctx,
+            2,
         )?;
         v_levels = v_l;
         let v_residual = dequant_and_inverse_typed_wh(
@@ -15608,6 +15781,7 @@ fn decode_block_rect4(
             0,
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
+            0,
         )?;
         hit!(RECT4_COEFF_HITS);
         let luma_residual = dequant_and_inverse_typed_wh(
@@ -15758,6 +15932,7 @@ fn decode_block_rect4(
             0,
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
+            0,
         )?;
         let mut planes = Vec::with_capacity(2);
         for plane in 1..3 {
@@ -15783,6 +15958,7 @@ fn decode_block_rect4(
                 dc_sign_ctx(around[plane].2),
                 default_tx,
                 fctx,
+                plane,
             )?;
             planes.push((levels, tx_type));
         }
@@ -17313,6 +17489,7 @@ fn decode_rect4_16_strip(
                         tu_skip_ctx,
                         dc_sign_ctx(tu_around.2),
                         TxType::DctDct,
+                        0,
                     )?;
                     let residual = dequant_and_inverse_typed_wh(
                         &tu_grid,
@@ -17419,6 +17596,7 @@ fn decode_rect4_16_strip(
                 0,
                 dc_sign_ctx(around.2),
                 TxType::DctDct,
+                0,
             )?;
             let residual = dequant_and_inverse_typed_wh(
                 &levels,
@@ -17935,6 +18113,7 @@ fn decode_rect4_16_strip(
                     dc_sign_ctx(around[plane].2),
                     default_tx,
                     fctx,
+                    plane,
                 )?;
                 planes.push((levels, tx_type));
             }
@@ -18441,6 +18620,7 @@ fn decode_block_rect64(
                 0,
                 dc_sign_ctx(around[0].2),
                 TxType::DctDct,
+                0,
             )?
         };
         if coeff_trace_on() {
@@ -18596,6 +18776,7 @@ fn decode_block_rect64(
                             dc_sign_ctx(cu_around[plane_idx].2),
                             TxType::DctDct,
                             fctx,
+                            plane_idx,
                         )?;
                         let residual = dequant_and_inverse_typed_wh(
                             &levels,
@@ -19822,6 +20003,8 @@ fn read_plane(
     if plane_idx > 0 && mono(fctx) {
         return Ok(Grid::Zero(side * side));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
@@ -20074,6 +20257,7 @@ fn read_rect_chroma_unit(
         usize::from(around.0) + usize::from(around.1) + chroma_skip_offset.unwrap_or(0),
         dc_sign_ctx(around.2),
         default_tx,
+        plane_idx,
     )?;
     let residual = dequant_and_inverse_typed_wh(
         &levels,
@@ -23125,6 +23309,7 @@ fn leaf8_chroma422_unit(
         usize::from(around.0) + usize::from(around.1),
         dc_sign_ctx(around.2),
         default_tx,
+        plane_idx,
     )?;
     let residual = dequant_and_inverse_typed_wh(
         &levels,
@@ -23775,6 +23960,7 @@ fn sub8_leaf_chroma444(
                         skip_ctx,
                         dc_sign_ctx(around[plane_idx].2),
                         default_tx,
+                        plane_idx,
                     )?;
                     let residual = dequant_and_inverse_typed_wh(
                         &levels,
@@ -23954,6 +24140,7 @@ fn sub8_leaf_chroma444(
                     skip_ctx,
                     dc_sign_ctx(around[plane_idx].2),
                     default_tx,
+                    plane_idx,
                 )?;
                 let residual = dequant_and_inverse_typed_wh(
                     &levels,
@@ -25337,6 +25524,7 @@ fn decode_leaf_rect8(
                         skip_ctx,
                         dc_sign_ctx(around.2),
                         TxType::DctDct,
+                        0,
                     )?;
                     if li == 0 {
                         chroma_tx = tx_type;
@@ -25748,6 +25936,7 @@ fn decode_leaf_rect8(
                 0,
                 dc_sign_ctx(around.2),
                 TxType::DctDct,
+                0,
             )?;
             if levels.iter().any(|&l| l != 0) {
                 if vert {
@@ -28200,6 +28389,13 @@ fn read_inter_rect_chroma(
     (write_chroma_w, write_chroma_h): (usize, usize),
     chroma_side: usize,
     mode_for_tx: usize,
+    // lane-av1chrtx: this block's coded luma transform leaves, `(row, col,
+    // tw, th, tx_type)` -- the same list the 4:4:4 four-unit arms resolve
+    // through `covering_leaf_tx_type`. This sibling used to hand EVERY unit
+    // the block-level `luma_tx_type` (the top-left leaf's type), so a rect
+    // inter block whose chroma plane splits (`nx*ny > 1`) over MIXED var-tx
+    // leaves read the wrong type per unit.
+    leaf_tx_types: &[(usize, usize, usize, usize, TxType)],
     luma_tx_type: TxType,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, Grid, Vec<((usize, usize), usize, Grid, usize, usize)>)> {
@@ -28225,7 +28421,12 @@ fn read_inter_rect_chroma(
     let invalid_ss_plane =
         ss_x(fctx) == 1 && ss_y(fctx) == 0 && (write_chroma_w, write_chroma_h) == (4, 32);
     let (uw, uh) = if invalid_ss_plane { (4, 8) } else { (uw, uh) };
-    let inherit_tx_type = Some(luma_tx_type);
+    // lane-av1chrtx: `inherit_tx_type` is resolved PER UNIT below, not once
+    // for the block -- `av1_get_tx_type` (blockd.h:1287-1297) reads
+    // `xd->tx_type_map` at the chroma unit's own position scaled back to
+    // luma, so a unit sitting over a luma leaf that coded NOTHING takes that
+    // leaf's `DCT_DCT` stamp (`decodetxb.c:199-203`), not the block-level
+    // (top-left leaf) type.
     let (nx, ny) = (write_chroma_w / uw, write_chroma_h / uh);
     let multi = nx * ny > 1;
     let set = rect_inter_chroma_set(uw, uh)?;
@@ -28263,6 +28464,7 @@ fn read_inter_rect_chroma(
                     at_mi.0 + cu_row * (span_y / MI),
                     at_mi.1 + cu_col * (span_x / MI),
                 );
+                let unit_rel_mi = (cu_mi.0 - at_mi.0, cu_mi.1 - at_mi.1);
                 let cu_around = if multi {
                     // lane-av1422ctxgather: at ss (1,0) the unit's above
                     // span covers `uw` chroma px = `2*uw` luma mi columns,
@@ -28282,6 +28484,16 @@ fn read_inter_rect_chroma(
                 };
                 let (cu_x, cu_y) = (cpx + cu_col * uw, cpy + cu_row * uh);
                 let cu_pred = src.offset(cu_row * uh * chroma_side + cu_col * uw);
+                let inherit_tx_type =
+                    if let Some(t) = covering_leaf_tx_type(leaf_tx_types, unit_rel_mi) {
+                        hit!(CHROMA_RECT_LEAF_TX_HITS);
+                        if Some(t) != Some(luma_tx_type) {
+                            hit!(CHROMA_RECT_LEAF_TX_DIFF_HITS);
+                        }
+                        Some(t)
+                    } else {
+                        Some(luma_tx_type)
+                    };
                 let cu_grid = read_inter_plane_rect(
                     dec,
                     cdfs,
@@ -28366,6 +28578,8 @@ fn read_inter_plane_rect(
     if plane_idx > 0 && mono(fctx) {
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         // `get_txb_ctx_general`: 0 only when this unit IS the whole plane
         // block; a var-tx leaf passes its own neighbour-table context.
@@ -28442,6 +28656,7 @@ fn read_inter_plane_rect(
             skip_ctx,
             dc_sign_ctx(around.2),
             default_tx_type,
+            plane_idx,
         )?
     };
     let grid = extend_corner(corner, cw, ch, w, h);
@@ -35436,6 +35651,8 @@ fn read_inter_plane(
     if plane_idx > 0 && mono(fctx) {
         return Ok((Grid::Zero(side * side), TxType::DctDct));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
@@ -35662,10 +35879,7 @@ fn read_intra_chroma_lossless(
 /// skipped (the returned order is the identity). `changed` is `true` only
 /// when the sort actually permutes the list, so a no-op ordering reads zero
 /// on [`MU_CHUNK_ORDER_HITS`] and cannot make a gate look armed.
-fn mu_chunk_order(
-    leaves: &[(usize, usize, usize, usize)],
-    side: usize,
-) -> (Vec<usize>, bool) {
+fn mu_chunk_order(leaves: &[(usize, usize, usize, usize)], side: usize) -> (Vec<usize>, bool) {
     let identity: Vec<usize> = (0..leaves.len()).collect();
     if side <= 64 {
         return (identity, false);
@@ -37944,6 +38158,39 @@ pub(crate) fn chroma_quad_leaf_tx_diff_hits() -> usize {
     CHROMA_QUAD_LEAF_TX_DIFF_HITS.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// lane-av1chrtx: chroma units of a RECT inter block
+    /// ([`read_inter_rect_chroma`], the sibling of the 4:4:4 four-unit arms)
+    /// that resolved their `tx_type` from the luma leaf covering their OWN
+    /// quadrant instead of the block-level one. A SEPARATE counter from
+    /// [`CHROMA_QUAD_LEAF_TX_HITS`] on purpose: that one gates a 4:2:0 control
+    /// that must stay at exactly 0, and this route IS reachable at 4:2:0, so
+    /// sharing the counter would destroy that control's meaning.
+    pub(crate) static CHROMA_RECT_LEAF_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Of those, how many resolved a type that DIFFERS from the block-level
+    /// one -- the condition that changes pixels. A route counter alone fires
+    /// on every multi-unit rect chroma read, including the blocks whose
+    /// leaves all agree (the exact shape a no-op fix looks green on).
+    pub(crate) static CHROMA_RECT_LEAF_TX_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`CHROMA_RECT_LEAF_TX_HITS`]: rect chroma units that took their type from
+/// the covering luma leaf.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_rect_leaf_tx_hits() -> usize {
+    CHROMA_RECT_LEAF_TX_HITS.with(std::cell::Cell::get)
+}
+
+/// [`CHROMA_RECT_LEAF_TX_DIFF_HITS`]: of those, the units whose covering
+/// leaf's type differs from the block-level one.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_rect_leaf_tx_diff_hits() -> usize {
+    CHROMA_RECT_LEAF_TX_DIFF_HITS.with(std::cell::Cell::get)
+}
+
 fn decode_inter_block(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -39875,6 +40122,7 @@ fn decode_inter_block(
                         (write_chroma_w, write_chroma_h),
                         chroma_stride,
                         mode_for_tx,
+                        &leaf_tx_types,
                         luma_tx_type,
                         fctx,
                     )?;
@@ -41667,6 +41915,7 @@ fn decode_inter_block(
                         (write_chroma_w, write_chroma_h),
                         chroma_stride,
                         mode_for_tx,
+                        &leaf_tx_types,
                         luma_tx_type,
                         fctx,
                     )?;
@@ -42317,8 +42566,7 @@ fn decode_inter_block(
                 if side > 64 {
                     let chunk = (row / 16, col / 16);
                     let done = pos + 1 == order.len()
-                        || (leaves[order[pos + 1]].0 / 16, leaves[order[pos + 1]].1 / 16)
-                            != chunk;
+                        || (leaves[order[pos + 1]].0 / 16, leaves[order[pos + 1]].1 / 16) != chunk;
                     if !done {
                         continue;
                     }
@@ -44694,6 +44942,7 @@ fn decode_intra_sub8_leaf(
                 0,
                 dc_sign_ctx(around.2),
                 TxType::DctDct,
+                0,
             )?;
             let residual = dequant_and_inverse_typed_wh(
                 &levels,
@@ -45079,6 +45328,7 @@ fn decode_intra_sub8_leaf(
                     skip_ctx,
                     dc_sign_ctx(around.2),
                     uv_tx,
+                    plane,
                 )?;
                 let residual = dequant_and_inverse_typed_wh(
                     &levels,
@@ -52762,6 +53012,46 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+    /// lane-av1chrtx: [`covering_leaf_tx_type`] resolves a chroma unit's
+    /// `tx_type` from the luma leaf covering the unit's OWN quadrant, and
+    /// reports "no leaf there" as `None` so the caller can fall back to the
+    /// block-level type. Both halves are load-bearing: the 128 mu-chunk tail,
+    /// the 4:4:4 four-unit arms and `read_inter_rect_chroma` all read the
+    /// `None` arm as "this block coded a single luma unit".
+    #[test]
+    fn covering_leaf_tx_type_picks_the_leaf_under_the_unit_or_reports_none() {
+        use TxType::*;
+        // A 32x64 strip's five-leaf tree, in decode order: one 32x32 leaf
+        // over mi rows 0..8, then 16x16 leaves. (row, col) are MI relative
+        // to the block, (tw, th) are PIXELS, MI == 4.
+        let leaves = [
+            (0usize, 0usize, 32usize, 32usize, Idtx),
+            (8, 0, 16, 16, VDct),
+            (8, 4, 16, 16, DctDct),
+            (12, 0, 16, 16, HDct),
+            (12, 4, 16, 16, VDct),
+        ];
+        // The TOP chroma unit (its own mi cell (0,0)) sits over the 32x32
+        // leaf; the LOWER one (mi (8,0)) over the first 16x16 leaf. The
+        // block-level type is the first leaf's, so only the second read
+        // differs -- exactly the condition the gate's DIFF counter counts.
+        assert_eq!(covering_leaf_tx_type(&leaves, (0, 0)), Some(Idtx));
+        assert_eq!(covering_leaf_tx_type(&leaves, (8, 0)), Some(VDct));
+        // Interior cells resolve the same leaf as the cell's top-left: the
+        // lookup is a rectangle containment test, not a raster position.
+        assert_eq!(covering_leaf_tx_type(&leaves, (11, 3)), Some(VDct));
+        assert_eq!(covering_leaf_tx_type(&leaves, (12, 4)), Some(VDct));
+        // The bottom-right corner of the last leaf, and the mi cell just
+        // past the block's own extent, must not fall into a neighbour.
+        assert_eq!(covering_leaf_tx_type(&leaves, (15, 7)), Some(VDct));
+        assert_eq!(covering_leaf_tx_type(&leaves, (16, 0)), None);
+        assert_eq!(covering_leaf_tx_type(&leaves, (0, 8)), None);
+        // A block with no var-tx tree (one coded luma unit) has no leaves at
+        // all: the caller's block-level fallback is the answer, and the
+        // resolver must say so rather than guess.
+        assert_eq!(covering_leaf_tx_type(&[], (0, 0)), None);
+    }
+
     /// lane-av1422warp r33: the OBMC pair-merge snap must move the READ to
     /// libaom's position, not the reported offset.
     ///
