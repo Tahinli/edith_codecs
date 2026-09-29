@@ -2293,6 +2293,21 @@ mod count_vacuity {
                     }
                 }
             }
+            // A DOC COMMENT is prose about code, not code. One row in the ledger
+            // was a `///` line quoting a gate's pre-fix body (`stream.rs:30924`,
+            // inside `pinned_lr_sgr_stream_call_unique_dump`) and the sweep
+            // counted it as an unpinned count site for a whole round: the gate
+            // it describes already spends `FRAMES` and asserts
+            // `pics.len() == FRAMES`. Skipping comment lines is not cosmetic --
+            // without it the ledger carries a row no reader can act on, and the
+            // ceiling can never reach 0.
+            //
+            // Only the SITE scan skips comments. The pin-window walk further
+            // down still sees every line, because a `//`-led line there is a
+            // comment BETWEEN the assert and the call, not a site.
+            if t.starts_with("//") {
+                continue;
+            }
             for callee in CALLEES {
                 let Some(at) = line.find(callee) else {
                     continue;
@@ -2604,21 +2619,27 @@ mod count_vacuity_tests {
         // against the encode instead of read off our decode. Two rows survived
         // that round; lane-av1pinspec2 closed both, so the ceiling is now 0.
         //
-        // lane-av1pinspec2: 2 -> 1, for the SVT row. That gate was handed
-        // forward last round because the count was underivable: the stream came
-        // from `EC_AV1_SVT1_STREAM`, was never committed, and the gate SKIPped
-        // on a stock box -- so a wire-derived assert would have been an
-        // unexercised assert wearing a pin's clothes. The crop is now COMMITTED
-        // (`fixtures/svt1-split-tx-pin.obu`, a byte-reproducible replay of a
-        // `-frames:v 1` libsvtav1 encode), the gate reads it, and its count
-        // comes from the stream's own OBU frame headers with
-        // `show_existing_frame` asserted false, so a header count cannot
-        // over-count. The gate runs on a stock box, so the assert executes.
+        // lane-av1pinspec2: 2 -> 0, in two steps.
+        //   * `an_svt_screen_palette_block_with_a_split_transform_decodes_exactly`
+        //     was handed forward because the count was underivable: the stream
+        //     came from `EC_AV1_SVT1_STREAM`, was never committed, and the gate
+        //     SKIPped on a stock box -- so a wire-derived assert would have been
+        //     an unexercised assert wearing a pin's clothes. The crop is now
+        //     COMMITTED (`fixtures/svt1-split-tx-pin.obu`, a byte-reproducible
+        //     replay of a `-frames:v 1` libsvtav1 encode), the gate reads it, and
+        //     its count comes from the stream's own OBU frame headers with
+        //     `show_existing_frame` asserted false so a header count cannot
+        //     over-count. The gate runs on a stock box, so the assert executes.
+        //   * the other row was a `///` DOC COMMENT quoting the pre-r4 body of
+        //     `pinned_lr_sgr_stream_call_unique_dump`, which this line-based
+        //     scan could not tell from code. `sites()` now skips comment lines,
+        //     so the row is no longer a site at all.
         //
-        // The remaining unpinned row is a `///` DOC COMMENT quoting the pre-r4
-        // body of `pinned_lr_sgr_stream_call_unique_dump`, which this
-        // line-based scan cannot tell from code.
-        const UNPINNED_CEILING: usize = 1;
+        // RED-BEFORE for the comment skip, which is a coverage change and not a
+        // cosmetic one: with the `t.starts_with("//")` guard removed and this
+        // ceiling at 0, the doc-comment row comes BACK as an unpinned site and
+        // reds with "1 unpinned count site(s), ceiling is 0".
+        const UNPINNED_CEILING: usize = 0;
         let unpinned = s.iter().filter(|x| x.pinned_by.is_none()).count();
         assert!(
             unpinned <= UNPINNED_CEILING,
@@ -2679,6 +2700,78 @@ mod count_vacuity_tests {
         assert!(
             !s.is_empty() && s.iter().all(|x| !x.gate.is_empty()),
             "a site has no owning gate -- the sweep's gate attribution is broken"
+        );
+    }
+
+    /// The comment skip is a COVERAGE change, so it is held to the same shape
+    /// the `pin_inventory` capability tests use: a SYNTHETIC source, not the
+    /// live tree, with BOTH halves. Run against the live tree instead, a fix
+    /// to the very gate that motivated it would delete the row that proves the
+    /// scanner still works -- the failure mode `pin_inventory` already records
+    /// as "a scanner that cannot see this shape is how 14 pins survived three
+    /// rounds".
+    ///
+    /// Half one: a count call that lives INSIDE a doc comment must not be a
+    /// site. That is the real `stream.rs:30924` row, which spent a whole round
+    /// in the ledger as an unpinned count no reader could act on -- the gate it
+    /// quotes already spends `FRAMES` and asserts `pics.len() == FRAMES`.
+    ///
+    /// Half two, the control: the SAME call as real code must still be a site,
+    /// and must still be pinned by an assert above it. A scanner that skips
+    /// comments by skipping the wrong thing looks identical on half one, and a
+    /// ceiling of 0 is exactly the state where an over-broad skip would go
+    /// unnoticed.
+    #[test]
+    fn a_doc_commented_count_call_is_not_a_site_but_real_code_still_is() {
+        let commented = r#"
+    /// The old body passed the wrong count to the oracle:
+    ///     let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
+    /// so a decoder that emitted zero frames asked ffmpeg for zero frames.
+    fn a_gate_whose_doc_comment_quotes_the_old_body() {
+        let pics = decode_stream(&data).unwrap();
+    }
+"#;
+        let commented_sites = sites(commented);
+        assert!(
+            commented_sites.is_empty(),
+            "a count call inside a `///` doc comment was counted as a site: {:?} -- a line-based \
+             scan cannot tell prose from code, and this row is why it now skips comment lines",
+            commented_sites
+                .iter()
+                .map(|x| (x.line, x.count_expr.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        let real = r#"
+    fn a_gate_that_really_spends_its_own_decode_length() {
+        let pics = decode_stream(&data).unwrap();
+        assert_eq!(pics.len(), 7, "{NAME}: expected seven key frames");
+        let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
+    }
+"#;
+        let found = sites(real);
+        assert_eq!(
+            found.len(),
+            1,
+            "the control did not find its one real site: {:?} -- the comment skip is over-broad \
+             if the same call is skipped as code",
+            found
+                .iter()
+                .map(|x| (x.line, x.count_expr.clone(), x.gate.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            found[0].count_expr, "pics.len()",
+            "control: wrong count expr"
+        );
+        assert_eq!(
+            found[0].gate, "a_gate_that_really_spends_its_own_decode_length",
+            "control: wrong gate attribution"
+        );
+        assert!(
+            found[0].pinned_by.is_some(),
+            "the control's site is UNPINNED: the comment skip changed the pin window too, \
+             because a `//` line between an assert and its call is still walked"
         );
     }
 }
