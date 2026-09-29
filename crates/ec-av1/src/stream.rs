@@ -140,6 +140,23 @@ pub fn reset_ibc444rect_hits() {
     crate::decode::reset_ibc444rect_hits()
 }
 
+/// lane-av1chromarect: 128-root intra-BC HORZ/VERT strips whose chroma plane
+/// block was sized `bw >> ss_x` by `bh >> ss_y` rather than the hardcoded
+/// 4:2:0 halving -- i.e. the 4:4:4 (and 4:4:0) cells, where
+/// `av1_get_max_uv_txsize` (`ss_size_lookup[bsize]`, blockd.h:1372) applies no
+/// halving of its own. At 4:2:0 the two forms are the same arithmetic, so a
+/// `>= 1` witness can only come from a stream that is not 4:2:0. EXCLUSIVE to
+/// `decode_intrabc_owned_rect`: no other caller sizes a 128-root intra-BC
+/// strip's chroma plane block.
+pub fn ibc_owned_rect_chroma_footprint_444_hits() -> usize {
+    crate::decode::ibc_owned_rect_chroma_footprint_444_hits()
+}
+
+/// Gate-side reset for the lane-av1chromarect counter above.
+pub fn reset_ibc_owned_rect_chroma_footprint_444_hits() {
+    crate::decode::reset_ibc_owned_rect_chroma_footprint_444_hits()
+}
+
 /// `(y, uv)` palette blocks RECONSTRUCTED inside an inter frame (lane-t900
 /// r22) -- the counter a screen-content witness gate reads to prove it
 /// exercises the inter-frame palette path, not the key frame's.
@@ -48681,5 +48698,140 @@ pub(crate) mod tests {
              sample 51360 -- the chroma tail is the OPEN entropy fork \
              (lanes/ibc444c.report.md r2), NOT an assertion"
         );
+    }
+
+    /// lane-av1chromarect: the 128-root intra-BC HORZ/VERT strip's chroma
+    /// plane block, on the 4:4:4 LOSSY witness `fixtures/r512.obu` that
+    /// reaches `decode_intrabc_owned_rect` five times.
+    ///
+    /// The extent is the ss-derived one (`bw >> ss_x` by `bh >> ss_y`;
+    /// `av1_get_max_uv_txsize` = `ss_size_lookup[bsize]`, blockd.h:1372), and
+    /// the plane block is walked by `get_vartx_max_txsize` steps -- a 4:4:4
+    /// 32x64 luma block's chroma plane block is 32x64, which libaom codes as
+    /// TWO `TX_32X32` units, not as one 32x64 transform.
+    ///
+    /// This gate WAS the refusal assertion "a rectangular inter chroma
+    /// transform unit whose shape has no coefficient table set here", put
+    /// there one commit earlier so that the day the arm landed it would go
+    /// RED and force this rewrite. The refusal string is GONE from the
+    /// witness's decode because nothing reaches it any more, not because it
+    /// was deleted: `rect_inter_chroma_set` still refuses (32, 64) and the
+    /// string is still in the source, it is just not on this path any more.
+    ///
+    /// The assertion is a per-(frame, plane) EXACT PREFIX against the
+    /// instrumented aomdec, the same shape as the sibling
+    /// `a_444_intrabc_rect_chroma_plane_block_is_the_block_footprint`. The
+    /// floors are MEASURED, and each one only grows:
+    ///
+    /// * luma is byte-exact on ALL THREE frames (786432/786432 samples).
+    ///   Before the fix frame 0 luma was 166229 samples wrong from 65728 --
+    ///   the halving's chroma misread desynced the tile.
+    /// * frame 2 is byte-exact on all three planes. Before the fix it was
+    ///   9216 U + 8192 V wrong.
+    /// * frames 0 and 1 carry an OPEN chroma fork at a DIFFERENT site (see
+    ///   lanes/av1chromarect.report.md); the floors below are the exact
+    ///   prefixes, not a claim that the tail is right.
+    #[test]
+    fn a_444_intrabc_owned_rect_strip_sizes_its_chroma_plane_block_and_decodes() {
+        const NAME: &str =
+            "a_444_intrabc_owned_rect_strip_sizes_its_chroma_plane_block_and_decodes";
+        const FILE: &str = "r512.obu";
+        const LEN: usize = 6948;
+        /// 512x512 8-bit 4:4:4, one plane.
+        const PLANE: usize = 512 * 512;
+        /// First differing sample per (frame, plane), decode order.
+        const EXACT_PREFIX: [[usize; 3]; 3] = [
+            [PLANE, 229728, 229728],
+            [PLANE, 65704, 65704],
+            [PLANE, PLANE, PLANE],
+        ];
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{FILE}"));
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: pinned fixture {FILE} missing: {e}"));
+        assert_eq!(stream.len(), LEN, "{NAME}: {FILE} length moved");
+        assert_444_header(&stream, NAME, 8);
+
+        let _guard = lock_gate_counters();
+        reset_ibc_owned_rect_chroma_footprint_444_hits();
+        // The refusal this gate used to assert must NOT be what happens now.
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, &stream).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        let decoded = decode_stream(&stream);
+        set_final_dump_prefix(None);
+        if let Err(e) = decoded {
+            panic!(
+                "{NAME}: this decoder refused the witness: {e} -- the chroma plane block is \
+                 sized ss-wide and walked in `get_vartx_max_txsize` units, so the 4:4:4 32x64 \
+                 plane block is two TX_32X32 units, NOT the rect unit the refusal named"
+            );
+        }
+        let hits = ibc_owned_rect_chroma_footprint_444_hits();
+        assert_eq!(
+            hits, 5,
+            "{NAME}: {hits} 128-root intra-BC strip(s) sized at 4:4:4, not 5 -- the witness \
+             stopped exercising the arm"
+        );
+        assert!(
+            !std::fs::read(format!("{}.f0", ours_prefix.display()))
+                .unwrap_or_default()
+                .is_empty(),
+            "{NAME}: our decoder wrote no frame"
+        );
+        for f in 0..3 {
+            let aom_dump = std::fs::read(format!("{}.f{f}", aom_prefix.display()))
+                .unwrap_or_else(|e| panic!("{NAME}: oracle dump f{f} missing: {e}"));
+            let our_dump = std::fs::read(format!("{}.f{f}", ours_prefix.display()))
+                .unwrap_or_else(|e| panic!("{NAME}: our dump f{f} missing: {e}"));
+            assert_eq!(
+                our_dump.len(),
+                3 * PLANE,
+                "{NAME}: frame {f} is not 8-bit 4:4:4 512x512"
+            );
+            assert_eq!(
+                our_dump.len(),
+                aom_dump.len(),
+                "{NAME}: frame {f} length differs"
+            );
+            for (plane, name) in [(0usize, "Y"), (1, "U"), (2, "V")] {
+                let at = plane * PLANE;
+                let floor = EXACT_PREFIX[f][plane];
+                if our_dump[at..at + floor] == aom_dump[at..at + floor] {
+                    continue;
+                }
+                let first = (0..floor)
+                    .find(|&s| our_dump[at + s] != aom_dump[at + s])
+                    .unwrap_or(floor);
+                panic!(
+                    "{NAME}: frame {f} plane {name} diverges from the oracle at sample {first} \
+                     of {PLANE} (x={}, y={}) -- the exact prefix this gate pins is {floor} and \
+                     it only grows",
+                    first % 512,
+                    first / 512
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
