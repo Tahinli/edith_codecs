@@ -289,3 +289,95 @@ The four pins recovered earlier in this lane (`golden4-pin.obu` 137 B
 `golden7-forwarding-mismatch.obu` 152 B `81b3bf65…`, `lr-sgr-r7.obu` 192 B
 `6b95b20e…`) are committed with `recovered-original` provenance; they lived only
 in the gitignored root, i.e. only in each machine's scratchpad.
+
+## 7. Three-host run on the FLIPPED tree (commit f4e1ac6b)
+
+Every host: its own staged library at `~/gates/library/fixtures`, passed as
+`EC_FIXTURES`; the source tarball excludes the root `fixtures/`, so the preflight
+resolves against that host's library and nothing else.
+
+```
+EC_FIXTURES=~/gates/library/fixtures EC_REQUIRE_FIXTURES=1 \
+  ./scripts/verify-fixture-library.sh
+```
+
+| host | library | verify exit | verdict | census | violations | invariant-1 control | census self-test |
+|---|---|---|---|---|---|---|---|
+| 178.105.165.182 | 793 files | 0 | GREEN (303 rows) | 8 / 21 / 0 / 0 / 0 | 0 | fired | passed |
+| 51.195.223.40 | 793 files | 0 | GREEN (303 rows) | 8 / 21 / 0 / 0 / 0 | 0 | fired | passed |
+| 2.28.124.204 | 802 files | 0 | GREEN (303 rows) | 8 / 21 / 0 / 0 / 0 | 0 | fired | passed |
+
+Census columns are `total / committed / uncommitted / ignored / assertless`.
+
+**Not vacuous, re-proved on all three.** `cp -al` the staged library, remove
+`video/h264-open-gop.mp4` from the COPY, rerun with `EC_FIXTURES` pointed at the
+copy:
+
+```
+FAIL [mode ii]: 2 referenced fixture path(s) do not resolve,
+  fixtures/video/h264-open-gop.mp4  <-  crates/ec-h264/tests/conformance.rs:2381  (regenerated, generator: scripts/gen-fixtures.sh)
+  fixtures/video/h264-open-gop.mp4  <-  crates/ec-hw/tests/gpu.rs:2793  (regenerated, generator: scripts/gen-fixtures.sh)
+  '+ only committed' is a row this host cannot satisfy ...
+```
+
+exit 1 on every host, naming the path, both referencing sites, the generator and
+the drift row. The real library was untouched — 793 files before and after on
+h1/h2, 802 on h3 — and GREEN again immediately afterwards. `cp -al` hardlinks,
+so `rm` removes only the copy's link; nothing in a staged library is reachable
+from the probe.
+
+**The hosts still differ, and the extra files are still unreachable.** h1 and h2
+have byte-identical library listings (same md5 over `find | sort`, 793 files);
+h3 has 802. The nine extra paths are `hbd-r5/{hunger,troy}.obu`,
+`part32/troy-extract.obu`, `realworld/{hunger-games,troy}.obu`,
+`sbpart/{seed42.obu,seed42.y4m,seed42.y.gray,seed42.yuv}`, `sub8`. Stated
+explicitly rather than left to inference: **the manifest carries zero rows under
+`fixtures/hbd-r5`, `fixtures/part32`, `fixtures/realworld`, `fixtures/sub8` and
+`fixtures/sbpart`, and no string literal anywhere in `crates/*/src` or
+`crates/*/tests` names any file inside them.** So this preflight gives no
+coverage of that difference — it is the grep-derived blind spot, measured rather
+than assumed, and closing it means either a sync decision (delete what nothing
+reads) or code that actually reads those pins. Neither is this lane's call, and
+nothing was re-synced.
+
+Six modes on the flipped tree, re-measured after the census fix:
+
+| mode | exit |
+|---|---|
+| A intact, `EC_REQUIRE_FIXTURES=1` | 0 — GREEN (303 rows) |
+| B one fixture renamed, flag set | 1 — `FAIL [mode ii]` |
+| C same rename, flag unset | 0 — SKIP-shaped report |
+| D `EC_FIXTURES=/nonexistent`, flag set | 1 — `FAIL [mode i]` |
+| E intact, flag set, `--strict` | 0 |
+| F a reintroduced `concat!` root-pin line, flag set | 1 — `FAIL [invariant 1]`, no flag needed |
+
+## 8. The census hole, and the control that closes it
+
+Kerem-5 measured a real defect: `fn_bodies` spans a gate's body from its `fn`
+line to the NEXT `fn` line, so a doc comment belonging to the following gate sits
+inside the previous gate's body. `ROOT_RE` matched the comment, the gate was
+reclassified into the root-literal branch, found no names and hit `continue` — the
+census count dropped and **nothing went red**, with `uncommitted=0` still reading
+clean. Unproven read as clean, which is the principle this lane exists to hold.
+
+Two things close that door, and the second is the one that matters:
+
+1. every search — `ROOT_RE`, `JOIN_RE`, the `crate_pin`/`pin_dir` singles, the
+   `asserts` check — matches on a comment-stripped body (`/* */`, `//`, `///`).
+2. `scripts/pin-gate-audit.py --self-test` is a positive control in the exact
+   shape: a comment reproducing the forbidden literal INSIDE a gate that reads
+   `crate_pin`, plus a second gate after it. It runs the real pipeline over a
+   synthetic tree in a temp dir (so it works on a read-only staged tree) and
+   asserts both gates are still counted as `crate_pin`. The verifier runs it and
+   fails if it does not pass.
+
+**Mutation-proved, because a control nobody made fail is not a control:** with the
+comment-stripping removed from the self-test path it fails with
+`reclassified=[('selftest_a_reads_a_pin', 'root-literal')]`; restored, it passes.
+A control that only proved "the scanner finds a forbidden literal" would NOT have
+caught this, which is exactly why the census needed its own.
+
+Measured with the verbatim prose restored — the state that ships, since the
+sentence explaining the removed shape is what a reader needs: census
+`total=8 committed=21 uncommitted=0 ignored=0 assertless=0`, violations 0, both
+controls firing, verify GREEN.
