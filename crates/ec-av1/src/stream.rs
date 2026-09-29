@@ -30290,48 +30290,103 @@ pub(crate) mod tests {
     /// `EC_LR_CALL_DUMP=1` set (see `restoration.rs`'s `apply_sgrproj_stripe`)
     /// to get the real window on stderr, call-uniquely keyed to `xqd ==
     /// [-16,-32]` rather than any coordinate.
+    /// lane-av1pinslive r4: this gate asserted NOTHING. It `eprintln!`d per-frame
+    /// mismatch flags and returned, so it could not go red on a decode regression
+    /// -- which is why r3 left it `#[ignore]`d on that fact rather than un-ignoring
+    /// it. It now carries the same three things its three siblings have: a pinned
+    /// FRAME COUNT, a length assert before the zip, and per-plane per-frame pixel
+    /// asserts. The diagnostic print is kept, and now runs BEFORE the asserts so a
+    /// failure still names the shape of the divergence.
+    ///
+    /// The frame count is the substantive fix. The old body passed `pics.len()` as
+    /// ffmpeg's EXPECTED count:
+    ///     let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
+    /// so a decoder that emitted ZERO frames asked ffmpeg for zero frames, the zip
+    /// compared no pairs, and the gate passed having proved nothing -- the exact
+    /// vacuous-pass shape the `cmpaudit` lane swept elsewhere in this crate. The
+    /// count now comes from the FIXTURE (`FRAMES`), so losing the frame reds on the
+    /// count instead of comparing nothing.
+    ///
+    /// On "does it compare only frame 0": the loop always visited every frame; this
+    /// pin simply holds one (`frame 0` was the only line the pre-r4 run printed).
+    /// The loop is unchanged in that respect and still visits every frame it gets.
+    ///
+    /// The `EC_LR_CALL_DUMP=1` window is unchanged and still needs that env -- but
+    /// it is a debugging session layered on a real gate now, not the gate itself.
     #[test]
-    // Stays `#[ignore]`d, and here are FACTS, not a judgement: (1) this gate
-    // asserts NOTHING -- it `eprintln!`s per-frame mismatch counts and returns,
-    // so it cannot go red on a decode regression and un-ignoring it would add a
-    // test that reports pass unconditionally; (2) its bytes ARE now committed
-    // at `crates/ec-av1/fixtures/lr-sgr-r7.obu` (192 bytes; sha256
-    // `6b95b20e3377430ffae0b2ce86fad9502e0dedf13cd6c38ab7f5af4a8b21f33d`,
-    // recovered byte-for-byte from the runner library), so the old "reads a
-    // pinned fixture under the gitignored fixtures dir" reason is false; (3) it
-    // yields a window only with `EC_LR_CALL_DUMP=1`, a debugging session rather
-    // than a suite run. What would close it: give it the pixel asserts its
-    // siblings have, then un-ignore.
-    #[ignore = "diagnostic only -- asserts nothing, so it cannot fail on a decode regression; run with --ignored and EC_LR_CALL_DUMP=1 for the Sgrproj window"]
     fn pinned_lr_sgr_stream_call_unique_dump() {
+        const NAME: &str = "pinned_lr_sgr_stream_call_unique_dump";
+        const W: usize = 192;
+        const H: usize = 128;
+        /// Measured: the pre-r4 run printed `frame 0` and no other frame line.
+        const FRAMES: usize = 1;
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| crate_pin("lr-sgr-r7.obu"));
         let stream = require_pin(&path, "lr-sgr-r7.obu");
         let pics = decode_stream(&stream).expect("pinned lr-sgr-r7.obu must decode");
-        if have_ffmpeg() {
-            let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
-            for (i, (got, want)) in pics.iter().zip(&reference).enumerate() {
-                let y_mismatch = got.y != want.y;
-                let u_mismatch = got.u != want.u;
-                let v_mismatch = got.v != want.v;
-                eprintln!(
-                    "frame {i}: y_mismatch={y_mismatch} u_mismatch={u_mismatch} v_mismatch={v_mismatch}"
-                );
-                if y_mismatch {
-                    let n = got.y.iter().zip(&want.y).filter(|(a, b)| a != b).count();
-                    eprintln!("  {n} luma bytes differ / {}", got.y.len());
-                }
-                if v_mismatch {
-                    let w = 96usize; // chroma plane width (192/2)
-                    for (idx, (a, b)) in got.v.iter().zip(&want.v).enumerate() {
-                        if a != b {
-                            eprintln!("  V[{},{}] got={a} want={b}", idx / w, idx % w);
-                        }
+        assert_eq!(
+            pics.len(),
+            FRAMES,
+            "{NAME}: decoded {} frame(s), the pinned stream holds {FRAMES} -- a short \
+             decode would otherwise ask ffmpeg for the same short count and compare \
+             nothing",
+            pics.len()
+        );
+        for f in &pics {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP {NAME}: no ffmpeg -- the pixel compare IS this gate's claim, so it \
+                 proves nothing here; set EC_AV1_REQUIRE_FFMPEG=1 to make that a hard \
+                 failure instead"
+            );
+            return;
+        }
+        let reference = ffmpeg_decode_sequence(&stream, W, H, FRAMES);
+        assert_eq!(
+            reference.len(),
+            FRAMES,
+            "{NAME}: ffmpeg returned {} frame(s), expected {FRAMES}",
+            reference.len()
+        );
+        for (i, (got, want)) in pics.iter().zip(&reference).enumerate() {
+            let y_mismatch = got.y != want.y;
+            let u_mismatch = got.u != want.u;
+            let v_mismatch = got.v != want.v;
+            eprintln!(
+                "frame {i}: y_mismatch={y_mismatch} u_mismatch={u_mismatch} v_mismatch={v_mismatch}"
+            );
+            if y_mismatch {
+                let n = got.y.iter().zip(&want.y).filter(|(a, b)| a != b).count();
+                eprintln!("  {n} luma bytes differ / {}", got.y.len());
+            }
+            if v_mismatch {
+                let w = 96usize; // chroma plane width (192/2)
+                for (idx, (a, b)) in got.v.iter().zip(&want.v).enumerate() {
+                    if a != b {
+                        eprintln!("  V[{},{}] got={a} want={b}", idx / w, idx % w);
                     }
                 }
             }
+            assert_eq!(
+                got.y, want.y,
+                "{NAME} frame {i} luma vs ffmpeg (pinned lr-sgr)"
+            );
+            assert_eq!(
+                got.u, want.u,
+                "{NAME} frame {i} U vs ffmpeg (pinned lr-sgr)"
+            );
+            assert_eq!(
+                got.v, want.v,
+                "{NAME} frame {i} V vs ffmpeg (pinned lr-sgr)"
+            );
         }
+        eprintln!(
+            "{NAME}: {FRAMES} frame(s) byte-exact vs ffmpeg from {}",
+            path.display()
+        );
     }
 
     /// lane-realworld r2: `read_cdef` (spec 5.11.56) ported -- per-superblock
