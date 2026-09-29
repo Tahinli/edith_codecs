@@ -157,6 +157,20 @@ pub fn reset_ibc_owned_rect_chroma_footprint_444_hits() {
     crate::decode::reset_ibc_owned_rect_chroma_footprint_444_hits()
 }
 
+/// lane-av1chromadc: chroma units of a skipped block whose intra-BC / UV
+/// palette override had to be windowed to the unit's own extent -- `cn_cols *
+/// cn_rows > 1`, which at 4:2:0 never happens and at 4:4:4 is every block of
+/// 64 and above. Counts UNITS. EXCLUSIVE to `decode_block`'s skipped square
+/// block chroma walk.
+pub fn skip_chroma_override_window_hits() -> usize {
+    crate::decode::skip_chroma_override_window_hits()
+}
+
+/// Gate-side reset for the lane-av1chromadc counter above.
+pub fn reset_skip_chroma_override_window_hits() {
+    crate::decode::reset_skip_chroma_override_window_hits()
+}
+
 /// `(y, uv)` palette blocks RECONSTRUCTED inside an inter frame (lane-t900
 /// r22) -- the counter a screen-content witness gate reads to prove it
 /// exercises the inter-frame palette path, not the key frame's.
@@ -49282,19 +49296,21 @@ pub(crate) mod tests {
     /// was deleted: `rect_inter_chroma_set` still refuses (32, 64) and the
     /// string is still in the source, it is just not on this path any more.
     ///
-    /// The assertion is a per-(frame, plane) EXACT PREFIX against the
-    /// instrumented aomdec, the same shape as the sibling
-    /// `a_444_intrabc_rect_chroma_plane_block_is_the_block_footprint`. The
-    /// floors are MEASURED, and each one only grows:
+    /// The floors were RAISED to full byte-exactness on all three planes of
+    /// all three frames by lane-av1chromadc, which closed the "open chroma
+    /// fork" this gate used to carry: a skipped 64x64 square block at 4:4:4
+    /// has a 64x64 chroma plane block, libaom walks it as a 2x2 grid of
+    /// `TX_32X32` units, and the intra-BC chroma override was handed to every
+    /// unit whole instead of windowed per unit (see
+    /// `a_444_skipped_64x64_square_block_windows_its_chroma_override_per_unit`
+    /// and lanes/av1chromadc.report.md). The history of these floors:
     ///
-    /// * luma is byte-exact on ALL THREE frames (786432/786432 samples).
-    ///   Before the fix frame 0 luma was 166229 samples wrong from 65728 --
-    ///   the halving's chroma misread desynced the tile.
-    /// * frame 2 is byte-exact on all three planes. Before the fix it was
-    ///   9216 U + 8192 V wrong.
-    /// * frames 0 and 1 carry an OPEN chroma fork at a DIFFERENT site (see
-    ///   lanes/av1chromarect.report.md); the floors below are the exact
-    ///   prefixes, not a claim that the tail is right.
+    /// * lane-av1chromarect, after the ss-derived extent and the multi-unit
+    ///   walk: `[[262144, 229728, 229728], [262144, 65704, 65704],
+    ///   [262144, 262144, 262144]]` -- luma exact on all three frames, frame 2
+    ///   exact on all three planes, 79969 chroma samples still wrong.
+    /// * lane-av1chromadc: `[[262144; 3]; 3]` -- every plane of every frame
+    ///   byte-exact against aomdec. Floors only ever grow.
     #[test]
     fn a_444_intrabc_owned_rect_strip_sizes_its_chroma_plane_block_and_decodes() {
         const NAME: &str =
@@ -49303,12 +49319,9 @@ pub(crate) mod tests {
         const LEN: usize = 6948;
         /// 512x512 8-bit 4:4:4, one plane.
         const PLANE: usize = 512 * 512;
-        /// First differing sample per (frame, plane), decode order.
-        const EXACT_PREFIX: [[usize; 3]; 3] = [
-            [PLANE, 229728, 229728],
-            [PLANE, 65704, 65704],
-            [PLANE, PLANE, PLANE],
-        ];
+        /// Exact prefix per (frame, plane), decode order. FULL: every plane of
+        /// every frame is byte-exact against the oracle.
+        const EXACT_PREFIX: [[usize; 3]; 3] = [[PLANE; 3]; 3];
         let path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{FILE}"));
         let stream = std::fs::read(&path)
@@ -49391,6 +49404,116 @@ pub(crate) mod tests {
                     "{NAME}: frame {f} plane {name} diverges from the oracle at sample {first} \
                      of {PLANE} (x={}, y={}) -- the exact prefix this gate pins is {floor} and \
                      it only grows",
+                    first % 512,
+                    first / 512
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// lane-av1chromadc: a SKIPPED 64x64 square block at 4:4:4 has a 64x64
+    /// chroma plane block, which libaom walks as a 2x2 grid of `TX_32X32` units
+    /// (`get_vartx_max_txsize`: `av1_get_adjusted_tx_size(TX_64X64) =
+    /// TX_32X32`). The intra-BC / UV-palette chroma override
+    /// ([`decode_block`]'s `intrabc_bufs` / `palette_uv_bufs`, the
+    /// `PALETTE_PRED` slot) is a whole-`chroma_side x chroma_height` buffer and
+    /// must be WINDOWED per unit: `PlaneBuf::reconstruct` uses the buffer it
+    /// takes as the unit's own `side x side` prediction. At 4:2:0 the chroma
+    /// plane block is one 32x32 unit, so the whole buffer IS that unit's
+    /// window and the bug is invisible -- which is why it survived every 4:2:0
+    /// gate. At 4:4:4 every unit was handed the buffer's FIRST 32x32, so the
+    /// block's right and bottom chroma columns were a copy of its top-left
+    /// unit.
+    ///
+    /// The witness: `fixtures/r512.obu`, 4:4:4 8-bit 512x512, three frames. The
+    /// seed is frame 0, `mi=(112,80)`, `px=(320,448)`, `side=64`, `skip=1`,
+    /// `mode=0`, `uv_mode=0` -- a skipped intra-BC block at the frame's bottom
+    /// edge. Its chroma unit `cu=(1,0)` at `px=(352,448)` reconstructs a flat
+    /// 241 (U) / 110 (V) where the oracle has 202 / 222, because it read the
+    /// same override window as `cu=(0,0)`.
+    ///
+    /// This gate asserts FULL frame exactness on all three planes of all three
+    /// frames. It is the red-before: on the unpatched tree it fails at
+    /// `(352,448)` of frame 0, which is the seed's second chroma unit.
+    #[test]
+    fn a_444_skipped_64x64_square_block_windows_its_chroma_override_per_unit() {
+        const NAME: &str = "a_444_skipped_64x64_square_block_windows_its_chroma_override_per_unit";
+        const FILE: &str = "r512.obu";
+        const LEN: usize = 6948;
+        const PLANE: usize = 512 * 512;
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{FILE}"));
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: pinned fixture {FILE} missing: {e}"));
+        assert_eq!(stream.len(), LEN, "{NAME}: {FILE} length moved");
+        assert_444_header(&stream, NAME, 8);
+
+        let _guard = lock_gate_counters();
+        reset_skip_chroma_override_window_hits();
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, &stream).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        if let Err(e) = decode_stream(&stream) {
+            panic!("{NAME}: this decoder refused the witness: {e}");
+        }
+        set_final_dump_prefix(None);
+        // Non-vacuity: the windowed arm must have run, or the exactness below
+        // is measuring a witness that never reached the 2x2 chroma walk.
+        let windows = skip_chroma_override_window_hits();
+        assert!(
+            windows >= 8,
+            "{NAME}: {windows} windowed chroma override unit(s) on this witness, expected at \
+             least 8 (two skipped 64x64 intra-BC blocks x 2x2 units x 2 planes) -- the witness \
+             stopped exercising the arm, so the exactness below is vacuous"
+        );
+        for f in 0..3 {
+            let aom_dump = std::fs::read(format!("{}.f{f}", aom_prefix.display()))
+                .unwrap_or_else(|e| panic!("{NAME}: oracle dump f{f} missing: {e}"));
+            let our_dump = std::fs::read(format!("{}.f{f}", ours_prefix.display()))
+                .unwrap_or_else(|e| panic!("{NAME}: our dump f{f} missing: {e}"));
+            assert_eq!(
+                our_dump.len(),
+                3 * PLANE,
+                "{NAME}: frame {f} is not 8-bit 4:4:4 512x512"
+            );
+            for (plane, name) in [(0usize, "Y"), (1, "U"), (2, "V")] {
+                let at = plane * PLANE;
+                if our_dump[at..at + PLANE] == aom_dump[at..at + PLANE] {
+                    continue;
+                }
+                let first = (0..PLANE)
+                    .find(|&s| our_dump[at + s] != aom_dump[at + s])
+                    .unwrap_or(PLANE);
+                let wrong = (0..PLANE)
+                    .filter(|&s| our_dump[at + s] != aom_dump[at + s])
+                    .count();
+                panic!(
+                    "{NAME}: decode-order frame {f} plane {name} is byte-exact nowhere -- first \
+                     divergence at sample {first} of {PLANE} (x={}, y={}), {wrong} samples \
+                     wrong. The seed is frame 0, mi=(112,80) px=(320,448) side=64 skip=1, whose \
+                     chroma unit cu=(1,0) at px=(352,448) must be the SECOND 32x32 window of \
+                     the block's chroma override and not a copy of cu=(0,0)'s.",
                     first % 512,
                     first / 512
                 );
