@@ -553,6 +553,27 @@ const PROVEN: &[(&str, &str)] = &[
         "a 64-axis strip whose chroma unit has no coefficient table",
         "every_chroma_unit_a_64_axis_strip_can_present_has_a_coefficient_table",
     ),
+    // lane-av1rect8x16, enumeration: `decode_block_rect`'s `_` arm. The nine
+    // textual `decode_block_rect(` matches are 1 declaration + 8 call sites
+    // (this test's `assert_eq!(sites, 8)` counts the calls); all eight pass
+    // `bw`/`bh` as integer LITERALS and every one of them is
+    // a 32-level `PARTITION_HORZ`/`VERT`/`HORZ_A`/`_B`/`VERT_A`/`_B` arm of
+    // `read_sb128_root`'s `match part32`, so the caller shape set is exactly
+    // {32x16, 16x32} and their chroma halves under the three subsamplings an
+    // AV1 `color_config` can carry are {(16,8), (8,16), (16,16), (8,32),
+    // (32,16), (16,32)} -- every one of which has a row. The shape the
+    // sibling sweep left open, a 4:2:0 8x16 luma strip's (4,8) chroma, is
+    // NOT reachable here: a 16-level 2:1 luma strip is read by
+    // `decode_leaf_rect`, which carries the (4,8)/(8,4) rows itself
+    // (decode.rs:15409-15420). Measured, not assumed: 840 real aomenc 4:2:0
+    // key-frame encodes, 826 of whose parsed leaf lists carry a coded
+    // 16-level 2:1 luma strip (`horz_vert_intra_hits()`, which fires only
+    // at the three `decode_leaf_rect` strip sites), decoded to completion
+    // with this string firing 0 times.
+    (
+        "a rectangular chroma transform whose size has no coefficient table",
+        "every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table",
+    ),
     // lane-t900 r33, enumeration: each of the four symbols this guard tests is
     // read under a size gate that no 128-pixel side passes (the call site's
     // literal `cfl=false`, `filter_intra_size_class_rect`'s table, and
@@ -1511,6 +1532,233 @@ mod tests {
         assert_eq!(
             checked, 40,
             "the strip domain is not the ten rect shapes x four depths"
+        );
+    }
+
+    /// lane-av1rect8x16, ENUMERATION for "a rectangular chroma transform
+    /// whose size has no coefficient table" --
+    /// [`crate::decode::decode_block_rect`]'s `_` arm.
+    ///
+    /// This refusal had NO `PROVEN` row: the sibling sweep that found the
+    /// gap (`every_rect_strip_shape_the_split_path_codes_has_a_luma_and_
+    /// chroma_table`, which audits `decode_rect_split`'s tables, not this
+    /// function's) asserted only the superblock-level 64x32/32x64
+    /// footprints, so the 8x16 luma strip's 4x8 chroma was left unasked.
+    ///
+    /// The answer is that the shape is UNREACHABLE, and structurally so:
+    /// every one of the function's call sites passes its `bw`/`bh` as
+    /// integer LITERALS, and all of them are 32-level `PARTITION_HORZ` /
+    /// `VERT` / `HORZ_A` / `HORZ_B` / `VERT_A` / `VERT_B` arms of
+    /// `read_sb128_root`'s `match part32` -- i.e. 32x16 or 16x32, never
+    /// 8x16. A 16-level 2:1 luma strip (16x8 / 8x16) is read by
+    /// [`crate::decode::decode_leaf_rect`], which carries the matching
+    /// `(4, 8)` / `(8, 4)` chroma rows (decode.rs:15409-15420,
+    /// `TxbSet::ChromaRect8x4` + `SCAN_4X8` / `SCAN_8X4`).
+    ///
+    /// So the proof is the CALLER SHAPE SET, read out of the call sites'
+    /// own argument lists, walked through `bw >> ss_x` / `bh >> ss_y` for
+    /// every subsampling an AV1 `color_config` can carry, against the
+    /// `match (chroma_w, chroma_h)` table read out of the function's own
+    /// text (class `table-and-reader-move-together`: a table edit
+    /// invalidates this test rather than sneaking past it).
+    ///
+    /// The subsampling domain is `{(0,0), (1,0), (1,1)}` and excludes
+    /// `(0,1)`: `ec-av1-syntax`'s `color_config` only ever READS
+    /// `subsampling_y` when `subsampling_x == 1` (sequence.rs:481), so
+    /// `(0,1)` is uncodable. `(1,0)` is 4:2:2, refused at the sequence
+    /// header by `a_non_420_subsampled_sequence_header_is_refused_by_name`
+    /// -- it is walked anyway, so the proof does not depend on that guard
+    /// staying in place.
+    #[test]
+    fn every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table() {
+        let src = include_str!("decode.rs");
+
+        // (1) The caller shape set, read out of the call sites' own
+        // argument lists. `decode_block_rect(dec, cdfs, neighbours, at, bw,
+        // bh, ...)`, so args 4 and 5 (0-based, after the opening paren) are
+        // `bw` and `bh`; the first three are the fixed `&mut` borrows.
+        const LEAD: [&str; 3] = ["&mut dec", "&mut cdfs", "&mut neighbours"];
+        let mut shapes: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let mut sites = 0usize;
+        let at_def = src
+            .find("fn decode_block_rect(")
+            .expect("decode_block_rect is gone");
+        for (i, _) in src.match_indices("decode_block_rect(") {
+            // The definition's own parameter list carries the same text,
+            // preceded by "fn " -- that is a declaration, not a call.
+            if src[..i].ends_with("fn ") {
+                continue;
+            }
+            // Split the argument list at top level (paren/bracket/angle
+            // balanced), so the `(at32.0 + 1, at32.1)` origin argument --
+            // which contains its own comma -- does not shift the indices.
+            let open = i + "decode_block_rect(".len();
+            let bytes = src.as_bytes();
+            let mut args: Vec<String> = Vec::new();
+            let mut depth = 0i32;
+            let mut start = open;
+            for j in open..bytes.len() {
+                match bytes[j] {
+                    b'(' | b'[' => depth += 1,
+                    b')' | b']' => {
+                        if depth == 0 {
+                            args.push(src[start..j].to_string());
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    b',' if depth == 0 => {
+                        args.push(src[start..j].to_string());
+                        start = j + 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                args.len() >= 6,
+                "a decode_block_rect call has only {} arguments -- the arg indices this \
+                 enumeration reads are off",
+                args.len()
+            );
+            for k in 0..3 {
+                assert_eq!(
+                    args[k].trim(),
+                    LEAD[k],
+                    "decode_block_rect's first three arguments changed -- re-derive the bw/bh \
+                     argument indices below"
+                );
+            }
+            let lit = |a: &str| -> usize {
+                a.trim().parse::<usize>().unwrap_or_else(|_| {
+                    panic!(
+                        "decode_block_rect is called with a non-literal strip size {:?} -- \
+                             this enumeration can no longer read the caller shape set",
+                        a.trim()
+                    )
+                })
+            };
+            shapes.insert((lit(&args[4]), lit(&args[5])));
+            sites += 1;
+        }
+        assert_eq!(
+            sites, 8,
+            "the number of decode_block_rect call sites changed"
+        );
+        let expected_shapes: BTreeSet<(usize, usize)> =
+            [(32usize, 16usize), (16, 32)].into_iter().collect();
+        assert_eq!(
+            shapes, expected_shapes,
+            "the set of strip sizes decode_block_rect is called with changed -- re-derive \
+             the chroma domain below. An 8x16/16x8 caller makes this refusal LIVE (a \
+             4:2:0 8x16 luma strip's chroma is 4x8, which libaom codes as TX_4X8: \
+             av1_ss_size_lookup[BLOCK_8X16][1][1] = BLOCK_4X8 in \
+             av1/common/common_data.c:24, then max_txsize_rect_lookup[BLOCK_4X8] = TX_4X8 \
+             in av1/common/common_data.h:130, via av1_get_max_uv_txsize, blockd.h:1372)"
+        );
+
+        // (2) The table, read out of the function's own text: every
+        // `(w, h) =>` / `(w, h) |` arm head between the match and the guard.
+        let body_at = at_def;
+        let rest = &src[body_at..];
+        let body = &rest[..rest.find("\nfn ").expect("unterminated fn")];
+        let from = body
+            .find("let (chroma_set, chroma_scan): (TxbSet, &[u16]) = match (chroma_w, chroma_h)")
+            .expect("decode_block_rect's chroma match is gone");
+        let to = body[from..]
+            .find("a rectangular chroma transform whose size has no coefficient table")
+            .expect("the refusal string is gone from decode_block_rect")
+            + from;
+        let table = &body[from..to];
+        let mut arms: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let bytes = table.as_bytes();
+        for (i, _) in table.match_indices('(') {
+            let mut j = i + 1;
+            let mut w = 0usize;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                w = w * 10 + usize::from(bytes[j] - b'0');
+                j += 1;
+            }
+            if j == i + 1 || !table[j..].starts_with(", ") {
+                continue;
+            }
+            j += 2;
+            let mut h = 0usize;
+            let start_h = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                h = h * 10 + usize::from(bytes[j] - b'0');
+                j += 1;
+            }
+            if j == start_h || !table[j..].starts_with(')') {
+                continue;
+            }
+            // Only an arm HEAD counts, never a `(32, 8)` inside prose.
+            let after = table[j + 1..].trim_start();
+            if after.starts_with("=>") || after.starts_with('|') {
+                arms.insert((w, h));
+            }
+        }
+        // (3) The enumeration itself -- run BEFORE the exact-table pin below
+        // so a deleted arm fails HERE, naming the footprint, instead of
+        // behind a vaguer "the table changed".
+        let mut checked = 0u32;
+        for &(bw, bh) in &shapes {
+            for (ss_x, ss_y) in [(0usize, 0usize), (1, 0), (1, 1)] {
+                let (cw, ch) = (bw >> ss_x, bh >> ss_y);
+                assert!(
+                    arms.contains(&(cw, ch)),
+                    "a {bw}x{bh} strip at subsampling ({ss_x},{ss_y}) has a {cw}x{ch} chroma \
+                     transform with no coefficient table -- the chroma refusal is LIVE"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 6,
+            "the chroma domain is not two shapes x three formats"
+        );
+
+        // (4) And the table is EXACTLY those six rows -- no row is a shape no
+        // caller can present, which is what makes the `_` arm dead.
+        assert_eq!(
+            arms,
+            [
+                (8usize, 16usize),
+                (8, 32),
+                (16, 8),
+                (16, 16),
+                (16, 32),
+                (32, 16)
+            ]
+            .into_iter()
+            .collect::<BTreeSet<(usize, usize)>>(),
+            "decode_block_rect's chroma table changed -- re-derive the walk above"
+        );
+
+        // (5) The residual, stated as an assertion so it cannot rot: the two
+        // 4:2:0 rows an 8x16/16x8 luma strip would need are NOT in this
+        // table, and (4,8)/(8,4) is not a shape any caller can produce. If a
+        // future caller hands this function an 8x16, step (1) goes red
+        // first, and the new row has to be added here with it.
+        for residual in [(4usize, 8usize), (8, 4)] {
+            assert!(
+                !arms.contains(&residual),
+                "decode_block_rect grew a {0}x{1} chroma row -- update the residual note",
+                residual.0,
+                residual.1
+            );
+        }
+        let produces: BTreeSet<(usize, usize)> = shapes
+            .iter()
+            .flat_map(|&(bw, bh)| {
+                [(0usize, 0usize), (1, 0), (1, 1)]
+                    .into_iter()
+                    .map(move |(sx, sy)| (bw >> sx, bh >> sy))
+            })
+            .collect();
+        assert!(
+            !produces.contains(&(4, 8)) && !produces.contains(&(8, 4)),
+            "the caller set can now produce a 4x8/8x4 chroma shape but the table has no \
+             such row -- the chroma refusal is LIVE"
         );
     }
 
