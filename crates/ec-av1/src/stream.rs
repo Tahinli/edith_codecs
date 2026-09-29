@@ -21110,6 +21110,106 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1f9singleland: `decode_inter_block` has TWO textually parallel
+    /// copies of the 4:4:4 four-unit chroma arm -- the compound prediction
+    /// arm (the `build` closure) and the single-reference arm. Both resolve
+    /// each unit's `tx_type` through `covering_leaf_tx_type` over a
+    /// `leaf_tx_types` list collected at EVERY size, both bumped the same
+    /// `CHROMA_QUAD_LEAF_TX_HITS` / `..._DIFF_HITS` pair, and the gate above
+    /// asserts only that pair. So that gate cannot say which arm its witness
+    /// came from, and the two arms can be reverted independently.
+    ///
+    /// Measured on the gate's own witness `fixtures/444_quad_leaf_tx_type.obu`
+    /// (the census is the point of this test, so it is quoted rather than
+    /// assumed): 96 chroma units resolve through their covering luma leaf, of
+    /// which 88 are the single-reference arm's and 8 the compound arm's; of
+    /// the 8 units whose resolved type DIFFERS from the block-level one --
+    /// the non-vacuity bar, since a block whose four leaves agree makes the
+    /// per-quadrant resolve a no-op -- ALL 8 are the single-reference arm's.
+    /// The shared counters' non-vacuity number is therefore 100%
+    /// single-reference, and the compound arm contributes 8 of 96 route hits
+    /// and none of the 8 that change an answer.
+    ///
+    /// The other 26 pinned 4:4:4 fixtures in this tree reach the arm zero
+    /// times (`444_intrabc_rect4_witness`, `444_leaf8_oob`,
+    /// `444_lossy_rect4_*`, `444_lossy_superres_*`, `444_sb128rect_lr_witness`,
+    /// and every `ll444_*`), so this one witness is the only thing pinning
+    /// the single-reference copy of the arm at all.
+    ///
+    /// Non-vacuity, per the mutation recorded in
+    /// `lanes/av1f9singleland.report.md`: reverting ONLY this arm's
+    /// `Some(cu_tx_type)` to `Some(luma_tx_type)` turns this gate red on
+    /// decode-order frame 1 with 777 bytes differing; gating ONLY this arm's
+    /// leaf push back behind `if side > 64` (the pre-`6c33f204` state) turns
+    /// it red with the same 777 bytes.
+    #[test]
+    fn the_pinned_444_quadrant_witness_is_the_single_reference_arms_and_not_only_the_compound_arms() {
+        const NAME: &str =
+            "the_pinned_444_quadrant_witness_is_the_single_reference_arms_and_not_only_the_compound_arms";
+        const FIXTURE_LEN: usize = 27933;
+        const FIXTURE_FNV: u64 = 0x85fa_830b_8800_90df;
+        let _gate_lock = lock_gate_counters();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_quad_leaf_tx_type.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let q0 = crate::decode::chroma_quad_leaf_tx_hits();
+        let s0 = crate::decode::chroma_quad_leaf_tx_singleref_hits();
+        let sd0 = crate::decode::chroma_quad_leaf_tx_singleref_diff_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the witness no longer decodes: {e}"))
+            .len();
+        assert_eq!(frames, 4, "{NAME}: expected 4 shown frames");
+        let quad = crate::decode::chroma_quad_leaf_tx_hits() - q0;
+        let singleref = crate::decode::chroma_quad_leaf_tx_singleref_hits() - s0;
+        let sr_diff = crate::decode::chroma_quad_leaf_tx_singleref_diff_hits() - sd0;
+
+        assert!(
+            singleref > quad / 2,
+            "{NAME}: the single-reference arm resolved {singleref} of {quad} covering-leaf chroma \
+             units -- the shared counter is no longer dominated by the arm this gate witnesses, so \
+             a revert of the single-reference copy would leave the shared total comfortably non-zero"
+        );
+        assert!(
+            sr_diff >= 2,
+            "{NAME}: the single-reference arm's per-quadrant resolve never CHANGED an answer \
+             (differing {sr_diff}). A route count alone is not a witness: it fires on every \
+             four-unit chroma read, including the blocks whose four luma leaves all agree -- the \
+             exact shape a no-op resolve looks green on."
+        );
+        eprintln!(
+            "{NAME}: {singleref} of {quad} covering-leaf units are the single-reference arm's, \
+             {sr_diff} of which changed an answer"
+        );
+
+        // 4:2:0 control, as in the gate above: the four-unit arm is the 4:4:4
+        // (`ss 0/0`) route only, so the single-reference arm's own counters
+        // must stay at exactly 0 there too.
+        let control = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/av1_192x128_8bit_intra64_in_inter.obu"),
+        )
+        .unwrap_or_else(|e| panic!("{NAME}: reading the 4:2:0 control: {e}"));
+        let c_s0 = crate::decode::chroma_quad_leaf_tx_singleref_hits();
+        let c_sd0 = crate::decode::chroma_quad_leaf_tx_singleref_diff_hits();
+        let c_frames = decode_stream(&control)
+            .unwrap_or_else(|e| panic!("{NAME}: the 4:2:0 control no longer decodes: {e}"))
+            .len();
+        assert!(c_frames > 0, "{NAME}: the 4:2:0 control decoded no frames");
+        assert_eq!(
+            (
+                crate::decode::chroma_quad_leaf_tx_singleref_hits() - c_s0,
+                crate::decode::chroma_quad_leaf_tx_singleref_diff_hits() - c_sd0,
+            ),
+            (0, 0),
+            "{NAME}: the 4:2:0 control fired the single-reference arm's four-unit route -- the \
+             counter is not specific to the route it claims to witness"
+        );
+    }
+
     /// lane-av1chrtx: the SIBLING of lane-av1444chr's four-unit arm -- a RECT
     /// inter block's chroma plane, read by `read_inter_rect_chroma`. That
     /// helper was left handing every unit the block-level `luma_tx_type`
