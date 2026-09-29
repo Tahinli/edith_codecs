@@ -11880,6 +11880,11 @@ pub(crate) mod tests {
                  reader for this orientation is untested (coded horz/vert = {coded:?})",
                 if *want_orient == 0 { "HORZ" } else { "VERT" }
             );
+            // The ENCODE's frame count: the per-arm render (11756) uses `-t 0.2`
+            // at TS256/TS512's `rate=25` (11700, 11701) -- 5 input frames -- and
+            // the aomenc args carry `--limit=1` (11797), so all three arms code
+            // exactly 1 frame. Asserted ABOVE the oracle call.
+            assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
             let theirs = ffmpeg_decode_sequence(&stream, *width, *height, frames.len());
             assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
             for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -12022,6 +12027,16 @@ pub(crate) mod tests {
                 assert!(
                     !frames.is_empty(),
                     "{NAME}: {arm} decoded no frame at {threads} recon thread(s)"
+                );
+                // The ENCODE's frame count: the skip_arms encode (11904) renders
+                // TS512 with `-t 0.2` at `rate=25` (11907) and its aomenc runs
+                // with `--limit=1` (11945), so the stream holds 1 coded frame --
+                // and this loop re-decodes those SAME bytes at each `threads`
+                // value, so the count is arm-invariant. Asserted ABOVE the call.
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "{NAME}: {arm} key frame at {threads} recon thread(s)"
                 );
                 let theirs = ffmpeg_decode_sequence(&stream, *width, *height, frames.len());
                 assert_eq!(
@@ -12265,6 +12280,14 @@ pub(crate) mod tests {
                     let blocks = crate::decode::intrabc_hits();
                     blocks_total += blocks;
                     blocks_at_depth[usize::from(depth == 10)] += blocks;
+                    // The ENCODE's frame count:
+                    // `screen_intrabc_stream_at_depth` (12203) renders
+                    // `smptebars=size=128x96:rate=25` with `-t 0.2` and
+                    // `-vf tile=2x2` (12066, 12069) -- 5 frames in, 1 tiled frame
+                    // out at 256x192 -- and its aomenc runs with `--limit=1`
+                    // (12101), so all eight (depth, txs, cq) arms code exactly
+                    // 1 frame. Asserted ABOVE the oracle call.
+                    assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
                     let theirs = if depth == 10 {
                         ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                     } else {
@@ -12654,6 +12677,15 @@ pub(crate) mod tests {
                 Ok(frames) => {
                     let sub8 = crate::decode::sub8_split_hits() - sub8_before;
                     sub8_total += sub8;
+                    // The ENCODE's frame count: `screen_intrabc_stream_with` (12593)
+                    // renders `smptebars=size=128x96:rate=25` with `-t 0.2` and
+                    // `-vf tile=2x2` (12066, 12069) -- 5 frames in, 1 tiled frame
+                    // out -- and its aomenc runs with `--limit=1` (12101), so both
+                    // cq arms code exactly 1 frame. The census is report-only about
+                    // the COUNTS, but its Ok arm asserts pixel-exactness, so the
+                    // budget handed to ffmpeg is pinned here rather than derived
+                    // from the decode under test.
+                    assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
                     let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                     assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
                     for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -12729,6 +12761,15 @@ pub(crate) mod tests {
                 Ok(frames) => {
                     let vartx = crate::decode::intrabc_vartx_hits();
                     vartx_total += vartx;
+                    // The ENCODE's frame count: `screen_intrabc_stream` (12679)
+                    // renders `smptebars=size=128x96:rate=25` with `-t 0.2` and
+                    // `-vf tile=2x2` (12066, 12069) -- 5 frames in, 1 tiled frame
+                    // out -- and its aomenc runs with `--limit=1` (12101), so all
+                    // four cq arms code exactly 1 frame. The census is
+                    // report-only about the COUNTS, but its Ok arm does assert
+                    // pixel-exactness, so the budget it hands ffmpeg is pinned
+                    // here rather than derived from the decode under test.
+                    assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
                     let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                     assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
                     for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -12833,6 +12874,12 @@ pub(crate) mod tests {
                     "{NAME}: vacuous -- {trees} var-tx tree(s), {mixed} mixed: the \
                      capability this gate pins was never exercised"
                 );
+                // The ENCODE's frame count: `screen_intrabc_stream_with` (12766)
+                // renders `testsrc2=size=320x180:rate=25` with `-t 0.2` and
+                // `-vf tile=2x2` (12066, 12069) -- 5 frames in, 1 tiled frame out
+                // at 640x360 -- and its aomenc runs with `--limit=1` (12101), so
+                // the stream codes exactly 1 frame. Asserted ABOVE the call.
+                assert_eq!(frames.len(), 1, "{NAME}: key frame");
                 let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                 assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
                 let mut mismatched = 0usize;
@@ -13135,6 +13182,12 @@ pub(crate) mod tests {
                 "{NAME}: cq={cq} no longer reads the inter var-tx tree for an intrabc block"
             );
             eprintln!("{NAME}: cq={cq} {blocks} intrabc block(s), {vartx} through var-tx");
+            // The ENCODE's frame count: `screen_intrabc_stream` (12022) renders
+            // `smptebars=size=128x96:rate=25` with `-t 0.2` and `-vf tile=2x2`
+            // (12066, 12069) -- 5 frames in, 1 tiled frame out -- and its aomenc
+            // runs with `--limit=1` (12101), so both cq arms code exactly 1
+            // frame. Asserted ABOVE the oracle call.
+            assert_eq!(frames.len(), 1, "{NAME}: cq={cq} key frame");
             let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
             assert_eq!(frames.len(), theirs.len(), "{NAME}: cq={cq} frame count");
             for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
