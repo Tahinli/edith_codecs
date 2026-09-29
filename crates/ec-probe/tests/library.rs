@@ -487,7 +487,20 @@ fn a_real_library_sweep() {
             taken += 1;
         }
     }
-    assert!(!chosen.is_empty(), "no readable files in the manifest");
+    // lane-h264reallib: NOT an `assert!` here. The file's own header, lines
+    // 5-6, is the spec: "Files that have since moved are skipped and
+    // reported, never failed -- the manifest is a snapshot of a moving
+    // library." An empty `chosen` IS the moved-files case, so failing on it
+    // contradicted the contract this file declares. It was also red on any
+    // host whose manifest paths no longer resolve, for a reason that had
+    // nothing to do with the probe. Reported and returned, which is what
+    // "skipped and reported, never failed" asks for.
+    if chosen.is_empty() {
+        eprintln!(
+            "skipped: no readable file in the manifest (every row has moved or is unreadable)"
+        );
+        return;
+    }
 
     let mut rows = Vec::new();
     let mut failures = Vec::new();
