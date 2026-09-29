@@ -2257,7 +2257,15 @@ mod tests {
         let mut i = gate_at;
         let mut depth = 0usize;
         let mut open = None;
+        let mut last: Option<usize> = None;
         while i < b.len() {
+            // Every arm advances `i`, including the ones that `continue`. A spin
+            // here would hang the suite instead of failing it, which is the one
+            // outcome a boundary finder must never have.
+            if let Some(last) = last {
+                debug_assert!(i > last, "body_braces: an arm must advance the cursor");
+            }
+            last = Some(i);
             match b[i] {
                 b'/' if b.get(i + 1) == Some(&b'/') => {
                     i = src[i..].find('\n').map_or(b.len(), |n| i + n + 1);
