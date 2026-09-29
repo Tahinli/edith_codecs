@@ -30759,6 +30759,12 @@ pub(crate) mod tests {
                     // r4: the pixel filters are wired -- every `uses_lr`
                     // frame must now decode Ok AND match an independent
                     // decoder pixel-exact, not just refuse cleanly.
+                    // The ENCODE's frame count: every `EC_FISTRIP_SRC` branch
+                    // and the `gradients_source` default (30568-30573) render at
+                    // `rate=25` with a 1-frame `duration=0.04`, and aomenc runs
+                    // with no `--limit` (30590) -- so each attempt's stream codes
+                    // exactly 1 frame. Asserted ABOVE the oracle call.
+                    assert_eq!(pics.len(), 1, "{NAME}: seed {seed} key frame");
                     let reference = ffmpeg_decode_sequence(&stream, width, height, pics.len());
                     let mismatched = pics
                         .iter()
@@ -38337,6 +38343,20 @@ pub(crate) mod tests {
                 };
                 let after = crate::decode::edge32_hits();
                 let delta: Vec<usize> = (0..8).map(|i| after[i] - before[i]).collect();
+                // The ENCODE's frame count, and it is PER ARM: the arm tuple's
+                // `frame_count` field is what the y4m is built from
+                // (`duration = frame_count / 25.0`, 38085, rendered with
+                // `-t {duration}` at 38131) and this gate's aomenc carries no
+                // `--limit` and no `--lag-in-frames`, so the stream codes exactly
+                // `frame_count` frames (1 for the intra arms, 5 for the
+                // inter/straddling ones). Asserted ABOVE the oracle call, so a
+                // decode that dropped one reds naming the encode.
+                assert_eq!(
+                    decoded.len(),
+                    frame_count,
+                    "{name}: {tag}: the encode codes {frame_count} frame(s), the decode showed {}",
+                    decoded.len()
+                );
                 let reference = if ten_bit {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len())
                 } else {
