@@ -4429,6 +4429,12 @@ fn exec_intra(
         1 => &mut *u,
         _ => &mut *v,
     };
+    // lane-av1cmpaudit: label the in-flight reconstruction's plane for the
+    // `EC_PRED` rung (aomdec's `EC_PREDOUT8`/`EC_PREDND` print `plane=`).
+    // Saved and restored so the rung reports THIS call's plane even under
+    // nesting, and so both of exec_intra's return paths need no cleanup.
+    let prev_plane = RECON_PLANE.with(|c| c.replace(plane));
+    let _plane_guard = PlaneGuard(prev_plane);
     if rect {
         target.reconstruct_rect(
             x,
@@ -6993,6 +6999,31 @@ pub(crate) fn chroma_eob_class1_hits() -> usize {
 fn note_chroma_class1(plane_idx: usize, tx_type: TxType) {
     if plane_idx > 0 && TxClass::of(tx_type) != TxClass::TwoD {
         hit!(CHROMA_EOB_CLASS1_HITS);
+    }
+}
+
+// Which plane the in-flight INTRA reconstruction is writing (0=Y, 1=U, 2=V).
+// lane-av1cmpaudit: aomdec's `EC_PREDOUT8`/`EC_PREDND` print `plane=`, and
+// without the same field on our side an `EC_PREDOUT8` vs `OUR_PRED` diff of a
+// per-plane prediction cannot be read off ours -- a luma/chroma disagreement
+// looked identical to a same-plane disagreement. Set by `exec_intra` (the
+// single place a `PlaneBuf::reconstruct{,_rect}` is reached from) and read only
+// by the `EC_PRED` rung, so it cannot change a decode.
+thread_local! {
+    static RECON_PLANE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The plane index the `EC_PRED` rung prints as `plane=`.
+fn recon_plane() -> usize {
+    RECON_PLANE.with(std::cell::Cell::get)
+}
+
+/// Restores [`RECON_PLANE`] on drop, so `exec_intra` needs no cleanup path on
+/// either of its two early returns.
+struct PlaneGuard(usize);
+impl Drop for PlaneGuard {
+    fn drop(&mut self) {
+        RECON_PLANE.with(|c| c.set(self.0));
     }
 }
 
@@ -20240,8 +20271,9 @@ impl PlaneBuf<'_> {
             let row0: Vec<u16> = prediction[..bw.min(8)].to_vec();
             let col0: Vec<u16> = (0..bh.min(8)).map(|r| prediction[r * bw]).collect();
             eprintln!(
-                "@{} OUR_PRED x={x} y={y} bw={bw} bh={bh} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}",
+                "@{} OUR_PRED x={x} y={y} plane={} bw={bw} bh={bh} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}",
                 std::panic::Location::caller(),
+                recon_plane(),
                 i32::from(smooth_neighbor)
             );
         }
@@ -20379,8 +20411,9 @@ impl PlaneBuf<'_> {
             let row0: Vec<u16> = prediction[..side.min(8)].to_vec();
             let col0: Vec<u16> = (0..side.min(8)).map(|r| prediction[r * side]).collect();
             eprintln!(
-                "@{} OUR_PRED x={x} y={y} side={side} side={side} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}",
+                "@{} OUR_PRED x={x} y={y} plane={} side={side} side={side} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}",
                 std::panic::Location::caller(),
+                recon_plane(),
                 i32::from(smooth_neighbor)
             );
         }
