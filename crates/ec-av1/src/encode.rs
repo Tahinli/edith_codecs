@@ -18615,8 +18615,17 @@ mod tests {
     ///
     /// `#[ignore]`: [`force_sb128`] moves a process-global.
     ///
-    ///     cargo test -p ec-av1 --release --lib -- --ignored \
-    ///         a_128_superblock_clip_whose_drl_index_the_write_time_stack --nocapture
+    /// The drl-clamp cell this gate's counter used to gate is no longer gated
+    /// here: it is covered by
+    /// [`every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal`],
+    /// which enumerates the pricer's offer set against the writer's rule (see
+    /// its doc). The clamp needs a stack that shrinks between search and
+    /// write, which is what a 128x128 superblock's visit order would do -- but
+    /// the pricer never offers an index this tree's `write_drl_idx` cannot
+    /// signal, so no clip can provoke it (lane-av1recipehunt: 153 attempts, 0;
+    /// widening the pricer to `0..5` fires the counter immediately, reverting
+    /// silences it). `drl_clamp_hits` is kept as the tripwire for that fix.
+
     /// lane-b128: the 128x128 `PARTITION_NONE` root -- one block, one mode
     /// and one motion vector where the four 64x64 roots below spend four of
     /// each (cen3's L1). The counter is the gate on the fixture (class

@@ -407,3 +407,108 @@ test result: ok. 3 passed; 0 failed
   `EC_PROBE_OUT` writes u8 and every sample then differs from ffmpeg's
   `yuv420p10le` raw -- a 220438-byte "defect" that is purely a dump-format
   mismatch.
+
+---
+
+# r2 -- gate 1 disposed of, and the three pins re-verified on merged main
+
+Base moved: rebased onto `aa0ac8c2` ("lanes: merge-wave-2 clean-checkout
+census"), 58 commits past this lane's original `a21f3680`. One conflict, in the
+two 1:4 gates' comment slot, and it is worth recording because **two lanes
+reached the same two facts independently**: `lane-av1pins` had already re-run
+both 1:4 gates in RELEASE on the seven-lane tree and recorded that the pixel
+blocker was gone and the recipe never fired; this lane then found why and closed
+them. Both records are kept side by side in the resolved comment rather than
+either being dropped -- `lane-av1pins`' measurement is the merge-main evidence
+that the stale mandelbrot-defect claim was dead, and this lane's is the
+mechanism.
+
+## Gate 1: DELETED, and the coverage claim moved to where it is asserted
+
+**Decision: delete.** The evidence that decided it, in the order it was
+gathered:
+
+1. **The precondition is unreachable**, not merely unprovoked -- established in
+   r1 (per-mode offer-set table, the existing invariant test, 153 attempts, and
+   the `0..3 -> 0..5` mutation proof).
+2. **The pixel half is not unique to the gate.** The deleted test's second half
+   -- decode the encoded stream and compare every frame/plane against the
+   encoder's own reconstruction, on a 1280x768 `force_sb128(true)` sequence --
+   is already made **four times over** at the same geometry by
+   `a_128_superblock_clip_whose_root_search_codes_128x128_blocks_decodes_exact`,
+   `a_128_root_block_with_a_real_residual_decodes_exact_through_both_decoders`,
+   `a_128_root_residual_block_under_a_per_unit_cdef_list_decodes_exact` and
+   `a_rect128_half_with_a_real_residual_decodes_exact_through_both_decoders`
+   (all four verified: same `force_sb128(true)`, same own-reconstruction
+   compare, same ffmpeg compare).
+
+So deletion loses no coverage on **either** half. That is the point on which
+"delete vs keep" turned: had the pixel compare been unique, keeping the test
+with a fact-stating ignore string would have been the honest call, because
+`#[ignore]` is cheap and a deleted unique assertion is not recoverable from the
+report. It was not unique, so the gate was pure dead weight in `--list`.
+
+**Why the surviving invariant test is strictly better coverage, not a
+substitute.** It enumerates the pricer's whole offer set against
+`signalled_drl_idx` for stack sizes 0..=4, and 0..=4 bounds the DOMAIN rather
+than sampling it: `best_new_mv_syntax` breaks at `entries.len() <= idx` for
+`idx > 0`, so indices 3 and 4 are unreachable at *any* stack size, and a stack
+larger than 4 only adds entries neither pricer offers. A clip gate could only
+ever have sampled that space; this test closes it.
+
+**Where the disposition is visible.** The cell is not tracked in
+`gate_coverage.rs` or `refusal_inventory.rs` (grepped: no `drl_clamp`,
+`sb128b` or `write_time_stack` entry in either), so the claim lives on the test
+that now carries the coverage, at
+**`crates/ec-av1/src/encode.rs:15689`**, in
+`every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal`'s doc
+comment. It names the deleted gate, both substitutes, the measurement and the
+mutation proof. A second pointer was added at
+**`crates/ec-av1/src/encode.rs:18618`** on the sb128 gate whose own doc had a
+`cargo test` run-line still naming the deleted test -- a stale instruction left
+by the deletion, caught by grepping for the name after the cut.
+
+**What was deliberately NOT removed.** `note_drl_clamp` and `DRL_CLAMP_HITS`
+stay. They are unreachable today, but they are the tripwire for the owning fix
+(`deferred(unblock: the DRL owner widens `best_new_mv_syntax`'s offer set past
+the writer's `start + 2` ceiling, or retires the counter)`): the invariant test
+goes red the instant the offer set is widened, and `tile::drl_clamp_hits()`
+(printed by `enc_probe`) then shows the clamp on real content. Deleting the
+counter would have made the fix silent. The `#[cfg(test)]`
+`take_drl_clamp_hits()` had no reader left and WAS removed -- the
+non-destructive `drl_clamp_hits()` is the accessor that survives.
+
+## Re-verification of the three pins on merged main
+
+Run on the rebased tree at `aa0ac8c2` + this lane, RELEASE, **plain pass (no
+`--ignored`)**, with a private `CARGO_TARGET_DIR=$HOME/.cache/cargo-target-rh`
+and `touch` on the three edited sources first (the census/source-scan trap).
+
+```
+test encode::tests::every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal ... ok
+a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact (8-bit): 6 frames
+  pixel-exact, intra 1:4 strips in inter frames 64x16=0 16x64=0 32x8=8 8x32=11
+  (--enable-1to4-partitions=0 control: 0/0/0/0), stream 35179 B fnv1a64=86f8d1e5a221162a
+test stream::tests::a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact ... ok
+a_real_aomenc_stream_..._horz_vert_partition_and_delta_q_decodes_pixel_exact: 4 frames
+  pixel-exact, sb_rect_hits=40, rect64_qidx_drift_hits=17 (--deltaq-mode=0 control: 0),
+  stream 8384 B fnv1a64=3d91a21680063ef6
+test stream::tests::..._and_delta_q_decodes_pixel_exact ... ok
+a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit (10-bit):
+  6 frames pixel-exact, intra 1:4 strips in inter frames 64x16=0 16x64=0 32x8=12 8x32=7
+  (--enable-1to4-partitions=0 control: 0/0/0/0), stream 34727 B fnv1a64=ecf9455bc20d60f0
+test stream::tests::..._1to4_strip_decodes_pixel_exact_10bit ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 737 filtered out; finished in 4.71s
+```
+
+* **`0 ignored`** -- the three gates now run in a plain pass, as they must once
+  the recipes carry the coverage.
+* Every pin byte-identical to r1 after the rebase onto 58 new commits:
+  8384 B / `3d91a21680063ef6`, 35179 B / `86f8d1e5a221162a`,
+  34727 B / `ecf9455bc20d60f0`. Wave 2 did not perturb aomenc's output on any
+  of these three cells, which is the point of pinning.
+* Each gate printed its self-evidencing line with the counter AND its control
+  arm in the same line, so a reader can see from one line that the precondition
+  fires and that the feature flag is what fires it.
+* `cargo check --release -p ec-av1 --all-targets` clean on the rebased tree, no
+  warnings.
