@@ -17755,7 +17755,14 @@ mod tests {
     /// the sweep pictures and whatever clips `EC_AV1_CLIPS` names. This is what
     /// sets [`SPLIT_BLOCKS`]; the table it prints is in the lane report.
     #[test]
-    #[ignore = "a sweep, not a gate"]
+    // ROBUST-RED on this tree, and the red is in the MEASURE, not the codec:
+    // the `stripes` picture codes LOSSLESSLY at q110/90/70, so both ladders
+    // come back as three identical `(inf, 1.8260748027008264)` points and
+    // `bd_rate` has an empty trapezoid to integrate, which panics with
+    // "the two ladders have to overlap in PSNR". Row 1 (`test card`) still
+    // prints its number before the panic. Point `EC_AV1_CLIPS` at a real lossy
+    // clip, or read only row 1.
+    #[ignore = "a sweep, not a gate; PANICS on its own lossless synthetic rows (stripes is lossless at q110/90/70, so bd_rate has no PSNR overlap) -- point EC_AV1_CLIPS at a lossy clip"]
     fn probe_split() {
         let _knobs = crate::speed::knob_read();
         let fctx = &crate::decode::FrameCtx::for_encoder();
@@ -19964,13 +19971,25 @@ mod tests {
     }
 
     /// Breaks one inter frame's own cost into the four [`STAGE_NS`] buckets
-    /// (motion search, [`crate::mc::predict`], transform+quantize,
-    /// `coeff_bits`), plus what is left over once those are subtracted --
-    /// the thirteen-mode intra-candidate loop `search_inter_block` still
-    /// runs on every inter block (its own transform/quant/entropy calls are
-    /// already inside buckets 2/3, so "left over" here is everything NOT
-    /// timed: `crate::intra::predict` for those 13 modes, RD bookkeeping,
-    /// symbol-cost lookups outside `coeff_bits`).
+    /// plus what is left over once buckets 0/2/3 are subtracted.
+    ///
+    /// lane-av1probes: the two search-shaped buckets OVERLAP and the old
+    /// print denied it. Bucket 0 is not "the motion search": `stage_since(0,
+    /// ..)` fires only after `find_best_new_mv` and the global-MV search
+    /// (`encode.rs:11959`, `:12080`), so it is the NEWMV/GLOBAL sub-search
+    /// alone. Bucket 1 is EVERY `crate::mc::predict` call, from the search's
+    /// candidates *and* from a committed inter block's final prediction --
+    /// and that final prediction runs OUTSIDE any bucket-0 region. So bucket 1
+    /// is neither inside bucket 0 nor smaller than it, and a print that shows
+    /// it as "motion search (of which interpolation ...)" necessarily shows
+    /// a sub-number bigger than its parent. Measured: bucket 0 = 17.82 ms,
+    /// bucket 1 = 148.63 ms.
+    ///
+    /// Which number is real: BOTH timers are right; only the old ARITHMETIC
+    /// was wrong. Bucket 1 is now printed as its own top-level row, the
+    /// overlap is stated, and the residual is labelled for what it is -- it
+    /// absorbs the committed block's own interpolation, so it is not a pure
+    /// "13-mode intra candidate loop" figure either.
     ///
     /// `cargo test -p ec-av1 --release stage_timing_breakdown_inter -- --ignored --nocapture`.
     #[test]
@@ -20007,23 +20026,34 @@ mod tests {
         .unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
+        // Buckets 0 and 2 and 3 are disjoint and additive. Bucket 1 (every
+        // `mc::predict` call) is NOT added: it overlaps bucket 0 wherever a
+        // search candidate calls predict, and it also covers the committed
+        // block's final prediction, which no other bucket times. Adding it
+        // would double-count the overlap; leaving it out puts the committed
+        // prediction (and the intra candidate loop, RD glue, and the symbol
+        // lookups outside `coeff_bits`) into the residual, which is what the
+        // residual has always been.
         let accounted = motion_search + transform_quant + entropy;
-        // motion_search already contains interpolation's own time (every
-        // candidate the search costs calls crate::mc::predict), so it is not
-        // added again here -- interpolation is reported alongside as "of
-        // which interpolation", not as a fifth additive bucket.
         let other = total_t.saturating_sub(accounted);
+        let overlap = interpolation.saturating_sub(motion_search);
 
         eprintln!(
             "\n=== inter frame {width}x{height}, one frame ===\n\
              total:                          {total_t:>9.2?}  ({} bytes)\n\
-             motion search (NEWMV):          {motion_search:>9.2?}  (of which interpolation \
-             {interpolation:>9.2?})\n\
-             transform + quantize:           {transform_quant:>9.2?}\n\
-             coeff_bits (entropy pricing):   {entropy:>9.2?}\n\
-             everything else (13-mode intra  {other:>9.2?}\n\
-             candidate loop's own predict/bookkeeping, NEARESTMV's own \
-             predict, RD glue):",
+             NEWMV/GLOBAL sub-search (bucket 0): {motion_search:>9.2?}\n\
+             transform + quantize (bucket 2):     {transform_quant:>9.2?}\n\
+             coeff_bits, entropy pricing (bucket 3): {entropy:>9.2?}\n\
+             buckets 0+2+3 accounted:              {accounted:>9.2?}\n\
+             \n\
+             OVERLAPPING, not additive: every mc::predict call (bucket 1)  {interpolation:>9.2?}\n\
+             \x20 -- of which {overlap:>9.2?} is OUTSIDE bucket 0 (a committed\n\
+             \x20 inter block's final prediction, which no bucket above times)\n\
+             \x20 and the rest is the search candidates' interpolation, already\n\
+             \x20 inside bucket 0. It is deliberately NOT added to the total.\n\
+             \n\
+             residual (13-mode intra candidate loop, the committed block's\n\
+             \x20 interpolation above, NEARESTMV's own predict, RD glue):  {other:>9.2?}",
             inter.stream.len(),
         );
     }
@@ -20038,7 +20068,12 @@ mod tests {
     /// so it stays `#[ignore]`, run by hand with real clips on this machine.
     /// `cargo test -p ec-av1 --release prune_k_quality_sweep -- --ignored --nocapture`.
     #[test]
-    #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
+    // The three clip paths are HARD-CODED ABSOLUTES under /home/tahinli, not
+    // env-driven: off this workstation every row prints `SKIP <label>: <path>
+    // not present on this machine` and the run exits 0 with no numbers. It is
+    // a local-run probe; there is no fleet-host configuration that makes it
+    // measure anything.
+    #[ignore = "local-run only: the three clips are hard-coded /home/tahinli paths, so off this workstation it SKIPs every row and prints nothing"]
     fn prune_k_quality_sweep() {
         let _knobs = crate::speed::knob_read();
         let fctx = &crate::decode::FrameCtx::for_encoder();
@@ -20145,7 +20180,9 @@ mod tests {
     /// for the inter frame alone, unpruned vs each `K`.
     /// `cargo test -p ec-av1 --release prune_k_quality_sweep_inter -- --ignored --nocapture`.
     #[test]
-    #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
+    // Same hard-coded /home/tahinli clip paths as `prune_k_quality_sweep`;
+    // off this workstation it SKIPs all three rows and prints nothing.
+    #[ignore = "local-run only: the three clips are hard-coded /home/tahinli paths, so off this workstation it SKIPs every row and prints nothing"]
     fn prune_k_quality_sweep_inter() {
         let _knobs = crate::speed::knob_read();
         let fctx = &crate::decode::FrameCtx::for_encoder();
@@ -22622,7 +22659,11 @@ mod tests {
     /// ratio explodes exactly where coding is cheap; this prints the numbers
     /// that confirm or refute it.
     #[test]
-    #[ignore = "needs ffmpeg and the film fixtures"]
+    // Reads ONLY `fixtures/video/h264-{1080p,2160p}-23.976-8bit.mp4` -- the
+    // COLOUR-BARS fixtures, in a centred crop. It never opens a film, so the
+    // old reason ("the film fixtures") sent readers looking for content the
+    // test cannot read. 0.9 s; prints the per-cell intra-MAD distribution.
+    #[ignore = "0.9 s; reads only the fixtures/video COLOUR-BARS clips (not the films) and prints the per-cell intra-MAD distribution"]
     fn tpl_intra_denominator_histogram() {
         let _knobs = crate::speed::knob_read();
         if !have_ffmpeg() {
@@ -22769,7 +22810,12 @@ mod tests {
     /// lane-probe diagnostic: the gate's own loader + ladder call for ONE
     /// point inside the test binary, to compare against `examples/enc_probe`.
     #[test]
-    #[ignore = "diagnostic: needs ffmpeg and a clip"]
+    // Panics on the first `env::var(...).unwrap()` when unset -- it needs FIVE
+    // variables, not "a clip": `EC_PARITY_DIMS`, `EC_PARITY_FRAMES`,
+    // `EC_PARITY_Q`, `EC_PARITY_CLIP`, `EC_PARITY_SS`, `EC_PARITY_VF`. Prints
+    // one PARITY line (bytes + fnv1a of the stream) to diff against
+    // `examples/enc_probe`.
+    #[ignore = "diagnostic: needs EC_PARITY_{DIMS,FRAMES,Q,CLIP,SS,VF} -- all five, it unwraps the first missing one; prints one PARITY hash line"]
     fn probe_parity_point() {
         let _knobs = crate::speed::knob_write();
         let g = |k: &str| std::env::var(k).unwrap();
