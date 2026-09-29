@@ -21,7 +21,29 @@ fn corpus(kind: &str) -> Option<Vec<PathBuf>> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/vectors/flac-xiph/flac-test-files-main")
         .join(kind);
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+    // A missing corpus made every gate below skip GREEN having decoded nothing
+    // — the "gate skips on its own failure" class. The root `fixtures/` tree is
+    // gitignored, so `git worktree add` hands every lane worktree a tree without
+    // it. `EC_REQUIRE_FIXTURES=1` turns that into a hard failure naming the
+    // exact path and the command that produces it; unset, the skip is kept and
+    // now says what it skipped. Set it in every batch run.
+    if !dir.is_dir() {
+        assert!(
+            std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+            "the FLAC xiph {kind} corpus is missing at {} — these gates would prove \
+             nothing. A worktree has no gitignored root `fixtures/`: run \
+             scripts/link-fixtures.sh, or fetch it with scripts/fetch-vectors.sh.",
+            dir.display()
+        );
+        eprintln!(
+            "SKIP the FLAC xiph {kind} corpus is missing at {} — these gates proved \
+             nothing; run scripts/link-fixtures.sh, or fetch it with \
+             scripts/fetch-vectors.sh (or set EC_REQUIRE_FIXTURES=1 to make this a failure).",
+            dir.display()
+        );
+        return None;
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "flac"))
