@@ -3856,7 +3856,10 @@ pub(crate) mod tests {
             ("film mandelbrot", "mandelbrot", 192, 128),
         ];
         for (arm, source, width, height) in &arms {
-            let stream = encode_aomenc_stream(source, *width, *height, 40, &extra);
+            // r7: the ENCODE's frame count, bound so the compare below asserts a
+            // spec rather than our own decode's length.
+            const ENCODED_FRAMES: usize = 40;
+            let stream = encode_aomenc_stream(source, *width, *height, ENCODED_FRAMES, &extra);
             // Premise: the shape under test really arrived -- segmentation on
             // every frame, the map both coded and inherited, and real ALT_Q
             // tables. An aomenc drift that dropped any of these would make
@@ -3904,7 +3907,11 @@ pub(crate) mod tests {
                 "{arm}: every block dequantized at the same qindex ({lo}) -- SEG_LVL_ALT_Q \
                  never changed any block's quantizer"
             );
-            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, *width, *height, pictures.len());
+            // `ENCODED_FRAMES`, not `pictures.len()`: our decode's length is the
+            // thing UNDER TEST, so using it as the oracle's expected count is
+            // circular -- a decode that dropped a frame would ask ffmpeg for the
+            // same short count and the compare would silently shrink.
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, *width, *height, ENCODED_FRAMES);
             for (i, (ours, theirs)) in pictures.iter().zip(&ffmpeg_frames).enumerate() {
                 assert_eq!(ours.y, theirs.y, "{NAME} {arm}: frame {i} luma vs ffmpeg");
                 assert_eq!(ours.u, theirs.u, "{NAME} {arm}: frame {i} U vs ffmpeg");
