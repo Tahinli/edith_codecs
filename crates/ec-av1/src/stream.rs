@@ -13169,6 +13169,415 @@ pub(crate) mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
     }
 
+    /// Shared body for the lane-av1superhbd HIGH-BIT-DEPTH 4:4:4 superres
+    /// arms: 10-bit and 12-bit, `--superres-mode=1` at a fixed denominator
+    /// and `--superres-mode=2` (a per-frame denominator libaom picks itself).
+    ///
+    /// Everything the 8-bit 4:4:4 superres cell is non-vacuous by, repeated
+    /// here, plus the one thing that only matters above 8 bits: the gate
+    /// asserts the PARSED `bit_depth` equals the depth it names, because a
+    /// 10-bit recipe whose flags were mistyped still decodes -- it just
+    /// decodes a DIFFERENT cell than the gate claims, which is the same
+    /// "phantom cell" trap lane-av1444edge r3 recorded for
+    /// `use_superres=false`.
+    ///
+    /// The per-frame table is `(denominator, coded_width)` in DECODE order.
+    /// The coded width is re-derived as `(UpscaledWidth*8 + denom/2)/denom`
+    /// from that frame's OWN parsed denominator rather than only compared to
+    /// a literal, so a re-pinned fixture cannot satisfy the literals while
+    /// the scaled-size arithmetic moves under them. `superres_hits` and
+    /// `predict_scaled_hits` are asserted as DELTAS (both are process-wide
+    /// counters with no reset).
+    #[allow(clippy::too_many_arguments)]
+    fn a_444_hbd_superres_arm(
+        name: &str,
+        fixture: &str,
+        fixture_len: usize,
+        fixture_fnv: u64,
+        fixture_sha: &str,
+        bit_depth: u8,
+        upscaled: (usize, usize),
+        per_frame: &[(u8, usize)],
+    ) -> Vec<FrameHeader> {
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture);
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{name}: pinned fixture {fixture} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip"
+            )
+        });
+        assert_eq!(stream.len(), fixture_len, "{name}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), fixture_fnv, "{name}: fixture bytes moved");
+
+        // --- the header facts the CELL depends on, parsed not assumed ------
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut seq = None;
+        let mut heads: Vec<FrameHeader> = Vec::new();
+        while pos < stream.len() {
+            let parsed = parser
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: aomenc OBU does not parse: {e:?}"));
+            if parsed.total_size == 0 {
+                break;
+            }
+            pos += parsed.total_size;
+            match parsed.kind {
+                ObuKind::SequenceHeader(s) => seq = Some(s),
+                ObuKind::FrameHeader(h) => heads.push(*h),
+                ObuKind::Frame(h, _) => heads.push(*h),
+                _ => {}
+            }
+        }
+        let seq = seq.unwrap_or_else(|| panic!("{name}: the stream carries no sequence header"));
+        assert_eq!(
+            (
+                seq.color_config.subsampling_x,
+                seq.color_config.subsampling_y
+            ),
+            (0, 0),
+            "{name}: the stream is not 4:4:4 (ss = ({}, {}))",
+            seq.color_config.subsampling_x,
+            seq.color_config.subsampling_y
+        );
+        // The high-bit-depth claim itself. A `--bit-depth` flag that silently
+        // did not take effect still produces a decodable 4:4:4 superres
+        // stream -- at 8 bits -- and every other assertion below would pass.
+        assert_eq!(
+            seq.color_config.bit_depth, bit_depth,
+            "{name}: the sequence header parses bit_depth {}, not the {bit_depth} this gate \
+             names -- the encoder flags did not take effect and this is a different cell",
+            seq.color_config.bit_depth
+        );
+        assert!(
+            seq.enable_superres,
+            "{name}: the sequence header does not enable superres at all"
+        );
+        assert_eq!(
+            heads.len(),
+            per_frame.len(),
+            "{name}: {} frame headers, expected {}",
+            heads.len(),
+            per_frame.len()
+        );
+        for (i, (h, (denom, coded))) in heads.iter().zip(per_frame).enumerate() {
+            assert!(
+                h.use_superres,
+                "{name}: frame {i} has use_superres = false -- this is an UNSCALED stream and \
+                 the gate would measure something other than the cell it names (class \
+                 gate-blind-to-feature)"
+            );
+            assert_eq!(
+                h.superres_denom, *denom,
+                "{name}: frame {i} PARSED denominator moved from {denom} -- read the header, \
+                 never the encoder flag (mode 2 chooses its own)"
+            );
+            assert_eq!(
+                (h.upscaled_width as usize, h.frame_height as usize),
+                upscaled,
+                "{name}: frame {i} upscaled size moved"
+            );
+            assert_eq!(
+                (h.frame_width as usize, h.frame_height as usize),
+                (*coded, upscaled.1),
+                "{name}: frame {i} CODED size moved -- this is the scaled half of the cell and \
+                 the part an unsized stream gets wrong"
+            );
+            let d = u32::from(*denom);
+            assert_eq!(
+                (h.upscaled_width * 8 + d / 2) / d,
+                h.frame_width,
+                "{name}: frame {i}: FrameWidth is not (UpscaledWidth*8 + denom/2)/denom -- the \
+                 scaled size the cell rests on is not the spec's"
+            );
+        }
+
+        // --- the pixels -----------------------------------------------------
+        let _guard = lock_gate_counters();
+        let before_sr = crate::superres::superres_hits();
+        let before_scaled = crate::mc::predict_scaled_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{name}: the pinned {bit_depth}-bit 4:4:4 superres stream was refused: {e}")
+        });
+        let scaled_up = crate::superres::superres_hits() - before_sr;
+        let scaled_mc = crate::mc::predict_scaled_hits() - before_scaled;
+        assert!(
+            scaled_up > 0,
+            "{name}: zero superres_hits -- the upscaler never ran (class gate-blind-to-feature)"
+        );
+        assert!(
+            scaled_mc > 0,
+            "{name}: zero predict_scaled_hits -- no inter block read a scaled reference, so the \
+             scaled-PREDICTION half of the cell is unexercised (class gate-blind-to-feature)"
+        );
+        assert_eq!(frames.len(), per_frame.len(), "{name}: decoded frame count");
+        let max = (1u32 << bit_depth) - 1;
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                (f.width, f.height),
+                upscaled,
+                "{name}: frame {i} came back {}x{}, not the UPSCALED {}x{}",
+                f.width,
+                f.height,
+                upscaled.0,
+                upscaled.1
+            );
+            for (plane, samples) in [("Y", &f.y), ("U", &f.u), ("V", &f.v)] {
+                assert_eq!(
+                    samples.len(),
+                    upscaled.0 * upscaled.1,
+                    "{name}: frame {i} {plane} plane is {} samples; at 4:4:4 upscaled it must be \
+                     full resolution ({}x{})",
+                    samples.len(),
+                    upscaled.0,
+                    upscaled.1
+                );
+                // The depth claim, on the pixels: a decoder that lost the
+                // high bits (or produced 8-bit values padded into a u16
+                // plane) would satisfy every length and geometry assert above
+                // and only be caught here.
+                assert!(
+                    samples.iter().all(|&s| u32::from(s) <= max),
+                    "{name}: frame {i} {plane} carries a sample above the {bit_depth}-bit \
+                     maximum {max} -- the bit depth of the OUTPUT does not match the header"
+                );
+            }
+        }
+        if aomdec_path().is_file() {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, name);
+            eprintln!(
+                "{name}: {decoded} decode-order frame(s) ({hidden} hidden) byte-exact vs aomdec \
+                 at {bit_depth}-bit {upscaled:?} upscaled from {per_frame:?} (denominator, coded \
+                 width) per frame, {scaled_up} upscale(s), {scaled_mc} scaled MC block(s); \
+                 fixture sha256 {fixture_sha}"
+            );
+        } else {
+            eprintln!("{name}: no oracle aomdec, pixel arm skipped");
+        }
+        heads
+    }
+
+    /// lane-av1superhbd (1): 4:4:4 superres at **10 bits**, `--superres-mode=1
+    /// --superres-denominator=12` on all four frames -- coded 171x128 upscaled
+    /// to 256x128 at `denom = 12`.
+    ///
+    /// **What it closes.** Every superres fixture the crate carried parsed
+    /// `bit_depth = 8` (4:2:0 `superres_kf_cdef_lr_64x64.obu`) or was 4:2:0
+    /// (`superres_alltools_sb128_320x180.obu`), and the 4:4:4 superres cells
+    /// were 8-bit. The chroma-format sweep's not-measured list kept "4:4:4
+    /// superres at 10/12 bits" open on that basis. This arm is the 10-bit
+    /// measurement: a 4:4:4 chroma plane upscaled at FULL resolution, where
+    /// the upscaler and the scaled inter predictor both run with a
+    /// 10-bit sample width and the 4:4:4 chroma gather has no subsampling
+    /// halving to hide behind.
+    ///
+    /// **The recipe** (sha256
+    /// `95b49d7aa81843399ee3aa64bdadfec8f4037bcc3f861923c9b2da3bc868b223`,
+    /// 15803 bytes, 4 frames, `testsrc2 256x128 rate=25` yuv444p10le):
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=256x128:rate=25" -frames:v 4 \
+    ///        -pix_fmt yuv444p10le -strict -1 -f yuv4mpegpipe - | \
+    /// aomenc --codec=av1 --profile=1 --bit-depth=10 --input-bit-depth=10 \
+    ///        --passes=1 --end-usage=q --cq-level=20 --cpu-used=2 --threads=1 \
+    ///        --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 --limit=4 \
+    ///        --superres-mode=1 --superres-denominator=12 \
+    ///        --superres-kf-denominator=12 --obu -o - -
+    /// ```
+    /// `-strict -1` is load-bearing: without it ffmpeg refuses to write
+    /// `yuv444p10le` into a y4m pipe at all (zero bytes out).
+    #[test]
+    fn a_444_lossy_superres_10bit_d12_stream_decodes_pixel_exact() {
+        a_444_hbd_superres_arm(
+            "a_444_lossy_superres_10bit_d12_stream_decodes_pixel_exact",
+            "fixtures/444_lossy_superres_256x128_d12_10bit.obu",
+            15803,
+            0x9fad_3227_6e91_792c,
+            "95b49d7aa81843399ee3aa64bdadfec8f4037bcc3f861923c9b2da3bc868b223",
+            10,
+            (256, 128),
+            &[(12, 171); 4],
+        );
+    }
+
+    /// lane-av1superhbd (2): 4:4:4 superres at **12 bits**,
+    /// `--superres-mode=1 --superres-denominator=12`, coded 171x128 upscaled
+    /// to 256x128.
+    ///
+    /// **Why the source is `mandelbrot` and not `testsrc2`.** The 12-bit
+    /// frame gate refuses a frame carrying `allow_screen_content_tools = 1`
+    /// by name (palette and intrabc have no 12-bit witness). libaom sets
+    /// that bit from its own content detection
+    /// (`av1_set_screen_content_options` -> `encoder_utils.c:1153`, keyed on
+    /// the palette-pixel ratio of the FIRST pass), and `testsrc2` -- flat
+    /// colour bars and hard edges -- trips it at 12 bits while the very same
+    /// recipe at 10 bits does not. `--enable-palette=0 --enable-intrabc=0`
+    /// and `--tune-content=film` do NOT suppress it (measured: all four
+    /// still parse `allow_screen_content_tools = true`), because the
+    /// detection is a property of the CONTENT, not of those flags. A
+    /// photographic source (`mandelbrot`, same geometry and frame count)
+    /// parses `allow_screen_content_tools = false` and decodes. This is a
+    /// source choice, stated so the next lane does not re-derive it.
+    ///
+    /// **The recipe** (sha256
+    /// `973bf374c0185c4e6301509ce834cef01318e6cdb9488fd258118d7ec89bdd04`,
+    /// 11023 bytes, 4 frames, `mandelbrot 256x128 rate=25` yuv444p12le):
+    /// ```text
+    /// ffmpeg -f lavfi -i "mandelbrot=size=256x128:rate=25" -frames:v 4 \
+    ///        -pix_fmt yuv444p12le -strict -1 -f yuv4mpegpipe - | \
+    /// aomenc --codec=av1 --profile=1 --bit-depth=12 --input-bit-depth=12 \
+    ///        --passes=1 --end-usage=q --cq-level=20 --cpu-used=2 --threads=1 \
+    ///        --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 --limit=4 \
+    ///        --superres-mode=1 --superres-denominator=12 \
+    ///        --superres-kf-denominator=12 --obu -o - -
+    /// ```
+    /// Byte-reproducible: two independent encodes produced the same 11023
+    /// bytes.
+    #[test]
+    fn a_444_lossy_superres_12bit_d12_stream_decodes_pixel_exact() {
+        a_444_hbd_superres_arm(
+            "a_444_lossy_superres_12bit_d12_stream_decodes_pixel_exact",
+            "fixtures/444_lossy_superres_256x128_d12_12bit.obu",
+            11023,
+            0xd6cf_bb83_2b42_8e2d,
+            "973bf374c0185c4e6301509ce834cef01318e6cdb9488fd258118d7ec89bdd04",
+            12,
+            (256, 128),
+            &[(12, 171); 4],
+        );
+    }
+
+    /// lane-av1superhbd (3): 4:4:4 superres at **12 bits** at the WIDEST
+    /// denominator this geometry allows, `--superres-denominator=9` -- coded
+    /// 228x128 upscaled to 256x128, so 28 of the 256 columns are the frame's
+    /// right-edge upscale margin, against 12's 85.
+    ///
+    /// It is a separate gate from the den=12 arm because the margin is
+    /// where a round-trip is most likely to read past the coded picture: a
+    /// decoder that sized the upscale source from `UpscaledWidth` instead of
+    /// `FrameWidth` is exact at den=12 on this content and wrong here. Its
+    /// recipe is the 12-bit one above with `--superres-denominator=9
+    /// --superres-kf-denominator=9` (sha256
+    /// `898c775108495b998cb5ec9b08e194d4656ed0140aa8e7e7236892d468bbad99`,
+    /// 13015 bytes).
+    #[test]
+    fn a_444_lossy_superres_12bit_d9_stream_decodes_pixel_exact() {
+        a_444_hbd_superres_arm(
+            "a_444_lossy_superres_12bit_d9_stream_decodes_pixel_exact",
+            "fixtures/444_lossy_superres_256x128_d9_12bit.obu",
+            13015,
+            0x4110_ce7b_cd85_901b,
+            "898c775108495b998cb5ec9b08e194d4656ed0140aa8e7e7236892d468bbad99",
+            12,
+            (256, 128),
+            &[(9, 228); 4],
+        );
+    }
+
+    /// lane-av1superhbd (4): 4:4:4 superres at **10 bits** under
+    /// `--superres-mode=2` -- the random-denominator arm, where libaom picks
+    /// a DIFFERENT denominator for every frame and IGNORES
+    /// `--superres-denominator` entirely.
+    ///
+    /// This is what keeps the high-bit-depth superres cell from silently
+    /// degenerating into a single-denominator cell: the per-frame parsed
+    /// denominators are 11, 14, 15, 9 -- three of them values no flag on the
+    /// command line ever named -- so a gate that read the flag instead of
+    /// the header would be wrong on three of four frames. The assertion
+    /// below makes that structural rather than incidental, and it is the
+    /// assertion that fails if a future libaom starts honouring the flag
+    /// under mode 2.
+    ///
+    /// **The recipe** (sha256
+    /// `699398aba58fb53b80e05d3d214eb746a3c91945e01da6b47488513f20b55668`,
+    /// 17776 bytes, 4 frames, `testsrc2 256x128 rate=25` yuv444p10le):
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=256x128:rate=25" -frames:v 4 \
+    ///        -pix_fmt yuv444p10le -strict -1 -f yuv4mpegpipe - | \
+    /// aomenc --codec=av1 --profile=1 --bit-depth=10 --input-bit-depth=10 \
+    ///        --passes=1 --end-usage=q --cq-level=20 --cpu-used=2 --threads=1 \
+    ///        --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 --limit=4 \
+    ///        --superres-mode=2 --obu -o - -
+    /// ```
+    #[test]
+    fn a_444_lossy_superres_10bit_mode2_random_denom_stream_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_444_lossy_superres_10bit_mode2_random_denom_stream_decodes_pixel_exact";
+        let heads = a_444_hbd_superres_arm(
+            NAME,
+            "fixtures/444_lossy_superres_mode2_256x128_10bit.obu",
+            17776,
+            0x164f_4099_7576_7ae4,
+            "699398aba58fb53b80e05d3d214eb746a3c91945e01da6b47488513f20b55668",
+            10,
+            (256, 128),
+            &[(11, 186), (14, 146), (15, 137), (9, 228)],
+        );
+        // Distinct-denominator assert: the cell must stay a MULTI-denominator
+        // one. A libaom that collapsed mode 2 onto a single denominator (or
+        // stopped scaling) would still decode, and the gate above would still
+        // hold only because the literals would have been re-pinned with it --
+        // so the property is asserted from the parsed headers directly.
+        let denoms: Vec<u8> = heads.iter().map(|h| h.superres_denom).collect();
+        let mut distinct = denoms.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 3,
+            "{NAME}: the stream carries denominators {denoms:?} -- fewer than three distinct \
+             values, so this is no longer the per-frame-denominator cell and the pin has to be \
+             re-derived from the stream"
+        );
+        let flagged = [9u8, 12, 16];
+        assert!(
+            denoms.iter().any(|d| !flagged.contains(d)),
+            "{NAME}: every parsed denominator is one of the flag values {flagged:?} -- mode 2 now \
+             appears to honour --superres-denominator, and this cell stops being the \
+             flag-ignoring one"
+        );
+    }
+
+    /// lane-av1superhbd (5): 4:4:4 superres at **12 bits** under
+    /// `--superres-mode=2` -- the high-bit-depth random-denominator arm, the
+    /// 12-bit twin of the arm above (sha256
+    /// `18aa8b3124ab10672f22577a8eea81e44141a3d0bb506104aee2f950254a2e9f`,
+    /// 14656 bytes, same `mandelbrot` source as the 12-bit fixed-denominator
+    /// arms). Its parsed denominators are again 11/14/15/9 at coded widths
+    /// 186/146/137/228, so the upscaler is handed FOUR coded-to-upscaled
+    /// ratios in one 12-bit decode -- the case a single-denominator gate
+    /// cannot reach at any bit depth.
+    #[test]
+    fn a_444_lossy_superres_12bit_mode2_random_denom_stream_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_444_lossy_superres_12bit_mode2_random_denom_stream_decodes_pixel_exact";
+        let heads = a_444_hbd_superres_arm(
+            NAME,
+            "fixtures/444_lossy_superres_mode2_256x128_12bit.obu",
+            14656,
+            0xef38_3fb7_b284_2166,
+            "18aa8b3124ab10672f22577a8eea81e44141a3d0bb506104aee2f950254a2e9f",
+            12,
+            (256, 128),
+            &[(11, 186), (14, 146), (15, 137), (9, 228)],
+        );
+        let denoms: Vec<u8> = heads.iter().map(|h| h.superres_denom).collect();
+        let mut distinct = denoms.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 3,
+            "{NAME}: the stream carries denominators {denoms:?} -- fewer than three distinct \
+             values, so this is no longer the per-frame-denominator cell and the pin has to be \
+             re-derived from the stream"
+        );
+        let flagged = [9u8, 12, 16];
+        assert!(
+            denoms.iter().any(|d| !flagged.contains(d)),
+            "{NAME}: every parsed denominator is one of the flag values {flagged:?} -- mode 2 now \
+             appears to honour --superres-denominator, and this cell stops being the \
+             flag-ignoring one"
+        );
+    }
+
     /// lane-filt1: `EC_AV1_FILTER_THREADS` splits every in-frame filter stage
     /// -- deblock (row bands for the vertical-edge pass, column bands for the
     /// horizontal one), CDEF (mi row bands), loop restoration (RU row bands)
