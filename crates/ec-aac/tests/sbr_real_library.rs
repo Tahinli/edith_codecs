@@ -38,6 +38,33 @@ fn have_ffmpeg() -> bool {
         .unwrap_or(false)
 }
 
+/// Fixture-presence probe for the generated HE-AAC matrix under
+/// `<repo>/.cache/heaac-fixtures` (`scripts/aac-tables/make-heaac-fixtures.sh`).
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that regenerates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape. The `~/Music` / `~/Downloads` / `~/Videos`
+/// scans in this file are host corpora, not the committed fixture library, and
+/// keep their plain skip.
+fn require_fixture(path: &Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
+
 /// A film's audio track is hours long; the correlation only needs a bounded
 /// window near the start, so both sides cap how much they ever decode.
 const MAX_SAMPLES: usize = 1_000_000;
@@ -437,7 +464,13 @@ fn exhaustive_lag_correlation(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i6
 }
 
 /// bucket (true if ITS coarse lag sat at the +/-`lag_max` search bound).
-fn robust_lag_topk(ours: &[f32], theirs: &[f32], lag_max: i64, rate: u32, k: usize) -> (i64, f64, bool) {
+fn robust_lag_topk(
+    ours: &[f32],
+    theirs: &[f32],
+    lag_max: i64,
+    rate: u32,
+    k: usize,
+) -> (i64, f64, bool) {
     const COARSE: usize = 4_096;
     let start = ours
         .len()
@@ -2111,7 +2144,10 @@ fn our_decode_core_only(path: &Path, stream_index: usize) -> Option<(Vec<Vec<f32
         if dump && au_idx < 40 {
             for c in 0..ch {
                 let plane: Vec<f32> = frame.samples.iter().skip(c).step_by(ch).copied().collect();
-                let rms = (plane.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
+                let rms = (plane
+                    .iter()
+                    .map(|v| f64::from(*v) * f64::from(*v))
+                    .sum::<f64>()
                     / plane.len().max(1) as f64)
                     .sqrt();
                 eprintln!(
@@ -2229,7 +2265,11 @@ fn core_only_matches_reference() {
             if at_edge {
                 (lag, corr, at_edge) = exhaustive_lag_correlation(&ol, &tl, SEARCH_LAG_MAX);
             }
-            let edge = if at_edge { " (AT SEARCH BOUND -- noise, not a measurement)" } else { "" };
+            let edge = if at_edge {
+                " (AT SEARCH BOUND -- noise, not a measurement)"
+            } else {
+                ""
+            };
             println!("  ch{ch}: below {cutoff:.0}Hz lag {lag}, corr {corr:.6}{edge}");
         }
     }
@@ -2428,15 +2468,10 @@ fn synthetic_heaac_matrix() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
     }
-    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
-        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
-    });
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
+        .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let dir = PathBuf::from(dir);
-    if !dir.is_dir() {
-        eprintln!(
-            "SKIP: {} absent -- run scripts/aac-tables/make-heaac-fixtures.sh first",
-            dir.display()
-        );
+    if !require_fixture(&dir, "scripts/aac-tables/make-heaac-fixtures.sh") {
         return;
     }
     unsafe {
@@ -2444,14 +2479,31 @@ fn synthetic_heaac_matrix() {
     }
     println!(
         "{:>5} {:>6} {:>4} {:>4} {:>4}  {:>8} {:>8} {:>8} {:>6}  {:>11} {:>8}  {:>10} {:>8}  {:>9} {:>9}",
-        "rate", "kbps", "prof", "kx", "k2", "full", "below", "above", "lag", "ours_v_core", "ovc_lag",
-        "core_v_ref", "cvr_lag", "core_rate", "full_rate"
+        "rate",
+        "kbps",
+        "prof",
+        "kx",
+        "k2",
+        "full",
+        "below",
+        "above",
+        "lag",
+        "ours_v_core",
+        "ovc_lag",
+        "core_v_ref",
+        "cvr_lag",
+        "core_rate",
+        "full_rate"
     );
     // Wide enough that the WIDE_LAG_MAX==LC's own decoder priming delay
     // (2048) plus a full SBR-chain worth of extra delay (a few thousand
     // samples at the doubled/full output rate) both land well inside it,
     // not right at the edge the way the plain (LAG_MAX=4000) search did.
     const WIDE_LAG_MAX: i64 = 20_000;
+    // Floor: the matrix is 2 rates x 4 bitrates x 2 profiles. Without a count
+    // the whole test is green having probed nothing, which is the same
+    // false-green this file's `require_fixture` exists to kill.
+    let mut probed = 0usize;
     for rate in [48_000u32, 44_100] {
         for br in ["32k", "48k", "64k", "96k"] {
             // LC first: its winning lag is the pure container/decoder
@@ -2460,10 +2512,10 @@ fn synthetic_heaac_matrix() {
             let mut lc_lag: Option<i64> = None;
             for (profile, prefix) in [("LC", "lc"), ("HE", "heaac")] {
                 let path = dir.join(format!("{prefix}_{rate}_{br}.m4a"));
-                if !path.exists() {
-                    eprintln!("SKIP {}: missing", path.display());
+                if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
                     continue;
                 }
+                probed += 1;
                 let before = ec_aac::sbr_sideinfo_log().len();
                 let Some((ours, _sbr, our_rate)) = our_decode(&path, 0) else {
                     eprintln!("SKIP {}: could not decode", path.display());
@@ -2479,8 +2531,7 @@ fn synthetic_heaac_matrix() {
                 let o = &ours[0];
                 let t = &theirs[0];
                 const TOPK: usize = 5;
-                let (mut lag, mut full, edge) =
-                    robust_lag_topk(o, t, WIDE_LAG_MAX, our_rate, TOPK);
+                let (mut lag, mut full, edge) = robust_lag_topk(o, t, WIDE_LAG_MAX, our_rate, TOPK);
                 assert!(
                     !edge,
                     "{}: {profile} row's refined winning lag {lag} sits at the \
@@ -2504,8 +2555,11 @@ fn synthetic_heaac_matrix() {
                 if profile == "HE" && ours.len() >= 2 && theirs.len() >= 2 {
                     let mono_o: Vec<f32> =
                         ours[0].iter().zip(&ours[1]).map(|(a, b)| a + b).collect();
-                    let mono_t: Vec<f32> =
-                        theirs[0].iter().zip(&theirs[1]).map(|(a, b)| a + b).collect();
+                    let mono_t: Vec<f32> = theirs[0]
+                        .iter()
+                        .zip(&theirs[1])
+                        .map(|(a, b)| a + b)
+                        .collect();
                     let (mono_lag, _, mono_edge) =
                         robust_lag_topk(&mono_o, &mono_t, WIDE_LAG_MAX, our_rate, TOPK);
                     assert!(
@@ -2548,7 +2602,9 @@ fn synthetic_heaac_matrix() {
                 } else {
                     ((-lag) as usize, 0usize)
                 };
-                let n = WINDOW.min(o.len().saturating_sub(oa)).min(t.len().saturating_sub(ob));
+                let n = WINDOW
+                    .min(o.len().saturating_sub(oa))
+                    .min(t.len().saturating_sub(ob));
                 let above = if n >= 1024 {
                     correlation(
                         &highpass(&o[oa..oa + n], our_rate, crossover_hz),
@@ -2704,6 +2760,11 @@ fn synthetic_heaac_matrix() {
             }
         }
     }
+    assert!(
+        probed >= 16,
+        "only {probed} of 16 HE-AAC matrix fixtures were present -- rerun \
+         scripts/aac-tables/make-heaac-fixtures.sh"
+    );
 }
 
 fn candidates() -> Vec<Candidate> {
@@ -2886,8 +2947,14 @@ fn sbr_real_library_matches_reference() {
             let high = if n >= 1024 {
                 let oh = highpass(&o[oa..oa + n], rate, c.crossover_hz);
                 let th = highpass(&t[ob..ob + n], rate, c.crossover_hz);
-                let rms = |v: &[f32]| (v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt();
-                println!("  ch{ch} above-crossover RMS ours/ref = {:.4}", rms(&oh) / rms(&th).max(1e-12));
+                let rms = |v: &[f32]| {
+                    (v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / v.len().max(1) as f64)
+                        .sqrt()
+                };
+                println!(
+                    "  ch{ch} above-crossover RMS ours/ref = {:.4}",
+                    rms(&oh) / rms(&th).max(1e-12)
+                );
                 correlation(&oh, &th)
             } else {
                 0.0
@@ -3154,7 +3221,10 @@ fn sbr_real_library_matches_reference() {
                             ci += c.im;
                         }
                         let coh = (cr * cr + ci * ci).sqrt() / (eo * et).sqrt().max(1e-30);
-                        println!("    band{band:>3}: {:>7.2} dB  coh {coh:.4}", 10.0 * (eo / et.max(1e-30)).log10());
+                        println!(
+                            "    band{band:>3}: {:>7.2} dB  coh {coh:.4}",
+                            10.0 * (eo / et.max(1e-30)).log10()
+                        );
                     }
                 }
                 let mean_in = |rows: &[(usize, f64)], lo: usize, hi: usize| {
@@ -3559,7 +3629,10 @@ fn sbr_actual_noise_fraction() {
     // has nonzero entries for QMF bands up to `k2`).
     let band_hz = f64::from(rate) / 128.0;
     let kx_band = bookkept.iter().map(|(b, ..)| *b).min().unwrap_or(0);
-    println!("    (crossover: QMF band {kx_band}, {:.0} Hz -- rows below it are core-decoded and excluded from the total)", kx_band as f64 * band_hz);
+    println!(
+        "    (crossover: QMF band {kx_band}, {:.0} Hz -- rows below it are core-decoded and excluded from the total)",
+        kx_band as f64 * band_hz
+    );
     println!(
         "  ACTUAL noise fraction (band_hz, energy_on, energy_off, actual_fraction, bookkept_fraction):"
     );
@@ -3712,15 +3785,14 @@ fn sbr_header_feature_table() {
             ffmpeg_stream: c.ffmpeg_stream,
         })
         .collect();
-    let fixtures = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
-        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
-    });
+    let fixtures = std::env::var("EC_AAC_HEAAC_FIXTURES")
+        .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let fixtures = PathBuf::from(fixtures);
-    if fixtures.is_dir() {
+    if require_fixture(&fixtures, "scripts/aac-tables/make-heaac-fixtures.sh") {
         for rate in [48_000u32, 44_100] {
             for br in ["32k", "48k", "64k", "96k"] {
                 let p = fixtures.join(format!("heaac_{rate}_{br}.m4a"));
-                if p.exists() {
+                if require_fixture(&p, "scripts/aac-tables/make-heaac-fixtures.sh") {
                     rows.push(Row {
                         label: format!("synth-{rate}-{br}"),
                         path: p,
@@ -3730,11 +3802,6 @@ fn sbr_header_feature_table() {
                 }
             }
         }
-    } else {
-        eprintln!(
-            "SKIP synthetic rows: {} absent -- run scripts/aac-tables/make-heaac-fixtures.sh first",
-            fixtures.display()
-        );
     }
     if rows.is_empty() {
         eprintln!("SKIP: no real HE-AAC files and no synthetic fixtures found");
@@ -3746,8 +3813,25 @@ fn sbr_header_feature_table() {
     const WIDE_LAG_MAX: i64 = 20_000;
     println!(
         "{:<20} {:>6} {:>4} {:>4} {:>4} {:>4} {:>4}  {:>4} {:>4} {:>4} {:>4} {:>4}  {:>5} {:>10} {:>10}  {:>8} {:>8}  {:>10} {:>6}",
-        "stream", "rate", "kx", "k2", "xovr", "sfrq", "efrq", "fscl", "ascl", "nbnd", "lbnd", "lgn",
-        "ifrq", "smooth", "envs", "invf", "harm", "df%", "corr"
+        "stream",
+        "rate",
+        "kx",
+        "k2",
+        "xovr",
+        "sfrq",
+        "efrq",
+        "fscl",
+        "ascl",
+        "nbnd",
+        "lbnd",
+        "lgn",
+        "ifrq",
+        "smooth",
+        "envs",
+        "invf",
+        "harm",
+        "df%",
+        "corr"
     );
     for r in &rows {
         let before = ec_aac::sbr_sideinfo_log().len();
@@ -3760,7 +3844,11 @@ fn sbr_header_feature_table() {
             continue;
         }
         let log = ec_aac::sbr_sideinfo_log();
-        let frames: Vec<_> = log[before..].iter().filter(|row| row.ch == 0).take(20).collect();
+        let frames: Vec<_> = log[before..]
+            .iter()
+            .filter(|row| row.ch == 0)
+            .take(20)
+            .collect();
         if frames.is_empty() {
             eprintln!("SKIP {}: no sideinfo rows captured", r.label);
             continue;
@@ -3772,13 +3860,24 @@ fn sbr_header_feature_table() {
         let mut df_total = 0usize;
         let mut df_ones = 0usize;
         for row in &frames {
-            *env_counts.entry(row.t_env.len().saturating_sub(1)).or_default() += 1;
+            *env_counts
+                .entry(row.t_env.len().saturating_sub(1))
+                .or_default() += 1;
             invf_seen.extend(&row.invf_mode);
-            if row.add_harmonic.as_ref().is_some_and(|h| h.iter().any(|&v| v != 0)) {
+            if row
+                .add_harmonic
+                .as_ref()
+                .is_some_and(|h| h.iter().any(|&v| v != 0))
+            {
                 any_harmonic = true;
             }
             df_total += row.df_env.len() + row.df_noise.len();
-            df_ones += row.df_env.iter().chain(&row.df_noise).filter(|&&b| b != 0).count();
+            df_ones += row
+                .df_env
+                .iter()
+                .chain(&row.df_noise)
+                .filter(|&&b| b != 0)
+                .count();
         }
         let df_pct = if df_total > 0 {
             100.0 * df_ones as f64 / df_total as f64
@@ -3790,20 +3889,36 @@ fn sbr_header_feature_table() {
             .map(|(k, v)| format!("{k}x{v}"))
             .collect::<Vec<_>>()
             .join(",");
-        let invf_str: String = invf_seen.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("");
+        let invf_str: String = invf_seen
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("");
         let theirs = ffmpeg_decode(&r.path, r.ffmpeg_stream, ours.len());
         let (_, corr) = best_lag_correlation_wide(&ours[0], &theirs[0], WIDE_LAG_MAX);
         println!(
             "{:<20} {:>6} {:>4} {:>4} {:>4} {:>4} {:>4}  {:>4} {:>4} {:>4} {:>4} {:>4}  {:>5} {:>10} {:>10}  {:>8} {:>8}  {:>10.1} {:>6.3}",
-            r.label, our_rate, f0.kx, f0.k2, f0.xover_band, f0.start_freq, f0.stop_freq,
-            f0.freq_scale, f0.alter_scale, f0.noise_bands, f0.limiter_bands, f0.limiter_gains,
-            f0.interpol_freq, f0.smoothing_mode, envs_hist, invf_str,
-            any_harmonic, df_pct, corr
+            r.label,
+            our_rate,
+            f0.kx,
+            f0.k2,
+            f0.xover_band,
+            f0.start_freq,
+            f0.stop_freq,
+            f0.freq_scale,
+            f0.alter_scale,
+            f0.noise_bands,
+            f0.limiter_bands,
+            f0.limiter_gains,
+            f0.interpol_freq,
+            f0.smoothing_mode,
+            envs_hist,
+            invf_str,
+            any_harmonic,
+            df_pct,
+            corr
         );
-        println!(
-            "  patches (frame0): {:?}",
-            f0.patch_lengths
-        );
+        println!("  patches (frame0): {:?}", f0.patch_lengths);
     }
 }
 
@@ -3874,7 +3989,11 @@ fn per_au_low_band_probe(label: &str, path: &Path, aac_stream: usize) {
         }
     }
     if core_ch0.is_empty() || full_ch0.is_empty() {
-        eprintln!("SKIP {label}: empty decode (core {} full {})", core_ch0.len(), full_ch0.len());
+        eprintln!(
+            "SKIP {label}: empty decode (core {} full {})",
+            core_ch0.len(),
+            full_ch0.len()
+        );
         return;
     }
 
@@ -3949,14 +4068,11 @@ fn per_au_low_band_divergence() {
     for c in &candidates() {
         per_au_low_band_probe(&c.path.display().to_string(), &c.path, c.aac_stream);
     }
-    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
-        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
-    });
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
+        .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let failing = PathBuf::from(&dir).join("heaac_44100_48k.m4a");
-    if failing.exists() {
+    if require_fixture(&failing, "scripts/aac-tables/make-heaac-fixtures.sh") {
         per_au_low_band_probe("synthetic 44100 48k (failing)", &failing, 0);
-    } else {
-        eprintln!("SKIP synthetic 44100 48k: {} absent", failing.display());
     }
 }
 
@@ -4003,7 +4119,20 @@ fn probe_explicit_config_and_wide_lag() {
         (planes, rate)
     }
 
-    for (label, path, aac_stream, ffmpeg_stream, core_sf_index, core_rate, ext_rate, channels) in [
+    // `synthetic` marks the case as coming from the committed fixture library
+    // (`scripts/aac-tables/make-heaac-fixtures.sh`); the FMJ row is a
+    // `~/Downloads` host corpus and keeps its plain skip.
+    for (
+        label,
+        path,
+        aac_stream,
+        ffmpeg_stream,
+        core_sf_index,
+        core_rate,
+        ext_rate,
+        channels,
+        synthetic,
+    ) in [
         (
             "FMJ",
             format!(
@@ -4016,6 +4145,7 @@ fn probe_explicit_config_and_wide_lag() {
             24_000u32,
             48_000u32,
             2u16,
+            false,
         ),
         (
             "heaac_44100_48k",
@@ -4029,10 +4159,15 @@ fn probe_explicit_config_and_wide_lag() {
             44_100,
             0, // filled below from parsed cfg's own extension_sample_rate
             2,
+            true,
         ),
     ] {
         let path = PathBuf::from(path);
-        if !path.exists() {
+        if synthetic {
+            if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
+                continue;
+            }
+        } else if !path.exists() {
             eprintln!("SKIP {label}: {} absent", path.display());
             continue;
         }
@@ -4097,7 +4232,9 @@ fn probe_explicit_config_and_wide_lag() {
         let theirs = ffmpeg_decode(&path, ffmpeg_stream, hand_planes.len());
         if let (Some(o), Some(t)) = (hand_planes.first(), theirs.first()) {
             let (lag, corr) = best_lag_correlation_wide(o, t, 100_000);
-            println!("  hand-built explicit config: full-band vs reference: lag={lag} corr={corr:.6}");
+            println!(
+                "  hand-built explicit config: full-band vs reference: lag={lag} corr={corr:.6}"
+            );
         }
     }
 
@@ -4111,10 +4248,9 @@ fn probe_explicit_config_and_wide_lag() {
         "{home}/Downloads/Full Metal Jacket (1987) (1080p BluRay x265 HEVC 10bit HDR AAC 5.1 afm72)/Full Metal Jacket (1987) (1080p BluRay x265 HDR afm72).mkv"
     ));
     if fmj.exists() {
-        if let (Some((core, core_rate)), Some((full, sbr, full_rate))) = (
-            our_decode_core_only(&fmj, 1),
-            our_decode(&fmj, 1),
-        ) {
+        if let (Some((core, core_rate)), Some((full, sbr, full_rate))) =
+            (our_decode_core_only(&fmj, 1), our_decode(&fmj, 1))
+        {
             if sbr == ec_aac::SbrSupport::V1 {
                 let up: Vec<f32> = core[0].iter().flat_map(|&s| [s, s]).collect();
                 let cutoff = f64::from(core_rate) * 0.4;
@@ -4239,12 +4375,10 @@ fn coupled_cpe_channel_swap_probe() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
     }
-    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
-        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
-    });
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
+        .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let path = PathBuf::from(&dir).join("heaac_44100_48k.m4a");
-    if !path.exists() {
-        eprintln!("SKIP: {} absent", path.display());
+    if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
         return;
     }
     let Some((ours, sbr, out_rate)) = our_decode(&path, 0) else {
@@ -4256,7 +4390,10 @@ fn coupled_cpe_channel_swap_probe() {
     let ref_r = ffmpeg_decode_pan_channel(&path, 0, 1);
     {
         let n = ref_l.len().min(ref_r.len()).min(WINDOW);
-        println!("ref L vs ref R (no lag): corr={:.6}", correlation(&ref_l[..n], &ref_r[..n]));
+        println!(
+            "ref L vs ref R (no lag): corr={:.6}",
+            correlation(&ref_l[..n], &ref_r[..n])
+        );
         let (lag, corr) = best_lag_correlation_wide(&ref_l, &ref_r, SEARCH_LAG_MAX);
         println!("ref L vs ref R (best lag search): lag={lag} corr={corr:.6}");
     }
@@ -4329,11 +4466,17 @@ fn coupled_cpe_channel_swap_probe() {
     let (core_lag0, core_corr0) =
         best_lag_correlation_wide(&core_planes[0], &ref_core[0], SEARCH_LAG_MAX);
     let core_implied_lag = core_lag0 * 2;
-    println!("core ch0 vs ref L best lag={core_lag0} corr={core_corr0:.6} -> implied full-rate lag={core_implied_lag}");
+    println!(
+        "core ch0 vs ref L best lag={core_lag0} corr={core_corr0:.6} -> implied full-rate lag={core_implied_lag}"
+    );
     let mono_ours: Vec<f32> = ours[0].iter().zip(&ours[1]).map(|(a, b)| a + b).collect();
     let mono_ref: Vec<f32> = {
         let n = ref_l.len().min(ref_r.len());
-        ref_l[..n].iter().zip(&ref_r[..n]).map(|(a, b)| a + b).collect()
+        ref_l[..n]
+            .iter()
+            .zip(&ref_r[..n])
+            .map(|(a, b)| a + b)
+            .collect()
     };
     let (mono_lag, mono_corr) = best_lag_correlation_wide(&mono_ours, &mono_ref, SEARCH_LAG_MAX);
     println!("mono (ch0+ch1) vs ref (L+R) best lag={mono_lag} corr={mono_corr:.6}");
@@ -4349,7 +4492,15 @@ fn coupled_cpe_channel_swap_probe() {
     // corr=0.873 above). So the TRUE best lag among our 4 candidates is
     // whichever one actually maximizes the fixed-lag mono correlation, not
     // whatever `mono_lag` the free search reported.
-    let mut true_best = (mono_lag, "mono-best lag (free search)", 0.0f64, 0.0f64, 0.0f64, 0.0f64, mono_corr);
+    let mut true_best = (
+        mono_lag,
+        "mono-best lag (free search)",
+        0.0f64,
+        0.0f64,
+        0.0f64,
+        0.0f64,
+        mono_corr,
+    );
     for (lag, label) in fixed_lags {
         let c0l = correlation_at_lag(&ours[0], &ref_l, lag);
         let c0r = correlation_at_lag(&ours[0], &ref_r, lag);
@@ -4398,7 +4549,9 @@ fn coupled_cpe_channel_swap_probe() {
             }
             let cl = correlation(&ours[0][oa..oa + step], &ref_l[ob..ob + step]);
             let cr = correlation(&ours[0][oa..oa + step], &ref_r[ob..ob + step]);
-            println!("subwindow t={w}s ch0 vs ref L/R @ lag {best_lag}: corr(L)={cl:.6} corr(R)={cr:.6}");
+            println!(
+                "subwindow t={w}s ch0 vs ref L/R @ lag {best_lag}: corr(L)={cl:.6} corr(R)={cr:.6}"
+            );
             w += 1;
         }
     }
@@ -4569,15 +4722,18 @@ fn sbr441_family_sample_drift_probe() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
     }
-    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
-        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
-    });
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
+        .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let home = std::env::var("HOME").unwrap_or_default();
-    let cases: [(&str, PathBuf, i64); 3] = [
+    // `synthetic` marks the rows served by the committed fixture library
+    // (`scripts/aac-tables/make-heaac-fixtures.sh`); the Nikbinler control is
+    // a `~/Music` host corpus and keeps its plain skip.
+    let cases: [(&str, PathBuf, i64, bool); 3] = [
         (
             "heaac_44100_48k (FAIL family)",
             PathBuf::from(&dir).join("heaac_44100_48k.m4a"),
             -4674,
+            true,
         ),
         (
             "heaac_48000_48k (48k control)",
@@ -4586,6 +4742,7 @@ fn sbr441_family_sample_drift_probe() {
             // (below) -- 0 was a bad guess, true fixed lag is -4673, same
             // as the failing family's.
             -4673,
+            true,
         ),
         (
             "Nikbinler (44.1k control)",
@@ -4595,11 +4752,16 @@ fn sbr441_family_sample_drift_probe() {
             // from an earlier probe, not its full-chain-vs-ffmpeg-reference
             // lag, which is +385.
             385,
+            false,
         ),
     ];
-    for (label, path, seed_lag) in cases {
+    for (label, path, seed_lag, synthetic) in cases {
         println!("\n=== {label}: {} ===", path.display());
-        if !path.exists() {
+        if synthetic {
+            if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
+                continue;
+            }
+        } else if !path.exists() {
             eprintln!("SKIP {label}: {} absent", path.display());
             continue;
         }
@@ -4690,12 +4852,10 @@ fn sbr_hf_window_band_probe() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
     }
-    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
-        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
-    });
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES")
+        .unwrap_or_else(|_| format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR")));
     let path = PathBuf::from(&dir).join("heaac_48000_64k.m4a");
-    if !path.exists() {
-        eprintln!("SKIP: {} absent", path.display());
+    if !require_fixture(&path, "scripts/aac-tables/make-heaac-fixtures.sh") {
         return;
     }
     const LAG: i64 = -4673;
@@ -4748,7 +4908,10 @@ fn sbr_hf_window_band_probe() {
             let mean_t: f64 = mags_t.iter().sum::<f64>() / 8.0;
             println!(
                 "  band{band:>3}: |ours|dB mean={mean_o:>7.2} |ref|dB mean={mean_t:>7.2} dphase(deg)={:?}",
-                dphase_deg.iter().map(|d| format!("{d:.0}")).collect::<Vec<_>>()
+                dphase_deg
+                    .iter()
+                    .map(|d| format!("{d:.0}"))
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -4803,7 +4966,9 @@ fn sbr_residual_locator() {
     if !path.exists() {
         return;
     }
-    let Some((ours, _, rate)) = our_decode(&path, 0) else { return };
+    let Some((ours, _, rate)) = our_decode(&path, 0) else {
+        return;
+    };
     let theirs = ffmpeg_decode(&path, 0, ours.len());
     const W: usize = 2048;
     const FFT_LEN: usize = 2048;
@@ -4815,7 +4980,12 @@ fn sbr_residual_locator() {
         let n = ours[ch].len().min(theirs[ch].len());
         let (o, t) = (&ours[ch][..n], &theirs[ch][..n]);
         let mut wins: Vec<(f64, usize)> = (0..n / W)
-            .map(|w| (correlation(&o[w * W..(w + 1) * W], &t[w * W..(w + 1) * W]), w))
+            .map(|w| {
+                (
+                    correlation(&o[w * W..(w + 1) * W], &t[w * W..(w + 1) * W]),
+                    w,
+                )
+            })
             .collect();
         wins.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         println!("ch{ch} worst windows (corr, frame): {:?}", &wins[..12]);
@@ -4865,7 +5035,9 @@ fn sbr_residual_locator() {
             }
         }
         // group into 250 Hz bands up to 8 kHz, then 1 kHz
-        let mut edges: Vec<usize> = (0..=32).map(|i| ((i as f64 * 250.0) / hz) as usize).collect();
+        let mut edges: Vec<usize> = (0..=32)
+            .map(|i| ((i as f64 * 250.0) / hz) as usize)
+            .collect();
         edges.extend((9..=22).map(|i| ((i as f64 * 1000.0) / hz) as usize));
         for e in edges.windows(2) {
             let (mut c, mut po, mut pt) = (0.0, 0.0, 0.0);

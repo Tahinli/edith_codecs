@@ -603,7 +603,11 @@ fn onset_after_silence_has_no_pre_echo() {
     // last few hundred samples before it cannot hide behind a guard band, and
     // the peak is barred too.
     let amp = 0.7f64;
-    for (rate, layouts) in [(44_100u32, &[1usize, 2][..]), (48_000, &[1, 2, 6]), (96_000, &[6])] {
+    for (rate, layouts) in [
+        (44_100u32, &[1usize, 2][..]),
+        (48_000, &[1, 2, 6]),
+        (96_000, &[6]),
+    ] {
         let grid = 16 * 1024usize;
         let onsets = [0.3333f64, 0.5, 0.7321, 0.9137, 1.0]
             .into_iter()
@@ -618,7 +622,8 @@ fn onset_after_silence_has_no_pre_echo() {
                     let start = onset + 11 * c;
                     for i in 0..tone_len {
                         let t = i as f64 / f64::from(rate);
-                        plane[start + i] = (amp * (2.0 * std::f64::consts::PI * hz * t).sin()) as f32;
+                        plane[start + i] =
+                            (amp * (2.0 * std::f64::consts::PI * hz * t).sin()) as f32;
                     }
                 }
                 let name = format!("onset-{rate}-{channels}ch-{onset}.ogg");
@@ -650,7 +655,10 @@ fn onset_after_silence_has_no_pre_echo() {
                             gap_rms <= 0.002 * tone_rms,
                             "{name}/{label} ch{c}: gap RMS {gap_rms:.6} vs tone RMS {tone_rms:.6}"
                         );
-                        assert!(f64::from(peak) <= 0.01 * amp, "{name}/{label} ch{c}: gap peak {peak:.4}");
+                        assert!(
+                            f64::from(peak) <= 0.01 * amp,
+                            "{name}/{label} ch{c}: gap peak {peak:.4}"
+                        );
                     }
                 };
                 let (ours, _) = our_decode(&path);
@@ -717,8 +725,8 @@ fn the_rate_loop_tracks_the_target_bitrate() {
 fn quiet_content_reaches_the_target_or_is_transparent() {
     let rate = 48_000u32;
     let samples = rate as usize * 3;
-    let fixture = ffmpeg_decode(&fixtures().join("audio/wav16-stereo-48000.wav"))
-        .expect("fixture decodes");
+    let fixture =
+        ffmpeg_decode(&fixtures().join("audio/wav16-stereo-48000.wav")).expect("fixture decodes");
     assert_eq!(fixture.1, rate);
     let attenuate = |mut source: Vec<Vec<f32>>| {
         for channel in source.iter_mut() {
@@ -740,7 +748,10 @@ fn quiet_content_reaches_the_target_or_is_transparent() {
             .fold(1.0f64, f64::min)
     };
     let loud = busy(2, rate, samples);
-    let loud_corr = corr_at(&encode_to_file(&loud, rate, 128_000, "loud-128k.ogg"), &loud);
+    let loud_corr = corr_at(
+        &encode_to_file(&loud, rate, 128_000, "loud-128k.ogg"),
+        &loud,
+    );
     let quiet_noise = attenuate(loud);
     let mut quiet_tones = attenuate(tones(2, rate, samples));
     for (channel, noise) in quiet_tones.iter_mut().zip(busy(2, rate, samples)) {
@@ -757,11 +768,19 @@ fn quiet_content_reaches_the_target_or_is_transparent() {
         let mut measured = Vec::new();
         let mut spent = Vec::new();
         for target in [96_000i32, 128_000, 192_000] {
-            let path = encode_to_file(source, rate, target, &format!("{name}-{}k.ogg", target / 1000));
+            let path = encode_to_file(
+                source,
+                rate,
+                target,
+                &format!("{name}-{}k.ogg", target / 1000),
+            );
             let bytes = std::fs::metadata(&path).expect("file").len();
             let kbps = bytes as f64 * 8.0 * f64::from(rate) / source[0].len() as f64 / 1000.0;
             let corr = corr_at(&path, source);
-            println!("{name}: target {} kbps -> {kbps:.0} kbps, corr {corr:.4}", target / 1000);
+            println!(
+                "{name}: target {} kbps -> {kbps:.0} kbps, corr {corr:.4}",
+                target / 1000
+            );
             let target_kbps = f64::from(target) / 1000.0;
             let within_25pct = (kbps - target_kbps).abs() / target_kbps < 0.25;
             let transparent_undershoot = kbps < target_kbps && corr >= 0.999;
@@ -776,7 +795,10 @@ fn quiet_content_reaches_the_target_or_is_transparent() {
             }
         }
         if spent.iter().all(|&s| s) {
-            assert!(measured[0] < measured[1] && measured[1] < measured[2], "{name}: {measured:?}");
+            assert!(
+                measured[0] < measured[1] && measured[1] < measured[2],
+                "{name}: {measured:?}"
+            );
         }
     }
 }
@@ -800,7 +822,10 @@ fn residue_histogram_vs_reference() {
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
         ("sadie", "~/Music/sadie.wav"),
         ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
-        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+        (
+            "hein",
+            "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3",
+        ),
     ];
     let bitrate = 128_000i32;
     let rate = 48_000u32;
@@ -812,11 +837,17 @@ fn residue_histogram_vs_reference() {
     std::fs::create_dir_all(&out_dir).expect("out dir");
     let mut report = String::new();
     report.push_str("# Residue histogram: ours vs libvorbis reference\n\n");
-    report.push_str(&format!("Bitrate: {} kbps, {} Hz, {}ch, {} s max\n\n",
-        bitrate / 1000, rate, channels, max_samples / rate as usize));
+    report.push_str(&format!(
+        "Bitrate: {} kbps, {} Hz, {}ch, {} s max\n\n",
+        bitrate / 1000,
+        rate,
+        channels,
+        max_samples / rate as usize
+    ));
     let mut total_ours_bytes = 0u64;
     let mut total_ref_bytes = 0u64;
 
+    let mut rows = 0usize;
     for &(name, src_path) in sources {
         let expanded = shellexpand(src_path);
         let src = PathBuf::from(&expanded);
@@ -824,6 +855,7 @@ fn residue_histogram_vs_reference() {
             report.push_str(&format!("## {name}: SKIP (file not found: {expanded})\n\n"));
             continue;
         }
+        rows += 1;
         // Decode source with ffmpeg, limit duration.
         let Some((source_pcm, src_rate)) = ffmpeg_decode_limited(&src, rate, max_samples) else {
             report.push_str(&format!("## {name}: SKIP (ffmpeg decode failed)\n\n"));
@@ -856,9 +888,19 @@ fn residue_histogram_vs_reference() {
             // target; audio-only input encodes at the requested rate.
             .args(["-y", "-v", "error", "-i"])
             .arg(&src)
-            .args(["-vn", "-t", &format!("{}", max_samples / rate as usize),
-                   "-ac", "2", "-ar", "48000",
-                   "-c:a", "libvorbis", "-b:a", "128k"])
+            .args([
+                "-vn",
+                "-t",
+                &format!("{}", max_samples / rate as usize),
+                "-ac",
+                "2",
+                "-ar",
+                "48000",
+                "-c:a",
+                "libvorbis",
+                "-b:a",
+                "128k",
+            ])
             .arg(&ref_ogg)
             .status();
         let (ref_residue, ref_split) = match ref_status {
@@ -919,11 +961,27 @@ fn residue_histogram_vs_reference() {
             let r_spend: u64 = r[1..].iter().sum();
             let ratio = if r_spend > 0 {
                 o_spend as f64 / r_spend as f64
-            } else { f64::INFINITY };
+            } else {
+                f64::INFINITY
+            };
             report.push_str(&format!(
                 "| {} | {}/{} | {}/{} | {}/{} | {}/{} | {}/{} | {}/{} | {}/{} | {:.2} |\n",
-                band, o[0], r[0], o[1], r[1], o[2], r[2], o[3], r[3], o[4], r[4], o[5], r[5],
-                o_total, r_total, ratio,
+                band,
+                o[0],
+                r[0],
+                o[1],
+                r[1],
+                o[2],
+                r[2],
+                o[3],
+                r[3],
+                o[4],
+                r[4],
+                o[5],
+                r[5],
+                o_total,
+                r_total,
+                ratio,
             ));
         }
 
@@ -967,18 +1025,26 @@ fn residue_histogram_vs_reference() {
             report.push_str(&format!(
                 "\nshape Bark 3-22: max dist {max_d:.3}, bands >= 0.15: {over}/{} — {}\n",
                 in_scope.len(),
-                if over == 0 { "SHAPE PASS" } else { "shape fail" },
+                if over == 0 {
+                    "SHAPE PASS"
+                } else {
+                    "shape fail"
+                },
             ));
         }
         report.push_str("\n");
     }
 
+    // The seven sources are the user's own library, so each may be absent on a
+    // given host -- but a run that encoded none of them is a measurement of
+    // nothing, and the report it writes looks the same as a real one.
+    assert!(rows > 0, "no library sources were readable");
     report.push_str(&format!(
         "\nTotal bytes: ours {total_ours_bytes} vs ref {total_ref_bytes} ({:.2}x)\n",
         total_ours_bytes as f64 / total_ref_bytes as f64,
     ));
-    let report_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lanes/vorbis-psy-r1.histogram.txt");
+    let report_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lanes/vorbis-psy-r1.histogram.txt");
     let mut f = File::create(&report_path).expect("create report");
     f.write_all(report.as_bytes()).expect("write report");
     println!("Histogram report: {}", report_path.display());
@@ -1028,7 +1094,10 @@ fn decode_capture(path: &Path) -> Vec<(usize, Vec<Vec<i32>>)> {
 
 /// Bit split summed over the stream: (floor bits, residue bits, packet bits,
 /// non-zero residue count) — bits per coded value is the coding-efficiency oracle.
-fn bit_split_summary(split: &[(u64, u64, u64)], residue: &[(usize, Vec<Vec<i32>>)]) -> (u64, u64, u64, u64) {
+fn bit_split_summary(
+    split: &[(u64, u64, u64)],
+    residue: &[(usize, Vec<Vec<i32>>)],
+) -> (u64, u64, u64, u64) {
     let (mut f, mut r, mut p) = (0u64, 0u64, 0u64);
     for &(a, b, c) in split {
         f += a;
@@ -1037,7 +1106,11 @@ fn bit_split_summary(split: &[(u64, u64, u64)], residue: &[(usize, Vec<Vec<i32>>
     }
     let nz: u64 = residue
         .iter()
-        .map(|(_, chs)| chs.iter().map(|c| c.iter().filter(|&&v| v != 0).count() as u64).sum::<u64>())
+        .map(|(_, chs)| {
+            chs.iter()
+                .map(|c| c.iter().filter(|&&v| v != 0).count() as u64)
+                .sum::<u64>()
+        })
         .sum();
     (f, r, p, nz)
 }
@@ -1100,25 +1173,45 @@ fn compare_captures(
         }
     }
     if diffs.is_empty() {
-        (true, format!("identical histograms ({} vs {} blocks)", a.len(), b.len()))
+        (
+            true,
+            format!("identical histograms ({} vs {} blocks)", a.len(), b.len()),
+        )
     } else {
-        (false, format!(
-            "{} vs {} blocks; first diffs: {}",
-            a.len(),
-            b.len(),
-            diffs.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
-        ))
+        (
+            false,
+            format!(
+                "{} vs {} blocks; first diffs: {}",
+                a.len(),
+                b.len(),
+                diffs.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+            ),
+        )
     }
 }
 
 /// Decode with ffmpeg into planar f32, resampled to `rate`, limited to `max_samples`.
-fn ffmpeg_decode_limited(path: &Path, rate: u32, max_samples: usize) -> Option<(Vec<Vec<f32>>, u32)> {
+fn ffmpeg_decode_limited(
+    path: &Path,
+    rate: u32,
+    max_samples: usize,
+) -> Option<(Vec<Vec<f32>>, u32)> {
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(path)
-        .args(["-t", &format!("{}", max_samples / rate as usize),
-               "-ac", "2", "-ar", &rate.to_string(),
-               "-f", "f32le", "-acodec", "pcm_f32le", "-"])
+        .args([
+            "-t",
+            &format!("{}", max_samples / rate as usize),
+            "-ac",
+            "2",
+            "-ar",
+            &rate.to_string(),
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+        ])
         .output()
         .expect("ffmpeg runs");
     if !out.stderr.is_empty() {
@@ -1179,7 +1272,6 @@ fn shellexpand(path: &str) -> String {
     }
 }
 
-
 /// Full-file sweep over the user's library at the two managed rates: ours
 /// encoded at the size libvorbis actually produced (ffmpeg's -b:a is
 /// unmanaged VBR, 10-30% under nominal on real music), bytes within ±3% of
@@ -1196,19 +1288,28 @@ fn real_library_sweep_vs_reference() {
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
         ("sadie", "~/Music/sadie.wav"),
         ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
-        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+        (
+            "hein",
+            "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3",
+        ),
     ];
     let rate = 48_000u32;
     let max_samples = rate as usize * 600;
     let out_dir = scratch().join("vorbis7-sweep");
     std::fs::create_dir_all(&out_dir).expect("out dir");
-    let mut table = String::from("source  kbps   ours_kbps ref_kbps rate%   corr_ours corr_ref gap     minsec_o minsec_r drops verdict\n");
+    let mut table = String::from(
+        "source  kbps   ours_kbps ref_kbps rate%   corr_ours corr_ref gap     minsec_o minsec_r drops verdict\n",
+    );
     let mut failures = Vec::new();
     let only = std::env::var("SWEEP_ONLY").ok();
     let dump_drops = std::env::var("DROPS_DUMP").is_ok();
     let mut drops = String::new();
+    let mut rows = 0usize;
     for &(name, src_path) in sources {
-        if only.as_deref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
+        if only
+            .as_deref()
+            .is_some_and(|o| !o.split(',').any(|n| n == name))
+        {
             continue;
         }
         let src = PathBuf::from(shellexpand(src_path));
@@ -1216,6 +1317,7 @@ fn real_library_sweep_vs_reference() {
             table.push_str(&format!("{name:<7} -      SKIP (missing)\n"));
             continue;
         }
+        rows += 1;
         let Some((source_pcm, _)) = ffmpeg_decode_limited(&src, rate, max_samples) else {
             table.push_str(&format!("{name:<7} -      SKIP (decode)\n"));
             continue;
@@ -1229,14 +1331,31 @@ fn real_library_sweep_vs_reference() {
             let status = Command::new("ffmpeg")
                 .args(["-y", "-v", "error", "-i"])
                 .arg(&src)
-                .args(["-vn", "-t", "600", "-ac", "2", "-ar", "48000", "-c:a", "libvorbis", "-b:a", &format!("{kbps}k")])
+                .args([
+                    "-vn",
+                    "-t",
+                    "600",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    "-c:a",
+                    "libvorbis",
+                    "-b:a",
+                    &format!("{kbps}k"),
+                ])
                 .arg(&reference)
                 .status()
                 .expect("ffmpeg runs");
             assert!(status.success(), "libvorbis encode of {name} at {kbps}k");
             let bytes = |p: &Path| std::fs::metadata(p).expect("size").len() as f64;
             let ref_kbps = bytes(&reference) * 8.0 / seconds / 1000.0;
-            let (ours, block_log) = encode_to_file_with_log(&source_pcm, rate, (ref_kbps * 1000.0).round() as i32, &format!("vorbis7-sweep/ours-{name}-{kbps}k.ogg"));
+            let (ours, block_log) = encode_to_file_with_log(
+                &source_pcm,
+                rate,
+                (ref_kbps * 1000.0).round() as i32,
+                &format!("vorbis7-sweep/ours-{name}-{kbps}k.ogg"),
+            );
             let ours_kbps = bytes(&ours) * 8.0 / seconds / 1000.0;
             let rate_pct = (ours_kbps / ref_kbps - 1.0) * 100.0;
             // Whole-file corr plus a per-second trace: a dropout (the
@@ -1246,12 +1365,18 @@ fn real_library_sweep_vs_reference() {
             let corr_of = |p: &Path| -> (f64, Vec<f64>) {
                 let (pcm, _) = our_decode(p);
                 let n = pcm[0].len().min(source_pcm[0].len());
-                let mean = (0..2).map(|c| correlation(&pcm[c][..n], &source_pcm[c][..n])).sum::<f64>() / 2.0;
+                let mean = (0..2)
+                    .map(|c| correlation(&pcm[c][..n], &source_pcm[c][..n]))
+                    .sum::<f64>()
+                    / 2.0;
                 let step = rate as usize;
                 let per_second = (0..n / step)
                     .map(|s| {
                         let r = s * step..(s + 1) * step;
-                        (0..2).map(|c| correlation(&pcm[c][r.clone()], &source_pcm[c][r.clone()])).sum::<f64>() / 2.0
+                        (0..2)
+                            .map(|c| correlation(&pcm[c][r.clone()], &source_pcm[c][r.clone()]))
+                            .sum::<f64>()
+                            / 2.0
                     })
                     .collect();
                 (mean, per_second)
@@ -1275,7 +1400,9 @@ fn real_library_sweep_vs_reference() {
                 .collect();
             let pass = rate_pct.abs() <= 3.0 && gap <= 0.005 && dropouts == 0;
             if !pass {
-                failures.push(format!("{name}@{kbps}k rate {rate_pct:+.2}% gap {gap:.4} dropouts {dropouts}"));
+                failures.push(format!(
+                    "{name}@{kbps}k rate {rate_pct:+.2}% gap {gap:.4} dropouts {dropouts}"
+                ));
             }
             table.push_str(&format!(
                 "{name:<7} {kbps:<6} {ours_kbps:<9.1} {ref_kbps:<8.1} {rate_pct:+6.2} {corr_ours:<9.4} {corr_ref:<8.4} {gap:<7.4} {min_ours:<8.3} {min_ref:<7.3} {dropouts:<5} {}\n",
@@ -1326,6 +1453,7 @@ fn real_library_sweep_vs_reference() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes/vorbis-psy-r1.sweep.txt"),
         &table,
     );
+    assert!(rows > 0, "no library sources were readable");
     assert!(failures.is_empty(), "sweep failures: {failures:?}");
 }
 
@@ -1385,7 +1513,10 @@ fn band_error_vs_reference() {
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
         ("sadie", "~/Music/sadie.wav"),
         ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
-        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+        (
+            "hein",
+            "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3",
+        ),
     ];
     let rate = 48_000u32;
     let max_samples = rate as usize * 600;
@@ -1412,8 +1543,12 @@ fn band_error_vs_reference() {
     let mut bands = String::from("# Band error: ours vs libvorbis, both via our decoder\n\n");
     let mut bits = String::from("# Bit split over full sources, same rows as the band error\n\n");
     let only = std::env::var("SWEEP_ONLY").ok();
+    let mut rows = 0usize;
     for &(name, src_path) in sources {
-        if only.as_deref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
+        if only
+            .as_deref()
+            .is_some_and(|o| !o.split(',').any(|n| n == name))
+        {
             continue;
         }
         let src = PathBuf::from(shellexpand(src_path));
@@ -1421,6 +1556,7 @@ fn band_error_vs_reference() {
             bands.push_str(&format!("## {name}: SKIP (missing)\n\n"));
             continue;
         }
+        rows += 1;
         let Some((source_pcm, _)) = ffmpeg_decode_limited(&src, rate, max_samples) else {
             bands.push_str(&format!("## {name}: SKIP (decode)\n\n"));
             continue;
@@ -1433,7 +1569,19 @@ fn band_error_vs_reference() {
             let status = Command::new("ffmpeg")
                 .args(["-y", "-v", "error", "-i"])
                 .arg(&src)
-                .args(["-vn", "-t", "600", "-ac", "2", "-ar", "48000", "-c:a", "libvorbis", "-b:a", &format!("{kbps}k")])
+                .args([
+                    "-vn",
+                    "-t",
+                    "600",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    "-c:a",
+                    "libvorbis",
+                    "-b:a",
+                    &format!("{kbps}k"),
+                ])
                 .arg(&reference)
                 .status()
                 .expect("ffmpeg runs");
@@ -1457,7 +1605,10 @@ fn band_error_vs_reference() {
             };
             let (ref_pcm, ref_split) = {
                 let (residue, split) = decode_capture_with_bits(&reference);
-                (our_decode(&reference).0, bit_split_summary(&split, &residue))
+                (
+                    our_decode(&reference).0,
+                    bit_split_summary(&split, &residue),
+                )
             };
 
             // Bit-split block: (floor, residue, packet, non-zero) per stream.
@@ -1494,8 +1645,9 @@ fn band_error_vs_reference() {
             let (mut e_src, mut e_ours, mut e_ref) =
                 (vec![0f64; nb], vec![0f64; nb], vec![0f64; nb]);
             let (mut err_ours, mut err_ref) = (vec![0f64; nb], vec![0f64; nb]);
-            let mut spec: Vec<(Vec<f64>, Vec<f64>)> =
-                (0..3).map(|_| (vec![0.0; FRAME], vec![0.0; FRAME])).collect();
+            let mut spec: Vec<(Vec<f64>, Vec<f64>)> = (0..3)
+                .map(|_| (vec![0.0; FRAME], vec![0.0; FRAME]))
+                .collect();
             let mut start = 0;
             while start + FRAME <= n {
                 for ch in 0..2 {
@@ -1523,7 +1675,13 @@ fn band_error_vs_reference() {
                 }
                 start += HOP;
             }
-            let db = |e: f64, s: f64| if s > 0.0 { 10.0 * (e / s).log10() } else { f64::NAN };
+            let db = |e: f64, s: f64| {
+                if s > 0.0 {
+                    10.0 * (e / s).log10()
+                } else {
+                    f64::NAN
+                }
+            };
             bands.push_str(&format!(
                 "## {name} @ {kbps}k (ours {ours_kbps:.1} vs ref {ref_kbps:.1} kbps)\n"
             ));
@@ -1560,13 +1718,16 @@ fn band_error_vs_reference() {
             );
         }
     }
+    // Both report files above are written unconditionally, so a run that
+    // measured no source writes a report indistinguishable from a real one.
+    assert!(rows > 0, "no library sources were readable");
     for (text, file) in [
         (&bands, "vorbis-psy-r1.bands.txt"),
         (&bits, "vorbis-psy-r1.bits.txt"),
     ] {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../lanes")
- .join(file);
+            .join(file);
         let mut f = File::create(&path).expect("create report");
         f.write_all(text.as_bytes()).expect("write report");
         println!("{file}: {}", path.display());

@@ -435,6 +435,30 @@ fn have_ffmpeg() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Fixture-presence probe for `<what this test needs>`.
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that regenerates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape.
+fn require_fixture(path: &std::path::Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
+
 /// Decode an Annex B stream with ffmpeg, returning one I420 triple per picture.
 fn ffmpeg_decode(stream: &[u8], w: usize, h: usize, extra: &[&str]) -> Option<Vec<Planes>> {
     // Distinct per call, not per process: several #[test]s in this binary
@@ -702,10 +726,10 @@ fn real_library_frames_encode_and_decode_exactly() {
     }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/real-library-manifest.tsv");
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
-        eprintln!("SKIP real_library_frames: {} missing", manifest.display());
+    if !require_fixture(&manifest, "scripts/scan-real-library.sh") {
         return;
-    };
+    }
+    let text = std::fs::read_to_string(&manifest).expect("manifest reads");
     // The first 8-bit 4:2:0 H.264 mp4 of at least 720p in the manifest.
     let mut source = None;
     for line in text.lines().skip(1) {
@@ -726,6 +750,14 @@ fn real_library_frames_encode_and_decode_exactly() {
         break;
     }
     let Some((path, w, h)) = source else {
+        // A manifest with no qualifying row is a corpus that drifted, not a
+        // reason to report PASS for a sweep that never ran.
+        assert!(
+            std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+            "EC_REQUIRE_FIXTURES=1 but {} lists no H.264 4:2:0 mp4 of at least \
+             720p -- regenerate with: scripts/scan-real-library.sh",
+            manifest.display()
+        );
         eprintln!("SKIP real_library_frames: no H.264 4:2:0 mp4 in the manifest");
         return;
     };
