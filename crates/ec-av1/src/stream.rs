@@ -7407,7 +7407,237 @@ pub(crate) mod tests {
         }
         eprintln!("{NAME}: 4:2:0 control {h4} HORZ_4 / {v4} VERT_4 strips, 0 own-extent gathers");
     }
+    /// lane-av1gates444: the live 4:4:4 LOSSY cell the chroma-format sweep
+    /// measured EXACT 4/4 and left unpinned. The recipe is the sweep's own
+    /// §6.2 encode, reproduced LIVE against the oracle `aomenc` rather than
+    /// from a pin, because the claim these three gates carry is a property
+    /// of the *decoder* at a geometry, not of a blob:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=<W>x<H>:rate=25" -frames:v 4 \
+    ///        -pix_fmt yuv444p -f yuv4mpegpipe - | \
+    /// aomenc --codec=av1 --profile=1 --passes=1 --end-usage=q --cq-level=20 \
+    ///        --cpu-used=2 --threads=1 --row-mt=0 --lag-in-frames=0 \
+    ///        --kf-max-dist=100 --limit=4 --obu -o - -
+    /// ```
+    /// `rate=25` is load-bearing (testsrc2's pattern is time-parameterised)
+    /// and `--limit=4` is the sweep's frame count: at `--limit=6` the same
+    /// recipe emits 7674 / 11465 / 19121 bytes instead of the sweep's
+    /// 5938 / 8945 / 15239, i.e. a different stream than the one measured.
+    /// `--profile=1` is what makes the source 4:4:4 at all.
+    ///
+    /// Every assertion here is a non-vacuity assertion first and a pixel
+    /// compare second. The frame count, the per-frame geometry and the
+    /// FULL-RESOLUTION chroma plane length are asserted because a truncated
+    /// or 4:2:0-shaped decode can pass a lenient compare; the
+    /// `rect4_inter_own_chroma444_hits()` reach assert is there because the
+    /// class these cells belong to is the 4:4:4-only own-chroma-extent route
+    /// in [`decode_inter_block`]'s `around_c` (a 4:2:0 stream of the same
+    /// content leaves it at 0), and a counter at 0 would mean the gate
+    /// measured a different route than it names.
+    fn encode_444_lossy_live(name: &str, w: usize, h: usize) -> Vec<u8> {
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP {name}: no aomenc oracle at {} -- run scripts/build-aom-oracle.sh",
+                aomenc_path().display()
+            );
+            return Vec::new();
+        }
+        let source = format!("testsrc2=size={w}x{h}:rate=25");
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-frames:v",
+                "4",
+                "-pix_fmt",
+                "yuv444p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{name}: ffmpeg refused the {w}x{h} 4:4:4 source: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let out = run_with_stdin(
+            Command::new(aomenc_path()).args([
+                "--codec=av1",
+                "--profile=1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=20",
+                "--cpu-used=2",
+                "--threads=1",
+                "--row-mt=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=100",
+                "--limit=4",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]),
+            &y4m.stdout,
+        );
+        assert!(
+            out.status.success(),
+            "{name}: aomenc refused the {w}x{h} 4:4:4 lossy recipe: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.stdout.is_empty(),
+            "{name}: aomenc produced no OBU for {w}x{h} -- a zero-length stream would \
+             decode to nothing and the compare below would compare nothing"
+        );
+        out.stdout
+    }
 
+    /// The body every 4:4:4 lossy live gate runs: assert the oracle compare
+    /// CANNOT be skipped, assert the decode really is the cell it claims
+    /// (frame count, geometry, full-resolution chroma), assert the 4:4:4-only
+    /// own-extent route really ran, then compare every frame in decode order
+    /// against the oracle aomdec with the length asserted first.
+    ///
+    /// The aomdec assert is deliberately a HARD failure, not the
+    /// `if aomdec_path().is_file()` skip the older gates use: a gate that
+    /// measures exactness and then quietly skips the compare reports green
+    /// for a decoder it never looked at (class gate-blind-to-the-arm). It
+    /// fires only when the gate is actually running, i.e. the oracle aomenc
+    /// resolved -- and aomenc and aomdec ship in the same build directory,
+    /// so an aomdec that is missing while aomenc is present is a broken
+    /// oracle, not a checkout without one.
+    fn gate_444_lossy_live_exact(name: &str, w: usize, h: usize) {
+        let stream = encode_444_lossy_live(name, w, h);
+        if stream.is_empty() {
+            return; // no oracle at all: the SKIP above already said so
+        }
+        assert!(
+            aomdec_path().is_file(),
+            "{name}: the oracle aomenc resolved to {} but no aomdec sits beside it at {} -- \
+             the pixel compare would silently skip, which this gate treats as a failure",
+            aomenc_path().display(),
+            aomdec_path().display()
+        );
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_rect4_inter_own_chroma444_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{name}: the live {w}x{h} 4:4:4 lossy stream was refused: {e}")
+        });
+        let own = crate::decode::rect4_inter_own_chroma444_hits();
+        assert!(
+            own > 0,
+            "{name}: no 4:4:4 1:4 inter strip read its chroma context over its own extent -- \
+             the route this cell is a witness for never ran (measured: 13 at 66x66, 12 at \
+             130x122, 24 at 256x128)"
+        );
+        assert_eq!(
+            frames.len(),
+            4,
+            "{name}: decoded {} frame(s), the recipe encodes 4 -- a short decode would make the \
+             oracle compare cover a prefix of the cell",
+            frames.len()
+        );
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                (f.width, f.height),
+                (w, h),
+                "{name}: frame {i} is {}x{}, the cell is {w}x{h}",
+                f.width,
+                f.height
+            );
+            // At 4:4:4 both chroma planes are full resolution. A decoder that
+            // kept a subsampled extent would hand quarter-size planes to the
+            // byte compare; say so here instead of letting the compare
+            // stand in for the shape claim.
+            assert_eq!(
+                f.u.len(),
+                w * h,
+                "{name}: frame {i} U plane is {} samples; at 4:4:4 it must be full resolution \
+                 ({w}x{h})",
+                f.u.len()
+            );
+            assert_eq!(
+                f.v.len(),
+                w * h,
+                "{name}: frame {i} V plane is {} samples; at 4:4:4 it must be full resolution \
+                 ({w}x{h})",
+                f.v.len()
+            );
+            assert_eq!(
+                f.y.len(),
+                w * h,
+                "{name}: frame {i} luma plane is {} samples, expected {w}x{h}",
+                f.y.len()
+            );
+        }
+        let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, name);
+        assert_eq!(
+            decoded, 4,
+            "{name}: the oracle decoded {decoded} frame(s) in decode order, the recipe carries 4 \
+             (so far {hidden} hidden)"
+        );
+        eprintln!(
+            "{name}: {w}x{h} 4:4:4 lossy, {decoded} decode-order frame(s) byte-exact vs aomdec \
+             ({hidden} hidden), {own} own-extent 1:4 chroma gather(s)"
+        );
+    }
+
+    /// lane-av1gates444 cell 1: **odd coded dims, 66x66** -- the partial-frame
+    /// walk in BOTH axes (66 is not a multiple of 8, so the frame is a
+    /// partial superblock column AND a partial row). Measured EXACT 4/4 by
+    /// the chroma-format sweep (§6.2, 5938 bytes) and unpinned: nothing in
+    /// the crate would go red if the odd-dimension 4:4:4 walk regressed,
+    /// and the only red-before evidence was a lane report nobody re-runs.
+    #[test]
+    fn a_444_lossy_odd_66x66_stream_decodes_pixel_exact() {
+        gate_444_lossy_live_exact("a_444_lossy_odd_66x66_stream_decodes_pixel_exact", 66, 66);
+    }
+
+    /// lane-av1gates444 cell 2: **odd coded dims, 130x122** -- the
+    /// partial-frame RIGHT edge that the sweep found DIVERGENT (first wrong
+    /// sample Y(128,16), 11521 samples on frame 3) until lane-av1444rect's
+    /// 4:4:4 own-chroma-extent fix landed. It measures EXACT 4/4 on this
+    /// tree and is the discriminating geometry: 66x66 was exact at the same
+    /// settings while this was not, so the pair is what keeps "the 4:4:4
+    /// partial-frame walk is right" from being a one-geometry accident.
+    #[test]
+    fn a_444_lossy_odd_130x122_stream_decodes_pixel_exact() {
+        gate_444_lossy_live_exact(
+            "a_444_lossy_odd_130x122_stream_decodes_pixel_exact",
+            130,
+            122,
+        );
+    }
+
+    /// lane-av1gates444 cell 3: **256x128**, the sweep's cell recorded as
+    /// "4:4:4 superres 256x128 (`--superres-mode=1`)".
+    ///
+    /// IT IS NOT A SUPERRES CELL, and this gate is named for what it is
+    /// instead. Measured here, live: encoding 256x128 with and without
+    /// `--superres-mode=1` produces BYTE-IDENTICAL OBU (15239 bytes,
+    /// sha256 06621606…, both), so the flag is a no-op on this aomenc build
+    /// and the sweep's cell was a plain 4:4:4 lossy cq-20 stream that
+    /// happened to carry the flag. The cell's actual value is the geometry
+    /// plus the filter stages: 256x128 is two full 128 superblock columns,
+    /// and the strip walk runs there with the post-deblock/CDEF/LR chain
+    /// live on the later frames -- so this is the third witness for the
+    /// 4:4:4 lossy strip class at a geometry the 128x96 rect4 gate does not
+    /// cover.
+    #[test]
+    fn a_444_lossy_256x128_stream_decodes_pixel_exact() {
+        gate_444_lossy_live_exact("a_444_lossy_256x128_stream_decodes_pixel_exact", 256, 128);
+    }
     /// lane-av1444rect r2 — the SAME class as the gate above, second
     /// instance: `decode_rect4_16_intrabc` applied the 4:2:0 pair geometry at
     /// ss (0,0), where `is_chroma_reference` makes an intra-BC 1:4 strip its
