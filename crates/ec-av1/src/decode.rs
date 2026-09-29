@@ -6000,6 +6000,35 @@ thread_local! {
     static CFL_BLOCK_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static UV_ANGLE_DELTA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+// lane-av1cfl: which `cfl_ac_ss` arm ran, one bump per CfL block. The 4:4:4
+// arm is libaom `cfl_luma_subsampling_444_lbd_c` (1x1 luma per chroma sample)
+// and the 4:2:2 arm is `cfl_luma_subsampling_422_lbd_c`; only the last two
+// reach `cfl_ac_q3_at`'s 2x2 average, so these four are the reachability
+// evidence for that function's format-blind extent.
+thread_local! {
+    static CFL_AC_444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CFL_AC_422_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CFL_AC_420_SQ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CFL_AC_420_RECT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CFL_AC_Q3_AT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `[4:4:4, 4:2:2, 4:2:0 square, 4:2:0 rect]` [`cfl_ac_ss`] arm hits.
+pub fn cfl_ac_arm_hits() -> [usize; 4] {
+    [
+        CFL_AC_444_HITS.with(|c| c.get()),
+        CFL_AC_422_HITS.with(|c| c.get()),
+        CFL_AC_420_SQ_HITS.with(|c| c.get()),
+        CFL_AC_420_RECT_HITS.with(|c| c.get()),
+    ]
+}
+
+/// Entries into [`cfl_ac_q3_at`] itself -- the one arm whose extent is
+/// `bw / 2, bh / 2` and whose footprint is a 2x2 luma average. The gate
+/// proves it is reached ONLY at 4:2:0.
+pub fn cfl_ac_q3_at_hits() -> usize {
+    CFL_AC_Q3_AT_HITS.with(|c| c.get())
+}
 
 /// Current value of [`CFL_BLOCK_HITS`].
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
@@ -20121,6 +20150,7 @@ fn cfl_ac_ss(
     ss_y: usize,
 ) -> Vec<i32> {
     if ss_x == 0 && ss_y == 0 {
+        hit!(CFL_AC_444_HITS);
         let mut ac = vec![0i32; bw * bh];
         let mut sum = 0i32;
         for row in 0..bh {
@@ -20140,6 +20170,7 @@ fn cfl_ac_ss(
         // (`(a + b) >> 1` in Q3 is `(a + b) << 2`). A rect luma strip's chroma
         // is square here, and the 4:2:0 rect/square helpers below would halve
         // the height it must keep.
+        hit!(CFL_AC_422_HITS);
         let (cw, ch) = (bw >> 1, bh);
         let mut ac = vec![0i32; cw * ch];
         let mut sum = 0i32;
@@ -20158,8 +20189,10 @@ fn cfl_ac_ss(
         ac.iter_mut().for_each(|v| *v -= avg);
         ac
     } else if bw == bh {
+        hit!(CFL_AC_420_SQ_HITS);
         cfl_ac_q3(y, px, py, bw)
     } else {
+        hit!(CFL_AC_420_RECT_HITS);
         cfl_ac_q3_rect(y, px, py, bw, bh)
     }
 }
@@ -20171,6 +20204,10 @@ pub(crate) fn cfl_ac_q3_at(
     bh: usize,
     sample: impl Fn(usize, usize) -> i32,
 ) -> Vec<i32> {
+    hit!(CFL_AC_Q3_AT_HITS);
+    if crate::envflags::env_flag!("EC_HALVSWEEP") {
+        eprintln!("EC_HALV cfl_ac_q3_at px={px} py={py} bw={bw} bh={bh}");
+    }
     let (cw, ch) = (bw / 2, bh / 2);
     let mut ac = vec![0i32; cw * ch];
     let mut sum = 0i32;
