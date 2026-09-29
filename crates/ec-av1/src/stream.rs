@@ -19270,6 +19270,105 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1chrtx: the SIBLING of lane-av1444chr's four-unit arm -- a RECT
+    /// inter block's chroma plane, read by `read_inter_rect_chroma`. That
+    /// helper was left handing every unit the block-level `luma_tx_type`
+    /// (the top-left leaf's type) after the four-unit arms were pointed at
+    /// `covering_leaf_tx_type`, so a rect block whose chroma plane splits
+    /// (`nx*ny > 1`) over MIXED var-tx leaves read the wrong type per unit.
+    ///
+    /// The witness is pinned into `fixtures/`: `testsrc2 256x256` yuv444p 3
+    /// frames, aomenc `--profile=1 --cq-level=30 --cpu-used=0 --sb-size=64
+    /// --min-partition-size=32 --max-partition-size=64 --enable-tx-size-search=1
+    /// --passes=1 --end-usage=q --threads=1 --row-mt=0 --lag-in-frames=0
+    /// --kf-max-dist=100 --limit=3 --obu`; 26839 bytes, sha256
+    /// `06174a66e92aaeb751a8e86db59711fcb1f18d74bde2d77e1ef1be7983eb7c80`.
+    /// Its one qualifying block is the 32x64 inter strip at mi(32,48): a
+    /// 4:4:4 chroma plane of (32,64) = TWO TX_32X32 units, over a luma tree
+    /// of five leaves -- `Idtx` (32x32) on top, then `VDct`/`DctDct`/`HDct`/
+    /// `VDct` 16x16 leaves. The lower chroma unit therefore inherits `VDct`
+    /// where the block-level value is `Idtx`.
+    ///
+    /// Getting a witness at all took a bounded hunt (200+ encodes): `multi`
+    /// is false by construction at 4:2:0 (a `side <= 64` block's chroma plane
+    /// is at most 32x32 = one unit), so the arm needs 4:4:4 AND a rect block
+    /// that keeps a 64-px axis, AND `--cpu-used=0` with `--min-partition-size=32`
+    /// to make aomenc actually pick the 32x64 strip.
+    ///
+    /// The non-vacuity bar is the DIFFERS counter, not the route counter: the
+    /// control below is a committed 4:4:4 rect stream where the route fires
+    /// and still changes nothing, because that block's leaves agree.
+    #[test]
+    fn a_pinned_444_rect_inter_stream_resolves_each_chroma_unit_from_its_own_luma_leaf() {
+        const NAME: &str =
+            "a_pinned_444_rect_inter_stream_resolves_each_chroma_unit_from_its_own_luma_leaf";
+        const FIXTURE_LEN: usize = 26839;
+        const FIXTURE_FNV: u64 = 0xc77f_310c_036d_ff73;
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP {NAME}: no aomenc/aomdec oracle at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_rect_strip_leaf_tx_type.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let hits0 = crate::decode::chroma_rect_leaf_tx_hits();
+        let diff0 = crate::decode::chroma_rect_leaf_tx_diff_hits();
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        let hits = crate::decode::chroma_rect_leaf_tx_hits() - hits0;
+        let diff = crate::decode::chroma_rect_leaf_tx_diff_hits() - diff0;
+        assert_eq!(
+            frames, 3,
+            "{NAME}: expected 3 decode-order frames ({hidden} hidden)"
+        );
+        assert!(
+            hits >= 2 * diff && hits > 0,
+            "{NAME}: no rect chroma unit took its type from the covering luma leaf (hits {hits}, \
+             differs {diff}) -- the corrected route never ran"
+        );
+        assert!(
+            diff >= 2,
+            "{NAME}: the per-unit resolve never CHANGED an answer (diff {diff}; measured 2 on this \
+             stream, one per chroma plane). A route counter alone is not a witness: the control \
+             below fires it and changes nothing."
+        );
+        eprintln!(
+            "{NAME}: rect chroma units resolved from their own leaf {hits}, of which {diff} differed"
+        );
+
+        // Control: a committed 4:4:4 rect stream where the SAME route fires
+        // and every resolved type equals the block-level one -- the shape a
+        // no-op fix would also be green on.
+        let control = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/444_sb128rect_lr_witness.obu"),
+        )
+        .unwrap_or_else(|e| panic!("{NAME}: reading the rect-strip control: {e}"));
+        let c_hits0 = crate::decode::chroma_rect_leaf_tx_hits();
+        let c_diff0 = crate::decode::chroma_rect_leaf_tx_diff_hits();
+        let c_frames = decode_stream(&control)
+            .unwrap_or_else(|e| panic!("{NAME}: the rect-strip control no longer decodes: {e}"))
+            .len();
+        let c_hits = crate::decode::chroma_rect_leaf_tx_hits() - c_hits0;
+        let c_diff = crate::decode::chroma_rect_leaf_tx_diff_hits() - c_diff0;
+        assert!(
+            c_frames > 0,
+            "{NAME}: the rect-strip control decoded no frames"
+        );
+        assert!(
+            c_hits > 0 && c_diff == 0,
+            "{NAME}: the rect-strip control fired the route {c_hits} times with {c_diff} differing \
+             types -- expected the single-unit/same-type shape (route fires, nothing changes)"
+        );
+    }
+
     /// lane-inter4 r2: the 32x32-level inter `PARTITION_HORZ`/`PARTITION_VERT`
     /// strips (32x16 / 16x32) carrying a REAL residual -- the capability r1
     /// found missing ("a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
