@@ -7,6 +7,14 @@
 # this script reproduce the full ladder from scratch.
 #
 # Rungs provided (both env-gated, so an uninstrumented run is unchanged):
+#   DEPTH TRAP (lane-av1oraclerungdepth): the DUMP rungs 1 / 6 / 7 / 15 write
+#       1 byte per sample with no YV12_FLAG_HIGHBITDEPTH check (they are paired
+#       with decoder-side dumps that narrow to u8 on purpose). On a 10/12-bit
+#       stream they crash the oracle, or where they survive produce a file of
+#       EXACTLY HALF w*h*bps -- which looks like a truncated decode but is the
+#       rung's depth assumption. Each of those four carries a
+#       `DEPTH ASSUMPTION` block naming its decoder-side pair; rung 12
+#       (EC_AV1_FINAL_DUMP) is the depth-correct one.
 #   EC_AV1_PREFILT_DUMP=<prefix>  -> <prefix>.f<N> per frame, Y then U then V,
 #       crop-sized rows, written after tile decode and BEFORE any loop filter,
 #       CDEF or LR. Diff against our own EC_AV1_PREFILT_DUMP to separate a
@@ -120,6 +128,20 @@ assert old_sig in s, "read_partition signature moved"
 s = s.replace(old_sig, new_sig, 1)
 
 # --- rung 1: pre-filter recon dump --------------------------------------
+# DEPTH ASSUMPTION (lane-av1oraclerungdepth): this rung writes 1 byte per
+# sample and has NO YV12_FLAG_HIGHBITDEPTH check. That is deliberate -- it is
+# byte-paired with our own EC_AV1_PREFILT_DUMP, which narrows 10/12-bit to u8
+# on purpose (decode.rs:20048-20054, `p.data.iter().map(|&s| s as u8)` in
+# `dump_stage`).
+# TRAP: on an HBD stream the file is EXACTLY HALF w*h*2 = w*h bytes, which
+# reads like a truncated/short decode, not a decoder bug. For HBD use rung 12
+# EC_AV1_FINAL_DUMP (:730) -- it IS depth-correct (u8 / u16 LE).
+# OBSERVED 2026-09-29 on the HBD oracle build (CONFIG_AV1_HIGHBITDEPTH=1) with
+# the committed `av112bit-key.obu` (160x128 4:2:0 12-bit = 30720 samples):
+# rung 12 wrote 61440 B (w*h*bps) and this rung's 1-byte fwrite SIGSEGVs inside
+# fwrite (exit 139, 0-byte file); the bytes it would have written are 30720 B
+# = exactly half. Either way this is the RUNG's depth assumption, not a decoder
+# defect -- never read a half-length/empty file here as a truncated decode.
 anchor = """  av1_alloc_cdef_buffers(cm, &pbi->cdef_worker, &pbi->cdef_sync,
                          pbi->num_workers, 1);"""
 dump = """  {
@@ -304,6 +326,16 @@ print("intra mode-info instrumented")
 PYI
 
 # --- rung 6: post-deblock, pre-superres row dump ------------------------
+# DEPTH ASSUMPTION (lane-av1oraclerungdepth): 1 byte per sample, NO
+# YV12_FLAG_HIGHBITDEPTH check. Deliberate -- byte-paired with our
+# EC_AV1_POSTDEBLOCK_DUMP, which narrows to u8 (decode.rs:20048-20054,
+# `dump_stage(..., &y, &u, &v)` over the u16 planes; same closure at :53489).
+# TRAP: on an HBD stream the file is EXACTLY HALF w*h*2, which reads like a
+# truncated/short decode, not a decoder bug. For HBD use rung 12
+# EC_AV1_FINAL_DUMP (:730) -- depth-correct (u8 / u16 LE).
+# OBSERVED 2026-09-29 (HBD build, av112bit-key.obu): the 1-byte fwrite SIGSEGVs
+# (exit 139); where it survives it writes 30720 B where 61440 B is expected --
+# exactly half. That is this rung, not a truncated decode.
 python3 - "$F" <<'PYD'
 import sys
 path = sys.argv[1]
@@ -362,6 +394,16 @@ PYD
 # additive env var at the SAME anchor (pre-loop-filter) but dumping the full
 # y_width/y_height aligned buffer, so a margin-region reconstruction bug can
 # be told apart from a margin-region deblock bug.
+# DEPTH ASSUMPTION (lane-av1oraclerungdepth): 1 byte per sample, NO
+# YV12_FLAG_HIGHBITDEPTH check. Deliberate -- byte-paired with our
+# EC_AV1_PREFILT_WIDE_DUMP, which narrows to u8 (decode.rs:20078-20090,
+# `dump_prefilter_wide`; same closure at :53489). TRAP: on an HBD
+# stream the file is EXACTLY HALF w*h*2, which reads like a truncated/short
+# decode, not a decoder bug. For HBD use rung 12 EC_AV1_FINAL_DUMP (:730) --
+# depth-correct (u8 / u16 LE).
+# OBSERVED 2026-09-29 (HBD build, av112bit-key.obu): the 1-byte fwrite SIGSEGVs
+# (exit 139); where it survives it writes 30720 B where 61440 B is expected --
+# exactly half. That is this rung, not a truncated decode.
 python3 - "$F" <<'PYW'
 import sys
 path = sys.argv[1]
@@ -659,6 +701,19 @@ PYC11
 # y_crop_width), 8-bit as u8 and high bitdepth as u16 LE -- bit-depth
 # correct, unlike the u8-narrowing debug dumps.
 #
+# DEPTH TRAP (lane-av1oraclerungdepth) -- READ BEFORE USING ANY DUMP RUNG:
+# rungs 1 (PREFILT :146), 6 (POSTDEBLOCK :352), 7 (PREFILT_WIDE :416) and
+# 15 (POSTCDEF :934) write 1 byte per sample with NO YV12_FLAG_HIGHBITDEPTH
+# check, because each is byte-paired with a decoder-side dump that narrows to
+# u8 on purpose. On a 10/12-bit stream those four are unusable: measured on the
+# HBD oracle build with `av112bit-key.obu` (160x128 4:2:0 12-bit, 30720
+# samples) their 1-byte fwrite SIGSEGVs (exit 139, 0-byte file), and where it
+# survives it writes 30720 B where w*h*bps = 61440 B is expected -- EXACTLY
+# HALF, which reads like a truncated decode. Check `stat -c%s` against
+# w*h*bps before calling either a decoder defect. This rung (12) is the
+# depth-correct one for HBD. Each of those four rungs carries a
+# `DEPTH ASSUMPTION` block naming its decoder-side pair and line.
+#
 # Rungs 1/6 (pre-filter / post-deblock) stop before CDEF+LR+superres, and
 # every ffmpeg/aomdec pixel gate in this repo compares SHOWN frames only
 # (class gate-blind-to-hidden-frames), so before this rung no instrument in
@@ -848,6 +903,15 @@ PYST
 # builds (its 8-bit run SEGFAULTS); this rung is the 8-bit one. lane-
 # av1422filter added it to the live oracle tree by hand first, then it was
 # transcribed here (class: instrument that lives only in a build tree).
+# DEPTH ASSUMPTION (lane-av1oraclerungdepth): 1 byte per sample, NO
+# YV12_FLAG_HIGHBITDEPTH check. Deliberate -- byte-paired with our
+# EC_AV1_POSTCDEF_DUMP, which narrows to u8 (decode.rs:20048-20054; same
+# closure at :53489). TRAP: on an HBD stream the file is EXACTLY HALF w*h*2,
+# which reads like a truncated/short decode, not a decoder bug. For HBD use rung 12
+# EC_AV1_FINAL_DUMP (:730) -- depth-correct (u8 / u16 LE).
+# OBSERVED 2026-09-29 (HBD build, av112bit-key.obu): the 1-byte fwrite SIGSEGVs
+# (exit 139); where it survives it writes 30720 B where 61440 B is expected --
+# exactly half. That is this rung, not a truncated decode.
 python3 - "$F" <<'PYC'
 import sys
 path = sys.argv[1]
