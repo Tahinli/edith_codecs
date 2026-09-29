@@ -19,6 +19,30 @@ fn have_ffmpeg() -> bool {
         .unwrap_or(false)
 }
 
+/// Fixture-presence probe for the committed `fixtures/audio` media this file
+/// decodes. Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that regenerates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape.
+fn require_fixture(path: &Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
+
 /// ffmpeg's decode of a file, as planar-by-channel `f32`.
 fn ffmpeg_decode(path: &Path, channels: usize) -> Vec<Vec<f32>> {
     let out = Command::new("ffmpeg")
@@ -128,8 +152,7 @@ fn adts_fixtures_match_ffmpeg_per_channel() {
         "aac-adts-5.1-48000.aac",
     ] {
         let path = dir.join(name);
-        if !path.exists() {
-            eprintln!("SKIP {name}: fixture missing");
+        if !require_fixture(&path, "scripts/gen-fixtures.sh") {
             continue;
         }
         let corr = compare(&path);
@@ -164,8 +187,7 @@ fn mp4_fixtures_match_ffmpeg_per_channel() {
         "aac-mp4-5.1-48000.mp4",
     ] {
         let path = dir.join(name);
-        if !path.exists() {
-            eprintln!("SKIP {name}: fixture missing");
+        if !require_fixture(&path, "scripts/gen-fixtures.sh") {
             continue;
         }
         // The mp4 side of the family is another slice; the elementary stream
@@ -209,8 +231,7 @@ fn aac_coding_tools_match_ffmpeg_in_isolation() {
     for tool in ["pns", "is", "ms", "tns", "all"] {
         let name = format!("aac-tool-{tool}-mp4-stereo-48000.m4a");
         let path = dir.join(&name);
-        if !path.exists() {
-            eprintln!("SKIP {name}: fixture missing");
+        if !require_fixture(&path, "scripts/gen-fixtures.sh") {
             continue;
         }
         let adts = tmp.join(format!("{name}.aac"));
@@ -421,8 +442,7 @@ fn encoder_beats_the_incumbent_bar() {
     let mut checked = 0;
     for (name, channels, kbps, bar) in INCUMBENT_BAR {
         let src = dir.join(format!("flac-{name}-48000.flac"));
-        if !src.exists() {
-            eprintln!("SKIP {name}: fixture missing");
+        if !require_fixture(&src, "scripts/gen-fixtures.sh") {
             continue;
         }
         let source = ffmpeg_decode(&src, *channels);
@@ -801,8 +821,7 @@ fn aac_stream(path: &Path) -> Option<(usize, usize, String)> {
 #[test]
 fn five_one_decodes_faster_than_realtime() {
     let path = fixtures().join("audio/aac-adts-5.1-48000.aac");
-    if !path.exists() {
-        eprintln!("SKIP: 5.1 fixture missing");
+    if !require_fixture(&path, "scripts/gen-fixtures.sh") {
         return;
     }
     let data = std::fs::read(&path).expect("fixture readable");

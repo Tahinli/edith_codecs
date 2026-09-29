@@ -6,7 +6,11 @@
 //! must be identical. Lossless codec, no tolerance.
 //!
 //! The corpus is fetched by `scripts/fetch-vectors.sh`; without it every test
-//! here skips rather than fails, so a fresh clone still runs green.
+//! here skips rather than fails, so a fresh clone still runs green. Set
+//! `EC_REQUIRE_FIXTURES=1` to turn an absent or empty corpus into a hard
+//! failure instead (class: gate-skips-on-its-own-failure; model `have_ffmpeg`
+//! in crates/ec-av1/src/stream.rs, silently short-circuited because the probe
+//! ran first in a compound `if`).
 //!
 //! Run the tables:
 //!   cargo test -p ec-flac --release --test xiph_vectors -- --nocapture
@@ -17,15 +21,47 @@ use std::process::Command;
 use ec_flac::checksum::md5_of_samples;
 use ec_flac::decode::FlacReader;
 
+/// Fixture-presence probe for the Xiph FLAC corpus.
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that regenerates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape.
+fn require_fixture(path: &Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
+
 fn corpus(kind: &str) -> Option<Vec<PathBuf>> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/vectors/flac-xiph/flac-test-files-main")
         .join(kind);
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "flac"))
-        .collect();
+    // Probe first, and never as part of the `ok()?` escape: a missing directory
+    // must assert under EC_REQUIRE_FIXTURES instead of short-circuiting the
+    // whole helper into a silent skip.
+    if !require_fixture(&dir, "scripts/fetch-vectors.sh") {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "flac"))
+            .collect(),
+        Err(e) => panic!("read fixture dir {}: {e}", dir.display()),
+    };
     files.sort();
     match files.is_empty() {
         true => None,
@@ -64,6 +100,12 @@ fn subset_vectors_decode_bit_exact_against_ffmpeg() {
         eprintln!("skipped: fixtures/vectors/flac-xiph not fetched");
         return;
     };
+    // Non-empty floor: a zero-file corpus would loop zero times and pass.
+    assert!(
+        files.len() >= 5,
+        "subset corpus holds {} .flac files, expected at least 5",
+        files.len()
+    );
     let mut failures = Vec::new();
     let mut passed = 0;
     for path in &files {
@@ -135,6 +177,11 @@ fn uncommon_vectors_decode_bit_exact_or_refuse_by_name() {
         eprintln!("skipped: fixtures/vectors/flac-xiph not fetched");
         return;
     };
+    assert!(
+        files.len() >= 5,
+        "uncommon corpus holds {} .flac files, expected at least 5",
+        files.len()
+    );
     let mut failures = Vec::new();
     for path in &files {
         let bytes = std::fs::read(path).expect("read fixture");
@@ -170,6 +217,11 @@ fn faulty_vectors_error_and_never_panic() {
         eprintln!("skipped: fixtures/vectors/flac-xiph not fetched");
         return;
     };
+    assert!(
+        files.len() >= 5,
+        "faulty corpus holds {} .flac files, expected at least 5",
+        files.len()
+    );
     // Faults our reader is expected to catch outright rather than decode past:
     // these break the structure a decoder must trust.
     let must_reject = ["06 - ", "07 - ", "08 - ", "09 - ", "11 - "];
@@ -196,6 +248,11 @@ fn seek_table_positions_the_reader_at_a_frame() {
         eprintln!("skipped: fixtures/vectors/flac-xiph not fetched");
         return;
     };
+    assert!(
+        files.len() >= 5,
+        "subset corpus holds {} .flac files, expected at least 5",
+        files.len()
+    );
     // "48 - Extremely large SEEKTABLE" is the file with a seek table worth
     // exercising; any file carrying one proves the hook.
     let mut checked = 0;
@@ -226,4 +283,10 @@ fn seek_table_positions_the_reader_at_a_frame() {
         }
     }
     println!("seek: {checked} files with a seek table exercised");
+    // The loop skips every file without a seek table, so it can reach zero
+    // iterations even with a full corpus: floor the exercised count.
+    assert!(
+        checked >= 1,
+        "no subset fixture carried a SEEKTABLE, so the seek hook went unexercised"
+    );
 }

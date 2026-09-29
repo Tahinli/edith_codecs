@@ -68,6 +68,47 @@ fn vectors_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/vectors/h264-jvt")
 }
 
+/// Fixture-presence probe for the JVT vector library these tests decode.
+/// Returns whether the fixture is present, but never silently: under
+/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
+/// and the script that populates it, so a host whose fixture library drifted
+/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
+/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
+/// short-circuited because the probe ran first in a compound `if`).
+///
+/// Order is load-bearing: probe, assert, return. Never merge the probe into
+/// the same `if` as the escape.
+fn require_fixture(path: &std::path::Path, generator: &str) -> bool {
+    let present = path.exists();
+    assert!(
+        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
+        path.display(),
+        generator
+    );
+    if !present {
+        eprintln!("SKIP: fixture {} absent", path.display());
+    }
+    present
+}
+/// The same probe for one vector directory: `find_stream` returning `None`
+/// means the JVT vector was extracted without its bitstream, which is a hole
+/// in the fixture library and not a reason to test one vector fewer silently.
+/// Probe first, assert unconditionally, return last — same order as
+/// [`require_fixture`].
+fn require_stream(dir: &Path) -> Option<PathBuf> {
+    let found = find_stream(dir);
+    assert!(
+        found.is_some() || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but {} holds no bitstream file -- regenerate with: scripts/fetch-vectors.sh",
+        dir.display()
+    );
+    if found.is_none() {
+        eprintln!("SKIP: no bitstream file in {}", dir.display());
+    }
+    found
+}
+
 /// Every vector directory `scripts/fetch-vectors.sh` has populated, in name
 /// order.
 ///
@@ -76,6 +117,9 @@ fn vectors_dir() -> PathBuf {
 /// regressed from bit-exact to refused would be invisible. Walking the
 /// directory makes every fixture on disk a claim this test has to account for.
 fn all_vectors(base: &Path) -> Vec<String> {
+    // Probe first, assert inside the helper, build the list last: a missing
+    // vector directory must not read as "zero vectors, nothing to check".
+    require_fixture(base, "scripts/fetch-vectors.sh");
     let mut names: Vec<String> = std::fs::read_dir(base)
         .into_iter()
         .flatten()
@@ -100,6 +144,23 @@ fn find_stream(dir: &Path) -> Option<PathBuf> {
         }
     }
     fallback
+}
+
+/// Same shape for a file the JVT vector is supposed to carry besides its
+/// bitstream: the reference decoder YUV. Every vector `scripts/fetch-vectors.sh`
+/// populates ships one, so its absence is a hole in the fixture library, not a
+/// licence to verify that vector against nothing.
+fn require_ref_yuv(dir: &Path) -> Option<PathBuf> {
+    let found = find_ref_yuv(dir);
+    assert!(
+        found.is_some() || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "EC_REQUIRE_FIXTURES=1 but {} holds no reference YUV -- regenerate with: scripts/fetch-vectors.sh",
+        dir.display()
+    );
+    if found.is_none() {
+        eprintln!("SKIP: no reference YUV in {}", dir.display());
+    }
+    found
 }
 
 fn find_ref_yuv(dir: &Path) -> Option<PathBuf> {
@@ -289,11 +350,7 @@ fn compare_sequence(stream: &Path) -> Result<usize, String> {
 #[test]
 fn jvt_cavlc_first_idr_bit_exact() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!(
-            "SKIP: {} missing — run scripts/fetch-vectors.sh",
-            base.display()
-        );
+    if !require_fixture(&base, "scripts/fetch-vectors.sh") {
         return;
     }
     let mut passed = Vec::new();
@@ -302,8 +359,7 @@ fn jvt_cavlc_first_idr_bit_exact() {
     for name in all_vectors(&base) {
         let name = name.as_str();
         let dir = base.join(name);
-        let Some(stream) = find_stream(&dir) else {
-            eprintln!("SKIP {name}: no bitstream file");
+        let Some(stream) = require_stream(&dir) else {
             continue;
         };
         let bytes = std::fs::read(&stream).unwrap();
@@ -312,7 +368,7 @@ fn jvt_cavlc_first_idr_bit_exact() {
                 let frame_len = w * h * 3 / 2;
                 // Oracle 1: reference decoder YUV, first frame.
                 let mut ok = true;
-                if let Some(ref_path) = find_ref_yuv(&dir) {
+                if let Some(ref_path) = require_ref_yuv(&dir) {
                     let reference = std::fs::read(&ref_path).unwrap();
                     assert!(
                         reference.len() >= frame_len,
@@ -396,14 +452,13 @@ fn jvt_cavlc_first_idr_bit_exact() {
 #[test]
 fn steady_state_decode_loop_zero_alloc() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: fixtures missing");
+    if !require_fixture(&base, "scripts/fetch-vectors.sh") {
         return;
     }
     // One stream per entropy coder, and one with B slices and multiple
     // reference frames so the decoded picture buffer really recycles pictures.
     for name in ["BA1_Sony_D", "CABA1_SVA_B", "CABA3_SVA_B"] {
-        let Some(stream) = find_stream(&base.join(name)) else {
+        let Some(stream) = require_stream(&base.join(name)) else {
             continue;
         };
         let bytes = std::fs::read(stream).unwrap();
@@ -480,10 +535,11 @@ fn steady_state_decode_loop_zero_alloc() {
 #[test]
 fn ns_per_macroblock_measurement() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: fixtures missing");
+    if !require_fixture(&base, "scripts/fetch-vectors.sh") {
         return;
     }
+
+    let mut measured = 0usize;
     for name in [
         "BA1_Sony_D",
         "CI_MW_D",
@@ -491,7 +547,7 @@ fn ns_per_macroblock_measurement() {
         "CABA1_SVA_B",
         "CABA3_SVA_B",
     ] {
-        let Some(stream) = find_stream(&base.join(name)) else {
+        let Some(stream) = require_stream(&base.join(name)) else {
             continue;
         };
         let bytes = std::fs::read(stream).unwrap();
@@ -520,7 +576,11 @@ fn ns_per_macroblock_measurement() {
             "PERF {name}: {w}x{h}, {mbs} MBs, {ns_per_mb:.0} ns/MB, {mpx_s:.1} Mpx/s \
              (intra IDR, single thread, deblock included, output copy excluded)"
         );
+        measured += 1;
     }
+    // A run that measured nothing printed no number and proved nothing: the
+    // floor keeps a fixture-less host from reporting PASS for it.
+    assert!(measured > 0, "no vector was measured: {measured}");
     perf_whole_sequence();
 }
 
@@ -529,7 +589,7 @@ fn ns_per_macroblock_measurement() {
 fn perf_whole_sequence() {
     let base = vectors_dir();
     for name in ["BA_MW_D", "CABA3_SVA_B", "MR1_BT_A"] {
-        let Some(stream) = find_stream(&base.join(name)) else {
+        let Some(stream) = require_stream(&base.join(name)) else {
             continue;
         };
         let bytes = std::fs::read(stream).unwrap();
@@ -564,8 +624,7 @@ fn perf_whole_sequence() {
 #[test]
 fn corrupt_streams_never_panic() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: fixtures missing");
+    if !require_fixture(&base, "scripts/fetch-vectors.sh") {
         return;
     }
     // One stream per entropy coder, plus one with B slices and multiple
@@ -573,12 +632,17 @@ fn corrupt_streams_never_panic() {
     // arrays from stream-derived values, and inter prediction indexes the
     // decoded picture buffer, the reference lists and the motion arrays from
     // them too. All of it needs the same no-panic floor as the CAVLC tables.
+    let mut swept = 0usize;
     for name in ["BA1_Sony_D", "CABA1_SVA_B", "CABA3_SVA_B", "BA_MW_D"] {
-        let Some(stream) = find_stream(&base.join(name)) else {
+        let Some(stream) = require_stream(&base.join(name)) else {
             continue;
         };
         corrupt_sweep(&std::fs::read(stream).unwrap());
+        swept += 1;
     }
+    // A sweep over zero streams never panics because it never decodes
+    // anything; the invariant is only proven by real inputs.
+    assert!(swept > 0, "no vector streams were swept: {swept}");
 }
 
 /// Truncate and bit-flip `bytes` many ways; every decode must return, error or
@@ -1070,8 +1134,7 @@ fn p_only_gop_matches_ffmpeg_every_frame() {
 #[test]
 fn jvt_full_sequence_bit_exact() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: {} missing", base.display());
+    if !require_fixture(&base, "scripts/fetch-vectors.sh") {
         return;
     }
     let mut table = String::new();
@@ -1080,7 +1143,7 @@ fn jvt_full_sequence_bit_exact() {
     let mut failed = Vec::new();
     for name in all_vectors(&base) {
         let dir = base.join(&name);
-        let Some(stream) = find_stream(&dir) else {
+        let Some(stream) = require_stream(&dir) else {
             continue;
         };
         let bytes = std::fs::read(&stream).unwrap();
@@ -1090,7 +1153,7 @@ fn jvt_full_sequence_bit_exact() {
             }
             Ok(frames) => {
                 let len = frames[0].len();
-                let Some(ref_path) = find_ref_yuv(&dir) else {
+                let Some(ref_path) = require_ref_yuv(&dir) else {
                     table.push_str(&format!(
                         "{name:<16} {:>3} frames, no reference YUV\n",
                         frames.len()
@@ -1159,6 +1222,13 @@ fn jvt_full_sequence_bit_exact() {
         failed.len()
     );
     assert!(failed.is_empty(), "{failed:#?}");
+    // `failed.is_empty()` over a loop that can run zero times is vacuously
+    // green; the floor is the one its first-IDR sibling at the top of this
+    // file already carries.
+    assert!(
+        passed >= 5,
+        "fewer than 5 full-sequence JVT conformance streams verified bit-exact: {passed}"
+    );
 }
 
 /// Decode a whole stream in decode order rather than display order.
@@ -1850,10 +1920,10 @@ fn real_library_streams_match_ffmpeg() {
     }
     let manifest =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/real-library-manifest.tsv");
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
-        eprintln!("SKIP: {} missing", manifest.display());
+    if !require_fixture(&manifest, "scripts/scan-real-library.sh") {
         return;
-    };
+    }
+    let text = std::fs::read_to_string(&manifest).expect("manifest reads");
     let dir = scratch("real-library");
     const FRAMES: usize = 500;
     /// A file counts as swept only when the oracle stayed with us this long.
@@ -2313,8 +2383,7 @@ fn h264_seek_matches_linear_open_gop() {
         return;
     }
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/video/h264-open-gop.mp4");
-    if !src.is_file() {
-        eprintln!("SKIP: no fixtures/video/h264-open-gop.mp4 (run scripts/gen-fixtures.sh)");
+    if !require_fixture(&src, "scripts/gen-fixtures.sh") {
         return;
     }
     let dir = scratch("open-gop");
