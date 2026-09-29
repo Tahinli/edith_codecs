@@ -185,7 +185,12 @@ nothing, and each needed its gate to say which string it was about.
 - No refusal, `PROVEN` row or decoder behaviour changed. The only semantic change is that
   nine gates now assert they name the refusal they prove.
 
+Two hardenings came out of the mutations and ride in the same branch: the
+cursor-advance assert (`566d61bd`, from M3b) and a `depth -= 1` that underflowed
+if the scan met a `}` between the `fn` keyword and the body's `{` (`81eaadfd`).
+
 ## 7. Open for Main
+
 
 - Merge `lane-av1refusalspan`; retire `lane-av1refusal`'s `body_of` (see §0).
 - The new pins make a refusal-string edit in `decode.rs`/`stream.rs` turn **two** gates red
