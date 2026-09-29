@@ -2388,6 +2388,90 @@ fn census_unit(
     );
 }
 
+/// lane-av1ibcfork: this decoder's half of the per-unit BIT INTERVAL -- the
+/// exact mirror of the oracle's `EC_ECDUMP_IN` / `EC_ECDUMP_OUT` /
+/// `EC_ECDUMP_END` triple (`aom-oracle2/src/av1/decoder/decodetxb.c`: one
+/// print in `read_coeffs_txb` before and after its `aom_read_symbol`, one in
+/// the single caller `av1_read_coeffs_txb` after the whole unit).
+///
+/// Why three prints and not one `EC_CENSUS_UNIT`: a COUNT is not a key. The
+/// two sides can walk a different NUMBER of units and still be paired, because
+/// the interval is what a unit CONSUMED. Entry position alone drifts the moment
+/// one side consumes a different number of bits, and list index is invalid the
+/// moment one side misses a unit -- both were measured here and both
+/// mis-attribute. `post_bit` after the `txb_skip` read is the same
+/// `aom_reader_tell` the oracle prints there; `end_bit` is the end of the whole
+/// unit including the optional luma `tx_type`, the eob, the base/BR passes and
+/// the sign/Golomb loop, so a unit that reads the right symbols in the wrong
+/// ORDER is caught too.
+///
+/// `bit` counts the bits this decoder has pulled out of its window, so it sits
+/// at a CONSTANT offset from the oracle's tell (the OBU header libaom counts
+/// before `aom_reader_init`). The offset is measured per fixture, never
+/// assumed: +14 on `444_intrabc_rect4_witness.obu`.
+#[inline]
+fn unit_iv_on() -> bool {
+    crate::envflags::env_flag!("EC_UNITIV")
+}
+
+/// The unit's ENTRY position. Returns it so the caller can pass the same value
+/// to [`unit_iv_skip`] and [`unit_iv_end`] without reading the decoder again.
+#[inline]
+#[track_caller]
+fn unit_iv_in(plane: usize, w: usize, h: usize, ctx: usize, dec: &SymbolDecoder) -> usize {
+    if !unit_iv_on() {
+        return 0;
+    }
+    let bit = dec.debug_bitpos();
+    let (mi_r, mi_c) = SymbolDecoder::symr_mi();
+    eprintln!(
+        "EC_UNITIV_IN side=ours plane={plane} mi=({mi_r},{mi_c}) w={w} h={h} ctx={ctx} bit={bit} at {}",
+        std::panic::Location::caller()
+    );
+    bit
+}
+
+/// The position immediately after this unit's `txb_skip` read. `bit_in ==
+/// post_bit` means the read consumed ZERO bits (a CDF row already at a
+/// boundary), so this is also the real-read filter: the reader logs a step
+/// either way, and counting raw lines overstates the symbol count ~2x (measured
+/// on `444_intrabc_rect4_witness.obu`: 2395 lines, 512 real reads, against the
+/// oracle's 513 -- not the "~1069 fewer" an earlier round reported).
+#[inline]
+fn unit_iv_skip(
+    dec: &SymbolDecoder,
+    bit_in: usize,
+    plane: usize,
+    w: usize,
+    h: usize,
+    ctx: usize,
+    all_zero: bool,
+) {
+    if !unit_iv_on() {
+        return;
+    }
+    let (mi_r, mi_c) = SymbolDecoder::symr_mi();
+    eprintln!(
+        "EC_UNITIV_SKIP side=ours plane={plane} mi=({mi_r},{mi_c}) w={w} h={h} ctx={ctx} az={} bit={bit_in} post_bit={}",
+        all_zero as i32,
+        dec.debug_bitpos()
+    );
+}
+
+/// The position after the WHOLE unit. One call per successful read, on both
+/// the all-zero early return and the full coefficient walk.
+#[inline]
+fn unit_iv_end(dec: &SymbolDecoder, plane: usize, w: usize, h: usize, ctx: usize) {
+    if !unit_iv_on() {
+        return;
+    }
+    let (mi_r, mi_c) = SymbolDecoder::symr_mi();
+    eprintln!(
+        "EC_UNITIV_END side=ours plane={plane} mi=({mi_r},{mi_c}) w={w} h={h} ctx={ctx} end_bit={}",
+        dec.debug_bitpos()
+    );
+}
+
 // As [`FILTER_INTRA_RECT_HITS`], counting only the strips BELOW 16x16
 // (8x16/16x8 leaves of a 16x16 HORZ/VERT partition, lane-fistrip r1) -- the
 // shapes whose `use_filter_intra` symbol had no CDF class before this round.
@@ -4023,6 +4107,7 @@ fn push_mc(
 
 /// [`PlaneBuf::reconstruct_mc_rect`], recorded (lane-wave1 step (i)).
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 fn push_mc_rect(
     plane: usize,
     x: usize,
@@ -4034,6 +4119,21 @@ fn push_mc_rect(
     residual: &[i32],
     fctx: &crate::decode::FrameCtx,
 ) {
+    // lane-av1ibcfork: the PUSH site of an MC/inter write. The executed rung
+    // (`EC_MCWR`, in `reconstruct_mc_rect`) can only name the dispatch, so
+    // this is what names the block decoder that asked for the write -- the
+    // only thing that distinguishes two writes of the same shape. It is what
+    // localized a 4:4:4 intra-BC SKIP block committing its chroma plane block
+    // at `(px/2, py/2)` instead of the ss origin, clobbering a neighbouring
+    // block's reconstruction (lanes/av1ibcfork.report.md).
+    if crate::envflags::env_flag!("EC_MCPUSH") {
+        eprintln!(
+            "EC_MCPUSH plane={plane} x={x} y={y} stride={stride} w={w} h={h} \
+             res_len={} at {}",
+            residual.len(),
+            std::panic::Location::caller()
+        );
+    }
     let (src, stride) = match prediction.inline(stride) {
         Some(v) => v,
         None => {
@@ -7961,6 +8061,12 @@ fn read_coeffs(
     // (which prints `r->ec.rng` before the same `txb_skip` read).
     let census_entry_rng = dec.debug_state().0;
     let (census_w, census_h) = rect_shape.unwrap_or((side, side));
+    // lane-av1ibcfork: the per-unit BIT INTERVAL, the twin of the oracle's
+    // `EC_ECDUMP_IN` / `_OUT` / `_END`. The census plane, not a fresh label:
+    // it is the same source `census_unit` reads, so the interval line and the
+    // census line can never disagree about which plane a unit is on.
+    let iv_plane = CENSUS_PLANE.with(|c| c.get()).min(2);
+    let iv_bit = unit_iv_in(iv_plane, census_w, census_h, skip_ctx, dec);
     if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") {
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
@@ -7983,6 +8089,9 @@ fn read_coeffs(
         0
     };
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    unit_iv_skip(
+        dec, iv_bit, iv_plane, census_w, census_h, skip_ctx, all_zero,
+    );
     // lane-ibc444c: this reader logs an `all_zero` step even for a read that
     // consumes ZERO bits, so `post_bit == bit` means "no symbol was read" --
     // filter on it before pairing anything against the oracle.
@@ -8029,6 +8138,7 @@ fn read_coeffs(
             census_entry_rng,
             dec,
         );
+        unit_iv_end(dec, iv_plane, census_w, census_h, skip_ctx);
         return Ok((Grid::Zero(side * side), TxType::DctDct));
     }
     let mut grid = vec![0i32; side * side];
@@ -8246,6 +8356,7 @@ fn read_coeffs(
         census_entry_rng,
         dec,
     );
+    unit_iv_end(dec, iv_plane, census_w, census_h, skip_ctx);
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -8289,7 +8400,9 @@ fn read_coeffs_rect(
     set_census_plane(plane);
     let ibctx_on = crate::envflags::env_flag!("EC_IBCTX");
     let entry_bit = if ibctx_on { dec.debug_bitpos() } else { 0 };
+    let iv_bit = unit_iv_in(plane, w, h, skip_ctx, dec);
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    unit_iv_skip(dec, iv_bit, plane, w, h, skip_ctx, all_zero);
     if rect_trace {
         eprintln!(
             "EC_COEFF_STEP tag=all_zero plane={plane} ctx={skip_ctx} entry={entry_rng} all_zero={} rng={} bit={entry_bit} post_bit={}",
@@ -8313,6 +8426,7 @@ fn read_coeffs_rect(
     }
     if all_zero {
         census_unit(w, h, TxType::DctDct, 0, true, entry_rng, dec);
+        unit_iv_end(dec, plane, w, h, skip_ctx);
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
     let mut grid = vec![0i32; w * h];
@@ -8517,6 +8631,7 @@ fn read_coeffs_rect(
         );
     }
     census_unit(w, h, tx_type, eob, false, entry_rng, dec);
+    unit_iv_end(dec, plane, w, h, skip_ctx);
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -36599,6 +36714,7 @@ impl PlaneBuf<'_> {
     /// but only its own true `w`x`h` footprint is committed to the plane, so
     /// two strips sharing a square's coordinate origin never clobber each
     /// other's real pixels.
+    #[track_caller]
     fn reconstruct_mc_rect(
         &mut self,
         x: usize,
@@ -36624,6 +36740,19 @@ impl PlaneBuf<'_> {
         // three row bases are computed once per row instead of a
         // multiply-add per sample (the samples themselves are unchanged).
         let max = crate::decode::sample_max(fctx);
+
+        // lane-av1ibcfork: the MC/inter write's own origin and shape. The intra
+        // side's `EC_PRED` rung prints the PREDICTION, so a region whose
+        // prediction is byte-identical to the oracle's and whose committed
+        // samples are not can only be a DIFFERENT WRITE -- and this is the
+        // only write path with no rung of its own.
+        if crate::envflags::env_flag!("EC_MCWR") {
+            eprintln!(
+                "EC_MCWR x={x} y={y} side={side} w={w} h={h} empty_res={} at {}",
+                residual.is_empty(),
+                std::panic::Location::caller()
+            );
+        }
         // lane-recoparse: an all-zero residual (60% of the units) is a plain
         // prediction copy -- the same arithmetic with `r == 0`, without
         // reading `side * h` zeros out of [`ZERO_RESIDUAL`].
