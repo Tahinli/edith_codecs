@@ -2092,48 +2092,174 @@ mod count_vacuity {
         pub fixable_from: Option<String>,
     }
 
-    /// A census/probe/diagnostic gate: it reports, it does not assert a verdict.
-    fn is_probe(gate: &str) -> bool {
-        [
-            "census",
-            "probe",
-            "sweep",
-            "first_diff",
-            "scratch",
-            "rectx",
-            "diagnostic",
-        ]
-        .iter()
-        .any(|m| gate.contains(m))
-    }
+    /// The scanner's matchers, as SINGLE-SOURCE tables.
+    ///
+    /// They are `pub const` rather than inline literals because the sweep's
+    /// floor only catches a LOST shape; nothing caught a matcher that has
+    /// never fired, so a dead spelling sat in this list advertising coverage
+    /// the scan does not have (class: unexercised matcher in a source
+    /// scanner). [`count_vacuity_tests::every_scanner_matcher_fires_on_a_known_site`]
+    /// iterates THESE arrays, so a matcher cannot be added here without a
+    /// positive control that has to pass.
+
+    /// Oracle call spellings whose LAST argument is a locally derived count.
+    /// `ffmpeg_decode_sequence_444(` fires on five real `stream.rs` gates
+    /// (stream.rs:7030/7545/7735/8439/11643) but yields no count-vacuity SITE,
+    /// because every one of those five passes the spec const `FRAMES` rather
+    /// than a decode-derived `.len()`. It is live coverage, not a dead
+    /// spelling, and the control below measures the spelling, not the site.
+    pub const CALLEES: &[&str] = &[
+        "ffmpeg_decode_sequence(",
+        "ffmpeg_decode_sequence_10bit(",
+        "ffmpeg_decode_sequence_444(",
+    ];
+
+    /// Gate-name substrings that mark a census/probe/diagnostic gate: it
+    /// reports, it does not assert a verdict. `"diagnostic"` was here and has
+    /// no gate in the tree carrying it (and no other occurrence in the crate
+    /// outside this list), so it was DELETED rather than kept: there is no
+    /// hypothetical caller to name, and a probe that later wants that name
+    /// re-adds one line here, where the control then holds it to firing.
+    pub const PROBE_SUBSTRINGS: &[&str] =
+        &["census", "probe", "sweep", "first_diff", "scratch", "rectx"];
 
     /// Encode helpers a gate can drive INDIRECTLY. The r7 extraction found 21 of
     /// the 25 bucket-b gates encode through one of these, not through
     /// `aomenc_path()` directly -- which is why a first pass that only looked for
     /// `aomenc_path()` classified 6 gates "unclassified" that plainly encode.
+    /// Six further names (`the_chroma_rect_gates`, `restore_gate`,
+    /// `cdef_gate`, `superres_gate`, `grain_gate`, `sgate`) were here and
+    /// matched no `fn` body in the tree; `grep -rn '\bNAME\b' crates/ec-av1/src`
+    /// returns these six and NOTHING ELSE -- no helper, no caller, no comment
+    /// naming them -- so they were rot and are DELETED, not kept with a
+    /// hypothetical-caller note.
+    pub const ENC_HELPERS: &[&str] = &[
+        "encode_aomenc_stream",
+        "screen_intrabc_stream_at_depth",
+        "screen_intrabc_stream_with",
+        "libaom_encode_with",
+        "libaom_encode",
+        "run_multi_tile_gate",
+        "edge32_gate",
+        "rect_tx_tool_gate",
+        "warp_gate",
+    ];
+
+    /// Frame-count bindings that are a SPEC rather than a self-fulfilling
+    /// number. `NFRAMES` and `frames_expected` were here, matched no `fn`
+    /// body, and appear nowhere else in the crate -- DELETED as rot.
+    pub const FIXABLE_CANDS: &[&str] = &["FRAMES", "frame_count"];
+
+    /// How many lines above a count site an `assert(..)` on the same binding
+    /// may sit and still call the count spec-pinned. A single-sourced const so
+    /// the control below can hold the WINDOW itself to being the window the
+    /// sweep walks (a window widened to EOF would pin sites it never pinned).
+    pub const PIN_WINDOW: usize = 14;
+
+    /// The bucket-(b) leaf: a gate that drives aomenc directly rather than
+    /// through [`ENC_HELPERS`].
+    pub const AOMENC_LEAF: &str = "aomenc_path()";
+
+    /// The bucket-(a) leaves: a gate that reads its stream from disk.
+    pub const DISK_READ_LEAVES: &[&str] = &["fs::read", "crate_pin"];
+
+    /// A census/probe/diagnostic gate: it reports, it does not assert a verdict.
+    fn is_probe(gate: &str) -> bool {
+        PROBE_SUBSTRINGS.iter().any(|m| gate.contains(m))
+    }
+
+    /// Encode helpers a gate can drive INDIRECTLY -- see [`ENC_HELPERS`].
     fn enc_helpers(body: &str) -> Vec<&'static str> {
-        const NAMES: &[&str] = &[
-            "encode_aomenc_stream",
-            "screen_intrabc_stream_at_depth",
-            "screen_intrabc_stream_with",
-            "libaom_encode_with",
-            "libaom_encode",
-            "run_multi_tile_gate",
-            "edge32_gate",
-            "rect_tx_tool_gate",
-            "the_chroma_rect_gates",
-            "restore_gate",
-            "cdef_gate",
-            "warp_gate",
-            "superres_gate",
-            "grain_gate",
-            "sgate",
-        ];
-        NAMES
+        ENC_HELPERS
             .iter()
             .copied()
             .filter(|n| body.contains(&format!("{n}(")))
             .collect()
+    }
+
+    /// End byte of the `fn` body starting at `fn_start`: a STRING- and
+    /// line-comment-aware brace walk (the trap it dodges is recorded at the
+    /// call site). Extracted so the matchers' positive-control test walks the
+    /// EXACT slice the scanner classifies -- a control that re-implemented the
+    /// walk would be measuring a different thing than the guard (class
+    /// control-and-measurement-drift).
+    pub fn fn_body_end(src: &str, fn_start: usize) -> usize {
+        let bytes = src.as_bytes();
+        let mut depth = 0i32;
+        let mut started = false;
+        let mut fn_end = src.len();
+        let mut in_str = false;
+        let mut in_line_comment = false;
+        let mut k = fn_start;
+        while k < bytes.len() {
+            let c = bytes[k];
+            if in_line_comment {
+                if c == b'\n' {
+                    in_line_comment = false;
+                }
+                k += 1;
+                continue;
+            }
+            if in_str {
+                if c == b'\\' {
+                    k += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    in_str = false;
+                }
+                k += 1;
+                continue;
+            }
+            match c {
+                b'"' => in_str = true,
+                b'/' if bytes.get(k + 1) == Some(&b'/') => {
+                    in_line_comment = true;
+                    k += 1;
+                }
+                b'{' => {
+                    depth += 1;
+                    started = true;
+                }
+                b'}' => {
+                    depth -= 1;
+                    if started && depth == 0 {
+                        fn_end = k + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        fn_end
+    }
+
+    /// `(fn name, body slice)` for every top-level `fn` in `src`, attributed
+    /// the way [`sites`] attributes a site to its gate.
+    pub fn fn_slices(src: &str) -> Vec<(String, &str)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut offsets: Vec<usize> = Vec::with_capacity(lines.len());
+        {
+            let mut o = 0usize;
+            for l in &lines {
+                offsets.push(o);
+                o += l.len() + 1;
+            }
+        }
+        let mut out: Vec<(String, &str)> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("fn ") else { continue };
+            let Some(nm) = rest.split('(').next() else { continue };
+            if nm.contains(' ') {
+                continue;
+            }
+            let at = offsets[i];
+            let end = fn_body_end(src, at);
+            out.push((nm.to_string(), &src[at..end]));
+        }
+        out
     }
 
     pub fn sites(src: &str) -> Vec<Site> {
@@ -2163,11 +2289,7 @@ mod count_vacuity {
                     }
                 }
             }
-            for callee in [
-                "ffmpeg_decode_sequence(",
-                "ffmpeg_decode_sequence_10bit(",
-                "ffmpeg_decode_sequence_444(",
-            ] {
+            for callee in CALLEES {
                 let Some(at) = line.find(callee) else {
                     continue;
                 };
@@ -2207,7 +2329,7 @@ mod count_vacuity {
                 // every multi-line spelling and inflated the unpinned count.
                 let want = format!("{binding}.len()");
                 let mut pinned = None;
-                for back in 1..=14usize {
+                for back in 1..=PIN_WINDOW {
                     if i < back {
                         break;
                     }
@@ -2242,54 +2364,7 @@ mod count_vacuity {
                 // body and made every compare-detection read false -- the same
                 // trap that made stream.rs look 2 braces short in the first
                 // review of this wave.
-                let bytes = src.as_bytes();
-                let mut depth = 0i32;
-                let mut started = false;
-                let mut fn_end = src.len();
-                let mut in_str = false;
-                let mut in_line_comment = false;
-                let mut k = fn_start;
-                while k < bytes.len() {
-                    let c = bytes[k];
-                    if in_line_comment {
-                        if c == b'\n' {
-                            in_line_comment = false;
-                        }
-                        k += 1;
-                        continue;
-                    }
-                    if in_str {
-                        if c == b'\\' {
-                            k += 2;
-                            continue;
-                        }
-                        if c == b'"' {
-                            in_str = false;
-                        }
-                        k += 1;
-                        continue;
-                    }
-                    match c {
-                        b'"' => in_str = true,
-                        b'/' if bytes.get(k + 1) == Some(&b'/') => {
-                            in_line_comment = true;
-                            k += 1;
-                        }
-                        b'{' => {
-                            depth += 1;
-                            started = true;
-                        }
-                        b'}' => {
-                            depth -= 1;
-                            if started && depth == 0 {
-                                fn_end = k + 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    k += 1;
-                }
+                let fn_end = fn_body_end(src, fn_start);
                 let body = &src[fn_start..fn_end];
                 // APPROXIMATE, and known to be so: the body slice is a
                 // hand-rolled brace walk, and this crate's compare idioms vary
@@ -2307,7 +2382,7 @@ mod count_vacuity {
                         || body.contains("vs ffmpeg"));
                 // A SPEC already in scope for this gate?
                 let mut fixable = None;
-                for cand in ["FRAMES", "frame_count", "NFRAMES", "frames_expected"] {
+                for cand in FIXABLE_CANDS {
                     if body.contains(&format!("const {cand}"))
                         || body.contains(&format!("let {cand}"))
                     {
@@ -2341,12 +2416,12 @@ mod count_vacuity {
                         Some("c"),
                         "census/probe: reports, does not assert a verdict".to_string(),
                     )
-                } else if body.contains("aomenc_path()") || !enc_helpers(body).is_empty() {
+                } else if body.contains(AOMENC_LEAF) || !enc_helpers(body).is_empty() {
                     (
                         Some("b"),
                         "live aomenc encode: count belongs to the encoder".to_string(),
                     )
-                } else if body.contains("fs::read") || body.contains("crate_pin") {
+                } else if DISK_READ_LEAVES.iter().any(|leaf| body.contains(leaf)) {
                     (
                         Some("a"),
                         "stream read from disk: count belongs to the pin".to_string(),
@@ -2374,6 +2449,109 @@ mod count_vacuity {
         }
         out
     }
+
+    /// Every matcher's POSITIVE CONTROL: each spelling in this module's tables
+    /// must fire on at least one real thing in the scanned source, or the
+    /// spelling is advertising coverage the scan does not have.
+    ///
+    /// This is the missing half of the sweep's own floor. `s.len() >= 40` and
+    /// the unpinned ceiling both catch a LOST shape; nothing caught a matcher
+    /// that never fired -- which is how six encode-helper names, two spec
+    /// binding names and one probe substring sat in these tables matching
+    /// nothing anywhere in the crate (class: unexercised matcher in a source
+    /// scanner). Those nine are deleted. The control reads the SAME `const`
+    /// tables the scanner reads, so a matcher added later cannot skip it.
+    ///
+    /// `fn_slices` walks the same `fn_body_end` the scanner classifies with, so
+    /// "fires" means fires on the slice the guard actually reads.
+    #[test]
+    fn every_scanner_matcher_fires_on_a_known_site() {
+        let src = include_str!("stream.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let fns = fn_slices(src);
+
+        // The callee list, as a SPELLING. Not as a produced site: the
+        // `_444` spelling fires on five real gates that all pass the spec
+        // const `FRAMES`, so it correctly yields no count-vacuity site. A
+        // spelling that no `stream.rs` line uses is a spelling that has
+        // stopped being written and is now dead weight in the table.
+        for callee in CALLEES {
+            let hits = lines.iter().filter(|l| l.contains(callee)).count();
+            assert!(
+                hits > 0,
+                "the callee matcher `{callee}` fires on NO line of stream.rs -- it is dead \
+                 coverage: either a gate stopped using that spelling (drop the entry) or a \
+                 new one is expected to (add the call site first, not the matcher)"
+            );
+        }
+
+        // The gate-name probe substrings, against real fn names.
+        for sub in PROBE_SUBSTRINGS {
+            let hits = fns.iter().filter(|(g, _)| g.contains(sub)).count();
+            assert!(
+                hits > 0,
+                "the probe substring `{sub}` matches NO fn name in stream.rs -- bucket (c) is \
+                 unpopulated and the substring is dead weight"
+            );
+        }
+
+        // The indirect-encode helpers, against real fn BODIES.
+        for helper in ENC_HELPERS {
+            let hits = fns
+                .iter()
+                .filter(|(_, b)| b.contains(&format!("{helper}(")))
+                .count();
+            assert!(
+                hits > 0,
+                "the encode-helper matcher `{helper}(` matches NO fn body in stream.rs -- it is \
+                 dead coverage (grep the crate: if the helper has no caller, delete the entry; if \
+                 it has a caller outside stream.rs, say so here and name the file)"
+            );
+        }
+
+        // The spec-binding candidates, against real fn BODIES.
+        for cand in FIXABLE_CANDS {
+            let hits = fns
+                .iter()
+                .filter(|(_, b)| {
+                    b.contains(&format!("const {cand}")) || b.contains(&format!("let {cand}"))
+                })
+                .count();
+            assert!(
+                hits > 0,
+                "the spec-binding matcher `{cand}` matches NO fn body in stream.rs -- `fixable_from` \
+                 can never name it, so it is dead coverage"
+            );
+        }
+
+        // The two bucket leaves the classifier short-circuits on.
+        assert!(
+            fns.iter().any(|(_, b)| b.contains(AOMENC_LEAF)),
+            "no fn body in stream.rs calls `{AOMENC_LEAF}`, so the bucket-(b) direct-encode leaf \
+             never fires"
+        );
+        for leaf in DISK_READ_LEAVES {
+            let hits = fns.iter().filter(|(_, b)| b.contains(leaf)).count();
+            assert!(
+                hits > 0,
+                "the disk-read leaf `{leaf}` matches NO fn body in stream.rs -- bucket (a) is \
+                 unpopulated by that spelling"
+            );
+        }
+
+        // The pin window is a matcher too: a window so wide it pinned
+        // everything, or so narrow it pinned nothing, would leave the
+        // ceiling reading a population it no longer describes.
+        let s = sites(src);
+        let pinned = s.iter().filter(|x| x.pinned_by.is_some()).count();
+        assert!(
+            PIN_WINDOW > 0 && pinned > 0,
+            "PIN_WINDOW={PIN_WINDOW} pins {pinned} of {} site(s) -- the window must be the one \
+             the sweep walks and must still pin at least one site",
+            s.len()
+        );
+    }
+
 }
 
 #[cfg(test)]
