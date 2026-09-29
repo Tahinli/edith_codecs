@@ -202,3 +202,123 @@ probes/benchmarks excluded from the earlier release triage.
 
 Procedure saved as managed skills `stale-ignore-reason-vs-stale-comment` and
 `fixture-absent-silent-skip-class`.
+
+---
+
+# r2 — the two pins were still `#[ignore]`d, so a plain run executed nothing
+
+Branch `lane-av1pinslive` off current main `a5867794`. Commit `2e9086c0`. Tests
+only, no decoder change, no push.
+
+A clean-checkout verification (13 branches, 39 gates) reported that the two gates
+lane-av1pins recovered are `#[ignore]`d: they pass under `--ignored` and their pins
+are committed, but **in a plain suite run they do not execute**. That is correct
+and it is the same hole in a different costume. r1's before/after table was
+measured with `--ignored` and did not say so, which made it read as a fix when it
+was only a fix *under a flag*.
+
+## 1. The facts
+
+| gate | `#[ignore]` on main `a5867794`? | reason string |
+|---|---|---|
+| `pinned_golden3_stream_decodes_pixel_exact` | **yes** | `bisect aid, not a suite gate; run it with --ignored` |
+| `pinned_sbpart_stream_decodes_pixel_exact` | **yes** | `bisect aid, not a suite gate; run it with --ignored` |
+| `a_real_aomenc_lossless_444_key_frame_decodes_sample_exact` | **no — already live** | — |
+
+**The reason string is stale, and it went stale twice.** It was introduced at
+`c9fede5d` (2026-08-28, lane-av1golden3) as
+`reads a pinned fixture path outside the repo; run manually`, with the doc comment
+giving the real cause: *"the file only exists on this machine's scratchpad"*. True
+then. It stopped being true at `78c805bd` (lane-av1pins), which committed both pins
+under `crates/ec-av1/fixtures/` — a path that travels in the runner tarball, so the
+bytes are on every runner.
+
+**The second staleness is mine.** lane-av1pins replaced the reason with *"bisect aid,
+not a suite gate"* — a judgement, not a fact, and wrong on this tree: with the bytes
+committed these are ordinary decode-exactness gates that cost 0.10–0.15 s, not
+bisect aids. A clean-checkout run cannot see a committed pin, so the lane that
+*fixed* the pin hole left the ignore hole standing in the same commit.
+
+## 2. No condition that makes this crate ignore a gate applies
+
+Measured on `a5867794`, both gate bodies:
+
+* **no process-global** — neither calls `force_sb128` nor `knob_write`. This is the
+  condition that legitimately earns 11 other ignores in this crate.
+* **no counter, no `lock_gate_counters()`** — so `--test-threads=1` is not required
+  of them either.
+* **no aomenc** — they decode committed bytes and compare to ffmpeg, so they are not
+  real-aomenc gates and stay out of the `gate_coverage` census either way.
+* **not slow** — 0.10–0.15 s each, against 9 ignored siblings that declare
+  minutes-per-item.
+* **ffmpeg guarded** — `have_ffmpeg()` already honours `EC_AV1_REQUIRE_FFMPEG`, so a
+  missing ffmpeg is a hard failure, not a silent skip.
+
+Precedent in-tree: `gate_coverage.rs` records the 10-bit LR gate *"was `#[ignore]`d on
+that branch and passes un-ignored on main, which carries the fix"* — the same
+un-ignore-once-the-blocker-clears move.
+
+## 3. Before / after, plain run
+
+Both commands are **plain** — no `--ignored`, no `--exact` needed to select them:
+
+```
+cargo test -p ec-av1 --lib --release -- --exact stream::tests::pinned_golden3_stream_decodes_pixel_exact --test-threads=1 --nocapture
+  test ...pinned_golden3_stream_decodes_pixel_exact ... pinned_golden3_stream_decodes_pixel_exact:
+        4 frame(s) byte-exact vs ffmpeg from .../crates/ec-av1/fixtures/golden3-pin.obu
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 730 filtered out; finished in 0.15s
+
+cargo test -p ec-av1 --lib --release -- --exact stream::tests::pinned_sbpart_stream_decodes_pixel_exact --test-threads=1 --nocapture
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 730 filtered out; finished in 0.10s
+     (EC_SBPART_DIAG=1 additionally prints "DIAG frame 0: 0 luma mismatches ... of 192x128"
+      plus per-SB-column counts — all 24576 luma samples walked)
+```
+
+| | main `a5867794` plain run | branch `2e9086c0` plain run |
+|---|---|---|
+| `pinned_golden3` | *not executed* (ignored) | 1 passed, 0.15s, prints 4 frames byte-exact |
+| `pinned_sbpart` | *not executed* (ignored) | 1 passed, 0.10s |
+| `a_real_aomenc_lossless_444_key_frame...` | 1 passed, 0.21s | 1 passed, 0.21s (unchanged) |
+
+Three further confirmations that they are genuinely live rather than merely
+un-flagged: they execute under a plain **substring** filter (`-- pinned_`, no
+`--exact`, no `--ignored`); neither appears in `-- --ignored` any more (0 matches);
+and `#[ignore]` in `stream.rs` drops **41 → 39**.
+
+## 4. A regression I caused and then disproved — recorded because it nearly shipped
+
+The first `gate_coverage` run **on this branch** showed
+`FAILED. 8 passed; 2 failed` (`never_exercised_8bit_matches_the_gate_recipes`,
+`never_exercised_10bit_matches_the_gate_recipes`), while the same filter on main
+passed 10/10. Un-ignoring changes the census input, so I took that as a regression
+I had introduced.
+
+It was not. A 554-second `--ignored` full-suite run was executing **against the same
+worktree and the same `CARGO_TARGET_DIR` at that moment**. Re-run after it finished:
+`gate_coverage` **10 passed / 0 failed on 6 consecutive runs**, and alone with
+`--exact` it also passes. These are compile-time source scans (`include_str!`),
+which cannot be perturbed by runtime state — consistent with a build/link race on
+the shared target dir, not with a logic change. Recorded because "I broke a meta-gate"
+was the correct reading of the evidence at the time, and the reason it was wrong is
+worth keeping.
+
+Final meta-gate state after the change: `gate_coverage` **10 passed**,
+`refusal_inventory` **15 passed**, both green.
+
+## 5. Follow-on found, NOT done here
+
+Three sibling pin gates carry the same stale reason **and** still read pins that are
+not committed — so in a clean checkout each either skips or panics:
+
+| gate | pin | committed? | failure mode if un-ignored as-is |
+|---|---|---|---|
+| `pinned_golden4_stream_decodes_pixel_exact` | `golden4-pin.obu` | no | silent skip |
+| `pinned_golden7_stream_decodes_pixel_exact` | `golden7-forwarding-mismatch.obu` | no | silent skip |
+| `pinned_lr_sgr_stream_call_unique_dump` | `lr-sgr-r7.obu` | no | **panic** — `std::fs::read(path).expect(...)`, no graceful skip |
+
+All three read through `pin_dir()` or a `concat!(env!("CARGO_MANIFEST_DIR"),
+"/../../fixtures/...")` literal, i.e. the gitignored root. `golden6-mismatch.obu` is
+a fourth untracked pin. These are the same defect and the same fix; recovering them
+is mechanical from the r1 recipes (golden4 and golden7 are siblings of golden3 off
+the cdf-forwarding gate). Left out of this commit to keep it a reason-removal, and
+handed back rather than folded in silently.
