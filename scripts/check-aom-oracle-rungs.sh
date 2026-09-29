@@ -21,6 +21,26 @@
 # upstream files, runs the instrument script over the copy, and asserts the
 # derived files' shape. The real oracle tree is never written to.
 #
+# EXIT CONTRACT (lane-av1stagegaps). A staging driver must be able to tell the
+# three states apart, because "checker passed", "checker failed" and "checker
+# never ran" all printed as `rungs_exit=1` (or as nothing at all) and the suite
+# ran anyway. Measured 2026-09-30 on host 51.195.223.40: the driver log showed
+#   === ORACLE RUNG CHECKER
+#   rungs_exit=1 ok_count=0            <- no detail line at all
+#   === SUITE
+# while the real reason, with stderr visible, was a missing PREREQUISITE:
+#   no oracle source at /home/tCloud/.cache/aom-oracle/src/av1/decoder/decodeframe.c
+#   $ ls ~/.cache/aom-oracle/
+#   build                               <- binaries only, no src/ tree
+#   0  GREEN   every assertion below held.
+#   3  NOTRUN  a PREREQUISITE is absent (no oracle source tree, or the base ref
+#              is not in it). Nothing was asserted: this is NOT a pass and NOT a
+#              defect. scripts/av1-suite-preflight.sh maps it to `not-run` and
+#              BLOCKS the suite unless a waiver names the host.
+#   1  FAIL    a derived file violates the rung contract, or the instrument
+#              script errored / was not idempotent.
+
+#
 # Usage:
 #   scripts/check-aom-oracle-rungs.sh [SRC_DIR] [BASE_REF]
 # Defaults: $AOM_ORACLE_SRC or ~/.cache/aom-oracle/src, and base ref v3.13.3
@@ -32,14 +52,21 @@ BASE="${2:-${AOM_ORACLE_BASE_REF:-v3.13.3}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DERIVED="$SRC/av1/decoder/decodeframe.c"
 RECONINTRA="$SRC/av1/common/reconintra.c"
+die_prereq() { echo "PREREQ-ABSENT: $*" >&2; exit 3; }
 
-[ -f "$DERIVED" ] || { echo "no oracle source at $DERIVED" >&2; exit 1; }
-[ -f "$RECONINTRA" ] || { echo "no oracle source at $RECONINTRA" >&2; exit 1; }
+
+[ -f "$DERIVED" ] || die_prereq "no oracle source at $DERIVED (provision it: git clone -b v3.13.3 --depth 1 aom at $SRC)"
+[ -f "$RECONINTRA" ] || die_prereq "no oracle source at $RECONINTRA (provision it: git clone -b v3.13.3 --depth 1 aom at $SRC)"
 git -C "$SRC" rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1 || {
-  echo "base ref '$BASE' is not a commit in $SRC" >&2
-  exit 1
+  die_prereq "base ref '$BASE' is not a commit in $SRC"
 }
 
+# systemd-run's --setenv=TMPDIR points at a per-suite dir; if staging created
+# the unit but not the dir, mktemp fails with an error that reads like a
+# checker bug. It is the same class as a missing oracle tree: not asserted.
+probe="$(mktemp -d "${TMPDIR:-$HOME/.cache/tmp}/aom-rung-check.XXXXXX" 2>/dev/null)" ||
+  die_prereq "scratch dir ${TMPDIR:-$HOME/.cache/tmp} does not exist (staging must mkdir it)"
+rmdir "$probe"
 WORK="$(mktemp -d "${TMPDIR:-$HOME/.cache/tmp}/aom-rung-check.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 cp -a "$SRC" "$WORK/src"
