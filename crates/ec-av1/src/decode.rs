@@ -9274,9 +9274,18 @@ impl Neighbours {
     /// differ from each other in not one sample. The gate for this value is
     /// therefore a source scan, not a pixel gate --
     /// `refusal_inventory::the_skipped_128_root_chroma_suppression_publishes_the_blocks_own_per_axis_chroma_extent`.
-    fn suppress_internal_lf_edges(&mut self, at_mi: (usize, usize), w_mi: usize, h_mi: usize, fctx: &FrameCtx) {
+    fn suppress_internal_lf_edges(
+        &mut self,
+        at_mi: (usize, usize),
+        w_mi: usize,
+        h_mi: usize,
+        fctx: &FrameCtx,
+    ) {
         let (mi_r, mi_c) = at_mi;
-        let (uv_w, uv_h) = (((w_mi * MI) >> ss_x(fctx)).max(4) as u8, ((h_mi * MI) >> ss_y(fctx)).max(4) as u8);
+        let (uv_w, uv_h) = (
+            ((w_mi * MI) >> ss_x(fctx)).max(4) as u8,
+            ((h_mi * MI) >> ss_y(fctx)).max(4) as u8,
+        );
         for rr in 0..h_mi {
             let start = (mi_r + rr) * self.skip_grid_cols_mi + mi_c;
             fill_span(&mut self.uv_tx_grid, start, w_mi, uv_w);
@@ -16829,6 +16838,22 @@ fn decode_intrabc_owned_rect(
 ) -> Result<()> {
     let _ = base_q_idx;
     let (px, py) = (mi_c * MI, mi_r * MI);
+    // lane-av1chromahalvings r5: libaom-WRONG at 4:4:4 -- `av1_get_max_uv_txsize`
+    // is `ss_size_lookup[bsize]` and `get_vartx_max_txsize` (blockd.h:1447) reads
+    // that plane block as `max_txsize_rect_lookup[plane_bsize]`, so chroma extent
+    // == luma extent at ss (0,0) -- and the chroma MV origins below are the
+    // prediction half of the same defect. MEASURED on the 4:4:4 LOSSY witness
+    // fixtures/r512.obu, chroma-only, luma byte-exact on both inter frames.
+    // BLOCKED, not missing: with the ss-derived extent the decode REFUSES --
+    // "a rectangular inter chroma transform unit whose shape has no coefficient
+    // table set here" -- because a 4:4:4 32x64 chroma plane block needs a
+    // `TxbSet` this crate lacks. The fix is a new coefficient set, not a swap.
+    // Left as the halving deliberately: turning a decoding stream into a
+    // refusal is a behaviour change with its own decision. See
+    // lanes/av1chromahalvings.report.md r5.
+    if crate::envflags::env_flag!("EC_HALVSWEEP") {
+        eprintln!("EC_HALV ibc_owned mi=({mi_r},{mi_c}) bw={bw} bh={bh} skip={skip}");
+    }
     let (cw, ch) = (bw / 2, bh / 2);
     let side = bw.max(bh);
     let cside = cw.max(ch);
