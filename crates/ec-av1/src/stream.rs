@@ -42085,6 +42085,15 @@ pub(crate) mod tests {
                 }
                 let rect4_now = (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
                     + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
+                // The ENCODE's frame count: `rectchroma_stream` (42059) renders
+                // `duration=0.04:rate=25` (42082) with `-t 0.04` (42094) -- one
+                // frame -- and its aomenc runs with no `--limit`, so every
+                // attempt's stream codes exactly 1 frame at both depths.
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "{NAME}: {bit_depth}-bit cq {cq} seed {seed} key frame"
+                );
                 let reference = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                 } else {
@@ -42322,6 +42331,11 @@ pub(crate) mod tests {
             let stream = rectchroma_stream(bit_depth, 32, 4, width, height);
             let frames = decode_stream(&stream)
                 .unwrap_or_else(|e| panic!("{NAME}: {bit_depth}-bit seed 46 refused: {e}"));
+            // The ENCODE's frame count: `rectchroma_stream` (42059) renders
+            // `duration=0.04:rate=25` (42082) with `-t 0.04` (42094) -- one frame
+            // -- and its aomenc runs with no `--limit`, so the stream codes
+            // exactly 1 frame at both depths. Asserted ABOVE the oracle call.
+            assert_eq!(frames.len(), 1, "{NAME}: {bit_depth}-bit seed 46 key frame");
             let reference = if bit_depth == 10 {
                 ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
             } else {
@@ -42491,6 +42505,15 @@ pub(crate) mod tests {
                     }
                     Ok(frames) => frames,
                 };
+                // The ENCODE's frame count: `duration=0.04:rate=25` (42263) is
+                // one frame and `-t 0.04` (42277) caps the y4m there, and aomenc
+                // runs with no `--limit` -- so every arm (both depths, all 10
+                // seeds) codes exactly 1 frame. Asserted ABOVE the oracle call.
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "{NAME}: {bit_depth}-bit seed {seed} key frame"
+                );
                 let reference = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                 } else {
@@ -42700,6 +42723,16 @@ pub(crate) mod tests {
                     };
                     let hits = crate::decode::edge_part_hits();
                     let skip_split_tx = crate::decode::skip_split_tx_hits();
+                    // The ENCODE's frame count: `-t 1` AND `-vframes 1` (42490)
+                    // cap the y4m at one frame and aomenc is given that one frame
+                    // with no `--limit`, so every arm's stream holds exactly 1
+                    // coded frame. Asserted ABOVE the oracle call so a decode that
+                    // dropped it reds naming the encode.
+                    assert_eq!(
+                        frames.len(),
+                        1,
+                        "{NAME}: {width}x{height} depth={depth} key frame"
+                    );
                     let ffmpeg_frames = if depth == 10 {
                         ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                     } else {
