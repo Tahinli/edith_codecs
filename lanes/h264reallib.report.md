@@ -76,6 +76,7 @@ still stands, and still holds, on the machine that can run it (it did: 15 ≥ 3)
 Verified — the target is no longer red, and the reason is printed verbatim:
 
 ```
+
 test real_library_streams_match_ffmpeg ... ignored, sweeps the PERSONAL media
 library (~/Videos, ~/Downloads, ~/Music) through the gitignored
 fixtures/real-library-manifest.tsv; MINUTES of wall time (measured past 840 s on
@@ -169,12 +170,35 @@ with a soft skip, so it is harmless today, and it also silently defeats
 worktree isolation. Worth converting to the relative form if that ignore is ever
 lifted.
 
+### Round 2 — the four approved follow-ups (all now fixed)
+
+| site | change | before | after |
+|---|---|---|---|
+| `crates/ec-probe/tests/library.rs:490` | `assert!(!chosen.is_empty())` → named SKIP + `return` | red-on-runner whenever every manifest path had moved | `1 passed; 0 failed; 0 ignored` |
+| `crates/ec-aac/tests/sbr_real_library.rs:4797` | `env::var("HOME").unwrap()` → `.unwrap_or_default()` | `FAILED. 0 passed; 1 failed` — `called Result::unwrap() on an Err value: NotPresent` | `1 passed; 0 failed; 0 ignored` |
+| `crates/ec-aac/tests/obs_real_content.rs:151` | same | `FAILED. 0 passed; 1 failed` — same panic | `1 passed; 0 failed; 0 ignored` |
+| `crates/ec-matroska/tests/matroska.rs:966` | hardcoded absolute manifest path → `fixtures()` | read the PRIMARY checkout's manifest from any worktree | `fixtures()` = `CARGO_MANIFEST_DIR/../../fixtures`, like every sibling |
+
+The two HOME fixes were proved by running them under `env -u HOME` (the
+runner shape) before and after; the probe fix was proved by running the test
+with its manifest paths unresolvable.
+
+**Sweep disposition after round 2: 6 fixed, 0 remaining, 14 already correct,
+the rest already `#[ignore]`d or false positives.** No member of this class is
+left red-on-runner.
+
 ## Change list
 
 | file | change |
 |---|---|
 | `crates/ec-h264/tests/conformance.rs:1870` | `#[ignore = "…"]` + 25-line reason above the test; assertion untouched |
 | `crates/ec-aac/tests/oracle.rs:688` | `#[ignore = "…"]` + reason; identical shape, assertion untouched |
+| `crates/ec-probe/tests/library.rs:490` | minimum-count assert → named SKIP + return; restores the file's own :5-6 contract |
+| `crates/ec-aac/tests/sbr_real_library.rs:4797` | bare `env::var("HOME").unwrap()` → `unwrap_or_default()` |
+| `crates/ec-aac/tests/obs_real_content.rs:151` | same |
+| `crates/ec-matroska/tests/matroska.rs:966` | hardcoded absolute manifest path → `fixtures()` |
 
-No decoder change. No new `#[ignore]` beyond the two class members above (both
-were red-on-runner, never green). No assertion weakened anywhere.
+No decoder change anywhere. Two new `#[ignore]`s, both previously
+red-on-runner and never green. The only assertion removed is the
+`ec-probe` minimum count, and removing it RESTORES the contract that file's
+own header declares rather than hiding a failure; no other assertion weakened.
