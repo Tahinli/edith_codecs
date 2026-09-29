@@ -481,3 +481,128 @@ both fixtures (§7); arm A is 11521 and 76404 samples off (§1).
 
 Cleanup: `git worktree remove --force ~/.cache/wt/av1444fork` and
 `rm -rf ~/.cache/cargo-target-forkA ~/.cache/cargo-target-forkB`.
+
+---
+
+## 11. Appendix r3 — the 4:4:4 superres cell is REAL, and how to tell
+
+Main relayed a measurement from lane-av1gates444 that 256x128 is
+byte-identical with and without `--superres-mode=1`, and asked whether ANY
+aomenc recipe on this build can produce a stream whose PARSED header
+carries superres. Both are right, about different recipes, and the
+distinction is the deliverable.
+
+### 11a. The flag sweep: attempted flags -> PARSED denom
+
+Build: `~/.cache/aom-oracle/build/aomenc`, libaom `v3.13.3-7-g9bb526a`
+(oracle snapshot; `--version` is not an accepted flag on this build, so the
+version comes from the source tree the binary is built from). Common
+recipe, 256x128 yuv444p `testsrc2=size=256x128:rate=25 -frames:v 4`, with
+`--profile=1 --passes=1 --end-usage=q --cq-level=20 --cpu-used=2
+--threads=1 --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 --limit=4`.
+Every row's verdict is read from the stream's OWN parsed frame header, not
+from the flag.
+
+```text
+verdict  | flags                        | parsed FH0                                            | sha256
+no-op    | (none, control)              | frame=256x128 upscaled=256 use_superres=false denom=8  | 06621606
+no-op    | superres-mode=1 (no denom)   | frame=256x128 upscaled=256 use_superres=false denom=8  | 06621606
+SCALED   | superres-mode=1 den=9        | frame=228x128 upscaled=256 use_superres=true  denom=9  | 3d619ee0
+SCALED   | superres-mode=1 den=12       | frame=171x128 upscaled=256 use_superres=true  denom=12 | 450caa3e
+SCALED   | superres-mode=1 den=16       | frame=128x128 upscaled=256 use_superres=true  denom=16 | 194450c4
+SCALED   | superres-mode=2 (no denom)   | frame=186x128 upscaled=256 use_superres=true  denom=11 | c18496cf
+SCALED   | superres-mode=2 den=9/12/16  | frame=186x128 upscaled=256 use_superres=true  denom=11 | c18496cf
+no-op    | superres-mode=3, all den     | frame=256x128 upscaled=256 use_superres=false denom=8  | 8dafaf38
+no-op    | superres-mode=4, all den     | frame=256x128 upscaled=256 use_superres=false denom=8  | 8dafaf38
+no-op    | resize-mode=1,2,3 any den    | frame=256x128 upscaled=256 use_superres=false denom=8  | 06621606
+```
+
+**7 of 29 combinations produce a real scaled stream.** Three findings
+behind that:
+
+1. **The reported no-op is real and is exactly the sweep's recipe.**
+   `--superres-mode=1` with NO denominator gives sha256 `06621606…`, which
+   is byte-identical to the no-flag control — so lane-av1gates444's
+   measurement is correct, and the sweep's `sr444` bytes are that
+   no-op stream. libaom picks the denominator itself
+   (`get_superres_denom_for_qindex`, `av1/encoder/superres_scale.c:143`):
+   it returns `SCALE_NUMERATOR` unless the frame is a KF/ARF update AND the
+   horizontal-energy test passes, and on a smooth `testsrc2` source it
+   returns 8.
+2. **Adding `--superres-denominator` is what makes the cell exist.** Mode 1
+   with an explicit denominator is scaled on every frame, and the parsed
+   `denom` equals the flag. This is the route the r3 gate pins.
+3. **Mode 2 (random) scales with no denominator at all** — and IGNORES
+   `--superres-denominator`: all four denominator values produce the same
+   stream (`186x128 denom=11`, sha `c18496cf…`). So "set the denominator"
+   is not the only working route, and a gate that asserted the flag value
+   rather than the parsed value would pass on mode 2 while the numbers it
+   printed were fiction.
+
+`--resize-mode` is a different feature and is never a superres witness: it
+downsizes the FRAME (`frame=171x85 upscaled=171`), whereas superres keeps
+`frame_width < upscaled_width`. Worth separating explicitly, because
+"denominator" appears in both flag families.
+
+Modes 3 (qthresh) and 4 (auto) are no-ops at every denominator tried,
+which is consistent with the committed census gate's own recorded finding
+that auto "picked denominator 8, so those two arms carry no scaling at
+all and prove nothing".
+
+### 11b. Our decoder on all four real scaled streams
+
+Every SCALED row above, compared against the instrumented aomdec in decode
+order with equal frame counts and equal per-frame byte lengths asserted
+first:
+
+```text
+mode=1 den=9   3d619ee0fda3  upscaled 228x128  f0 EXACT  f1 EXACT  f2 EXACT  f3 EXACT
+mode=1 den=12  450caa3e3152  upscaled 171x128  f0 EXACT  f1 EXACT  f2 EXACT  f3 EXACT
+mode=1 den=16  194450c4bf19  upscaled 128x128  f0 EXACT  f1 EXACT  f2 EXACT  f3 EXACT
+mode=2         c18496cf3b7d  upscaled 186x128  f0 EXACT  f1 EXACT  f2 EXACT  f3 EXACT
+```
+
+So the 4:4:4 superres class is byte-exact across denominators 9, 11, 12
+and 16 and coded widths 128, 171, 186 and 228 at 256x128 — not one
+geometry. The gate pins the den=12 member and asserts its PARSED
+`use_superres` / `denom` / coded size, so a stream that stops being scaled
+goes red on a header assertion rather than becoming a differently-shaped
+exactness claim. `denom=9` (coded 228, the widest margin the frame
+allows) and `mode=2`'s `denom=11` are the obvious next pins and are not
+gated; recorded rather than quietly dropped.
+
+### 11c. The sweep claims that need correcting (NOT edited here)
+
+`lanes/av1formatsweep.report.md` is the sweep lane's file; these are the
+lines to fix, named rather than touched:
+
+- **line 438** — the `sr444` row: "4:4:4 **superres** 256x128
+  (`--superres-mode=1`) … **DIVERGENT** from f2, 76404 samples". Two
+  errors: the stream carries `use_superres=false denom=8` (§11a), and its
+  divergence is the H1 rect4-strip class, already localised and gated in
+  `a_444_lossy_rect4_strip_stream_decodes_pixel_exact_at_odd_and_wide_geometries`
+  (whose second arm is these exact 15239 bytes). The row should say the
+  recipe was a no-op and name the class.
+- **line 83** — the §1 matrix row `| superres | – | – | – |` for 4:4:4.
+  Should become `Y` at 8-bit: gated by
+  `a_444_lossy_superres_stream_decodes_pixel_exact`.
+- **line 485** — "Matrix changes (§1): 4:4:4 row gains … `superres → D`".
+  Should be `superres → Y` at 8-bit.
+- **line 442** — "Note the aomenc flag is `--superres-mode=1`; there is no
+  `--enable-superres` in this build". True but incomplete, and it is the
+  note that let the no-op recipe stand as a cell: the flag needs
+  `--superres-denominator` (or mode 2) to do anything, and the verdict
+  must come from the parsed header.
+- **line 492** — "Still not measured … 4:4:4 superres at 10/12 bits" is
+  still true and still open; only the 8-bit cell is closed here.
+
+### 11d. Overlap to be aware of when merging
+
+lane-av1gates444's `a_444_lossy_256x128_stream_decodes_pixel_exact` already
+pins the plain 256x128 lossy geometry. My r1 gate's second arm uses the
+same 15239 bytes but claims something different — that the 4:4:4 1:4
+inter-strip route fired (76 strips, 24 own-extent chroma gathers) and that
+the H1 fork is gone there — so it is not redundant with a geometry gate.
+The two fixtures are the same bytes, so whichever lands second should reuse
+the pin rather than add a second copy. Flagging it rather than resolving
+it: both claims are load-bearing and the merge order is Main's call.
