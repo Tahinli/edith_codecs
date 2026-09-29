@@ -28704,6 +28704,18 @@ pub(crate) mod tests {
                             eprintln!("x={start_x} cq={cq} rtx={rtx} fired={fired} REFUSED {e}")
                         }
                         Ok(frames) => {
+                            // The ENCODE's frame count: the y4m is rendered with
+                            // `-t 1` and `-vframes 1` (28747) -- one frame, and
+                            // the sources carry no explicit `:rate=` so that
+                            // `-vframes` is the binding bound -- and aomenc runs
+                            // with `--kf-max-dist=0` and no `--limit`
+                            // (28782), so all 126 arms code exactly 1 frame.
+                            // This sweep asserts no verdict, but `bad` below is
+                            // the NUMBER of mismatching frames it reports, so a
+                            // decode that showed fewer frames than the wire
+                            // would silently under-report it. Pinned here, above
+                            // the oracle call, for that reason.
+                            assert_eq!(frames.len(), 1, "x={start_x} cq={cq} rtx={rtx} key frame");
                             let want = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                             let bad = frames
                                 .iter()
@@ -29307,6 +29319,12 @@ pub(crate) mod tests {
                 .map(|((label, _), d)| format!("{label}={d}"))
                 .collect();
             let fired = fired.join(" ");
+            // The ENCODE's frame count: `gradients_source` (6015) is rendered with
+            // `duration=0.04:rate=25` (29116) and `-frames:v 1` (29119) caps the
+            // y4m at one frame; aomenc runs with `--limit=1` and
+            // `--kf-max-dist=0` (29150) and so codes exactly that one. Asserted
+            // ABOVE the oracle call -- it holds for every one of the 16 seeds.
+            assert_eq!(frames.len(), 1, "{NAME}: seed {seed} key frame");
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
             assert_eq!(
                 frames.len(),
