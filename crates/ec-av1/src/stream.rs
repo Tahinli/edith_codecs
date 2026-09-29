@@ -47709,6 +47709,403 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1cfl: the 4:4:4 CfL AC body is a DIFFERENT function from the
+    /// 4:2:0 one, and this gate is the proof that the format-blind
+    /// `cfl_ac_q3_at` (`bw / 2, bh / 2`, a 2x2 luma average per chroma
+    /// sample) is reached only at 4:2:0.
+    ///
+    /// **The claim this closes.** `cfl_ac_q3_at` has no `fctx`/`ss`
+    /// parameter, so at 4:4:4 it would be wrong twice over: the chroma
+    /// extent equals the luma extent when `ss_x == ss_y == 0`, and libaom
+    /// averages 2x2 luma per chroma sample at 4:2:0 but 1x1 at 4:4:4
+    /// (`cfl_luma_subsampling_420_lbd_c` vs `cfl_luma_subsampling_444_lbd_c`,
+    /// `~/.cache/aom-oracle/src/av1/common/cfl.c:230` and `:257`). The
+    /// inherited report claimed "188 rung hits on the 4:4:4 set"
+    /// (`lanes/av1chromahalvings.report.md` r3.4). **It does not
+    /// reproduce**: the env-gated rung `EC_HALVSWEEP` in `cfl_ac_q3_at`,
+    /// swept over all 27 `*444*` pins, printed **0 hits on every one**,
+    /// while the 4:4:4 arm of `cfl_ac_ss` fired 4..312 times on the same
+    /// fixtures. The 4:4:4 CfL path is real and heavily exercised; it just
+    /// does not go through this function. `cfl_ac_ss` dispatches 4:4:4 and
+    /// 4:2:2 to their own transcriptions of libaom's 444/422 subsampling
+    /// bodies BEFORE the 4:2:0 fallthrough, and the fallthrough is the only
+    /// road to `cfl_ac_q3_at`.
+    ///
+    /// Two-sided on purpose. The 4:4:4 arm asserts `> 0` (the CfL path
+    /// fired, so the `== 0` below is a routing fact and not an absence of
+    /// CfL) and the 4:2:0 arm asserts `> 0` on the SAME counter (so the
+    /// counter is live and the 4:4:4 zero is not a dead one). Both arms
+    /// compare every decoded frame to the instrumented `aomdec`
+    /// plane by plane, and the 4:2:0 arm is the "unchanged" quote: its
+    /// per-plane mismatch counts must be 0/0/0.
+    ///
+    /// Provenance: both fixtures are aomenc-produced and already pinned
+    /// with sha256 by the gates named beside them. 4:4:4 lossy
+    /// `444_lossy_superres_mode2_256x128.obu` (16620 bytes, sha256
+    /// `c18496cf3b7db0feca9aa904024cec2115be80b5b94f87c848ac52f9b32ffd97`,
+    /// `testsrc2=size=256x128:rate=25 -pix_fmt yuv444p`, `--passes=1
+    /// --end-usage=q --cq-level=20 --cpu-used=2 --superres-mode=2
+    /// --limit=4 --obu`, 4 frames); 4:2:0 lossy
+    /// `420_intrabc_rect4_witness.obu` (890 bytes, sha256
+    /// `d01352af5059919cdce733abdcbae8e8240ac3c2a6190fa1bd96d3c6f945b979`).
+    #[test]
+    fn cfl_ac_444_routes_to_its_own_1x1_luma_body_and_420_to_the_2x2_average() {
+        const NAME: &str = "cfl_ac_444_routes_to_its_own_1x1_luma_body_and_420_to_the_2x2_average";
+        // (fixture, len, fnv1a64, sha256, (w, h), frames, cfL arm index, is_444)
+        const ARMS: [(&str, usize, u64, &str, (usize, usize), usize, usize, bool); 2] = [
+            (
+                "fixtures/444_lossy_superres_mode2_256x128.obu",
+                16620,
+                0x8cbb_36b2_5e0f_07ab,
+                "c18496cf3b7db0feca9aa904024cec2115be80b5b94f87c848ac52f9b32ffd97",
+                (256, 128),
+                4,
+                0,
+                true,
+            ),
+            (
+                "fixtures/420_intrabc_rect4_witness.obu",
+                890,
+                0x57ec_3da2_a63b_403a,
+                "d01352af5059919cdce733abdcbae8e8240ac3c2a6190fa1bd96d3c6f945b979",
+                (640, 480),
+                1,
+                2,
+                false,
+            ),
+        ];
+        let _guard = lock_gate_counters();
+        for (fixture, len, fnv, sha, (w, h), want_frames, arm_idx, is_444) in ARMS {
+            let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture);
+            let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+                panic!(
+                    "{NAME}: pinned fixture {fixture} is missing ({e}) -- the gate cannot run, \
+                     which is a failure, not a skip"
+                )
+            });
+            assert_eq!(stream.len(), len, "{NAME}: {fixture} length moved");
+            assert_eq!(fnv1a64(&stream), fnv, "{NAME}: {fixture} bytes moved");
+
+            // The arm counters are process-wide with no reset, so every read
+            // is a DELTA: a full-suite run has already put other streams'
+            // CfL blocks through this decoder, and an absolute count would be
+            // a non-vacuity assertion satisfied by residue.
+            let arms_before = crate::decode::cfl_ac_arm_hits();
+            let q3_before = crate::decode::cfl_ac_q3_at_hits();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: {fixture} no longer decodes cleanly: {e}"));
+            let arms = crate::decode::cfl_ac_arm_hits();
+            let q3_delta = crate::decode::cfl_ac_q3_at_hits() - q3_before;
+            let arm_delta: Vec<usize> = (0..4).map(|i| arms[i] - arms_before[i]).collect();
+
+            // The arm this stream's format MUST take, and the count that
+            // proves the CfL path is live on it. At 4:4:4 that is arm 0
+            // (`cfl_luma_subsampling_444_lbd_c`'s 1x1 body); at 4:2:0 it is
+            // arm 2 (the square fallthrough into `cfl_ac_q3`).
+            assert!(
+                arm_delta[arm_idx] > 0,
+                "{NAME}: {fixture} ran {} 4:4:4 / {} 4:2:2 / {} 4:2:0-square / \
+                 {} 4:2:0-rect CfL blocks; arm {arm_idx} is the one this format must \
+                 take and it is ZERO -- the stream no longer exercises CfL, so the \
+                 routing assertion below would be vacuous (class gate-blind-to-feature)",
+                arm_delta[0],
+                arm_delta[1],
+                arm_delta[2],
+                arm_delta[3],
+            );
+            if is_444 {
+                assert_eq!(
+                    q3_delta, 0,
+                    "{NAME}: {fixture} is 4:4:4 and entered the format-blind cfl_ac_q3_at \
+                     {q3_delta} time(s) -- its extent is bw/2, bh/2 and its footprint is a \
+                     2x2 luma average, both wrong at ss (0,0) (libaom cfl.c:230 vs :257). \
+                     Arm deltas {arm_delta:?}. Either cfl_ac_ss lost its 4:4:4 arm or a new \
+                     caller reached cfl_ac_q3_at directly; both make this site LIVE"
+                );
+                assert_eq!(
+                    (arm_delta[2], arm_delta[3]),
+                    (0, 0),
+                    "{NAME}: {fixture} is 4:4:4 but ran the 4:2:0 CfL arms -- the format test \
+                     that keeps cfl_ac_q3_at format-blind has moved"
+                );
+            } else {
+                assert!(
+                    q3_delta > 0,
+                    "{NAME}: {fixture} is 4:2:0 and cfl_ac_q3_at was entered ZERO times \
+                     (arm deltas {arm_delta:?}) -- the counter this gate proves 4:4:4 never \
+                     touches is dead on 4:2:0 too, so the 4:4:4 assertion is a dead zero"
+                );
+                assert_eq!(
+                    (arm_delta[0], arm_delta[1]),
+                    (0, 0),
+                    "{NAME}: {fixture} is 4:2:0 but ran a 4:4:4 or 4:2:2 CfL arm"
+                );
+            }
+            assert_eq!(frames.len(), want_frames, "{NAME}: {fixture} frame count");
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(
+                    (f.width, f.height),
+                    (w, h),
+                    "{NAME}: {fixture} frame {i} dimensions"
+                );
+                if is_444 {
+                    assert_eq!(
+                        f.u.len(),
+                        w * h,
+                        "{NAME}: {fixture} frame {i} chroma plane is {} samples; at 4:4:4 it \
+                         must be full resolution ({w}x{h})",
+                        f.u.len()
+                    );
+                }
+            }
+            // Per-plane mismatch counts against the instrumented oracle, so
+            // the "4:2:0 unchanged" claim is a number rather than a claim.
+            if aomdec_available(NAME) {
+                let [y, u, v] = oracle_plane_diffs(
+                    &stream,
+                    NAME,
+                    [frames[0].y.len(), frames[0].u.len(), frames[0].v.len()],
+                );
+                assert!(
+                    y == 0 && u == 0 && v == 0,
+                    "{NAME}: {fixture} differs from the oracle on {y}/{u}/{v} of the \
+                     {w}x{h} Y/U/V samples -- sha256 {sha}"
+                );
+                eprintln!(
+                    "{NAME}: {fixture} arm{arm_idx} {arm_delta:?}, cfl_ac_q3_at {q3_delta}, \
+                     per-plane Y/U/V mismatches vs aomdec {y}/{u}/{v} of {w}x{h}; \
+                     sha256 {sha}"
+                );
+            }
+        }
+    }
+
+    /// lane-av1cfl: the STATIC half of the same claim -- `cfl_ac_q3_at`'s
+    /// caller set, read out of the sources themselves, is what makes its
+    /// `bw / 2, bh / 2` extent and 2x2 luma footprint correct rather than
+    /// merely untested. The counter gate above measures that on two pinned
+    /// streams; this one survives a change no fixture would catch.
+    ///
+    /// **What is asserted, and why each part is load-bearing.**
+    ///
+    /// 1. `cfl_ac_q3_at` has exactly **three** call sites -- the two 4:2:0
+    ///    wrappers `cfl_ac_q3` / `cfl_ac_q3_rect` in `decode.rs` and the
+    ///    encoder's CfL candidate in `encode.rs`. A fourth would be a new
+    ///    road to a format-blind body.
+    /// 2. Both `decode.rs` wrappers are called from **exactly one** function,
+    ///    `cfl_ac_ss`, and only from its LAST two arms -- the ones after the
+    ///    `ss_x == 0 && ss_y == 0` (4:4:4) and `ss_x == 1 && ss_y == 0`
+    ///    (4:2:2) tests. So every decode-side entry is 4:2:0 by
+    ///    construction, whatever a stream's header says.
+    /// 3. The encoder's call site is 4:2:0 because `Colour::color_config` and
+    ///    `unspecified_color_config` both hardcode `subsampling_x: 1,
+    ///    subsampling_y: 1` -- there is no 4:4:4 encoder colour config in the
+    ///    crate. A future encoder that grows one must thread `ss` into this
+    ///    call, and the `subsampling_x: 0` count going above zero is what
+    ///    says so.
+    ///
+    /// (0, 1) needs no arm: `ec-av1-syntax` reads `subsampling_y` only when
+    /// `subsampling_x == 1` (`crates/ec-av1-syntax/src/sequence.rs:483-485`),
+    /// so the pair is structurally uncodable and the 4:2:0 fallthrough is the
+    /// only residual. 4:2:2 is refused at the sequence header.
+    #[test]
+    fn cfl_ac_q3_at_is_reached_only_through_the_420_fallthrough_of_cfl_ac_ss() {
+        const NAME: &str = "cfl_ac_q3_at_is_reached_only_through_the_420_fallthrough_of_cfl_ac_ss";
+        let decode = include_str!("decode.rs");
+        let encode = include_str!("encode.rs");
+
+        // (1) The call-site set, definition excluded. A declaration is
+        // preceded by "pub(crate) fn " / "fn "; a call is not.
+        let mut sites: Vec<&str> = Vec::new();
+        for src in [decode, encode] {
+            for (i, _) in src.match_indices("cfl_ac_q3_at(") {
+                if src[..i].ends_with("fn ") {
+                    continue;
+                }
+                sites.push(if src == decode {
+                    "decode.rs"
+                } else {
+                    "encode.rs"
+                });
+            }
+        }
+        let mut per_file: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for s in &sites {
+            *per_file.entry(s).or_default() += 1;
+        }
+        assert_eq!(
+            per_file,
+            std::collections::BTreeMap::from([("decode.rs", 2), ("encode.rs", 1)]),
+            "{NAME}: cfl_ac_q3_at's call-site set changed -- {per_file:?} against an expected \
+             2 in decode.rs (the cfl_ac_q3 / cfl_ac_q3_rect wrappers) and 1 in encode.rs (the \
+             encoder's CfL candidate). A new call site must thread the frame's subsampling in; \
+             the body is a 4:2:0 2x2 luma average over a bw/2 x bh/2 extent and is WRONG at \
+             4:4:4 on both counts (libaom cfl_luma_subsampling_444_lbd_c is 1x1 over the full \
+             extent, cfl.c:257)"
+        );
+
+        // (2) Both wrappers have exactly one caller, and it is cfl_ac_ss.
+        let cfl_ac_ss_at = decode
+            .find("fn cfl_ac_ss(")
+            .expect("cfl_ac_ss is gone -- re-derive the fallthrough arms below");
+        for wrapper in ["cfl_ac_q3(", "cfl_ac_q3_rect("] {
+            let mut ats = Vec::new();
+            for (i, _) in decode.match_indices(wrapper) {
+                if decode[..i].ends_with("fn ") {
+                    continue;
+                }
+                ats.push(i);
+            }
+            // The scan string carries its own open paren, so it cannot match
+            // `cfl_ac_q3_rect(` or `cfl_ac_q3_at(` -- those are `cfl_ac_q3`
+            // followed by `_`, not `(`. No prefix filter is needed.
+            assert_eq!(
+                ats.len(),
+                1,
+                "{NAME}: `{wrapper}` is called {} time(s) outside its own definition, expected \
+                 exactly 1 (from cfl_ac_ss) -- a second caller is a new road to the 4:2:0 \
+                 average that this gate's counter arm measures only on 4:2:0",
+                ats.len()
+            );
+            assert!(
+                ats[0] > cfl_ac_ss_at && ats[0] < cfl_ac_ss_at + 4000,
+                "{NAME}: `{wrapper}`'s only call site is at byte {} and cfl_ac_ss is at {} -- \
+                 the call has moved out of the 4:2:0 fallthrough into something that may be \
+                 handed a 4:4:4 or 4:2:2 block",
+                ats[0],
+                cfl_ac_ss_at
+            );
+        }
+
+        // Inside cfl_ac_ss, the two format tests must come BEFORE both
+        // wrapper calls, and the wrappers must be the fallthrough -- a 4:4:4
+        // block returns from the first arm and never reaches either.
+        let body_end = decode[cfl_ac_ss_at..]
+            .find("\nfn ")
+            .expect("cfl_ac_ss must be a top-level fn")
+            + cfl_ac_ss_at;
+        let body = &decode[cfl_ac_ss_at..body_end];
+        let t444 = body.find("if ss_x == 0 && ss_y == 0 {").expect(
+            "cfl_ac_ss lost its 4:4:4 arm -- every 4:4:4 CfL block now falls into the \
+2:0 average",
+        );
+        let t422 = body
+            .find("} else if ss_x == 1 && ss_y == 0 {")
+            .expect("cfl_ac_ss lost its 4:2:2 arm -- a 4:2:2 block would take the 4:2:0 average");
+        let sq = body
+            .find("cfl_ac_q3(y, px, py, bw)")
+            .expect("cfl_ac_ss lost its 4:2:0 square fallthrough");
+        let rect = body
+            .find("cfl_ac_q3_rect(y, px, py, bw, bh)")
+            .expect("cfl_ac_ss lost its 4:2:0 rect fallthrough");
+        assert!(
+            t444 < t422 && t422 < sq && sq < rect,
+            "{NAME}: cfl_ac_ss's arm order moved (4:4:4 at {t444}, 4:2:2 at {t422}, 4:2:0 square \
+             at {sq}, 4:2:0 rect at {rect}) -- the format-blind 2x2 average must stay the \
+             FALLTHROUGH, after both format tests have had their chance to return"
+        );
+
+        // (3) The encoder's colour configs are 4:2:0 only.
+        for (src, label) in [
+            (encode, "encode.rs"),
+            (include_str!("encoder.rs"), "encoder.rs"),
+        ] {
+            let n = src.matches("subsampling_x: 0").count();
+            assert_eq!(
+                n, 0,
+                "{NAME}: {label} now builds a 4:4:4 ColorConfig ({n} site(s)) -- the encoder's \
+                 cfl_ac_q3_at call (encode.rs) is a 4:2:0 2x2 average over a half extent and \
+                 must thread ss before any encoder can emit one"
+            );
+        }
+    }
+
+    /// lane-av1cfl: per-plane sample-mismatch counts between this decoder's
+    /// final stored frames and the instrumented oracle's, summed over every
+    /// decode-order frame. Returns `[Y, U, V]`.
+    ///
+    /// [`decode_all_frames_vs_oracle`] panics on the first differing byte,
+    /// which names an offset but not WHICH PLANE the offset falls in -- and
+    /// for a chroma-scoped defect the plane split is the whole diagnosis
+    /// (luma byte-exact while U and V both diverge is the chroma-sizing
+    /// signature; all three diverging is not).
+    ///
+    /// `plane_samples` is each plane's own sample count in DECODE order
+    /// (`[Y, U, V]`) and is read off this decoder's own frame rather than
+    /// derived from the dimensions: at 4:2:0 the chroma planes are half-size
+    /// and at 4:4:4 full-size, and a helper that assumed one layout would
+    /// report every chroma byte as a luma byte. 8-bit only: the dump is one
+    /// byte per sample at 8-bit and two at 10/12.
+    fn oracle_plane_diffs(stream: &[u8], name: &str, plane_samples: [usize; 3]) -> [usize; 3] {
+        let dir = std::env::temp_dir().join(format!("ec-av1-{name}-planes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, stream).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{name}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut oracle_frames = 0usize;
+        while std::path::PathBuf::from(format!("{}.f{oracle_frames}", aom_prefix.display()))
+            .is_file()
+        {
+            oracle_frames += 1;
+        }
+        assert!(
+            oracle_frames > 0,
+            "{name}: the oracle wrote no EC_AV1_FINAL_DUMP frames -- rung 12 of \
+             scripts/instrument-aom-oracle.sh is missing from {}",
+            aomdec_path().display()
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        let decoded = decode_stream(stream);
+        set_final_dump_prefix(None);
+        let _ = decoded.expect("the caller already decoded this stream cleanly");
+        let total: usize = plane_samples.iter().sum();
+        // Plane boundaries in the concatenated dump, in DECODE order.
+        let mut starts = [0usize; 3];
+        for p in 1..3 {
+            starts[p] = starts[p - 1] + plane_samples[p - 1];
+        }
+        let mut per_plane = [0usize; 3];
+        for i in 0..oracle_frames {
+            let want =
+                std::fs::read(format!("{}.f{i}", aom_prefix.display())).expect("oracle dump");
+            let got = std::fs::read(format!("{}.f{i}", ours_prefix.display())).expect("our dump");
+            assert_eq!(
+                got.len(),
+                total,
+                "{name}: decode-order frame {i} is {} bytes, expected {plane_samples:?} at 8-bit",
+                got.len()
+            );
+            for p in 0..3 {
+                let (a, b) = (starts[p], starts[p] + plane_samples[p]);
+                per_plane[p] += got[a..b]
+                    .iter()
+                    .zip(&want[a..b])
+                    .filter(|(x, y)| x != y)
+                    .count();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        per_plane
+    }
+
     /// lane-av1444edge r3: the FIRST 4:4:4 superres cell in the crate, and
     /// the cell the chroma-format sweep's "4:4:4 superres" row was supposed
     /// to be.
