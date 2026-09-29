@@ -779,6 +779,87 @@ mod tests {
                 }
             }
         }
+        // (3b) `for (<var>, ...) in <ident>` where `<ident>` is a `let`
+        // binding in this same body -- the arm table hoisted OUT of the
+        // loop header, so the `for` line NAMES the array instead of
+        // spelling it. Strategy (3) alone silently reads past the `for`
+        // line to the next `[` in the body (an unrelated `&[..]` flag
+        // list), finds no digits, and returns an empty set: the gate is
+        // then filed as UNRESOLVED even though both of its arms sit
+        // verbatim in the source. Measured: the 128x96 4:4:4 lossy
+        // tx-size-search gate, whose `for (label, search, ...) in arms`
+        // drove `print_tx_size_search_census`'s `unresolvable == 0`
+        // assertion red on merge. The `=` hop matters: the binding's
+        // TYPE annotation is itself bracketed
+        // (`[(&str, &str, TxMode, usize, u64); 2]`), so scanning for the
+        // first `[` after the name would return the type.
+        // `<var>`'s column, read off the arm table a hoisted `for` line
+        // NAMES rather than spells. Returns `None` unless the body really
+        // has that shape, so an unrecognised loop is left to the other
+        // strategies instead of being read as "no values".
+        let named_column = |pos: usize| -> Option<BTreeSet<char>> {
+            let at = body.find("for (")?;
+            let head = &body[at..];
+            let close = head.find(')')?;
+            let after = head[close + 1..].trim_start().strip_prefix("in ")?;
+            let name: &str = after
+                .split(|c: char| !is_ident_byte(c as u8))
+                .next()
+                .filter(|n| !n.is_empty() && !n.starts_with(|c: char| c.is_ascii_digit()))?;
+            let decl = body.find(&format!("let {name}"))?;
+            let after_name = decl + "let ".len() + name.len();
+            // `let arms_foo` must not answer for `let arms`.
+            if body[after_name..]
+                .chars()
+                .next()
+                .is_some_and(|c| is_ident_byte(c as u8))
+            {
+                return None;
+            }
+            // Hop the `=`: the binding's TYPE annotation is itself
+            // bracketed, so the first `[` after the name is the type.
+            let eq = after_name + body[after_name..].find('=')?;
+            let open = eq + 1 + body[eq + 1..].find('[')?;
+            let mut depth = 0i32;
+            for (i, c) in body[open..].char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let mut set: BTreeSet<char> = Default::default();
+                            for tuple in split_top(&body[open + 1..open + i]) {
+                                let Some(inner) =
+                                    tuple.strip_prefix('(').and_then(|t| t.strip_suffix(')'))
+                                else {
+                                    continue;
+                                };
+                                let fields = split_top(inner);
+                                let Some(field) = fields.get(pos) else {
+                                    continue;
+                                };
+                                set.extend(bare_digits(field));
+                                set.extend(quoted_digits(field));
+                            }
+                            return Some(set);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        };
+        if let Some(at) = body.find("for (") {
+            let head = &body[at..];
+            if let Some(close) = head.find(')') {
+                let pattern = &head["for (".len()..close];
+                if let Some(pos) = pattern.split(',').position(|p| p.trim() == var) {
+                    if let Some(set) = named_column(pos) {
+                        merge(set);
+                    }
+                }
+            }
+        }
         // (4) `u8::from(<a>.<field>)` over a struct-literal arm table.
         for (i, _) in body.match_indices("u8::from(") {
             let arg = &body[i + "u8::from(".len()..];
@@ -1383,6 +1464,18 @@ mod tests {
                 "for (tx_search, bit_depth) in [(\"1\", 8u8), (\"0\", 8u8), (\"1\", 10u8)]",
                 "for (tx_search, bit_depth) in [(\"0\", 8u8), (\"0\", 8u8), (\"0\", 10u8)]",
                 "a_real_aomenc_stream_with_filter_intra_on_a_sub8_rect_leaf_decodes_pixel_exact",
+            ),
+            // The arm table hoisted OUT of the `for` line into a named
+            // `let` -- the shape lane-av1lossy128x96 writes, and the one
+            // that reads as UNRESOLVED unless the `for` line's collection
+            // name is followed back to its binding. Without this case a
+            // resolver that only understood inline arrays passes the
+            // three above and still cannot bind this gate.
+            (
+                "format!(\"--enable-tx-size-search={search}\")",
+                "\"tx size search on\",\n                \"1\",",
+                "\"tx size search on\",\n                \"0\",",
+                "a_real_aomenc_444_whole_64_root_tx_size_search_stream_decodes_pixel_exact_at_128x96",
             ),
         ];
         for (template, from, to, name) in cases {
