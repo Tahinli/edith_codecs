@@ -2336,9 +2336,14 @@ mod tests {
                     depth += 1;
                 }
                 b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return open.map(|o| (o, i));
+                    // A closer seen BEFORE the body opened is not ours (it can
+                    // only come from a signature or a type ascription the scan
+                    // mis-read); ignore it rather than underflowing `depth`.
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            return open.map(|o| (o, i));
+                        }
                     }
                 }
                 _ => {}
