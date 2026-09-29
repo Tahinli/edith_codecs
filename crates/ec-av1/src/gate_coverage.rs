@@ -190,10 +190,21 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     // `enable-cfl-intra` LEFT both lists on 2026-09-02 (lane-troykf r1): the
     // sb128 skipped-CfL / 1:4-chroma gate passes `--enable-cfl-intra=1` at 8
     // AND 10 bits and pixel-compares both arms.
-    (
-        "enable-dist-wtd-comp",
-        "off in 11 gates, on in none: distance-weighted compound is unimplemented",
-    ),
+    // `enable-dist-wtd-comp` LEFT this list on 2026-09-29 (lane-av1distwtd).
+    // The entry's stated reason was WRONG: the distance-weighted compound
+    // combine is not unimplemented -- `compound::dist_wtd_comp_weight_assign`
+    // (lane-av1comp) and `mc::combine_compound`'s weighted path have been in
+    // the tree for a long time. What was missing was a stream CARRYING the
+    // tool, and `a_distance_weighted_compound_stream_decodes_pixel_exact`
+    // (stream.rs) now supplies one: it spells `--enable-dist-wtd-comp=1` and
+    // asserts the PARSED sequence header carries `enable_jnt_comp == true`
+    // (and `false` from the same recipe with `=0`, so the bit is proven to
+    // move with the flag), that `dist_wtd_comp_hits() > 0` -- the
+    // `compound_idx == 0` arm, the only branch whose blend weights are not the
+    // constant (8, 8) -- and pixel-compares every frame against the oracle.
+    // The existing lane-cwarp compound-warp gates already SPELLED `=1` and
+    // the census still read this entry as open, so the hole was a missing
+    // witness, not a missing flag.
     (
         "enable-dual-filter",
         "never spelled by any gate, so defaulted = unknown; no stream is proven to carry per-direction interp filters",

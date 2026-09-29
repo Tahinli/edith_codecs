@@ -4999,6 +4999,32 @@ pub(crate) fn affine_gm_hits() -> usize {
     AFFINE_GM_HITS.with(|c| c.get())
 }
 
+// lane-av1distwtd: how many blocks took the DISTANCE-WEIGHTED compound
+// combine rather than the simple average -- `compound_idx == 0` under
+// `enable_jnt_comp`, whose weights come from
+// [`crate::compound::dist_wtd_comp_weight_assign`] instead of the constant
+// `(8, 8)` split. Counting the `idx == 0` arm (not merely the
+// `compound_idx` symbol read) is what makes this a witness of the TOOL: a
+// stream that carries `enable_jnt_comp = true` in its sequence header but
+// codes every compound block with `compound_idx == 1` leaves this at 0 and
+// decoded identically without the whole distance-weight path.
+thread_local! {
+    static DIST_WTD_COMP_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DIST_WTD_COMP_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn dist_wtd_comp_hits() -> usize {
+    DIST_WTD_COMP_HITS.with(|c| c.get())
+}
+
+/// Resets [`DIST_WTD_COMP_HITS`] to 0.
+#[allow(dead_code)] // test-only
+pub(crate) fn reset_dist_wtd_comp_hits() {
+    DIST_WTD_COMP_HITS.with(|c| c.set(0));
+}
+
 // lane-av1gwarp12: how many 16x16+ blocks built their SINGLE-reference
 // prediction through `crate::warp::global_warp_params` with a FOUR-parameter
 // (`ROTZOOM`) model. Vanilla aomenc pins its global-motion search to ROTZOOM
@@ -38882,6 +38908,10 @@ fn decode_inter_block(
                     if idx == 1 {
                         (8, 8, 1u8)
                     } else {
+                        // lane-av1distwtd: `idx == 0` is the
+                        // distance-weighted arm -- the only branch whose
+                        // weights are NOT the constant (8, 8) split.
+                        hit!(DIST_WTD_COMP_HITS);
                         let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
                             order_hint_bits,
                             order_hint,
@@ -46846,6 +46876,10 @@ fn decode_inter_block8(
                         if idx == 1 {
                             (8, 8, 1u8)
                         } else {
+                            // lane-av1distwtd: the 8x8 leaf's own
+                            // distance-weighted arm, same counter as the
+                            // 16x16+ site above.
+                            hit!(DIST_WTD_COMP_HITS);
                             let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
                                 order_hint_bits,
                                 order_hint,
