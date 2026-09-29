@@ -10502,6 +10502,15 @@ pub(crate) mod tests {
                             match decoded {
                                 Ok(frames) => {
                                     assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
+                                    // The ENCODE's frame count: the per-arm
+                                    // render (10417) builds
+                                    // `{src}=size=128x128:rate=25` with `-t 0.04`
+                                    // (10427) -- one frame -- and the aomenc args
+                                    // carry `--limit=1` (10467), so every
+                                    // (src, depth, cq, txs, tiles) arm codes
+                                    // exactly 1 frame. Asserted ABOVE the oracle
+                                    // call.
+                                    assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
                                     let theirs = if depth == 10 {
                                         ffmpeg_decode_sequence_10bit(
                                             &stream,
@@ -10728,6 +10737,23 @@ pub(crate) mod tests {
         // report can still say whether the arm fired.
         let parts = decode::rect_partition_hits() - parts_before;
         let tus = decode::rect_coeff_tu_hits() - tus_before;
+        // The ENCODE's frame count: the fixture renders `mandelbrot=size=64x64:rate=25`
+        // with `-t "0.60"` (10677-10691) -- 25 x 0.60 = 15 frames -- and the
+        // caller's `args` carry no `--limit` (10823-10853), so every arm's stream
+        // codes all 15. Asserted ABOVE the oracle call, which is the fix for the
+        // misattribution this gate's own doc comment records: the
+        // `--enable-tx-size-search=0` arm is a stream ffmpeg cannot decode past
+        // frame 6 of 15, and with the count taken from our decode the helper's
+        // byte-length assert fires FIRST and reads as an ffmpeg fault. Naming the
+        // 15 here makes the shortfall ours to explain.
+        const ENCODED_FRAMES: usize = 15;
+        assert_eq!(
+            decoded.len(),
+            ENCODED_FRAMES,
+            "{name}: the encode codes {ENCODED_FRAMES} frames, the decode showed {} (rect \
+             partitions {parts}, rect coefficient TUs {tus})",
+            decoded.len()
+        );
         let reference = if ten_bit {
             ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len())
         } else {
@@ -11208,12 +11234,18 @@ pub(crate) mod tests {
                          reconstruction is not ported, it must refuse by name"
                     );
                     assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
+                    // The ENCODE's frame count, asserted ABOVE the oracle call:
+                    // the per-arm render (11100) uses `-t 0.2` at TS/SB's
+                    // `rate=25` (10987, 10988) -- 5 input frames -- and the aomenc
+                    // args carry `--limit=1` (11145), so all eight arms code
+                    // exactly 1 frame. The old comment below claimed a count
+                    // assert here would be tautological; that is true of
+                    // `ffmpeg_frames.len() == frames.len()` and false of this:
+                    // `frames.len() == 1` is a fact about the ENCODE, checked
+                    // before `frames.len()` is spent as ffmpeg's frame budget.
+                    assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
                     let ffmpeg_frames =
                         ffmpeg_decode_sequence(&stream, width, height, frames.len());
-                    // No frame-count assert here: `ffmpeg_decode_sequence` was
-                    // handed `frames.len()` as its frame budget, so
-                    // `ffmpeg_frames.len() == frames.len()` holds by
-                    // construction and the assert was tautological.
                     // EVERY frame is compared; an arm whose decode never hit an
                     // intrabc block proves nothing about the DV/prediction path,
                     // so it is counted OUT OF SCOPE -- but a mismatch there is
@@ -11380,8 +11412,14 @@ pub(crate) mod tests {
             crate::decode::rect4_16_intrabc_hits() > 0,
             "{NAME}: no 16x4/4x16 intrabc strip -- the pair body was not reached"
         );
+        // The ENCODE's frame count, asserted ABOVE the oracle call: the y4m is
+        // rendered with `-frames:v 1` (11333) -- a single frame of
+        // `testsrc2=s=640x480:r=25` -- and aomenc runs with
+        // `--limit=1 --kf-max-dist=1` (11355, 11356), so the stream codes
+        // exactly 1 key frame. Below the call this assert could not fire
+        // first: `ffmpeg_decode_sequence` was already handed `frames.len()`.
+        assert_eq!(frames.len(), 1, "{NAME}: expected one key frame");
         let refs = ffmpeg_decode_sequence(&out.stdout, width, height, frames.len());
-        assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].y, refs[0].y, "{NAME}: luma");
         assert_eq!(frames[0].u, refs[0].u, "{NAME}: u");
         assert_eq!(frames[0].v, refs[0].v, "{NAME}: v");
@@ -11452,6 +11490,13 @@ pub(crate) mod tests {
             crate::decode::rect4_16_lossless_chroma_hits() > 0,
             "{NAME}: no lossless 16x4/4x16 chroma pair -- the walk was not reached"
         );
+        // The ENCODE's frame count: the y4m is rendered with `-frames:v 1`
+        // (11414) -- a single frame of `testsrc2=s=320x240:r=25` -- and aomenc
+        // runs with `--limit=1 --kf-max-dist=1` (11434, 11435), so the stream
+        // codes exactly 1 lossless key frame. Asserted ABOVE the oracle call:
+        // this gate then indexes `frames[0]`/`refs[0]`, which a zero-frame
+        // decode would panic on rather than report.
+        assert_eq!(frames.len(), 1, "{NAME}: expected one lossless key frame");
         let refs = ffmpeg_decode_sequence(&out.stdout, width, height, frames.len());
         let repaired = 128 * width;
         assert_eq!(
@@ -11835,6 +11880,11 @@ pub(crate) mod tests {
                  reader for this orientation is untested (coded horz/vert = {coded:?})",
                 if *want_orient == 0 { "HORZ" } else { "VERT" }
             );
+            // The ENCODE's frame count: the per-arm render (11756) uses `-t 0.2`
+            // at TS256/TS512's `rate=25` (11700, 11701) -- 5 input frames -- and
+            // the aomenc args carry `--limit=1` (11797), so all three arms code
+            // exactly 1 frame. Asserted ABOVE the oracle call.
+            assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
             let theirs = ffmpeg_decode_sequence(&stream, *width, *height, frames.len());
             assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
             for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -11977,6 +12027,16 @@ pub(crate) mod tests {
                 assert!(
                     !frames.is_empty(),
                     "{NAME}: {arm} decoded no frame at {threads} recon thread(s)"
+                );
+                // The ENCODE's frame count: the skip_arms encode (11904) renders
+                // TS512 with `-t 0.2` at `rate=25` (11907) and its aomenc runs
+                // with `--limit=1` (11945), so the stream holds 1 coded frame --
+                // and this loop re-decodes those SAME bytes at each `threads`
+                // value, so the count is arm-invariant. Asserted ABOVE the call.
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "{NAME}: {arm} key frame at {threads} recon thread(s)"
                 );
                 let theirs = ffmpeg_decode_sequence(&stream, *width, *height, frames.len());
                 assert_eq!(
@@ -12220,6 +12280,14 @@ pub(crate) mod tests {
                     let blocks = crate::decode::intrabc_hits();
                     blocks_total += blocks;
                     blocks_at_depth[usize::from(depth == 10)] += blocks;
+                    // The ENCODE's frame count:
+                    // `screen_intrabc_stream_at_depth` (12203) renders
+                    // `smptebars=size=128x96:rate=25` with `-t 0.2` and
+                    // `-vf tile=2x2` (12066, 12069) -- 5 frames in, 1 tiled frame
+                    // out at 256x192 -- and its aomenc runs with `--limit=1`
+                    // (12101), so all eight (depth, txs, cq) arms code exactly
+                    // 1 frame. Asserted ABOVE the oracle call.
+                    assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
                     let theirs = if depth == 10 {
                         ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                     } else {
@@ -12609,6 +12677,15 @@ pub(crate) mod tests {
                 Ok(frames) => {
                     let sub8 = crate::decode::sub8_split_hits() - sub8_before;
                     sub8_total += sub8;
+                    // The ENCODE's frame count: `screen_intrabc_stream_with` (12593)
+                    // renders `smptebars=size=128x96:rate=25` with `-t 0.2` and
+                    // `-vf tile=2x2` (12066, 12069) -- 5 frames in, 1 tiled frame
+                    // out -- and its aomenc runs with `--limit=1` (12101), so both
+                    // cq arms code exactly 1 frame. The census is report-only about
+                    // the COUNTS, but its Ok arm asserts pixel-exactness, so the
+                    // budget handed to ffmpeg is pinned here rather than derived
+                    // from the decode under test.
+                    assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
                     let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                     assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
                     for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -12684,6 +12761,15 @@ pub(crate) mod tests {
                 Ok(frames) => {
                     let vartx = crate::decode::intrabc_vartx_hits();
                     vartx_total += vartx;
+                    // The ENCODE's frame count: `screen_intrabc_stream` (12679)
+                    // renders `smptebars=size=128x96:rate=25` with `-t 0.2` and
+                    // `-vf tile=2x2` (12066, 12069) -- 5 frames in, 1 tiled frame
+                    // out -- and its aomenc runs with `--limit=1` (12101), so all
+                    // four cq arms code exactly 1 frame. The census is
+                    // report-only about the COUNTS, but its Ok arm does assert
+                    // pixel-exactness, so the budget it hands ffmpeg is pinned
+                    // here rather than derived from the decode under test.
+                    assert_eq!(frames.len(), 1, "{NAME}: {arm} key frame");
                     let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                     assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
                     for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -12788,6 +12874,12 @@ pub(crate) mod tests {
                     "{NAME}: vacuous -- {trees} var-tx tree(s), {mixed} mixed: the \
                      capability this gate pins was never exercised"
                 );
+                // The ENCODE's frame count: `screen_intrabc_stream_with` (12766)
+                // renders `testsrc2=size=320x180:rate=25` with `-t 0.2` and
+                // `-vf tile=2x2` (12066, 12069) -- 5 frames in, 1 tiled frame out
+                // at 640x360 -- and its aomenc runs with `--limit=1` (12101), so
+                // the stream codes exactly 1 frame. Asserted ABOVE the call.
+                assert_eq!(frames.len(), 1, "{NAME}: key frame");
                 let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                 assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
                 let mut mismatched = 0usize;
@@ -13090,6 +13182,12 @@ pub(crate) mod tests {
                 "{NAME}: cq={cq} no longer reads the inter var-tx tree for an intrabc block"
             );
             eprintln!("{NAME}: cq={cq} {blocks} intrabc block(s), {vartx} through var-tx");
+            // The ENCODE's frame count: `screen_intrabc_stream` (12022) renders
+            // `smptebars=size=128x96:rate=25` with `-t 0.2` and `-vf tile=2x2`
+            // (12066, 12069) -- 5 frames in, 1 tiled frame out -- and its aomenc
+            // runs with `--limit=1` (12101), so both cq arms code exactly 1
+            // frame. Asserted ABOVE the oracle call.
+            assert_eq!(frames.len(), 1, "{NAME}: cq={cq} key frame");
             let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
             assert_eq!(frames.len(), theirs.len(), "{NAME}: cq={cq} frame count");
             for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -13151,6 +13249,21 @@ pub(crate) mod tests {
             "{NAME}: only {headers} frame headers in the fixture"
         );
         let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {e}"));
+        // The frame count, and it comes from the WIRE, not from our decode: the
+        // loop above parsed this stream's own OBU frame headers with
+        // `Av1Parser` and counted `headers` of them (>= 3, from the arm's
+        // `--limit=3` at 13127, which overrides the helper's `--limit=1` because
+        // aomenc keeps the last occurrence of a repeated flag). Asserted ABOVE
+        // the oracle call, so a decode that showed fewer frames than the bitstream
+        // codes reds naming the wire instead of asking ffmpeg for the same short
+        // count. Deriving it from `headers` rather than a literal keeps the pin
+        // honest if aomenc's frame count ever drifts.
+        assert_eq!(
+            frames.len(),
+            headers,
+            "{NAME}: the stream codes {headers} frame(s), the decode showed {}",
+            frames.len()
+        );
         let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
         assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
         for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -13356,15 +13469,19 @@ pub(crate) mod tests {
                     Err(e) => panic!("{NAME}: decode failed on {arm} at {depth}-bit: {e}"),
                 };
                 let fired = decode::rect4_palette_hits() - before;
+                // The ENCODE's frame count, asserted ABOVE the oracle call: the
+                // y4m renders 5 frames (`-t 0.2` at every arm's `rate=25`,
+                // 13275) but aomenc is given `--limit=1` (13313), so the stream
+                // codes exactly 1 frame at both depths on every arm. Asserted
+                // here it is NOT the tautology the old comment below claimed:
+                // `frames.len() == 1` is a fact about the encode, checked before
+                // `frames.len()` is spent as ffmpeg's frame budget.
+                assert_eq!(frames.len(), 1, "{NAME}: {arm} at {depth}-bit key frame");
                 let ffmpeg_frames = if depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                 } else {
                     ffmpeg_decode_sequence(&stream, width, height, frames.len())
                 };
-                // No frame-count assert here: `ffmpeg_decode_sequence{,_10bit}`
-                // was handed `frames.len()` as its frame budget, so
-                // `ffmpeg_frames.len() == frames.len()` holds by construction
-                // and the assert was tautological.
                 assert!(
                     !frames.is_empty(),
                     "{NAME}: {arm} at {depth}-bit decoded no frame"
@@ -15494,6 +15611,21 @@ pub(crate) mod tests {
                 .map(|((label, _), d)| format!("{label}={d}"))
                 .collect();
             let fired = fired.join(" ");
+            // The ENCODE's frame count, and it is this helper's `frames` PARAMETER
+            // (15446) -- not our decode's length. It is the same value handed to
+            // `encode_10bit_gradients_seed` (15469), which renders
+            // `frames / 25.0` seconds at `rate=25` (15928, 15940) and runs
+            // aomenc with no `--limit` of its own, so the stream codes exactly
+            // `frames` frames: 1 for the single-key-frame callers, 24 for the
+            // `--lag-in-frames=16` inter callers. Asserted ABOVE the oracle call,
+            // so a decode that showed fewer reds naming the encode rather than
+            // handing ffmpeg the same short count.
+            assert_eq!(
+                decoded.len(),
+                frames,
+                "{name}: seed {seed}: the encode codes {frames} frame(s), the decode showed {}",
+                decoded.len()
+            );
             let reference = ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len());
             assert_eq!(
                 decoded.len(),
@@ -27633,8 +27765,12 @@ pub(crate) mod tests {
             "{NAME}: the stream decoded but no coded (non-skip) rect leaf fired -- \
              the gate proves nothing"
         );
-        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+        // The ENCODE's frame count, asserted ABOVE the oracle call: the y4m is
+        // rendered with `-t 1` and `-vframes 1` (27566) -- one frame at the
+        // source's default rate 25 -- and aomenc runs with no `--limit` and
+        // `--kf-max-dist=0` (27593), so the stream codes exactly 1 frame.
         assert_eq!(frames.len(), 1, "{NAME}: expected one key frame");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
         assert_eq!(
             ffmpeg_frames.len(),
             frames.len(),
@@ -27761,8 +27897,13 @@ pub(crate) mod tests {
             // Counted only on an attempt that actually decoded AND is compared
             // below -- a refusal never contributes to the firing assert.
             let overrides = crate::decode::mode_mi_override_hits() - before;
-            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+            // The ENCODE's frame count, asserted ABOVE the oracle call: the y4m is
+            // rendered ONCE outside this loop with `-t 1` and `-vframes 1`
+            // (27792) -- one frame at the source's default rate 25 -- and aomenc
+            // runs with no `--limit` and `--kf-max-dist=0` (27726), so both
+            // (rtx, filter_intra) arms code exactly 1 frame.
             assert_eq!(frames.len(), 1, "{NAME}: expected one key frame");
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
             assert_eq!(
                 ffmpeg_frames.len(),
                 frames.len(),
@@ -27929,16 +28070,20 @@ pub(crate) mod tests {
             let cfl_blocks = crate::decode::cfl_block_hits() - before_cfl;
             let angle_blocks = crate::decode::uv_angle_delta_hits() - before_angle;
             let uv_overrides = crate::decode::uv_mode_mi_override_hits() - before_uv;
-            let ffmpeg_frames = if depth == 10 {
-                ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
-            } else {
-                ffmpeg_decode_sequence(&stream, width, height, frames.len())
-            };
+            // The ENCODE's frame count, asserted ABOVE the oracle call: the y4m is
+            // rendered with `-t 1` and `-vframes 1` (27852) -- one frame at the
+            // source's default rate 25 -- and aomenc runs with no `--limit` and
+            // `--kf-max-dist=0` (27890), so both depths code exactly 1 frame.
             assert_eq!(
                 frames.len(),
                 1,
                 "{NAME}: expected one key frame (depth={depth})"
             );
+            let ffmpeg_frames = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames.len())
+            };
             assert_eq!(
                 ffmpeg_frames.len(),
                 frames.len(),
@@ -28125,6 +28270,12 @@ pub(crate) mod tests {
             // Counters read only on an attempt that decoded AND is compared.
             let after = crate::decode::troy_chroma_counters();
             let (skip_cfl, dir_pairs) = (after.0 - before.0, after.1 - before.1);
+            // The ENCODE's frame count: the y4m is rendered with `-t 1` and
+            // `-vframes 1` (28056) -- one frame at the source's default rate 25
+            // -- and aomenc runs with no `--limit` and `--kf-max-dist=0`
+            // (28088), so both depths code exactly 1 frame. Asserted ABOVE the
+            // oracle call.
+            assert_eq!(frames.len(), 1, "{NAME}: depth={depth} key frame");
             let ffmpeg_frames = if depth == 10 {
                 ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
             } else {
@@ -28452,6 +28603,11 @@ pub(crate) mod tests {
             let after = crate::decode::ab16_hits_by_arm();
             let this: Vec<usize> = (0..4).map(|i| after[i] - before[i]).collect();
             eprintln!("{NAME}: {desc} decoded, arms this attempt={this:?}");
+            // The ENCODE's frame count: every attempt's y4m is rendered with
+            // `-t 1` and `-vframes 1` (28367) -- one frame whatever the source's
+            // rate -- and aomenc carries `--limit=1` (28401), so all six arms
+            // code exactly 1 frame. Asserted ABOVE the oracle call.
+            assert_eq!(frames.len(), 1, "{NAME}: {desc} key frame");
             let want = if a.ten_bit {
                 ffmpeg_decode_sequence_10bit(&stream, a.w, a.h, frames.len())
             } else {
@@ -28606,6 +28762,18 @@ pub(crate) mod tests {
                             eprintln!("x={start_x} cq={cq} rtx={rtx} fired={fired} REFUSED {e}")
                         }
                         Ok(frames) => {
+                            // The ENCODE's frame count: the y4m is rendered with
+                            // `-t 1` and `-vframes 1` (28747) -- one frame, and
+                            // the sources carry no explicit `:rate=` so that
+                            // `-vframes` is the binding bound -- and aomenc runs
+                            // with `--kf-max-dist=0` and no `--limit`
+                            // (28782), so all 126 arms code exactly 1 frame.
+                            // This sweep asserts no verdict, but `bad` below is
+                            // the NUMBER of mismatching frames it reports, so a
+                            // decode that showed fewer frames than the wire
+                            // would silently under-report it. Pinned here, above
+                            // the oracle call, for that reason.
+                            assert_eq!(frames.len(), 1, "x={start_x} cq={cq} rtx={rtx} key frame");
                             let want = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                             let bad = frames
                                 .iter()
@@ -29209,6 +29377,12 @@ pub(crate) mod tests {
                 .map(|((label, _), d)| format!("{label}={d}"))
                 .collect();
             let fired = fired.join(" ");
+            // The ENCODE's frame count: `gradients_source` (6015) is rendered with
+            // `duration=0.04:rate=25` (29116) and `-frames:v 1` (29119) caps the
+            // y4m at one frame; aomenc runs with `--limit=1` and
+            // `--kf-max-dist=0` (29150) and so codes exactly that one. Asserted
+            // ABOVE the oracle call -- it holds for every one of the 16 seeds.
+            assert_eq!(frames.len(), 1, "{NAME}: seed {seed} key frame");
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
             assert_eq!(
                 frames.len(),
@@ -30643,6 +30817,12 @@ pub(crate) mod tests {
                     // r4: the pixel filters are wired -- every `uses_lr`
                     // frame must now decode Ok AND match an independent
                     // decoder pixel-exact, not just refuse cleanly.
+                    // The ENCODE's frame count: every `EC_FISTRIP_SRC` branch
+                    // and the `gradients_source` default (30568-30573) render at
+                    // `rate=25` with a 1-frame `duration=0.04`, and aomenc runs
+                    // with no `--limit` (30590) -- so each attempt's stream codes
+                    // exactly 1 frame. Asserted ABOVE the oracle call.
+                    assert_eq!(pics.len(), 1, "{NAME}: seed {seed} key frame");
                     let reference = ffmpeg_decode_sequence(&stream, width, height, pics.len());
                     let mismatched = pics
                         .iter()
@@ -38221,6 +38401,20 @@ pub(crate) mod tests {
                 };
                 let after = crate::decode::edge32_hits();
                 let delta: Vec<usize> = (0..8).map(|i| after[i] - before[i]).collect();
+                // The ENCODE's frame count, and it is PER ARM: the arm tuple's
+                // `frame_count` field is what the y4m is built from
+                // (`duration = frame_count / 25.0`, 38085, rendered with
+                // `-t {duration}` at 38131) and this gate's aomenc carries no
+                // `--limit` and no `--lag-in-frames`, so the stream codes exactly
+                // `frame_count` frames (1 for the intra arms, 5 for the
+                // inter/straddling ones). Asserted ABOVE the oracle call, so a
+                // decode that dropped one reds naming the encode.
+                assert_eq!(
+                    decoded.len(),
+                    frame_count,
+                    "{name}: {tag}: the encode codes {frame_count} frame(s), the decode showed {}",
+                    decoded.len()
+                );
                 let reference = if ten_bit {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len())
                 } else {
@@ -41949,6 +42143,15 @@ pub(crate) mod tests {
                 }
                 let rect4_now = (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
                     + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
+                // The ENCODE's frame count: `rectchroma_stream` (42059) renders
+                // `duration=0.04:rate=25` (42082) with `-t 0.04` (42094) -- one
+                // frame -- and its aomenc runs with no `--limit`, so every
+                // attempt's stream codes exactly 1 frame at both depths.
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "{NAME}: {bit_depth}-bit cq {cq} seed {seed} key frame"
+                );
                 let reference = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                 } else {
@@ -42186,6 +42389,11 @@ pub(crate) mod tests {
             let stream = rectchroma_stream(bit_depth, 32, 4, width, height);
             let frames = decode_stream(&stream)
                 .unwrap_or_else(|e| panic!("{NAME}: {bit_depth}-bit seed 46 refused: {e}"));
+            // The ENCODE's frame count: `rectchroma_stream` (42059) renders
+            // `duration=0.04:rate=25` (42082) with `-t 0.04` (42094) -- one frame
+            // -- and its aomenc runs with no `--limit`, so the stream codes
+            // exactly 1 frame at both depths. Asserted ABOVE the oracle call.
+            assert_eq!(frames.len(), 1, "{NAME}: {bit_depth}-bit seed 46 key frame");
             let reference = if bit_depth == 10 {
                 ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
             } else {
@@ -42355,6 +42563,15 @@ pub(crate) mod tests {
                     }
                     Ok(frames) => frames,
                 };
+                // The ENCODE's frame count: `duration=0.04:rate=25` (42263) is
+                // one frame and `-t 0.04` (42277) caps the y4m there, and aomenc
+                // runs with no `--limit` -- so every arm (both depths, all 10
+                // seeds) codes exactly 1 frame. Asserted ABOVE the oracle call.
+                assert_eq!(
+                    frames.len(),
+                    1,
+                    "{NAME}: {bit_depth}-bit seed {seed} key frame"
+                );
                 let reference = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                 } else {
@@ -42564,6 +42781,16 @@ pub(crate) mod tests {
                     };
                     let hits = crate::decode::edge_part_hits();
                     let skip_split_tx = crate::decode::skip_split_tx_hits();
+                    // The ENCODE's frame count: `-t 1` AND `-vframes 1` (42490)
+                    // cap the y4m at one frame and aomenc is given that one frame
+                    // with no `--limit`, so every arm's stream holds exactly 1
+                    // coded frame. Asserted ABOVE the oracle call so a decode that
+                    // dropped it reds naming the encode.
+                    assert_eq!(
+                        frames.len(),
+                        1,
+                        "{NAME}: {width}x{height} depth={depth} key frame"
+                    );
                     let ffmpeg_frames = if depth == 10 {
                         ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                     } else {
@@ -42790,6 +43017,18 @@ pub(crate) mod tests {
                         }
                     };
                     let narrow = crate::mc::rect_narrow_kern_hits();
+                    // The ENCODE's frame count, asserted ABOVE the oracle call, not
+                    // our decode's length: `-vframes {FRAMES}` (42696) feeds aomenc
+                    // exactly FRAMES frames and `--limit={FRAMES}` (42724) caps its
+                    // output there. A decode that dropped a frame must red HERE,
+                    // naming the encode, rather than hand the same short count to
+                    // ffmpeg and let the helper's byte-length assert blame ffmpeg.
+                    assert_eq!(
+                        frames.len(),
+                        FRAMES,
+                        "{NAME}: not every coded frame was decoded ({width}x{height}, \
+                         depth={depth}, cq={cq})"
+                    );
                     let ffmpeg_frames = if depth == 10 {
                         ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                     } else {
@@ -42799,12 +43038,6 @@ pub(crate) mod tests {
                         ffmpeg_frames.len(),
                         frames.len(),
                         "{NAME}: ffmpeg frame count ({width}x{height}, depth={depth}, cq={cq})"
-                    );
-                    assert_eq!(
-                        frames.len(),
-                        FRAMES,
-                        "{NAME}: not every coded frame was decoded ({width}x{height}, \
-                         depth={depth}, cq={cq})"
                     );
                     for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                         assert_eq!(
