@@ -4682,6 +4682,15 @@ thread_local! {
     /// invisible to every gate because they only counted CODED strips.
     static INTRABC_RECT_SKIPPED_HITS: std::cell::Cell<[usize; 2]> =
         const { std::cell::Cell::new([0, 0]) };
+    /// lane-ibc444c: rect intra-BC blocks whose chroma plane block was sized
+    /// `bw >> ss_x` by `bh >> ss_y` -- the 4:4:4 and 4:4:0 cells, where
+    /// `av1_get_max_uv_txsize` (`ss_size_lookup[bsize]`, blockd.h) applies no
+    /// halving of its own. At 4:2:0 this is the same arithmetic as the halving,
+    /// so a `>= 1` witness can only come from a stream that is not 4:2:0.
+    /// EXCLUSIVE to this arm: no other caller sizes an intrabc rect block's
+    /// chroma plane block.
+    static IBC_RECT_CHROMA_FOOTPRINT_444_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     /// lane-whtshape: LOSSLESS rect intrabc blocks whose chroma plane block
     /// [`decode_intrabc_rect`] walked as a `(cw/4) * (ch/4)` PLANE-MAJOR
     /// raster of TX_4X4 units -- the shape libaom's lossless geometry codes
@@ -4722,6 +4731,18 @@ pub(crate) fn reset_intrabc_rect_hits() {
     INTRABC_RECT_VARTX_HITS.with(|c| c.set(0));
     INTRABC_RECT_CODED_HITS.with(|c| c.set([0, 0]));
     INTRABC_RECT_SKIPPED_HITS.with(|c| c.set([0, 0]));
+}
+
+/// lane-ibc444c: [`IBC_RECT_CHROMA_FOOTPRINT_444_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn ibc_rect_chroma_footprint_444_hits() -> usize {
+    IBC_RECT_CHROMA_FOOTPRINT_444_HITS.with(|c| c.get())
+}
+
+/// lane-ibc444c: zeroes [`IBC_RECT_CHROMA_FOOTPRINT_444_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_ibc_rect_chroma_footprint_444_hits() {
+    IBC_RECT_CHROMA_FOOTPRINT_444_HITS.with(|c| c.set(0));
 }
 
 /// lane-whtshape: [`INTRABC_RECT_LOSSLESS_CHROMA4_HITS`].
@@ -7791,6 +7812,8 @@ fn coeff_step_base_eob_level(dec: &SymbolDecoder, level: i32) {
     eprintln!("EC_COEFF_STEP tag=base_eob level={level} rng={rng}");
 }
 
+// lane-ibc444c: see `read_coeffs_rect`'s `#[track_caller]`.
+#[track_caller]
 fn read_coeffs(
     dec: &mut SymbolDecoder,
     coding: &mut TxbTables,
@@ -7834,12 +7857,29 @@ fn read_coeffs(
     } else {
         [0; 3]
     };
+    let sq_bit = if coeff_trace_on() {
+        dec.debug_bitpos()
+    } else {
+        0
+    };
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    // lane-ibc444c: this reader logs an `all_zero` step even for a read that
+    // consumes ZERO bits, so `post_bit == bit` means "no symbol was read" --
+    // filter on it before pairing anything against the oracle.
+    if crate::envflags::env_flag!("EC_IBCTX") {
+        eprintln!(
+            "EC_IBCTX2 side={} skip_ctx={skip_ctx} sign_ctx={sign_ctx} bit={sq_bit} at {}",
+            coding.side,
+            std::panic::Location::caller(),
+        );
+    }
     if coeff_trace_on() {
         let (rng, _) = dec.debug_state();
         eprintln!(
-            "EC_COEFF_STEP tag=all_zero side={} ctx={skip_ctx} dcctx={sign_ctx} cdf={dbg_txbskip:?} all_zero={} rng={rng}",
-            coding.side, all_zero as i32
+            "EC_COEFF_STEP tag=all_zero side={} ctx={skip_ctx} dcctx={sign_ctx} cdf={dbg_txbskip:?} all_zero={} rng={rng} bit={sq_bit} post_bit={}",
+            coding.side,
+            all_zero as i32,
+            dec.debug_bitpos()
         );
     }
     if crate::envflags::env_flag!("EC_AV1_TELL") {
@@ -8098,6 +8138,11 @@ fn read_coeffs(
 /// neither `base_ctx_rect`/`br_ctx_rect` nor [`class_scan_table`] have a rect
 /// form for those.
 
+// lane-ibc444c: `#[track_caller]` so the EC_IBCTX rung below names the CALLER
+// of this reader -- the only thing that identifies a unit's route. No plane is
+// printed here: the plane is the ORACLE's side of the pairing, and a label
+// here is one more thing that can disagree with it.
+#[track_caller]
 fn read_coeffs_rect(
     dec: &mut SymbolDecoder,
     coding: &mut TxbTables,
@@ -8122,12 +8167,28 @@ fn read_coeffs_rect(
     // `read_inter_plane_rect`'s corner) are all plane 0 -- the stamp's initial
     // value -- and the other plane-owning readers stamp on entry.
     set_census_plane(plane);
+    let ibctx_on = crate::envflags::env_flag!("EC_IBCTX");
+    let entry_bit = if ibctx_on { dec.debug_bitpos() } else { 0 };
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if rect_trace {
         eprintln!(
-            "EC_COEFF_STEP tag=all_zero plane={plane} ctx={skip_ctx} entry={entry_rng} all_zero={} rng={}",
+            "EC_COEFF_STEP tag=all_zero plane={plane} ctx={skip_ctx} entry={entry_rng} all_zero={} rng={} bit={entry_bit} post_bit={}",
             all_zero as i32,
-            dec.debug_state().0
+            dec.debug_state().0,
+            dec.debug_bitpos()
+        );
+    }
+    if ibctx_on {
+        // lane-ibc444c. `bit`/`post_bit` are the STREAM POSITION, not the coder
+        // range: the only collision-free key for pairing this unit against the
+        // oracle's `EC_ECDUMP_IN`. And `post_bit != bit` is how a caller tells
+        // a real symbol read from a 0-bit one -- the SQUARE reader logs a step
+        // either way, which is exactly the artifact that made an earlier
+        // round of this lane claim a false exactness.
+        eprintln!(
+            "EC_IBCTX w={w} h={h} skip_ctx={skip_ctx} sign_ctx={sign_ctx} bit={entry_bit} post_bit={} at {}",
+            dec.debug_bitpos(),
+            std::panic::Location::caller(),
         );
     }
     if all_zero {
@@ -13464,26 +13525,21 @@ fn decode_intrabc_rect(
     // 16x8 intrabc block's chroma plane block came out 8x4 and the lossless
     // walk below coded 2 units per plane where libaom codes 8.
     //
-    // Scoped to `lossless` ON PURPOSE. The 4:2:0 halving is right at 4:2:0,
-    // and every pinned 4:4:4 stream that reaches this helper does so LOSSY
-    // (measured: zero pinned fixtures decode a LOSSLESS intrabc rect block),
-    // whose footprint is a separate, already-named open cell --
-    // lanes/av1444rect.report.md's 4:4:4 intra-BC chroma. This lane must not
-    // move it, and a lossless-only split here changes no green pin either way.
-    let (cpx, cpy) = if lossless(fctx) {
-        (px >> ss_x(fctx), py >> ss_y(fctx))
-    } else {
-        (px / 2, py / 2)
-    };
+    // lane-ibc444c: UNSCOPED now. lane-whtshape split this on `lossless` and
+    // named the LOSSY 4:4:4 footprint as another lane's open cell; this is
+    // that cell. Measured on `444_intrabc_rect4_witness.obu`: with the
+    // halving, an 8x16 luma block's 8x16 chroma plane block was read as ONE
+    // 4x8 rect unit where libaom codes ONE TX_8X16, and the U `txb_skip` of
+    // the block at mi (92, 104) read all_zero=0 here against the oracle's
+    // all_zero=1 -- the bit position forks there. Identical arithmetic at
+    // 4:2:0, where `ss_x = ss_y = 1`, so the pinned 4:2:0 twin of the
+    // witness is the identity arm of this lane's gate.
+    let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));
     // `av1_get_max_uv_txsize(bw x bh)`: 4:2:0 halves the footprint and the
     // halved shape's own `max_txsize_rect_lookup` entry IS that size for every
     // shape this helper is called at, so the uv plane block is ONE unit --
     // the same call `decode_token_recon_block`'s own chroma loop makes.
-    let (cw, ch) = if lossless(fctx) {
-        (bw >> ss_x(fctx), bh >> ss_y(fctx))
-    } else {
-        (bw / 2, bh / 2)
-    };
+    let (cw, ch) = (bw >> ss_x(fctx), bh >> ss_y(fctx));
     // lane-av1-intrabc r2: the square stride the proven INTER path uses
     // (`side`). The residual grids, the prediction windows AND
     // `TxParams::stride` are all laid out at it -- the block's own width
@@ -13508,6 +13564,16 @@ fn decode_intrabc_rect(
     )?;
     if leaves.is_some() {
         hit!(INTRABC_RECT_VARTX_HITS);
+    }
+    if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
+        hit!(IBC_RECT_CHROMA_FOOTPRINT_444_HITS);
+    }
+    // lane-ibc444c: per-block geometry, for the chroma-tail attribution.
+    if crate::envflags::env_flag!("EC_IBCBLOCK") {
+        eprintln!(
+            "EC_IBCBLOCK mi=({mi_r},{mi_c}) bw={bw} bh={bh} cpx={cpx} cpy={cpy} \
+             cw={cw} ch={ch} cside={cside} skip={skip}"
+        );
     }
     // The whole-block prediction: `predict_inter_block` runs once, before any
     // coefficient is read. `flush_recon` first -- the source is this frame's
