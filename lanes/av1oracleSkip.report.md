@@ -1,12 +1,12 @@
 # lane-av1oracleskip — gate-honesty: the oracle SKIP class
 
-**Tree.** `lane-av1oracleskip` off **main `7f8817cb`** ("Merge lane-av1pins @
-44a05b40"), worktree `~/.cache/wt/av1oracleskip`, branch
-`lane-av1oracleskip`. Commit `ee4f2d55` (see §5). The primary checkout was
-mid-merge when this lane started (`UU crates/ec-av1/src/stream.rs` in its
-index), so this worktree is pinned to the last merge commit rather than to a
-moving HEAD. Built in a lane-private `CARGO_TARGET_DIR`
-(`~/.cache/cargo-target-av1oracleskip`).
+**Tree.** `lane-av1oracleskip`, worktree `~/.cache/wt/av1oracleskip`. r1 was
+cut from main `7f8817cb` ("Merge lane-av1pins @ 44a05b40") and is commit
+`644bdbb8` after the r2 rebase onto `9b2f6c9d` ("Merge lane-av1dumpyuv @
+60a7788a"). The r1 text of this report was written when the primary checkout
+was mid-merge (`UU crates/ec-av1/src/stream.rs` in its index), so the worktree
+was pinned to a merge commit rather than to a moving HEAD. Built in a
+lane-private `CARGO_TARGET_DIR` (`~/.cache/cargo-target-av1oracleskip`).
 
 **Scope.** (1) the three `lane-av1gates444` gates that reported green having
 measured nothing on a host without the oracle; (2) the class sweep behind it,
@@ -86,7 +86,9 @@ env var, and this commit does not change that.
 **Shape B is the part the sweep found that nobody had named**, and it is worse
 than the three gates Main pointed at: those three fail loudly in REQUIRE mode
 (through `have_aomenc`), while all thirteen B sites had **no env escape at
-all** — with `EC_AV1_REQUIRE_AOMENC=1` set and aomdec absent, they encoded,
+all** (r2 correction: thirteen CALL SITES across **twelve** distinct gates —
+`a_444_lossy_rect4_inter_stream_decodes_pixel_exact` calls the probe twice,
+once for the 4:4:4 stream and once for its 4:2:0 control) — with `EC_AV1_REQUIRE_AOMENC=1` set and aomdec absent, they encoded,
 decoded, asserted their geometry and counters, skipped the compare, and
 reported green. Four of the thirteen printed nothing at all.
 
@@ -157,3 +159,108 @@ fixture to fall back on, so a missing aomdec there really is a broken oracle
 and stays a hard failure. If the house wants the pinned gates to fail
 unconditionally too, that is a one-line change per site and a policy call, not
 a bug.
+
+---
+
+# r2 — the class was NOT closed: a stale base
+
+r1 fixed thirteen call sites found on base `7f8817cb`. The merge review then
+measured the CURRENT tree and found **21** bare `aomdec_path().is_file()`
+occurrences there, not 13: six gates that merged after r1 branched were added
+with the same silent shape, and under `EC_AV1_REQUIRE_AOMENC=1` with aomdec
+absent all six reported GREEN with the compare skipped. **The lesson is bigger
+than the fix: a class sweep run against a base that is still moving is a
+snapshot of the past.** A lane that merges into main while others are
+measuring will reopen the class behind your back unless the probe is the only
+place the decision is made — which is why r2 leaves exactly one.
+
+## 7. The sweep, re-run on the current tree
+
+Current main at the r2 rebase: `9b2f6c9d`. `grep -c 'aomdec_path().is_file()'`
+over `crates/ec-av1/src/stream.rs` gives **21**, which decomposes exactly:
+
+| kind | count on main | what r2 did |
+|---|---|---|
+| bare `if aomdec_path().is_file() { …compare… }` guards (17 positive + 1 inverted `if !…`) | **18** | **all 18 routed through `aomdec_available()`** — 13 in r1, 5 in r2 |
+| `assert!(aomdec_path().is_file(), …)` — a deliberate hard failure | 2 | kept (they are the strict form) |
+| a doc comment naming the old shape | 1 | kept (it documents the defect) |
+| the presence check inside `aomdec_available` itself | 0 (it did not exist) | **the one place the decision is made** |
+
+**Before/after: 18 bare guard sites -> 0. The presence check now exists in
+exactly one place** (`aomdec_available`, `stream.rs:9131-9160`), called from
+**18 call sites**. Two of those sites sit in shared helpers, so the 18 sites
+serve **20 tests**: `a_444_hbd_superres_arm` (site 14201) is called by
+`a_444_lossy_superres_{10bit_d12,12bit_d12,12bit_d9}_stream_decodes_pixel_exact`
+and `a_444_superres_arm` (site 46871) by
+`a_444_lossy_superres_mode1_den9_stream_decodes_pixel_exact` (and the
+`mode2_random_denom` gate, which calls the same helper through a second
+path). Counting direct `NAME`-bearing tests only: **16 gates**, plus four more
+reaching the same probe through a shared helper. The
+`aomdec_path().is_file()` string now survives only in two doc comments, two
+hard asserts, and the probe's own body.
+
+### The six gates the review named, routed in r2
+
+| gate | r2 site (post-rebase line) | shape it had | now |
+|---|---|---|---|
+| `a_444_lossless_sb64_intrabc_rect_chroma_walks_4x4_units` | `stream.rs:46246` | **inverted** `if !aomdec_path().is_file() { eprintln!(… "pixel arm skipped"); return; }` | `if !aomdec_available(NAME) { …; return; }` — the probe has already said SKIP or failed |
+| `a_lossless_block_clips_its_transform_grid_at_the_frame_edge` | `stream.rs:6972` | `if aomdec_path().is_file() { … } else { eprintln!("SKIP … aomdec arm: no oracle aomdec at {}") }` | `if aomdec_available(NAME) { … }`, else arm deleted |
+| `a_444_lossy_rect4_strip_stream_decodes_pixel_exact_at_odd_and_wide_geometries` | `stream.rs:46470` | nested `if aomdec_path().is_file()`, else arm deleted in r2 | `if aomdec_available(NAME) { … }` |
+| `a_444_lossy_superres_stream_decodes_pixel_exact` | `stream.rs:46699` | `if aomdec_path().is_file() { … } else { eprintln!("… pixel arm skipped") }` | `if aomdec_available(NAME) { … }` |
+| `a_444_superres_arm` (shared helper; reached by `a_444_lossy_superres_mode1_den9_stream_decodes_pixel_exact` and `a_444_lossy_superres_mode2_random_denom_stream_decodes_pixel_exact`) | `stream.rs:46886` | `if aomdec_path().is_file() { … } else { eprintln!("… pixel arm skipped") }` | `if aomdec_available(name) { … }` |
+| `a_distance_weighted_compound_stream_decodes_pixel_exact` | routed in **r1** (one of the 13) | bare guard, no env escape | `if aomdec_available(NAME) { … }` |
+
+**Redundant `else { eprintln!("… pixel arm skipped") }` arms deleted: 7** (6 in
+the scripted pass, 1 found afterwards by running the gates and reading the
+output — `a_lossless_block_clips_its_transform_grid_at_the_frame_edge` printed
+TWO skip lines for one skip, which is how the survivor was located). After
+that, a skip prints exactly one line, from the probe.
+
+## 8. Red-before, re-proven on the CURRENT tree
+
+Base for this proof is **r1 as rebased** (r2's edits reverted by
+`git checkout --`, i.e. exactly what main `9b2f6c9d` would give with r1
+applied) — the point is that a lane merging AFTER r1 branched reintroduces the
+class, so the proof has to stand on the tree the six gates actually live in.
+
+`EC_AV1_AOMDEC=/nonexistent/oracle/aomdec EC_AV1_REQUIRE_AOMENC=1`:
+
+| gate | before r2 | after r2 |
+|---|---|---|
+| `a_444_lossless_sb64_intrabc_rect_chroma_walks_4x4_units` | `… 0 split; no oracle aomdec at /nonexistent/oracle/aomdec, pixel arm skipped` | **FAILED**: `no oracle aomdec at /nonexistent/oracle/aomdec -- the pixel compare this gate exists for would be skipped, and EC_AV1_REQUIRE_AOMDEC/EC_AV1_REQUIRE_AOMENC is set.` |
+| `a_lossless_block_clips_its_transform_grid_at_the_frame_edge` | `SKIP … aomdec arm: no oracle aomdec at /nonexistent/oracle/aomdec` | **FAILED**, same message |
+| `a_444_lossy_rect4_strip_stream_decodes_pixel_exact_at_odd_and_wide_geometries` | two `…: no oracle aomdec, pixel arm skipped` lines (one per pinned fixture) | **FAILED**, same message |
+
+`test result: ok. 3 passed` before, **`test result: FAILED. 0 passed; 3
+failed`** after — with `EC_AV1_REQUIRE_AOMENC=1` set, i.e. exactly the mode a
+batch run is supposed to be in.
+
+## 9. The other two directions, on the current tree
+
+* **Oracle present** — the six (plus the two superres-mode gates that share
+  `a_444_superres_arm`) run and pass: `a_444_lossy_superres_mode1_den9… 4
+  decode-order frame(s) byte-exact vs aomdec at (256,128) upscaled from
+  [(9,228)…]`, `a_444_lossy_rect4_strip… 12 / 24 own-extent 1:4 chroma
+  gather(s)`, `a_444_lossless_sb64_intrabc… 4 lossless rect intra-BC block(s)
+  walked 4x4 chroma units, 24576 WHT units`. **7 passed, 0 failed.**
+* **Absent, env unset** — one SKIP line per gate, from the probe, naming the
+  path and the escape hatch; the gates still pass. Developer-only
+  convenience, unchanged from r1 and now impossible to print twice.
+
+Acceptance: `cargo test -p ec-av1 --lib -- gate_coverage refusal_inventory` ->
+**26 passed, 0 failed** on the rebased tree (the `enable-rect-tx` staleness
+r1 reported is gone — lane-av1toolgates' entries were retired upstream).
+
+## 10. What is still open after r2
+
+* **Shape A stays.** ~445 `if !have_aomenc()` / `if !have_ffmpeg()` early
+  returns, plus `have_affine_aomenc` (which does have the assert-last shape).
+  They fail under the REQUIRE vars because their probes assert; a future lane
+  adding a NEW guard must call a probe rather than re-derive `.is_file()`.
+* **The anti-regression is procedural, not enforced.** A guard written as
+  `aomdec_path().is_file()` compiles, passes review and re-opens the class. The
+  mechanical guard is a source-scan test ("no `aomdec_path().is_file()` outside
+  `aomdec_available` and the two documented asserts"); it was NOT added here
+  because the source-scan pattern for a whole-file assertion is itself a new
+  piece of machinery, and this lane's charter is the probe. It is the obvious
+  next step and it is small.

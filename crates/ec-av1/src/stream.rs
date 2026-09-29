@@ -6969,13 +6969,8 @@ pub(crate) mod tests {
         for f in &frames {
             assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
         }
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             assert_rawvideo_matches(&obu, &stream, NAME, FRAMES);
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
 
         // Control: a stream whose roots all fit must not clip at all.
@@ -7427,8 +7422,6 @@ pub(crate) mod tests {
                 "{NAME}: {decoded} frame(s) byte-exact vs aomdec, {own_chroma} \
                  own-extent 1:4 chroma gather(s)"
             );
-        } else {
-            eprintln!("{NAME}: no oracle aomdec, pixel arm skipped");
         }
 
         // The specificity arm: the SAME source, flags and 1:4 partitions at
@@ -7862,8 +7855,6 @@ pub(crate) mod tests {
                  (U/V first wrong at index 20532, entropy fork read 12465 at \
                  mi (90,108)) -- see lanes/av1444rect.report.md \u{00a7}6"
             );
-        } else {
-            eprintln!("{NAME}: no oracle aomdec, pixel arm skipped");
         }
     }
 
@@ -14215,8 +14206,6 @@ pub(crate) mod tests {
                  width) per frame, {scaled_up} upscale(s), {scaled_mc} scaled MC block(s); \
                  fixture sha256 {fixture_sha}"
             );
-        } else {
-            eprintln!("{name}: no oracle aomdec, pixel arm skipped");
         }
         heads
     }
@@ -46059,7 +46048,9 @@ pub(crate) mod tests {
             let mut parser = Av1Parser::new();
             let mut pos = 0usize;
             while pos < stream.len() {
-                let obu = parser.parse_obu(&stream[pos..]).expect("parsing our own OBUs");
+                let obu = parser
+                    .parse_obu(&stream[pos..])
+                    .expect("parsing our own OBUs");
                 pos += obu.total_size;
             }
             parser
@@ -46243,12 +46234,12 @@ pub(crate) mod tests {
         );
         assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
 
-        if !aomdec_path().is_file() {
+        // The probe decides; its own SKIP (and its assert under
+        // EC_AV1_REQUIRE_AOMDEC / EC_AV1_REQUIRE_AOMENC) has already been said.
+        if !aomdec_available(NAME) {
             eprintln!(
-                "{NAME}: {chroma4} lossless rect intra-BC block(s) walked 4x4 chroma \
-                 units, {wht} WHT units, 0 split; no oracle aomdec at {}, pixel arm \
-                 skipped",
-                aomdec_path().display()
+                "{NAME}: {chroma4} lossless rect intra-BC block(s) walked 4x4 chroma units, \
+                 {wht} WHT units, 0 split"
             );
             return;
         }
@@ -46428,9 +46419,8 @@ pub(crate) mod tests {
                 h + v
             };
             crate::decode::reset_rect4_inter_own_chroma444_hits();
-            let frames = decode_stream(&stream).unwrap_or_else(|e| {
-                panic!("{NAME}: {fixture} no longer decodes cleanly: {e}")
-            });
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: {fixture} no longer decodes cleanly: {e}"));
             let own_chroma = crate::decode::rect4_inter_own_chroma444_hits();
             let strips = {
                 let (h, v, _, _) = crate::decode::inter16_rect4_counters();
@@ -46467,15 +46457,13 @@ pub(crate) mod tests {
                     f.u.len()
                 );
             }
-            if aomdec_path().is_file() {
+            if aomdec_available(NAME) {
                 let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
                 eprintln!(
                     "{NAME}: {fixture} {decoded} decode-order frame(s) \
                      ({hidden} hidden) byte-exact vs aomdec, {own_chroma} own-extent \
                      1:4 chroma gather(s), {strips} 1:4 inter strip(s)"
                 );
-            } else {
-                eprintln!("{NAME}: {fixture}: no oracle aomdec, pixel arm skipped");
             }
         }
     }
@@ -46696,7 +46684,7 @@ pub(crate) mod tests {
                 f.v.len()
             );
         }
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
             eprintln!(
                 "{NAME}: {decoded} decode-order frame(s) ({hidden} hidden) byte-exact vs \
@@ -46704,8 +46692,6 @@ pub(crate) mod tests {
                  {scaled_up} upscale(s), {scaled_mc} scaled MC block(s); fixture sha256 \
                  {FIXTURE_SHA256}"
             );
-        } else {
-            eprintln!("{NAME}: no oracle aomdec, pixel arm skipped");
         }
     }
 
@@ -46842,8 +46828,9 @@ pub(crate) mod tests {
         let _guard = lock_gate_counters();
         let before_sr = crate::superres::superres_hits();
         let before_scaled = crate::mc::predict_scaled_hits();
-        let frames = decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{name}: the pinned 4:4:4 superres stream was refused: {e}"));
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{name}: the pinned 4:4:4 superres stream was refused: {e}")
+        });
         let scaled_up = crate::superres::superres_hits() - before_sr;
         let scaled_mc = crate::mc::predict_scaled_hits() - before_scaled;
         assert!(
@@ -46883,7 +46870,7 @@ pub(crate) mod tests {
                 );
             }
         }
-        if aomdec_path().is_file() {
+        if aomdec_available(name) {
             let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, name);
             eprintln!(
                 "{name}: {decoded} decode-order frame(s) ({hidden} hidden) byte-exact vs \
@@ -46891,8 +46878,6 @@ pub(crate) mod tests {
                  width) per frame, {scaled_up} upscale(s), {scaled_mc} scaled MC block(s); \
                  fixture sha256 {fixture_sha}"
             );
-        } else {
-            eprintln!("{name}: no oracle aomdec, pixel arm skipped");
         }
         heads
     }
@@ -47009,9 +46994,21 @@ pub(crate) mod tests {
         }
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=256x128:rate=25",
-                "-frames:v", "4", "-pix_fmt", "yuv444p", "-strict", "-1", "-f",
-                "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=256x128:rate=25",
+                "-frames:v",
+                "4",
+                "-pix_fmt",
+                "yuv444p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -47023,10 +47020,11 @@ pub(crate) mod tests {
             "{NAME}: ffmpeg refused to generate the y4m source: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let pinned =
-            std::fs::read(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/444_lossy_superres_mode2_256x128.obu"))
-                .expect("pinned fixture disappeared between the two reads");
+        let pinned = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/444_lossy_superres_mode2_256x128.obu"),
+        )
+        .expect("pinned fixture disappeared between the two reads");
         for extra in [
             vec![],
             vec!["--superres-denominator=9"],
