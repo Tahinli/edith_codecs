@@ -7,7 +7,7 @@
 # string literal in the same file (manifest rows, vectors.sha256 names,
 # format! interpolation); such names are only covered through their parent
 # directory, which the verifier requires to exist AND be non-empty.
-# 191 media-name literal(s) in this tree resolved under no enumerated
+# 193 media-name literal(s) in this tree resolved under no enumerated
 # fixture directory and are therefore not listed individually.
 #
 # FIXTURE ROOT: worktree-relative, deliberately NOT an absolute path. A
@@ -26,6 +26,7 @@
 #   sync deliberately excluded the .tar.gz blobs; nothing in crates/ reads a
 #   blob, so the extracted directories are the whole requirement.
 #   Unreferenced committed pins carried as rows: 4
+crates/ec-av1/fixtures/420_intrabc_rect4_witness.obu	crates/ec-av1/src/stream.rs:48071	captured	-	ok	yes	d01352af5059919cdce733abdcbae8e8240ac3c2a6190fa1bd96d3c6f945b979
 crates/ec-av1/fixtures/420_intrabc_rect4_witness.obu	crates/ec-av1/src/stream.rs:8154	captured	-	ok	yes	d01352af5059919cdce733abdcbae8e8240ac3c2a6190fa1bd96d3c6f945b979
 crates/ec-av1/fixtures/422_allskip_2f.obu	crates/ec-av1/src/stream.rs:2311	captured	-	ok	yes	ba4932c14f95971b5f25321b04abce80c9fdd5de4b1fe6fffcdad82aaea87ce1
 crates/ec-av1/fixtures/422_intrabc_sb128_strip_notxsearch.obu	crates/ec-av1/src/stream.rs:2373	captured	-	ok	yes	80dd0d4e93fd6c3d4b7188a43e69d9638f2bece38edfab60ff3582628314b5ec
@@ -33,6 +34,7 @@ crates/ec-av1/fixtures/422_intrabc_sb128_strip.obu	crates/ec-av1/src/stream.rs:2
 crates/ec-av1/fixtures/422_residual_compound_warp_16f.obu	crates/ec-av1/src/stream.rs:2590	captured	-	ok	yes	d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95
 crates/ec-av1/fixtures/422_residual_compound_warp_nolr_16f.obu	crates/ec-av1/src/stream.rs:2669	captured	-	ok	yes	8bed368f7ec4bca772137c6a9c2af89e1b2767ed5f937b91bd9e72ec60aeb42f
 crates/ec-av1/fixtures/422_sb128_3f.obu	crates/ec-av1/src/stream.rs:2312	captured	-	ok	yes	0b851799d99cb4d141a7d042138a3999aad7e0fb24d69c670bca1d38c286dce9
+crates/ec-av1/fixtures/444_intrabc_rect4_witness.obu	crates/ec-av1/src/stream.rs:48069	captured	-	ok	yes	7fe888edf18caa74bdb415f0de643dc59963e87e0255d77191200b7a62eb2542
 crates/ec-av1/fixtures/444_intrabc_rect4_witness.obu	crates/ec-av1/src/stream.rs:8148	captured	-	ok	yes	7fe888edf18caa74bdb415f0de643dc59963e87e0255d77191200b7a62eb2542
 crates/ec-av1/fixtures/444_leaf8_oob.obu	crates/ec-av1/src/stream.rs:8561	captured	-	ok	yes	72bed2791d1ceba8be7926a052c7838c5d96d4f9d56d28fb69789a753d3593af
 crates/ec-av1/fixtures/444_lossy_rect4_inter_witness.obu	crates/ec-av1/src/stream.rs:21216	captured	-	ok	yes	77f727e76d81fe48cd03709f799131677c04869b163e18d78e96bc742ec69153
