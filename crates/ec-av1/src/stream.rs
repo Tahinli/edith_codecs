@@ -6492,14 +6492,40 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let Ok(stream) = std::fs::read(pin_dir().join("ll444-lossless-key.obu")) else {
-            eprintln!(
-                "SKIP {NAME}: no pinned bytes at {} -- regenerate with \
-                 `testsrc2 128x96` yuv444p 6 frames, aomenc --profile=1 --lossless=1 \
-                 --enable-palette=0 --enable-intrabc=0, cut to the key frame's OBUs",
-                pin_dir().join("ll444-lossless-key.obu").display()
-            );
-            return;
+        // lane-av1skipfix: this arm used to be a bare SKIP, so on any box
+        // without the pin (the root `fixtures/` directory is GITIGNORED --
+        // `.gitignore:2` -- so a fresh clone, and every linked worktree, can
+        // never have it) the gate reported green having decoded nothing.
+        // `EC_REQUIRE_FIXTURES=1` -- the repo-wide fixture env, same as the
+        // ec-h264/ec-flac/ec-opus conformance gates -- or this crate's own
+        // `EC_AV1_REQUIRE_AOMENC=1` turns it into a hard failure naming the
+        // missing pin, the exact regeneration recipe and the
+        // `EC_AV1_PIN_DIR` override, so a batch run cannot report green off it.
+        let pin = pin_dir().join("ll444-lossless-key.obu");
+        let stream = match std::fs::read(&pin) {
+            Ok(stream) => stream,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("EC_REQUIRE_FIXTURES").is_none()
+                        && std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+                    "{NAME}: the pinned 4:4:4 lossless key frame is missing at {} ({e}). \
+                     This gate would prove nothing. A worktree has no gitignored root \
+                     `fixtures/`: run scripts/link-fixtures.sh. No script generates this \
+                     pin -- regenerate it with `testsrc2 128x96` yuv444p 6 frames, aomenc \
+                     --profile=1 --lossless=1 --enable-palette=0 --enable-intrabc=0, cut to \
+                     the key frame's OBUs -- or point EC_AV1_PIN_DIR at a directory that has it.",
+                    pin.display()
+                );
+                eprintln!(
+                    "SKIP {NAME}: no pinned bytes at {} ({e}) -- this gate decoded nothing \
+                     and proves nothing; run scripts/link-fixtures.sh, or regenerate with \
+                     `testsrc2 128x96` yuv444p 6 frames, aomenc --profile=1 --lossless=1 \
+                     --enable-palette=0 --enable-intrabc=0, cut to the key frame's OBUs \
+                     (or set EC_REQUIRE_FIXTURES=1 to make this a failure).",
+                    pin.display()
+                );
+                return;
+            }
         };
         // Blindness guard: the pinned fixture must really be a lossless frame.
         let mut parser = Av1Parser::new();
@@ -8572,48 +8598,118 @@ pub(crate) mod tests {
     /// CDEF *on* (no `-enable-cdef 0`) -- the whole point of `lane-av1cdef`:
     /// proves `apply_cdef` itself, not just that this decoder still works
     /// when the filter never fires. Gradient content at a low crf reliably
-    /// gives libaom something to dering. If a run happens to land on
-    /// `cdef_bits > 0` (per-64x64 `cdef_idx`, still unimplemented -- see the
-    /// refusal in `decode_stream`) the stream is skipped rather than failed:
-    /// that gap is named by the refusal's own error text, not silently
-    /// swallowed here.
+    /// gives libaom something to dering.
+    ///
+    /// lane-av1skipfix: the attempt-loop shape. A single-SB 64x64 frame can
+    /// never make libaom write `cdef_bits > 0` (nothing to differentiate per
+    /// superblock), so this recipe is MULTI-SB and MULTI-FRAME, and it sweeps
+    /// (size, cpu-used, crf) until one attempt reads a real `cdef_idx` literal
+    /// -- MEASURED 2026-09-29 on `a21f3680`: 64x64 at every crf/cpu reads
+    /// ZERO `cdef_idx` (single superblock, `bits == 0`, though `apply_cdef`
+    /// does filter with a nonzero strength pair), while 128x64/128x128 at
+    /// 24 frames read 2-8. Every attempt that decodes is ALWAYS pixel-
+    /// compared against ffmpeg's own decode of the identical bytes; a decode
+    /// error is a named refusal recorded per attempt, never a SKIP, and
+    /// exhausting every attempt -- or decoding without ever reading a
+    /// `cdef_idx` -- is a hard FAILURE (an unfired gate is a vacuous gate,
+    /// class `gate-skips-on-its-own-failure`).
     #[test]
     fn a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact() {
+        const NAME: &str = "a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
-            eprintln!(
-                "SKIP a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact: no ffmpeg"
-            );
+            eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let (width, height) = (64, 64);
-        let stream = libaom_encode_with(
-            &gradients_source(42, width, height, "rate=1"),
-            width,
-            height,
-            30,
-            &[
-                "-threads",
-                "1",
-                "-row-mt",
-                "0",
-                "-tile-columns",
-                "0",
-                "-tile-rows",
-                "0",
-            ],
-        )
-        .expect("ffmpeg encode");
-        match decode_stream(&stream) {
-            Ok(frames) => {
-                let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-                assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg (CDEF on)");
-                assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (CDEF on)");
-                assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (CDEF on)");
+        // (width, height, frames, cpu-used, crf). The frame count is what
+        // gives libaom's cdef search more than one superblock to price.
+        const RECIPES: [(usize, usize, usize, &str, u32); 8] = [
+            (128, 64, 24, "0", 20),
+            (128, 64, 24, "2", 20),
+            (128, 64, 24, "0", 16),
+            (128, 128, 24, "2", 20),
+            (128, 128, 24, "0", 16),
+            (128, 128, 24, "0", 24),
+            (128, 64, 24, "2", 24),
+            (128, 128, 24, "2", 24),
+        ];
+        let mut refusals = Vec::new();
+        let mut counted_exact = 0u32;
+        let mut uncounted_exact = 0u32;
+        for (w, h, frames, cpu, crf) in RECIPES {
+            let Some(stream) = libaom_encode_with(
+                &gradients_source(42, w, h, "rate=25"),
+                w,
+                h,
+                crf,
+                &[
+                    "-cpu-used",
+                    cpu,
+                    "-frames:v",
+                    &frames.to_string(),
+                    "-threads",
+                    "1",
+                    "-row-mt",
+                    "0",
+                    "-tile-columns",
+                    "0",
+                    "-tile-rows",
+                    "0",
+                ],
+            ) else {
+                refusals.push(format!(
+                    "{w}x{h} cpu-used {cpu} crf {crf}: ffmpeg itself refused"
+                ));
+                continue;
+            };
+            let before = decode::cdef_idx_hits();
+            let decoded = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("{w}x{h} cpu-used {cpu} crf {crf}: {e}"));
+                    continue;
+                }
+            };
+            // A decode that succeeded is ALWAYS pixel-compared; the hit
+            // counter only decides whether the attempt counts as firing
+            // (class `counter-from-refused-stream`).
+            let counted = decode::cdef_idx_hits() != before;
+            if counted {
+                counted_exact += 1;
+            } else {
+                uncounted_exact += 1;
             }
-            Err(e) => {
-                eprintln!("SKIP a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact: {e}");
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, w, h, frames);
+            assert_eq!(decoded.len(), frames);
+            for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg ({w}x{h} cpu-used {cpu} crf {crf}, \
+                     cdef_idx fired: {counted})"
+                );
+                assert_eq!(
+                    got.u, want.u,
+                    "{NAME} frame {i} U vs ffmpeg ({w}x{h} cpu-used {cpu} crf {crf}, \
+                     cdef_idx fired: {counted})"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{NAME} frame {i} V vs ffmpeg ({w}x{h} cpu-used {cpu} crf {crf}, \
+                     cdef_idx fired: {counted})"
+                );
+            }
+            if counted_exact >= 2 {
+                break;
             }
         }
+        gate_buckets(NAME, counted_exact, uncounted_exact, refusals.len());
+        assert!(
+            counted_exact > 0,
+            "{NAME}: no attempt of {} read a cdef_idx literal -- CDEF is not exercised \
+             (class gate-blind-to-feature):\n{}",
+            RECIPES.len(),
+            refusals.join("\n")
+        );
     }
 
     /// Path to a real `aomenc` build carrying the reference options this
@@ -8996,124 +9092,171 @@ pub(crate) mod tests {
     /// decoder has no in-loop deblocking filter at all, and libaom's default
     /// (on) smooths every block-boundary column, which first looked like a
     /// filter-intra math bug (mismatches straddling the 32-pixel block
-    /// seam) until the recipe without it round-tripped byte-exact. Checks
-    /// [`decode::filter_intra_hits`] actually moved (a process-global
-    /// counter, so before/after rather than an absolute value) to prove the
-    /// symbol fired, then pixel-exactness against ffmpeg's own decode of the
-    /// identical bytes on every plane.
+    /// seam) until the recipe without it round-tripped byte-exact.
+    ///
+    /// lane-av1skipfix: the attempt-loop shape this gate's single recipe
+    /// lacked. It sweeps (seed, cq) and REQUIRES at least one attempt to both
+    /// decode and read `use_filter_intra`: a decode error on EVERY attempt is
+    /// a hard failure carrying the refusal texts, not a printed SKIP, and an
+    /// attempt that decodes without the symbol firing is still pixel-compared
+    /// (class `gate-skips-on-its-own-failure`). MEASURED 2026-09-29 on
+    /// `a21f3680`: seed 42 cq 40 and seed 43 cq 40 read the symbol 3x each,
+    /// pixel-exact, while seed 44 cq 45 and seed 45 cq 30 decode WITHOUT it --
+    /// so the one fixed recipe really did carry the whole gate.
+    ///
+    /// The per-attempt decode error the old single recipe SKIPped on is
+    /// `screen_content_tools_determination` (libaom `encoder_utils.c`): a real
+    /// internal trial-encode/PSNR comparison, not a flag this CLI exposes a
+    /// knob for -- on this flat gradient fixture it lands on
+    /// `allow_screen_content_tools=0` most runs but occasionally trips over
+    /// its 0.9 dB threshold the other way even with palette/intrabc both
+    /// disabled. That is a genuine separate gap (`decode_stream` never reads
+    /// `intrabc`/`palette_mode_info`), so it is a NAMED REFUSAL counted per
+    /// attempt, never a silent skip and never a pass.
     #[test]
     fn a_real_aomenc_filter_intra_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_filter_intra_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
-            eprintln!("SKIP a_real_aomenc_filter_intra_stream_decodes_pixel_exact: no ffmpeg");
+            eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
         if !have_aomenc() {
-            eprintln!(
-                "SKIP a_real_aomenc_filter_intra_stream_decodes_pixel_exact: no aomenc at {}",
-                aomenc_path().display()
-            );
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
         let (width, height) = (64usize, 64usize);
-        // Recipe-search hooks: with the encoder pinned to one thread the
-        // stream is a deterministic function of (seed, cq), so a firing recipe
-        // can be searched for without a rebuild.
+        // Recipe-search hooks: with the encoder pinned to one thread the stream
+        // is a deterministic function of (seed, cq), so a firing recipe can be
+        // searched for without a rebuild. These pin attempt 0 for a bisect; the
+        // sweep walks the same axes regardless.
         let fi_seed: u32 = std::env::var("EC_FI_SEED")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(42);
-        let fi_source = gradients_source(fi_seed, 64, 64, "duration=0.04:rate=25");
-        let fi_cq = std::env::var("EC_FI_CQ").unwrap_or_else(|_| "40".to_string());
-        let fi_cq_arg = format!("--cq-level={fi_cq}");
-        let y4m = Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                &fi_source,
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "yuv4mpegpipe",
-                "-",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("ffmpeg failed to run");
-        assert!(
-            y4m.status.success(),
-            "ffmpeg refused to generate the y4m fixture: {}",
-            String::from_utf8_lossy(&y4m.stderr)
-        );
-        let out = run_with_stdin(
-            Command::new(aomenc_path()).args([
-                "--codec=av1",
-                "--passes=1",
-                "--end-usage=q",
-                &fi_cq_arg,
-                "--cpu-used=0",
-                // Every sibling gate pins these; this one did not, and a
-                // multi-threaded aomenc is not deterministic, so each run
-                // encoded a slightly different stream and the gate flaked
-                // against whichever features that run happened to pick.
-                // Pinning them makes seed 42 mean one stream (class
-                // `parallel-flake-is-attempt-selection`).
-                "--threads=1",
-                "--row-mt=0",
-                "--enable-filter-intra=1",
-                "--enable-smooth-intra=0",
-                "--enable-paeth-intra=0",
-                "--enable-directional-intra=0",
-                "--enable-angle-delta=0",
-                "--enable-tx-size-search=0",
-                "--enable-cdef=0",
-                "--max-partition-size=32",
-                "--loopfilter-control=0",
-                "--enable-palette=0",
-                "--enable-intrabc=0",
-                "--obu",
-                "-o",
-                "-",
-                "-",
-            ]),
-            &y4m.stdout,
-        );
-        assert!(
-            out.status.success(),
-            "aomenc refused the fixture: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let stream = out.stdout;
-        let before = decode::filter_intra_hits();
-        // `screen_content_tools_determination` (libaom encoder_utils.c) is a
-        // real internal trial-encode/PSNR comparison, not a flag this CLI
-        // exposes a knob for -- on this flat gradient fixture it lands on
-        // `allow_screen_content_tools=0` most runs but occasionally trips
-        // over its 0.9 dB threshold the other way even with palette/intrabc
-        // both disabled. That is a genuine separate gap (`decode_stream`
-        // never reads `intrabc`/`palette_mode_info`), not a filter-intra
-        // regression, so it is skipped here exactly as
-        // `a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact`
-        // above skips its own still-unsupported-gap runs.
-        let frames = match decode_stream(&stream) {
-            Ok(frames) => frames,
-            Err(e) => {
-                eprintln!("SKIP a_real_aomenc_filter_intra_stream_decodes_pixel_exact: {e}");
-                return;
+        let fi_cq: u32 = std::env::var("EC_FI_CQ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+        // Two seeds x three quantisers, so "every attempt refused" and "no
+        // attempt ever read `use_filter_intra`" are distinguishable failures
+        // rather than one unlucky recipe.
+        const CQS: [u32; 3] = [40, 35, 30];
+        let mut refusals = Vec::new();
+        let mut counted_exact = 0u32;
+        let mut uncounted_exact = 0u32;
+        'attempts: for round in 0..2u32 {
+            for (i, &walked) in CQS.iter().enumerate() {
+                let seed = fi_seed + round;
+                let cq = if round == 0 && i == 0 { fi_cq } else { walked };
+                let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg refused to generate the y4m fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let out = run_with_stdin(
+                    Command::new(aomenc_path()).args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        &cq_arg,
+                        "--cpu-used=0",
+                        // Every sibling gate pins these; this one did not, and a
+                        // multi-threaded aomenc is not deterministic, so each run
+                        // encoded a slightly different stream and the gate flaked
+                        // against whichever features that run happened to pick.
+                        // Pinning them makes seed 42 mean one stream (class
+                        // `parallel-flake-is-attempt-selection`).
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--enable-filter-intra=1",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-tx-size-search=0",
+                        "--enable-cdef=0",
+                        "--max-partition-size=32",
+                        "--loopfilter-control=0",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ]),
+                    &y4m.stdout,
+                );
+                assert!(
+                    out.status.success(),
+                    "{NAME}: aomenc refused the seed {seed} cq {cq} fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = decode::filter_intra_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        refusals.push(format!("seed {seed} cq {cq}: {e}"));
+                        continue;
+                    }
+                };
+                // A decode that succeeded is ALWAYS pixel-compared; the hit
+                // counter only decides whether the attempt counts as firing
+                // (class `counter-from-refused-stream`).
+                let counted = decode::filter_intra_hits() != before;
+                if counted {
+                    counted_exact += 1;
+                } else {
+                    uncounted_exact += 1;
+                }
+                let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+                assert_eq!(
+                    frames[0].y, ffmpeg_frames[0].y,
+                    "luma vs ffmpeg (seed {seed} cq {cq}, use_filter_intra fired: {counted})"
+                );
+                assert_eq!(
+                    frames[0].u, ffmpeg_frames[0].u,
+                    "U vs ffmpeg (seed {seed} cq {cq}, use_filter_intra fired: {counted})"
+                );
+                assert_eq!(
+                    frames[0].v, ffmpeg_frames[0].v,
+                    "V vs ffmpeg (seed {seed} cq {cq}, use_filter_intra fired: {counted})"
+                );
+                if counted_exact >= 2 {
+                    break 'attempts;
+                }
             }
-        };
+        }
+        gate_buckets(NAME, counted_exact, uncounted_exact, refusals.len());
         assert!(
-            decode::filter_intra_hits() > before,
-            "use_filter_intra never fired decoding this stream"
+            counted_exact > 0,
+            "{NAME}: none of {} attempts decoded a stream that read use_filter_intra -- the \
+             gate would prove nothing (class gate-blind-to-feature):\n{}",
+            CQS.len() * 2,
+            refusals.join("\n")
         );
-        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
-        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
-        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
     /// A real `aomenc` palette-Y fixture (lane-palette r3): `smptebars`
@@ -14759,96 +14902,144 @@ pub(crate) mod tests {
     /// picks a nonzero level -- proves `apply_deblock` itself, not just that
     /// this decoder still works when every edge lands on level 0. CDEF
     /// stays off so a pixel mismatch can only come from the loop filter.
+    ///
+    /// lane-av1skipfix: the attempt-loop shape. The sweep walks cq (which is
+    /// what decides whether libaom picks a nonzero deblocking level at all)
+    /// and seed, REQUIRES at least one attempt to decode, and hard-asserts
+    /// `decode::deblock_hits` on a pixel-compared attempt -- a decode error on
+    /// every attempt is a hard failure carrying the refusal texts, never a
+    /// printed SKIP (class `gate-skips-on-its-own-failure`). MEASURED
+    /// 2026-09-29 on `a21f3680`: cq 55/45/35/63 all decode pixel-exact with
+    /// 48/64/64/64 deblock edges, so the old single recipe was one lucky
+    /// point of a cq range that needed no fallback.
     #[test]
     fn a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
-            eprintln!(
-                "SKIP a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact: no ffmpeg"
-            );
+            eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
         if !have_aomenc() {
-            eprintln!(
-                "SKIP a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact: no aomenc at {}",
-                aomenc_path().display()
-            );
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
         let (width, height) = (64usize, 64usize);
-        let source = gradients_source(42, width, height, "duration=0.04:rate=25");
-        let y4m = Command::new("ffmpeg")
-            .args(["-v", "error", "-f", "lavfi", "-i"])
-            .arg(&source)
-            .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("ffmpeg failed to run");
-        assert!(
-            y4m.status.success(),
-            "ffmpeg fixture: {}",
-            String::from_utf8_lossy(&y4m.stderr)
-        );
-        let out = run_with_stdin(
-            Command::new(aomenc_path()).args([
-                // lane-defon r1: explicit on-value (aomenc keeps the FIRST
-                // occurrence, so overrides go before the base list).
-                "--loopfilter-control=1",
-                "--codec=av1",
-                "--passes=1",
-                "--end-usage=q",
-                "--cq-level=55",
-                "--cpu-used=0",
-                "--enable-filter-intra=0",
-                "--enable-smooth-intra=0",
-                "--enable-paeth-intra=0",
-                "--enable-directional-intra=0",
-                "--enable-angle-delta=0",
-                "--enable-tx-size-search=0",
-                "--enable-cdef=0",
-                // Loop restoration is a named refusal (aomenc's RD picks
-                // Sgrproj on this kind of content) -- off in every recipe
-                // whose test targets a different surface.
-                "--enable-restoration=0",
-                "--max-partition-size=32",
-                "--enable-palette=0",
-                "--enable-intrabc=0",
-                "--enable-cfl-intra=0",
-                // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
-                // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
-                "--enable-ref-frame-mvs=0",
-                "--obu",
-                "-o",
-                "-",
-                "-",
-            ]),
-            &y4m.stdout,
-        );
-        assert!(
-            out.status.success(),
-            "aomenc refused the fixture: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let stream = out.stdout;
-        let before = decode::deblock_hits();
-        let frames = match decode_stream(&stream) {
-            Ok(frames) => frames,
-            Err(e) => {
-                eprintln!(
-                    "SKIP a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact: {e}"
+        // Two seeds x four quantisers.
+        const CQS: [u32; 4] = [55, 45, 35, 63];
+        let mut refusals = Vec::new();
+        let mut counted_exact = 0u32;
+        let mut uncounted_exact = 0u32;
+        'attempts: for round in 0..2u32 {
+            for cq in CQS {
+                let source = gradients_source(42 + round, width, height, "duration=0.04:rate=25");
+                let y4m = Command::new("ffmpeg")
+                    .args(["-v", "error", "-f", "lavfi", "-i"])
+                    .arg(&source)
+                    .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg fixture (seed {} cq {cq}): {}",
+                    42 + round,
+                    String::from_utf8_lossy(&y4m.stderr)
                 );
-                return;
+                let cq_arg = format!("--cq-level={cq}");
+                let out = run_with_stdin(
+                    Command::new(aomenc_path()).args([
+                        // lane-defon r1: explicit on-value (aomenc keeps the FIRST
+                        // occurrence, so overrides go before the base list).
+                        "--loopfilter-control=1",
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        &cq_arg,
+                        "--cpu-used=0",
+                        "--enable-filter-intra=0",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-tx-size-search=0",
+                        "--enable-cdef=0",
+                        // Loop restoration is a named refusal (aomenc's RD picks
+                        // Sgrproj on this kind of content) -- off in every recipe
+                        // whose test targets a different surface.
+                        "--enable-restoration=0",
+                        "--max-partition-size=32",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-cfl-intra=0",
+                        // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                        // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                        "--enable-ref-frame-mvs=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ]),
+                    &y4m.stdout,
+                );
+                assert!(
+                    out.status.success(),
+                    "{NAME}: aomenc refused the seed {} cq {cq} fixture: {}",
+                    42 + round,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = decode::deblock_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        refusals.push(format!("seed {} cq {cq}: {e}", 42 + round));
+                        continue;
+                    }
+                };
+                // A decode that succeeded is ALWAYS pixel-compared; the hit
+                // counter only decides whether the attempt counts as firing
+                // (class `counter-from-refused-stream`).
+                let counted = decode::deblock_hits() != before;
+                if counted {
+                    counted_exact += 1;
+                } else {
+                    uncounted_exact += 1;
+                }
+                let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+                assert_eq!(
+                    frames[0].y,
+                    ffmpeg_frames[0].y,
+                    "luma vs ffmpeg (seed {} cq {cq}, deblock fired: {counted})",
+                    42 + round
+                );
+                assert_eq!(
+                    frames[0].u,
+                    ffmpeg_frames[0].u,
+                    "U vs ffmpeg (seed {} cq {cq}, deblock fired: {counted})",
+                    42 + round
+                );
+                assert_eq!(
+                    frames[0].v,
+                    ffmpeg_frames[0].v,
+                    "V vs ffmpeg (seed {} cq {cq}, deblock fired: {counted})",
+                    42 + round
+                );
+                if counted_exact >= 2 {
+                    break 'attempts;
+                }
             }
-        };
+        }
+        gate_buckets(NAME, counted_exact, uncounted_exact, refusals.len());
         assert!(
-            decode::deblock_hits() > before,
-            "no deblocking edge fired decoding this stream -- raise cq-level"
+            counted_exact > 0,
+            "{NAME}: none of {} attempts decoded a stream with a deblocking edge -- \
+             apply_deblock is unproven (class gate-blind-to-feature):\n{}",
+            CQS.len() * 2,
+            refusals.join("\n")
         );
-        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
-        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
-        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
     /// As [`a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact`],
@@ -21869,133 +22060,174 @@ pub(crate) mod tests {
         );
     }
 
+    /// The inter-frame twin of
+    /// [`a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact`]:
+    /// deblocking left *on* at a crf high enough that libaom picks a nonzero
+    /// level, CDEF off, so a pixel mismatch can only come from the loop
+    /// filter -- and over a real 4-frame INTER sequence, not one key frame.
+    ///
+    /// lane-av1skipfix: the attempt-loop shape. The sweep walks cq and seed,
+    /// REQUIRES at least one attempt to decode, and hard-asserts
+    /// `decode::deblock_hits` on a pixel-compared attempt; a decode error on
+    /// every attempt is a hard failure carrying the refusal texts, never a
+    /// printed SKIP (class `gate-skips-on-its-own-failure`). MEASURED
+    /// 2026-09-29 on `a21f3680`: cq 55/45/35/63 all decode 4 frames
+    /// pixel-exact with 208/224/160/208 deblock edges.
     #[test]
     fn a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
-            eprintln!(
-                "SKIP a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact: no ffmpeg"
-            );
+            eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
         if !have_aomenc() {
-            eprintln!(
-                "SKIP a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact: no aomenc at {}",
-                aomenc_path().display()
-            );
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
         let (width, height, frame_count) = (64usize, 64usize, 4usize);
-        let source = gradients_source(42, width, height, "duration=0.16:rate=25");
-        let y4m = Command::new("ffmpeg")
-            .args(["-v", "error", "-f", "lavfi", "-i"])
-            .arg(&source)
-            .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("ffmpeg failed to run");
-        assert!(
-            y4m.status.success(),
-            "ffmpeg fixture: {}",
-            String::from_utf8_lossy(&y4m.stderr)
-        );
-        let out = run_with_stdin(
-            Command::new(aomenc_path()).args([
-                // lane-defon r1: explicit on-value (aomenc keeps the FIRST
-                // occurrence, so overrides go before the base list).
-                "--loopfilter-control=1",
-                "--codec=av1",
-                "--passes=1",
-                "--end-usage=q",
-                "--cq-level=55",
-                "--cpu-used=0",
-                "--lag-in-frames=0",
-                "--auto-alt-ref=0",
-                "--kf-max-dist=1000",
-                // Forces `primary_ref_frame = PRIMARY_REF_NONE` on every
-                // frame (spec 5.9.2): without it a real encoder's inter
-                // frame loads its initial CDF state from the previous
-                // frame's *adapted* tables (spec 7.20's `load_cdfs`), which
-                // this decoder never does -- it always starts each frame's
-                // `Cdfs` from the spec defaults (`decode.rs`'s
-                // `Cdfs::new(q_ctx)`, called fresh per frame in
-                // `decode_stream`). Without this flag the inter frame's
-                // very first symbol desyncs immediately (traced 2026-08-27:
-                // no coefficient trace at all before the tile's first
-                // partition read comes back an out-of-alphabet value). A
-                // real decoder needs cross-frame CDF forwarding to handle
-                // that stream; this fixture sidesteps it the same way a
-                // real broadcast/low-latency encode legitimately can.
-                "--error-resilient=1",
-                "--enable-rect-partitions=0",
-                "--enable-ab-partitions=0",
-                "--enable-1to4-partitions=0",
-                "--enable-filter-intra=0",
-                "--enable-smooth-intra=0",
-                "--enable-paeth-intra=0",
-                "--enable-directional-intra=0",
-                "--enable-angle-delta=0",
-                "--enable-tx-size-search=0",
-                "--enable-cdef=0",
-                // Loop restoration is a named refusal (aomenc's RD picks
-                // Sgrproj on this kind of content) -- off in every recipe
-                // whose test targets a different surface.
-                "--enable-restoration=0",
-                "--max-partition-size=32",
-                "--enable-palette=0",
-                "--enable-intrabc=0",
-                "--enable-cfl-intra=0",
-                // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
-                // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
-                "--enable-ref-frame-mvs=0",
-                "--obu",
-                "-o",
-                "-",
-                "-",
-            ]),
-            &y4m.stdout,
-        );
-        assert!(
-            out.status.success(),
-            "aomenc refused the fixture: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let stream = out.stdout;
-        if let Ok(dump) = std::env::var("EC_AV1_GATE_DUMP") {
-            std::fs::write(dump, &stream).expect("dump stream");
-        }
-        let before = decode::deblock_hits();
-        let frames = match decode_stream(&stream) {
-            Ok(frames) => frames,
-            Err(e) => {
-                eprintln!(
-                    "SKIP a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact: {e}"
+        // Two seeds x four quantisers.
+        const CQS: [u32; 4] = [55, 45, 35, 63];
+        let mut refusals = Vec::new();
+        let mut counted_exact = 0u32;
+        let mut uncounted_exact = 0u32;
+        'attempts: for round in 0..2u32 {
+            for cq in CQS {
+                let source = gradients_source(42 + round, width, height, "duration=0.16:rate=25");
+                let y4m = Command::new("ffmpeg")
+                    .args(["-v", "error", "-f", "lavfi", "-i"])
+                    .arg(&source)
+                    .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg fixture (seed {} cq {cq}): {}",
+                    42 + round,
+                    String::from_utf8_lossy(&y4m.stderr)
                 );
-                return;
-            }
-        };
-        assert!(
-            decode::deblock_hits() > before,
-            "no deblocking edge fired decoding this sequence -- raise cq-level"
-        );
-        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
-        assert_eq!(frames.len(), frame_count);
-        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-            // gradients' colors ignore its seed, so this gate encodes fresh
-            // content every run -- a mismatch here may never reproduce.
-            // Self-pin the stream before panicking so the failure is
-            // bisectable (replay: EC_AV1_PIN on scratch_isolate_pinned_mismatch).
-            let ok = got.y == want.y && got.u == want.u && got.v == want.v;
-            if !ok {
-                let pin = std::env::temp_dir().join("ec-av1-deblocking-gate-fail.obu");
-                let _ = std::fs::write(&pin, &stream);
-                panic!(
-                    "frame {i} mismatch vs ffmpeg -- stream pinned at {}",
-                    pin.display()
+                let cq_arg = format!("--cq-level={cq}");
+                let out = run_with_stdin(
+                    Command::new(aomenc_path()).args([
+                        // lane-defon r1: explicit on-value (aomenc keeps the FIRST
+                        // occurrence, so overrides go before the base list).
+                        "--loopfilter-control=1",
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        &cq_arg,
+                        "--cpu-used=0",
+                        "--lag-in-frames=0",
+                        "--auto-alt-ref=0",
+                        "--kf-max-dist=1000",
+                        // Forces `primary_ref_frame = PRIMARY_REF_NONE` on every
+                        // frame (spec 5.9.2): without it a real encoder's inter
+                        // frame loads its initial CDF state from the previous
+                        // frame's *adapted* tables (spec 7.20's `load_cdfs`), which
+                        // this decoder never does -- it always starts each frame's
+                        // `Cdfs` from the spec defaults (`decode.rs`'s
+                        // `Cdfs::new(q_ctx)`, called fresh per frame in
+                        // `decode_stream`). Without this flag the inter frame's
+                        // very first symbol desyncs immediately (traced 2026-08-27:
+                        // no coefficient trace at all before the tile's first
+                        // partition read comes back an out-of-alphabet value). A
+                        // real decoder needs cross-frame CDF forwarding to handle
+                        // that stream; this fixture sidesteps it the same way a
+                        // real broadcast/low-latency encode legitimately can.
+                        "--error-resilient=1",
+                        "--enable-rect-partitions=0",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-filter-intra=0",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-tx-size-search=0",
+                        "--enable-cdef=0",
+                        // Loop restoration is a named refusal (aomenc's RD picks
+                        // Sgrproj on this kind of content) -- off in every recipe
+                        // whose test targets a different surface.
+                        "--enable-restoration=0",
+                        "--max-partition-size=32",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-cfl-intra=0",
+                        // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                        // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                        "--enable-ref-frame-mvs=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ]),
+                    &y4m.stdout,
                 );
+                assert!(
+                    out.status.success(),
+                    "{NAME}: aomenc refused the seed {} cq {cq} fixture: {}",
+                    42 + round,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                if let Ok(dump) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(dump, &stream).expect("dump stream");
+                }
+                let before = decode::deblock_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        refusals.push(format!("seed {} cq {cq}: {e}", 42 + round));
+                        continue;
+                    }
+                };
+                // A decode that succeeded is ALWAYS pixel-compared; the hit
+                // counter only decides whether the attempt counts as firing
+                // (class `counter-from-refused-stream`).
+                let counted = decode::deblock_hits() != before;
+                if counted {
+                    counted_exact += 1;
+                } else {
+                    uncounted_exact += 1;
+                }
+                let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+                assert_eq!(frames.len(), frame_count);
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    // gradients' colors ignore its seed, so this gate encodes fresh
+                    // content every run -- a mismatch here may never reproduce.
+                    // Self-pin the stream before panicking so the failure is
+                    // bisectable (replay: EC_AV1_PIN on scratch_isolate_pinned_mismatch).
+                    let ok = got.y == want.y && got.u == want.u && got.v == want.v;
+                    if !ok {
+                        let pin = std::env::temp_dir().join(format!(
+                            "ec-av1-deblocking-gate-fail-s{}-cq{cq}.obu",
+                            42 + round
+                        ));
+                        let _ = std::fs::write(&pin, &stream);
+                        panic!(
+                            "frame {i} mismatch vs ffmpeg (seed {} cq {cq}, deblock fired: \
+                             {counted}) -- stream pinned at {}",
+                            42 + round,
+                            pin.display()
+                        );
+                    }
+                }
+                if counted_exact >= 2 {
+                    break 'attempts;
+                }
             }
         }
+        gate_buckets(NAME, counted_exact, uncounted_exact, refusals.len());
+        assert!(
+            counted_exact > 0,
+            "{NAME}: none of {} attempts decoded a sequence with a deblocking edge -- \
+             apply_deblock is unproven (class gate-blind-to-feature):\n{}",
+            CQS.len() * 2,
+            refusals.join("\n")
+        );
     }
 
     /// The decisive cross-frame CDF forwarding test: identical to
