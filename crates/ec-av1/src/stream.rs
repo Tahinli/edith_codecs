@@ -13249,6 +13249,21 @@ pub(crate) mod tests {
             "{NAME}: only {headers} frame headers in the fixture"
         );
         let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {e}"));
+        // The frame count, and it comes from the WIRE, not from our decode: the
+        // loop above parsed this stream's own OBU frame headers with
+        // `Av1Parser` and counted `headers` of them (>= 3, from the arm's
+        // `--limit=3` at 13127, which overrides the helper's `--limit=1` because
+        // aomenc keeps the last occurrence of a repeated flag). Asserted ABOVE
+        // the oracle call, so a decode that showed fewer frames than the bitstream
+        // codes reds naming the wire instead of asking ffmpeg for the same short
+        // count. Deriving it from `headers` rather than a literal keeps the pin
+        // honest if aomenc's frame count ever drifts.
+        assert_eq!(
+            frames.len(),
+            headers,
+            "{NAME}: the stream codes {headers} frame(s), the decode showed {}",
+            frames.len()
+        );
         let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
         assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
         for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -13454,15 +13469,19 @@ pub(crate) mod tests {
                     Err(e) => panic!("{NAME}: decode failed on {arm} at {depth}-bit: {e}"),
                 };
                 let fired = decode::rect4_palette_hits() - before;
+                // The ENCODE's frame count, asserted ABOVE the oracle call: the
+                // y4m renders 5 frames (`-t 0.2` at every arm's `rate=25`,
+                // 13275) but aomenc is given `--limit=1` (13313), so the stream
+                // codes exactly 1 frame at both depths on every arm. Asserted
+                // here it is NOT the tautology the old comment below claimed:
+                // `frames.len() == 1` is a fact about the encode, checked before
+                // `frames.len()` is spent as ffmpeg's frame budget.
+                assert_eq!(frames.len(), 1, "{NAME}: {arm} at {depth}-bit key frame");
                 let ffmpeg_frames = if depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                 } else {
                     ffmpeg_decode_sequence(&stream, width, height, frames.len())
                 };
-                // No frame-count assert here: `ffmpeg_decode_sequence{,_10bit}`
-                // was handed `frames.len()` as its frame budget, so
-                // `ffmpeg_frames.len() == frames.len()` holds by construction
-                // and the assert was tautological.
                 assert!(
                     !frames.is_empty(),
                     "{NAME}: {arm} at {depth}-bit decoded no frame"
@@ -15592,6 +15611,21 @@ pub(crate) mod tests {
                 .map(|((label, _), d)| format!("{label}={d}"))
                 .collect();
             let fired = fired.join(" ");
+            // The ENCODE's frame count, and it is this helper's `frames` PARAMETER
+            // (15446) -- not our decode's length. It is the same value handed to
+            // `encode_10bit_gradients_seed` (15469), which renders
+            // `frames / 25.0` seconds at `rate=25` (15928, 15940) and runs
+            // aomenc with no `--limit` of its own, so the stream codes exactly
+            // `frames` frames: 1 for the single-key-frame callers, 24 for the
+            // `--lag-in-frames=16` inter callers. Asserted ABOVE the oracle call,
+            // so a decode that showed fewer reds naming the encode rather than
+            // handing ffmpeg the same short count.
+            assert_eq!(
+                decoded.len(),
+                frames,
+                "{name}: seed {seed}: the encode codes {frames} frame(s), the decode showed {}",
+                decoded.len()
+            );
             let reference = ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len());
             assert_eq!(
                 decoded.len(),
