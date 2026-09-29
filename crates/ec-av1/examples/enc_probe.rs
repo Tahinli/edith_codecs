@@ -20,9 +20,10 @@ fn main() {
         true => (0, 0),
         false => (a[1].parse().unwrap(), a[2].parse().unwrap()),
     };
-    let qs: Vec<u8> = a
-        .get(4)
-        .map_or_else(|| vec![150, 120, 90, 60], |s| s.split(',').map(|q| q.parse().unwrap()).collect());
+    let qs: Vec<u8> = a.get(4).map_or_else(
+        || vec![150, 120, 90, 60],
+        |s| s.split(',').map(|q| q.parse().unwrap()).collect(),
+    );
 
     // lane-census/lane-probe: the BD gate's native rows CROP (`EC_ENC_VF`) and
     // SEEK (`EC_ENC_SS`) -- without the seek this probe read film B's black
@@ -71,7 +72,10 @@ fn main() {
                     .join(" ")
             };
             println!("  census luma SAD rank of RD winner: {}", pct(&luma_rank));
-            println!("  census chroma SAD rank of RD winner: {}", pct(&chroma_rank));
+            println!(
+                "  census chroma SAD rank of RD winner: {}",
+                pct(&chroma_rank)
+            );
         }
         // lane-arfmode: the engagement counter of the top ARF's offer-set
         // lever, taken once per point so an armed run PRINTS a non-zero count
@@ -80,6 +84,10 @@ fn main() {
         // control's own expectation.
         let hits = ec_av1::encode::take_arfmode_hits();
         println!("  arfmode hits: {} {} {}", hits[0], hits[1], hits[2]);
+        // lane-av1recipehunt: the gate's own precondition number -- how many
+        // blocks this point's search picked a DRL index the write-time stack
+        // could not carry.
+        println!("  drl_clamp: {}", ec_av1::tile::drl_clamp_hits());
     }
     println!("wall {:.3}s", start.elapsed().as_secs_f64());
 }
