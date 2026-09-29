@@ -5019,9 +5019,77 @@ pub(crate) mod tests {
         bytes
     }
 
+    /// The bit depth the stream's OWN sequence header declares, read from
+    /// the bytes rather than taken from the gate's name or recipe (class
+    /// `helper-packs-u16-for-an-8-bit-stream`: aomdec's `--rawvideo`
+    /// writes 8 bits per sample for an 8-bit stream and 16 bits LE for a
+    /// high-bitdepth one, so a u16 packer turns every 8-bit compare into a
+    /// raw-SIZE failure that never looks at a sample).
+    fn stream_bit_depth(stream: &[u8], name: &str) -> u8 {
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: OBU at byte {pos} does not parse: {e:?}"));
+            pos += obu.total_size;
+        }
+        probe
+            .sequence_header()
+            .unwrap_or_else(|| panic!("{name}: the stream carries no sequence header OBU"))
+            .color_config
+            .bit_depth
+    }
+
+    /// Packs decoded planes the way `aomdec --rawvideo` writes them for
+    /// `bit_depth`: 1 byte per sample at 8-bit, 2 bytes little-endian at
+    /// 10/12-bit. Plane order is Y, U, V at the frame's own subsampled
+    /// shape, which is exactly what rawvideo emits.
+    fn pack_rawvideo(decoded: &[Pic], bit_depth: u8, name: &str) -> Vec<u8> {
+        let mut ours: Vec<u8> = Vec::new();
+        for (fi, f) in decoded.iter().enumerate() {
+            for p in [&f.y, &f.u, &f.v] {
+                if bit_depth == 8 {
+                    for &s in p {
+                        assert!(
+                            s <= 0xff,
+                            "{name}: decode-order frame {fi} carries the sample {s}, which an \
+                             8-bit stream cannot hold -- the stream is not the one this gate thinks \
+                             it is"
+                        );
+                        ours.push(s as u8);
+                    }
+                } else {
+                    for &s in p {
+                        ours.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+            }
+        }
+        ours
+    }
+
     /// Decodes `stream` and the oracle's `aomdec --rawvideo` output and
     /// requires every sample of every frame to agree, in decode order.
-    fn assert_rawvideo_matches(obu: &std::path::Path, stream: &[u8], name: &str, frames: usize) {
+    ///
+    /// `bit_depth` is the depth the CALLER believes the stream has; it is
+    /// asserted against the stream's own sequence header, so a gate that
+    /// hands this an 8-bit stream under a 10-bit label fails here by name
+    /// instead of dying on a raw-size mismatch that reads like a pixel bug.
+    fn assert_rawvideo_matches(
+        obu: &std::path::Path,
+        stream: &[u8],
+        name: &str,
+        frames: usize,
+        bit_depth: u8,
+    ) {
+        let actual_depth = stream_bit_depth(stream, name);
+        assert_eq!(
+            actual_depth, bit_depth,
+            "{name}: the stream's sequence header says {actual_depth}-bit, the gate passed \
+             {bit_depth}-bit -- aomdec's --rawvideo writes {actual_depth} bits per sample for it, \
+             so packing for {bit_depth} compares nothing"
+        );
         let dir = std::env::temp_dir().join(format!("ec-av1-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -5043,15 +5111,20 @@ pub(crate) mod tests {
         let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
         let _ = std::fs::remove_dir_all(&dir);
         let decoded = decode_stream(stream).expect("decode for comparison");
-        let mut ours: Vec<u8> = Vec::with_capacity(ref_raw.len());
-        for f in &decoded {
-            for p in [&f.y, &f.u, &f.v] {
-                for s in p {
-                    ours.extend_from_slice(&s.to_le_bytes());
-                }
-            }
-        }
-        assert_eq!(ours.len(), ref_raw.len(), "{name}: raw sizes differ");
+        let ours = pack_rawvideo(&decoded, bit_depth, name);
+        assert_eq!(
+            ours.len(),
+            ref_raw.len(),
+            "{name}: {bit_depth}-bit raw sizes differ -- ours packs {} bytes ({} samples at \
+             {} bit/sample), aomdec wrote {}",
+            ours.len(),
+            decoded
+                .iter()
+                .map(|f| f.y.len() + f.u.len() + f.v.len())
+                .sum::<usize>(),
+            bit_depth,
+            ref_raw.len()
+        );
         assert_eq!(decoded.len(), frames, "{name}: frame count");
         let first = ours
             .iter()
@@ -5065,6 +5138,115 @@ pub(crate) mod tests {
             ours.iter().zip(&ref_raw).filter(|(a, b)| a != b).count(),
             first
         );
+    }
+
+    /// lane-av1rawhelper: `assert_rawvideo_matches` used to pack our samples
+    /// as `u16` for EVERY stream, while `aomdec --rawvideo` writes 8 bits
+    /// per sample for an 8-bit stream. An 8-bit caller therefore died on a
+    /// raw-SIZE assertion (2359296 vs 1179648) without comparing a single
+    /// sample, and a high-bitdepth caller was the only one that could work.
+    ///
+    /// Two arms, both on a real `aomenc` 8-bit stream:
+    ///
+    /// 1. the correct label compares real samples -- the byte counts it
+    ///    walks equal the oracle's, so every `u8` in the 8-bit pack is
+    ///    zipped against a real oracle byte;
+    /// 2. a WRONG label fails by name, quoting both depths and the fact that
+    ///    the pack would compare nothing, rather than by size. Arm 2 is what
+    ///    keeps arm 1 from being a green that a reverted check would also
+    ///    give.
+    #[test]
+    fn the_rawvideo_helper_compares_real_samples_at_the_streams_own_bit_depth() {
+        const NAME: &str = "the_rawvideo_helper_compares_real_samples_at_the_streams_own_bit_depth";
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() || !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no aomenc/aomdec oracle or no ffmpeg");
+            return;
+        }
+        let (w, h) = (192usize, 128usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &gradients_source(7, w, h, "duration=0.24:rate=25"),
+                "-pix_fmt",
+                "yuv420p",
+                "-t",
+                "0.24",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{NAME}: ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=40",
+            "--cpu-used=2",
+            "--threads=1",
+            "--row-mt=0",
+            "--limit=6",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "{NAME}: aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        assert_eq!(
+            stream_bit_depth(&stream, NAME),
+            8,
+            "{NAME}: the fixture must really be 8-bit, or this gate measures nothing"
+        );
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-raw8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, &stream).expect("writing the stream");
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the 8-bit stream no longer decodes: {e}"))
+            .len();
+        assert!(frames > 0, "{NAME}: nothing decoded");
+
+        // ARM 2 first: the wrong label must be refused BY NAME. A helper that
+        // packed u16 unconditionally got this far and then failed on size.
+        let wrong = std::panic::catch_unwind(|| {
+            assert_rawvideo_matches(&obu, &stream, NAME, frames, 10);
+        });
+        let boom = wrong
+            .err()
+            .map(|e| e.downcast_ref::<String>().cloned().unwrap_or_default())
+            .unwrap_or_default();
+        assert!(
+            boom.contains("sequence header says 8-bit") && boom.contains("compares nothing"),
+            "{NAME}: a 10-bit label on an 8-bit stream must be refused by the depth check \
+             naming both depths; the panic read: {boom}"
+        );
+
+        // ARM 1: the correct label compares real samples. The pre-fix helper
+        // reached a size mismatch here (ours 2x the oracle); reaching the
+        // sample compare is what this arm proves.
+        assert_rawvideo_matches(&obu, &stream, NAME, frames, 8);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("{NAME}: {frames} 8-bit frame(s) byte-identical to aomdec --rawvideo");
     }
 
     fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -6886,7 +7068,7 @@ pub(crate) mod tests {
         let _ = decode_stream(&ctrl_stream)
             .unwrap_or_else(|e| panic!("{NAME}: the control arm no longer decodes cleanly: {e}"));
         if aomdec_path().is_file() {
-            assert_rawvideo_matches(&ctrl, &ctrl_stream, NAME, FRAMES);
+            assert_rawvideo_matches(&ctrl, &ctrl_stream, NAME, FRAMES, 10);
         } else {
             eprintln!(
                 "SKIP {NAME} control aomdec arm: no oracle aomdec at {}",
