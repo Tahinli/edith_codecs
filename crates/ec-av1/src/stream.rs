@@ -6858,6 +6858,128 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1lm444loss: a LOSSLESS block's transform-unit grid is clipped at
+    /// the FRAME edge, exactly as libaom's `max_block_high`/`max_block_wide`
+    /// clip it (`av1_common_int.h:1565`, `:1579` fold `mb_to_bottom_edge` /
+    /// `mb_to_right_edge` into `block_size_high/wide` before `>>
+    /// MI_SIZE_LOG2`), so a block hanging off the bottom/right codes only the
+    /// units inside the frame. `decode_token_recon_block` then bounds every
+    /// mu chunk with `unit_height = ROUND_POWER_OF_TWO(AOMMIN(mu_blocks_high
+    /// + row, max_blocks_high), ss_y)`, so the overflow units are never read
+    /// there either.
+    ///
+    /// Fixture is the sibling [`a_lossless_444_128_root_lossless_stream_reads_chunks_chunk_major`]
+    /// pin -- 128x96 yuv444p 4:4:4 lossless, 6 frames, 63429 bytes -- because
+    /// 96 is NOT a multiple of the 128 superblock: its five inter frames each
+    /// carry one unsplit 128 root that overhangs the bottom by 32 px. That is
+    /// the whole reason this stream is the witness. The frame is 24 mi tall,
+    /// so `max_blocks_high >> 2` is 24 transform rows where the block's own
+    /// `side / MI` is 32.
+    ///
+    /// The three assertions are all non-vacuous and all EXACT:
+    ///
+    /// 1. `lossless_edge_clipped()` fired -- 5, one per inter frame's 128
+    ///    root. It is 0 on any frame whose height and width are multiples of
+    ///    the superblock, so a stream that merely decodes cannot satisfy it.
+    /// 2. `lossless_edge_clip_units()` is 1280 = 5 x 256: the 8 transform rows
+    ///    x 32 columns the unclipped walk read past the frame bottom, per
+    ///    inter frame. The pre-fix walk read 2560 units per inter frame
+    ///    against the oracle's 2304, and this is that 256.
+    /// 3. every sample of every frame matches the oracle `aomdec
+    ///    --rawvideo` in decode order -- all six frames, hidden alt-ref
+    ///    included, which the pre-fix tree failed from frame 1 on
+    ///    (5596 wrong samples there, growing to 33561 by frame 5).
+    ///
+    /// The control arm pins the other direction of the invariant: the
+    /// `ll444_minp64_128root_control` stream has no overhanging root, so its
+    /// clip counters must both read 0 -- the clip cannot fire on a block that
+    /// fits, which is what keeps every other lossless pin byte-identical.
+    #[test]
+    fn a_lossless_block_clips_its_transform_grid_at_the_frame_edge() {
+        const NAME: &str = "a_lossless_block_clips_its_transform_grid_at_the_frame_edge";
+        const W: usize = 128;
+        const H: usize = 96;
+        const FRAMES: usize = 6;
+        /// 5 inter frames, one unsplit 128 root each; frame 0 splits.
+        const ROOTS: usize = 5;
+        /// `max_blocks_high >> 2` = 24 rows (96 px / 4), against the block's
+        /// own `side / MI` = 32 -- so 8 rows x 32 columns = 256 units per root
+        /// were read past the frame bottom before the clip.
+        const CLIP_UNITS_PER_ROOT: usize = 256;
+
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_128root_lossless.obu");
+        let stream = read_pin(&obu, 63429, 0xf07d_47fc_fd51_2658, NAME);
+        let _guard = lock_gate_counters();
+        let (c0, u0) = (
+            crate::decode::lossless_edge_clipped(),
+            crate::decode::lossless_edge_clip_units(),
+        );
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
+        let (c1, u1) = (
+            crate::decode::lossless_edge_clipped(),
+            crate::decode::lossless_edge_clip_units(),
+        );
+        assert_eq!(
+            c1 - c0,
+            ROOTS,
+            "{NAME}: the frame-edge clip fired on {}/{} of the 128 roots -- it must be 0 \
+             on a frame that fits, so this is what makes the gate non-vacuous",
+            c1 - c0,
+            ROOTS
+        );
+        assert_eq!(
+            u1 - u0,
+            ROOTS * CLIP_UNITS_PER_ROOT,
+            "{NAME}: the clip removed {}/{} transform units; the unclipped walk read {} \
+             per inter frame past the 96 px frame bottom (8 rows x 32 columns)",
+            u1 - u0,
+            ROOTS * CLIP_UNITS_PER_ROOT,
+            CLIP_UNITS_PER_ROOT
+        );
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for f in &frames {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
+        }
+        if aomdec_path().is_file() {
+            assert_rawvideo_matches(&obu, &stream, NAME, FRAMES);
+        } else {
+            eprintln!(
+                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
+                aomdec_path().display()
+            );
+        }
+
+        // Control: a stream whose roots all fit must not clip at all.
+        let ctrl = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/ll444_minp64_128root_control.obu");
+        let ctrl_stream = read_pin(
+            &ctrl,
+            61494,
+            0xf6f5_a3cb_efc7_eb10,
+            &format!("{NAME} control"),
+        );
+        let (c2, u2) = (
+            crate::decode::lossless_edge_clipped(),
+            crate::decode::lossless_edge_clip_units(),
+        );
+        let _ = decode_stream(&ctrl_stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the control arm no longer decodes cleanly: {e}"));
+        assert_eq!(
+            crate::decode::lossless_edge_clipped() - c2,
+            0,
+            "{NAME} control: the clip fired on a stream whose blocks all fit -- the clip \
+             must be a no-op there, which is what keeps every other lossless pin \
+             byte-identical"
+        );
+        assert_eq!(
+            crate::decode::lossless_edge_clip_units() - u2,
+            0,
+            "{NAME} control: the clip removed units from a stream whose blocks all fit"
+        );
+    }
+
     /// lane-av1llpredgate2: the debug-exact pin for the ss-aware
     /// `obmc_skip_chroma_above` decision (lane-av1-llpred2). Fixture is the
     /// llpred/llpred2 reports' stream pinned into `fixtures/`: testsrc2
