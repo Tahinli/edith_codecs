@@ -18591,14 +18591,17 @@ pub(crate) mod tests {
         // lane-interp3 r1: sequence length -- a compound block needs several
         // already-coded references, which a 4-frame sequence never has.
         frame_count: usize,
-    ) {
+        // lane-av1dualfilter10: the encoded stream, so a caller can assert on
+        // the PARSED sequence header (bit depth, `enable_dual_filter`) rather
+        // than on the flag it asked for. Empty on the SKIP paths below.
+    ) -> Vec<u8> {
         if !have_ffmpeg() {
             eprintln!("SKIP {name}: no ffmpeg");
-            return;
+            return Vec::new();
         }
         if !have_aomenc() {
             eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
-            return;
+            return Vec::new();
         }
         let height = 64usize;
         let duration = format!("{:.2}", frame_count as f64 / 25.0);
@@ -18721,6 +18724,7 @@ pub(crate) mod tests {
                 );
             }
         }
+        stream
     }
 
     #[test]
@@ -18867,6 +18871,88 @@ pub(crate) mod tests {
             "{NAME}: no 8x8 COMPOUND leaf was predicted through the per-ref GLOBAL \
              warp -- the r3 root-cause path never fired, so this stream no longer \
              proves it"
+        );
+    }
+
+    /// lane-av1dualfilter10: the 10-bit arm of the dual-filter witness.
+    ///
+    /// `NEVER_EXERCISED_10BIT` kept `enable-dual-filter` listed after the
+    /// 8-bit entry was retired (lane-av1distwtd r3, gate_coverage.rs), and
+    /// the reason was structural, not incidental: the only `=1` witness,
+    /// `a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact`,
+    /// calls `inter_sb_none_gate(NAME, false, ...)` -- and that `false` IS the
+    /// `ten_bit` parameter, so it built an 8-bit stream. Its `ten_bit = true`
+    /// siblings build 10-bit streams but spell no dual-filter flag. This is
+    /// that missing arm.
+    ///
+    /// What makes it a witness and not a spelling: the header is read back
+    /// from the ENCODED stream (`enable_dual_filter` and `bit_depth` both come
+    /// from `Av1Parser`, never from the flag or the fixture name), and the
+    /// arrival assert is a DELTA on `decode::dual_filter_diff_hits()` taken
+    /// around this arm alone. A stream that merely parsed would not move the
+    /// counter; the counter moves only when `resolve_interp_filter` reads two
+    /// DIFFERENT directions for one block, which is the property the entry
+    /// was claiming no real stream carried.
+    #[test]
+    fn a_real_aomenc_10bit_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_10bit_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let before_dual = decode::dual_filter_diff_hits();
+        let stream = inter_sb_none_gate(
+            NAME,
+            // `ten_bit`: this is the whole difference from the 8-bit witness.
+            true,
+            "8",
+            "16",
+            decode::compound8_filter_hits,
+            "a compound 8x8 leaf reading its own switchable interp_filter",
+            &[
+                "--enable-dual-filter=1",
+                "--enable-obmc=1",
+                "--enable-warped-motion=1",
+                "--enable-onesided-comp=1",
+            ],
+            64,
+            std::env::var("EC_INTERP3_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16),
+        );
+        // The ARRIVAL assert comes first on purpose. `dual_filter_diff_hits()`
+        // moves only inside `resolve_interp_filter` when the header bit is set
+        // AND the block's two directions differ, so pinning it =0 reds HERE,
+        // on the tool failing to arrive -- not on some shape or pixel assert
+        // downstream of it. The two header asserts below corroborate it from
+        // the encoded bytes; they are not what carries the proof.
+        assert!(
+            decode::dual_filter_diff_hits() > before_dual,
+            "{NAME}: no block read two DIFFERENT dual-filter directions in the 10-bit stream \
+             -- --enable-dual-filter=1 did not arrive or aomenc declined it"
+        );
+        // Both facts from the PARSED header, not from what we asked for: a
+        // gate that trusted `--bit-depth=10` would pass on a stream aomenc
+        // silently coded at 8, which is the vacuity this asserts against.
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe.parse_obu(&stream[pos..]).unwrap();
+            pos += obu.total_size;
+        }
+        let seq = probe
+            .sequence_header()
+            .expect("stream has a sequence header OBU");
+        assert_eq!(
+            seq.color_config.bit_depth, 10,
+            "{NAME}: aomenc did not write a 10-bit sequence header"
+        );
+        assert!(
+            seq.enable_dual_filter,
+            "{NAME}: the parsed sequence header says enable_dual_filter = false, so this \
+             stream cannot carry per-direction interp filters however the pixels compare"
         );
     }
 
