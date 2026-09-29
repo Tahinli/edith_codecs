@@ -23663,11 +23663,14 @@ pub(crate) mod tests {
     /// `EC_AV1_GATE_DUMP=$SP/golden3-pin.obu` off
     /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
     /// (seed 47, frame 1 U). Deterministic and static -- no aomenc/ffmpeg
-    /// re-encode involved, only re-decodes fixed bytes on disk. Still
-    /// `#[ignore]`d: it is a BISECT aid, not a suite gate. What changed under
-    /// lane-av1pins is WHERE the bytes live -- they are now committed at
-    /// `crates/ec-av1/fixtures/golden3-pin.obu` instead of a scratchpad that
-    /// tmpfs reaps, so the gate does real work on any runner.
+    /// re-encode involved, only re-decodes fixed bytes on disk. What changed
+    /// under lane-av1pinslive is that the gate is LIVE: the bytes are committed
+    /// at `crates/ec-av1/fixtures/golden3-pin.obu` instead of a scratchpad that
+    /// tmpfs reaps, so it runs in the ordinary suite on any runner that has
+    /// ffmpeg (guarded by `have_ffmpeg()`, so `EC_AV1_REQUIRE_FFMPEG=1` turns
+    /// its absence into a hard failure rather than a silent skip). It costs
+    /// ~0.15 s, touches no process-global, and reads no counter -- none of the
+    /// conditions that make this crate ignore its other manual gates.
     ///
     /// The original capture (2026-08-28, `bec27414`) is NOT reproducible: it
     /// predates `5ae053d3` "route all 20 gradients gate fixtures through
@@ -23681,7 +23684,6 @@ pub(crate) mod tests {
     /// `a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`
     /// prints for that seed -- which is what proves the recipe is that gate's.
     #[test]
-    #[ignore = "bisect aid, not a suite gate; run it with --ignored"]
     fn pinned_golden3_stream_decodes_pixel_exact() {
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
@@ -39426,7 +39428,8 @@ pub(crate) mod tests {
     /// decodes_pixel_exact` -- fast red/green loop for the bisect, and lets
     /// `EC_AV1_TRACE=1` be set for one run without re-driving the encoder.
     ///
-    /// lane-av1pins: the bytes are now committed at
+    /// LIVE since lane-av1pinslive (it was `#[ignore]`d from lane-sbpart r4
+    /// only because the bytes lived in a scratchpad). Bytes committed at
     /// `crates/ec-av1/fixtures/sbpart-pin.obu` (238 bytes; sha256
     /// `62238fc077f45d89745d4d254b9c0465464003529da3b42d0a65631fbb7e16e9`),
     /// re-encoded 2026-09-29 from the source gate's own recipe
@@ -39437,7 +39440,6 @@ pub(crate) mod tests {
     /// 192x128 cell, so this pin is a 192x128 re-run of its recipe, not a
     /// replay of the original mismatch bytes.
     #[test]
-    #[ignore = "bisect aid, not a suite gate; run it with --ignored"]
     fn pinned_sbpart_stream_decodes_pixel_exact() {
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
             .map(std::path::PathBuf::from)
@@ -45960,7 +45962,9 @@ pub(crate) mod tests {
             let mut parser = Av1Parser::new();
             let mut pos = 0usize;
             while pos < stream.len() {
-                let obu = parser.parse_obu(&stream[pos..]).expect("parsing our own OBUs");
+                let obu = parser
+                    .parse_obu(&stream[pos..])
+                    .expect("parsing our own OBUs");
                 pos += obu.total_size;
             }
             parser
