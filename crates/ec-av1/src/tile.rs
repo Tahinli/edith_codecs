@@ -7195,15 +7195,13 @@ fn note_drl_clamp(target: usize, signalled: usize, entries: usize) {
     }
 }
 
-/// Takes and clears [`DRL_CLAMP_HITS`], for a gate's own before/after delta.
-#[cfg(test)]
-pub(crate) fn take_drl_clamp_hits() -> usize {
-    DRL_CLAMP_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Reads [`DRL_CLAMP_HITS`] WITHOUT clearing it -- the before/after delta is
-/// `take_drl_clamp_hits`, but a recipe sweep that arms one encode and reads the
-/// total (lane-av1recipehunt's `enc_probe` driver) wants a non-destructive read.
+/// Reads [`DRL_CLAMP_HITS`] -- the tripwire for the DRL owner's fix. It is
+/// provably zero while `every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal`
+/// (encode.rs) holds: the pricer never offers an index this walk cannot signal,
+/// so no clip can move it (lane-av1recipehunt, 153 attempts, plus a mutation
+/// proof that widening the pricer's offer set does). The clip gate that used
+/// to wait on it is deleted; this counter stays so that widening the pricer
+/// is loud instead of silent. `EC_AV1_TRACE=1` prints each hit.
 pub fn drl_clamp_hits() -> usize {
     DRL_CLAMP_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
