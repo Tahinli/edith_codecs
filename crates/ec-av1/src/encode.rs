@@ -16843,12 +16843,22 @@ mod tests {
     fn probe_intrabc_key_frame() {
         let _knobs = crate::speed::knob_write();
         let fctx = &crate::decode::FrameCtx::for_encoder();
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
-        let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"))
+        // lane-av1clipprobe: the manifest is a real-library file, so it
+        // resolves through the crate's one fixture root (EC_FIXTURES first)
+        // and its absence is reported by the one probe instead of an inline
+        // SKIP that named no path. A file that IS there but unreadable is not
+        // an absence, so it is a hard error rather than a second silent skip.
+        let Some(manifest_path) =
+            crate::library_fixture::require("real-library-manifest.tsv", "probe_intrabc_key_frame")
         else {
-            eprintln!("SKIP probe_intrabc_key_frame: no real-library manifest");
             return;
         };
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+            panic!(
+                "probe_intrabc_key_frame: {} is present but unreadable ({e})",
+                manifest_path.display()
+            )
+        });
         let Some(clip) = manifest
             .lines()
             .skip(1)
@@ -19732,7 +19742,11 @@ mod tests {
             eprintln!("SKIP pricer_error_census_on_clips: no ffmpeg");
             return;
         }
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        // lane-av1clipprobe: the crate's one fixture root (EC_FIXTURES first),
+        // so this probe reads the same tree the preflight validates. Its
+        // `assert!(!clips.is_empty())` below was already a hard failure, so no
+        // skip shape changes here — only the root does.
+        let fixtures = crate::library_fixture::root();
         let mut clips: Vec<(String, std::path::PathBuf)> = Vec::new();
         let film = fixtures.join("video/h264-1080p-23.976-8bit.mp4");
         if film.exists() {
@@ -20341,15 +20355,16 @@ mod tests {
             eprintln!("SKIP real_clip_encodes_within_its_quality_and_size_budget: no ffmpeg");
             return;
         }
-        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
-        if !clip.exists() {
-            eprintln!(
-                "SKIP real_clip_encodes_within_its_quality_and_size_budget: {} missing",
-                clip.display()
-            );
+        // lane-av1clipprobe: the clip's absence was a bare `clip.exists()`
+        // -> SKIP with no env escape, so this gate reported green on a tree
+        // with no root `fixtures/`. The probe prints that one line (naming the
+        // resolved path) and fails under the require envs.
+        let Some(clip) = crate::library_fixture::require(
+            "video/h264-1080p-23.976-8bit.mp4",
+            "real_clip_encodes_within_its_quality_and_size_budget",
+        ) else {
             return;
-        }
+        };
         let (width, height, frame_count) = (640usize, 384usize, 12usize);
         let source = clip_frames(clip.to_str().unwrap(), "0", width, height, frame_count);
         let encoded = encode_sequence_with_ctx(&source, 100, 0.5, fctx).unwrap();
@@ -20406,16 +20421,14 @@ mod tests {
             );
             return;
         }
-        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
-        if !clip.exists() {
-            eprintln!(
-                "SKIP real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size: \
-                 {} missing",
-                clip.display()
-            );
+        // lane-av1clipprobe: see the sibling gate above -- the bare
+        // `clip.exists()` -> SKIP had no env escape.
+        let Some(clip) = crate::library_fixture::require(
+            "video/h264-1080p-23.976-8bit.mp4",
+            "real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size",
+        ) else {
             return;
-        }
+        };
         let (width, height, frame_count) = (704usize, 400usize, 8usize);
         let source = clip_frames(clip.to_str().unwrap(), "0", width, height, frame_count);
         let encoded = encode_sequence_with_ctx(&source, 100, 0.5, fctx).unwrap();
@@ -20490,13 +20503,16 @@ mod tests {
             "h264-1080p-23.976-8bit.mp4", // film-ish, 23.976fps
             "h264-1080p-60-8bit.mp4",     // higher motion, 60fps
         ] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../fixtures/video")
-                .join(clip);
-            if !path.exists() {
-                eprintln!("SKIP {clip}: fixture missing");
+            // lane-av1clipprobe: the crate's one fixture root and its one
+            // presence probe -- the bare `path.exists()` -> SKIP -> `continue`
+            // had no env escape, and with every clip absent the sweep looped
+            // zero times and passed.
+            let Some(path) = crate::library_fixture::require(
+                &format!("video/{clip}"),
+                &format!("calibration_sweep_base_q_idx: {clip}"),
+            ) else {
                 continue;
-            }
+            };
             let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
             eprintln!("--- {clip} ---");
             for q in [40u8, 70, 100, 130, 160, 190, 220, 240] {
@@ -20909,12 +20925,15 @@ mod tests {
             eprintln!("SKIP the_encoders_own_streams_are_byte_identical_to_their_pins: no ffmpeg");
             return;
         }
-        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
-        if !clip.exists() {
-            eprintln!("SKIP the_encoders_own_streams_are_byte_identical_to_their_pins: no clip");
+        // lane-av1clipprobe: the bare `clip.exists()` -> SKIP had no env escape,
+        // so a tree with no root `fixtures/` reported this gate green having
+        // compared nothing at all.
+        let Some(clip) = crate::library_fixture::require(
+            "video/h264-1080p-23.976-8bit.mp4",
+            "the_encoders_own_streams_are_byte_identical_to_their_pins",
+        ) else {
             return;
-        }
+        };
         let source = clip_frames(clip.to_str().unwrap(), "0", 640, 384, 4);
         // FNV-1a over the stream: a witness that every coded bit is where it
         // was, which a byte count alone is not.
@@ -21177,7 +21196,8 @@ mod tests {
             eprintln!("SKIP probe_screen_library: no ffmpeg");
             return;
         }
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        // lane-av1clipprobe: the crate's one fixture root (EC_FIXTURES first).
+        let fixtures = crate::library_fixture::root();
         let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"))
         else {
             eprintln!("SKIP probe_screen_library: no real-library manifest");
@@ -21559,7 +21579,8 @@ mod tests {
             eprintln!("SKIP bd_rate_vs_libaom_and_rav1e: no ffmpeg");
             return;
         }
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        // lane-av1clipprobe: the crate's one fixture root (EC_FIXTURES first).
+        let fixtures = crate::library_fixture::root();
         let mut clips: Vec<(String, std::path::PathBuf)> = Vec::new();
         // testsrc2 COLOUR BARS, not film -- labelled so no reader takes these
         // rows for real content (the real rows live in the native gate).
@@ -21567,11 +21588,13 @@ mod tests {
             ("bars 1080p", "h264-1080p-23.976-8bit.mp4"),
             ("bars 2160p", "h264-2160p-23.976-8bit.mp4"),
         ] {
-            let path = fixtures.join("video").join(name);
-            if path.exists() {
+            // lane-av1clipprobe: the one probe, so a missing clip is RED under
+            // the require envs instead of a drop-with-no-escape.
+            if let Some(path) = crate::library_fixture::require(
+                &format!("video/{name}"),
+                &format!("bd_rate_vs_libaom_and_rav1e: {label}"),
+            ) {
                 clips.push((label.to_string(), path));
-            } else {
-                eprintln!("SKIP clip {name}: missing");
             }
         }
         // Screen capture: the repo carries no screen-capture fixture, so take
@@ -22110,7 +22133,8 @@ mod tests {
     /// clips the keep table is read off. Selector env vars as documented on
     /// the gate; a missing clip prints a SKIP and drops its row.
     fn native_gate_clips() -> Vec<(String, String, String)> {
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        // lane-av1clipprobe: the crate's one fixture root (EC_FIXTURES first).
+        let fixtures = crate::library_fixture::root();
         let on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
         let (film, film4k, screen) = (
             on("EC_AV1_NATIVE_FILM"),
@@ -22130,14 +22154,17 @@ mod tests {
             if !want {
                 continue;
             }
-            let path = fixtures.join("video").join(file);
-            match path.exists() {
-                true => clips.push((
+            // lane-av1clipprobe: the one probe, so a missing clip is RED under
+            // the require envs instead of a dropped row with no escape.
+            if let Some(path) = crate::library_fixture::require(
+                &format!("video/{file}"),
+                &format!("the native BD-rate gate: {label}"),
+            ) {
+                clips.push((
                     label.to_string(),
                     path.to_str().unwrap().to_string(),
                     "0".into(),
-                )),
-                false => eprintln!("SKIP {label}: {file} missing"),
+                ));
             }
         }
         let manifest = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"));
@@ -22670,16 +22697,19 @@ mod tests {
             eprintln!("SKIP tpl_intra_denominator_histogram: no ffmpeg");
             return;
         }
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         for (label, file) in [
             ("bars 1080p", "h264-1080p-23.976-8bit.mp4"),
             ("bars 2160p", "h264-2160p-23.976-8bit.mp4"),
         ] {
-            let path = fixtures.join("video").join(file);
-            if !path.exists() {
-                eprintln!("SKIP {label}: {file} missing");
+            // lane-av1clipprobe: the one probe, so a missing clip is RED under
+            // the require envs. With both clips absent this histogram used to
+            // loop zero times and pass having printed nothing.
+            let Some(path) = crate::library_fixture::require(
+                &format!("video/{file}"),
+                &format!("tpl_intra_denominator_histogram: {label}"),
+            ) else {
                 continue;
-            }
+            };
             let path = path.to_str().unwrap();
             let Some((nw, nh)) = probe_dims(path) else {
                 eprintln!("SKIP {label}: ffprobe gave no size");

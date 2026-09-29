@@ -45,6 +45,16 @@
 # is, and RESOLVE requires that directory to exist and be non-empty. This is a
 # preflight against silent drift, not a proof that every byte a test reads is
 # present.
+#
+# THE TWO ROOTS (lane-av1clipprobe). This script validates `$EC_FIXTURES`,
+# defaulting to `$ROOT/fixtures`. The gates used to read `$ROOT/fixtures`
+# UNCONDITIONALLY, so pointing EC_FIXTURES at a library elsewhere printed
+# `resolve 0 missing` and `GREEN` here while every clip gate skipped -- a green
+# preflight over gates reading a tree nobody validated. The clip-reading gates
+# now resolve through the same precedence this script does (EC_FIXTURES first,
+# `$ROOT/fixtures` otherwise: `crates/ec-av1/src/library_fixture.rs`), so the
+# verdict below and the bytes the tests read are the same tree in every
+# combination, and mode (i) below fires exactly when the gates will skip.
 
 set -uo pipefail
 
@@ -69,6 +79,10 @@ shape_violations=0
 note() { [ "$REQUIRE" = 0 ] || echo "$@"; }
 
 echo "verify-fixture-library: root=$ROOT fixtures=$FIXTURES EC_REQUIRE_FIXTURES=${REQUIRE:-0}"
+# The gates' root is the SAME string, by the reconciliation documented above --
+# printed here so a reader comparing this verdict against a gate's SKIP line
+# never has to guess which of two directories the two sides meant.
+echo "verify-fixture-library: the clip gates resolve $FIXTURES too (EC_FIXTURES first, else \$ROOT/fixtures)"
 
 # --- SHAPE ---------------------------------------------------------------
 if [ ! -f "$MANIFEST" ]; then
@@ -436,4 +450,17 @@ fi
 for s in $(echo "$audit" | awk -F'\t' '/^BADROW/{c++} END{print c+0}'); do :; done
 echo "  code-shape violations: $(echo "$audit" | awk -F'\t' '/^BADROW/{c++} END{print c+0}')" >&2
 echo "$forbidden" | grep -q . && shape_violations=$((shape_violations + $(echo "$forbidden" | grep -c .)))
-echo "verify-fixture-library: GREEN ($rows rows)"
+# lane-av1clipprobe: the last word of this script used to be a bare `GREEN`
+# even when mode (i) had just been reported a few lines above -- so a reader
+# who read only the verdict read GREEN over a tree whose fixture root does not
+# exist, which is the same false green as a gate that skipped. The verdict now
+# says which it is: findings reported (not failed, because
+# EC_REQUIRE_FIXTURES is unset) versus a clean pass. `EC_REQUIRE_FIXTURES=1`
+# turns the first into the RED above.
+if [ "$root_present" -eq 0 ]; then
+    echo "verify-fixture-library: GREEN-WITH-FINDINGS ($rows rows; the absent root above is" >&2
+    echo "           REPORTED, not failed -- set EC_REQUIRE_FIXTURES=1 on a tree that is" >&2
+    echo "           meant to have the library, or provision it and re-run)" >&2
+else
+    echo "verify-fixture-library: GREEN ($rows rows)"
+fi
