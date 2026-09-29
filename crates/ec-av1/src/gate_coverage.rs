@@ -2,14 +2,25 @@
 //!
 //! Every gate in [`crate::stream`] that runs a real `aomenc` picks its coding
 //! tools with `--enable-*=0/1` flags, and a flag left off the command line
-//! takes aomenc's default (on, for the tools this decoder cares about). That
-//! makes it possible -- and it happened -- for a coding tool to be switched
-//! *off in every single gate*, so that no real stream in this repository ever
-//! exercised it and a corner-cut in the decoder survived twenty gates
-//! unnoticed: `reconstruct`'s `smooth_neighbor` was hardcoded `false`, wrong
-//! whenever a directional block neighbours a smooth-mode one, and invisible
-//! because all twenty gates passed `--enable-smooth-intra=0`
-//! (lane-chroma r1, 2026-08-30).
+//! takes aomenc's default. That default is `1` for essentially every tool in
+//! [`TOOL_UNIVERSE`] on a non-realtime build -- `default_extra_cfg` in
+//! `av1/av1_cx_iface.c` is all-ones across the seq-level tool fields, and this
+//! oracle is built with `CONFIG_REALTIME_ONLY 0`. But a `1` default is NOT
+//! the same as the tool reaching the stream, and the rest of this file's
+//! "defaulted means unknown" rule rests on that gap: palette and intrabc are
+//! gated on CONTENT (`encoder.c:2079` derives `allow_screen_content_tools`
+//! from block counts, and `seq_force_screen_content_tools` is left at the
+//! adaptive `SELECT_SCREEN_CONTENT_TOOLS`), and `speed_features.c` masks
+//! several tools OFF again per `--cpu-used`. A `1` default proves the encoder
+//! was ALLOWED the tool, never that any block used it.
+//!
+//! With that default in place it is possible -- and it happened -- for a
+//! coding tool to be switched *off in every single gate*, so that no real
+//! stream in this repository ever exercised it and a corner-cut in the
+//! decoder survived twenty gates unnoticed: `reconstruct`'s
+//! `smooth_neighbor` was hardcoded `false`, wrong whenever a directional
+//! block neighbours a smooth-mode one, and invisible because all twenty
+//! gates passed `--enable-smooth-intra=0` (lane-chroma r1, 2026-08-30).
 //!
 //! The test below re-derives that set from the gate source and pins it. A tool
 //! that is switched off in every gate and on in none is *provably never
@@ -22,8 +33,10 @@
 // keys on `--enable-<tool>=0/1`, and `--tile-columns=<log2>` has no such
 // shape -- a `--tile-columns=` presence check would also read `=0` (one tile)
 // as coverage, which is the opposite of what it would claim. It needs no
-// entry either: 13 gates spell `--tile-columns`/`--tile-rows` with a nonzero
-// log2 and assert the parsed `tile_info` really carries the grid, and
+// entry either: measured 2026-09-29 (lane-av1distwtd r2), 19 of the 146
+// census-selected gate bodies spell `--tile-columns`/`--tile-rows` with a
+// nonzero log2 -- 9 assert the parsed `tile_info` in the same body and 10
+// more delegate to a shared helper that asserts it -- and
 // `run_multi_tile_gate` covers a 2D grid with the coding tools ON at both
 // bit depths.
 
@@ -107,16 +120,44 @@ enum On {
 /// cover, listed with their aomenc default.
 ///
 /// lane-covbd's derivation read `--enable-*` flags only, so a tool a gate pins
-/// off through another spelling was invisible: all 49 gates that name it pass
-/// `--enable-tx-size-search=0`, and the real-stream PANIC hiding behind that
-/// pin was found by lane-ab16, not by this guard. `--loopfilter-control=0`,
+/// off through another spelling was invisible: every gate that named
+/// `--enable-tx-size-search` passed `--enable-tx-size-search=0` when this was
+/// written, and the real-stream PANIC hiding behind that pin was found by
+/// lane-ab16, not by this guard. `--loopfilter-control=0`,
 /// `--tile-columns=0` and a `--cpu-used` high enough to switch a search off are
 /// the same shape.
+///
+/// The "all 49" count is GONE as of 2026-09-29 (lane-av1distwtd r2) and is
+/// deliberately not replaced by a number: the tool is no longer pinned off
+/// tree-wide, so any count would be a snapshot that rots the same way.
+/// Measured on this tree for the record: 113 of the 146 selected gate bodies
+/// name it, 88 pass `=0`, 15 pass `=1`, and 9 build the value into a
+/// `format!` variable the census cannot see -- so the historical claim no
+/// longer holds in EITHER direction, and the `enable-tx-size-search` entry
+/// below is a live question, not a settled one.
 ///
 /// Each entry is `(tool, spellings, aomenc default, what counts as on)`. The
 /// "defaulted means unknown" rule of [`NEVER_EXERCISED`] applies unchanged: a
 /// default of `1` does not prove the encoder picked the tool for any stream, so
 /// only a gate that spells an on-value at that bit depth retires an entry.
+    // lane-av1distwtd r3: `enable-tx-size-search` is the one DEFAULT_ON_TOOLS
+    // entry the r2 audit could NOT settle, and the reason is a THIRD detector
+    // limit rather than a coverage fact. After the r3 call-resolving fix, 113
+    // of the 230 selected gates name it: 88 pass `=0`, 15 pass `=1`, and 9
+    // build the value into a `format!`/`String` variable that neither
+    // `flags_in` nor `settings_in` can see, because both scan for a literal
+    // `"--flag=value"` inside one segment.
+    //
+    // WHAT WOULD SETTLE IT, for whoever takes it next -- the method, not a
+    // guess: extend `flags_in`/`settings_in` to resolve a local binding, the
+    // same way `gate_bodies` now resolves calls. Concretely, when a segment
+    // contains `let <name> = format!("--enable-tx-size-search={tx_search}")`
+    // (or a `String::from`/`to_string` of the same shape), record the
+    // TEMPLATE and bind the variable's value at each use site. Re-count, and
+    // only then decide whether the tool is a live hole. Until that exists the
+    // count above is a floor, not a measurement: 9 gates are unclassified in
+    // an unknown direction, and an unknown direction is exactly the failure
+    // mode this file exists to prevent.
 #[cfg(test)]
 const DEFAULT_ON_TOOLS: &[(&str, &[&str], &str, On)] = &[
     (
@@ -168,9 +209,17 @@ const DEFAULT_ON_TOOLS: &[(&str, &[&str], &str, On)] = &[
 
 /// Non-`--enable-*` spellings that drive a [`TOOL_UNIVERSE`] tool.
 ///
-/// `--superres-mode=1` is how all three superres gates switch superres on;
+/// `--superres-mode=1` is how every superres gate switches superres on;
 /// without this map they read as an `enable-superres` hole while a real stream
-/// exercises the tool (lane-covbd deferred exactly this).
+/// exercises the tool (lane-covbd deferred exactly this). The count was "all
+/// three" until 2026-09-29 (lane-av1distwtd r2), which measured SIX gates
+/// spelling a nonzero `--superres-mode` (5 among the 146 census-selected
+/// bodies, plus `a_superres_census_over_six_real_streams_...`). No count is
+/// given here for the same reason as `enable-tx-size-search` above: it rots.
+/// Worth noting the alias is the ONLY positive evidence for superres, and
+/// those gates do assert arrival -- `superres_hits` / `predict_scaled_hits`
+/// are read in five of them -- so this one is a healthy alias, not a
+/// spelling-only one.
 #[cfg(test)]
 const ALIASES: &[(&str, &str)] = &[("superres-mode", "enable-superres")];
 
@@ -190,18 +239,52 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     // `enable-cfl-intra` LEFT both lists on 2026-09-02 (lane-troykf r1): the
     // sb128 skipped-CfL / 1:4-chroma gate passes `--enable-cfl-intra=1` at 8
     // AND 10 bits and pixel-compares both arms.
-    (
-        "enable-dist-wtd-comp",
-        "off in 11 gates, on in none: distance-weighted compound is unimplemented",
-    ),
-    (
-        "enable-dual-filter",
-        "never spelled by any gate, so defaulted = unknown; no stream is proven to carry per-direction interp filters",
-    ),
-    (
-        "enable-flip-idtx",
-        "never spelled; the flip/identity transform types are unproven by a real stream",
-    ),
+    // `enable-dist-wtd-comp` LEFT this list on 2026-09-29 (lane-av1distwtd).
+    // The entry's stated reason was WRONG: the distance-weighted compound
+    // combine is not unimplemented -- `compound::dist_wtd_comp_weight_assign`
+    // (lane-av1comp) and `mc::combine_compound`'s weighted path have been in
+    // the tree for a long time. What was missing was a stream CARRYING the
+    // tool, and `a_distance_weighted_compound_stream_decodes_pixel_exact`
+    // (stream.rs) now supplies one: it spells `--enable-dist-wtd-comp=1` and
+    // asserts the PARSED sequence header carries `enable_jnt_comp == true`
+    // (and `false` from the same recipe with `=0`, so the bit is proven to
+    // move with the flag), that `dist_wtd_comp_hits() > 0` -- the
+    // `compound_idx == 0` arm, the only branch whose blend weights are not the
+    // constant (8, 8) -- and pixel-compares every frame against the oracle.
+    // The existing lane-cwarp compound-warp gates already SPELLED `=1` and
+    // the census still read this entry as open, so the hole was a missing
+    // witness, not a missing flag.
+    // `enable-dual-filter` LEFT this list on 2026-09-29 (lane-av1distwtd r3),
+    // paid by a DETECTOR fix rather than by a new gate. The r2 audit found
+    // this entry's reason false on both halves. It is spelled -- as `=0`, by
+    // `real_aomenc_1to4_streams_...` and
+    // `a_real_aomenc_inter_sequence_with_32x32_level_1to4_strips_...` -- so
+    // "never spelled" was wrong; and a stream IS proven to carry the tool,
+    // because `a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact`
+    // spells `--enable-dual-filter=1` and hard-asserts
+    // `decode::dual_filter_diff_hits()` moved, the differing-direction arrival
+    // assert (`resolve_interp_filter` in decode.rs). That gate builds its
+    // stream through `inter_sb_none_gate`, so it spells none of the three
+    // tokens `gate_bodies()` used to filter on and was INVISIBLE to the
+    // census; r3 made `gate_bodies()` resolve calls as well as spellings, and
+    // `the_detector_sees_the_gates_the_spelling_filter_missed` pins that.
+    // Supporting measurement: with the flag left off the command line the
+    // parsed sequence header already carries `enable_dual_filter = true`
+    // (6855 B), while `--enable-dual-filter=0` parses false and encodes
+    // different bytes (6874 B) -- so the gates pinning it `=0` were removing
+    // the tool and the ones leaving it defaulted carry it.
+    //
+    // `enable-flip-idtx` LEFT this list the same day, also by detector fix.
+    // `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact`
+    // spells `=1` and hard-asserts `compared_class1 > 0` ("--enable-flip-idtx=1
+    // never produced a V_DCT/H_DCT transform on a compared attempt"). Its
+    // recipe is parameterised on `ten_bit` and names BOTH fixture formats, so
+    // `is_ten_bit` filed the whole body 10-bit-ONLY and the 8-bit bucket
+    // never saw it -- the lane-defon/troykf blind spot through a THIRD
+    // spelling, which r3 taught `covers_both_depths` to recognise as the
+    // pair-of-formats marker. Measured run of that gate: 12 pixel-exact
+    // decodes, 6 of them 8-bit, 219 rect coefficient TUs of which 10 carry a
+    // 1D tx class.
     // `enable-global-motion` LEFT this list on 2026-09-25 (lane-av1gwarp12 r2):
     // `a_real_affine_global_motion_stream_decodes_pixel_exact` loops
     // `for depth in [8u32, 10u32]` passing `--enable-global-motion=1` and
@@ -210,6 +293,23 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     // containing both the gate and this test until the ROTZOOM suite.
     // The 12-bit ROTZOOM gate rides the high-depth bucket via `encode_12bit(`
     // in `is_ten_bit`, so it plays no part in this retirement.
+    // `enable-rect-tx` -- reason RE-VERIFIED 2026-09-29 (lane-av1distwtd
+    // r2), both halves still TRUE, and the second half is now PROVEN rather
+    // than asserted. (1) "never spelled": measured across all 146
+    // census-selected gate bodies, zero spell `--enable-rect-tx` at either
+    // depth -- the only `--enable-*` tool in [`TOOL_UNIVERSE`] with no
+    // spelling anywhere. (2) "reach the decoder only through partition
+    // shape": aom 3.13.3 has no sequence-header bit for it. `enable_rect_tx`
+    // is an `AV1E_SET_ENABLE_RECT_TX` encoder-search control
+    // (`av1_cx_iface.c:2125`, copied to `txfm_cfg->enable_rect_tx` at
+    // `av1_cx_iface.c:1483`) and is read ONLY inside `tx_search.c`
+    // (lines 2568/2662/2686/2710/2956); `bitstream.c` writes no such bit, and
+    // this crate's `SequenceHeader` (`ec-av1-syntax/src/sequence.rs`) has no
+    // such field. The decoder's own gate is `is_rect_tx_allowed`, derived
+    // from partition shape -- exactly what this reason says. A gate can
+    // therefore never prove this tool by naming the flag, only by proving a
+    // rect transform unit fired (`rect_partition_hits` /
+    // `rect_coeff_tu_hits`, which lane-rect1d's gate does assert).
     (
         "enable-rect-tx",
         "never spelled; rect transforms reach the decoder only through partition shape, never through a gate that names the tool",
@@ -225,10 +325,16 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // `enable-rect-partitions` and `enable-restoration` at 10 bits. All five
     // deleted together.
 
-    // Only 4 of the 45 real-aomenc gates encode at 10 bits, and they pin the
-    // pixel filters and the intra tool set off. Every entry the 8-bit list
-    // carries is a hole here too. lane-hbdgates r1 closed six of the seven
-    // 8-bit-only entries with real 10-bit gates (filter-intra, smooth-intra,
+    // The "Only 4 of the 45 real-aomenc gates encode at 10 bits" sentence that
+    // stood here is STALE (lane-av1distwtd r2, 2026-09-29), and understated
+    // the high-depth bucket by more than an order of magnitude. Measured
+    // against this tree with `gate_bodies()`' own filter: 146 selected gate
+    // bodies, of which 83 are classified 10-bit-or-higher by `is_ten_bit`.
+    // The historical point stands -- those gates pin the pixel filters and
+    // the intra tool set off far more often than not -- but the counts a
+    // reader would check them against no longer exist.
+    // Every entry the 8-bit list carries is a hole here too. lane-hbdgates r1
+    // closed six of the seven 8-bit-only entries with real 10-bit gates
     // paeth-intra, intra-edge-filter, rect-partitions, ab-partitions); its
     // seventh, the 10-bit LR gate, was `#[ignore]`d on that branch and passes
     // un-ignored on main, which carries the fix.
@@ -241,9 +347,33 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // gate passes `=1` for both. `enable-1to4-partitions` left it on 2026-09-02:
     // lane-tx64x16 r4's 32-level 1:4 gate has a 10-bit arm that asserts both
     // orientations and coded strips inside pixel-exact attempts.
+    // `enable-dual-filter` -- reason CORRECTED 2026-09-29 (lane-av1distwtd
+    // r3), and this entry STAYS while its 8-bit twin was retired. That is the
+    // honest outcome, not an oversight: after the r3 detector fix the 8-bit
+    // bucket sees the tool exercised and the 10-bit bucket still does not.
+    // The only `=1` witness is
+    // `a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact`,
+    // and it calls `inter_sb_none_gate(NAME, false, ...)` -- `false` is the
+    // `ten_bit` parameter, so that gate builds an 8-bit stream only. Its
+    // sibling `a_real_aomenc_10bit_inter_sequence_with_a_whole_superblock_block_decodes_pixel_exact`
+    // passes `true`, and the 8x8-leaf pair likewise, but none of those spells
+    // `--enable-dual-filter=1`. So: exercised at 8 bits (arrival assert
+    // `dual_filter_diff_hits()` moved, `resolve_interp_filter` in decode.rs),
+    // NOT exercised at 10 bits. Retiring this entry needs a 10-bit arm of that
+    // gate -- pass `true` to `inter_sb_none_gate` and assert the differing-
+    // direction counter still moves there.
+    //
+    // The two numbers in the `enable-flip-idtx` retirement below were
+    // RE-MEASURED 2026-09-29 (lane-av1distwtd r2) by running the gate, and
+    // both still hold exactly: "pixel-compares six 10-bit decodes" (the run
+    // reports 12 pixel-exact decodes, 6 of them 10-bit) and "10 of its rect
+    // coefficient TUs carry a 1D tx class" (219 rect coefficient TUs on
+    // compared attempts, 10 of them 1D). The gate also hard-asserts
+    // `compared_class1 > 0`, so its "passes =1 at both depths" is backed by an
+    // arrival assert, not just a spelling.
     (
         "enable-dual-filter",
-        "hole at both depths, see the 8-bit list",
+        "exercised at 8 bits only, by a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact (=1, asserts dual_filter_diff_hits moved); no 10-bit gate spells =1 -- that gate calls inter_sb_none_gate with ten_bit=false. Retire by adding its 10-bit arm",
     ),
     // `enable-flip-idtx` LEFT this list on 2026-09-02 (lane-rect1d r1):
     // `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact`
@@ -285,23 +415,119 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// Bodies of the real-aomenc gates: a `fn` body carrying the shared
-    /// `--passes=1` every one of them passes. Split on the attribute that
-    /// opens a test.
+    /// Whether `body` contains a call to the `fn` named `name`.
+    ///
+    /// The name must not be the tail of a longer identifier, or
+    /// `inter_sb_none_gate` would "call" `sb_none_gate`.
+    fn calls_fn(body: &str, name: &str) -> bool {
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut at = 0usize;
+        while let Some(rel) = body[at..].find(name) {
+            let start = at + rel;
+            let end = start + name.len();
+            let starts_clean = start == 0 || !ident(body.as_bytes()[start - 1]);
+            if starts_clean && body[end..].starts_with('(') {
+                return true;
+            }
+            at = end;
+        }
+        false
+    }
+
+    /// Every `fn` defined in `stream.rs`'s test module, as `(name, body)`.
+    ///
+    /// The census reasons about whole `#[`-segments (see [`gate_bodies`]) but
+    /// has to know which segment DEFINES or CALLS an encoder-driving `fn`, and
+    /// the only way to answer that is to name the units.
+    fn fn_units(src: &'static str) -> Vec<(&'static str, &'static str)> {
+        const OPEN: &str = "\n    fn ";
+        let mut units = Vec::new();
+        let mut at = 0usize;
+        while let Some(rel) = src[at..].find(OPEN) {
+            let head = at + rel + OPEN.len();
+            let Some(paren) = src[head..].find('(') else {
+                break;
+            };
+            let close = src[head..]
+                .find("\n    }\n")
+                .map_or(src.len(), |e| head + e);
+            units.push((&src[head..head + paren], &src[head..close]));
+            at = close.max(head + paren + 1);
+        }
+        units
+    }
+
+    /// Names of every `fn` in `stream.rs` that drives the real `aomenc`,
+    /// DIRECTLY (it mentions `aomenc_path()`) or by DELEGATING to one.
+    ///
+    /// lane-av1distwtd r3: the transitive closure is the whole point. A gate
+    /// that hands its recipe to a shared helper (`inter_sb_none_gate` and
+    /// friends) never spells `--passes=1` itself, so the old token filter
+    /// dropped it -- 165 of 311 segments, 6 of which spell `--enable-X=1`.
+    /// That is not a coverage fact, it is a segmentation fact, and it is what
+    /// kept `enable-dual-filter` on the never-exercised lists while a named
+    /// gate exercised the tool and hard-asserted the arrival.
+    fn encoder_fns(src: &'static str) -> BTreeSet<&'static str> {
+        let units = fn_units(src);
+        let mut enc: BTreeSet<&'static str> = units
+            .iter()
+            .filter(|(_, body)| body.contains("aomenc_path()"))
+            .map(|(name, _)| *name)
+            .collect();
+        // Fixpoint: `inter_sb_none_gate` is an encoder fn because it names
+        // `aomenc_path()`; the `#[test]` that only CALLS it is a gate too.
+        loop {
+            let mut grew = false;
+            for (name, body) in &units {
+                if enc.contains(name) {
+                    continue;
+                }
+                if enc.iter().any(|e| calls_fn(body, e)) {
+                    enc.insert(name);
+                    grew = true;
+                }
+            }
+            if !grew {
+                return enc;
+            }
+        }
+    }
+
+    /// The token spellings the filter used before it resolved calls. Kept as a
+    /// floor: a gate is still recognised by these even if the call graph
+    /// misses it, so the fix can only ever ADD gates, never lose one.
+    fn legacy_gate_tokens(body: &str) -> bool {
+        body.contains("\"--passes=1\"")
+            || body.contains("ten_bit_tool_gate(")
+            || body.contains("encode_10bit_gradients")
+    }
+
+    /// Bodies of the real-aomenc gates: a `fn` body that drives the real
+    /// `aomenc`, however it gets there. Split on the attribute that opens a
+    /// test.
+    ///
+    /// lane-av1distwtd r3: a segment qualifies if it spells one of the
+    /// [`legacy_gate_tokens`] OR names an encoder `fn` -- either by defining
+    /// one (it mentions `aomenc_path()`) or by calling one. Recognition by
+    /// CALL is what a helper-delegating gate needs: its flags live in the
+    /// helper it calls, and it is invisible to a spelling-only filter.
     fn gate_bodies() -> Vec<&'static str> {
         let src = include_str!("stream.rs");
+        let enc = encoder_fns(src);
         let gates: Vec<&str> = src
             .split("\n    #[")
             // lane-hbdgates r1: an `#[ignore]`d gate exercises nothing, so it
             // must not close a hole. Its body is the segment that opens with
             // the ignore attribute.
             .filter(|body| !body.starts_with("ignore"))
-            // lane-hbdgates r1: gates that build their stream through the
-            // shared 10-bit helpers spell `--passes=1` there, not inline.
+            // lane-av1distwtd r3: a segment qualifies by what it SPELLS
+            // (`legacy_gate_tokens`) or by what it CALLS. `calls_fn` is
+            // deliberately the weak half of an OR, so the fix can only add
+            // gates -- it can never stop recognising one the old filter did.
             .filter(|body| {
-                body.contains("\"--passes=1\"")
-                    || body.contains("ten_bit_tool_gate(")
-                    || body.contains("encode_10bit_gradients")
+                legacy_gate_tokens(body)
+                    || body.contains("aomenc_path()")
+                    || enc.iter().any(|e| calls_fn(body, e))
             })
             .collect();
         assert!(
@@ -466,10 +692,94 @@ mod tests {
     /// this marker that gate's own 8-bit-only flags read as 10-bit-only -- the
     /// lane-defon/troykf blind spot with `depth` spelled instead of
     /// `bit_depth`. Three gates share the helper, at both depths.
+    /// lane-av1distwtd r3: the THIRD spelling of the same blind spot, still
+    /// live after lane-defon and lane-troykf. A recipe parameterised on
+    /// `ten_bit` names BOTH fixture formats in one body -- `let pix_fmt = if
+    /// ten_bit { "yuv420p10le" } else { "yuv420p" };` -- so `is_ten_bit` saw
+    /// the 10-bit arm and filed the whole body 10-bit-ONLY, hiding its 8-bit
+    /// arm from the 8-bit bucket. The marker is the PAIR OF FORMATS, not the
+    /// parameter name: a body spelling both pixel formats builds streams at
+    /// both depths, whatever it calls the flag. The quotes matter -- a bare
+    /// `yuv420p` substring test also matches `yuv420p10le` and would fire on
+    /// every 10-bit gate, retiring entries on no evidence.
+    ///
+    /// This is what mis-filed `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact`
+    /// and kept `enable-flip-idtx` on the 8-bit list while that gate ran 6
+    /// pixel-exact 8-bit decodes through it.
     fn covers_both_depths(body: &str) -> bool {
         body.contains("if bit_depth == 10")
             || body.contains("if depth == 10")
             || body.contains("for depth in [8usize, 10]")
+            || (body.contains("\"yuv420p\"") && body.contains("\"yuv420p10le\""))
+    }
+
+    /// lane-av1distwtd r3: the detector fix, pinned. A detector change with
+    /// no test can only be shown to find MORE, never to stop missing, so this
+    /// asserts the three gates the two blind spots actually hid are now seen
+    /// -- the two `enable-dual-filter` witnesses and the `enable-flip-idtx`
+    /// both-depths gate -- and that the fix is strictly ADDITIVE against the
+    /// old spelling-only filter.
+    #[test]
+    fn the_detector_sees_the_gates_the_spelling_filter_missed() {
+        let src = include_str!("stream.rs");
+        let gates = gate_bodies();
+        // The helper-delegation half: each of these builds its stream through
+        // `inter_sb_none_gate` and spells none of `legacy_gate_tokens`, so the
+        // old filter dropped both while each hard-asserts its tool arrived.
+        for name in [
+            "a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact",
+            "a_real_obmc_stream_reads_a_recorded_switchable_filter_for_every_neighbour",
+        ] {
+            let body = gates
+                .iter()
+                .find(|b| b.contains(name))
+                .unwrap_or_else(|| panic!("{name}: not seen by gate_bodies()"));
+            assert_eq!(
+                flags_in(body).get("enable-dual-filter"),
+                Some(&'1'),
+                "{name}: seen, but its --enable-dual-filter=1 spelling is not visible to \
+                 flags_in, so recognising the gate would not retire the entry"
+            );
+        }
+        // The both-depths half: this gate's recipe is parameterised on `ten_bit`
+        // and names both fixture formats, so `covers_both_depths` must credit
+        // it to the 8-bit bucket, not just the 10-bit one.
+        let flip = gates
+            .iter()
+            .find(|b| {
+                b.contains("a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform")
+            })
+            .expect("the flip-idtx gate must be seen");
+        assert!(
+            covers_both_depths(flip),
+            "the flip-idtx gate spells both fixture formats, so covers_both_depths must \
+             credit it to the 8-bit bucket as well"
+        );
+        assert!(
+            covers_depth(flip, false) && covers_depth(flip, true),
+            "the flip-idtx gate must cover BOTH depths"
+        );
+        // Strictly additive: every segment the old spelling-only filter kept
+        // is still kept, so the fix cannot have cost the census a gate.
+        let legacy_only: Vec<&str> = src
+            .split("\n    #[")
+            .filter(|b| !b.starts_with("ignore") && legacy_gate_tokens(b))
+            .collect();
+        assert!(
+            legacy_only.len() < gates.len(),
+            "the call-resolving filter found {} gates, the old spelling-only filter found \
+             {} -- the fix is expected to ADD gates, never to drop one",
+            gates.len(),
+            legacy_only.len()
+        );
+        for body in &legacy_only {
+            assert!(
+                gates.contains(body),
+                "a gate the spelling-only filter recognised is no longer recognised: \
+                 {:?}",
+                &body[..body.len().min(60)]
+            );
+        }
     }
 
     /// Whether a gate body drives a stream at this depth.
