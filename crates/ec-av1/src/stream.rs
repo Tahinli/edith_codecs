@@ -42959,6 +42959,18 @@ pub(crate) mod tests {
                         }
                     };
                     let narrow = crate::mc::rect_narrow_kern_hits();
+                    // The ENCODE's frame count, asserted ABOVE the oracle call, not
+                    // our decode's length: `-vframes {FRAMES}` (42696) feeds aomenc
+                    // exactly FRAMES frames and `--limit={FRAMES}` (42724) caps its
+                    // output there. A decode that dropped a frame must red HERE,
+                    // naming the encode, rather than hand the same short count to
+                    // ffmpeg and let the helper's byte-length assert blame ffmpeg.
+                    assert_eq!(
+                        frames.len(),
+                        FRAMES,
+                        "{NAME}: not every coded frame was decoded ({width}x{height}, \
+                         depth={depth}, cq={cq})"
+                    );
                     let ffmpeg_frames = if depth == 10 {
                         ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                     } else {
@@ -42968,12 +42980,6 @@ pub(crate) mod tests {
                         ffmpeg_frames.len(),
                         frames.len(),
                         "{NAME}: ffmpeg frame count ({width}x{height}, depth={depth}, cq={cq})"
-                    );
-                    assert_eq!(
-                        frames.len(),
-                        FRAMES,
-                        "{NAME}: not every coded frame was decoded ({width}x{height}, \
-                         depth={depth}, cq={cq})"
                     );
                     for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                         assert_eq!(
