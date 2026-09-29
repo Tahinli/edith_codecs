@@ -237,8 +237,17 @@ At the fork both sides are at `ph=inter`, where both publish **block-level** mi
 (ours from `decode_inter_block`'s `at`, `decode.rs:38706`; the oracle from the
 mode-info reader's entry, `decodemv.c:941`) — the same granularity — and they
 still disagree, off an identical pre-state `(24645, 40117)` with different
-post-ranges (39316 vs 39862). So read 125511 is a **genuine block-level walk
-divergence**.
+post-ranges (39316 vs 39862).
+
+**SUPERSEDED IN PART BY §10.3.** The measurement above stands — the labels are
+not transposed, not a field-order artefact, and not noise. What does NOT stand
+is the conclusion this section drew from it, that read 125511 is "a genuine
+block-level walk divergence": the frame boundary had not been measured, and
+§10.1 puts the fork in `decode_idx=1` while the key frame's 49 samples sit in
+`decode_idx=0`. Retracting a caveat is not the same as getting the rest right;
+here both halves were wrong in sequence — first the label story, then the
+fork's home. Both are recorded rather than tidied away, because a reader who
+arrives at §8.1 first must be stopped there.
 
 The generalisable lesson is the mirror of the one in
 `skill://ec-av1-divergence-debug`: a "the tag disagrees, so it is a labelling
@@ -354,3 +363,46 @@ theirs` (`msac.rs`'s own `EC_SYMR` doc). The corrected predicate is
 125511** — so the number I reported stands, but it survived a script that could
 not have been trusted to find it. A fork index from a script with a known-bad
 comparison field is a coincidence until re-derived.
+
+## 11. Closure of the handover
+
+`Aras-2` (`lane-av1loss444mm`, worktree `~/.cache/wt/av1loss444mm`) reported
+FINAL after this lane's measurement landed. The split was adopted and
+independently confirmed on their own encode, and the cell is now owned:
+
+* **(b), the frame-1 entropy fork — FIXED and GATED by them.** Their defect was
+  `decode_inter_block`'s INTRA tail passing the per-mu-chunk lossless chroma
+  region as `(cu_tx, cu_tx)` with `cu_tx = 32` (the TX_32X32 UNIT size) where
+  `decode_token_recon_block` walks the chunk's chroma SPAN of `64 >> ss` —
+  32x32 at 4:2:0, where 32 was accidentally right, and 64x64 at 4:4:4, i.e.
+  16x16 TX_4X4 units per plane. The inter half of the same function already had
+  `chunk_chroma_w/h`; the intra tail was the stale copy. Frame 1 went 8652 ->
+  10368 transform units, exactly the oracle's, and its damage 70151 -> 49.
+  Their r1 walk fix closed the fork at read 123121 on their stream **without
+  touching the key frame's 49**.
+* **(a), the key-frame 49 — RECONSTRUCTION-ONLY, handed over, no fix claimed.**
+  Confirmed on two independent encodes. Localised to three adjacent 4x8
+  rectangular 4:4:4 blocks (`#734` px=(196,200) uv_mode 7 D203, `#735`
+  px=(200,200) uv_mode 7, `#736` px=(204,200) uv_mode 11 CFL) whose neighbours
+  are exact, with damage on the first of their two stacked TX_4x4 chroma units
+  and PARTIAL per cell (U 6/16, 9/16, 6/16 — which is why it is not a rounding
+  constant). Search space in their priority order: (1) the chroma prediction
+  fetch in `av1/common/reconintra.c` — the angular D203 and CFL source fetch for
+  a 4-WIDE chroma unit, the only one of the three that explains two different
+  predictors failing identically in the same place; (2) the WHT/placement in
+  `dequant_and_inverse_wht4x4` / `TxParams::run`, specifically how a 4x4 unit
+  is placed inside a 4x8 chroma plane block; (3) the post-recon filter chain,
+  cheaply, with the oracle's `EC_AV1_POSTDEBLOCK_DUMP` and
+  `EC_AV1_POSTCDEF_DUMP`.
+
+They also reproduced this lane's 109909 B fixture byte-for-byte, so the two
+encodes are confirmed as independent rather than merely believed to be. They
+exonerated the dequant scale (0 of 2053 units have non-zero levels with an
+empty `dq`; all 2053 have both) and corrected two of their own numbers — an
+r6 "1650 of 1663 chroma grids empty" figure that was an artefact of their own
+comparison script, and a still-unpaired r9 ladder sequence diff.
+
+**This lane claims no part of that cell.** Nothing on
+`lane-av1lm444loss-corr` asserts on the 256x256 stream, no fixture for it is
+pinned here, and the only thing this branch contributes to it is the
+measurement in §10.1 that closed its (a)/(b) question.
