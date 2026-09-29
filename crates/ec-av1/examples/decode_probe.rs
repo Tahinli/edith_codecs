@@ -51,12 +51,17 @@ fn main() {
             ec_av1::decode::chroma422_pair_wide_hits()
         );
         println!(
-            "uv_left_ss_y: reads={} mode_diff={} smooth_diff={}",
+            "uv_left_ss_y: reads={} mode_diff={} smooth_diff={} split1mi={}",
             ec_av1::decode::uv_left_ss_y_reads(),
             ec_av1::decode::uv_left_ss_y_mode_diff_hits(),
-            ec_av1::decode::uv_left_ss_y_smooth_diff_hits()
+            ec_av1::decode::uv_left_ss_y_smooth_diff_hits(),
+            ec_av1::decode::uv_left_1mi_split_hits(),
         );
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
+        println!(
+            "rect4_16_uv_pair_filt: {}",
+            ec_av1::decode::rect4_16_uv_pair_filt_hits()
+        );
         println!("rect4_32: horz={h} vert={v} coded={c}");
         println!(
             "rect_intrabc_reads: {}",

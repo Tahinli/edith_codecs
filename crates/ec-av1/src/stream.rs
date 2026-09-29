@@ -43057,14 +43057,17 @@ pub(crate) mod tests {
     /// every subsampling until this lane.
     ///
     /// The read is only observable when the two cells hold DIFFERENT blocks --
-    /// a left neighbour at most 1 mi tall. Measured over every committed
-    /// fixture and ~1000 swept aomenc encodes (report table), that never
-    /// happens on a decode-path read: `uv_mode_grid` runs down a left mi
-    /// column always have EVEN length, because libaom only starts a block on
-    /// an odd mi row with an 8-px strip, and the 4-px `HORZ_4` strips aomenc
-    /// does pick all land inside one mi row. So the term is a proven no-op on
-    /// today's material, and this gate pins BOTH halves of that statement:
-    /// the arm runs thousands of times, and it never changes an answer.
+    /// a left neighbour at most 1 mi tall (1 mi = 4 luma px, so a 4x4/8x4/16x4
+    /// /32x4/64x4 leaf). lane-av1leftwit measured that shape off a per-cell
+    /// owner stamp instead of the mode value: `uv_left_1mi_split_hits()` counts
+    /// decode-path reads whose two cells were written by DIFFERENT blocks, and
+    /// it is NOT zero -- five committed fixtures carry it (15 reads in all,
+    /// `lanes/av1leftwit.report.md`). What no committed fixture shows is the two
+    /// blocks DISAGREEING on `uv_mode`, which is what `mode_diff`/`smooth_diff`
+    /// below measure. So this gate pins both halves honestly: the arm runs
+    /// thousands of times, the shape it needs is genuinely reached, and the
+    /// term has not yet been seen to change an answer. Its exactness arms are
+    /// what would decide the shipped read if a DIFF bucket ever went non-zero.
     ///
     /// A non-zero DIFF bucket is not a failure here -- it is the first stream
     /// that witnesses the term, and the exactness arms below are what then
@@ -43110,6 +43113,90 @@ pub(crate) mod tests {
             "{NAME}: {reads} left-reference reads, +ss_y changed the mode {mode_diff} \
              and the smooth boolean {smooth_diff} times, all three planes pixel-exact"
         );
+    }
+
+    /// lane-av1leftwit: the `+ss_y` term's SHAPE is reachable on the decode
+    /// path, and this is the gate that says so.
+    ///
+    /// lane-av1leftref shipped the left read's `+ss_y` row term with the
+    /// argument that the shape it needs -- a left neighbour at most 1 mi tall,
+    /// so the cell this decoder read and the cell libaom reads belong to
+    /// different blocks -- is "structurally absent, because aomenc never starts
+    /// a block on an odd mi row". Both halves of that are wrong. libaom's
+    /// `PARTITION_HORZ_4` puts its `i == 0` child on the PARENT's own mi row
+    /// (`decode_partition`, `av1/decoder/decodeframe.c`: `mi_row + i * bw / 4`),
+    /// and a 16x16 parent sits on a 4-mi grid, so a 1-mi-tall leaf at an EVEN
+    /// row is what the syntax asks for, not forbids. And the shape is measured
+    /// in the corpus: these two fixtures each present it to a real decode-path
+    /// read.
+    ///
+    /// The counter is `decode::uv_left_1mi_split_hits()`, incremented only
+    /// where `decode_path` is true -- the snapping form every decode call site
+    /// uses -- so the 16x4/4x16 pair witness's counter-only mirror (which
+    /// reads an odd mi row and feeds `RECT4_16_UV_PAIR_FILT_HITS`) cannot
+    /// inflate it. `UV_LEFT_SS_Y_READS` alone would prove nothing: it counts
+    /// every read with a left neighbour, whether or not the two cells differ.
+    ///
+    /// NON-VACUITY: the `uv_owner` stamp the counter turns on was removed for
+    /// one build; both arms fell to 0 and this gate failed on the census
+    /// (report §5), so a decoder that stops recording which block owns a cell
+    /// fails here instead of passing vacuously. It is deliberately NOT a
+    /// mutation of the `+ss_y` term itself: the term's own mutation leaves
+    /// these reads untouched, which is the honest limit of what the fixture
+    /// set can decide (the kf900 gate above owns the exactness side).
+    #[test]
+    fn a_committed_4to20_stream_presents_a_one_mi_left_neighbour_to_a_decode_path_read() {
+        const NAME: &str = "a_committed_4to20_stream_presents_a_one_mi_left_neighbour_to_a_decode_path_read";
+        // (fixture, frames, width, height, measured split-owner reads)
+        let arms: [(&str, usize, usize, usize, usize); 2] = [
+            ("gm_small_side_witness.obu", 33, 1920, 792, 5),
+            ("troy_sb128_inter_witness.obu", 15, 1920, 792, 7),
+        ];
+        for (fixture, want_frames, width, height, want_split) in arms {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(fixture);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            let before_split = crate::decode::uv_left_1mi_split_hits();
+            let before_reads = crate::decode::uv_left_ss_y_reads();
+            let before_mode = crate::decode::uv_left_ss_y_mode_diff_hits();
+            let before_smooth = crate::decode::uv_left_ss_y_smooth_diff_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => panic!("{NAME}: {fixture} refused: {e}"),
+            };
+            let split = crate::decode::uv_left_1mi_split_hits() - before_split;
+            assert_eq!(
+                frames.len(),
+                want_frames,
+                "{NAME}: {fixture} frame count"
+            );
+            assert!(
+                frames
+                    .iter()
+                    .all(|f| (f.width, f.height) == (width, height)),
+                "{NAME}: {fixture} is not {width}x{height}"
+            );
+            assert_eq!(
+                split, want_split,
+                "{NAME}: {fixture} presented {split} 1-mi-tall left neighbours to \
+                 a decode-path read, measured {want_split} -- the census this \
+                 gate pins moved"
+            );
+            // Printed, not asserted: `== 0` would pin an accident, and a
+            // non-zero value is the first WITNESS of the term rather than a
+            // failure (that is what the kf900 gate above then decides against
+            // the oracle).
+            eprintln!(
+                "{NAME}: {fixture}: {split} 1-mi-tall left neighbours in \
+                 {} decode-path reads, +ss_y changed the mode {} and the smooth \
+                 boolean {} times",
+                crate::decode::uv_left_ss_y_reads() - before_reads,
+                crate::decode::uv_left_ss_y_mode_diff_hits() - before_mode,
+                crate::decode::uv_left_ss_y_smooth_diff_hits() - before_smooth,
+            );
+        }
     }
 
     /// lane-av1formatsweep: the ODD CODED DIMENSION cell -- a frame whose

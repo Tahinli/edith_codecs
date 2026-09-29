@@ -5696,6 +5696,27 @@ pub fn uv_left_ss_y_smooth_diff_hits() -> usize {
     UV_LEFT_SS_Y_SMOOTH_DIFF_HITS.with(|c| c.get())
 }
 
+// lane-av1leftwit: decode-path chroma edge-filter-type reads at `ss_y > 0`
+// whose left-neighbour COLUMN holds a run of length 1 -- the cell this
+// decoder reads (its own mi row) and the cell libaom reads (one row down)
+// were written by two DIFFERENT blocks, i.e. the left neighbour is at most
+// 1 mi tall. That is the only geometry in which the `+ss_y` term can change
+// the answer at all; `UV_LEFT_SS_Y_READS` alone proves nothing about it.
+thread_local! {
+    static UV_LEFT_1MI_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`UV_LEFT_1MI_SPLIT_HITS`].
+pub fn uv_left_1mi_split_hits() -> usize {
+    UV_LEFT_1MI_SPLIT_HITS.with(|c| c.get())
+}
+
+// lane-av1leftwit: the per-tile epoch `uv_owner` cells are stamped with.
+// Bumped in `Neighbours::start_tile`; never read by decode logic.
+thread_local! {
+    static UV_OWNER_EPOCH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 // lane-cfl r1 gate counters: `UV_CFL_PRED` blocks (every `cfl_alpha_signs`
 // read) and chroma blocks with a NONZERO `angle_delta_uv` -- the two block
 // shapes the r1 chroma defect showed up on.
@@ -8228,6 +8249,16 @@ struct Neighbours {
     /// [`Self::uv_mode_grid`]'s stride, in mi units (superblock-padded, like
     /// every other band here).
     uv_grid_cols: usize,
+    /// lane-av1leftwit: which BLOCK wrote each cell of [`Self::uv_mode_grid`],
+    /// as `(epoch << 24) | (mi_r << 12) | mi_c` of the writing block's own
+    /// top-left mi. The `uv_mode` value alone cannot answer "are the two cells
+    /// the `+ss_y` read compares written by the same block?", which is the
+    /// whole question the `+ss_y` term turns on: the term is only observable
+    /// when the left neighbour is 1 mi tall, i.e. when the cell this decoder
+    /// used to read and the cell libaom reads hold DIFFERENT blocks. `epoch`
+    /// is [`UV_OWNER_EPOCH`], bumped once per tile, so a cell no block wrote
+    /// in this tile can never be mistaken for a written one.
+    uv_owner: Vec<u32>,
     /// Whether the block above/left of this column/row was coded `skip` --
     /// an inter frame's own `skip` context (spec `SkipContext`), which the
     /// key-frame writer never tracks (its skip context is always zero); a
@@ -8421,6 +8452,7 @@ impl Neighbours {
             uv_mode_row: vec![(u16::MAX, 0); rows * (SUB / MI)],
             uv_mode_grid: vec![u8::MAX; cols * (SUB / MI) * rows * (SUB / MI)],
             uv_grid_cols: cols * (SUB / MI),
+            uv_owner: vec![0; cols * (SUB / MI) * rows * (SUB / MI)],
             above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
             left_txfm: vec![TXFM_CTX_INIT; rows * (SUB / MI)],
             // lane-inter8 r2: mi(4px)-granular, not [`SUB`]-granular -- an
@@ -8490,6 +8522,10 @@ impl Neighbours {
         // lane-seg: `AvailU`/`AvailL` for the segment-id neighbour prediction
         // are tile-relative, same as every other neighbour lookup here.
         fctx.seg_tile_origin.with(|c| c.set((row0_mi, col0_mi)));
+        // lane-av1leftwit: a fresh epoch stamps every `uv_owner` cell this
+        // tile writes, so the `+ss_y` read's "different block?" probe never
+        // compares against a cell a previous tile left behind.
+        UV_OWNER_EPOCH.with(|c| c.set(c.get().wrapping_add(1) | (1 << 24)));
         self.tile_row0_mi = row0_mi;
         self.tile_col0_mi = col0_mi;
         let end = col1_mi.min(self.above.len());
@@ -9599,6 +9635,17 @@ impl Neighbours {
                 uv_mode as u8,
             );
         }
+        // lane-av1leftwit: stamp the writing block's own mi over its extent,
+        // the same cells and the same clipping as `uv_mode_grid` above.
+        let owner = UV_OWNER_EPOCH.with(|c| c.get()) | ((mi_r as u32) << 12) | mi_c as u32;
+        for row in mi_r..=last_r {
+            fill_span(&mut self.uv_owner, row * stride + mi_c, n, owner);
+        }
+        if crate::envflags::env_flag!("EC_LEFTSSY") {
+            eprintln!(
+                "EC_LEAF mi=({mi_r},{mi_c}) wh=({mi_w},{mi_h}) uv_mode={uv_mode}"
+            );
+        }
     }
 
     /// Whether either mi-exact chroma neighbour of the block at `(mi_r, mi_c)`
@@ -9659,11 +9706,16 @@ impl Neighbours {
     /// decode path uses the snapping form.
     /// `decode_path` is `true` only for the snapping form every decode call
     /// site uses; the 16x4/4x16 pair witness's mirror passes `false`, so the
-    /// `+ss_y` counters measure the read that actually filters a chroma edge
-    /// and not the counter-only one. (The mirror reads an ODD mi row -- the
-    /// pair's chroma-reference half -- where the two cells differ far more
-    /// often; counting it would make this lane look reachable when no
-    /// committed fixture reaches it on the decode path.)
+    /// `+ss_y` counters measure a read that actually filters a chroma edge and
+    /// not the counter-only one.
+    ///
+    /// lane-av1leftwit: the mirror's justification used to be "no committed
+    /// fixture reaches the shape on the decode path", and that was false --
+    /// `UV_LEFT_1MI_SPLIT_HITS` fires on five of them. The flag stays (a
+    /// counter-only mirror at an ODD mi row is still not a decode-path read,
+    /// and its result feeds only `RECT4_16_UV_PAIR_FILT_HITS`), but it is no
+    /// longer evidence about the `+ss_y` term, and nothing may cite it as such.
+    /// The decode path's own reach is `uv_left_1mi_split_hits()`.
     fn smooth_uv_neighbour_unsnapped(
         &self,
         mi_r: usize,
@@ -9720,13 +9772,18 @@ impl Neighbours {
         // its own row at 4:2:2 (`ss_y == 0`); this read its own row at every
         // subsampling. An earlier attempt applied the `ss_y` term to the WRONG
         // read (the above) and regressed the byte-exact 4:2:0 control, which
-        // is what exposed the crossing. The premise that blocked the correct
-        // read -- "no committed fixture presents a 1-mi-tall left neighbour at
-        // 4:2:0/4:4:0" -- was wrong: the observable condition is not the 8x4
-        // leaf specifically but any left neighbour at most 1 mi tall, which
-        // 4:2:0 partitioning produces constantly. Six committed 4:2:0
-        // fixtures reach it (see the report's measurement table), and on
-        // `hg_ss600_key_frame.obu` the boolean flips.
+        // is what exposed the crossing. lane-av1leftwit CORRECTED the claim
+        // this comment used to make: "six committed 4:2:0 fixtures reach it,
+        // and on `hg_ss600_key_frame.obu` the boolean flips" was never
+        // measured. Measured over all 48 committed fixtures that decode
+        // (`lanes/av1leftwit.report.md`), `hg_ss600_key_frame.obu` reads
+        // `mode_diff=0 smooth_diff=0 split1mi=0`, and exactly FIVE fixtures
+        // put a 1-mi-tall left neighbour in front of a decode-path read at
+        // all -- `gm_small_side_witness` (5), `troy_sb128_inter_witness` (7),
+        // `av112bit-{inter,compound,compound-masked}` (1 each) -- and in every
+        // one of those reads the two blocks agree on `uv_mode`. So the SHAPE is
+        // reachable (see `UV_LEFT_1MI_SPLIT_HITS`) and the term's VALUE
+        // changing is what is still unwitnessed.
         let above_mi = (mi_r.saturating_sub(1), mi_c + ss_x);
         // lane-av1leftref: libaom's LEFT read carries the `+ss_y` ROW term --
         // `base_mi[ss_y * mi_stride - 1]` (`av1_common_int.h:1400-1401`) is
@@ -9735,11 +9792,17 @@ impl Neighbours {
         // row at every subsampling. The term is only observable when the two
         // cells hold DIFFERENT blocks, i.e. the left neighbour is 1 mi tall or
         // shorter -- then `(row, col-1)` and `(row+1, col-1)` are two blocks
-        // and only libaom's is the chroma reference. The two counters below
-        // are the gate's non-vacuity proof: the mode value moved on
-        // `UV_LEFT_SS_Y_MODE_DIFF_HITS` reads, and the boolean this feeds
+        // and only libaom's is the chroma reference. Three counters measure
+        // that, and the third is the one the other two need: a read can only
+        // differ if the two cells are written by DIFFERENT blocks, which
+        // `UV_LEFT_1MI_SPLIT_HITS` counts off the per-cell owner stamp
+        // (`uv_owner`, below). A DIFF bucket that reads 0 while SPLIT reads 0
+        // was never in contention; a DIFF bucket that reads 0 while SPLIT
+        // reads > 0 is the term being unobservable on real material, not
+        // unreachable. `..._MODE_DIFF_HITS` / `..._SMOOTH_DIFF_HITS` then say
+        // whether the mode value, and the boolean this feeds
         // (`is_smooth_mode` -> `av1_get_intra_edge_filter_type` -> the chroma
-        // edge filter) flipped on `UV_LEFT_SS_Y_SMOOTH_DIFF_HITS`.
+        // edge filter), actually moved.
         let left_mi = (mi_r + ss_y, mi_c.saturating_sub(1));
         let read_left = |row: usize| -> usize {
             match self.uv_mode_row.get(row) {
@@ -9775,6 +9838,36 @@ impl Neighbours {
             }
             if is_smooth_mode(own_row) != is_smooth_mode(left) {
                 hit!(UV_LEFT_SS_Y_SMOOTH_DIFF_HITS);
+            }
+            // lane-av1leftwit: the geometry the `+ss_y` term needs. The two
+            // cells are one left mi column apart, so they are two different
+            // blocks exactly when the left neighbour is 1 mi tall or shorter.
+            let col = left_mi.1;
+            let epoch = UV_OWNER_EPOCH.with(|c| c.get()) & 0xff00_0000;
+            let own = (col < self.uv_grid_cols)
+                .then(|| self.uv_owner.get(mi_r * self.uv_grid_cols + col).copied())
+                .flatten()
+                .filter(|o| o & 0xff00_0000 == epoch)
+                .unwrap_or(0);
+            let down = self
+                .uv_owner
+                .get((mi_r + ss_y) * self.uv_grid_cols + col)
+                .copied()
+                .filter(|o| o & 0xff00_0000 == epoch)
+                .unwrap_or(0);
+            if own != 0 && down != 0 && own != down {
+                hit!(UV_LEFT_1MI_SPLIT_HITS);
+                if crate::envflags::env_flag!("EC_LEFTSSY") {
+                    eprintln!(
+                        "EC_LEFTSSY epoch={} mi=({mi_r},{mi_c}) left_col={col} \
+                         owners=({},{})->({},{}) modes={own_row}/{left}",
+                        epoch >> 24,
+                        own >> 12 & 0xfff,
+                        own & 0xfff,
+                        down >> 12 & 0xfff,
+                        down & 0xfff,
+                    );
+                }
             }
         }
         if have_above && cell(&self.uv_mode_grid, mi_r - 1, mi_c).is_some_and(|m| {
@@ -17536,6 +17629,16 @@ fn decode_rect4_16_strip(
         // frame's own `ss_x` -- the unsnapped read is the pair-merge witness
         // counter's mirror of the snapping form, and the shipped read offsets
         // the above COLUMN by `+ss_x` (libaom's `chroma_above_mi`).
+        //
+        // lane-av1leftwit: this mirror is NOT evidence about the left read's
+        // `+ss_y` term, whatever a report once said. It reads the leaf's own
+        // (odd) mi row, which no decode call site does -- every one of them
+        // uses the snapping form, whose base row is even -- and its result
+        // feeds `RECT4_16_UV_PAIR_FILT_HITS` only. What it measures is real
+        // and worth keeping (the pair's chroma-reference read against the
+        // leaf's own row: 51/24/121/0/1 hits on the five fixtures censused),
+        // so it stays; the decode path's own reach for the `+ss_y` term is
+        // `uv_left_1mi_split_hits()`.
         if smooth_neighbor_uv
             != neighbours.smooth_uv_neighbour_unsnapped(
                 lmi.0,
