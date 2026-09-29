@@ -200,3 +200,85 @@ corr"` = 0.
 - **Citation.** The step rule is taken from this codebase's own reference
   construction (`decode.rs:43688`) rather than re-derived only from libaom, so
   the change matches the shape every other replay in the tree already uses.
+
+## 8. Handover of the 256x256 cell, and a retraction
+
+The 4:4:4 lossless 256x256 cell is a **second defect**, untouched by this
+branch and by the superseded `lane-av1lm444loss` branch (identical wrong-sample
+count, first sample and magnitude set on both). Handed to **`Aras-2`**, who is
+already working that cell and whose pinned tripwire `(1, 201, 200, 160, 159)` is
+the same first sample this lane measured. Sent 2026-09-29, in the message
+thread on `agent://Aras-2`.
+
+Fixture for reproduction: `testsrc2 256x256 rate=25 yuv444p` (rate matters — my
+rate=1 encodes of the same geometry were byte-exact **at base**), aomenc
+`--lossless=1 --sb-size=128 --passes=1 --threads=1 --row-mt=0
+--enable-palette=0 --lag-in-frames=0 --kf-max-dist=100 --limit=6`, 109909 bytes.
+Signature: key frame only, chroma only, 49 samples (Y=0, U=21, V=28), first
+U(200,201) ours 160 vs ref 159.
+
+### 8.1 Retraction: "the mi labels are transposed" was wrong
+
+This lane's earlier report flagged the ladder's first fork at read 125511 with
+a caveat that the differing `mi` labels looked like a coordinate-grid artefact
+rather than a decode divergence. **That caveat is withdrawn.** Three
+measurements, taken before the handover:
+
+1. **Both traces print mi in the same field order.** The oracle prints
+   `ec_symr_mi_row, ec_symr_mi_col` (`aom_dsp/bitreader.h:265-266`); this
+   decoder prints `SYMR_MI.get().0, .1` (`msac.rs:476-478`). There is no
+   field-order swap to explain anything.
+2. **It is not a transposition of the same position either.** Ours reads
+   `mi=(32,0)`, the oracle `mi=(0,48)`; swapping ours gives `(0,32)`.
+3. **The label tracks the walk closely**, so its first disagreement is signal.
+   The two labels agree on **90112 of the first 125511 reads (71.8%)**.
+
+At the fork both sides are at `ph=inter`, where both publish **block-level** mi
+(ours from `decode_inter_block`'s `at`, `decode.rs:38706`; the oracle from the
+mode-info reader's entry, `decodemv.c:941`) — the same granularity — and they
+still disagree, off an identical pre-state `(24645, 40117)` with different
+post-ranges (39316 vs 39862). So read 125511 is a **genuine block-level walk
+divergence**.
+
+The generalisable lesson is the mirror of the one in
+`skill://ec-av1-divergence-debug`: a "the tag disagrees, so it is a labelling
+artefact" reading is a hypothesis to be TESTED, not a conclusion to be
+forwarded. This lane forwarded one. Testing it cost three cheap measurements
+and reversed the conclusion.
+
+### 8.2 One more cross-side trap found in the same ladder
+
+The **phase vocabulary differs between the two decoders**. This decoder emits
+`ph=inter8` for the sub-8x8 leaf arm (`decode.rs:47162`) — 13894 reads on this
+stream — and the oracle has **no `inter8` phase at all**: its `ec_symr_phase`
+is set at the mode-info reader's entry and lumps those reads under the block's
+own phase. So `ph` is not a pairable field across the two sides either; only
+`ph=inter` against `ph=inter` compares.
+
+## 9. Two findings recorded for the batch's shared lore
+
+**9.1 A luma first-fork is the signature of a chroma arithmetic error.** The
+bug this branch fixes is a purely CHROMA error — an mi step on the chroma
+context replay — yet the first wrong sample on the witness stream is **luma**,
+`Y(64,448)`, in the key frame. Mechanism: the wrongly-placed chroma stamps
+corrupt the `txb_skip_ctx` the NEXT unit reads, the tile desyncs from there, and
+whichever block comes next in luma is what moves first. This is the shape that
+makes a correctly-applied fix look ineffective: the gate goes green and the
+diff you were watching was never where the bug was. Whenever a chroma-side
+arithmetic fix appears not to have moved a LUMA first-fork, check the chroma
+step before suspecting the reconstruction or the filter chain.
+
+**9.2 The non-vacuity discipline this gate uses, restated.** Two rows do the
+real work and both are about *reaching* the corrected expression, not about
+its value:
+
+* the **parsed-header** assert pins `(0,0,8)` from the stream's own sequence
+  header precisely *because* at `(1,1)` the old and new steps are the same
+  integer — a 4:2:0 stream cannot fail this gate at all, so without the header
+  row every other row would be asserting nothing;
+* the **control pin** reads the counter 0 on a stream of whole square blocks,
+  because those have no multi-unit chroma plane block to step — which is what
+  makes "the counter fired" mean "a multi-unit step was actually taken".
+
+Together those two mean the gate fails if the step is wrong AND fails if the
+step is never reached. Neither alone would.
