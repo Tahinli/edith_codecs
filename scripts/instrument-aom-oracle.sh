@@ -902,3 +902,175 @@ s = s.replace(anchor, anchor + dump, 1)
 open(path, "w").write(s)
 print("postcdef dump instrumented")
 PYC
+
+# --- depth contract for the four u8-narrowing dump rungs ------------------
+# PREFILT (rung 1), POSTDEBLOCK (rung 3), PREFILT_WIDE (rung 7) and POSTCDEF
+# are paired with ec-av1 decoder rungs that narrow every sample with `as u8`,
+# so the oracle side owes ONE BYTE PER SAMPLE at every depth. As instrumented
+# above they wrote `fwrite(plane + r*stride, 1, w, f)`, which is wrong twice
+# over on a high-bit-depth stream:
+#   1. YV12_BUFFER_CONFIG stores plane pointers in HALVED form -- aom_ports/mem.h
+#      defines CONVERT_TO_BYTEPTR(x) = x >> 1 -- so the real address is
+#      CONVERT_TO_SHORTPTR(p) (p << 1). Pointer arithmetic on the raw uint8_t*
+#      therefore yields an unrelated half-address, and fwrite faults inside
+#      memmove: SIGSEGV (exit 139) with a 0-byte file, on EVERY HBD stream, for
+#      all four rungs, while rung 12 (which does convert) works. A lane hitting
+#      it sees a crashed aomdec and cannot tell it from a decoder defect.
+#   2. y_stride/uv_stride count SAMPLES, so `+ r*stride` in bytes also picks the
+#      wrong row even where the address happens to be readable.
+# At 8 bit neither applies: buf is the real pointer and flags is 0, so the
+# bytes emitted are bit-for-bit what these rungs always wrote. This block owns
+# the contract for all four, runs last, and is a REPAIR pass: it rewrites the
+# loops an earlier (or pre-fix) instrumentation left behind, so re-running this
+# script on an already-instrumented tree fixes it in place.
+python3 - "$F" <<'PYN'
+import re
+import sys
+
+path = sys.argv[1]
+s = open(path).read()
+
+helper = '''/* EC_INSTRUMENTED_NARROW_ROW: emit one plane row as ONE BYTE PER SAMPLE, the
+ * shape the ec-av1 decoder's own EC_AV1_*_DUMP rungs write (they narrow every
+ * sample with `as u8`).
+ *
+ * Two HBD traps this replaces, both fatal until fixed:
+ *  1. YV12_BUFFER_CONFIG stores plane pointers in HALVED form: the real
+ *     address is `CONVERT_TO_SHORTPTR(p)` (aom_ports/mem.h defines
+ *     `CONVERT_TO_BYTEPTR(x) = x >> 1`), so `p + r*stride` computed on the raw
+ *     uint8_t* is an unrelated address. `fwrite(y_buffer + r*y_stride, 1, w,
+ *     f)` on a 10/12-bit stream therefore hands fwrite a half-address that
+ *     faults inside memmove -- SIGSEGV with a 0-byte file, which reads as a
+ *     decoder crash rather than a broken rung.
+ *  2. y_stride/uv_stride count SAMPLES, so a byte-wise `+ r*stride` addresses
+ *     the wrong row as well.
+ * At 8 bit neither applies: the pointer is the real one and the bytes written
+ * are exactly what the rung always emitted. */
+static void ec_dump_narrow_row(FILE *f, const YV12_BUFFER_CONFIG *b,
+                               const uint8_t *plane8, int stride, int row,
+                               int w) {
+  if (!(b->flags & YV12_FLAG_HIGHBITDEPTH)) {
+    fwrite(plane8 + (size_t)row * stride, 1, (size_t)w, f);
+    return;
+  }
+  const uint16_t *p = CONVERT_TO_SHORTPTR(plane8) + (size_t)row * stride;
+  uint8_t *narrow = (uint8_t *)aom_malloc((size_t)w);
+  if (!narrow) return;
+  for (int c = 0; c < w; ++c) narrow[c] = (uint8_t)(p[c] & 0xFF);
+  fwrite(narrow, 1, (size_t)w, f);
+  aom_free(narrow);
+}
+
+/* EC_INSTRUMENTED_DUMP_CHECK: the harm the depth bug above caused is not a
+ * wrong number, it is a SILENT 0-byte dump -- downstream that reads as "the
+ * oracle has no data for this stage" and becomes a phantom stage diff. So
+ * every narrowing rung checks the byte count it just produced against the
+ * shape it claims to write and aborts IN THE ORACLE, naming itself, instead
+ * of handing the decoder an empty file. `expect` is Y + U + V at ONE BYTE PER
+ * SAMPLE: the crop extent when `aligned` is 0 (PREFILT), the mi-aligned
+ * extent when 1 (PREFILT_WIDE / POSTDEBLOCK / POSTCDEF). No configuration
+ * writes 0 bytes: a frame's crop extent is non-zero by construction, and a
+ * failed fopen skips the block entirely (so a bad path is not an abort). */
+static void ec_dump_finish(FILE *f, const char *rung,
+                           const YV12_BUFFER_CONFIG *b, int num_planes,
+                           int aligned) {
+  const size_t y = aligned ? (size_t)b->y_width * b->y_height
+                           : (size_t)b->y_crop_width * b->y_crop_height;
+  const size_t uv = aligned ? (size_t)b->uv_width * b->uv_height
+                            : (size_t)b->uv_crop_width * b->uv_crop_height;
+  const size_t expect = y + (num_planes > 1 ? 2 * uv : 0);
+  const long wrote = ftell(f);
+  if (wrote < 0 || (size_t)wrote != expect || fflush(f) != 0) {
+    fprintf(stderr,
+            "EC_DUMP_ABORT rung=%s bit_depth=%u hbd=%d expect=%zu wrote=%ld "
+            "(one byte per sample, Y+U+V)\\n",
+            rung, b->bit_depth,
+            (b->flags & YV12_FLAG_HIGHBITDEPTH) ? 1 : 0, expect, wrote);
+    abort();
+  }
+  fclose(f);
+}
+
+'''
+
+MARKER_ROW = "EC_INSTRUMENTED_NARROW_ROW"
+MARKER_CHECK = "EC_INSTRUMENTED_DUMP_CHECK"
+missing = ""
+if MARKER_ROW not in s:
+    missing = helper
+elif MARKER_CHECK not in s:
+    # The tree already carries the row helper from an earlier run of this
+    # script: add the byte-count checker on its own so a repaired tree
+    # converges instead of erroring.
+    missing = helper[helper.index("/* " + MARKER_CHECK):]
+if missing:
+    # Both helpers must precede every user: the POSTCDEF rung was refactored
+    # into a static helper that sits ABOVE av1_decode_tg_tiles_and_wrapup, so
+    # anchor there when it exists and at the function itself otherwise.
+    for anchor in ("static void ec_dump_postcdef(const AV1_COMMON *cm, int num_planes) {",
+                   "void av1_decode_tg_tiles_and_wrapup(AV1Decoder *pbi, const uint8_t *data,"):
+        if anchor in s:
+            s = s.replace(anchor, missing + anchor, 1)
+            break
+    else:
+        raise SystemExit("dump helpers: no anchor before the dump rungs")
+    print("dump helpers inserted: %s"
+          % ("narrow-row + byte-count check" if len(missing) == len(helper)
+             else "byte-count check only"))
+
+row_loop = re.compile(
+    r"for \(int ec_r = 0; ec_r < ec_b->(\w+); \+\+ec_r\)\n"
+    r"(\s*)fwrite\(ec_b->(\w+)_buffer \+ ec_r \* ec_b->(\w+), 1,\s*\n?\s*ec_b->(\w+),\s*\n?\s*ec_f\);")
+
+
+def narrow(match):
+    rows, indent, plane, stride, width = match.groups()
+    return ("for (int ec_r = 0; ec_r < ec_b->%s; ++ec_r)\n%s"
+            "ec_dump_narrow_row(ec_f, ec_b, ec_b->%s_buffer, ec_b->%s, ec_r,\n"
+            "%s%s ec_b->%s);" % (rows, indent, plane, stride, indent, indent, width))
+
+
+s, rewritten = row_loop.subn(narrow, s)
+if rewritten:
+    print("narrow-row depth fix: rewrote %d plane row loops" % rewritten)
+else:
+    print("narrow-row depth fix: no legacy row loop left (already depth-correct)")
+
+# Close each narrowing rung through the checker. Keyed on the presence of a
+# rewritten row loop, so rung 12 (EC_AV1_FINAL_DUMP, 2 bytes per sample and
+# already depth-correct) is never reached: its block has no ec_dump_narrow_row.
+# The terminator alternation keeps each block matched to ITS OWN close, so a
+# re-run cannot run a block's body forward into a later rung's fclose.
+dump_block = re.compile(
+    r'(FILE \*ec_f = fopen\(ec_path, "wb"\);)(.*?)'
+    r'((?:fclose\(ec_f\);)|(?:ec_dump_finish\([^;]*\);))',
+    re.S)
+
+WIRED = []
+
+def finish(match):
+    opened, body, closed = match.groups()
+    if "ec_dump_narrow_row" not in body:
+        return match.group(0)
+    # The rung name can sit ABOVE the fopen (the POSTCDEF rung was refactored
+    # into a helper that does getenv -> fopen at the top), so take the nearest
+    # preceding EC_AV1_* env lookup rather than searching the block body.
+    preceding = re.findall(r'getenv\("(EC_AV1_[A-Z_]+)"\)', s[:match.start()])
+    if not preceding:
+        raise SystemExit("dump check: no rung env var above a narrowing block")
+    aligned = 0 if "y_crop_height" in body else 1
+    if closed.startswith("fclose"):
+        WIRED.append(preceding[-1])
+    return "%s%s%s" % (
+        opened, body,
+        'ec_dump_finish(ec_f, "%s", ec_b, num_planes, %d);' % (preceding[-1], aligned))
+
+
+s, _ = dump_block.subn(finish, s)
+if WIRED:
+    print("dump byte-count check: wired into %d narrowing rung(s): %s"
+          % (len(WIRED), ", ".join(WIRED)))
+else:
+    print("dump byte-count check: every narrowing rung already checks its bytes")
+open(path, "w").write(s)
+PYN
