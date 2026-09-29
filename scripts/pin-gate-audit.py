@@ -125,15 +125,20 @@ def main():
         for line, name, body, attrs in fn_bodies(text):
             if not any(a.startswith("#[test") for a in attrs):
                 continue
+            # Match every shape on a COMMENT-STRIPPED body. A doc comment that
+            # reproduces a root literal to explain the shape it removed used to
+            # invent a gate here, the same blindness invariant 1 had.
+            code = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+            code = "\n".join(l.split("//", 1)[0] for l in code.splitlines())
             root_lit = None
             root_kind = "none"
             var = None
-            m = ROOT_RE.search(body)
+            m = ROOT_RE.search(code)
             if m:
                 root_lit, var = m.group(1), None
                 root_kind = "concat!"
             else:
-                m = JOIN_RE.search(body)
+                m = JOIN_RE.search(code)
                 if m:
                     joined = re.findall(r'\.join\("([^"]*)"\)', m.group(0))
                     root_lit = "".join(joined)
@@ -143,30 +148,29 @@ def main():
                 # the census counts every pin-reading gate, not only the ones
                 # reached through a root literal.
                 ign_s = "yes" if any("ignore" in a for a in attrs) else "no"
-                singles = re.findall(r'crate_pin\(\s*"([^"]+)"', body)
+                singles = re.findall(r'crate_pin\(\s*"([^"]+)"', code)
                 # A gate that builds the pin name at runtime (crate_pin(&format!(..)))
                 # matches no single-name shape and would VANISH from the census --
                 # the same blind spot in a new place. Surface it instead.
-                for dyn_call in re.findall(r'crate_pin\(\s*&?\s*(?!")', body):
+                for dyn_call in re.findall(r'crate_pin\(\s*&?\s*(?!")', code):
                     print("BADCALL\t{}\t{}\tcrate_pin argument is not a string literal: {}"
                           .format("{}:{}".format(rel, line), name, dyn_call.strip()[:60]))
                     bad.append("BADROW\t{}\t{}\tcrate_pin\tname built at runtime -- this census "
                                "cannot resolve it, so the gate is UNPROVEN here".format(
                                    "{}:{}".format(rel, line), name))
                 singles += re.findall(
-                    r'pin_dir\(\)\.join\(\s*"([^"]+)"', body)
+                    r'pin_dir\(\)\.join\(\s*"([^"]+)"', code)
                 if not singles:
                     continue
                 total += 1
                 if ign_s == "yes":
                     ignored += 1
+                print("GATE\t{}\t{}\tcrate_pin\tyes\t{}\t{}".format(
+                    "{}:{}".format(rel, line), name, ign_s, len(singles)))
                 for n in singles:
                     committed_rel = "crates/{}/fixtures/{}".format(crate, n)
                     present = os.path.isfile(os.path.join(ROOT, committed_rel))
                     tr = tracked(committed_rel) if present else "no"
-                    total_names = 1
-                    print("GATE\t{}\t{}\tcrate_pin\tyes\t{}\t{}".format(
-                        "{}:{}".format(rel, line), name, ign_s, len(singles)))
                     print("NAME\t{}\t{}\t{}\t{}\t{}\t{}".format(
                         "{}:{}".format(rel, line), name, n,
                         "present" if present else "absent", tr, "yes"))
@@ -182,7 +186,7 @@ def main():
             v = re.search(
                 r'let\s+([a-z_0-9]+)\s*=\s*(?:concat!\(\s*env!\("CARGO_MANIFEST_DIR"\)|'
                 r'Path::(?:new|buf_from)\(\s*env!\("CARGO_MANIFEST_DIR"\)\s*\)\s*(?:\.join\("[^"]*"\)\s*)+)',
-                body,
+                code,
             )
             if v:
                 var = v.group(1)
@@ -211,7 +215,7 @@ def main():
                     for n in items:
                         names.append((n, ext))
             if not names:
-                lit = re.search(r'"(/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+)"', body)
+                lit = re.search(r'"(/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+)"', code)
                 # a lane dump under lanes/ is not a fixture and is not this gate
                 if lit and "/fixtures/" in lit.group(1):
                     names.append((os.path.basename(lit.group(1)), ""))
@@ -219,10 +223,10 @@ def main():
                 continue
 
             # assertion classification through the CALL GRAPH
-            asserts = "assert" in body
+            asserts = "assert" in code
             via = ""
             if not asserts:
-                for h in HELPER_RE.findall(body):
+                for h in HELPER_RE.findall(code):
                     hb = helpers.get(h)
                     if hb and "assert" in hb:
                         asserts = True
