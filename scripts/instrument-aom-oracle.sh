@@ -961,20 +961,62 @@ static void ec_dump_narrow_row(FILE *f, const YV12_BUFFER_CONFIG *b,
   aom_free(narrow);
 }
 
+/* EC_INSTRUMENTED_DUMP_CHECK: the harm the depth bug above caused is not a
+ * wrong number, it is a SILENT 0-byte dump -- downstream that reads as "the
+ * oracle has no data for this stage" and becomes a phantom stage diff. So
+ * every narrowing rung checks the byte count it just produced against the
+ * shape it claims to write and aborts IN THE ORACLE, naming itself, instead
+ * of handing the decoder an empty file. `expect` is Y + U + V at ONE BYTE PER
+ * SAMPLE: the crop extent when `aligned` is 0 (PREFILT), the mi-aligned
+ * extent when 1 (PREFILT_WIDE / POSTDEBLOCK / POSTCDEF). No configuration
+ * writes 0 bytes: a frame's crop extent is non-zero by construction, and a
+ * failed fopen skips the block entirely (so a bad path is not an abort). */
+static void ec_dump_finish(FILE *f, const char *rung,
+                           const YV12_BUFFER_CONFIG *b, int num_planes,
+                           int aligned) {
+  const size_t y = aligned ? (size_t)b->y_width * b->y_height
+                           : (size_t)b->y_crop_width * b->y_crop_height;
+  const size_t uv = aligned ? (size_t)b->uv_width * b->uv_height
+                            : (size_t)b->uv_crop_width * b->uv_crop_height;
+  const size_t expect = y + (num_planes > 1 ? 2 * uv : 0);
+  const long wrote = ftell(f);
+  if (wrote < 0 || (size_t)wrote != expect || fflush(f) != 0) {
+    fprintf(stderr,
+            "EC_DUMP_ABORT rung=%s bit_depth=%u hbd=%d expect=%zu wrote=%ld "
+            "(one byte per sample, Y+U+V)\\n",
+            rung, b->bit_depth,
+            (b->flags & YV12_FLAG_HIGHBITDEPTH) ? 1 : 0, expect, wrote);
+    abort();
+  }
+  fclose(f);
+}
+
 '''
 
-if "EC_INSTRUMENTED_NARROW_ROW" not in s:
-    # Must precede every user: the POSTCDEF rung was refactored into a static
-    # helper that sits ABOVE av1_decode_tg_tiles_and_wrapup, so anchor there
-    # when it exists and at the function itself otherwise.
+MARKER_ROW = "EC_INSTRUMENTED_NARROW_ROW"
+MARKER_CHECK = "EC_INSTRUMENTED_DUMP_CHECK"
+missing = ""
+if MARKER_ROW not in s:
+    missing = helper
+elif MARKER_CHECK not in s:
+    # The tree already carries the row helper from an earlier run of this
+    # script: add the byte-count checker on its own so a repaired tree
+    # converges instead of erroring.
+    missing = helper[helper.index("/* " + MARKER_CHECK):]
+if missing:
+    # Both helpers must precede every user: the POSTCDEF rung was refactored
+    # into a static helper that sits ABOVE av1_decode_tg_tiles_and_wrapup, so
+    # anchor there when it exists and at the function itself otherwise.
     for anchor in ("static void ec_dump_postcdef(const AV1_COMMON *cm, int num_planes) {",
                    "void av1_decode_tg_tiles_and_wrapup(AV1Decoder *pbi, const uint8_t *data,"):
         if anchor in s:
-            s = s.replace(anchor, helper + anchor, 1)
+            s = s.replace(anchor, missing + anchor, 1)
             break
     else:
-        raise SystemExit("narrow-row helper: no anchor before the dump rungs")
-    print("narrow-row helper inserted")
+        raise SystemExit("dump helpers: no anchor before the dump rungs")
+    print("dump helpers inserted: %s"
+          % ("narrow-row + byte-count check" if len(missing) == len(helper)
+             else "byte-count check only"))
 
 row_loop = re.compile(
     r"for \(int ec_r = 0; ec_r < ec_b->(\w+); \+\+ec_r\)\n"
@@ -993,5 +1035,42 @@ if rewritten:
     print("narrow-row depth fix: rewrote %d plane row loops" % rewritten)
 else:
     print("narrow-row depth fix: no legacy row loop left (already depth-correct)")
+
+# Close each narrowing rung through the checker. Keyed on the presence of a
+# rewritten row loop, so rung 12 (EC_AV1_FINAL_DUMP, 2 bytes per sample and
+# already depth-correct) is never reached: its block has no ec_dump_narrow_row.
+# The terminator alternation keeps each block matched to ITS OWN close, so a
+# re-run cannot run a block's body forward into a later rung's fclose.
+dump_block = re.compile(
+    r'(FILE \*ec_f = fopen\(ec_path, "wb"\);)(.*?)'
+    r'((?:fclose\(ec_f\);)|(?:ec_dump_finish\([^;]*\);))',
+    re.S)
+
+WIRED = []
+
+def finish(match):
+    opened, body, closed = match.groups()
+    if "ec_dump_narrow_row" not in body:
+        return match.group(0)
+    # The rung name can sit ABOVE the fopen (the POSTCDEF rung was refactored
+    # into a helper that does getenv -> fopen at the top), so take the nearest
+    # preceding EC_AV1_* env lookup rather than searching the block body.
+    preceding = re.findall(r'getenv\("(EC_AV1_[A-Z_]+)"\)', s[:match.start()])
+    if not preceding:
+        raise SystemExit("dump check: no rung env var above a narrowing block")
+    aligned = 0 if "y_crop_height" in body else 1
+    if closed.startswith("fclose"):
+        WIRED.append(preceding[-1])
+    return "%s%s%s" % (
+        opened, body,
+        'ec_dump_finish(ec_f, "%s", ec_b, num_planes, %d);' % (preceding[-1], aligned))
+
+
+s, _ = dump_block.subn(finish, s)
+if WIRED:
+    print("dump byte-count check: wired into %d narrowing rung(s): %s"
+          % (len(WIRED), ", ".join(WIRED)))
+else:
+    print("dump byte-count check: every narrowing rung already checks its bytes")
 open(path, "w").write(s)
 PYN

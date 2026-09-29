@@ -214,3 +214,85 @@ Rules of thumb:
 - Rung 12 was already right and is the model to copy.
 - A segfaulting rung is silent about pixels; the file being 0 bytes is the only
   signal, and it looks exactly like a decoder crash from the outside.
+
+## 8. Addendum (round 2, after PASS) — loud failure and the derivation check
+
+### 8.1 Blast radius, stated plainly
+
+Affected rungs, all four of them, all of them on **every** 10/12-bit stream:
+`EC_AV1_PREFILT_DUMP`, `EC_AV1_POSTDEBLOCK_DUMP`, `EC_AV1_PREFILT_WIDE_DUMP`,
+`EC_AV1_POSTCDEF_DUMP`. `EC_AV1_FINAL_DUMP` (rung 12) was never affected and is
+still untouched.
+
+The **shared** oracle reproduces all four 139s on the same fixture
+(`~/.cache/aom-oracle/build/aomdec`, unmodified — see §5's last table), so this
+was pre-existing for every lane that ever paired against those four rungs, not
+something the private copy introduced. The damage is the *silence*: the rungs
+left a 0-byte file behind, which downstream reads as "the oracle has no data
+for this stage" and turns into a phantom stage diff — or, after the crash is
+noticed, as evidence about the decoder when it is evidence about the oracle.
+
+Rung 12 was correct all along, and that is what made the fix's shape obvious
+rather than a guess: it is the one rung that calls
+`CONVERT_TO_SHORTPTR(ec_p8[ec_pl])` and passes `2` as the element size. The
+four broken rungs are the same code with that one conversion missing.
+
+### 8.2 The failure is now loud
+
+`ec_dump_finish()` is called instead of `fclose()` by all four narrowing rungs
+(rung 12 keeps its own `fclose`). It compares the bytes the rung just wrote
+against the shape that rung claims — `Y + U + V` at one byte per sample, crop
+extent for PREFILT, mi-aligned extent for the other three — and on a mismatch
+prints one line and `abort()`s:
+
+```
+EC_DUMP_ABORT rung=EC_AV1_PREFILT_DUMP bit_depth=12 hbd=1 expect=30720 wrote=30560 (one byte per sample, Y+U+V)
+```
+
+Measured non-vacuity: dropping PREFILT's last luma row (`ec_r <
+y_crop_height - 1`) makes aomdec exit **134** with exactly that line; restoring
+it gives exit 0 and 30720 B. A future narrowing regression now dies inside the
+oracle with a self-naming message instead of handing the decoder an empty file.
+
+No configuration legitimately writes 0 bytes: a frame's crop extent is
+non-zero by construction, and a failed `fopen` skips the whole block, so a bad
+output path is a missing file, not an abort. Monochrome streams are handled
+(`expect = Y` when `num_planes == 1`).
+
+Wiring is keyed on the presence of a rewritten `ec_dump_narrow_row` call in the
+block, so rung 12 cannot be reached by the rewriter, and the terminator
+alternation (`fclose(ec_f);` or an existing `ec_dump_finish(...)`) keeps each
+block matched to its own close — a re-run cannot run one block's body forward
+into a later rung's `fclose`.
+
+### 8.3 Anti-regression for the script itself
+
+`scripts/check-aom-oracle-rungs.sh` — a runnable command, not a note:
+
+```
+scripts/check-aom-oracle-rungs.sh [SRC_DIR] [BASE_REF]   # defaults: ~/.cache/aom-oracle/src, v3.13.3
+```
+
+It copies the oracle source to a scratch dir (the real tree is never written),
+replaces `av1/decoder/decodeframe.c` with the **pristine upstream** file from
+`$BASE_REF`, runs `instrument-aom-oracle.sh` over the copy, and asserts:
+
+- 0 legacy `fwrite(ec_b->…_buffer + ec_r*ec_b->…, 1, …)` row loops;
+- exactly 12 `ec_dump_narrow_row` call sites (4 rungs x 3 planes);
+- exactly 4 `ec_dump_finish` call sites, one per named narrowing rung;
+- rung 12 still calls `CONVERT_TO_SHORTPTR` and is NOT routed through the
+  narrowing checker;
+- a second run of the instrument script changes nothing (idempotence).
+
+Current output: 10 `ok` lines, exit 0. Non-vacuity: with the depth block
+deleted from a copy of the script, the same command prints 7 `FAIL` lines —
+`legacy u8 row loops left: got 12, want 0` — and exits 1, in under a second and
+with no build. A future edit that reintroduces the old expression reds on the
+derivation path instead of on somebody's decode.
+
+### 8.4 Bytes unchanged by the loudness work
+
+Re-ran the full pairing after wiring the checker: `av112bit-key.obu` (12-bit)
+and `palette_screen_witness_10bit.obu` (10-bit), all four rungs, oracle vs
+decoder — all `IDENTICAL` (30720 B and 73728 B). The checker only reads
+`ftell`; it cannot move a byte.
