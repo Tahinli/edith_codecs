@@ -712,3 +712,120 @@ The rule this lane earns, on top of r3's: **a fix can blind the check that was
 watching the shape it changed.** The pin inventory went from blind, to correct, to
 blind-again-in-a-new-guise, across three commits in three rounds. The floor and the
 synthetic capability tests are what make that survivable.
+
+---
+
+# r6 — name the real cause, classify the defect, and report the 44
+
+Branch `lane-av1pins5`. Commit `02c8e7a8`. Tests and test helpers only. Not
+pushed; main untouched.
+
+**Canonical branch: `lane-av1pins5`.** `av1pinslive` is a **stale duplicate** at
+`2e5509e9` with no work of its own beyond r4; every r5/r6 commit is here only.
+`av1pinslive` can be dropped. No pins are at risk either way — all 18 recovered
+pins are committed.
+
+## 1. The change that matters: the failure now names the real cause
+
+Before, a caller passing our own decode's length got:
+
+```
+expected N 4:2:0 frames, ffmpeg said: <empty>
+```
+
+Empty tail, because ffmpeg runs at `-v error` and succeeds. It named ffmpeg, said
+nothing about where `N` came from, and sent the reader hunting ffmpeg for a count
+ffmpeg never chose.
+
+All three helpers (`ffmpeg_decode_sequence`, `_10bit`, `_444`) now share
+`frame_count_diagnosis`. Measured with the same probe r5 used:
+
+```
+FRAME COUNT MISMATCH (4:2:0 192x128): the caller passed `frames=0`, ffmpeg produced
+1 frame(s) (36864 bytes, 0 byte(s) not a whole frame, at 36864 B/frame).
+`frames` is the EXPECTED count the CALLER asserted -- it is NOT measured from ffmpeg,
+so it never had ffmpeg's agreement. If it came from our own decode_stream(), this is
+OUR decoder disagreeing with ffmpeg about how many frames the stream holds, and the
+fix is on OUR side, not ffmpeg's. ffmpeg itself exited cleanly with no diagnostics.
+```
+
+**This converts most of the 44 from confusing to diagnosable without touching a
+single caller** — which is exactly the de-risking Main asked for, since "48 edits
+of unclear value" was the risk.
+
+## 2. Two defect classes, named so r4 is not repeated
+
+The sweep's doc comment now states:
+
+* **MISATTRIBUTED RED** — a wrong count reds, and the old message blamed ffmpeg.
+  **This is what these sites are.** The `stdout.len() == frame_bytes * frames`
+  assert is unconditional, so a wrong count cannot pass silently.
+* **SILENT PASS** — the compare is skipped or truncated and the gate reports green.
+  A *different* defect with a *different* fix. **These sites are not that.**
+
+## 3. The sweep: 61 sites, 17 spec-pinned, 44 not, 30 distinct gates
+
+Two detection bugs of mine, both inflating the number:
+
+* `assert_eq!` is split across lines by rustfmt (`assert_eq!(` then
+  `frames.len(),`), so a one-line containment check missed every multi-line
+  spelling. Now matched over a two-line window: **13 → 17** spec-pinned.
+* The body slice used to classify each gate is a hand-rolled brace walk, and raw
+  byte counting treats a `}` inside a format string as a closing brace — the same
+  trap that made `stream.rs` look two braces short in the first review of this wave.
+
+**The `pixel_comparing` column is APPROXIMATE and under-reports, and I am not
+building the 44-row table on it.** I sampled three gates it marks `false` and all
+three plainly compare planes (`a_real_aomenc_stream_with_rect_palette…` 4
+plane-compare lines, `…palette_stream_with_8x8_leaves…` 5,
+`a_16x4_intrabc_pair_strip…` 1). The column's `line`, `gate` and `count_expr`
+are exact — a line-based scan with no body slicing — but whether a gate
+pixel-compares needs a reader, not a regex.
+
+## 4. The table — 44 sites, exact columns
+
+`file:line | gate | count source before | fixture's own count known? | status`
+
+| file:line | gate | count source before → after | fixture count known? | status |
+|---|---|---|---|---|
+| stream.rs:3895 | `a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact` | `pictures.len()` → unchanged | no (live aomenc; use the encode's frame count) | reported |
+| stream.rs:5414 | `an_svt_screen_palette_block_with_a_split_transform_decodes_exactly` | `decoded.len()` → unchanged | no (SVT stream read from a file) | reported |
+| stream.rs:10135 | `a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact` | `frames.len()` → unchanged | yes (the gate's own `frames` const) | reported |
+| stream.rs:10354, :10356 | `rect_tx_tool_gate` | `decoded.len()` ×2 → unchanged | yes (encode frame count) | reported |
+| stream.rs:10834 | `a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips` | `frames.len()` → unchanged | yes | reported |
+| stream.rs:11005 | `a_16x4_intrabc_pair_strip_decodes_pixel_exact` | `frames.len()` → unchanged | yes (pinned fixture) | reported |
+| stream.rs:11077 | `a_lossless_16x4_chroma_pair_repairs_the_measured_site` | `frames.len()` → unchanged | yes (pinned fixture) | reported |
+| stream.rs:11465, :11608 | `a_coded_rect_intrabc_block_reconstructs_in_both_orientations` | `frames.len()` ×2 → unchanged | yes | reported |
+| stream.rs:11851, :11853 | `an_sb128_screen_stream_with_intrabc_decodes_pixel_exact` | `frames.len()` ×2 → unchanged | yes | reported |
+| stream.rs:12239 | `a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal` | `frames.len()` → unchanged | n/a (census/probe) | report-only |
+| stream.rs:12314 | `an_intrabc_vartx_census_measures_the_mixed_leaf_refusal` | `frames.len()` → unchanged | n/a (census/probe) | report-only |
+| stream.rs:12418 | `a_real_aomenc_intrabc_mixed_vartx_tree_decodes_without_the_mixed_leaf_refusal` | `frames.len()` → unchanged | no (live aomenc) | reported |
+| stream.rs:12720 | `an_intrabc_block_under_tx_mode_select_decodes_pixel_exact` | `frames.len()` → unchanged | yes | reported |
+| stream.rs:12781 | `a_real_aomenc_stream_with_cdf_update_disabled_decodes_pixel_exact` | `frames.len()` → unchanged | no (live aomenc) | reported |
+| stream.rs:12987, :12989 | `a_real_aomenc_stream_with_rect_strip_palette_decodes_pixel_exact` | `frames.len()` ×2 → unchanged | no (live aomenc) | reported |
+| stream.rs:15126 | `first_diff` (helper) | `decoded.len()` → unchanged | n/a (diagnostic helper) | report-only |
+| … 27 more across 15 gates | — | `frames.len()` / `decoded.len()` | mixed | reported |
+
+The full 44-line list is printed by `every_locally_derived_oracle_count_is_reported`
+on every run, so it cannot drift from the source.
+
+**None fixed in this commit beyond r4's.** The per-site fix is to derive each count
+from the fixture — a recorded frame count, a parsed OBU frame count, a length
+assert on the pinned stream — or, for a live-aomenc gate, from **the encoder's own
+frame count**, not from our decode. That is 30 gates of real work and it is the
+next lane.
+
+## 5. State
+
+`lane-av1pins5`, four commits on top of `2e5509e9`. `cargo check -p ec-av1
+--all-targets` clean, **0 warnings**. `gate_coverage` 15 passed,
+`refusal_inventory` 15, `count_vacuity` 2, `pin_inventory` 3, `pinned_golden3`
+green. `#[ignore]` unchanged at 34. Not verified: a full `cargo test -p ec-av1`
+run (project-wide validation is Main's).
+
+The rule r6 adds, on top of r3's and r5's: **a scanner's own columns are only as
+trustworthy as the slice it parsed, and a column that is "approximately right" is
+worse than no column** — because a 44-row table built on it would send a lane
+after the wrong gates. Two of the four bugs in this lane's scanners were exactly
+this: a slice that stopped at `len()`'s own paren, and a brace count that did not
+skip string literals.
