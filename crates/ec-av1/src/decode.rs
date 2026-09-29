@@ -9903,9 +9903,7 @@ impl Neighbours {
             fill_span(&mut self.uv_owner, row * stride + mi_c, n, owner);
         }
         if crate::envflags::env_flag!("EC_LEFTSSY") {
-            eprintln!(
-                "EC_LEAF mi=({mi_r},{mi_c}) wh=({mi_w},{mi_h}) uv_mode={uv_mode}"
-            );
+            eprintln!("EC_LEAF mi=({mi_r},{mi_c}) wh=({mi_w},{mi_h}) uv_mode={uv_mode}");
         }
     }
 
@@ -12547,6 +12545,17 @@ fn intra_in_inter_size_row(bw: usize, bh: usize) -> Option<(usize, usize)> {
 /// stream can present.
 #[test]
 fn every_intra_in_inter_shape_the_census_lists_has_a_size_group_row() {
+    // lane-av1refusalspan: this gate is the PROOF for the refusal below, so it
+    // names that string exactly (placeholders included) and pins its guard
+    // site. The enumeration below establishes the shape domain; on its own it
+    // never said WHICH string the domain was about, so under a real function
+    // boundary -- rather than a window that ran into the next test -- the row
+    // read as unanchored.
+    const REFUSAL: &str = "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)";
+    assert!(
+        include_str!("decode.rs").contains(REFUSAL),
+        "this gate proves {REFUSAL:?}, but that string is no longer in decode.rs"
+    );
     let mut checked = 0;
     for &(side, w, h) in &INTER_BLOCK_SHAPES {
         if (w, h) == (side, side) || w.min(h) < 8 || w.max(h) > 64 {
@@ -12639,6 +12648,13 @@ const BLOCK_SIZES_ALL_WH: [(usize, usize); 22] = [
 /// clause rejects before the lookup.
 #[test]
 fn every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row() {
+    // lane-av1refusalspan: this gate is the PROOF for the refusal below, so it
+    // names it and pins its guard site.
+    const REFUSAL: &str = "a motion_mode symbol for a block shape with no CDF row here";
+    assert!(
+        crate::refusal_inventory::pins_refusal(include_str!("decode.rs"), REFUSAL),
+        "this gate proves {REFUSAL:?}, but that string is no longer in decode.rs"
+    );
     let mut rows = std::collections::BTreeSet::new();
     let mut excluded = 0;
     for (w, h) in BLOCK_SIZES_ALL_WH {
@@ -13910,8 +13926,10 @@ fn decode_intrabc_rect(
                         // its own mi row/column on a 4:4:4 lossless frame, and
                         // the whole block's per-unit states are stamped over
                         // cells that belong to other blocks (or to nothing).
-                        (mi_r + ur * ((4 << ss_y(fctx)) / MI),
-                         mi_c + uc * ((4 << ss_x(fctx)) / MI)),
+                        (
+                            mi_r + ur * ((4 << ss_y(fctx)) / MI),
+                            mi_c + uc * ((4 << ss_x(fctx)) / MI),
+                        ),
                         4 << ss_x(fctx),
                         4 << ss_y(fctx),
                         plane_idx,
@@ -27948,6 +27966,18 @@ fn sub_tx_size_map_matches_libaom() {
 ///   case the refusal is guarded by.
 #[test]
 fn a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered() {
+    // lane-av1refusalspan: this gate is the PROOF for both var-tx refusals, so
+    // it names both and pins both guard sites. The walk below proves the leaf
+    // domain; it never said which two strings that domain was about.
+    for refusal in [
+        "an inter var-tx tree with a leaf transform larger than 32x32",
+        "an inter var-tx tree with a leaf transform larger than 64x64",
+    ] {
+        assert!(
+            crate::refusal_inventory::pins_refusal(include_str!("decode.rs"), refusal),
+            "this gate proves {refusal:?}, but that string is no longer in decode.rs"
+        );
+    }
     // Every leaf `read_var_tx_size` can reach from `entry`, as (depth, w, h).
     fn reachable(entry: (usize, usize), depth: usize, out: &mut Vec<(usize, usize, usize)>) {
         out.push((depth, entry.0, entry.1));
@@ -28553,6 +28583,21 @@ fn rect_scan(w: usize, h: usize) -> Result<&'static [u16]> {
 /// loop, which is why they are skipped below.
 #[test]
 fn every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan() {
+    // lane-av1refusalspan: this gate is the PROOF for THREE refusals, so it
+    // names all three and pins all three guard sites. The census below proves
+    // the shape domain and, on its own, named NONE of the strings that domain
+    // was about -- under a real function boundary rather than a window that
+    // ran into the next test, all three rows read as unanchored.
+    for refusal in [
+        "a rectangular inter luma transform unit whose shape has no coefficient table set here",
+        "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
+        "a rectangular transform unit whose shape has no coefficient scan table here",
+    ] {
+        assert!(
+            include_str!("decode.rs").contains(refusal),
+            "this gate proves {refusal:?}, but that string is no longer in decode.rs"
+        );
+    }
     let fctx = &crate::decode::FrameCtx::new();
     let corner_scan = |w: usize, h: usize| {
         let (cw, ch) = (w.min(32), h.min(32));
@@ -28637,9 +28682,8 @@ fn read_block_tx_size_rect(
         let full_h_mi = bh / MI;
         if max_w_mi != full_w_mi || max_h_mi != full_h_mi {
             LOSSLESS_EDGE_CLIPPED.with(|c| c.set(c.get() + 1));
-            LOSSLESS_EDGE_CLIP_UNITS.with(|c| {
-                c.set(c.get() + (full_w_mi * full_h_mi - max_w_mi * max_h_mi))
-            });
+            LOSSLESS_EDGE_CLIP_UNITS
+                .with(|c| c.set(c.get() + (full_w_mi * full_h_mi - max_w_mi * max_h_mi)));
         }
         let mut leaves = Vec::with_capacity(max_w_mi * max_h_mi);
         for row in 0..max_h_mi {
@@ -54497,6 +54541,16 @@ mod tests {
     #[test]
     fn every_inter_record_publishes_an_obmc_readable_filter() {
         let src = include_str!("decode.rs");
+        // lane-av1refusalspan: this gate is the PROOF for the refusal below, so
+        // it names it and pins its guard site. The sibling test
+        // `an_obmc_neighbour_with_no_recorded_filter_refuses_instead_of_panicking`
+        // carries the same string 27k lines away in this file -- exactly the
+        // reach a window that is not a function boundary used to have.
+        const REFUSAL: &str = "an OBMC neighbour whose switchable interp filter was never recorded";
+        assert!(
+            crate::refusal_inventory::pins_refusal(&src, REFUSAL),
+            "this gate proves {REFUSAL:?}, but that string is no longer in decode.rs"
+        );
         let mut calls = 0usize;
         for (start, _) in src.match_indices("record_inter_rect_mi(") {
             // Skip the definition and the wrapper's own forwarding call.
@@ -54576,8 +54630,13 @@ mod tests {
     /// open half of this proof.
     #[test]
     fn a_selected_reference_with_an_empty_ref_frame_idx_slot_refuses_by_name() {
-        const REFUSAL: &str =
-            "a reference frame selected with no picture at this frame's own ref_frame_idx slot";
+        // lane-av1refusalspan: the FULL refusal, not a prefix of it. This gate
+        // is the proof for the row in `refusal_inventory`, whose anchor is the
+        // whole string (it carries no `(` and no `:`), and this const is what
+        // that anchor reads. Shortened to `...own ref_frame_idx slot` it
+        // stopped being a pin on the guard's text.
+        const REFUSAL: &str = "a reference frame selected with no picture at this frame's own \
+             ref_frame_idx slot for it";
         let pic = Picture {
             width: 4,
             height: 4,

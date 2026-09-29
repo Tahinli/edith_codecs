@@ -4417,6 +4417,14 @@ pub(crate) mod tests {
     /// re-deriving the formula here.
     #[test]
     fn every_frame_size_a_header_can_code_has_a_mode_info_grid() {
+        // lane-av1refusalspan: this gate is the PROOF for the refusal below, so
+        // it names it and pins its guard site (the decode-path guard in
+        // decode.rs carries the same string).
+        const REFUSAL: &str = "a frame with no mode-info grid";
+        assert!(
+            crate::refusal_inventory::pins_refusal(include_str!("stream.rs"), REFUSAL),
+            "this gate proves {REFUSAL:?}, but that string is no longer in stream.rs"
+        );
         let mut sizes: Vec<u32> = (1..=1024).collect();
         sizes.extend([2048, 4095, 4096, 8192, 16384, 32768, 65535, 65536]);
         // `mi_cols` is nondecreasing in `frame_width`, so an empty grid can
