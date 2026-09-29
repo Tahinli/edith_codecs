@@ -264,3 +264,86 @@ r1 reported is gone — lane-av1toolgates' entries were retired upstream).
   because the source-scan pattern for a whole-file assertion is itself a new
   piece of machinery, and this lane's charter is the probe. It is the obvious
   next step and it is small.
+
+---
+
+# r3 — the mechanical anti-regression: the class can no longer be reopened silently
+
+r2 left the class closed *currently* and the anti-regression *procedural*: a
+new guard written as `aomdec_path().is_file()` compiles, passes review, and
+re-opens exactly the hole r2 closed — which is how the five r2 sites got there
+in the first place. r3 replaces the review rule with a check that reads the
+source.
+
+## 11. The scan
+
+`gate_coverage::tests::no_tool_presence_check_outside_its_probe`, in
+`crates/ec-av1/src/gate_coverage.rs` — the crate's existing source-scan home
+(it already `include_str!`s `stream.rs` to re-derive the gates' recipes from
+their own text), extended to all three test-bearing files.
+
+**The rule.** A tool presence check — `aomenc_path().is_file()`,
+`aomdec_path().is_file()`, `affine_aomenc_path().is_file()`, plain or `!…`
+inverted — may appear only
+
+1. inside the body of the probe that owns that path (`have_aomenc`,
+   `aomdec_available`, `have_affine_aomenc`), where the assert-last and the
+   env escape live; the scan computes each probe's line span from its `fn`
+   opener to the first column-0 `}` and asserts it found all three, so a moved
+   or renamed probe reds rather than silently exempting the whole crate;
+2. inside an `assert!` (the deliberate hard-failure form); or
+3. in a comment, which cannot execute.
+
+Anything else fails the test naming the exact `file:line`, the line's text, and
+what to do about it. Current state:
+
+```
+oracle-presence scan: 7 site(s) inspected, 7 in a probe / assert / comment,
+0 offender(s); per pattern {"affine_aomenc_path().is_file()": 1,
+"aomdec_path().is_file()": 5, "aomenc_path().is_file()": 1}
+```
+
+**The floors.** A source scan that matches nothing is the false-pass shape
+this batch has been bitten by twice (a `format!` brace escape, and
+`args.find(')')` stopping at the wrong paren), so there are two, not one:
+
+* a total floor, `MIN_SITES = 5` — the STRUCTURAL count (three probes + two
+  hard asserts), so prose that comes and goes with the doc comments is counted
+  but never load-bearing;
+* a **per-pattern** floor — each of the three path patterns must match at
+  least once. A total alone hides a single broken matcher: mutating ONE
+  pattern still leaves the other two adding up (measured: with
+  `aomdec_path().exists()` substituted, the scan still reported 6 sites and
+  passed). The per-pattern floor is what catches that.
+
+The per-pattern floor earned its place on its FIRST run, by catching a real
+bug in the matcher written one line above it: `affine_aomenc_path().is_file()`
+CONTAINS `aomenc_path().is_file()`, so a first-match scan credited the affine
+probe's line to the aomenc pattern and the affine pattern matched nothing. The
+matcher now takes the LONGEST match, and the floor is what noticed.
+
+## 12. Mutation proofs, both directions
+
+Both mutations were made, run, and reverted; `git diff crates/ec-av1/src/stream.rs`
+is empty afterwards and the scan is green.
+
+| mutation | result |
+|---|---|
+| a bare `if aomdec_path().is_file() { let _ = 1; }` injected into `gate_444_lossy_live_exact` | **RED**, naming the site: `1 bare tool presence check(s) outside a probe … stream.rs:7634: if aomdec_path().is_file() {` |
+| one pattern replaced by a non-matching `aomdec_path().exists()` | **RED** on the per-pattern floor: `the oracle-presence scan matched NOTHING for ["aomdec_path().exists()"] … that pattern is stale (renamed helper, exists() instead of is_file(), a format! escape) and the gates it was meant to police would pass unreviewed` |
+| both reverted | **GREEN**, 7 sites inspected, 0 offenders |
+
+`touch` ran on every scanned source before every one of those runs — these
+scans read compile-time sources, and a stale build would otherwise have read
+the pre-mutation text.
+
+## 13. Status
+
+* `cargo test -p ec-av1 --lib -- gate_coverage refusal_inventory` -> **27
+  passed, 0 failed** (26 in r2, plus this scan).
+* The six gates the review named still pass with the oracle present (5 run in
+  the final check: `5 passed, 0 failed`).
+* Shape A is unchanged and still not a hole: the ~445
+  `if !have_aomenc()` / `if !have_ffmpeg()` early returns call probes that
+  assert last with the env escape, and the affine probe is now covered by this
+  scan as well. What is gone is the only shape that had no probe at all.
