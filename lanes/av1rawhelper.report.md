@@ -142,3 +142,131 @@ and neither is a false green):
   fixing here.
 - `ffmpeg_decode_sequence*` all hard-code their own pix_fmt and size-assert before unpacking,
   so a depth mismatch is a loud failure there too.
+
+---
+
+# r2 — rebase onto main and fix the stranded call site
+
+**Rework reason (Main, from an independent review):** the 4-arg → 5-arg signature change
+stranded a call site this branch never saw. `git merge-tree` reported the merge CLEAN and the
+merged tree then failed to compile with E0061.
+
+**The trap, stated once: a signature change must be validated by COMPILING the merged result,
+not by `git merge-tree`'s conflict report.** `merge-tree` reasons about content overlap, not
+about arity — a call site on lines the signature diff never touches is a non-conflict to it and
+an E0061 to rustc.
+
+## 1. Rebase and the full call-site set
+
+Rebased `lane-av1rawhelper` onto current main `9b2f6c9ddb5c704e7649900c704b911e6822cd43`
+(clean rebase, 1 commit replayed → `8bf6c4fe`). The call-site set was then re-established from
+the CURRENT tree with `grep -rn "assert_rawvideo_matches(" crates/`, not from the branch's
+pre-rebase view.
+
+| | count | sites (rebased tree) |
+|---|---|---|
+| before r2 | 2 real call sites, 1 of them 4-arg stranded | `stream.rs:7071` (updated), `stream.rs:7165` (**stranded**, 4-arg) |
+| after r2 | 2 real call sites, both 5-arg | `stream.rs:7071`, `stream.rs:7165` |
+
+(The r1 gate contributes 2 more call sites of its own — `stream.rs:5232` and `:5247` — which
+are the deliberate wrong-label and correct-label arms.)
+
+**Depth of the stranded site, from the bytes.** `stream.rs:7165` belongs to
+`a_lossless_block_clips_its_transform_grid_at_the_frame_edge`, added by `7b9f46fa`, which the
+r1 base `7f8817cb` predates. Its depth is **not** taken from the gate's doc prose, which says
+"128x96 yuv444p 4:4:4 lossless" without naming a depth. It is read off the pin's own parsed
+sequence header via the crate's own parser:
+
+```
+$ cargo run -p ec-av1 --example decode_probe -- fixtures/ll444_128root_lossless.obu
+SEQ: use_128x128_superblock=true bit_depth=10 mono_chrome=false max_frame=128x96
+$ cargo run -p ec-av1 --example decode_probe -- fixtures/ll444_minp64_128root_control.obu
+SEQ: use_128x128_superblock=true bit_depth=10 mono_chrome=false max_frame=128x96
+```
+
+Both pins are genuinely 10-bit, so both sites take `10` — and the new in-helper assert
+independently re-derives and confirms that at runtime, so a wrong label here could not pass
+silently.
+
+## 2. Both gates green (tails)
+
+```
+$ cargo test -p ec-av1 --lib the_rawvideo_helper_compares_real_samples -- --nocapture
+the_rawvideo_helper_compares_real_samples_at_the_streams_own_bit_depth:
+  6 8-bit frame(s) byte-identical to aomdec --rawvideo
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 742 filtered out
+```
+
+```
+$ cargo test -p ec-av1 --lib a_lossless_block_clips_its_transform_grid_at_the_frame_edge -- --nocapture
+running 1 test
+test stream::tests::a_lossless_block_clips_its_transform_grid_at_the_frame_edge ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 742 filtered out
+```
+
+The second tail is the one that matters: `a_lossless_block_clips_its_transform_grid_at_the_frame_edge`
+is the gate that owns the stranded site, so its green is the proof that the site the branch
+never saw is now correct — and it is a real 6-frame `aomdec --rawvideo` compare at 10-bit, not
+a compile-only pass.
+
+## 3. `cargo check -p ec-av1 --all-targets`
+
+**CLEAN.** No errors, no warnings:
+
+```
+$ touch crates/ec-av1/src/stream.rs && cargo check -p ec-av1 --all-targets
+    Checking ec-av1 v0.1.0 (/home/tahinli/.cache/wt/av1rawhelper/crates/ec-av1)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.36s
+```
+
+(The `touch` is load-bearing: an earlier run reported `Finished in 0.01s` off a cached binary,
+which is not evidence of anything.)
+
+## 4. The merged result itself, compiled
+
+Checking the branch alone is not the check — the defect only exists in the MERGED tree. So the
+merge was materialised and compiled:
+
+```
+$ git merge-tree --write-tree main HEAD          # tree 7125a2a3
+$ git commit-tree 7125a2a3 -p main -p HEAD -m "merge-sim"   # 72954a27
+$ git worktree add --detach ~/.cache/wt/av1rawhelper-merge 72954a27
+$ cargo check -p ec-av1 --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.81s
+```
+
+**The merged result compiles clean.** Its call sites are the ones the branch intended:
+
+```
+5079:    fn assert_rawvideo_matches(
+5232:            assert_rawvideo_matches(&obu, &stream, NAME, frames, 10);
+5247:        assert_rawvideo_matches(&obu, &stream, NAME, frames, 8);
+7071:            assert_rawvideo_matches(&ctrl, &ctrl_stream, NAME, FRAMES, 10);
+7165:            assert_rawvideo_matches(&obu, &stream, NAME, FRAMES, 10);
+```
+
+### Red-before for the rework
+
+With `stream.rs:7165` reverted to its 4-arg form inside the merged tree, the merged result
+fails at exactly the line and error the review reported:
+
+```
+error[E0061]: this function takes 5 arguments but 4 arguments were supplied
+    --> crates/ec-av1/src/stream.rs:7165:13
+     |
+7165 |             assert_rawvideo_matches(&obu, &stream, NAME, FRAMES);
+     |             ^^^^^^^^^^^^^^^^^^^^^^^------------------------ argument #5 of type `u8` is missing
+error: could not compile `ec-av1` (lib test) due to 1 previous error
+```
+
+The line and the error match the review's finding, and `git merge-tree` had called this same
+merge CLEAN. Restored to the 5-arg form it compiles clean again; the scratch merge worktree and
+its target dir were removed.
+
+## 5. Process note
+
+Any lane that changes a function signature in this crate should, before reporting done:
+establish the call-site set from the current tree, and then compile a materialised merge
+(`git merge-tree --write-tree` + `git commit-tree` + worktree + `cargo check`) rather than
+trusting the conflict report. Signature churn during a multi-lane merge wave is the exact
+condition under which `merge-tree` is confidently wrong.
