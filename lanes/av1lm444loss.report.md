@@ -256,3 +256,102 @@ lane's invariant names.
   than libaom's floor `h >> 3`; the two agree on every multiple-of-8 height,
   which is the fixture's 96, and differ by at most one 4-px transform row
   otherwise — the same approximation the shipped var-tx branch already carries.
+
+---
+
+# Appendix r2 — lead (b): the blocking defect, diagnosed in full
+
+Written BEFORE the fix, so the diagnosis survives even if the work stops here.
+
+## The line
+
+`crates/ec-av1/src/decode.rs`, `decode_intrabc_rect`, line 13065 and line 13070
+at the base tree:
+
+```rust
+let (cpx, cpy) = (px / 2, py / 2);   // line 13065
+let (cw, ch) = (bw / 2, bh / 2);    // line 13070
+```
+
+Both are a **hardcoded 4:2:0 halving**. The chroma plane block's true geometry
+is `bw >> ss_x(fctx)` x `bh >> ss_y(fctx)` at `(px >> ss_x(fctx),
+py >> ss_y(fctx))`. At `ss (0,0)` (4:4:4) `ss_x = ss_y = 0`, so every one of
+those four values is halved when it must not be.
+
+## Mechanism
+
+`decode_intrabc_rect` serves a 1:4 rect partition inside an IntraBC block. Its
+chroma arm calls
+
+```rust
+read_inter_plane_rect(dec, cdfs, rect_inter_chroma_set(cw, ch)?, (cw, ch),
+                      cside, plane, around[plane], ...)
+```
+
+with the halved `(cw, ch)`. On a **lossless** block that shape reaches
+`TxParams::run`, whose lossless arm is the 4x4 Walsh-Hadamard path and carries
+
+```rust
+debug_assert_eq!((self.w, self.h), (4, 4));
+```
+
+So a lossless 4:4:4 rect block whose halved chroma shape is rect (any 1:4
+strip: 8x16 -> 4x8, 4x32 -> 2x16, ...) asserts. Release builds compile the
+`debug_assert` out, `dequant_and_inverse_wht4x4` returns a buffer shorter than
+`w * h`, and the failure surfaces one frame later in the strided residual copy:
+
+```
+thread 'main' panicked at crates/ec-av1/src/decode.rs:2823:59:
+range end index 4 out of range for slice of length 0
+```
+
+which is the release-mode face of the same defect.
+
+## Evidence
+
+Recipe `testsrc2 512x128 yuv444p --lossless=1 --cpu-used=2 --lag-in-frames=0
+--kf-max-dist=100 --limit=6` (121844 bytes), base tree, debug build:
+
+```
+thread 'main' panicked at crates/ec-av1/src/decode.rs:2787:13:
+assertion `left == right` failed
+  left: (4, 8)
+ right: (4, 4)
+   4: <ec_av1::decode::TxParams>::run
+   5: ec_av1::decode::push_mc_rect_tx
+   6: ec_av1::decode::read_inter_plane_rect
+   7: ec_av1::decode::decode_intrabc_rect
+   8: ec_av1::decode::decode_leaf_rect
+   9: ec_av1::decode::decode_key_frame_tile_with_cdfs
+```
+
+A temporary env-gated probe at `decode_intrabc_rect`'s residual split isolates
+which side is wrong:
+
+```
+EC_PROBE_IBC mi=(28,106) bw=8 bh=16 lossless=true leaves=Some(8)
+```
+
+`leaves=Some(8)` with `bw=8, bh=16` is **2 x 4 = 8 TX_4X4 units** — the lossless
+leaf builder is CORRECT and produced no rect luma unit at all. The `(4, 8)` in
+the assert therefore cannot be luma. At 4:4:4 this block's chroma plane block is
+8x16; the hardcoded halving turns it into 4x8, which is exactly the `left`
+value in the assert. `ss_x = ss_y = 0`, so `(bw >> ss_x, bh >> ss_y)` is a
+no-op there and `(bw / 2, bh / 2)` is a pure error.
+
+Confirming it is the ONLY blocker on this stream: the identical recipe re-encoded
+with `--enable-intrabc=0` (118365 bytes, which never routes through
+`decode_intrabc_rect`) decodes on this tree **byte-exact against the oracle
+aomdec on all six frames**. So the 18779 -> 130708 damage and the 459866 vs
+369136 `EC_SYMR` asymmetry the sweep recorded are behind this line, not
+independent of it.
+
+## Class and ownership
+
+Same class `av1tilerows` landed in the lossless 16x4/4x16 chroma-pair walk: a
+hardcoded 4:2:0-shaped chroma reach at 4:4:4. `decode_intrabc_rect` is a
+different function from the one that lane fixed and carries its own gates
+(`a_lossless_444_intrabc_rect_leaf_walks_per_4x4_units`,
+`a_skipped_lossless_intrabc_rect_strip_zeroes_its_entropy_bands`), which is why
+r1 reported rather than fixed it. Appendix r3 takes it on, on this branch, with
+those gates as the blast-radius check.
