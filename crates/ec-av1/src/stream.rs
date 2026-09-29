@@ -45060,7 +45060,8 @@ pub(crate) mod tests {
     /// set can decide (the kf900 gate above owns the exactness side).
     #[test]
     fn a_committed_4to20_stream_presents_a_one_mi_left_neighbour_to_a_decode_path_read() {
-        const NAME: &str = "a_committed_4to20_stream_presents_a_one_mi_left_neighbour_to_a_decode_path_read";
+        const NAME: &str =
+            "a_committed_4to20_stream_presents_a_one_mi_left_neighbour_to_a_decode_path_read";
         // (fixture, frames, width, height, measured split-owner reads)
         let arms: [(&str, usize, usize, usize, usize); 2] = [
             ("gm_small_side_witness.obu", 33, 1920, 792, 5),
@@ -45081,11 +45082,7 @@ pub(crate) mod tests {
                 Err(e) => panic!("{NAME}: {fixture} refused: {e}"),
             };
             let split = crate::decode::uv_left_1mi_split_hits() - before_split;
-            assert_eq!(
-                frames.len(),
-                want_frames,
-                "{NAME}: {fixture} frame count"
-            );
+            assert_eq!(frames.len(), want_frames, "{NAME}: {fixture} frame count");
             assert!(
                 frames
                     .iter()
@@ -47282,5 +47279,193 @@ pub(crate) mod tests {
             pinned.len(),
             heads.iter().map(|h| h.superres_denom).collect::<Vec<_>>()
         );
+    }
+
+    /// lane-av1lossy128x96: the 128x96 sibling of the pinned 128x128 witness
+    /// `a_pinned_444_inter_stream_chroma_units_inherit_their_own_quadrants_tx_type`
+    /// (commit 6c33f204). That fix closed the "4:4:4 lossy + TX size search"
+    /// divergence (H2) for the 128x128 twin; the 128x96 geometry -- two whole
+    /// 64x64 roots over a frame whose second block row is only 32 rows tall,
+    /// which is why it exercises BOTH chroma planes and a partial block row --
+    /// was left ungated, and it is the geometry the sweep measured the
+    /// U+V form of the defect on (608 wrong samples from decode-order frame 2).
+    ///
+    /// Measured for this lane on the fix's parent `4155c7c7`: decode-order
+    /// frames 2 and 3 differ from the oracle in 608 and 692 samples (luma
+    /// exact, U and V wrong), entropy bit-identical; at HEAD and at `6c33f204`
+    /// all four frames are byte-exact. So the defect is FIXED and this gate is
+    /// the pin that keeps it fixed.
+    ///
+    /// Recipe (encoded LIVE, no fixture): `testsrc2 128x96:rate=25` yuv444p
+    /// 4 frames, `aomenc --profile=1 --codec=av1 --passes=1 --end-usage=q
+    /// --cq-level=20 --cpu-used=2 --sb-size=64 --min-partition-size=64
+    /// --max-partition-size=64 --enable-tx-size-search=1 --threads=1 --row-mt=0
+    /// --lag-in-frames=0 --kf-max-dist=100 --limit=4 --obu -o - -`.
+    /// Search ON: 21830 B, sha256 `7380bcbbfb791c6a369850357211223e20fab959423135951f6eb43ffbfcfebd`,
+    /// fnv1a64 `0x1ba3fe9a4335bdbb`. Control arm, same recipe with
+    /// `--enable-tx-size-search=0`: 21296 B, sha256
+    /// `347edcc9f4899fb05b15174b82d37f6562dcc6fe7691af0ed9ba4efd6cc878c6`,
+    /// fnv1a64 `0x2f87d8e98c9db686`.
+    ///
+    /// NON-VACUITY, and the search flag is NOT the assert: the recipe SPELLS
+    /// `--enable-tx-size-search=1` (aomenc keeps the FIRST occurrence, and a
+    /// flag left defaulted is "unknown", not "on"), and then
+    /// 1. every frame header's PARSED `tx_mode` is `TxMode::Select`
+    ///    (`TX_MODE_SELECT`) -- the searched transform mode is really in the
+    ///    bitstream, not merely requested. The control arm asserts the
+    ///    opposite (`TxMode::Largest`), so neither arm can pass on the other's
+    ///    stream;
+    /// 2. the sequence header is `ss (0,0)` at 8 bits (`assert_444_header`),
+    ///    and the stream is byte-identical to the recorded encode (length +
+    ///    fnv1a64), so an aomenc that stopped producing this cell fails here
+    ///    rather than silently measuring something else;
+    /// 3. `decode::chroma_quad_leaf_tx_diff_hits()` strictly increases on the
+    ///    search arm -- the number that says the per-quadrant resolve CHANGED
+    ///    an answer, which is the defect itself. It must be exactly 0 on the
+    ///    search-off control: with no var-tx there is no four-leaf luma tree,
+    ///    so the arm is unreachable and a counter that fired there would be
+    ///    counting something else;
+    /// 4. every decoded plane is 128*96 (at `ss (0,0)` chroma is full
+    ///    resolution, so a subsampled extent fails the shape assert);
+    /// 5. `decode_all_frames_vs_oracle` asserts the decode-order frame COUNT
+    ///    and each frame's byte LENGTH before any sample is compared.
+    ///
+    /// Red-before: reverting ONLY the per-quadrant resolve in
+    /// `decode_inter_block`'s 64x64 four-unit chroma arm (the `covering_leaf_tx_type`
+    /// call back to the block-level `first_tx_type`, counters and this gate
+    /// untouched) turns this gate red on decode-order frame 2 with 608 bytes
+    /// differing, and green again on restore.
+    #[test]
+    fn a_real_aomenc_444_whole_64_root_tx_size_search_stream_decodes_pixel_exact_at_128x96() {
+        const NAME: &str =
+            "a_real_aomenc_444_whole_64_root_tx_size_search_stream_decodes_pixel_exact_at_128x96";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        // (label, --enable-tx-size-search, parsed tx mode, bytes, fnv1a64)
+        let arms: [(&str, &str, TxMode, usize, u64); 2] = [
+            (
+                "tx size search on",
+                "1",
+                TxMode::Select,
+                21830,
+                0x1ba3_fe9a_4335_bdbb,
+            ),
+            (
+                "tx size search off (control)",
+                "0",
+                TxMode::Largest,
+                21296,
+                0x2f87_d8e9_8c9d_b686,
+            ),
+        ];
+        for (label, search, want_mode, want_len, want_fnv) in arms {
+            let search_flag = format!("--enable-tx-size-search={search}");
+            let stream = chroma_format_stream(
+                128,
+                96,
+                "yuv444p",
+                8,
+                4,
+                &[
+                    "--profile=1",
+                    "--cq-level=20",
+                    "--cpu-used=2",
+                    "--sb-size=64",
+                    "--min-partition-size=64",
+                    "--max-partition-size=64",
+                    &search_flag,
+                ],
+                0,
+            );
+            assert_444_header(&stream, NAME, 8);
+            assert_eq!(
+                stream.len(),
+                want_len,
+                "{NAME} ({label}): aomenc produced {} bytes, not the recorded {want_len} -- the \
+                 recipe no longer makes this cell",
+                stream.len()
+            );
+            assert_eq!(
+                fnv1a64(&stream),
+                want_fnv,
+                "{NAME} ({label}): the encoded bytes moved"
+            );
+            // PARSED, not requested: the transform mode the bitstream carries.
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut modes: Vec<TxMode> = Vec::new();
+            while pos < stream.len() {
+                let obu = parser
+                    .parse_obu(&stream[pos..])
+                    .unwrap_or_else(|e| panic!("{NAME}: aomenc OBU does not parse: {e:?}"));
+                if obu.total_size == 0 {
+                    break;
+                }
+                pos += obu.total_size;
+                if let ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) = obu.kind {
+                    modes.push(h.tx_mode);
+                }
+            }
+            assert_eq!(
+                modes.len(),
+                4,
+                "{NAME} ({label}): four frame headers expected"
+            );
+            for (i, mode) in modes.iter().enumerate() {
+                assert_eq!(
+                    *mode, want_mode,
+                    "{NAME} ({label}): decode-order frame {i} carries tx_mode {mode:?}, not \
+                     {want_mode:?} -- the searched-transform claim is about the bitstream"
+                );
+            }
+            let diff0 = crate::decode::chroma_quad_leaf_tx_diff_hits();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME} ({label}): refused the stream: {e}"));
+            let diff = crate::decode::chroma_quad_leaf_tx_diff_hits() - diff0;
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(
+                    f.y.len(),
+                    128 * 96,
+                    "{NAME} ({label}): frame {i} luma is {} samples, not 128x96",
+                    f.y.len()
+                );
+                assert_eq!(
+                    f.u.len(),
+                    128 * 96,
+                    "{NAME} ({label}): frame {i} U is {} samples -- at 4:4:4 the chroma plane is \
+                     full resolution",
+                    f.u.len()
+                );
+            }
+            // Pixel compare FIRST: it is the informative failure (it names the
+            // decode-order frame and the sample), and the counter assert below
+            // is the guard that says WHY the cell is not vacuous.
+            let (frames_decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert!(
+                frames_decoded >= 4,
+                "{NAME} ({label}): {frames_decoded} decode-order frames"
+            );
+            if label.starts_with("tx size search on") {
+                assert!(
+                    diff >= 2,
+                    "{NAME}: the per-quadrant tx_type resolve never CHANGED an answer (diff \
+                     {diff}) -- on this stream the four-leaf luma tree under a searched transform \
+                     is exactly what makes the block-level value wrong"
+                );
+            } else {
+                assert_eq!(
+                    diff, 0,
+                    "{NAME}: the four-unit 4:4:4 chroma arm fired with tx size search OFF \
+                     ({diff} resolves) -- the counter is not measuring the searched path"
+                );
+            }
+            eprintln!(
+                "{NAME} ({label}): {frames_decoded} frames byte-exact vs aomdec, tx_mode \
+                 {want_mode:?} on every frame, quad-tx resolves that differed {diff}"
+            );
+        }
     }
 }
