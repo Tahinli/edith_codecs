@@ -273,12 +273,38 @@ unvalidated change into a path with zero coverage:
    the reach answer in an arm whose unit geometry is still 4:2:0-shaped, with
    no gate able to catch the difference.
 
-**Recommendation.** Fix H1 first; this site then becomes witnessable and
-should be repaired as a unit (`cu_tx = 32 << ss_x(fctx)`, `luma_span =
-cu_tx << ss_x(fctx)`, and the per-chunk chroma origin with it), with the same
-`<< 1 == * 2` 4:2:0 identity argument. The 4:2:0 identity is not in question —
-`32 << 1 == 64` — so the repair is provably a no-op for the only format with
-committed coverage on this path.
+   > **RETRACTED by `lanes/av1txsizeaudit.report.md` §3.1. DO NOT ACT ON
+   > ITEM 3 OR THE RECOMMENDATION BELOW.** `blockd.h:1371` is the *body* of
+   > `av1_get_max_uv_txsize`, and its last line is
+   > `return av1_get_adjusted_tx_size(uv_tx);`.
+   > `av1_get_adjusted_tx_size` (`blockd.h:1361`) takes **no subsampling
+   > argument** and maps `TX_64X64`/`TX_64X32`/`TX_32X64` to `TX_32X32`
+   > **unconditionally** — the parenthetical "(adjusted → itself)" above is
+   > the error: it stopped one line short of the adjustment it annotated.
+   > Measured against libaom's own code (a C probe linked against
+   > `~/.cache/aom-oracle/build/libaom.a`),
+   > `av1_get_max_uv_txsize(BLOCK_128X128, 0, 0) == TX_32X32`, and the
+   > oracle's `EC_TRACE_COEFF` on a 4:4:4 `--sb-size=128` stream shows every
+   > TX_64X64 luma unit followed by **four** TX_32X32 chroma units per plane
+   > per 64x64 mu chunk (`cu_tx` stays 32; the unit *count* is what changes,
+   > 1 → 4 at 4:4:4). The site was repaired correctly by `4bfe8d8e`.
+   > The generalisation: `max_txsize_rect_lookup` is only half the rule; the
+   > `av1_get_adjusted_tx_size` call on its result is the other half and it is
+   > unconditional.
+
+**Recommendation (RETRACTED — see the note above).** Fix H1 first; this site
+then becomes witnessable and should be repaired as a unit (`cu_tx = 32 <<
+ss_x(fctx)`, `luma_span = cu_tx << ss_x(fctx)`, and the per-chunk chroma origin
+with it), with the same `<< 1 == * 2` 4:2:0 identity argument. The 4:2:0
+identity is not in question — `32 << 1 == 64` — so the repair is provably a
+no-op for the only format with committed coverage on this path.
+
+> **The 4:2:0 identity argument does not licence the repair.** `32 << 1 == 64`
+> is true, and the 4:2:0 adjusted step is inert — but that is an argument about
+> the one format where the change does nothing, and says nothing about 4:4:4,
+> where it is wrong. **A subsampling-parameterised expression can only be
+> certified by the measured value at every subsampling, never by an identity
+> at one of them.**
 
 **Net class status: the class is closed except for this one site, which is
 proven reachable and documented rather than silently changed.**
