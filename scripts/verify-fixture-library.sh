@@ -55,7 +55,7 @@ REQUIRE=${EC_REQUIRE_FIXTURES:-0}
 # Code-shape invariants fail only when explicitly made fatal: `scripts/
 # verify-fixture-library.sh --strict` or EC_FIXTURE_SHAPE_STRICT=1. The default
 # flips to fatal when the last live violation is fixed.
-SHAPE=${EC_FIXTURE_SHAPE_STRICT:-0}
+SHAPE=${EC_FIXTURE_SHAPE_STRICT:-1}
 # `--strict` on the command line is the same switch, so the default can be
 # flipped with a one-character edit the moment the last shape violation lands.
 case " $* " in
@@ -176,8 +176,35 @@ fi
 # `.unwrap()`, so a clean checkout PANICKED instead). A root SUBDIRECTORY
 # (`fixtures/audio`, `fixtures/vectors/...`) is a different thing: those are
 # produced by a generator named in the manifest, so they are not forbidden here.
-forbidden=$(grep -rn 'concat!(env!("CARGO_MANIFEST_DIR"), "/\.\./\.\./fixtures/[^/"]*\.' \
-    "$ROOT"/crates/*/src "$ROOT"/crates/*/tests 2>/dev/null)
+# Comments are stripped first: a doc comment that REPRODUCES the forbidden
+# literal to explain what was fixed is prose, not code, and a grep cannot tell
+# the difference. One such comment in crates/ec-av1 read as a live violation for
+# a whole round (found by the lane that fixed the real ones).
+forbidden=$(python3 - "$ROOT" <<'PYEOF'
+import os, re, sys
+root = sys.argv[1]
+pat = re.compile(r'concat!\(\s*env!\("CARGO_MANIFEST_DIR"\)\s*,\s*"/\.\./\.\./fixtures/[^/"]*\.')
+for crate in sorted(os.listdir(os.path.join(root, "crates"))):
+    for sub in ("src", "tests"):
+        d = os.path.join(root, "crates", crate, sub)
+        if not os.path.isdir(d):
+            continue
+        for dirpath, _dirs, files in os.walk(d):
+            for name in sorted(files):
+                if not name.endswith(".rs"):
+                    continue
+                p = os.path.join(dirpath, name)
+                try:
+                    text = open(p, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+                text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+                for i, line in enumerate(text.splitlines(), 1):
+                    code = line.split("//", 1)[0]
+                    if pat.search(code):
+                        print("{}:{}:{}".format(os.path.relpath(p, root), i, line.strip()))
+PYEOF
+)
 if [ -n "$forbidden" ]; then
     if [ "$SHAPE" != 0 ]; then
         echo "FAIL [invariant 1]: a committed pin is reached through the gitignored root" >&2

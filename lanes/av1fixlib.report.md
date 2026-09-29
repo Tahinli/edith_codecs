@@ -116,16 +116,49 @@ All four are reported on every run; the count is always printed.
    three regenerated pins land today.
 4. **The pin-reading gate census** above, including the bare-directory verdict.
 
-**Exit status is split, deliberately, and the flip is one character away.** The LIBRARY verdict (mode i, mode ii,
+**Exit status: shape is now FATAL BY DEFAULT.** The LIBRARY verdict (mode i, mode ii,
 drift) decides the exit under `EC_REQUIRE_FIXTURES=1`. The four code-shape
 invariants fail only under `EC_FIXTURE_SHAPE_STRICT=1`. A shape violation is a
 defect in a file this preflight does not own — two live sites in `crates/ec-av1`
 — and a batch that cannot start because another crate has two open lines helps
-nobody. Nothing is hidden: the count is printed every run, the sites are named
-every run, and `--strict` (or `EC_FIXTURE_SHAPE_STRICT=1`) makes them fatal.
-Measured exit codes: default 0 / renamed+set 1 / renamed+unset 0 / no-root 1 /
-`--strict` 1. The default flips to fatal the moment the two `crates/ec-av1`
-violations below are fixed; nothing else needs to change.
+nobody. Nothing is hidden: the count is printed every run and the sites are named
+every run.
+
+The split existed only while two `crates/ec-av1` violations were open and owned by
+another lane. Kerem-5's `2364d7a7` closed both — the root pin now reads
+`crate_pin("lr-sgr-r7.obu")`, and all fourteen warp pins are committed under
+`crates/ec-av1/fixtures/` and read through the pin helper — so
+`SHAPE=${EC_FIXTURE_SHAPE_STRICT:-1}` is the default now. `--strict` and
+`EC_FIXTURE_SHAPE_STRICT=0` are the escape hatches, in that direction.
+
+Measured exit codes after the flip:
+
+| mode | exit |
+|---|---|
+| A intact, `EC_REQUIRE_FIXTURES=1` | 0 — GREEN (303 rows) |
+| B one fixture renamed, flag set | 1 — `FAIL [mode ii]`, names path, both sites, generator |
+| C same rename, flag unset | 0 — the same list printed SKIP-shaped |
+| D `EC_FIXTURES=/nonexistent`, flag set | 1 — `FAIL [mode i]`, names `.gitignore:2` |
+| E intact, flag set, `--strict` | 0 — was 1 before the flip |
+| F a reintroduced `concat!` root-pin line, flag set | 1 — `FAIL [invariant 1]` |
+
+F is the point of the flip: reintroducing the shape is now fatal with no flag.
+
+Three defects this lane's own tooling had, all found by running it off its own
+tree, and all the class it exists to prevent:
+
+1. Off-git the `tracked` column was recomputed as `no-git` for all 37 pin rows,
+   so every host reported DRIFT with a good library.
+2. Invariant 1 could not see a comment: a doc comment that REPRODUCES the
+   forbidden literal to explain what was fixed read as a live violation for a
+   whole round. It now strips comments before matching, the way the gate census
+   already did.
+3. The census's single-name branch neither tracked `ignored` (every `crate_pin`
+   gate reported `ignored=0` whether or not it was `#[ignore]`d) nor noticed a
+   `crate_pin` whose name is built at runtime — such a gate would have vanished
+   from the census silently, the same blind spot in a new place. It now counts
+   `ignored` and prints a `BADCALL` row the preflight fails on, because a gate
+   the census cannot resolve is UNPROVEN, not proven clean.
 
 ## 4. Proof
 
