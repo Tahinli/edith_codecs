@@ -10014,6 +10014,338 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1toolgates: the shared body of the two `enable-rect-tx`
+    /// coverage gates (8-bit and 10-bit).
+    ///
+    /// The aomenc ARGUMENT VECTOR is built by each gate and passed in, never
+    /// assembled here. That is not tidiness: `gate_coverage`'s `gate_bodies()`
+    /// splits `stream.rs` on `\n    #[` and keeps a segment only if that
+    /// segment itself contains `--passes=1`, so a flag living in a helper is
+    /// invisible to the coverage derivation. A helper that owns the recipe
+    /// would leave this gate counted at whatever depth the helper's own text
+    /// implies -- which is the blind spot that kept `enable-rect-tx` on the
+    /// `NEVER_EXERCISED` lists after real streams had exercised it.
+    ///
+    /// WHAT THIS GATE IS AND IS NOT. `enable_rect_tx` has no sequence-header
+    /// bit in AV1 -- aom reads it only in `tx_search.c` (`search_tx_size`'s
+    /// `!enable_rect_tx && tx_size_wide != tx_size_high` skip and the
+    /// `tx_size_max_32_square` remap) -- so the flag never reaches a decoder.
+    /// Spelling `--enable-rect-tx=1` proves the ENCODER was ALLOWED the tool
+    /// and nothing more. It is CONTEXT here, not the witness: a gate that
+    /// stopped at the flag would be the `tool-disabled-in-every-gate` defect
+    /// `NEVER_EXERCISED` exists to prevent, in a new costume.
+    ///
+    /// The witness is the PARSED PARTITION SHAPE, the only thing in the
+    /// bitstream that can carry a rect transform:
+    /// [`decode::rect_partition_hits`] counts `PARTITION_HORZ`/`PARTITION_VERT`
+    /// symbols actually read, i.e. a rect partition in the tree this decoder
+    /// walked, and [`decode::rect_coeff_tu_hits`] counts the rectangular
+    /// transform units that then coded coefficients through `read_coeffs_rect`
+    /// (`all_zero == 0`) -- the rect coefficient TABLES being read, not a
+    /// header bit. Both are asserted above zero over the arms that decoded AND
+    /// compared, and every frame is pixel-compared against ffmpeg's own decode
+    /// of the identical bytes.
+    ///
+    /// LIMIT, stated because it bounds what this gate can claim: this
+    /// repository has no INDEPENDENT partition parser to list leaves from --
+    /// `ec-av1-syntax` parses OBU headers and the sequence header only -- and
+    /// `ec_av1::census`'s per-frame `blocks`/`tx` shape maps, the one true
+    /// leaf list, are armed by a process-global `OnceLock` on
+    /// `EC_AV1_BITCENSUS`, so arming them inside a lib test would switch the
+    /// accountant on for every other gate in the process. The partition walk is
+    /// therefore observed through the decoder's own counters, which is weaker
+    /// than a second opinion but is still a shape fact about the stream rather
+    /// than a fact about the flag.
+    ///
+    /// RED-BEFORE: the COUNTERS, one per assert, both measured.
+    /// `--enable-rect-tx=0` is deliberately NOT claimed as the mutation: it
+    /// does NOT zero these counters (39 rect coefficient TUs against 210 on
+    /// the cq20 arm, because `--enable-rect-partitions=1` already forces
+    /// non-square transform sizes regardless), and with every partition shape
+    /// off the flag yields no rect transform at either setting. `=0` does turn
+    /// the gate red, but through the ORACLE -- its `--enable-tx-size-search=0`
+    /// arm is a stream ffmpeg cannot decode past frame 6 of 15 -- so the
+    /// frame-count assert fires first and proves nothing about the tool.
+    fn rect_tx_tool_gate(name: &str, ten_bit: bool, args: &[String]) -> (usize, usize) {
+        // A missing tool SKIPs, so the totals the caller sums stay 0 and the
+        // gate's own witness assert fails loudly instead of passing vacuously
+        // on a run that decoded nothing.
+        if !have_ffmpeg() {
+            eprintln!("SKIP {name}: no ffmpeg");
+            return (0, 0);
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
+            return (0, 0);
+        }
+        let (width, height) = (64usize, 64usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "mandelbrot=size=64x64:rate=25",
+                "-pix_fmt",
+                if ten_bit { "yuv420p10le" } else { "yuv420p" },
+                // y4m calls 10-bit an unofficial pixel format (no-op at 8).
+                "-strict",
+                "-1",
+                "-t",
+                "0.60",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{name}: ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let out = run_with_stdin(Command::new(aomenc_path()).args(args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "{name}: aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        assert!(!stream.is_empty(), "{name}: aomenc wrote an empty stream");
+        if ten_bit {
+            assert_eq!(
+                parsed_bit_depth(&stream),
+                10,
+                "{name}: aomenc did not write a 10-bit sequence header"
+            );
+        }
+        let parts_before = decode::rect_partition_hits();
+        let tus_before = decode::rect_coeff_tu_hits();
+        let decoded = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{name}: decode_stream refused: {e}"),
+        };
+        // Sampled after the decode, before the pixel compare, so a mismatch
+        // report can still say whether the arm fired.
+        let parts = decode::rect_partition_hits() - parts_before;
+        let tus = decode::rect_coeff_tu_hits() - tus_before;
+        let reference = if ten_bit {
+            ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len())
+        } else {
+            ffmpeg_decode_sequence(&stream, width, height, decoded.len())
+        };
+        assert_eq!(
+            decoded.len(),
+            reference.len(),
+            "{name}: shown-frame count vs ffmpeg (rect partitions {parts}, rect coefficient \
+             TUs {tus})"
+        );
+        for (i, (ours, theirs)) in decoded.iter().zip(&reference).enumerate() {
+            for (plane, (a, b), w) in [
+                ("Y", (&ours.y, &theirs.y), width),
+                ("U", (&ours.u, &theirs.u), width / 2),
+                ("V", (&ours.v, &theirs.v), width / 2),
+            ] {
+                assert_eq!(a.len(), b.len(), "{name}: frame {i} {plane} plane length");
+                if a != b {
+                    let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
+                    let _ = std::fs::write(&pin, &stream);
+                    let at = a
+                        .iter()
+                        .zip(b.iter())
+                        .position(|(x, y)| x != y)
+                        .unwrap_or(0);
+                    panic!(
+                        "{name}: frame {i} {plane} mismatch vs ffmpeg at row {}, col {}: {} vs \
+                         {} (rect partitions {parts}, rect coefficient TUs {tus}; stream pinned \
+                         at {})",
+                        at / w,
+                        at % w,
+                        a[at],
+                        b[at],
+                        pin.display()
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "{name}: {} bit, pixel-exact vs ffmpeg; parsed rect partitions {parts}, rect \
+             coefficient TUs {tus}",
+            if ten_bit { "10" } else { "8" }
+        );
+        (parts, tus)
+    }
+
+    /// lane-av1toolgates: the gate-level WITNESS, summed over the arms that
+    /// decoded AND compared. It cannot be asserted per arm: the cq20 /
+    /// tx-size-search=1 arm reaches a rect transform through the var-tx
+    /// search on a SQUARE block (a nonzero rect coefficient count with zero
+    /// rect partitions read -- the purest form of what `--enable-rect-tx`
+    /// buys), while the rect PARTITION only shows up on the
+    /// tx-size-search=0 arm. Either fact alone would let a stream through on
+    /// which the tool was allowed and unused, which is the defect this
+    /// coverage entry was written for; together they are the parsed-shape
+    /// evidence the entry asked for.
+    #[track_caller]
+    fn assert_rect_tx_witness(name: &str, parts: usize, tus: usize) {
+        assert!(
+            parts > 0,
+            "{name}: no PARTITION_HORZ/PARTITION_VERT symbol was read on any pixel-exact decode \
+             -- the parsed partition tree never yielded a rect leaf, so `--enable-rect-tx=1` \
+             was allowed and unused"
+        );
+        assert!(
+            tus > 0,
+            "{name}: no rectangular transform unit coded coefficients through read_coeffs_rect \
+             ({parts} rect partitions read) -- the rect coefficient path was never taken"
+        );
+    }
+
+    /// lane-av1toolgates: `enable-rect-tx` at 8 BITS. See
+    /// [`rect_tx_tool_gate`] for what the flag does and does not prove, and
+    /// why the recipe is spelled here rather than in the helper.
+    ///
+    /// The whole recipe is inline: `--passes=1` has to be findable in this
+    /// segment for the coverage derivation to count the gate at all, and
+    /// `--enable-rect-tx=1` has to be findable here for it to count the
+    /// TOOL. The quantiser and the tx-size-search setting are swept as two
+    /// arms so the witness cannot rest on one RD interaction.
+    #[test]
+    fn a_real_aomenc_8bit_stream_with_a_rect_transform_decodes_pixel_exact() {
+        let mut totals = (0usize, 0usize);
+        for (cq, tx_search) in [("20", "1"), ("40", "0")] {
+            let args: Vec<String> = [
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--lag-in-frames=0",
+                "--auto-alt-ref=0",
+                "--kf-max-dist=1000",
+                "--error-resilient=1",
+                "--sb-size=64",
+                // The tool under test, spelled explicitly. CONTEXT, per
+                // `rect_tx_tool_gate`: aomenc was ALLOWED rect tx sizes.
+                "--enable-rect-tx=1",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--enable-cdef=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--enable-order-hint=0",
+                "--min-partition-size=8",
+                "--max-partition-size=32",
+            ]
+            .map(String::from)
+            .into_iter()
+            .chain([
+                format!("--cq-level={cq}"),
+                format!("--enable-tx-size-search={tx_search}"),
+            ])
+            // The output tail comes LAST: aomenc stops reading flags at the
+            // first bare argument, so a sweep flag appended after `-o - -` is
+            // silently dropped and the arm encodes a different recipe than the
+            // one this gate claims to have run.
+            .chain(["--obu", "-o", "-", "-"].map(String::from))
+            .collect();
+            let name = format!(
+                "a_real_aomenc_8bit_stream_with_a_rect_transform_decodes_pixel_exact[cq{cq}/tx{tx_search}]"
+            );
+            let (p, t) = rect_tx_tool_gate(&name, false, &args);
+            totals.0 += p;
+            totals.1 += t;
+        }
+        assert_rect_tx_witness(
+            "a_real_aomenc_8bit_stream_with_a_rect_transform_decodes_pixel_exact",
+            totals.0,
+            totals.1,
+        );
+        eprintln!(
+            "a_real_aomenc_8bit_stream_with_a_rect_transform_decodes_pixel_exact: 2 arms \
+             pixel-exact; parsed rect partitions {}, rect coefficient TUs {}",
+            totals.0, totals.1
+        );
+    }
+
+    /// lane-av1toolgates: `enable-rect-tx` at 10 BITS -- the same recipe, the
+    /// same parsed-shape witness, at the depth the 8-bit arm says nothing
+    /// about (the per-depth rule `NEVER_EXERCISED_10BIT` is built on:
+    /// lane-hbdinter's two 10-bit-only defects survived because every 10-bit
+    /// gate pinned the filters off). The depth is spelled in THIS body,
+    /// which is what files the gate in the 10-bit bucket.
+    #[test]
+    fn a_real_aomenc_10bit_stream_with_a_rect_transform_decodes_pixel_exact() {
+        let mut totals = (0usize, 0usize);
+        for (cq, tx_search) in [("20", "1"), ("40", "0")] {
+            let args: Vec<String> = [
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--lag-in-frames=0",
+                "--auto-alt-ref=0",
+                "--kf-max-dist=1000",
+                "--error-resilient=1",
+                "--sb-size=64",
+                "--input-bit-depth=10",
+                "--bit-depth=10",
+                // The tool under test, spelled explicitly. CONTEXT, per
+                // `rect_tx_tool_gate`: aomenc was ALLOWED rect tx sizes.
+                "--enable-rect-tx=1",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--enable-cdef=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--enable-order-hint=0",
+                "--min-partition-size=8",
+                "--max-partition-size=32",
+            ]
+            .map(String::from)
+            .into_iter()
+            .chain([
+                format!("--cq-level={cq}"),
+                format!("--enable-tx-size-search={tx_search}"),
+            ])
+            // The output tail comes LAST: aomenc stops reading flags at the
+            // first bare argument, so a sweep flag appended after `-o - -` is
+            // silently dropped and the arm encodes a different recipe than the
+            // one this gate claims to have run.
+            .chain(["--obu", "-o", "-", "-"].map(String::from))
+            .collect();
+            let name = format!(
+                "a_real_aomenc_10bit_stream_with_a_rect_transform_decodes_pixel_exact[cq{cq}/tx{tx_search}]"
+            );
+            let (p, t) = rect_tx_tool_gate(&name, true, &args);
+            totals.0 += p;
+            totals.1 += t;
+        }
+        assert_rect_tx_witness(
+            "a_real_aomenc_10bit_stream_with_a_rect_transform_decodes_pixel_exact",
+            totals.0,
+            totals.1,
+        );
+        eprintln!(
+            "a_real_aomenc_10bit_stream_with_a_rect_transform_decodes_pixel_exact: 2 arms \
+             pixel-exact; parsed rect partitions {}, rect coefficient TUs {}",
+            totals.0, totals.1
+        );
+    }
+
     /// lane-kf900 r5, the gate for the rect-strip `use_intrabc` read.
     ///
     /// `av1_allow_intrabc` is a FRAME-level test (`decodemv.c:892`,
