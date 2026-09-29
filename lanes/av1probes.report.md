@@ -101,22 +101,40 @@ correct behaviour off the library host, and each was re-run on the workstation t
 | `prune_k_quality_sweep` | real-clip sweep | no on VPS (3 hard-coded `/home/tahinli/...` paths, all SKIP); yes locally, 23 s | 3 clips × 2 quantizers × K∈{3,4,6}: `dark/flat q=60 baseline 2863 B 54.71 dB → K=6 2879 B 54.77 dB (+0.060 dB)`, `detailed q=150 baseline 2859 B 39.73 dB → K=3 2828 B (−0.061 dB)`, `film q=150 7570 B 36.74 dB → K=3 7526 B (−0.015 dB)` | REAL DIAGNOSTIC VALUE — the K-pruning decision table; the deltas are ≤0.06 dB everywhere | keep; **local-run only**; reason rewrite: the paths are hard-coded absolutes, so name that |
 | `prune_k_quality_sweep_inter` | real-clip sweep | no on VPS (3 SKIPs); yes locally, 53 s | inter arms: `dark/flat q=150 baseline 504 B 49.82 dB`, K=3/4/6 all 504 B / +0.000 dB; `film q=60 33440 B 45.71 dB → K=3 33147 B (−0.012 dB)` | REAL DIAGNOSTIC VALUE (it is the evidence that K pruning is free on inter) | keep; **local-run only** |
 
-## Already un-ignored by the wave (were in scope on `298f75c4`)
+## Already un-ignored by the wave (were `#[ignore]`d on `298f75c4`)
 
-These six were `#[ignore]`d on the tree this lane measured first and are **not** in the base commit's
-ignored set any more. Re-verified on `6c1d78a6`, un-ignored and green:
+These nine were in the ignored set on the tree this lane measured first and are **not** in the base
+commit's ignored set any more. I flagged three of them to Main as a suite-red risk; **that flag is
+withdrawn on measurement** — see the last table.
 
 | name | class | ran? | observed result | verdict bucket | disposition |
 |---|---|---|---|---|---|
-| `pinned_golden3_stream_decodes_pixel_exact` | pinned gate | yes | `pinned_golden3_stream_decodes_pixel_exact: 4 frame(s) byte-exact vs ffmpeg from …/crates/ec-av1/fixtures/golden3-pin.obu` (0.10 s) | REAL DIAGNOSTIC VALUE | already un-ignored; the SKIP seen on the older tree was a staging artifact |
+| `pinned_golden3_stream_decodes_pixel_exact` | pinned gate | yes | `pinned_golden3_stream_decodes_pixel_exact: 4 frame(s) byte-exact vs ffmpeg from …/crates/ec-av1/fixtures/golden3-pin.obu` (0.10 s) | REAL DIAGNOSTIC VALUE | already un-ignored; the SKIP seen on the older tree was a staging artifact of an older commit |
 | `pinned_sbpart_stream_decodes_pixel_exact` | pinned gate | yes | `ok` (0.10 s) | REAL DIAGNOSTIC VALUE | already un-ignored |
 | `pinned_golden4_stream_decodes_pixel_exact` | pinned gate | yes, 0.1 s | `non_last_ref_hits before=0 after=1` | REAL DIAGNOSTIC VALUE | already un-ignored |
 | `pinned_golden7_stream_decodes_pixel_exact` | pinned gate | yes, 0.1 s | `non_last_ref_hits before=0 after=2`, pixel-exact vs ffmpeg on all 4 frames | REAL DIAGNOSTIC VALUE | already un-ignored |
 | `pinned_lr_sgr_stream_call_unique_dump` | pinned dump | yes, 0.1 s | `frame 0: y_mismatch=false u_mismatch=false v_mismatch=false` | REAL DIAGNOSTIC VALUE | already un-ignored |
-| `a_real_aomenc_*` recipe gates (3) | recipe gates, gate-blind | yes, 6/15/16 s | each FAILS by its own non-vacuity guard: `zero rect64 dequant calls ever observed CURRENT_Q_IDX != base_q_idx (40 matches, 0 refusals out of 40)`; `no 32-level intra 1:4 strip (32x8/8x32) fired over 40 compared streams` | ROBUST-RED (correct reds — the gate refuses to pass vacuously) | un-ignored by the wave, which means they now run in the suite and red on the feature not firing; that is the gate's stated contract, flagged here for the merge owner |
+| `a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact` | recipe gate | yes, plainly, 1.51 s | `ok` — the rewritten gate re-encodes a pinned 512x384 stream and byte-compares it; its feature arm reads 48 `delta_q` symbol groups with 17 `rect64_qidx_drift_hits`, and its `--deltaq-mode=0` control reads 0 groups / 0 drift | REAL DIAGNOSTIC VALUE | already un-ignored, and the un-ignore is CORRECT: the feature fires, so the gate is not vacuous |
+| `a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact` | recipe gate | yes, plainly, 1.6 s | `6 frames pixel-exact, intra 1:4 strips in inter frames 64x16=0 16x64=0 32x8=8 8x32=11 (--enable-1to4-partitions=0 control: 0/0/0/0), stream 35179 B` | REAL DIAGNOSTIC VALUE | already un-ignored, correctly: the feature fires and the control arm proves the strips come from 1:4 partitions |
+| `a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit` | recipe gate | yes, plainly, 1.5 s | `6 frames pixel-exact, … 32x8=12 8x32=7 (control 0/0/0/0), stream 34727 B` | REAL DIAGNOSTIC VALUE | already un-ignored, correctly |
 
 `pinned_warp_stream_decodes_pixel_exact` is still `#[ignore]`d at the base commit and is in the
-measured set below (11 pins walked, `warp_selected_hits` 0→1→5→6→8…, all pixel-exact, 1.2 s).
+measured set above (11 pins walked, `warp_selected_hits` 0→1→5→6→8…, all pixel-exact, 1.2 s).
+
+### The suite-red flag is WITHDRAWN — measured, not inferred
+
+On `298f75c4` these three gates were 40-stream sweeps that asserted the feature had fired, and they
+red on their own non-vacuity guards. I flagged to Main that the wave had un-ignored them and that
+they would red the suite. **They do not.** The wave REWROTE them into feature-armed gates, and on
+`745c60e7`, release, plain (non-`--ignored`), lane-private target dir:
+
+```
+$ cargo test -p ec-av1 --lib --release -- --test-threads=1 a_real_aomenc_
+test result: ok. 185 passed; 0 failed; 0 ignored; 0 measured; 564 filtered out; finished in 833.35s
+```
+
+The flag was wrong because I read it off two reports and one older tree instead of running it. The
+general rule it exercised is now in the report's closing section.
 
 ## Summary of buckets
 
@@ -130,8 +148,8 @@ measured set below (11 pins walked, `warp_selected_hits` 0→1→5→6→8…, a
   need operator-supplied env vars, and three of them die inside the ffmpeg oracle with a
   frame-size assert rather than a "you forgot the variable" message.
 - **ROBUST-RED (1 of the 38)** — `probe_split`: a real signal, in `bd_rate`, not in the decoder.
-  (The three `a_real_aomenc_*` recipe gates were ROBUST-RED too, but the wave un-ignored them, so
-  they are no longer part of the ignored set — see the table above.) **0 decoder defects.**
+  (The three `a_real_aomenc_*` recipe gates red the same way on the older tree, but the wave
+  REWROTE them into feature-armed gates that now pass; measured, see above.) **0 decoder defects.**
 - **DEAD WEIGHT (0)** — nothing in the set is dead: every item produced a number or a verdict on some
   tree. What *is* dead is the reason text: **11 items carried a reason that misdescribed them**
   (4 bare `#[ignore]`, `filter_stage_wall_film` naming a film it does not read off the library,
@@ -254,3 +272,28 @@ the overlap quantified (70.54 − 8.57 = 61.97 ms sits outside bucket 0), it is 
 to `accounted` because adding it would double-count the shared candidates, and the residual is
 labelled for what it now demonstrably contains. The accounting closes: 107.27 + 157.56 = 264.83 ms
 against a 264.82 ms wall.
+
+## The rule this lane exercised (and broke once)
+
+**An `#[ignore]` reason must name the UNBLOCK CONDITION — the one thing that makes the item runnable
+or true. A gate that asserts "this feature fires" has exactly one unblock (it fires), so
+un-ignoring it is a claim about the decoder, not a tidy-up.**
+
+Concretely, the discipline is three questions per ignored item:
+
+1. **What is the precondition to RUN it?** (a host with N cores, an env var, a clip path, a
+   library) — that goes in the reason, with the measured wall and the host floor.
+2. **What is the precondition for it to PASS?** If that is a decoder behaviour rather than an
+   environment fact, the honest state is `#[ignore]` with that behaviour named — because a gate
+   whose contract is "this must fire" cannot be un-ignored while it does not fire: it converts a
+   known-open item into a permanent suite red that hides the next real failure.
+3. **If the reason cannot be phrased as an unblock, the reason is a lane label** (`lane-rectx r3
+   scratch sweep`) and it is worse than no reason, because it reads as if someone had said
+   something.
+
+I broke rule 2 once: I told Main that three gates the wave had un-ignored would red the suite,
+having read it off two reports and one older tree instead of running them. On the base commit they
+pass (185/185 in the `a_real_aomenc_` filter), because the wave rewrote them into feature-armed
+gates whose feature demonstrably fires (`32x8=8 8x32=11` strips, with the
+`--enable-1to4-partitions=0` control at `0/0/0/0`; 48 `delta_q` groups and 17 drift hits, with the
+`--deltaq-mode=0` control at 0/0). The flag is withdrawn. The measurement is the disposition.
