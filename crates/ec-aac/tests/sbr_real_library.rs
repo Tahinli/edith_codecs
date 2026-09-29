@@ -4957,7 +4957,13 @@ fn sbr_residual_locator() {
     if !have_ffmpeg() {
         return;
     }
-    let home = std::env::var("HOME").unwrap();
+    // lane-h264reallib: `unwrap_or_default()`, the shape this file's five
+    // other HOME reads already use (:2710, :3426, :4109, :4182, :4575). A bare
+    // `unwrap()` panicked on any host with no HOME -- a fleet runner -- which
+    // is a red with no bearing on the decoder. The `path.exists()` guard below
+    // already handles the absent-file case, so an empty HOME just makes the
+    // fallback path relative-and-nonexistent and the test returns.
+    let home = std::env::var("HOME").unwrap_or_default();
     // `EC_AAC_SBR_LOCATOR_FILE` points the same instrument at any other
     // HE-AAC file (e.g. a mono, uncoupled, noise-only probe encode).
     let path = std::env::var("EC_AAC_SBR_LOCATOR_FILE")

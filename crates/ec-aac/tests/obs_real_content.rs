@@ -28,11 +28,23 @@ fn ffmpeg_decode(path: &Path, channels: usize) -> Vec<Vec<f32>> {
         .args(["-v", "error", "-i"])
         .arg(path)
         .args([
-            "-map", "0:a:0", "-t", "10", "-f", "f32le", "-acodec", "pcm_f32le", "-",
+            "-map",
+            "0:a:0",
+            "-t",
+            "10",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
         ])
         .output()
         .expect("ffmpeg runs");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let samples: Vec<f32> = out
         .stdout
         .chunks_exact(4)
@@ -48,7 +60,10 @@ fn ffmpeg_decode(path: &Path, channels: usize) -> Vec<Vec<f32>> {
 fn extract_aac_track(path: &Path) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
     let f = File::open(path).ok()?;
     let mut d = Mp4Demuxer::new(BufReader::new(f)).ok()?;
-    let aac = d.streams().iter().find(|s| s.params.codec == CodecId::Aac)?;
+    let aac = d
+        .streams()
+        .iter()
+        .find(|s| s.params.codec == CodecId::Aac)?;
     let idx = aac.index;
     let asc = aac.params.extradata.as_ref()?.to_vec();
     let mut aus = Vec::new();
@@ -90,11 +105,18 @@ fn our_decode(path: &Path) -> Option<Vec<Vec<f32>>> {
         }
     }
     eprintln!("  {failed}/{} AUs failed", aus.len());
-    if planes.is_empty() { None } else { Some(planes) }
+    if planes.is_empty() {
+        None
+    } else {
+        Some(planes)
+    }
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum()
 }
 
 fn correlation(a: &[f32], b: &[f32]) -> f64 {
@@ -114,14 +136,28 @@ fn correlation(a: &[f32], b: &[f32]) -> f64 {
 
 fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
     const COARSE: usize = 4_096;
-    let start = ours.len().min(theirs.len()).saturating_sub(WINDOW).min(ours.len() / 4);
+    let start = ours
+        .len()
+        .min(theirs.len())
+        .saturating_sub(WINDOW)
+        .min(ours.len() / 4);
     let slice_at = |lag: i64, len: usize| -> Option<(usize, usize)> {
-        let (oa, ob) = if lag >= 0 { (start, start + lag as usize) } else { (start + (-lag) as usize, start) };
-        if oa + len > ours.len() || ob + len > theirs.len() { None } else { Some((oa, ob)) }
+        let (oa, ob) = if lag >= 0 {
+            (start, start + lag as usize)
+        } else {
+            (start + (-lag) as usize, start)
+        };
+        if oa + len > ours.len() || ob + len > theirs.len() {
+            None
+        } else {
+            Some((oa, ob))
+        }
     };
     let mut coarse_best = (0i64, -1.0f64, 0.0f64);
     for lag in -(LAG_MAX as i64)..=(LAG_MAX as i64) {
-        let Some((oa, ob)) = slice_at(lag, COARSE) else { continue };
+        let Some((oa, ob)) = slice_at(lag, COARSE) else {
+            continue;
+        };
         let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]);
         if c.abs() > coarse_best.1 {
             coarse_best = (lag, c.abs(), c);
@@ -129,7 +165,9 @@ fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
     }
     let mut best = (coarse_best.0, -1.0f64, 0.0f64);
     for lag in (coarse_best.0 - 8)..=(coarse_best.0 + 8) {
-        let Some((oa, ob)) = slice_at(lag, WINDOW) else { continue };
+        let Some((oa, ob)) = slice_at(lag, WINDOW) else {
+            continue;
+        };
         let c = correlation(&ours[oa..oa + WINDOW], &theirs[ob..ob + WINDOW]);
         if c.abs() > best.1 {
             best = (lag, c.abs(), c);
@@ -148,7 +186,13 @@ fn obs_content_table() {
         eprintln!("skip: no ffmpeg");
         return;
     }
-    let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("Videos/OBS");
+    // lane-h264reallib: `unwrap_or_default()` rather than a bare `unwrap()`.
+    // A host with no HOME -- a fleet runner -- panicked here before reaching
+    // the `read_dir` guard one line down, which already reports an absent
+    // directory correctly. With an empty HOME the guard simply reports
+    // `skip: no ./Videos/OBS`, so the test degrades to the silent skip its
+    // own guard was written for instead of a red that says nothing about AAC.
+    let dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Videos/OBS");
     let Ok(rd) = std::fs::read_dir(&dir) else {
         eprintln!("skip: no {}", dir.display());
         return;
@@ -188,11 +232,21 @@ fn obs_content_table() {
         let rows = &all_rows[before..];
         let (mut pns, mut is_, mut ms, mut tns, mut cpe) = (0usize, 0usize, 0usize, 0usize, 0usize);
         for r in rows {
-            if r.pns_bands > 0 { pns += 1; }
-            if r.is_bands > 0 { is_ += 1; }
-            if r.ms_bands > 0 { ms += 1; }
-            if r.tns_present { tns += 1; }
-            if r.is_cpe { cpe += 1; }
+            if r.pns_bands > 0 {
+                pns += 1;
+            }
+            if r.is_bands > 0 {
+                is_ += 1;
+            }
+            if r.ms_bands > 0 {
+                ms += 1;
+            }
+            if r.tns_present {
+                tns += 1;
+            }
+            if r.is_cpe {
+                cpe += 1;
+            }
         }
         eprintln!(
             "  tools over {} AUs: cpe={cpe} pns_aus={pns} is_aus={is_} ms_aus={ms} tns_aus={tns}",

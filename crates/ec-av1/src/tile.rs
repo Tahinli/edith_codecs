@@ -12,16 +12,16 @@
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ec_core::{Error, Result};
 
 use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
-use crate::decode::{txfm_partition_ctx_rect, TXFM_CTX_INIT};
+use crate::decode::{TXFM_CTX_INIT, txfm_partition_ctx_rect};
 use crate::msac::SymbolEncoder;
-use crate::mvstack::{find_mv_stack, mv16, MiGrid, MiInfo, NO_REF1};
+use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16};
 use crate::transform::TxType;
 
 // ---------------------------------------------------------------------------
@@ -1637,10 +1637,10 @@ fn write_compound_ref_frames(
     (ref0, ref1): (i8, i8),
 ) -> Result<()> {
     use crate::mvstack::{
-        comp_reference_type_ctx, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx,
-        single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx, uni_comp_ref_p1_ctx,
-        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
-        LAST_FRAME,
+        ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME,
+        LAST3_FRAME, comp_reference_type_ctx, single_ref_p1_ctx, single_ref_p2_ctx,
+        single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
+        uni_comp_ref_p1_ctx,
     };
     let a = (above_ref > 0).then_some(above_ref);
     let l = (left_ref > 0).then_some(left_ref);
@@ -1819,7 +1819,10 @@ fn write_compound_block(
     if crate::envflags::env_flag!("EC_TRACE_MODE") {
         eprintln!(
             "EC_WCOMP mi_row={mi_row} mi_col={mi_col} mode={mode} ref0={} ref1={ref1} ctx={ctx} new_mv_ctx={} ref_mv_ctx={} stack={}",
-            info.ref_frame, stack.new_mv_ctx, stack.ref_mv_ctx, stack.entries.len()
+            info.ref_frame,
+            stack.new_mv_ctx,
+            stack.ref_mv_ctx,
+            stack.entries.len()
         );
     }
     enc.symbol(mode, &mut cdfs.inter_compound_mode[ctx]);
@@ -5889,7 +5892,7 @@ fn scan_of(side: usize) -> &'static Vec<u16> {
 /// DECODER's own table so the two cannot drift, cached per size and class.
 fn class_scan_of(side: usize, class: crate::decode::TxClass) -> &'static [u16] {
     static SCANS: LazyLock<[[Vec<u16>; 2]; 4]> = LazyLock::new(|| {
-        use crate::decode::{class_scan_table, TxClass};
+        use crate::decode::{TxClass, class_scan_table};
         [TX4, TX8, TX16, TX32].map(|side| {
             [
                 class_scan_table(side, TxClass::Horiz),
@@ -6966,11 +6969,7 @@ pub(crate) fn intra_inter_ctx(
 /// `CLASS0_SIZE << (class + 2)` (spec 3), the magnitude an `MV_CLASS_n`
 /// component's own bits start counting from; class zero starts at zero.
 fn mv_class_base(class: usize) -> i32 {
-    if class == 0 {
-        0
-    } else {
-        2i32 << (class + 2)
-    }
+    if class == 0 { 0 } else { 2i32 << (class + 2) }
 }
 
 /// The class a pre-offset magnitude `z` (`|diff| - 1`) falls in — the inverse
@@ -7096,9 +7095,9 @@ fn write_single_ref(
     REF_HITS[(ref_frame.max(1) - 1) as usize % 7]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     use crate::mvstack::{
+        ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
         single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
-        single_ref_p5_ctx, single_ref_p6_ctx, ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME,
-        GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        single_ref_p5_ctx, single_ref_p6_ctx,
     };
     let above = (above_ref > 0).then_some(above_ref);
     let left = (left_ref > 0).then_some(left_ref);
@@ -7196,10 +7195,15 @@ fn note_drl_clamp(target: usize, signalled: usize, entries: usize) {
     }
 }
 
-/// Takes and clears [`DRL_CLAMP_HITS`], for a gate's own before/after delta.
-#[cfg(test)]
-pub(crate) fn take_drl_clamp_hits() -> usize {
-    DRL_CLAMP_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+/// Reads [`DRL_CLAMP_HITS`] -- the tripwire for the DRL owner's fix. It is
+/// provably zero while `every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal`
+/// (encode.rs) holds: the pricer never offers an index this walk cannot signal,
+/// so no clip can move it (lane-av1recipehunt, 153 attempts, plus a mutation
+/// proof that widening the pricer's offer set does). The clip gate that used
+/// to wait on it is deleted; this counter stays so that widening the pricer
+/// is loud instead of silent. `EC_AV1_TRACE=1` prints each hit.
+pub fn drl_clamp_hits() -> usize {
+    DRL_CLAMP_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn note_inter_mode(mode: usize, drl: usize) {
@@ -7335,7 +7339,7 @@ fn write_inter_mode(
             enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not NEWMV
             enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not GLOBALMV
             enc.symbol(1, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARMV
-                                                               // `RefMvIdx` starts at 1 for NEARMV (spec 5.11.24).
+            // `RefMvIdx` starts at 1 for NEARMV (spec 5.11.24).
             let idx = idx.max(1);
             let signalled = write_drl_idx(enc, cdfs, stack, 1, idx);
             let mv = stack.entries.get(signalled).map_or(stack.near_mv, |e| e.mv);
@@ -8954,8 +8958,8 @@ mod tests {
     use crate::sequence::sequence_header_obu;
     use ec_av1_syntax::sequence::SequenceHeader;
     use ec_av1_syntax::{
-        FrameHeader, FrameType, LoopFilterParams, QuantizationParams, TileInfo, TxMode,
-        PRIMARY_REF_NONE,
+        FrameHeader, FrameType, LoopFilterParams, PRIMARY_REF_NONE, QuantizationParams, TileInfo,
+        TxMode,
     };
     use std::process::{Command, Stdio};
 
@@ -10594,11 +10598,7 @@ mod tests {
             .map(|&v| {
                 let m = f64::from(v).abs() + 0.5;
                 let l = if m < 1.0 { 0 } else { m.floor() as i32 };
-                if v < 0.0 {
-                    -l
-                } else {
-                    l
-                }
+                if v < 0.0 { -l } else { l }
             })
             .collect();
         let before = levels.clone();
@@ -10657,11 +10657,7 @@ mod tests {
             .map(|&v| {
                 let m = f64::from(v).abs() + 0.5;
                 let l = if m < 1.0 { 0 } else { m.floor() as i32 };
-                if v < 0.0 {
-                    -l
-                } else {
-                    l
-                }
+                if v < 0.0 { -l } else { l }
             })
             .collect();
         let bits = rdoq(
@@ -11158,11 +11154,7 @@ mod tests {
             (d << 3) | (fr << 1) | 1
         };
         let mag = mv_class_base(class) + local as i32 + 1;
-        if sign == 1 {
-            -mag
-        } else {
-            mag
-        }
+        if sign == 1 { -mag } else { mag }
     }
 
     /// Decodes one superblock a [`sb_coeff_inter_frame_tile`] payload wrote,
