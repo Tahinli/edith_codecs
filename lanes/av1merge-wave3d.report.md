@@ -395,9 +395,83 @@ the same defect class this wave is about.)*
 | Main's tsv row-set check | empty, twice |
 | name-set `comm` both directions | +2 / −0 |
 
-**VPS suite for wave 3d: not run.** The wave-3c-b suite
-(`tCloud@2.28.124.204`, unit `wave3cb-suite`, log `~/gates/wave3cb/suite.log`)
-was still executing when this wave started and I did not queue a second full run
-behind it. Everything above is measured on the merged tree in a lane-private
-target dir with the local `aomenc`/`aomdec`/`ffmpeg` present, except the oracle
-rebuild-dependent rung output, which is named as the lane's measurement.
+## 8. VPS full suite for wave 3d
+
+Host `tCloud@51.195.223.40` (`vps-4733167b.vps.ovh.net`), unit
+`wave3d-suite.service`, staging `~/gates/wave3d`, logs `~/gates/wave3d-suite.log`
+and `~/gates/wave3d/suite.log`.
+
+Staging used the recipe this batch validated, with both corrections:
+
+1. `git archive HEAD` — never a worktree tar — scp, extract under `$HOME`.
+2. `git init -q` **plus `git add -A`**: 1693 index entries. A bare `git init`
+   leaves the index empty, `pin-gate-audit.py`'s `git ls-files --error-unmatch`
+   then fails for every pin, and the census reads `committed=0 uncommitted=21` —
+   a staging artefact that looks exactly like the defect invariant 4 exists to
+   catch. This is the wave-3c-b correction.
+3. `ln -sfn ~/gates/library/fixtures fixtures`: the clip gates now **fail
+   loudly** without it. That is the clipprobe fix working, not a staging defect.
+4. `systemd-run --user` with explicit `WorkingDirectory`, `CARGO_TARGET_DIR`,
+   `TMPDIR`, `EC_NOMEMGUARD=1`, `EC_AV1_REQUIRE_AOMENC=1`,
+   `EC_AV1_REQUIRE_FFMPEG=1`, `EC_REQUIRE_FIXTURES=1`, `EC_FIXTURES`,
+   `EC_AV1_AOMENC`, `EC_AV1_AOMDEC`, and `PATH` **carrying
+   `$HOME/.cargo/bin`** — `systemd-run` resets `PATH`, and a missing `cargo`
+   there silently empties every measurement in the script.
+5. Both gitignored `lanes/*.expected.txt` dumps present (24440 / 10129 B).
+
+### Hash check, both directions, re-keyed
+
+    rows local=496 host=496
+    $ comm -3 local3d.ps hostC3d.ps
+                                        (no output)
+    comm_exit=0
+    $ comm -3 local3d.ps local3d.ps | wc -l     # control: comm really compares
+    0
+
+The re-keying (`awk '{print $2"\\t"$1}' | LC_ALL=C sort`) is not optional: raw
+`comm` on `sha256sum` output prints "not in sorted order" and then interleaves
+byte-identical rows as if they differed — the exact false reading this check
+exists to prevent. The self-comparison control is there so an empty `comm -3`
+cannot be mistaken for a broken one.
+
+### What the unit reported before the suite started
+
+    === host=vps-4733167b.vps.ovh.net commit=08f8ffb3622f80056542b36cb3da34a1998bc38b
+    === root fixtures -> /home/tCloud/gates/library/fixtures; library files=793
+    === PREFLIGHT (EC_REQUIRE_FIXTURES=1, root linked)
+    preflight_exit=0 :: verify-fixture-library: GREEN (299 rows)
+      shape: 299 rows
+      resolve: 0 missing, 0 empty
+      invariant 1: positive control fired (the scanner can still see a literal)
+      invariant 1: no root-fixture pin path
+      invariant 2: every committed pin is tracked
+      invariant 3: .gitignore negation present
+      invariant 3: no tracked pin is shadowed by .gitignore
+      pin gates: total=8 committed=21 uncommitted=0 ignored=0 assertless=0
+      invariant 4: census self-test passed (a comment cannot steal a gate)
+      invariant 4: every pin-reading gate resolves through committed copies
+    === PIN-GATE-AUDIT SELF-TEST
+    SELFTEST	PASS	a doc comment between two gates left both counted as crate_pin
+    selftest_exit=0
+
+So both regenerated manifests and the whole 3c-b chain are GREEN **from a
+`git archive` checkout on a runner** — the state the 3c-b report could not reach.
+
+**One check does NOT run on this host, and it is provisioning, not the repo:**
+
+    $ ./scripts/check-aom-oracle-rungs.sh ; echo $?
+    no oracle source at /home/tCloud/.cache/aom-oracle/src/av1/decoder/decodeframe.c
+    1
+    $ ls ~/.cache/aom-oracle/
+    build
+
+This host carries only `~/.cache/aom-oracle/build` (the `aomdec` and `aomenc`
+binaries) and **no `src/`**, so the rung checker — which compares the derived
+instrumented files against pristine oracle source — cannot run here. The
+**14 ok / exit 0** figure in §4 and §7 is the local measurement. The suite needs
+only the binaries, so it is unaffected; recorded so nobody reads the exit 1 as a
+regression.
+
+### Totals
+
+*(appended when the unit exits.)*
