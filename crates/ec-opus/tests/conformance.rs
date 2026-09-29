@@ -775,7 +775,7 @@ fn decode_speed() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "probe: report harness with no asserts; unblocks by setting EC_OPUS_FILES to committed .opus fixtures -- unset, it decodes nothing"]
 fn real_library_sweep() {
     // Files named on the command line (EC_OPUS_FILES=a.opus:b.opus), decoded
     // and compared against libopus channel by channel, with the decode speed.
@@ -3001,7 +3001,7 @@ fn per_second_corr(source: &[f32], decoded: &[f32], channels: usize) -> (f64, u3
 //   cargo test -p ec-opus --release --test conformance sadie64_persecond_diag -- --ignored --nocapture
 
 #[test]
-#[ignore]
+#[ignore = "probe: per-second correlation dump for the 64k lane; unblocks when ~/Music/sadie.wav is back in the corpus (hard-asserts src.exists)"]
 fn sadie64_persecond_diag() {
     const SECS: f64 = 120.0;
     const FRAME: usize = 960; // 20 ms
@@ -3260,7 +3260,7 @@ fn sadie64_persecond_diag() {
     println!("wrote {}", out_path.display());
 }
 #[test]
-#[ignore]
+#[ignore = "library gate: hand-run 14-row sweep, 120s per source, needs ffmpeg libopus and the local ~/Music corpus (~12 min); the sadie@64k dropout that first failed it is fixed per lanes/opus-drop-r2.report.md, so only the corpus dependency keeps it out of the default suite"]
 fn encoder_library_gate_vs_libopus() {
     const SECS: f64 = 120.0; // 2 min cap; full 600s made the 14-row sweep infeasible
     const FRAME: usize = 960; // 20 ms at 48 kHz
@@ -3572,7 +3572,7 @@ fn first_audio_toc(ogg: &[u8]) -> u8 {
 }
 
 #[test]
-#[ignore]
+#[ignore = "library gate: hand-run mono VoIP sweep; blocked until ~/Music/sadie.wav is back in the corpus (hard-asserts src.exists) and it is a multi-minute ffmpeg run, not a suite test"]
 fn silk_library_gate_vs_libopus() {
     const SECS: f64 = 120.0; // 2 min cap
     const FRAME: usize = 960; // 20 ms at 48 kHz
@@ -3811,7 +3811,7 @@ fn silk_library_gate_vs_libopus() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore]
+#[ignore = "probe: per-second SILK 12k bit-allocation dump; unblocks when ~/Music/sadie.wav is back in the corpus (hard-asserts src.exists)"]
 fn silk_silkq_persecond_diag() {
     const SECS: f64 = 120.0;
     const FRAME: usize = 960; // 20 ms at 48 kHz
@@ -4083,7 +4083,7 @@ fn silk_silkq_persecond_diag() {
 //      silk_silkq_oracle -- --ignored --nocapture
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore]
+#[ignore = "probe: per-frame SILK Indices side-by-side oracle dump; unblocks when ~/Music/sadie.wav is back in the corpus (hard-asserts src.exists)"]
 fn silk_silkq_oracle() {
     const SECS: f64 = 120.0;
     const FRAME: usize = 960; // 20 ms at 48 kHz
@@ -4365,7 +4365,7 @@ fn collect_indices(packets: &[Vec<u8>]) -> Vec<(ec_opus::SilkDecIndices, usize)>
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore]
+#[ignore = "probe: per-band spectral divergence dump at 12k; unblocks when ~/Music/sadie.wav is back in the corpus (hard-asserts src.exists)"]
 fn silk_spectral_divergence_12k() {
     const SECS: f64 = 120.0;
     const FRAME: usize = 960; // 20 ms at 48 kHz
@@ -4721,7 +4721,7 @@ fn silk_spectral_divergence_12k() {
 //      opus_compare_harness -- --ignored --nocapture
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore]
+#[ignore = "probe: needs hand-supplied SW_REF/SW_TEST .sw files to cross-check our opus_compare against the C tool; asserts nothing without those env vars"]
 fn opus_compare_harness() {
     let ref_path = std::env::var("SW_REF").expect("SW_REF");
     let test_path = std::env::var("SW_TEST").expect("SW_TEST");
@@ -4757,7 +4757,7 @@ fn opus_compare_harness() {
 //      cargo test -p ec-opus --release opus_compare_harness_ours -- --ignored --nocapture
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore]
+#[ignore = "probe: needs hand-supplied SW_SRC/SW_KBPS/SW_OUT_SRC/SW_OUT_DEC to round-trip a .sw through our encoder; only writes .sw dumps, asserts nothing"]
 fn opus_compare_harness_ours() {
     let src_path = std::env::var("SW_SRC").expect("SW_SRC");
     let kbps: u32 = std::env::var("SW_KBPS")
@@ -4900,7 +4900,7 @@ const CELT_EBANDS: [usize; NBANDS + 1] = [
 ];
 
 #[test]
-#[ignore]
+#[ignore = "probe: per-window CELT band divergence sweep over the local corpus; a multi-minute ffmpeg report run, not a suite gate"]
 fn spectral_divergence_vs_libopus() {
     const SECS: f64 = 120.0;
     const FRAME: usize = 960;
@@ -5382,7 +5382,7 @@ fn celt_silence_then_attack_decodes_bounded() {
 /// Sample-level view of the naz startup: per-120-sample energy of source,
 /// ours (gate path) and libopus reference around the first attack.
 #[test]
-#[ignore]
+#[ignore = "probe: HOP_SRC/HOP_MS-driven hop-energy dump around the naz startup attack; returns silently when HOP_SRC is absent, so it can never be a suite gate"]
 fn naz_startup_hop_energies() {
     const CH: usize = 2;
     // HOP_SRC / HOP_MS pick another source and window centre (diagnostic).
@@ -5465,7 +5465,7 @@ fn naz_startup_hop_energies() {
 /// Where a lone click lands after a CELT-only fullband roundtrip, relative to
 /// the encoder look-ahead (diagnostic for the hybrid alignment tolerance).
 #[test]
-#[ignore]
+#[ignore = "probe: self-contained, but prints where a synthetic click lands after a CELT-only roundtrip and asserts nothing; unblocks when that offset is turned into a tolerance assert"]
 fn celt_click_peak_offset() {
     let mut click = vec![0f32; 48000];
     let at = 960 * 10 + 300;
@@ -5496,7 +5496,7 @@ fn celt_click_peak_offset() {
 /// dual_stereo share, spread/tf histograms, total_bits — ours vs ref, split by
 /// the decoder's transient flag. Output: `lanes/opus-sb-r1.bits.txt`.
 #[test]
-#[ignore]
+#[ignore = "probe: per-frame short-block allocation dump over the local corpus; a multi-minute ffmpeg report run, not a suite gate"]
 fn short_block_bits_vs_libopus() {
     const SECS: f64 = 120.0;
     const FRAME: usize = 960;
@@ -5777,7 +5777,7 @@ fn short_block_bits_vs_libopus() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore]
+#[ignore = "probe: EC_ERRMAP_SRC-driven per-window error map; returns silently when the named source is missing, so it can never be a suite gate"]
 fn err_map_vs_libopus() {
     const SECS: f64 = 120.0;
     const FRAME: usize = 960;
@@ -6031,7 +6031,7 @@ fn err_map_vs_libopus() {
 /// with our own decoder on both sides. FRAME_SRC / FRAME_KBPS / FRAME_FROM /
 /// FRAME_TO pick the source, rate and frame range (diagnostic).
 #[test]
-#[ignore]
+#[ignore = "probe: FRAME_SRC/FRAME_FROM/FRAME_TO-driven per-frame decision dump; returns silently when FRAME_SRC is missing, so it can never be a suite gate"]
 fn frame_decisions_vs_libopus() {
     const CH: usize = 2;
     let src_s =
