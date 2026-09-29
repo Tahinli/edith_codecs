@@ -5043,6 +5043,11 @@ fn record_intrabc_mi_rect(
                 *cell = true;
             }
         }
+        // lane-av1txctxband: the per-CELL `is_inter_block` an INTRABC block
+        // publishes (`blockd.h:372-374` counts it), at the granularity
+        // `get_tx_size_context` reads it. The band above is one slot per
+        // column and so survives every later block in that column.
+        n.mark_inter_grid_rect((mi_r, mi_c), n4_w, n4_h, true);
     }
     fctx.intrabc_mi_grid.with(|g| {
         let mut g = g.borrow_mut();
@@ -5884,6 +5889,30 @@ thread_local! {
 #[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 pub(crate) fn txctx_deblock_divergence_hits() -> usize {
     TXCTX_DEBLOCK_DIVERGENCE_HITS.with(std::cell::Cell::get)
+}
+// lane-av1txctxband: how many `get_tx_size_context` reads the per-CELL
+// `is_inter_block` cover and the per-COLUMN `above_inter`/`left_inter` bands
+// DISAGREE about -- i.e. exactly the reads whose CDF row the old code chose
+// wrongly. Green on the old code too (a plain "some block was inter" tally
+// would be), so this is the non-vacuity arm of the witness gate: it is 0 on
+// every stream where the bands happened to be right and non-zero on the
+// 4:4:4 lossy `--sb-size=128` cq-62 stream whose entropy forked at read 32813
+// on the 8x4 intra leaf at mi(57,52).
+thread_local! {
+    static TXCTX_INTER_CELL_BAND_DIVERGENCE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`TXCTX_INTER_CELL_BAND_DIVERGENCE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gate
+pub(crate) fn txctx_inter_cell_band_divergence_hits() -> usize {
+    TXCTX_INTER_CELL_BAND_DIVERGENCE_HITS.with(std::cell::Cell::get)
+}
+
+/// Zeroes [`TXCTX_INTER_CELL_BAND_DIVERGENCE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gate
+pub(crate) fn reset_txctx_inter_cell_band_divergence_hits() {
+    TXCTX_INTER_CELL_BAND_DIVERGENCE_HITS.with(|c| c.set(0));
 }
 
 // lane-intra14 r1: how many intra-coded 1:4 strips decoded on the INTER
@@ -8931,6 +8960,26 @@ struct Neighbours {
     /// pixels, which for chroma is `max(luma_dim / 2, 4)` (lane-t900 r30b).
     blk_grid: Vec<BlkCell>,
     skip_grid_cols_mi: usize,
+    /// Per-4x4-mi `is_inter_block` of the coded block COVERING that cell --
+    /// lane-av1txctxband. libaom's `get_tx_size_context`
+    /// (`av1/common/pred_common.h:361-370`) gates its "an inter neighbour
+    /// contributes its own BLOCK size" override on `xd->above_mbmi` /
+    /// `xd->left_mbmi`, which `set_mi_offsets` takes as `xd->mi[-mi_stride]`
+    /// / `xd->mi[-1]`: the block whose bottom (left) edge abuts THIS block's
+    /// top (right) edge at THIS cell. `setup_mbs` (`decodeframe.c:355-361`)
+    /// writes that pointer into EVERY mi cell a block covers, so libaom's
+    /// granularity is the covering block PER CELL -- not one slot per column.
+    /// [`Self::above_inter`]/[`Self::left_inter`] are per-COLUMN bands holding
+    /// the LAST block written in that column, which is the covering block only
+    /// for the block immediately below it: on a 4:4:4 lossy `--sb-size=128`
+    /// cq-62 stream the 8x4 intra leaf at mi(57,52) read `above_inter` as
+    /// `true` (stale, from an intrabc block earlier in column 52) with
+    /// `above_side_mi` 4, took the override, and read `tx_size_cat0[1]` where
+    /// libaom reads row 2 -- the `EC_SYMR` fork at read 32813.
+    /// Written by exactly the three places that already write the bands:
+    /// [`Self::record_inter_rect_mi`], `record_intrabc_mi_rect` and
+    /// `fill_lf_grid_rect`'s intra-only clear.
+    inter_grid: Vec<bool>,
     /// Per-4x4-mi luma transform width in pixels (8/16/32/64) -- this decoder
     /// never splits a coded block's transform below its own size (round 2:
     /// `TxMode::Select`/`tx_depth` refused), so a block's own side *is* its
@@ -9065,6 +9114,7 @@ impl Neighbours {
                 cols * (SUB / MI) * rows * (SUB / MI)
             ],
             skip_grid_cols_mi: cols * (SUB / MI),
+            inter_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             uv_tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
@@ -9551,6 +9601,12 @@ impl Neighbours {
                     *cell = false;
                 }
             }
+            // lane-av1txctxband: the same clear at libaom's own per-CELL
+            // granularity. The band above clears one slot per column, so a
+            // block that covered column 52 and a later block in the SAME
+            // column but a different row leave the band describing whichever
+            // wrote last; the grid clears exactly the cells this block owns.
+            self.mark_inter_grid_rect(at_mi, w_mi, h_mi, false);
         }
         // lane-av1-intrabc r4: publish this coded block's own mi footprint
         // into the intrabc MV grid's block-COVERAGE map -- every coded block,
@@ -9627,6 +9683,55 @@ impl Neighbours {
                 },
             );
         }
+    }
+    /// Publishes one coded block's `is_inter_block` over EVERY 4x4 mi cell it
+    /// covers -- lane-av1txctxband. libaom's `setup_mbs`
+    /// (`decodeframe.c:355-361`) writes the block's own `MB_MODE_INFO`
+    /// pointer into all of them, so `xd->mi[-xd->mi_stride]` /
+    /// `xd->mi[-1]` name the block COVERING the cell, not "the last block
+    /// written in this column" ([`Self::above_inter`] /
+    /// [`Self::left_inter`], which is a per-column band and therefore stale
+    /// for any block below the last writer in its column).
+    /// Separate from [`Self::fill_skip_grid_rect`] because the two publishers
+    /// run in BOTH orders at different call sites; both write disjoint fields,
+    /// so the order does not matter. The value read is libaom's
+    /// `is_inter_block` (`blockd.h:372-374`): an INTRABC block counts.
+    fn mark_inter_grid_rect(
+        &mut self,
+        at_mi: (usize, usize),
+        w_mi: usize,
+        h_mi: usize,
+        is_inter: bool,
+    ) {
+        for rr in 0..h_mi {
+            let start = (at_mi.0 + rr) * self.skip_grid_cols_mi + at_mi.1;
+            fill_span(&mut self.inter_grid, start, w_mi, is_inter);
+        }
+    }
+
+    /// `is_inter_block` of the coded block covering the mi cell
+    /// `(mi_r, mi_c)`, or `false` for a cell no block has written yet (a tile
+    /// border or a not-yet-decoded cell) -- lane-av1txctxband. The caller's
+    /// `up_available` / `left_available` guard already excludes the borders.
+    fn inter_at(&self, mi_r: usize, mi_c: usize) -> bool {
+        self.inter_grid
+            .get(mi_r * self.skip_grid_cols_mi + mi_c)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The covering block's own `(block_size_wide, block_size_high)` in
+    /// pixels at the mi cell `(mi_r, mi_c)`, from [`Self::blk_grid`]'s `dim`
+    /// (the published mi extent) scaled by [`MI`] -- lane-av1txctxband. This
+    /// is libaom's `block_size_wide[above_mbmi->bsize]` /
+    /// `block_size_high[left_mbmi->bsize]`, read at the abutting CELL rather
+    /// than from the per-column [`Self::above_side_mi`] /
+    /// [`Self::left_side_mi`] band.
+    fn blk_side_at(&self, mi_r: usize, mi_c: usize) -> (usize, usize) {
+        self.blk_grid
+            .get(mi_r * self.skip_grid_cols_mi + mi_c)
+            .filter(|c| c.written)
+            .map_or((0, 0), |c| (c.dim[0] as usize * MI, c.dim[1] as usize * MI))
     }
 
     /// Whether the 8x8 luma block at mi position `(mi_r, mi_c)` (2x2 mi
@@ -9795,6 +9900,9 @@ impl Neighbours {
             self.record_mode_mi(r, c, w_mi, h_mi, DC_PRED);
             self.record_uv_mode_mi(r, c, w_mi, h_mi, DC_PRED);
         }
+        // lane-av1txctxband: the per-CELL `is_inter_block` the per-column
+        // `above_inter` band stands in for, at libaom's own granularity.
+        self.mark_inter_grid_rect(at_mi, w_mi, h_mi, is_inter);
         let altref = is_inter && ref_frame == crate::mvstack::ALTREF_FRAME;
         self.above_skip[c..c + w_mi].fill(skip);
         self.above_skip_mode[c..c + w_mi].fill(skip_mode);
@@ -28297,17 +28405,56 @@ fn tx_size_context_txfm_rect(
     let has_left = mi_c > n.tile_col0_mi;
     let mut above = usize::from(n.above_txfm[mi_c]) >= own_w;
     let mut left = usize::from(n.left_txfm[mi_r]) >= own_h;
-    if has_above && n.above_inter[mi_c] {
-        above = usize::from(n.above_side_mi[mi_c]) >= own_w;
+    // lane-av1txctxband: the override's gate and its size term are read at
+    // the ABUTTING CELL -- libaom's `xd->above_mbmi` is `xd->mi[-mi_stride]`
+    // and `xd->left_mbmi` is `xd->mi[-1]` (`set_mi_offsets`,
+    // av1_common_int.h:1381-1389), which `setup_mbs` fills with the pointer
+    // of the block COVERING that cell (decodeframe.c:355-361). The old code
+    // read the per-COLUMN `above_inter`/`left_inter` bands and the matching
+    // `above_side_mi`/`left_side_mi` bands, i.e. the LAST block written in
+    // that column, which names the abutting block only for the block directly
+    // below it. Measured: on the 4:4:4 lossy `--sb-size=128` cq-62 stream the
+    // 8x4 intra leaf at mi(57,52) saw a stale `above_inter=true` (from an
+    // intrabc block earlier in column 52) with `above_side=4`, took the
+    // override, and read `tx_size_cat0[1]` where libaom reads row 2.
+    if has_above && n.inter_at(mi_r - 1, mi_c) {
+        above = usize::from(n.blk_side_at(mi_r - 1, mi_c).0) >= own_w;
     }
-    if has_left && n.left_inter[mi_r] {
-        left = usize::from(n.left_side_mi[mi_r]) >= own_h;
+    if has_left && n.inter_at(mi_r, mi_c - 1) {
+        left = usize::from(n.blk_side_at(mi_r, mi_c - 1).1) >= own_h;
+    }
+    // lane-av1txctxband: the non-vacuity arm. It counts the reads whose
+    // RESOLVED context term differs from what the old per-column bands would
+    // have produced -- not merely reads where the two `is_inter` booleans
+    // disagree, because on the measured witness they AGREE (`above_inter` and
+    // the per-cell cover are both true at mi(57,52)) and it is the SIZE term
+    // that is stale (band 4 vs the covering block's own 8), which is what put
+    // the read on `tx_size_cat0[1]` instead of row 2.
+    {
+        let band_above = has_above
+            && if n.above_inter[mi_c] {
+                usize::from(n.above_side_mi[mi_c]) >= own_w
+            } else {
+                usize::from(n.above_txfm[mi_c]) >= own_w
+            };
+        let band_left = has_left
+            && if n.left_inter[mi_r] {
+                usize::from(n.left_side_mi[mi_r]) >= own_h
+            } else {
+                usize::from(n.left_txfm[mi_r]) >= own_h
+            };
+        if band_above != (has_above && usize::from(above) != 0)
+            || band_left != (has_left && usize::from(left) != 0)
+        {
+            hit!(TXCTX_INTER_CELL_BAND_DIVERGENCE_HITS);
+        }
     }
     if crate::envflags::env_flag!("EC_TXCTX") {
         eprintln!(
             "EC_TXCTX mi={mi_r},{mi_c} own={own_w}x{own_h} ha={has_above} hl={has_left} \
              intra_only={} above_txfm={} left_txfm={} above_inter={} left_inter={} \
-             above_side={} left_side={} above={above} left={left}",
+             above_side={} left_side={} above={above} left={left} \
+             | cell_inter ab={} lb={} ab_side={} lb_side={}",
             fctx.intra_only.with(std::cell::Cell::get),
             n.above_txfm[mi_c],
             n.left_txfm[mi_r],
@@ -28315,6 +28462,21 @@ fn tx_size_context_txfm_rect(
             n.left_inter[mi_r],
             n.above_side_mi[mi_c],
             n.left_side_mi[mi_r],
+            // lane-av1txctxband: the per-CELL terms this read now uses, next to
+            // the per-column bands it used to use, so a divergence names which
+            // of the two disagreed.
+            has_above
+                .then(|| n.inter_at(mi_r - 1, mi_c))
+                .unwrap_or(false),
+            has_left
+                .then(|| n.inter_at(mi_r, mi_c - 1))
+                .unwrap_or(false),
+            has_above
+                .then(|| n.blk_side_at(mi_r - 1, mi_c).0)
+                .unwrap_or(0),
+            has_left
+                .then(|| n.blk_side_at(mi_r, mi_c - 1).1)
+                .unwrap_or(0),
         );
     }
     let ctx = match (has_above, has_left) {
@@ -28352,23 +28514,63 @@ fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usiz
     // 16x16 intra block whose left neighbour is an inter block at mi row 4
     // then missed libaom's "an inter neighbour contributes its BLOCK size"
     // override and read `tx_size_cat1` row 1 where aomdec reads row 2.
-    if has_above && n.above_inter[mi_c] {
-        above = usize::from(n.above_side_mi[mi_c]) >= side;
+    // lane-angledelta r1 (class [[context-read-from-one-cell]]) fixed the
+    // `/ (SUB / MI)` on this pair; lane-av1txctxband fixes what it could not:
+    // the bands are per COLUMN, so they name the last block written in the
+    // column, not the block covering the abutting cell. libaom's
+    // `xd->above_mbmi` is `xd->mi[-xd->mi_stride]` and `xd->left_mbmi` is
+    // `xd->mi[-1]` (`set_mi_offsets`, av1_common_int.h:1381-1389), and
+    // `setup_mbs` (decodeframe.c:355-361) writes the covering block's own
+    // pointer into every mi cell the block covers.
+    if has_above && n.inter_at(mi_r - 1, mi_c) {
+        above = usize::from(n.blk_side_at(mi_r - 1, mi_c).0) >= side;
     }
-    if has_left && n.left_inter[mi_r] {
-        left = usize::from(n.left_side_mi[mi_r]) >= side;
+    if has_left && n.inter_at(mi_r, mi_c - 1) {
+        left = usize::from(n.blk_side_at(mi_r, mi_c - 1).1) >= side;
+    }
+    // lane-av1txctxband: the non-vacuity arm (see the rect form above).
+    {
+        let band_above = has_above
+            && if n.above_inter[mi_c] {
+                usize::from(n.above_side_mi[mi_c]) >= side
+            } else {
+                usize::from(n.above_txfm[mi_c]) >= side
+            };
+        let band_left = has_left
+            && if n.left_inter[mi_r] {
+                usize::from(n.left_side_mi[mi_r]) >= side
+            } else {
+                usize::from(n.left_txfm[mi_r]) >= side
+            };
+        if band_above != (has_above && usize::from(above) != 0)
+            || band_left != (has_left && usize::from(left) != 0)
+        {
+            hit!(TXCTX_INTER_CELL_BAND_DIVERGENCE_HITS);
+        }
     }
     if crate::envflags::env_flag!("EC_TXCTX") {
         eprintln!(
             "EC_TXCTX mi={mi_r},{mi_c} own={side} ha={has_above} hl={has_left} \
              above_txfm={} left_txfm={} above_inter={} left_inter={} above_side={} left_side={} \
-             above={above} left={left}",
+             above={above} left={left} | cell_inter ab={} lb={} ab_side={} lb_side={}",
             n.above_txfm[mi_c],
             n.left_txfm[mi_r],
             n.above_inter[mi_c],
             n.left_inter[mi_r],
             n.above_side_mi[mi_c],
             n.left_side_mi[mi_r],
+            has_above
+                .then(|| n.inter_at(mi_r - 1, mi_c))
+                .unwrap_or(false),
+            has_left
+                .then(|| n.inter_at(mi_r, mi_c - 1))
+                .unwrap_or(false),
+            has_above
+                .then(|| n.blk_side_at(mi_r - 1, mi_c).0)
+                .unwrap_or(0),
+            has_left
+                .then(|| n.blk_side_at(mi_r, mi_c - 1).1)
+                .unwrap_or(0),
         );
     }
     match (has_above, has_left) {

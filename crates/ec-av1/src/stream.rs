@@ -8278,6 +8278,100 @@ pub(crate) mod tests {
     fn a_444_lossy_256x128_stream_decodes_pixel_exact() {
         gate_444_lossy_live_exact("a_444_lossy_256x128_stream_decodes_pixel_exact", 256, 128);
     }
+    /// lane-av1txctxband — the 4:4:4 lossy `--sb-size=128` stream whose
+    /// `EC_SYMR` ladder forked at read 32813, and the gate that makes the fix
+    /// non-vacuous.
+    ///
+    /// **The defect.** `get_tx_size_context` (libaom
+    /// `av1/common/pred_common.h:361-370`) gates its "an inter neighbour
+    /// contributes its own BLOCK size" override on `xd->above_mbmi` /
+    /// `xd->left_mbmi`, which `set_mi_offsets`
+    /// (`av1_common_int.h:1381-1389`) takes as `xd->mi[-xd->mi_stride]` /
+    /// `xd->mi[-1]`. `setup_mbs` (`decodeframe.c:355-361`) writes the covering
+    /// block's own `MB_MODE_INFO` pointer into EVERY mi cell the block covers,
+    /// so libaom's granularity is the covering block PER CELL. This decoder
+    /// read the per-COLUMN `above_inter`/`left_inter` bands and the matching
+    /// `above_side_mi`/`left_side_mi` bands instead — the LAST block written in
+    /// that column, which names the abutting block only for the block directly
+    /// below it. On this witness the 8x4 intra leaf at mi(57,52) (SB row 1,
+    /// col 1) read a stale `above_inter=true` with `above_side=4`, took the
+    /// override, got `above = (4 >= 8) = 0` where libaom keeps
+    /// `above = (above_txfm_context[0] >= 8) = 1`, and read
+    /// `tx_size_cat0[1]` where libaom reads `tx_size_cdf[...][2]`.
+    ///
+    /// **The fork signature that identifies it** (a CDF-row error, not a
+    /// unit-enumeration one): the two sides held the IDENTICAL pre-state
+    /// `pre=(7550, 45492)` and the IDENTICAL width/value `n=2 s=1`; only
+    /// `cdf0` differed, ours 6424 (`32768-6424 = 26344`) vs the oracle's
+    /// 19938, so the ICDF mirror convention does not reconcile it either.
+    ///
+    /// **Non-vacuity.** The pixel assert alone would be green on the old code
+    /// for any stream where the bands happened to be right, so the gate also
+    /// asserts `txctx_inter_cell_band_divergence_hits() > 0` — the number of
+    /// `get_tx_size_context` reads where the per-CELL cover and the
+    /// per-COLUMN band DISAGREE, i.e. exactly the reads the old code resolved
+    /// off a different CDF row. Reverting either reader to the bands drives
+    /// this to 0 and the gate red, with the oracle compare as the second,
+    /// independent arm.
+    ///
+    /// **Fixture provenance** (`444_lossy_sb128_txctx_witness.obu`, 6186 B,
+    /// sha256 `14acb74e825a2bb3ef195a52cc2abc67794d9c4d92080b66c739d318177fc7c6`):
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=256x256:rate=25" -frames:v 2 \
+    ///        -pix_fmt yuv444p -strict -1 -f yuv4mpegpipe -y src.y4m
+    /// aomenc --codec=av1 --passes=1 --end-usage=q --cq-level=62 --cpu-used=2 \
+    ///        --threads=1 --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 \
+    ///        --sb-size=128 --profile=1 --obu -o t256.obu src.y4m
+    /// ```
+    /// 256x256 is the smallest geometry that gives `--sb-size=128` a SECOND
+    /// superblock row and column, which is where the stale band bites: a cell
+    /// whose abutting block is not the last block written in its column. The
+    /// cq level is load-bearing — this cell is entropy-exact at cq 20..58 and
+    /// forks at 54/56/60/62 depending on the frame count (12 of the 99 cells
+    /// swept in `lanes/av1txctxband.report.md` §4 forked, all of them at
+    /// cq >= 54 on 256x256/320x240/256x384). `--sb-size=128` is load-bearing
+    /// too: at the default 64 the two superblock columns are 4 mi wide, so a
+    /// column band and a per-cell cover coincide for every 4-column run.
+    #[test]
+    fn a_444_lossy_sb128_txctx_reads_the_covering_block_per_cell() {
+        const NAME: &str = "a_444_lossy_sb128_txctx_reads_the_covering_block_per_cell";
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_lossy_sb128_txctx_witness.obu");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned fixture {} is missing ({e}) -- a failure, not a skip",
+                path.display()
+            )
+        });
+        assert_eq!(bytes.len(), 6186, "{NAME}: fixture length moved");
+        assert_eq!(
+            fnv1a64(&bytes),
+            0x2ec1_bb1b_5196_c4b3,
+            "{NAME}: fixture bytes moved"
+        );
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_txctx_inter_cell_band_divergence_hits();
+        let frames = decode_stream(&bytes)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned 4:4:4 stream was refused: {e}"));
+        assert_eq!(frames.len(), 2, "{NAME}: frame count");
+        let diverged = crate::decode::txctx_inter_cell_band_divergence_hits();
+        assert!(
+            diverged > 0,
+            "{NAME}: no `get_tx_size_context` read on this stream had the \
+             per-CELL cover and the per-COLUMN band disagree, so the witness \
+             does not exercise the corrected read at all (class \
+             gate-blind-to-feature) -- re-encode per the recipe above"
+        );
+        if aomdec_available(NAME) {
+            decode_all_frames_vs_oracle(&bytes, NAME);
+        }
+        eprintln!(
+            "{NAME}: {diverged} tx_depth read(s) where the per-cell cover and \
+             the per-column band disagreed (the 8x4 intra leaf at mi(57,52) is \
+             the one that forked the ladder at read 32813)"
+        );
+    }
     /// lane-av1444rect r2 — the SAME class as the gate above, second
     /// instance: `decode_rect4_16_intrabc` applied the 4:2:0 pair geometry at
     /// ss (0,0), where `is_chroma_reference` makes an intra-BC 1:4 strip its
