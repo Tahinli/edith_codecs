@@ -43597,4 +43597,230 @@ pub(crate) mod tests {
         }
         assert!(seen, "{name}: no sequence header parsed");
     }
+
+    /// lane-av1distwtd: the gate that pays the `enable-dist-wtd-comp` entry in
+    /// `gate_coverage.rs`'s [`NEVER_EXERCISED_8BIT`], and corrects its stated
+    /// reason. The entry said "distance-weighted compound is unimplemented" --
+    /// it is NOT: [`crate::compound::dist_wtd_comp_weight_assign`] (lane-av1comp)
+    /// and `mc::combine_compound`'s weighted path have been in the tree since.
+    /// What was missing is a stream that CARRIES the tool. Proved producible
+    /// against aom 3.13.3: the flag maps onto the sequence header's
+    /// `enable_jnt_comp` bit (`av1_cx_iface.c:1062` ->
+    /// `order_hint_info.enable_dist_wtd_comp` -> `bitstream.c:2681` writes it
+    /// under `enable_order_hint`), and this recipe's parsed header prints
+    /// `jnt_comp=true` with `=1` and `jnt_comp=false` with `=0` -- the parsed
+    /// value is asserted, never the flag spelling, per the class
+    /// `knob-never-reached-the-tool` trap that mislabelled a cell once already.
+    ///
+    /// Three hard asserts, all load-bearing:
+    /// 1. the PARSED sequence header carries `enable_jnt_comp == true` (the
+    ///    off-arm asserts `false` from the same recipe, so the bit is proven to
+    ///    MOVE with the flag rather than to be set by something else);
+    /// 2. `dist_wtd_comp_hits() > 0` -- the `compound_idx == 0` arm, the only
+    ///    branch whose blend weights are not the constant (8, 8). A stream
+    ///    carrying the header bit while coding every compound block with
+    ///    `compound_idx == 1` leaves this at 0 and decodes byte-identically
+    ///    without the whole distance-weight path, so the counter -- not the
+    ///    header bit -- is what makes this a witness of the TOOL;
+    /// 3. every frame pixel-compared against the oracle through
+    ///    [`decode_all_frames_vs_oracle`], which length-asserts each
+    ///    decode-order frame before zipping.
+    ///
+    /// `--min-partition-size=32` is what makes the arm fire: at 16 the encoder
+    /// emits 8x8 inter leaves this decoder refuses BY NAME, so a smaller
+    /// min-partition refuses before the `compound_idx` read ever runs (measured:
+    /// the `min=16` arm of the same recipe refuses with "an inter partition
+    /// below 16x16" and dumps zero `compound_idx` lines). `--cq-level=30` is
+    /// likewise load-bearing: at cq 45/55 the same arm encodes a single-ref
+    /// stream (zero `compound_idx` reads) and the counter assert would be
+    /// vacuous.
+    #[test]
+    fn a_distance_weighted_compound_stream_decodes_pixel_exact() {
+        const NAME: &str = "distwtd-comp";
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            return;
+        }
+        assert!(have_ffmpeg(), "{NAME}: ffmpeg required");
+        assert!(
+            aomdec_path().is_file(),
+            "{NAME}: aomenc resolved to {} but no aomdec sits beside it -- a \
+             pixel-exactness gate that compares nothing is worse than no gate",
+            aomenc_path().display()
+        );
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        // mandelbrot + a slow rotation: two genuinely different references at
+        // different temporal distances, which is what `dist_wtd_comp_weight_
+        // assign` weights BY. A static or flat source has equal distances
+        // everywhere and every block collapses onto one weight row.
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "mandelbrot=size=128x128:rate=25:start_x=-0.6:start_y=-0.4,\
+                 rotate=a=0.01*n:ow=128:oh=128:c=black,scale=64:64",
+                "-t",
+                "0.96",
+                "-pix_fmt",
+                "yuv420p",
+                "-strict",
+                "-1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{NAME}: ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        // the shared recipe; the flag under test is appended per arm so the
+        // two arms differ in exactly one argument.
+        let recipe: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=30",
+            "--cpu-used=0",
+            "--kf-max-dist=1000",
+            "--threads=1",
+            "--row-mt=0",
+            "--auto-alt-ref=1",
+            "--lag-in-frames=25",
+            "--enable-fwd-kf=0",
+            // `enable_jnt_comp` is only READ when order hints are on
+            // (`av1_cx_iface.c:1491` ANDs the two).
+            "--enable-order-hint=1",
+            "--enable-warped-motion=1",
+            "--tune-content=default",
+            "--min-partition-size=32",
+            "--max-partition-size=64",
+            // partition/intra tools this decoder does not code -- the same
+            // exclusion list every compound gate in this file carries.
+            "--enable-rect-partitions=0",
+            "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0",
+            "--enable-filter-intra=0",
+            "--enable-smooth-intra=0",
+            "--enable-paeth-intra=0",
+            "--enable-directional-intra=0",
+            "--enable-angle-delta=0",
+            "--enable-tx-size-search=0",
+            "--enable-cdef=0",
+            "--enable-restoration=0",
+            "--enable-palette=0",
+            "--enable-intrabc=0",
+            "--enable-cfl-intra=0",
+            "--enable-ref-frame-mvs=0",
+        ];
+        let encode = |flag: &str| -> Vec<u8> {
+            let out = run_with_stdin(
+                Command::new(aomenc_path()).args(
+                    recipe
+                        .iter()
+                        .copied()
+                        .chain([flag, "--obu", "-o", "-", "-"]),
+                ),
+                &y4m.stdout,
+            );
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the fixture with {flag}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        // The PARSED header, read back off the encoded bytes -- never the
+        // command line. `Av1Parser` walks the real OBUs, so a flag the encoder
+        // ignored is caught here rather than inherited into coverage.
+        let parsed_jnt_comp = |stream: &[u8]| -> bool {
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            while pos < stream.len() {
+                let obu = parser.parse_obu(&stream[pos..]).expect("parsing our own OBUs");
+                pos += obu.total_size;
+            }
+            parser
+                .sequence_header()
+                .expect("the stream carries a sequence header")
+                .enable_jnt_comp
+        };
+        // NB: the OFF arm is spelled FIRST on purpose. `gate_coverage.rs`'s
+        // `flags_in` keeps the LAST `--enable-<tool>=<value>` it finds in a gate
+        // body, so a trailing `=0` would make the whole gate read as "tool
+        // disabled" to the census and leave the entry unretired even though
+        // this gate does exercise the tool. Both arms are still asserted below.
+        let off = encode("--enable-dist-wtd-comp=0");
+        let on = encode("--enable-dist-wtd-comp=1");
+        // the bit MOVES with the flag, and it moves the BYTES: a flag the
+        // encoder accepted but ignored would fail both of these.
+        assert!(
+            parsed_jnt_comp(&on),
+            "{NAME}: the recipe spelled --enable-dist-wtd-comp=1 but the PARSED \
+             sequence header carries enable_jnt_comp == false (class \
+             knob-never-reached-the-tool) -- the gate would be vacuous"
+        );
+        assert!(
+            !parsed_jnt_comp(&off),
+            "{NAME}: the same recipe with --enable-dist-wtd-comp=0 still parses \
+             enable_jnt_comp == true, so the ON arm proves nothing about the flag"
+        );
+        assert_ne!(
+            on.len(),
+            off.len(),
+            "{NAME}: both arms encoded {} bytes -- the flag changed nothing on \
+             the wire, so neither arm is evidence for anything",
+            on.len()
+        );
+        // shape non-vacuity, before any compare: at 4:2:0 a decoder keeping a
+        // subsampled extent would hand quarter-size planes to the byte compare.
+        let frames = decode_stream(&on).unwrap_or_else(|e| panic!("{NAME}: refused: {e}"));
+        assert_eq!(
+            frames.len(),
+            frame_count,
+            "{NAME}: expected {frame_count} shown frames"
+        );
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                (f.width, f.height),
+                (width, height),
+                "{NAME}: frame {i} is {}x{}",
+                f.width,
+                f.height
+            );
+            assert_eq!(
+                f.u.len(),
+                width * height / 4,
+                "{NAME}: frame {i} U plane is {} samples, not 4:2:0",
+                f.u.len()
+            );
+            assert_eq!(f.v.len(), f.u.len(), "{NAME}: frame {i} V plane extent");
+            assert_eq!(f.y.len(), width * height, "{NAME}: frame {i} luma extent");
+        }
+        crate::decode::reset_dist_wtd_comp_hits();
+        let hits_before = crate::decode::dist_wtd_comp_hits();
+        let (oracle_frames, hidden) = decode_all_frames_vs_oracle(&on, NAME);
+        let dist_wtd = crate::decode::dist_wtd_comp_hits() - hits_before;
+        eprintln!(
+            "{NAME}: {oracle_frames} oracle frames ({hidden} hidden), \
+ dist_wtd_comp_hits={dist_wtd}, on={} B off={} B",
+            on.len(),
+            off.len()
+        );
+        assert!(
+            dist_wtd > 0,
+            "{NAME}: no block took the distance-weighted compound combine \
+             (compound_idx == 0) across {oracle_frames} frames that carry \
+             enable_jnt_comp = true -- every compound block used the simple \
+             average, so this gate proves nothing about the tool"
+        );
+    }
 }
