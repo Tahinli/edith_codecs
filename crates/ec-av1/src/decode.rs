@@ -10430,6 +10430,20 @@ impl Neighbours {
         uv_mode: usize,
         grids: &[&[i32]; 3],
     ) {
+        self.record_rect_mi_modes(at_mi, w, h, mode, uv_mode);
+        self.record_mi_rect(at_mi, w, h, grids);
+    }
+
+    /// [`Self::record_rect_mi`]'s mode and transform-size half, without the
+    /// coefficient-context stamp.
+    fn record_rect_mi_modes(
+        &mut self,
+        at_mi: (usize, usize),
+        w: usize,
+        h: usize,
+        mode: usize,
+        uv_mode: usize,
+    ) {
         let (r, c) = (at_mi.0 / (SUB / MI), at_mi.1 / (SUB / MI));
         // lane-inter4 r2: a strip whose own footprint runs past the frame's
         // last 16-px column/row stamps only the cells that exist (libaom's
@@ -10452,7 +10466,28 @@ impl Neighbours {
         }
         self.record_mode_mi(at_mi.0, at_mi.1, w / MI, h / MI, mode);
         self.record_uv_mode_mi(at_mi.0, at_mi.1, w / MI, h / MI, uv_mode);
-        self.record_mi_rect(at_mi, w, h, grids);
+    }
+
+    /// lane-av1chromarect: [`Self::record_rect_mi`] for a block whose uv
+    /// plane block is SEVERAL transform units, each of which stamped its own
+    /// span through [`Self::record_mi_chroma`]. Writing one whole-block state
+    /// over them is the `override-slot-on-one-arm` class: libaom keeps the
+    /// per-unit above/left contexts distinct, and the next block's first
+    /// unit reads them. The luma plane has one unit here, so it is stamped
+    /// exactly as the whole-block record stamps it.
+    fn record_rect_mi_luma_only(
+        &mut self,
+        at_mi: (usize, usize),
+        w: usize,
+        h: usize,
+        mode: usize,
+        uv_mode: usize,
+        luma_grid: &[i32],
+    ) {
+        self.record_rect_mi_modes(at_mi, w, h, mode, uv_mode);
+        fill_span(&mut self.left_side_mi, at_mi.0, h / MI, h as u8);
+        fill_span(&mut self.above_side_mi, at_mi.1, w / MI, w as u8);
+        self.record_mi_luma_rect(at_mi, w, h, luma_grid);
     }
 
     /// The coefficient-context half of [`Self::record`], taking the block's
@@ -10653,6 +10688,39 @@ impl Neighbours {
         uv_mode: usize,
         chroma_grids: [&[i32]; 2],
     ) {
+        self.record_split_luma_rect_mi_modes(at_mi, w, h, mode, uv_mode);
+        let (mi_r, _) = at_mi;
+        let (w_mi, h_mi) = (w / MI, h / MI);
+        let round_up_even = |n: usize| n.div_ceil(2) * 2;
+        let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
+        for (plane_idx, grid) in chroma_grids.into_iter().enumerate() {
+            let plane = plane_idx + 1;
+            let state = neighbour_state(grid);
+            for cell in 0..h_mi {
+                if cell < h_mi.min(bound_h.saturating_sub(mi_r)) {
+                    self.left[mi_r + cell][plane] = state;
+                }
+            }
+            for cell in 0..w_mi {
+                if cell < w_mi.min(bound_w.saturating_sub(at_mi.1)) {
+                    self.above[at_mi.1 + cell][plane] = state;
+                }
+            }
+        }
+    }
+
+    /// [`Self::record_split_luma_rect_mi`]'s mode and transform-size half,
+    /// without the per-plane coefficient stamp -- see
+    /// [`Self::record_rect_mi_luma_only`] for why a multi-unit chroma block
+    /// must not take the whole-block stamp.
+    fn record_split_luma_rect_mi_modes(
+        &mut self,
+        at_mi: (usize, usize),
+        w: usize,
+        h: usize,
+        mode: usize,
+        uv_mode: usize,
+    ) {
         let (mi_r, mi_c) = at_mi;
         let (r, c) = (mi_r / (SUB / MI), mi_c / (SUB / MI));
         for cell in 0..w.div_ceil(SUB) {
@@ -10677,22 +10745,6 @@ impl Neighbours {
         self.record_uv_mode_mi(mi_r, mi_c, w_mi, h_mi, uv_mode);
         fill_span(&mut self.left_side_mi, mi_r, h_mi, h as u8);
         fill_span(&mut self.above_side_mi, mi_c, w_mi, w as u8);
-        let round_up_even = |n: usize| n.div_ceil(2) * 2;
-        let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
-        for (plane_idx, grid) in chroma_grids.into_iter().enumerate() {
-            let plane = plane_idx + 1;
-            let state = neighbour_state(grid);
-            for cell in 0..h_mi {
-                if cell < h_mi.min(bound_h.saturating_sub(mi_r)) {
-                    self.left[mi_r + cell][plane] = state;
-                }
-            }
-            for cell in 0..w_mi {
-                if cell < w_mi.min(bound_w.saturating_sub(mi_c)) {
-                    self.above[mi_c + cell][plane] = state;
-                }
-            }
-        }
     }
 }
 
@@ -16982,6 +17034,8 @@ fn decode_intrabc_owned_rect(
         u_grid = Grid::Zero(cside * cside);
         v_grid = Grid::Zero(cside * cside);
     } else if let Some(ls) = leaves.as_ref() {
+        let mut leaf_types: Vec<(usize, usize, usize, usize, TxType)> =
+            Vec::with_capacity(ls.len());
         for (idx, &(row, col, tw, th)) in ls.iter().enumerate() {
             let tu_mi = (mi_r + row, mi_c + col);
             let (tu_px, tu_py) = (px + col * MI, py + row * MI);
@@ -17024,6 +17078,7 @@ fn decode_intrabc_owned_rect(
                     fctx,
                 )?
             };
+            leaf_types.push((row, col, tw, th, tt));
             if idx == 0 {
                 luma_tx_type = tt;
             }
@@ -17039,43 +17094,66 @@ fn decode_intrabc_owned_rect(
             }
         }
         luma_grid = Grid::Zero(side * side);
-        let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
-        let (ug, _) = read_inter_plane_rect(
-            dec,
-            cdfs,
-            rect_inter_chroma_set(cw, ch)?,
-            (cw, ch),
-            cside,
-            1,
-            around[1],
-            0,
-            u,
-            cpx,
-            cpy,
-            Pred::Inline(&pred_u, cside),
-            Some(luma_tx_type),
-            None,
-            fctx,
-        )?;
-        let (vg, _) = read_inter_plane_rect(
-            dec,
-            cdfs,
-            rect_inter_chroma_set(cw, ch)?,
-            (cw, ch),
-            cside,
-            2,
-            around[2],
-            0,
-            v,
-            cpx,
-            cpy,
-            Pred::Inline(&pred_v, cside),
-            Some(luma_tx_type),
-            None,
-            fctx,
-        )?;
-        u_grid = ug;
-        v_grid = vg;
+        if cw.min(32) != cw || ch.min(32) != ch {
+            // lane-av1chromarect: more than one chroma transform unit (the
+            // 4:4:4 32x64/64x32 plane block). See the helper.
+            let (ug, vg) = read_intrabc_rect_chroma_split(
+                dec,
+                cdfs,
+                neighbours,
+                (mi_r, mi_c),
+                (cpx, cpy),
+                (cw, ch),
+                cside,
+                &pred_u,
+                &pred_v,
+                &leaf_types,
+                luma_tx_type,
+                u,
+                v,
+                fctx,
+            )?;
+            u_grid = ug;
+            v_grid = vg;
+        } else {
+            let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+            let (ug, _) = read_inter_plane_rect(
+                dec,
+                cdfs,
+                rect_inter_chroma_set(cw, ch)?,
+                (cw, ch),
+                cside,
+                1,
+                around[1],
+                0,
+                u,
+                cpx,
+                cpy,
+                Pred::Inline(&pred_u, cside),
+                Some(luma_tx_type),
+                None,
+                fctx,
+            )?;
+            let (vg, _) = read_inter_plane_rect(
+                dec,
+                cdfs,
+                rect_inter_chroma_set(cw, ch)?,
+                (cw, ch),
+                cside,
+                2,
+                around[2],
+                0,
+                v,
+                cpx,
+                cpy,
+                Pred::Inline(&pred_v, cside),
+                Some(luma_tx_type),
+                None,
+                fctx,
+            )?;
+            u_grid = ug;
+            v_grid = vg;
+        }
     } else {
         let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
         let (g, tt) = read_inter_plane_rect(
@@ -17097,53 +17175,93 @@ fn decode_intrabc_owned_rect(
         )?;
         luma_tx_type = tt;
         luma_grid = g;
-        let (ug, _) = read_inter_plane_rect(
-            dec,
-            cdfs,
-            rect_inter_chroma_set(cw, ch)?,
-            (cw, ch),
-            cside,
-            1,
-            around[1],
-            0,
-            u,
-            cpx,
-            cpy,
-            Pred::Inline(&pred_u, cside),
-            Some(luma_tx_type),
-            None,
-            fctx,
-        )?;
-        let (vg, _) = read_inter_plane_rect(
-            dec,
-            cdfs,
-            rect_inter_chroma_set(cw, ch)?,
-            (cw, ch),
-            cside,
-            2,
-            around[2],
-            0,
-            v,
-            cpx,
-            cpy,
-            Pred::Inline(&pred_v, cside),
-            Some(luma_tx_type),
-            None,
-            fctx,
-        )?;
-        u_grid = ug;
-        v_grid = vg;
+        if cw.min(32) != cw || ch.min(32) != ch {
+            // lane-av1chromarect: more than one chroma transform unit (the
+            // 4:4:4 32x64/64x32 plane block). See the helper.
+            let (ug, vg) = read_intrabc_rect_chroma_split(
+                dec,
+                cdfs,
+                neighbours,
+                (mi_r, mi_c),
+                (cpx, cpy),
+                (cw, ch),
+                cside,
+                &pred_u,
+                &pred_v,
+                &[],
+                luma_tx_type,
+                u,
+                v,
+                fctx,
+            )?;
+            u_grid = ug;
+            v_grid = vg;
+        } else {
+            let (ug, _) = read_inter_plane_rect(
+                dec,
+                cdfs,
+                rect_inter_chroma_set(cw, ch)?,
+                (cw, ch),
+                cside,
+                1,
+                around[1],
+                0,
+                u,
+                cpx,
+                cpy,
+                Pred::Inline(&pred_u, cside),
+                Some(luma_tx_type),
+                None,
+                fctx,
+            )?;
+            let (vg, _) = read_inter_plane_rect(
+                dec,
+                cdfs,
+                rect_inter_chroma_set(cw, ch)?,
+                (cw, ch),
+                cside,
+                2,
+                around[2],
+                0,
+                v,
+                cpx,
+                cpy,
+                Pred::Inline(&pred_v, cside),
+                Some(luma_tx_type),
+                None,
+                fctx,
+            )?;
+            u_grid = ug;
+            v_grid = vg;
+        }
     }
     drop(restore);
+    // lane-av1chromarect: when the chroma plane block was walked as SEVERAL
+    // transform units, each unit stamped its own span through
+    // `record_mi_chroma` and the whole-block stamp below would overwrite them
+    // with one state (class `override-slot-on-one-arm`). libaom keeps the
+    // per-unit above/left contexts distinct; the next block's first unit
+    // reads them.
+    // `!skip` matters: a SKIPPED strip reads no chroma unit at all (its whole
+    // chroma plane block is one `push_mc_rect` of `ZERO_RESIDUAL`), so no
+    // per-unit `record_mi_chroma` ran and the whole-block chroma stamp below
+    // is still the only one that happens.
+    let chroma_split_units = !skip && (cw.min(32) != cw || ch.min(32) != ch);
     if leaves.is_some() {
-        neighbours.record_split_luma_rect_mi(
-            (mi_r, mi_c),
-            bw,
-            bh,
-            DC_PRED,
-            DC_PRED,
-            [&u_grid, &v_grid],
-        );
+        if chroma_split_units {
+            neighbours.record_split_luma_rect_mi_modes((mi_r, mi_c), bw, bh, DC_PRED, DC_PRED);
+        } else {
+            neighbours.record_split_luma_rect_mi(
+                (mi_r, mi_c),
+                bw,
+                bh,
+                DC_PRED,
+                DC_PRED,
+                [&u_grid, &v_grid],
+            );
+        }
+    } else if chroma_split_units {
+        neighbours.record_rect_mi_luma_only((mi_r, mi_c), bw, bh, DC_PRED, DC_PRED, &luma_grid);
     } else {
         neighbours.record_rect_mi(
             (mi_r, mi_c),
@@ -17177,6 +17295,111 @@ fn decode_intrabc_owned_rect(
     );
     let _ = luma_tx_type;
     Ok(())
+}
+
+/// The chroma plane block of a 128-root intra-BC HORZ/VERT strip when that
+/// plane block needs MORE THAN ONE transform unit -- the 4:4:4 cell, and the
+/// 4:2:0 cell of a strip with a 128-px axis.
+///
+/// libaom never forms a 64-point CHROMA transform. `get_vartx_max_txsize`
+/// (blockd.h:1447) returns `av1_get_adjusted_tx_size(max_txsize_rect_lookup
+/// [plane_bsize])` and `av1_get_adjusted_tx_size` maps `TX_32X64`/`TX_64X32`
+/// to `TX_32X32`; `decode_token_recon_block` (decodeframe.c:994-1004) then
+/// steps the plane block by that size's mi units, and
+/// `decode_reconstruct_tx`'s `tx_size == plane_tx_size || plane` arm never
+/// recurses for chroma -- the same statement from the other side. So a 4:4:4
+/// 32x64 chroma plane block is TWO stacked `TX_32X32` units, each with its
+/// own eob, its own scan and its own coefficient context, NOT one 32x64 unit
+/// whose coded corner happens to be 32x32: `av1_get_max_eob`'s 64-axis
+/// truncation is a LUMA rule, and a chroma plane block is never 64 points
+/// long to begin with.
+///
+/// That is exactly the tiling [`read_inter_rect_chroma`] implements
+/// (`(write_chroma_w.min(32), write_chroma_h.min(32))` and the `nx * ny`
+/// walk); this is the same walk for a caller that keeps its own grid
+/// assembly and neighbour recording. The single-unit case is deliberately
+/// NOT routed through here, so at 4:2:0 and at every 4:4:4 shape below 64
+/// the caller keeps its own one-unit read verbatim.
+#[allow(clippy::too_many_arguments)]
+fn read_intrabc_rect_chroma_split(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    (cpx, cpy): (usize, usize),
+    (cw, ch): (usize, usize),
+    cside: usize,
+    pred_u: &[u16],
+    pred_v: &[u16],
+    leaf_tx_types: &[(usize, usize, usize, usize, TxType)],
+    luma_tx_type: TxType,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<(Grid, Grid)> {
+    let (uw, uh) = (cw.min(32), ch.min(32));
+    let (nx, ny) = (cw / uw, ch / uh);
+    let set = rect_inter_chroma_set(uw, uh)?;
+    let assembled_h = ch.max(cside);
+    let mut assembled: [Vec<i32>; 2] = [
+        vec![0i32; cside * assembled_h],
+        vec![0i32; cside * assembled_h],
+    ];
+    for plane_idx in 1..=2 {
+        let (src, buf) = if plane_idx == 1 {
+            (pred_u, &mut *u)
+        } else {
+            (pred_v, &mut *v)
+        };
+        for cu_row in 0..ny {
+            for cu_col in 0..nx {
+                let (span_x, span_y) = (uw << ss_x(fctx), uh << ss_y(fctx));
+                let cu_mi = (mi_r + cu_row * (span_y / MI), mi_c + cu_col * (span_x / MI));
+                let cu_around = neighbours.around_mi_rect(cu_mi, span_x, span_y);
+                let (cu_x, cu_y) = (cpx + cu_col * uw, cpy + cu_row * uh);
+                let cu_pred = Pred::Inline(src, cside).offset(cu_row * uh * cside + cu_col * uw);
+                // libaom's `av1_get_tx_type` (blockd.h:1287) reads
+                // `xd->tx_type_map` at the chroma unit's OWN position scaled
+                // back to luma, so a unit sitting over a luma leaf that coded
+                // nothing takes that leaf's stamp, not the block-level one.
+                let rel_mi = (cu_mi.0 - mi_r, cu_mi.1 - mi_c);
+                let inherit_tx_type =
+                    covering_leaf_tx_type(leaf_tx_types, rel_mi).or(Some(luma_tx_type));
+                let cu_grid = read_inter_plane_rect(
+                    dec,
+                    cdfs,
+                    set,
+                    (uw, uh),
+                    cside,
+                    plane_idx,
+                    cu_around[plane_idx],
+                    0,
+                    buf,
+                    cu_x,
+                    cu_y,
+                    cu_pred,
+                    inherit_tx_type,
+                    // `get_txb_ctx`: plus 10 when the plane block is bigger
+                    // than the transform -- the same offset-3 convention
+                    // `read_inter_rect_chroma` passes on this arm.
+                    Some(3),
+                    fctx,
+                )?
+                .0;
+                // Immediately, so the next unit of this block reads this one's
+                // coefficient context (libaom updates the chroma above/left
+                // contexts per unit).
+                neighbours.record_mi_chroma(cu_mi, span_x, span_y, plane_idx, &cu_grid);
+                let dst = &mut assembled[plane_idx - 1];
+                for rr in 0..uh {
+                    let start = (cu_row * uh + rr) * cside + cu_col * uw;
+                    dst[start..start + uw].copy_from_slice(&cu_grid[rr * uw..][..uw]);
+                }
+            }
+        }
+    }
+    let [ug, vg] = assembled;
+    Ok((Grid::Own(ug), Grid::Own(vg)))
 }
 
 fn predict_intrabc_window(
