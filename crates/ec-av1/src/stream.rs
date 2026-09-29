@@ -23977,10 +23977,10 @@ pub(crate) mod tests {
     /// delta=2). `GOLDEN_FRAME` refuses by name until this decodes exact.
     ///
     /// LIVE since lane-av1pinslive r3. The old shape was the worst of the
-    /// class: a `concat!` of `CARGO_MANIFEST_DIR` with the GITIGNORED
-    /// repo-root `fixtures/` directory, which no committed pin can satisfy,
-    /// combined with a bare `.expect()`.
-    /// The bytes are now committed at
+    /// class: a `concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/...")`
+    /// literal, which points at the GITIGNORED root and can therefore never be
+    /// satisfied by a committed pin, combined with a bare `.expect()`. The
+    /// bytes are now committed at
     /// `crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu` (152 bytes;
     /// sha256 `81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be`,
     /// recovered byte-for-byte from the runner library).
