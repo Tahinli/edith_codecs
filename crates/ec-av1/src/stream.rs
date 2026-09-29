@@ -6701,7 +6701,7 @@ pub(crate) mod tests {
         }
 
         // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let dir = std::env::temp_dir().join(format!("ec-av1-ll444-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -6750,11 +6750,6 @@ pub(crate) mod tests {
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
 
         // ffmpeg's decoder: same frames, full-resolution chroma.
@@ -6885,13 +6880,8 @@ pub(crate) mod tests {
         );
         let _ = decode_stream(&ctrl_stream)
             .unwrap_or_else(|e| panic!("{NAME}: the control arm no longer decodes cleanly: {e}"));
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             assert_rawvideo_matches(&ctrl, &ctrl_stream, NAME, FRAMES);
-        } else {
-            eprintln!(
-                "SKIP {NAME} control aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
     }
 
@@ -7075,7 +7065,7 @@ pub(crate) mod tests {
         }
 
         // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let dir = std::env::temp_dir().join(format!("ec-av1-llminp8-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -7125,11 +7115,6 @@ pub(crate) mod tests {
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
 
         // ffmpeg's decoder: same frames, full-resolution chroma.
@@ -7269,7 +7254,7 @@ pub(crate) mod tests {
         // was a stage-ladder mixup, refuted in lane-av1lrflush r3.
 
         // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let dir = std::env::temp_dir().join(format!("ec-av1-444sb-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -7319,11 +7304,6 @@ pub(crate) mod tests {
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
 
         // ffmpeg's decoder: same frames, full-resolution chroma. Same
@@ -7441,7 +7421,7 @@ pub(crate) mod tests {
                 f.u.len()
             );
         }
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let (decoded, _hidden) = decode_all_frames_vs_oracle(&stream, NAME);
             eprintln!(
                 "{NAME}: {decoded} frame(s) byte-exact vs aomdec, {own_chroma} \
@@ -7531,7 +7511,7 @@ pub(crate) mod tests {
         // The identity half: the fix adds an arm gated on `ss_x == 0`, so a
         // 4:2:0 stream must stay byte-exact through it. This is the arm that
         // would go red if the new arm were ever widened past ss_x 0.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             decode_all_frames_vs_oracle(&out.stdout, &format!("{NAME}-420"));
         }
         eprintln!("{NAME}: 4:2:0 control {h4} HORZ_4 / {v4} VERT_4 strips, 0 own-extent gathers");
@@ -7563,13 +7543,24 @@ pub(crate) mod tests {
     /// in [`decode_inter_block`]'s `around_c` (a 4:2:0 stream of the same
     /// content leaves it at 0), and a counter at 0 would mean the gate
     /// measured a different route than it names.
-    fn encode_444_lossy_live(name: &str, w: usize, h: usize) -> Vec<u8> {
+    /// The guard is [`have_aomenc`], which probes first and asserts LAST with
+    /// the env escape: with `EC_AV1_REQUIRE_AOMENC` set, a missing oracle is
+    /// a hard failure naming the path it looked for, and a batch run cannot
+    /// report green off three skipped gates. With it unset the `None` below is
+    /// a developer-only convenience for a checkout without an oracle -- it is
+    /// the ONLY way this gate can return without measuring, and it announces
+    /// itself on stderr naming the env var that would make it a failure.
+    /// (It used to return an empty `Vec` that the caller turned into a silent
+    /// early `return`: the same green, reached through a second exit nobody
+    /// was reading.)
+    fn encode_444_lossy_live(name: &str, w: usize, h: usize) -> Option<Vec<u8>> {
         if !have_aomenc() {
             eprintln!(
-                "SKIP {name}: no aomenc oracle at {} -- run scripts/build-aom-oracle.sh",
+                "SKIP {name}: no aomenc oracle at {} -- set EC_AV1_REQUIRE_AOMENC=1 to make this \
+                 a failure, or run scripts/build-aom-oracle.sh",
                 aomenc_path().display()
             );
-            return Vec::new();
+            return None;
         }
         let source = format!("testsrc2=size={w}x{h}:rate=25");
         let y4m = Command::new("ffmpeg")
@@ -7628,7 +7619,7 @@ pub(crate) mod tests {
             "{name}: aomenc produced no OBU for {w}x{h} -- a zero-length stream would \
              decode to nothing and the compare below would compare nothing"
         );
-        out.stdout
+        Some(out.stdout)
     }
 
     /// The body every 4:4:4 lossy live gate runs: assert the oracle compare
@@ -7637,19 +7628,20 @@ pub(crate) mod tests {
     /// own-extent route really ran, then compare every frame in decode order
     /// against the oracle aomdec with the length asserted first.
     ///
-    /// The aomdec assert is deliberately a HARD failure, not the
-    /// `if aomdec_path().is_file()` skip the older gates use: a gate that
-    /// measures exactness and then quietly skips the compare reports green
-    /// for a decoder it never looked at (class gate-blind-to-the-arm). It
-    /// fires only when the gate is actually running, i.e. the oracle aomenc
-    /// resolved -- and aomenc and aomdec ship in the same build directory,
-    /// so an aomdec that is missing while aomenc is present is a broken
-    /// oracle, not a checkout without one.
+    /// The aomdec arm is a HARD failure, not a skip: these three gates encode
+    /// LIVE, so reaching this point means the oracle aomenc resolved, and
+    /// aomenc and aomdec ship in the same build directory -- an aomdec that is
+    /// missing beside a present aomenc is a broken oracle, not a checkout
+    /// without one. (The older shape, `if aomdec_path().is_file()`, let the
+    /// compare vanish with no env escape at all; that is what
+    /// [`aomdec_available`] replaced for the pinned gates, and it cannot be
+    /// used here because these gates have no stream to compare without one.)
     fn gate_444_lossy_live_exact(name: &str, w: usize, h: usize) {
-        let stream = encode_444_lossy_live(name, w, h);
-        if stream.is_empty() {
-            return; // no oracle at all: the SKIP above already said so
-        }
+        // The ONLY way out without measuring, and it has already printed a
+        // SKIP naming the env var that would turn it into a failure.
+        let Some(stream) = encode_444_lossy_live(name, w, h) else {
+            return;
+        };
         assert!(
             aomdec_path().is_file(),
             "{name}: the oracle aomenc resolved to {} but no aomdec sits beside it at {} -- \
@@ -7842,7 +7834,7 @@ pub(crate) mod tests {
         // lengths match before it compares anything -- the check whose absence
         // turned an out-of-window divergence into a reported EXACT in this
         // lane's own round 1.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             decode_all_frames_vs_oracle(&stream420, &format!("{NAME}-420"));
             crate::decode::reset_intrabc_rect4_own_chroma444_hits();
             decode_stream(&stream420)
@@ -7973,7 +7965,7 @@ pub(crate) mod tests {
         }
 
         // Frames 0/1 through the PIPELINE, byte-exact vs both oracles.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let dir = std::env::temp_dir().join(format!("ec-av1-lrflush-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -8023,11 +8015,6 @@ pub(crate) mod tests {
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
         if have_ffmpeg() {
             let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
@@ -8123,7 +8110,7 @@ pub(crate) mod tests {
         );
 
         // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let dir = std::env::temp_dir().join(format!("ec-av1-ll444dp-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -8164,11 +8151,6 @@ pub(crate) mod tests {
                     );
                 }
             }
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
     }
 
@@ -8265,7 +8247,7 @@ pub(crate) mod tests {
         }
 
         // The oracle aomdec, rawvideo out: FRAMES concatenated yuv444p frames.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let dir = std::env::temp_dir().join(format!("ec-av1-leaf8oob-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -8291,11 +8273,6 @@ pub(crate) mod tests {
                 fnv1a64(&ref_raw),
                 0x3821_0bcb_f572_973c,
                 "{NAME}: aomdec raw fingerprint moved"
-            );
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
             );
         }
     }
@@ -8697,7 +8674,7 @@ pub(crate) mod tests {
         );
 
         // The oracle aomdec, rawvideo out: one concatenated yuv444p frame.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let dir = std::env::temp_dir().join(format!("ec-av1-ibcskip2-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -8738,11 +8715,6 @@ pub(crate) mod tests {
                      predictor or the rect walk"
                 );
             }
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
         eprintln!(
             "{NAME}: frame sample-exact vs oracle aomdec; {luma}+{chroma} rect \
@@ -9144,6 +9116,48 @@ pub(crate) mod tests {
             "EC_AV1_REQUIRE_AOMENC is set but no aomenc at {} -- run scripts/build-aom-oracle.sh",
             aomenc_path().display()
         );
+        present
+    }
+
+    /// lane-av1oracleskip: the probe for the ORACLE COMPARER, in the same
+    /// shape as [`have_ffmpeg`] -- probe first, then `assert!` LAST, with the
+    /// env escape -- and it prints its own SKIP so a caller cannot skip the
+    /// compare silently.
+    ///
+    /// Why this exists: thirteen gates wrapped their oracle arm in a bare
+    /// `if aomdec_path().is_file()`, and that shape had NO env escape at all.
+    /// An oracle build with `aomenc` but no `aomdec` beside it (or an
+    /// `EC_AV1_AOMDEC` override pointing at a moved path) made the gate
+    /// encode, decode, assert its geometry and its counters, and then quietly
+    /// never compare -- green having measured nothing, with no line in the
+    /// output to notice. Nine of the thirteen printed a SKIP in an `else` and
+    /// four printed nothing at all; both are the same defect, and both are
+    /// closed by one probe.
+    ///
+    /// With `EC_AV1_REQUIRE_AOMENC` (or the aomdec-specific
+    /// `EC_AV1_REQUIRE_AOMDEC`) set, the absence is a HARD failure naming the
+    /// path that was looked for -- that is the batch-run guarantee, and it is
+    /// what the bare `is_file()` could not give. With it unset the SKIP below
+    /// is printed and the gate still passes: that remains a developer-only
+    /// convenience for a checkout without an oracle, never evidence.
+    fn aomdec_available(name: &str) -> bool {
+        let present = aomdec_path().is_file();
+        let require = std::env::var_os("EC_AV1_REQUIRE_AOMDEC").is_some()
+            || std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_some();
+        assert!(
+            present || !require,
+            "{name}: no oracle aomdec at {} -- the pixel compare this gate exists for would be \
+             skipped, and EC_AV1_REQUIRE_AOMDEC/EC_AV1_REQUIRE_AOMENC is set. Build the oracle \
+             with scripts/build-aom-oracle.sh, or point EC_AV1_AOMDEC at a real aomdec.",
+            aomdec_path().display()
+        );
+        if !present {
+            eprintln!(
+                "SKIP {name}: no oracle aomdec at {} -- the pixel compare is NOT running (set \
+                 EC_AV1_REQUIRE_AOMDEC=1 to make this a failure)",
+                aomdec_path().display()
+            );
+        }
         present
     }
 
@@ -11180,18 +11194,13 @@ pub(crate) mod tests {
         // The oracle, DECODE order, every frame including hidden alt-ref
         // frames. This is the arm that proves the repair against aomdec's
         // own reconstruction, not just ffmpeg's.
-        if aomdec_path().is_file() {
+        if aomdec_available(NAME) {
             let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
             assert!(
                 decoded >= FRAMES,
                 "{NAME}: oracle decoded {decoded} frames, expected at least {FRAMES}"
             );
             let _ = hidden;
-        } else {
-            eprintln!(
-                "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
-                aomdec_path().display()
-            );
         }
 
         // ffmpeg's decoder: DISPLAY order, full-resolution chroma.
@@ -14198,7 +14207,7 @@ pub(crate) mod tests {
                 );
             }
         }
-        if aomdec_path().is_file() {
+        if aomdec_available(name) {
             let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, name);
             eprintln!(
                 "{name}: {decoded} decode-order frame(s) ({hidden} hidden) byte-exact vs aomdec \
