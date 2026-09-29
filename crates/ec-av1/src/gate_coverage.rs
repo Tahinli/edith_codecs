@@ -2072,6 +2072,19 @@ mod count_vacuity {
         /// Does this gate actually COMPARE PIXELS (so a wrong count would
         /// corrupt a verdict), or is it a report-only probe?
         pub pixel_comparing: bool,
+        /// The fix bucket, by READING the gate (r7). `Some(b)` where
+        ///   a = pinned stream on disk -> take the count from the PIN
+        ///   b = live aomenc encode    -> take it from the ENCODE's frame count;
+        ///                                      our decode's length is the thing
+        ///                                      UNDER TEST and must never be the
+        ///                                      expected value
+        ///   c = census/probe          -> report only, never fix
+        /// `None` = could not classify, and the reason is in `bucket_reason`.
+        pub bucket: Option<&'static str>,
+        pub bucket_reason: String,
+        /// The numeric frame count found in this gate's own encode call, when
+        /// one is visible -- the value the compare should assert instead.
+        pub candidate: Option<String>,
         /// A frame count already in scope that is a SPEC rather than a
         /// self-fulfilling number -- e.g. the `FRAMES` the gate encoded, or a
         /// count asserted on the pinned stream. `Some(..)` means the fix is a
@@ -2079,9 +2092,65 @@ mod count_vacuity {
         pub fixable_from: Option<String>,
     }
 
+    /// A census/probe/diagnostic gate: it reports, it does not assert a verdict.
+    fn is_probe(gate: &str) -> bool {
+        [
+            "census",
+            "probe",
+            "sweep",
+            "first_diff",
+            "scratch",
+            "rectx",
+            "diagnostic",
+        ]
+        .iter()
+        .any(|m| gate.contains(m))
+    }
+
+    /// Encode helpers a gate can drive INDIRECTLY. The r7 extraction found 21 of
+    /// the 25 bucket-b gates encode through one of these, not through
+    /// `aomenc_path()` directly -- which is why a first pass that only looked for
+    /// `aomenc_path()` classified 6 gates "unclassified" that plainly encode.
+    fn enc_helpers(body: &str) -> Vec<&'static str> {
+        const NAMES: &[&str] = &[
+            "encode_aomenc_stream",
+            "screen_intrabc_stream_at_depth",
+            "screen_intrabc_stream_with",
+            "libaom_encode_with",
+            "libaom_encode",
+            "run_multi_tile_gate",
+            "edge32_gate",
+            "rect_tx_tool_gate",
+            "the_chroma_rect_gates",
+            "restore_gate",
+            "cdef_gate",
+            "warp_gate",
+            "superres_gate",
+            "grain_gate",
+            "sgate",
+        ];
+        NAMES
+            .iter()
+            .copied()
+            .filter(|n| body.contains(&format!("{n}(")))
+            .collect()
+    }
+
     pub fn sites(src: &str) -> Vec<Site> {
         let mut out = Vec::new();
         let lines: Vec<&str> = src.lines().collect();
+        // LINE index -> BYTE offset. The body walk indexes `src.as_bytes()`, so
+        // handing it a line number walks from the wrong place entirely and every
+        // body-dependent classification reads "unclassified". Same bug I hit in
+        // the Python classifier one step earlier.
+        let mut offsets: Vec<usize> = Vec::with_capacity(lines.len());
+        {
+            let mut o = 0usize;
+            for l in &lines {
+                offsets.push(o);
+                o += l.len() + 1;
+            }
+        }
         let mut gate = String::new();
         let mut fn_start = 0usize;
         for (i, line) in lines.iter().enumerate() {
@@ -2090,7 +2159,7 @@ mod count_vacuity {
                 if let Some(n) = rest.split('(').next() {
                     if !n.contains(' ') {
                         gate = n.to_string();
-                        fn_start = i;
+                        fn_start = offsets[i];
                     }
                 }
             }
@@ -2246,6 +2315,50 @@ mod count_vacuity {
                         break;
                     }
                 }
+                // Bucket by READING the gate. A census/probe reports and never
+                // asserts, so its count is not a verdict and is left alone. A
+                // gate that drives aomenc takes the count from the ENCODE -- our
+                // decode's length is what is under test, so using it as the
+                // expected value is circular. A gate that reads a stream from
+                // disk takes it from that stream.
+                // The candidate fix: the numeric frame count in this gate's own
+                // encode call. For bucket (b) that number IS the encoder's frame
+                // count, so it is the spec the compare should assert.
+                let candidate = enc_helpers(body).first().and_then(|h| {
+                    let at = body.find(&format!("{h}("))?;
+                    let open = at + h.len() + 1;
+                    let seg = &body[open..(open + 400).min(body.len())];
+                    let close = seg.find(';')?;
+                    let nums: Vec<&str> = seg[..close]
+                        .split(',')
+                        .map(|x| x.trim())
+                        .filter(|x| !x.is_empty() && x.chars().all(|c| c.is_ascii_digit()))
+                        .collect();
+                    nums.last().map(|x| x.to_string())
+                });
+                let (bucket, bucket_reason) = if is_probe(&gate) {
+                    (
+                        Some("c"),
+                        "census/probe: reports, does not assert a verdict".to_string(),
+                    )
+                } else if body.contains("aomenc_path()") || !enc_helpers(body).is_empty() {
+                    (
+                        Some("b"),
+                        "live aomenc encode: count belongs to the encoder".to_string(),
+                    )
+                } else if body.contains("fs::read") || body.contains("crate_pin") {
+                    (
+                        Some("a"),
+                        "stream read from disk: count belongs to the pin".to_string(),
+                    )
+                } else {
+                    (
+                        None,
+                        "unclassified: no aomenc drive, no disk read, and not a probe -- \
+                         needs a reader"
+                            .to_string(),
+                    )
+                };
                 out.push(Site {
                     line: i + 1,
                     gate: gate.clone(),
@@ -2253,6 +2366,9 @@ mod count_vacuity {
                     pinned_by: pinned,
                     pixel_comparing,
                     fixable_from: fixable,
+                    bucket,
+                    bucket_reason,
+                    candidate,
                 });
             }
         }
@@ -2276,10 +2392,20 @@ mod count_vacuity_tests {
              shape",
             s.len()
         );
+        // r7: the first reported site (3895, `pictures.len()`) is FIXED -- it now
+        // asserts `ENCODED_FRAMES`, the encode's own count. The anchor therefore
+        // moved from "the site is still there" to "the fix is still in place AND
+        // the dominant remaining shape is still found", so the sweep cannot go
+        // quiet by either route.
         assert!(
-            s.iter()
-                .any(|x| x.line == 3895 || x.count_expr == "pictures.len()"),
-            "the original reported site (pictures.len()) is gone -- re-derive the sweep"
+            !s.iter().any(|x| x.count_expr == "pictures.len()"),
+            "3895 regressed: a site is passing `pictures.len()` as the oracle's expected \
+             count again -- our decode's length must never be the expected value"
+        );
+        assert!(
+            s.iter().any(|x| x.count_expr == "frames.len()"),
+            "the dominant `frames.len()` shape is no longer found -- the sweep has lost a \
+             shape, not gained a fix"
         );
     }
 
@@ -2315,12 +2441,16 @@ mod count_vacuity_tests {
         // The table Main asked for, as columns the guard itself computes.
         for x in s.iter().filter(|x| x.pinned_by.is_none()) {
             eprintln!(
-                "ROW {} | {} | {} | pixel_comparing={} | spec_in_scope={}",
+                "ROW {} | {} | {} | bucket={} | candidate={} | spec_in_scope={} | {} | \
+                 pixel_comparing={}",
                 x.line,
                 x.gate,
                 x.count_expr,
-                x.pixel_comparing,
-                x.fixable_from.clone().unwrap_or_else(|| "-".into())
+                x.bucket.unwrap_or("?"),
+                x.candidate.clone().unwrap_or_else(|| "-".into()),
+                x.fixable_from.clone().unwrap_or_else(|| "-".into()),
+                x.bucket_reason,
+                x.pixel_comparing
             );
         }
         assert!(
