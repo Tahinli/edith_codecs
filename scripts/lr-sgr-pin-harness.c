@@ -30,10 +30,34 @@ int main(void) {
   // sized for that max, so replicate the chunking (target col=6 is in
   // the first 64-wide chunk).
   const int w = 64, h = 4;
-  uint8_t *buf = malloc(bw * bh);
+  // The depth of `/tmp/lr_full.bin` is NOT in the file: the capture is a raw
+  // plane dump written by an env-gated `std::fs::write` inside
+  // `apply_sgrproj_stripe`, and whoever re-captures it from a 10/12-bit pin
+  // gets 2 bytes per sample, i.e. a file TWICE this size whose first half
+  // still looks like plausible plane data. Reading it at 1 byte per sample
+  // would then print self-guided-restoration A/B taps for the wrong pixels
+  // and nothing would fail -- so the size is the assertion: a 2x capture
+  // must not pass as an 8-bit one.
+  const size_t expect = (size_t)bw * bh;
+  uint8_t *buf = malloc(expect);
   FILE *f = fopen("/tmp/lr_full.bin", "rb");
   if (!f) { perror("open"); return 1; }
-  if (fread(buf, 1, bw * bh, f) != (size_t)(bw * bh)) { fprintf(stderr, "short read\n"); return 1; }
+  fseek(f, 0, SEEK_END);
+  const long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (size != (long)expect) {
+    fprintf(stderr,
+            "/tmp/lr_full.bin is %ld bytes, this harness reads it as %d-bit (%zu bytes: "
+            "%dx%d at 1 byte per sample). %s\n",
+            size, 8, expect, bw, bh,
+            size == 2 * (long)expect
+                ? "That is exactly a 2x-size high-bit-depth capture: re-capture it as 8-bit, "
+                  "or port the harness to the uint16 arm (bit_depth=10, highbd=1) before "
+                  "trusting a single printed tap."
+                : "Recapture it, or fix bw/bh to the plane the capture came from.");
+    return 1;
+  }
+  if (fread(buf, 1, expect, f) != expect) { fprintf(stderr, "short read\n"); return 1; }
   fclose(f);
 
   const uint8_t *dgd8 = buf + 3 * bw + 3; // logical (0,0)
