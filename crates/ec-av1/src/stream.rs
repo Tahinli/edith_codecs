@@ -140,6 +140,23 @@ pub fn reset_ibc444rect_hits() {
     crate::decode::reset_ibc444rect_hits()
 }
 
+/// lane-av1chromarect: 128-root intra-BC HORZ/VERT strips whose chroma plane
+/// block was sized `bw >> ss_x` by `bh >> ss_y` rather than the hardcoded
+/// 4:2:0 halving -- i.e. the 4:4:4 (and 4:4:0) cells, where
+/// `av1_get_max_uv_txsize` (`ss_size_lookup[bsize]`, blockd.h:1372) applies no
+/// halving of its own. At 4:2:0 the two forms are the same arithmetic, so a
+/// `>= 1` witness can only come from a stream that is not 4:2:0. EXCLUSIVE to
+/// `decode_intrabc_owned_rect`: no other caller sizes a 128-root intra-BC
+/// strip's chroma plane block.
+pub fn ibc_owned_rect_chroma_footprint_444_hits() -> usize {
+    crate::decode::ibc_owned_rect_chroma_footprint_444_hits()
+}
+
+/// Gate-side reset for the lane-av1chromarect counter above.
+pub fn reset_ibc_owned_rect_chroma_footprint_444_hits() {
+    crate::decode::reset_ibc_owned_rect_chroma_footprint_444_hits()
+}
+
 /// `(y, uv)` palette blocks RECONSTRUCTED inside an inter frame (lane-t900
 /// r22) -- the counter a screen-content witness gate reads to prove it
 /// exercises the inter-frame palette path, not the key frame's.
@@ -48447,6 +48464,58 @@ pub(crate) mod tests {
              byte-exact; 4:4:4 luma byte-exact (307200/307200), U and V byte-exact to \
              sample 51360 -- the chroma tail is the OPEN entropy fork \
              (lanes/ibc444c.report.md r2), NOT an assertion"
+        );
+    }
+
+    /// lane-av1chromarect: the 128-root intra-BC HORZ/VERT strip's chroma
+    /// plane block, on the 4:4:4 LOSSY witness that reaches
+    /// `decode_intrabc_owned_rect`.
+    ///
+    /// The extent is the ss-derived one (`bw >> ss_x` by `bh >> ss_y`,
+    /// `av1_get_max_uv_txsize` = `ss_size_lookup[bsize]`, blockd.h:1372), and
+    /// the witness is pinned at the size that shape forces -- a 4:4:4 32x64
+    /// luma block's chroma plane block is 32x64. **This gate asserts the
+    /// refusal, on purpose.** It exists so the day the missing arm lands the
+    /// gate goes RED and the assertion has to be rewritten as the
+    /// pixel-exactness check -- a witness with no gate is a pin, and a pin
+    /// with no governing refusal is a defect nobody is looking at.
+    #[test]
+    fn a_444_intrabc_owned_rect_strip_refuses_the_missing_rect_chroma_coefficient_set() {
+        const NAME: &str =
+            "a_444_intrabc_owned_rect_strip_refuses_the_missing_rect_chroma_coefficient_set";
+        const FILE: &str = "r512.obu";
+        const LEN: usize = 6948;
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{FILE}"));
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: pinned fixture {FILE} missing: {e}"));
+        assert_eq!(stream.len(), LEN, "{NAME}: {FILE} length moved");
+        assert_444_header(&stream, NAME, 8);
+
+        let _guard = lock_gate_counters();
+        reset_ibc_owned_rect_chroma_footprint_444_hits();
+        let err = decode_stream(&stream).err().unwrap_or_else(|| {
+            panic!(
+                "{NAME}: the witness DECODED -- the extent is not the ss-derived one any \
+                    more, so this gate is no longer measuring what it names"
+            )
+        });
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "a rectangular inter chroma transform unit whose shape has no coefficient table \
+                 set here"
+            ),
+            "{NAME}: expected the missing-rect-chroma-set refusal, got: {msg}"
+        );
+        let hits = ibc_owned_rect_chroma_footprint_444_hits();
+        // Exactly 1, not 5: the decode stops AT the first 4:4:4 strip, so this
+        // counts the strips that reached the corrected extent before the
+        // refusal ended the stream. The pixel-exactness gate that replaces
+        // this one sees all five.
+        assert_eq!(
+            hits, 1,
+            "{NAME}: {hits} 128-root intra-BC strip(s) sized at 4:4:4 before the refusal, not 1"
         );
     }
 }

@@ -4708,6 +4708,16 @@ thread_local! {
     /// be satisfied by any older route.
     static INTRABC_RECT_LOSSLESS_CHROMA4_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// lane-av1chromarect: 128-root intra-BC HORZ/VERT strips
+    /// ([`decode_intrabc_owned_rect`]) whose chroma plane block was sized
+    /// `bw >> ss_x` by `bh >> ss_y` -- the 4:4:4 and 4:4:0 cells, where
+    /// `av1_get_max_uv_txsize` (`ss_size_lookup[bsize]`, blockd.h:1372) applies
+    /// no halving of its own. At 4:2:0 the two forms are the same arithmetic,
+    /// so a `>= 1` witness can only come from a stream that is not 4:2:0.
+    /// EXCLUSIVE to this arm: no other caller sizes a 128-root intra-BC
+    /// strip's chroma plane block.
+    static IBC_OWNED_RECT_CHROMA_FOOTPRINT_444_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// lane-av1-intrabc r4: coded (`skip == 0`) rect intrabc blocks reconstructed,
@@ -4749,6 +4759,18 @@ pub fn ibc_rect_chroma_footprint_444_hits() -> usize {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_ibc_rect_chroma_footprint_444_hits() {
     IBC_RECT_CHROMA_FOOTPRINT_444_HITS.with(|c| c.set(0));
+}
+
+/// lane-av1chromarect: [`IBC_OWNED_RECT_CHROMA_FOOTPRINT_444_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn ibc_owned_rect_chroma_footprint_444_hits() -> usize {
+    IBC_OWNED_RECT_CHROMA_FOOTPRINT_444_HITS.with(|c| c.get())
+}
+
+/// lane-av1chromarect: zeroes [`IBC_OWNED_RECT_CHROMA_FOOTPRINT_444_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_ibc_owned_rect_chroma_footprint_444_hits() {
+    IBC_OWNED_RECT_CHROMA_FOOTPRINT_444_HITS.with(|c| c.set(0));
 }
 
 /// lane-whtshape: [`INTRABC_RECT_LOSSLESS_CHROMA4_HITS`].
@@ -16838,25 +16860,31 @@ fn decode_intrabc_owned_rect(
 ) -> Result<()> {
     let _ = base_q_idx;
     let (px, py) = (mi_c * MI, mi_r * MI);
-    // lane-av1chromahalvings r5: libaom-WRONG at 4:4:4 -- `av1_get_max_uv_txsize`
-    // is `ss_size_lookup[bsize]` and `get_vartx_max_txsize` (blockd.h:1447) reads
-    // that plane block as `max_txsize_rect_lookup[plane_bsize]`, so chroma extent
-    // == luma extent at ss (0,0) -- and the chroma MV origins below are the
-    // prediction half of the same defect. MEASURED on the 4:4:4 LOSSY witness
-    // fixtures/r512.obu, chroma-only, luma byte-exact on both inter frames.
-    // BLOCKED, not missing: with the ss-derived extent the decode REFUSES --
-    // "a rectangular inter chroma transform unit whose shape has no coefficient
-    // table set here" -- because a 4:4:4 32x64 chroma plane block needs a
-    // `TxbSet` this crate lacks. The fix is a new coefficient set, not a swap.
-    // Left as the halving deliberately: turning a decoding stream into a
-    // refusal is a behaviour change with its own decision. See
-    // lanes/av1chromahalvings.report.md r5.
+    // lane-av1chromarect: libaom does NOT halve a 128-root intra-BC strip's
+    // chroma plane block. `av1_get_max_uv_txsize` (blockd.h:1372) is
+    // `max_txsize_rect_lookup[get_plane_block_size(bsize, ss_x, ss_y)]` run
+    // through `av1_get_adjusted_tx_size`, and `get_plane_block_size` is
+    // `ss_size_lookup[bsize]` -- at 4:4:4 the chroma plane block is the block's
+    // OWN footprint, so the extent below and the eight chroma MV origin pairs
+    // that follow must be `>> ss_x` / `>> ss_y`, not `/ 2`. At 4:2:0
+    // (`ss_x == ss_y == 1`) the two forms are the same arithmetic.
+    // MEASURED on the 4:4:4 LOSSY witness `fixtures/r512.obu` (6948 B, 3
+    // frames, 5 strips through this function): with the halving, frame 0
+    // diverges from the aomdec oracle in 166229 Y / 155383 U / 153498 V
+    // samples and both later frames keep luma byte-exact while 74708 U +
+    // 73501 V (f1) and 9216 U + 8192 V (f2) are wrong -- chroma-only, which is
+    // what makes this a chroma-sizing defect and not a block-geometry one.
+    // Re-measured by this lane; see lanes/av1chromarect.report.md.
     if crate::envflags::env_flag!("EC_HALVSWEEP") {
         eprintln!("EC_HALV ibc_owned mi=({mi_r},{mi_c}) bw={bw} bh={bh} skip={skip}");
     }
-    let (cw, ch) = (bw / 2, bh / 2);
+    let (cw, ch) = (bw >> ss_x(fctx), bh >> ss_y(fctx));
+    let (cpx, cpy) = (px >> ss_x(fctx), py >> ss_y(fctx));
     let side = bw.max(bh);
     let cside = cw.max(ch);
+    if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
+        hit!(IBC_OWNED_RECT_CHROMA_FOOTPRINT_444_HITS);
+    }
     let saved_reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
     let saved_tx = fctx.tx_select_inter.with(std::cell::Cell::get);
     fctx.reduced_tx_set_inter.with(|c| c.set(reduced_tx_set));
@@ -16871,30 +16899,8 @@ fn decode_intrabc_owned_rect(
 
     flush_recon(fctx, y, u, v);
     let pred_y = predict_intrabc_window(y, px, py, bw, bh, dv_col, dv_row, true, side, fctx);
-    let pred_u = predict_intrabc_window(
-        u,
-        px / 2,
-        py / 2,
-        cw,
-        ch,
-        dv_col,
-        dv_row,
-        false,
-        cside,
-        fctx,
-    );
-    let pred_v = predict_intrabc_window(
-        v,
-        px / 2,
-        py / 2,
-        cw,
-        ch,
-        dv_col,
-        dv_row,
-        false,
-        cside,
-        fctx,
-    );
+    let pred_u = predict_intrabc_window(u, cpx, cpy, cw, ch, dv_col, dv_row, false, cside, fctx);
+    let pred_v = predict_intrabc_window(v, cpx, cpy, cw, ch, dv_col, dv_row, false, cside, fctx);
 
     let mi_cols = 2 * y.true_width.div_ceil(8);
     let mi_rows = 2 * y.true_height.div_ceil(8);
@@ -16928,8 +16934,8 @@ fn decode_intrabc_owned_rect(
         );
         push_mc_rect(
             1,
-            px / 2,
-            py / 2,
+            cpx,
+            cpy,
             cside,
             cw,
             ch,
@@ -16939,8 +16945,8 @@ fn decode_intrabc_owned_rect(
         );
         push_mc_rect(
             2,
-            px / 2,
-            py / 2,
+            cpx,
+            cpy,
             cside,
             cw,
             ch,
@@ -17044,8 +17050,8 @@ fn decode_intrabc_owned_rect(
             around[1],
             0,
             u,
-            px / 2,
-            py / 2,
+            cpx,
+            cpy,
             Pred::Inline(&pred_u, cside),
             Some(luma_tx_type),
             None,
@@ -17061,8 +17067,8 @@ fn decode_intrabc_owned_rect(
             around[2],
             0,
             v,
-            px / 2,
-            py / 2,
+            cpx,
+            cpy,
             Pred::Inline(&pred_v, cside),
             Some(luma_tx_type),
             None,
@@ -17101,8 +17107,8 @@ fn decode_intrabc_owned_rect(
             around[1],
             0,
             u,
-            px / 2,
-            py / 2,
+            cpx,
+            cpy,
             Pred::Inline(&pred_u, cside),
             Some(luma_tx_type),
             None,
@@ -17118,8 +17124,8 @@ fn decode_intrabc_owned_rect(
             around[2],
             0,
             v,
-            px / 2,
-            py / 2,
+            cpx,
+            cpy,
             Pred::Inline(&pred_v, cside),
             Some(luma_tx_type),
             None,
