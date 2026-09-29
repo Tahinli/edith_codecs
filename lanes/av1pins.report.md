@@ -559,3 +559,156 @@ Follow-on handed back rather than folded in: the 14 `pinned_warp` pins, which ar
 the same defect as r3's four and want the same `crate_pin` + committed-copy
 treatment. Not verified: a full `cargo test -p ec-av1` run (project-wide validation
 is Main's).
+
+---
+
+# r5 — the scanner, the 14 pins, and a correction to r4
+
+Branch `lane-av1pins5`, forked from the r4 tip `2e5509e9`. Commits `e200fede`
+(the 14 pins), `3eb90648` (scanner + sweep), plus this report. Tests and test
+helpers only. Not pushed; main untouched.
+
+**Authoritative location, as the batch-close audit asked:** this lane lives in
+`~/.cache/wt/av1pins5` (branch `lane-av1pins5`). It is **not** a stale duplicate of
+`~/.cache/wt/av1pinslive` — `av1pinslive` sits at the same tip `2e5509e9` but does
+**not** carry the 14 pins; they were only ever in `av1pins5`. All 14 were verified
+byte-identical in three independent locations (this worktree's staged copy, a
+local `/tmp` copy, and the runner library) before committing: **14/14 identical,
+0 mismatches**. They are now committed, so no worktree holds the only copy.
+
+## 1. The scanner
+
+`pin_inventory` in `gate_coverage.rs` resolves **five** shapes:
+
+| # | shape | example |
+|---|---|---|
+| (a) | single-name committed | `crate_pin("golden3-pin.obu")` |
+| (b) | single-name machine-local | `pin_dir().join("x.obu")` |
+| (c) | whole-file `concat!` literal | `concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/x.obu")` |
+| (d) | directory literal + runtime name | `let fixtures = concat!(...); … format!("{fixtures}/{n}.obu")` |
+| (e) | committed + runtime name | `crate_pin(&format!("{n}.obu"))` |
+
+### Scanner before/after on the live tree
+
+```
+BEFORE (r3 inventory):  gate=pinned_warp_stream_decodes_pixel_exact  reads=0
+AFTER  (r5 inventory):  14 pin(s) a gate reads have no committed copy under
+                        crates/ec-av1/fixtures/:
+  pinned_warp_stream_decodes_pixel_exact:warp-mismatch.obu (concat_dir_runtime_name)
+  … all 14 named, then 0 after the fix landed.
+```
+
+### Shape (e) is the finding worth reading
+
+Rewriting the directory literal as a committed-path lookup made the gate
+**correct and simultaneously invisible**: `crate_pin("` no longer appears, shape
+(a) found nothing, and the enumerator reported a **clean tree while 14 pins were
+read**. A false pass is worse than the original gap — the original at least
+surfaced in a filesystem audit, which is exactly how the batch-close audit found
+it. It was caught by the `reads.len() >= 20` floor in the invariant test. That
+floor exists for this and I would not remove it.
+
+**The general lesson:** fixing a shape can blind the check that was watching it.
+
+### Two scanner bugs, both found by the capability tests
+
+* A `format!` brace escape emitted `{n` instead of `{n}`, so the marker never
+  matched and shape (d) resolved 0 pins.
+* `args.find(')')` stopped at the `)` of `pictures.len()`, truncating the argument
+  list and yielding **zero** sites overall — the sweep reported a clean tree.
+
+Capability tests therefore use **synthetic source**, never the live file. Asserting
+against the live tree would rot the moment the fix lands, which is precisely how a
+scanner loses its edge.
+
+**Ownership, stated because two lanes touch this:** the scanner owns the
+**enumeration** (which gates read which pins, from source). The fixture-preflight
+lane owns the **file inventory on a runner** (does each path exist on the box).
+The scanner is the stricter of the two — it fails on an uncommitted pin whether or
+not some runner happens to have a copy.
+
+## 2. The 14 pins — provenance `recovered-original`
+
+Fetched byte-for-byte from the runner library. **Not regenerated**: these are the
+actual historical mismatch witnesses, and a re-encode would be a different stream
+that must not be called the pin.
+
+| pin | size | sha256 |
+|---|---|---|
+| warp-mismatch.obu | 621 B | `24cca5beb41c1078f8109d8fa7e35f10cc1eefb67c6d1d1ea248a0b6842287bb` |
+| warp-flake-5.obu | 602 B | `1a99f9e5b257eed0ebae055441904d6c40962a26c0c2d63c3e051732569ff0a0` |
+| warp-flake-7.obu | 723 B | `c2f8b93f5a59c56b1c4453ea789e0fc955557ed9b63c0e2cb8683fa483eff2b5` |
+| ii-flake-1.obu | 579 B | `700ded3e61e15bc3573d339d7fcc6ab94500adb796c30021094d354306662238` |
+| ii-flake-2.obu | 581 B | `edc4ad3a6c00c6bc909c626fa24433ef31a88ed519ed57403f5373a160e590af` |
+| ii-flake-3.obu | 670 B | `994bfbdc952ecef18ae1560d5e7f121ba1000172e0bc2ad05e5b8cfaa17b15cb` |
+| ii-flake-5.obu | 681 B | `f43fe77ea0e8ddd9c1524b642e09f935921cb0d00c4a60061a52d2260af38b9a` |
+| ii-flake-6.obu | 632 B | `84a1f60011dfdb77ede98ce95a25d247d270b0af1cff2c44aa1e6b311ca63dce` |
+| ii-flake-7.obu | 654 B | `61ba4d114aa55ebcf95ae691abbce3307146a2d969c0627ea3ceea02f3875574` |
+| ii-flake-8.obu | 635 B | `f19d3d80ed564850cec02a26cfe7ab00e282afa7896821c535a117f5541bef5d` |
+| ii-flake-9.obu | 690 B | `0df4874737cc615258c0fdfb4bcb157c9a3663127cbf0a896af44d4deb83c653` |
+| rect-flake-1.obu | 607 B | `a3869b5d2bd8a8bc5413e0d039d5e3375a48601cdeb2edb8d4b732402926d357` |
+| rect-flake-2.obu | 601 B | `c780ddee1adf25cf63a6ba70ff449820f6f4474b23ef16615c1e843ad0c86adb` |
+| rect-flake-3.obu | 572 B | `3b23d204549b7bcfbd7166b1b3e2920580236c78de12e8f23f7fb64c1864f3e6` |
+
+`.gitignore`'s `!crates/*/fixtures/**` negation means a plain `git add` suffices —
+verified with `git check-ignore -q` (returns 1) and by staging with no `-f`.
+
+## 3. The gate is live
+
+`pinned_warp_stream_decodes_pixel_exact` reads all 14 from
+`crates/ec-av1/fixtures/`, via `crate_pin`, with `require_pin` in the helper.
+Plain run (no `--ignored`): **1 passed; 0 failed; 0 ignored; 744 filtered out;
+1.47 s**, printing each `pin: …/crates/ec-av1/fixtures/<name>`.
+
+The asserts live in `check_pinned_warp_stream`, which this gate delegates to —
+stated in the gate's doc comment, because a body-only scan reads as assert-free,
+which is how the r4 audit got it wrong. `#[ignore]` **36 → 35**.
+
+## 4. The count-vacuity sweep — and a CORRECTION to r4
+
+`count_vacuity` enumerates every site passing a locally-derived count as the
+oracle's expected frame count: **61 sites, 13 spec-pinned by a prior assert, 48
+not**. The floor (`>= 40`) stops the sweep silently shrinking.
+
+**r4 reported this shape as a "vacuous pass" and I told Main so. That was wrong.**
+Measured, by calling `ffmpeg_decode_sequence(&stream, 192, 128, 0)` on a real
+pinned stream under `catch_unwind`:
+
+```
+panicked at crates/ec-av1/src/stream.rs:5110:9:
+expected 0 4:2:0 frames, ffmpeg said:
+```
+
+The helper asserts `out.stdout.len() == frame_bytes * frames` unconditionally, so
+a wrong count **cannot pass silently** — it REDS, with a message that blames
+FFmpeg for a count our decoder chose. The consequence is a **misattributed red**,
+not a silent pass.
+
+r4's *fix* still stands (the count now comes from the fixture, so the red names the
+real cause). The *justification* was wrong, and a sweep repeating it would send
+the next reader after a bug that does not exist.
+
+| column | meaning |
+|---|---|
+| `stream.rs:3895` | `a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact` — `pictures.len()`, not spec-pinned: a wrong count reds, blaming ffmpeg |
+| `stream.rs:5355` | `an_svt_screen_palette_block_with_a_split_transform_decodes_exactly` — `decoded.len()`, not spec-pinned |
+| `stream.rs:10287/10289` | `rect_tx_tool_gate` — `decoded.len()`, not spec-pinned |
+| … 48 total | full list printed by the test; the floor pins the count |
+
+**All 48 are reported, none fixed.** That is an unbounded change across gates this
+lane does not own, and dressing it as a fix would be dishonest. The pin-class gates
+are clean: **0** unpinned count sites in `pinned_lr_sgr`,
+`check_pinned_warp_stream`, `pinned_golden3`, `pinned_sbpart` and the film-grain
+gate.
+
+## 5. State
+
+`lane-av1pins5`, three commits on top of `2e5509e9`. `cargo check -p ec-av1
+--all-targets` clean, **0 warnings**. `gate_coverage` **15 passed** (10 pre-existing
++ 5 new scanner tests), `refusal_inventory` 15 passed. Not verified: a full
+`cargo test -p ec-av1` run (project-wide validation is Main's).
+
+The rule this lane earns, on top of r3's: **a fix can blind the check that was
+watching the shape it changed.** The pin inventory went from blind, to correct, to
+blind-again-in-a-new-guise, across three commits in three rounds. The floor and the
+synthetic capability tests are what make that survivable.
