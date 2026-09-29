@@ -38022,6 +38022,208 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1sb128chroma: the PINNED half of
+    /// [`a_real_aomenc_444_intra_in_inter_128_root_codes_chroma_per_mu_chunk_unit_pixel_exact`].
+    /// That gate re-encodes its fixture on every run, so the arm it names had
+    /// NO committed 4:4:4 bytes at all: a host without ffmpeg/aomenc silently
+    /// skips it, and the whole committed 4:4:4 base is lossless 8-bit, so
+    /// nothing else in the crate decoded one of these streams. This gate is
+    /// the pin, and it also carries the COUNTER-PROOF arm: the recipe a
+    /// proposed 4:4:4 `--sb-size=128` chroma repair was argued from reads
+    /// ZERO on both the arm's own counters, so its green is vacuous.
+    ///
+    /// **Witness** `fixtures/444_intra_in_inter_128root_mu_chroma.obu`,
+    /// sha256 `f5999bd996fef820472dc7846e42cad3e62bd1f816fafd7f218e34b77786394a`,
+    /// 3570 bytes, 3 decode-order frames. Recipe (verified byte-reproducible):
+    /// ```text
+    /// ffmpeg -v error -f lavfi -i "gradients=size=128x256:c0=0xa1128f:c1=0xd98c48:\
+    /// c2=0x120601:c3=0x4abfba:seed=63:duration=0.12:rate=25,\
+    /// noise=all_seed=63:alls=6:allf=t" -pix_fmt yuv444p -t 0.12 -f yuv4mpegpipe - > in.y4m
+    /// aomenc --codec=av1 --profile=1 --passes=1 --end-usage=q --cq-level=62 \
+    ///        --cpu-used=0 --threads=1 --row-mt=0 --sb-size=128 --limit=3 \
+    ///        --max-partition-size=128 --min-partition-size=64 \
+    ///        --enable-rect-partitions=0 --enable-ab-partitions=0 \
+    ///        --enable-1to4-partitions=0 --enable-palette=0 --enable-intrabc=0 \
+    ///        --deltaq-mode=0 --enable-tx-size-search=0 --obu -o out.obu in.y4m
+    /// ```
+    /// `duration=0.12:rate=25` and `--limit=3` are load-bearing (the
+    /// `gradients`/`noise` patterns are time-parameterised, and at `--limit=2`
+    /// the encoder stops choosing INTRA over inter for a whole 128 root).
+    ///
+    /// **Measured on this witness** (unpatched `main` `57834ee2`): the arm
+    /// fires `intra_128_in_inter_hits = 1` root and
+    /// `intra_128_in_inter_mu_chroma_hits = 4` mu-chunk chroma reads (a 4:4:4
+    /// 64x64 mu chunk is FOUR TX_32X32 units per plane, two chunks, one
+    /// plane reached before the other), and all 3 frames are byte-exact
+    /// against the oracle. The claimed `cu_tx = 64` repair is refuted by two
+    /// independent measurements: (a) with `cu_tx` at 64 this arm PANICS --
+    /// `no default scan for a 64-point transform` at `decode.rs:7197`, because
+    /// libaom's `av1_get_adjusted_tx_size` (blockd.h:1361) maps TX_64X64 to
+    /// TX_32X32 unconditionally, so a 4:4:4 chroma unit is never 64 and
+    /// `av1_scan_orders` has no 64-point chroma table; (b) with only the
+    /// luma-span and per-chunk-origin halves of that repair applied (`cu_tx`
+    /// left at 32 so the mutation reaches the pixels), this same witness goes
+    /// RED: Y 12537, U 16696, V 16667 wrong samples of 98304 per plane,
+    /// first at Y(90,120) ours 142 vs oracle 141, U(65,120) 153 vs 152,
+    /// V(64,120) 145 vs 146 -- all of it on decode-order frame 2, and the
+    /// counters still read 1/4, so the damage is on PIXELS.
+    #[test]
+    fn a_444_intra_in_inter_128root_muchroma_pinned_stream_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_444_intra_in_inter_128root_muchroma_pinned_stream_decodes_pixel_exact";
+        const WITNESS_LEN: usize = 3570;
+        const WITNESS_FNV: u64 = 0xe455_060d_f685_86dd;
+        const CONTROL_LEN: usize = 31602;
+        const CONTROL_FNV: u64 = 0xc542_f45f_f3a5_d494;
+        const W: usize = 128;
+        const H: usize = 256;
+        const FRAMES: usize = 3;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let read_pinned = |name: &str, len: usize, fnv: u64| -> Vec<u8> {
+            let path = dir.join(name);
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{NAME}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                     which is a failure, not a skip",
+                    path.display()
+                )
+            });
+            assert_eq!(bytes.len(), len, "{NAME}: {name} length moved");
+            assert_eq!(fnv1a64(&bytes), fnv, "{NAME}: {name} bytes moved");
+            bytes
+        };
+        let stream = read_pinned(
+            "444_intra_in_inter_128root_mu_chroma.obu",
+            WITNESS_LEN,
+            WITNESS_FNV,
+        );
+
+        let _gate_lock = lock_gate_counters();
+        // The shape claim first: a stream that silently came back 4:2:0 would
+        // leave the arm unexercised while every other assert still passed.
+        let header = {
+            let mut parser = ec_av1_syntax::Av1Parser::new();
+            let mut pos = 0usize;
+            while let Ok(obu) = parser.parse_obu(&stream[pos..]) {
+                pos += obu.total_size;
+                if pos >= stream.len() {
+                    break;
+                }
+            }
+            parser.sequence_header().map(|q| {
+                (
+                    q.use_128x128_superblock,
+                    q.color_config.subsampling_x,
+                    q.color_config.subsampling_y,
+                    q.color_config.mono_chrome,
+                )
+            })
+        };
+        assert_eq!(
+            header,
+            Some((true, 0, 0, false)),
+            "{NAME}: the witness is not a 4:4:4 (ss 0/0, non-mono) 128x128-superblock stream \
+             -- {header:?}, so the arm under test is not the one that ran"
+        );
+        let before = (
+            crate::decode::intra_128_in_inter_hits(),
+            crate::decode::intra_128_in_inter_mu_chroma_hits(),
+        );
+        let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        let (roots, units) = (
+            crate::decode::intra_128_in_inter_hits() - before.0,
+            crate::decode::intra_128_in_inter_mu_chroma_hits() - before.1,
+        );
+        assert_eq!(decoded, FRAMES, "{NAME}: decode-order frame count");
+        // At 4:4:4 the chroma planes are full resolution; a decoder that kept
+        // the 4:2:0 extent would hand quarter-size chroma to the byte compare,
+        // which cannot pass. Say it here rather than let the compare stand in
+        // for the shape claim.
+        for f in crate::stream::decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the witness no longer decodes cleanly: {e}"))
+        {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: frame dimensions");
+            assert_eq!(
+                f.u.len(),
+                W * H,
+                "{NAME}: chroma plane is {} samples",
+                f.u.len()
+            );
+        }
+        assert!(
+            roots >= 1,
+            "{NAME}: no INTRA-coded 128x128 root inside an inter frame -- the arm under \
+             test never ran"
+        );
+        assert!(
+            units >= 4,
+            "{NAME}: only {units} mu-chunk chroma reads across {roots} intra-in-inter 128 \
+             root(s) -- a 4:4:4 64x64 mu chunk is FOUR TX_32X32 units per plane, so fewer \
+             than four means the per-unit walk this gate names did not run"
+        );
+        eprintln!(
+            "{NAME}: {decoded} decode-order frame(s) pixel-exact ({hidden} hidden), \
+             intra_128_in_inter={roots} mu_chunk_chroma_reads={units}"
+        );
+
+        // The COUNTER-PROOF arm. The 4:4:4 `--sb-size=128 --cq-level=20`
+        // `testsrc2` recipe a 64-point-chroma repair was argued from is
+        // byte-exact on all 24 frames AND reads ZERO on both of the arm's
+        // counters: on clean `testsrc2` the encoder's RD never picks INTRA
+        // over inter for a whole 128 root, so that stream cannot witness this
+        // arm at all. Pinning it keeps the refutation reproducible in-crate
+        // with no encoder on the host.
+        let control = read_pinned("444_sb128cq20_tsrc2_control.obu", CONTROL_LEN, CONTROL_FNV);
+        let ctl_header = {
+            let mut parser = ec_av1_syntax::Av1Parser::new();
+            let mut pos = 0usize;
+            while let Ok(obu) = parser.parse_obu(&control[pos..]) {
+                pos += obu.total_size;
+                if pos >= control.len() {
+                    break;
+                }
+            }
+            parser.sequence_header().map(|q| {
+                (
+                    q.use_128x128_superblock,
+                    q.color_config.subsampling_x,
+                    q.color_config.subsampling_y,
+                )
+            })
+        };
+        assert_eq!(
+            ctl_header,
+            Some((true, 0, 0)),
+            "{NAME}: the control stream is not the 4:4:4 128-superblock stream its recipe \
+             names -- {ctl_header:?}"
+        );
+        let ctl_before = (
+            crate::decode::intra_128_in_inter_hits(),
+            crate::decode::intra_128_in_inter_mu_chroma_hits(),
+        );
+        let ctl_frames = crate::stream::decode_stream(&control)
+            .unwrap_or_else(|e| panic!("{NAME}: the control stream no longer decodes: {e}"))
+            .len();
+        let ctl = (
+            crate::decode::intra_128_in_inter_hits() - ctl_before.0,
+            crate::decode::intra_128_in_inter_mu_chroma_hits() - ctl_before.1,
+        );
+        assert_eq!(ctl_frames, 24, "{NAME}: control frame count");
+        assert_eq!(
+            ctl,
+            (0, 0),
+            "{NAME}: the control stream now reaches the arm ({ctl:?}) -- the witness's \
+             non-vacuity argument rested on `testsrc2` never choosing an \
+             intra-coded 128 root, and that is no longer true, so the two \
+             fixtures no longer separate the cells"
+        );
+        if aomdec_available(NAME) {
+            let (ctl_decoded, ctl_hidden) = decode_all_frames_vs_oracle(&control, NAME);
+            assert_eq!(ctl_decoded, 24, "{NAME}: control decode-order frame count");
+            eprintln!("{NAME}: control {ctl_decoded} frame(s) pixel-exact ({ctl_hidden} hidden)");
+        }
+    }
+
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level
     /// partition decision is genuinely HORZ/VERT (not NONE/SPLIT) must
     /// decode pixel-exact through [`crate::decode::decode_block_rect64`] --
