@@ -2275,6 +2275,119 @@ pub(crate) fn rect_class1_hits() -> usize {
     RECT_CLASS1_HITS.with(|c| c.get())
 }
 
+// lane-av1readcensus: the PER-UNIT coefficient census -- one unit counted
+// per `read_coeffs`/`read_coeffs_rect` call, i.e. per object this decoder
+// actually walks, which is the unit the round-4 `av1444rect` count measured
+// (636 square chroma reads against the oracle's 1086). The counters are
+// 4:4:4-ONLY (`CENSUS_444`, set per frame beside `set_subsampling`), so a
+// 4:2:0 control reads `(0, 0, 0)` -- a walk-shape change at 4:2:0 is another
+// lane's business, and this census must not fire there.
+thread_local! {
+    /// Per-plane unit counts, `[luma, u, v]`, at 4:4:4 only.
+    static CENSUS_444_UNITS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Of [`CENSUS_444_UNITS`], the units that coded at least one coefficient
+    /// (`txb_skip == 0`) -- the per-plane split is only comparable against
+    /// the oracle's when both sides count all-zero units the same way.
+    static CENSUS_444_CODED: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Sequential unit index, so a trace line names its own position in the
+    /// frame's walk rather than relying on line order alone.
+    static CENSUS_UNIT_N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The plane the units read from here on belong to. A thread-local rather
+    /// than a `read_coeffs` parameter because the three luma call sites
+    /// (`decode_rect_split`, `decode_block_rect64`, `read_inter_plane_rect`)
+    /// are not this lane's to edit and would each grow an argument; the
+    /// plane-owning readers stamp it once on entry instead.
+    static CENSUS_PLANE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 4:4:4 (`subsampling_x == 0 && subsampling_y == 0`) for the frame being
+    /// decoded, set per frame from [`crate::stream`].
+    static CENSUS_444: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Current `[luma, u, v]` 4:4:4 coefficient-unit counts.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn census_444_units() -> [usize; 3] {
+    CENSUS_444_UNITS.with(|c| c.get())
+}
+
+/// Current `[luma, u, v]` 4:4:4 counts of units that coded coefficients.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn census_444_coded() -> [usize; 3] {
+    CENSUS_444_CODED.with(|c| c.get())
+}
+
+/// lane-av1readcensus: arms the 4:4:4 census for the frame about to decode,
+/// called once per frame from [`crate::stream`]'s decode loop beside
+/// [`set_subsampling`]. At 4:2:0 (or 4:2:2) every census counter stays zero --
+/// the walk-shape question this census answers is a 4:4:4 one.
+pub(crate) fn set_census_444(ss_x: u8, ss_y: u8) {
+    CENSUS_444.with(|c| c.set(ss_x == 0 && ss_y == 0));
+}
+
+/// lane-av1readcensus: the plane the units read from here on belong to,
+/// stamped by the plane-owning readers ([`read_plane`], [`read_inter_plane`],
+/// [`read_inter_plane_rect`]) on entry.
+pub(crate) fn set_census_plane(plane: usize) {
+    CENSUS_PLANE.with(|c| c.set(plane));
+}
+
+/// lane-av1readcensus: is the per-unit census trace on? Shares
+/// [`coeff_trace_on`]'s per-frame narrowing so one frame's walk can be
+/// dumped without the rest of the stream.
+fn census_trace_on() -> bool {
+    if !crate::envflags::env_flag!("EC_CENSUS_UNIT") {
+        return false;
+    }
+    match COEFF_TRACE_FRAME.with(|c| c.get()) {
+        None => true,
+        Some(w) if w >= usize::MAX - 1 => true,
+        Some(w) => COEFF_TRACE_CUR.with(|c| c.get()) == w,
+    }
+}
+
+/// lane-av1readcensus: one line per coefficient unit this decoder walks, the
+/// twin of the oracle's `EC_COEFF` / `EC_COEFF_VAL` bracket around each
+/// `av1_read_coeffs_txb` call. Pair the two sides by `post_rng` (or by `n`),
+/// never by plane label or by walk position -- the walk order is exactly what
+/// the census is measuring.
+fn census_unit(
+    w: usize,
+    h: usize,
+    tx_type: TxType,
+    eob: usize,
+    all_zero: bool,
+    entry_rng: u32,
+    dec: &SymbolDecoder,
+) {
+    let plane = CENSUS_PLANE.with(|c| c.get()).min(2);
+    let coded = usize::from(!all_zero);
+    CENSUS_UNIT_N.with(|c| c.set(c.get() + 1));
+    hit_do! {
+        CENSUS_444_UNITS.with(|c| {
+            if CENSUS_444.with(|on| on.get()) {
+                let mut v = c.get();
+                v[plane] += 1;
+                c.set(v);
+            }
+        });
+        CENSUS_444_CODED.with(|c| {
+            if CENSUS_444.with(|on| on.get()) {
+                let mut v = c.get();
+                v[plane] += coded;
+                c.set(v);
+            }
+        });
+    }
+    if !census_trace_on() {
+        return;
+    }
+    let n = CENSUS_UNIT_N.with(|c| c.get()) - 1;
+    let post_rng = dec.debug_state().0;
+    eprintln!(
+        "EC_CENSUS_UNIT side=ours n={n} plane={plane} w={w} h={h} tx={tx_type:?} eob={eob} \
+         all_zero={all_zero} entry_rng={entry_rng} post_rng={post_rng}"
+    );
+}
+
 // As [`FILTER_INTRA_RECT_HITS`], counting only the strips BELOW 16x16
 // (8x16/16x8 leaves of a 16x16 HORZ/VERT partition, lane-fistrip r1) -- the
 // shapes whose `use_filter_intra` symbol had no CDF class before this round.
@@ -7561,6 +7674,11 @@ fn read_coeffs(
 ) -> Result<(Grid, TxType)> {
     let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     let side = coding.side;
+    // lane-av1readcensus: this unit's own entry state, so the census line
+    // carries the pre-read rng and pairs against the oracle's `EC_COEFF`
+    // (which prints `r->ec.rng` before the same `txb_skip` read).
+    let census_entry_rng = dec.debug_state().0;
+    let (census_w, census_h) = rect_shape.unwrap_or((side, side));
     if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") {
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
@@ -7603,6 +7721,15 @@ fn read_coeffs(
     if all_zero {
         // lane-coefgrid: the all-zero unit (60% of the 4K segment's) names the
         // shared zero grid instead of allocating and zeroing its own.
+        census_unit(
+            census_w,
+            census_h,
+            TxType::DctDct,
+            0,
+            true,
+            census_entry_rng,
+            dec,
+        );
         return Ok((Grid::Zero(side * side), TxType::DctDct));
     }
     let mut grid = vec![0i32; side * side];
@@ -7811,6 +7938,15 @@ fn read_coeffs(
         }
         grid[pos] = if negative { -level } else { level };
     }
+    census_unit(
+        census_w,
+        census_h,
+        tx_type,
+        eob,
+        false,
+        census_entry_rng,
+        dec,
+    );
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -7840,6 +7976,13 @@ fn read_coeffs_rect(
 ) -> Result<(Grid, TxType)> {
     let rect_trace = coeff_trace_on();
     let entry_rng = dec.debug_state().0;
+    // lane-av1readcensus: this reader is handed the real plane (lane-av1chrtx
+    // threaded it in for the `EC_COEFF_STEP` traces), so it stamps the census
+    // plane itself rather than inheriting whichever reader did last. The
+    // luma-only readers (`decode_rect_split`, `decode_block_rect64`,
+    // `read_inter_plane_rect`'s corner) are all plane 0 -- the stamp's initial
+    // value -- and the other plane-owning readers stamp on entry.
+    set_census_plane(plane);
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if rect_trace {
         eprintln!(
@@ -7849,6 +7992,7 @@ fn read_coeffs_rect(
         );
     }
     if all_zero {
+        census_unit(w, h, TxType::DctDct, 0, true, entry_rng, dec);
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
     let mut grid = vec![0i32; w * h];
@@ -8052,6 +8196,7 @@ fn read_coeffs_rect(
             nz.join(",")
         );
     }
+    census_unit(w, h, tx_type, eob, false, entry_rng, dec);
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -19858,6 +20003,8 @@ fn read_plane(
     if plane_idx > 0 && mono(fctx) {
         return Ok(Grid::Zero(side * side));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
@@ -28431,6 +28578,8 @@ fn read_inter_plane_rect(
     if plane_idx > 0 && mono(fctx) {
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         // `get_txb_ctx_general`: 0 only when this unit IS the whole plane
         // block; a var-tx leaf passes its own neighbour-table context.
@@ -35502,6 +35651,8 @@ fn read_inter_plane(
     if plane_idx > 0 && mono(fctx) {
         return Ok((Grid::Zero(side * side), TxType::DctDct));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {

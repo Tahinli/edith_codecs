@@ -1837,6 +1837,10 @@ fn decode_frame(
     // 4:2:0 one never inherits the wrong plane count.
     crate::decode::set_mono(seq.mono_chrome, fctx);
     crate::decode::set_subsampling(seq.subsampling_x, seq.subsampling_y, fctx);
+    // lane-av1readcensus: the 4:4:4 coefficient-unit census is armed here,
+    // off the same sequence-header subsampling -- at 4:2:0/4:2:2 every census
+    // counter reads zero, so a 4:2:0 control can assert exactly that.
+    crate::decode::set_census_444(seq.subsampling_x, seq.subsampling_y);
     // lane-av1txr: spec 5.9.2 `disable_cdf_update` -- a frame that sets it
     // codes every tile symbol against the CDFs it started with, so the tile
     // readers must not adapt (libaom `decodeframe.c:2909`:
@@ -19366,6 +19370,141 @@ pub(crate) mod tests {
             c_hits > 0 && c_diff == 0,
             "{NAME}: the rect-strip control fired the route {c_hits} times with {c_diff} differing \
              types -- expected the single-unit/same-type shape (route fires, nothing changes)"
+        );
+    }
+
+    /// lane-av1readcensus: the 4:4:4 coefficient-UNIT census, pinned.
+    ///
+    /// The lane report `av1444rect` round 4 left an unexplained signal: 636
+    /// square chroma reads against the oracle's 1086, and 2052 luma reads
+    /// against its 1309, recorded as "most likely a counting-shape difference"
+    /// with no evidence either way. This gate is that evidence.
+    ///
+    /// Measured on this arm (`ll444_minp8_inter`, pixel-exact against aomdec
+    /// on every plane of every frame -- see
+    /// `a_lossless_444_min_partition8_inter_stream_decodes_sample_exact`),
+    /// pairing each of our 11292 walked units with the oracle's
+    /// `av1_read_coeffs_txb` call BY `post_rng` (the msac state after the
+    /// unit) rather than by plane label or walk position: EVERY unit pairs,
+    /// and no unit's plane, shape, eob or all-zero flag differs. The per-plane
+    /// split is equal too -- 3764 units per plane on both sides, of which
+    /// 975 / 1793 / 1859 coded coefficients. So on a pixel-exact arm there is
+    /// no asymmetry to explain at all; the round-4 numbers came from
+    /// `444_intrabc_rect4_witness`, an arm that DIVERGES (390380 of 921600
+    /// samples wrong), where our surplus is the divergence itself.
+    ///
+    /// What this gate pins is the walk's OBJECT SHAPE on the pixel-exact arm:
+    /// a change to the number or plane split of coefficient units this decoder
+    /// walks shows up here as an intentional diff, not as the next lane's
+    /// mystery signal. The 4:2:0 control asserts the census is inert there.
+    #[test]
+    fn a_pixel_exact_444_stream_walks_the_same_coefficient_units_the_oracle_does() {
+        const NAME: &str =
+            "a_pixel_exact_444_stream_walks_the_same_coefficient_units_the_oracle_does";
+        const FIXTURE_LEN: usize = 34037;
+        const FIXTURE_FNV: u64 = 0x2c8f_4a2c_c025_52da;
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP {NAME}: no aomenc/aomdec oracle at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/ll444_minp8_inter.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+        let delta = |now: [usize; 3], before: [usize; 3]| {
+            [now[0] - before[0], now[1] - before[1], now[2] - before[2]]
+        };
+
+        let u0 = crate::decode::census_444_units();
+        let c0 = crate::decode::census_444_coded();
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        assert_eq!(
+            frames + hidden,
+            8,
+            "{NAME}: expected 8 decode-order frames (6 shown + 2 hidden)"
+        );
+        let walked = delta(crate::decode::census_444_units(), u0);
+        let coded = delta(crate::decode::census_444_coded(), c0);
+
+        // The oracle's own census on the same stream, paired by post_rng:
+        // 3764 units per plane, 975 / 1793 / 1859 of them coded.
+        assert_eq!(
+            walked,
+            [3764, 3764, 3764],
+            "{NAME}: the 4:4:4 unit walk changed -- {walked:?} against the oracle's \
+             [3764, 3764, 3764] (measured by post_rng pairing, every unit matching). A change \
+             here is a WALK-SHAPE change: re-measure against aomdec before assuming it is a bug"
+        );
+        assert_eq!(
+            coded,
+            [975, 1793, 1859],
+            "{NAME}: the coded-unit split changed -- {coded:?} against the oracle's [975, 1793, 1859]"
+        );
+        assert!(
+            walked.iter().all(|&v| v > 0) && coded.iter().all(|&v| v > 0),
+            "{NAME}: an all-zero plane split means the census did not run, not that the walk is empty"
+        );
+
+        // A SECOND pixel-exact arm, with a MIXED unit-shape mix -- the pinned
+        // lossless stream above is all TX_4X4 (min-partition-8), so on its own
+        // it would not notice a var-tx walk that started folding 8x8/4x8
+        // leaves. This one walks 4x4/8x8/8x4/4x8/4x16/16x4/8x16/16x16, and
+        // the oracle's census on it pairs unit-for-unit by post_rng with no
+        // shape, plane, eob or all-zero difference: 1373 units, 629 luma and
+        // 372 per chroma plane, of which 130 / 253 / 278 coded.
+        let path2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_lossy_rect4_inter_witness.obu");
+        let stream2 = std::fs::read(&path2)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path2.display()));
+        let m0 = crate::decode::census_444_units();
+        let mc0 = crate::decode::census_444_coded();
+        let (frames2, hidden2) = decode_all_frames_vs_oracle(&stream2, NAME);
+        assert!(
+            frames2 + hidden2 > 0,
+            "{NAME}: the mixed-shape 4:4:4 arm decoded no frames"
+        );
+        let walked2 = delta(crate::decode::census_444_units(), m0);
+        let coded2 = delta(crate::decode::census_444_coded(), mc0);
+        assert_eq!(
+            walked2,
+            [629, 372, 372],
+            "{NAME}: the mixed-shape 4:4:4 walk changed -- {walked2:?} against the oracle's \
+             [629, 372, 372]. The all-4x4 arm above cannot see a var-tx fold; this one can"
+        );
+        assert_eq!(
+            coded2,
+            [130, 253, 278],
+            "{NAME}: the mixed-shape coded-unit split changed -- {coded2:?} against the oracle's \
+             [130, 253, 278]"
+        );
+
+        // 4:2:0 control: the census is a 4:4:4 question and must not fire.
+        let control = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/av1_192x128_8bit_intra64_in_inter.obu"),
+        )
+        .unwrap_or_else(|e| panic!("{NAME}: reading the 4:2:0 control: {e}"));
+        let k0 = crate::decode::census_444_units();
+        let kc0 = crate::decode::census_444_coded();
+        let k_frames = decode_stream(&control)
+            .unwrap_or_else(|e| panic!("{NAME}: the 4:2:0 control no longer decodes: {e}"))
+            .len();
+        assert!(k_frames > 0, "{NAME}: the 4:2:0 control decoded no frames");
+        assert_eq!(
+            delta(crate::decode::census_444_units(), k0),
+            [0, 0, 0],
+            "{NAME}: the 4:4:4 census fired on the 4:2:0 control"
+        );
+        assert_eq!(
+            delta(crate::decode::census_444_coded(), kc0),
+            [0, 0, 0],
+            "{NAME}: the 4:4:4 coded-unit census fired on the 4:2:0 control"
         );
     }
 
@@ -39628,7 +39767,6 @@ pub(crate) mod tests {
             "{NAME}: no attempt decoded a depth-1 1:4 split strip -- the recipe no longer \
              covers the shape this round fixed"
         );
-        eprintln!("{NAME}: {depth1_decoded} depth-1 1:4 split strips decoded pixel-exact");
     }
 
     /// The chroma-rect gate's fixture + aomenc recipe for one attempt, shared
