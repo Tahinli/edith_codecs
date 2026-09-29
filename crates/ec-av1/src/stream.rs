@@ -7479,6 +7479,387 @@ pub(crate) mod tests {
         }
     }
 
+    /// Shared body for the lane-av1superpin 4:4:4 superres arms. It is the
+    /// body of [`a_444_lossy_superres_stream_decodes_pixel_exact`] with the
+    /// single `(denominator, coded_width)` constant generalised to a PER-FRAME
+    /// table, which is what the mode-2 cell needs: libaom picks a different
+    /// denominator for each frame there, so a single constant would either
+    /// describe frame 0 only or be a literal the arithmetic below could not
+    /// hold.
+    ///
+    /// Everything that makes the den=12 cell non-vacuous is here, unchanged:
+    /// the pinned bytes (length + FNV-1a), 4:4:4 / 8-bit / superres-enabled
+    /// from the sequence header, `use_superres` on every parsed frame header,
+    /// the per-frame parsed denominator and coded size, and the coded width
+    /// RE-DERIVED as `(UpscaledWidth*8 + denom/2)/denom` from that frame's OWN
+    /// parsed denominator rather than compared to a literal alone -- so a
+    /// re-pinned fixture cannot satisfy the literals while the scaled-size
+    /// arithmetic moves under them. Then `superres_hits` and
+    /// `predict_scaled_hits` as DELTAS (both counters are process-wide with no
+    /// reset, so absolute values would pass on residue from another stream),
+    /// the returned frames at the UPSCALED width with full-resolution 4:4:4
+    /// chroma planes, and every decode-order frame byte-exact against the
+    /// instrumented aomdec.
+    #[allow(clippy::too_many_arguments)]
+    fn a_444_superres_arm(
+        name: &str,
+        fixture: &str,
+        fixture_len: usize,
+        fixture_fnv: u64,
+        fixture_sha: &str,
+        upscaled: (usize, usize),
+        // `(denominator, coded_width)` per DECODE-ORDER frame.
+        per_frame: &[(u8, usize)],
+    ) -> Vec<ec_av1_syntax::FrameHeader> {
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture);
+        let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+            panic!(
+                "{name}: pinned fixture {} is missing ({e}) -- the gate cannot run, \
+                 which is a failure, not a skip",
+                obu.display()
+            )
+        });
+        assert_eq!(stream.len(), fixture_len, "{name}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), fixture_fnv, "{name}: fixture bytes moved");
+
+        // --- the header facts the CELL depends on, parsed not assumed ------
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut seq = None;
+        let mut heads: Vec<FrameHeader> = Vec::new();
+        while pos < stream.len() {
+            let obu = parser
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: aomenc OBU does not parse: {e:?}"));
+            if obu.total_size == 0 {
+                break;
+            }
+            pos += obu.total_size;
+            match obu.kind {
+                ObuKind::SequenceHeader(s) => seq = Some(s),
+                ObuKind::FrameHeader(h) => heads.push(*h),
+                ObuKind::Frame(h, _) => heads.push(*h),
+                _ => {}
+            }
+        }
+        let seq = seq.unwrap_or_else(|| panic!("{name}: the stream carries no sequence header"));
+        assert_eq!(
+            (
+                seq.color_config.subsampling_x,
+                seq.color_config.subsampling_y
+            ),
+            (0, 0),
+            "{name}: the stream is not 4:4:4 (ss = ({}, {}))",
+            seq.color_config.subsampling_x,
+            seq.color_config.subsampling_y
+        );
+        assert_eq!(
+            seq.color_config.bit_depth, 8,
+            "{name}: not the 8-bit cell this gate names"
+        );
+        assert!(
+            seq.enable_superres,
+            "{name}: the sequence header does not enable superres at all"
+        );
+        assert_eq!(
+            heads.len(),
+            per_frame.len(),
+            "{name}: {} frame headers, expected {}",
+            heads.len(),
+            per_frame.len()
+        );
+        for (i, (h, (denom, coded))) in heads.iter().zip(per_frame).enumerate() {
+            // The assertion the phantom cell failed. Without a denominator
+            // flag aomenc picks 8 and this is false while the stream still
+            // decodes, which is how a whole sweep cell ends up mislabelled.
+            assert!(
+                h.use_superres,
+                "{name}: frame {i} has use_superres = false -- this is an UNSCALED \
+                 stream and the gate would be measuring something other than the \
+                 cell it names (class gate-blind-to-feature)"
+            );
+            assert_eq!(
+                h.superres_denom, *denom,
+                "{name}: frame {i} PARSED denominator moved from {denom} -- read the \
+                 header, never the encoder flag (mode 2 chooses its own)"
+            );
+            assert_eq!(
+                (h.upscaled_width as usize, h.frame_height as usize),
+                upscaled,
+                "{name}: frame {i} upscaled size moved"
+            );
+            assert_eq!(
+                (h.frame_width as usize, h.frame_height as usize),
+                (*coded, upscaled.1),
+                "{name}: frame {i} CODED size moved -- this is the scaled half of \
+                 the cell and the part an unsized stream gets wrong"
+            );
+            // Re-derive rather than only compare literals, so a re-pinned
+            // fixture cannot satisfy the numbers above while the scaled-size
+            // arithmetic has moved under them. The denominator here is the
+            // one PARSED out of this frame, so the check cannot be satisfied by
+            // a literal that merely happens to agree.
+            let d = u32::from(*denom);
+            assert_eq!(
+                (h.upscaled_width * 8 + d / 2) / d,
+                h.frame_width,
+                "{name}: frame {i}: FrameWidth is not (UpscaledWidth*8 + denom/2)/denom -- \
+                 the scaled size the cell rests on is not the spec's"
+            );
+        }
+
+        // --- the pixels -----------------------------------------------------
+        let _guard = lock_gate_counters();
+        let before_sr = crate::superres::superres_hits();
+        let before_scaled = crate::mc::predict_scaled_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{name}: the pinned 4:4:4 superres stream was refused: {e}"));
+        let scaled_up = crate::superres::superres_hits() - before_sr;
+        let scaled_mc = crate::mc::predict_scaled_hits() - before_scaled;
+        assert!(
+            scaled_up > 0,
+            "{name}: zero superres_hits -- the upscaler never ran (class \
+             gate-blind-to-feature)"
+        );
+        assert!(
+            scaled_mc > 0,
+            "{name}: zero predict_scaled_hits -- no inter block read a scaled reference, \
+             so the scaled-PREDICTION half of the cell is unexercised (class \
+             gate-blind-to-feature)"
+        );
+        assert_eq!(frames.len(), per_frame.len(), "{name}: decoded frame count");
+        for (i, f) in frames.iter().enumerate() {
+            // The upscale must have REPLACED the frame: a decoder that returned
+            // the coded-width picture fails here, and without this check the
+            // chroma-shape assertion below could be satisfied by coded-size
+            // planes.
+            assert_eq!(
+                (f.width, f.height),
+                upscaled,
+                "{name}: frame {i} came back {}x{}, not the UPSCALED {}x{}",
+                f.width,
+                f.height,
+                upscaled.0,
+                upscaled.1
+            );
+            for (plane, len) in [("U", f.u.len()), ("V", f.v.len())] {
+                assert_eq!(
+                    len,
+                    upscaled.0 * upscaled.1,
+                    "{name}: frame {i} {plane} plane is {len} samples; at 4:4:4 upscaled it \
+                     must be full resolution ({}x{})",
+                    upscaled.0,
+                    upscaled.1
+                );
+            }
+        }
+        if aomdec_path().is_file() {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, name);
+            eprintln!(
+                "{name}: {decoded} decode-order frame(s) ({hidden} hidden) byte-exact vs \
+                 aomdec at {upscaled:?} upscaled from {per_frame:?} (denominator, coded \
+                 width) per frame, {scaled_up} upscale(s), {scaled_mc} scaled MC block(s); \
+                 fixture sha256 {fixture_sha}"
+            );
+        } else {
+            eprintln!("{name}: no oracle aomdec, pixel arm skipped");
+        }
+        heads
+    }
+
+    /// lane-av1superpin (a): `--superres-mode=1 --superres-denominator=9`, the
+    /// WIDEST frame-edge margin this 256x128 geometry allows -- coded 228x128
+    /// upscaled to 256x128, `denom = 9`, on all four frames.
+    ///
+    /// **Why 9 and not 12.** The den=12 cell beside it (coded 171x128) is the
+    /// one the chroma-format sweep's matrix row ended up pointing at, and
+    /// denom 16 (coded 128x128) is the degenerate one where the coded width
+    /// equals the superblock grid exactly. Nine is the largest denominator
+    /// libaom's own `SUPERRES_NUM` ladder accepts here and still scales, and
+    /// it is the member that leaves the most coded samples at the frame's
+    /// right edge: `228 * 8 / 256` of the frame is a 28-column upscale margin,
+    /// against 12's 85 columns. A wide margin is where a round-trip is most
+    /// likely to read past the coded picture, so it is the member worth
+    /// pinning next to the den=12 one.
+    ///
+    /// **The recipe** (sha256
+    /// `3d619ee0fda3d9bb9cf8ff0541ba00ea5d83ae38cd8eec1322f8dbbbe6a5ec96`,
+    /// 17437 bytes, 4 frames, `testsrc2 256x128 rate=25` yuv444p):
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=256x128:rate=25" -frames:v 4 \
+    ///        -pix_fmt yuv444p -strict -1 -f yuv4mpegpipe - | \
+    /// aomenc --codec=av1 --passes=1 --end-usage=q --cq-level=20 --cpu-used=2 \
+    ///        --threads=1 --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 \
+    ///        --limit=4 --superres-mode=1 --superres-denominator=9 \
+    ///        --superres-kf-denominator=9 --obu -o - -
+    /// ```
+    /// Byte-reproducible: re-encoding this recipe reproduces the pinned 17437
+    /// bytes exactly, and the PARSED headers of that re-encode were read
+    /// (`frame=228x128 upscaled=256 use_superres=true denom=9` on all four) --
+    /// which is where the numbers below come from, not from the flags.
+    #[test]
+    fn a_444_lossy_superres_mode1_den9_stream_decodes_pixel_exact() {
+        a_444_superres_arm(
+            "a_444_lossy_superres_mode1_den9_stream_decodes_pixel_exact",
+            "fixtures/444_lossy_superres_256x128_d9.obu",
+            17437,
+            0x1ff2_fb84_528f_aa05,
+            "3d619ee0fda3d9bb9cf8ff0541ba00ea5d83ae38cd8eec1322f8dbbbe6a5ec96",
+            (256, 128),
+            &[(9, 228); 4],
+        );
+    }
+
+    /// lane-av1superpin (b): `--superres-mode=2` (random denominator), coded
+    /// 186x128 on the first frame and a DIFFERENT denominator on each frame
+    /// after it.
+    ///
+    /// **This is the cell that makes the flag-vs-header distinction
+    /// unavoidable.** Measured on the pinned bytes by parsing every frame
+    /// header, `--superres-mode=2` does not honour `--superres-denominator`
+    /// at all -- encoding the recipe four times (no denominator, then 9, 12,
+    /// 16) produced ONE stream, sha256
+    /// `c18496cf3b7db0feca9aa904024cec2115be80b5b94f87c848ac52f9b32ffd97`
+    /// (16620 bytes), byte-identical every time -- and the parsed headers of
+    /// that stream are:
+    ///
+    /// ```text
+    /// FH0 frame=186x128 upscaled=256 use_superres=true denom=11
+    /// FH1 frame=146x128 upscaled=256 use_superres=true denom=14
+    /// FH2 frame=137x128 upscaled=256 use_superres=true denom=15
+    /// FH3 frame=228x128 upscaled=256 use_superres=true denom=9
+    /// ```
+    ///
+    /// So a gate written against this cell that read the flag instead of the
+    /// header would assert `denom == 9` (or 12, or 16) and be wrong on three
+    /// of four frames -- or, worse, pass while printing numbers the stream does
+    /// not carry. Three of the four parsed denominators (11, 14, 15) are values
+    /// no flag on the command line ever named, which is the property the arm
+    /// below asserts directly.
+    ///
+    /// **Why it is worth a gate of its own** beyond the flag-ignoring point:
+    /// the den=12 and den=9 cells both scale every frame at one denominator,
+    /// so `av1_superres_upscale` is only ever handed one coded-to-upscaled
+    /// ratio. This stream hands it four (256->186, 256->146, 256->137,
+    /// 256->228) in one decode, and libaom's upscaler picks its filter taps
+    /// from `denom` per frame. That is the case a single-denominator gate
+    /// cannot reach.
+    ///
+    /// **The recipe**:
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=256x128:rate=25" -frames:v 4 \
+    ///        -pix_fmt yuv444p -strict -1 -f yuv4mpegpipe - | \
+    /// aomenc --codec=av1 --passes=1 --end-usage=q --cq-level=20 --cpu-used=2 \
+    ///        --threads=1 --row-mt=0 --lag-in-frames=0 --kf-max-dist=100 \
+    ///        --limit=4 --superres-mode=2 --obu -o - -
+    /// ```
+    #[test]
+    fn a_444_lossy_superres_mode2_random_denom_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_444_lossy_superres_mode2_random_denom_stream_decodes_pixel_exact";
+        let heads = a_444_superres_arm(
+            NAME,
+            "fixtures/444_lossy_superres_mode2_256x128.obu",
+            16620,
+            0x8cbb_36b2_5e0f_07ab,
+            "c18496cf3b7db0feca9aa904024cec2115be80b5b94f87c848ac52f9b32ffd97",
+            (256, 128),
+            &[(11, 186), (14, 146), (15, 137), (9, 228)],
+        );
+
+        // The flag-ignoring arm. Every denominator libaom accepted on the
+        // command line, plus the recipe's own "no denominator at all", must
+        // land on the SAME bytes as the pinned fixture. If a future libaom
+        // starts honouring the flag under mode 2 this goes red -- and that is
+        // the point: the gate above is pinned to parsed denominators, so the
+        // day the flag starts mattering the pin has to be re-derived from the
+        // stream, not from the recipe.
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("{NAME}: flag-ignoring arm skipped (no ffmpeg/aomenc)");
+            return;
+        }
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=256x128:rate=25",
+                "-frames:v", "4", "-pix_fmt", "yuv444p", "-strict", "-1", "-f",
+                "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{NAME}: ffmpeg refused to generate the y4m source: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let pinned =
+            std::fs::read(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/444_lossy_superres_mode2_256x128.obu"))
+                .expect("pinned fixture disappeared between the two reads");
+        for extra in [
+            vec![],
+            vec!["--superres-denominator=9"],
+            vec!["--superres-denominator=12"],
+            vec!["--superres-denominator=16"],
+        ] {
+            let mut args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=20",
+                "--cpu-used=2",
+                "--threads=1",
+                "--row-mt=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=100",
+                "--limit=4",
+                "--superres-mode=2",
+            ];
+            args.extend(extra.iter().copied());
+            args.extend(["--obu", "-o", "-", "-"]);
+            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the recipe with {extra:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                out.stdout.len(),
+                pinned.len(),
+                "{NAME}: --superres-mode=2 {extra:?} produced {} bytes, pinned is {} -- \
+                 mode 2 now honours --superres-denominator (or stopped scaling), and this \
+                 gate's per-frame denominators are pinned to the PARSED headers, not to \
+                 the recipe",
+                out.stdout.len(),
+                pinned.len()
+            );
+            assert_eq!(
+                fnv1a64(&out.stdout),
+                fnv1a64(&pinned),
+                "{NAME}: --superres-mode=2 {extra:?} does NOT reproduce the pinned bytes"
+            );
+        }
+        // And the denominators the stream carries must include values no flag
+        // on the command line ever named -- the property that makes "read the
+        // parsed header" the only correct source for the table above.
+        let flagged = [9u8, 12, 16];
+        assert!(
+            heads
+                .iter()
+                .any(|h| h.superres_denom > 0 && !flagged.contains(&h.superres_denom)),
+            "{NAME}: every parsed denominator is one of the flags {flagged:?} -- if libaom \
+             ever starts honouring --superres-denominator under mode 2 this cell stops being \
+             the flag-ignoring one and the pin has to be re-derived"
+        );
+        eprintln!(
+            "{NAME}: --superres-mode=2 with no/9/12/16 denominator flags all reproduce the \
+             pinned {} bytes; parsed denominators {:?} (flag values {flagged:?} ignored)",
+            pinned.len(),
+            heads.iter().map(|h| h.superres_denom).collect::<Vec<_>>()
+        );
+    }
+
     /// lane-av1lrflush: the pipelined loop-restoration band release flushes
     /// RU row 0 on the inter frame whose top superblock row carries a
     /// 128-root rect -- the exact shape lanes/av1444sb.report.md r2 named as
