@@ -322,3 +322,116 @@ a fourth untracked pin. These are the same defect and the same fix; recovering t
 is mechanical from the r1 recipes (golden4 and golden7 are siblings of golden3 off
 the cdf-forwarding gate). Left out of this commit to keep it a reason-removal, and
 handed back rather than folded in silently.
+
+---
+
+# r3 — the four remaining untracked pins, and the class closed
+
+Branch `lane-av1pinslive`, rebased onto current main `eccbd6c6`. Commit `f99a5ff9`.
+Tests only, no decoder change, no push.
+
+r2 fixed two gates and handed back three siblings. All four untracked pins are now
+committed, three gates are live, and one earns a factual ignore.
+
+## 1. The pins — RECOVERED, not re-encoded
+
+| path | sha256 | size |
+|---|---|---|
+| `crates/ec-av1/fixtures/golden4-pin.obu` | `1754023e44e46edaebc2c05065bf1c65db1a41354577cbf71c0e8ebe737ae14a` | 137 B |
+| `crates/ec-av1/fixtures/golden6-mismatch.obu` | `c56909b98542192b03f3a945e153475aa57a58a1586bf166513297296cb225b3` | 452 B |
+| `crates/ec-av1/fixtures/golden7-forwarding-mismatch.obu` | `81b3bf657a85e95085287b30d97dee93ba5aea0ed1db1e1f4fcd19a06afc17be` | 152 B |
+| `crates/ec-av1/fixtures/lr-sgr-r7.obu` | `6b95b20e3377430ffae0b2ce86fad9502e0dedf13cd6c38ab7f5af4a8b21f33d` | 192 B |
+
+**`.gitignore` verified as Main described.** `main:.gitignore:12` is
+`!crates/*/fixtures/**` — a negation, so `git check-ignore -v` printing that line
+means NOT ignored. Confirmed by exit code and by the decisive test: a plain
+`git add crates/ec-av1/fixtures/<pin>` staged all four with no `-f`.
+
+**Recovered, not re-encoded — and the order matters for provenance.** I first
+reproduced golden4 and golden7 from the cdf-forwarding recipe (seeds 43–48, all of
+which decode exact) and captured golden6 through a throwaway harness built on the
+crate's own `panned_test_card` (the real recipe needs that Rust helper, not a
+lavfi source). Then I found the **original bytes still on the runner libraries**
+and fetched those instead. They are the actual historical mismatch witnesses; a
+re-encode is a different stream that happens to exercise the same path, and
+labelling it as the pin would be a false provenance claim.
+
+The originals also **self-validate**, which is the check a re-encode cannot pass:
+`pinned_golden7`'s committed doc records `non_last_ref_hits` delta=2 for this
+stream, and the recovered pin reproduces exactly `0->2` in a plain run.
+
+The throwaway capture harness was deleted before the commit (`grep -c zz_throwaway`
+= 0).
+
+## 2. Three gates go live — same bar as r2
+
+| gate | on main `eccbd6c6` | on branch, PLAIN run |
+|---|---|---|
+| `pinned_golden4_stream_decodes_pixel_exact` | ignored, not executed | **1 passed, 0 failed, 0 ignored, 0.11s** — prints `non_last_ref_hits before=0 after=1` |
+| `pinned_golden7_stream_decodes_pixel_exact` | ignored, not executed | **1 passed, 0 failed, 0 ignored, 0.10s** — prints `non_last_ref_hits before=0 after=2` |
+| `a_real_aomenc_stream_with_film_grain_decodes_pixel_exact` | **live and PANICKING** | **1 passed, 0 failed, 0 ignored, 0.10s** |
+
+None touches a process-global, none calls aomenc, and the counter each reads
+(`non_last_ref_hits`) is **printed, never asserted** — so there is no
+counter-race exposure to justify an ignore. `#[ignore]` in `stream.rs`: **41 → 37**.
+
+**The film-grain gate was the worst shape in the class and was already LIVE.** It
+read its pin through `concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/...")`
+and `.unwrap()` — the gitignored root, with no graceful skip. A clean checkout
+with no runner library **panics**, it does not skip. That shape can never be
+satisfied by a committed pin at all, which is exactly why it is now `crate_pin`.
+
+## 3. `require_pin` — the new shared shape
+
+```rust
+fn require_pin(path: &std::path::Path, name: &str) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|e| panic!(
+        "no pinned bytes at {} ({e}) -- set EC_AV1_GATE_DUMP_PIN to a freshly \
+         captured stream, or restore the committed copy at \
+         crates/ec-av1/fixtures/{name}",
+        path.display()
+    ))
+}
+```
+
+A missing pin is a **hard failure naming the path and the generator**, never a raw
+io panic and never a silent skip. Those are the two shapes this class has taken
+(`golden4` skipped; the film-grain gate panicked), and both are now impossible.
+
+## 4. One gate stays ignored, on facts
+
+`pinned_lr_sgr_stream_call_unique_dump` — reason replaced with the two reasons that
+are still true:
+
+> `diagnostic only -- asserts nothing, so it cannot fail on a decode regression;
+> run with --ignored and EC_LR_CALL_DUMP=1 for the Sgrproj window`
+
+The fact: the body `eprintln!`s per-frame mismatch counts and **returns**. There is
+no `assert!` anywhere in it, so it cannot go red on a decode regression;
+un-ignoring it would add a test that reports pass unconditionally. Its pin is now
+committed too, so the old reason ("reads a pinned fixture under the gitignored
+fixtures dir") was false and is gone. Measured plain run under `--ignored` for the
+record: **1 passed, 0.10s**, `frame 0: y_mismatch=false u_mismatch=false
+v_mismatch=false`.
+
+**What would close it:** give it the pixel asserts its three siblings have (the
+compare loop is already there, it only prints), then un-ignore. That is a real
+change with a real verdict, so it is not folded in here.
+
+## 5. State
+
+`lane-av1pinslive`, three commits on top of `eccbd6c6`: `c7ea69c1` (r2 un-ignore),
+`f99a5ff9` (r3 siblings), plus report commits. `cargo check -p ec-av1 --all-targets`
+clean, no warnings. Meta-gates after the change: `gate_coverage` **10 passed**,
+`refusal_inventory` **15 passed**. r2's two gates re-verified green
+(1 passed, 0.15s each). Not pushed; main untouched.
+
+Not verified: a full `cargo test -p ec-av1` run (project-wide validation is
+Main's), and the remaining ignored set — now 37 tests, of which these four were
+the machine-local-pin population.
+
+The class rule this lane earns, in the shape Main is adopting as a batch rule: an
+`#[ignore]` reason must state a **fact** (what the gate needs, what it costs), never
+a **judgement** ("bisect aid", "not a suite gate"). A judgement cannot be checked
+against reality, so it cannot go stale loudly — and that is exactly how the r1
+reason survived into a tree where it was false.
