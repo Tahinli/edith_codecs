@@ -6490,28 +6490,34 @@ pub(crate) mod tests {
         }
         // lane-av1skipfix: this arm used to be a bare SKIP, so on any box
         // without the pin (the root `fixtures/` directory is GITIGNORED --
-        // `.gitignore:2` -- so a fresh clone can never have it) the gate
-        // reported green having decoded nothing. `EC_AV1_REQUIRE_AOMENC=1`
-        // turns it into a hard failure naming the missing pin and its exact
-        // regeneration recipe, so a batch run cannot report green off it.
+        // `.gitignore:2` -- so a fresh clone, and every linked worktree, can
+        // never have it) the gate reported green having decoded nothing.
+        // `EC_REQUIRE_FIXTURES=1` -- the repo-wide fixture env, same as the
+        // ec-h264/ec-flac/ec-opus conformance gates -- or this crate's own
+        // `EC_AV1_REQUIRE_AOMENC=1` turns it into a hard failure naming the
+        // missing pin, the exact regeneration recipe and the
+        // `EC_AV1_PIN_DIR` override, so a batch run cannot report green off it.
         let pin = pin_dir().join("ll444-lossless-key.obu");
         let stream = match std::fs::read(&pin) {
             Ok(stream) => stream,
             Err(e) => {
                 assert!(
-                    std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+                    std::env::var_os("EC_REQUIRE_FIXTURES").is_none()
+                        && std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
                     "{NAME}: the pinned 4:4:4 lossless key frame is missing at {} ({e}). \
-                     Regenerate it with `testsrc2 128x96` yuv444p 6 frames, aomenc \
-                     --profile=1 --lossless=1 --enable-palette=0 --enable-intrabc=0, \
-                     cut to the key frame's OBUs -- or point EC_AV1_PIN_DIR at a \
-                     directory that has it.",
+                     This gate would prove nothing. A worktree has no gitignored root \
+                     `fixtures/`: run scripts/link-fixtures.sh. No script generates this \
+                     pin -- regenerate it with `testsrc2 128x96` yuv444p 6 frames, aomenc \
+                     --profile=1 --lossless=1 --enable-palette=0 --enable-intrabc=0, cut to \
+                     the key frame's OBUs -- or point EC_AV1_PIN_DIR at a directory that has it.",
                     pin.display()
                 );
                 eprintln!(
                     "SKIP {NAME}: no pinned bytes at {} ({e}) -- this gate decoded nothing \
-                     and proves nothing; regenerate with `testsrc2 128x96` yuv444p 6 \
-                     frames, aomenc --profile=1 --lossless=1 --enable-palette=0 \
-                     --enable-intrabc=0, cut to the key frame's OBUs",
+                     and proves nothing; run scripts/link-fixtures.sh, or regenerate with \
+                     `testsrc2 128x96` yuv444p 6 frames, aomenc --profile=1 --lossless=1 \
+                     --enable-palette=0 --enable-intrabc=0, cut to the key frame's OBUs \
+                     (or set EC_REQUIRE_FIXTURES=1 to make this a failure).",
                     pin.display()
                 );
                 return;
