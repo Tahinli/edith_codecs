@@ -18,12 +18,21 @@
 #   (ii) a path under a PRESENT root is absent (or an empty dir). Fix: the
 #        generator named in the row, or the pin is genuinely missing.
 #
-# ENFORCEMENT ENV: EC_REQUIRE_FIXTURES=1 -- the same env the per-crate
-# `require_fixture` asserts honour, so one convention covers the fleet batch
-# units and a local run:
+# ENFORCEMENT ENV: EC_REQUIRE_FIXTURES=1 -- the same env the per-crate `require_fixture` asserts
+# honour, so one convention covers the fleet batch units and a local run:
 #   set   -> any absent referenced path is RED, and the drift diff is RED
 #   unset -> the same findings are printed SKIP-shaped and the exit stays 0,
 #            so an unprepared local checkout is not blocked
+#
+# EXIT STATUS is the LIBRARY verdict: mode i, mode ii, or drift. The four
+# code-shape invariants (forbidden root-fixture path, pin tracking, .gitignore
+# negation, pin-reading gate census) are REPORTED with their own count and fail
+# only under EC_FIXTURE_SHAPE_STRICT=1. That split is deliberate: a shape
+# violation is a defect in a file this preflight does not own, and a batch that
+# cannot start because another crate has two open lines helps nobody -- but the
+# findings are printed, counted, and one env var away from being fatal, so
+# nothing is hidden. Set EC_FIXTURE_SHAPE_STRICT=1 in a tree whose shape
+# violations you intend to fix.
 #
 # Usage:  scripts/verify-fixture-library.sh
 # Env:    EC_FIXTURES=<dir>            fixture root, as every generator takes
@@ -43,9 +52,13 @@ ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 MANIFEST=$ROOT/scripts/fixture-library.tsv
 FIXTURES=${EC_FIXTURES:-$ROOT/fixtures}
 REQUIRE=${EC_REQUIRE_FIXTURES:-0}
+# Code-shape invariants fail only when explicitly made fatal.
+SHAPE=${EC_FIXTURE_SHAPE_STRICT:-0}
 LINK_SCRIPT=$ROOT/scripts/link-fixtures.sh
 
 fail=0
+shape_fail=0
+shape_violations=0
 note() { [ "$REQUIRE" = 0 ] || echo "$@"; }
 
 echo "verify-fixture-library: root=$ROOT fixtures=$FIXTURES EC_REQUIRE_FIXTURES=${REQUIRE:-0}"
@@ -60,9 +73,9 @@ if [ "$rows" -eq 0 ]; then
     echo "FAIL: $MANIFEST has no rows" >&2
     exit 1
 fi
-malformed=$(awk -F'\t' '!/^#/ && NF != 5 { print NR": "$0 }' "$MANIFEST")
+malformed=$(awk -F'\t' '!/^#/ && NF != 7 { print NR": "$0 }' "$MANIFEST")
 if [ -n "$malformed" ]; then
-    echo "FAIL: malformed rows in $MANIFEST (want 5 tab-separated columns):" >&2
+    echo "FAIL: malformed rows in $MANIFEST (want 7 tab-separated columns):" >&2
     echo "$malformed" >&2
     exit 1
 fi
@@ -89,19 +102,22 @@ fi
 # --- RESOLVE --------------------------------------------------------------
 missing=()
 empty=()
-while IFS=$'\t' read -r path required_by provenance status sum; do
+while IFS=$'\t' read -r path required_by class prov status tracked sum; do
     case $path in
         \#* | '') continue ;;
     esac
-    [ "$status" = absent-pin ] && continue   # known gap, reported as a finding
+    case $class in
+        absent-pin) continue ;;   # known gap, reported as a finding
+    esac
     case $path in
+        fixtures) abs=$FIXTURES ;;
         fixtures/*) abs=$FIXTURES/${path#fixtures/} ;;
         *) abs=$ROOT/$path ;;
     esac
     if [ ! -e "$abs" ]; then
-        missing+=("$path  <-  $required_by  (provenance: $provenance)")
+        missing+=("$path  <-  $required_by  ($class, generator: $prov)")
     elif [ -d "$abs" ] && [ -z "$(ls -A -- "$abs" 2>/dev/null)" ]; then
-        empty+=("$path  <-  $required_by  (provenance: $provenance)")
+        empty+=("$path  <-  $required_by  ($class, generator: $prov)")
     fi
 done <"$MANIFEST"
 
@@ -131,8 +147,8 @@ fi
 note "  resolve: ${#missing[@]} missing, ${#empty[@]} empty"
 
 # --- FINDINGS (not failures, but stated) ---------------------------------
-no_prov=$(awk -F'\t' '!/^#/ && $3 ~ /^none/ {print $1}' "$MANIFEST" | sort -u)
-absent=$(awk -F'\t' '!/^#/ && $4 == "absent-pin" {print $1"\t"$3}' "$MANIFEST" | sort -u)
+no_prov=$(awk -F'\t' '!/^#/ && ($3 == "captured" || $3 == "recovered-original") {print $1}' "$MANIFEST" | sort -u)
+absent=$(awk -F'\t' '!/^#/ && $3 == "absent-pin" {print $1}' "$MANIFEST" | sort -u)
 if [ -n "$no_prov" ]; then
     n=$(printf '%s\n' "$no_prov" | wc -l)
     echo "FINDING: $n pinned fixture(s) have NO generator -- provenance is prose in a" >&2
@@ -145,9 +161,154 @@ if [ -n "$absent" ]; then
     printf '  %s\n' "$absent" >&2
 fi
 
+# --- HARD INVARIANT 1: the forbidden root-fixture shape ---------------------
+# `concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/<file>")` names a
+# ROOT-level committed pin through the gitignored `fixtures/`. No committed pin
+# can satisfy it, so on any clean checkout or runner the gate silently skips --
+# the worst shape in the class (the film-grain instance combined it with
+# `.unwrap()`, so a clean checkout PANICKED instead). A root SUBDIRECTORY
+# (`fixtures/audio`, `fixtures/vectors/...`) is a different thing: those are
+# produced by a generator named in the manifest, so they are not forbidden here.
+forbidden=$(grep -rn 'concat!(env!("CARGO_MANIFEST_DIR"), "/\.\./\.\./fixtures/[^/"]*\.' \
+    "$ROOT"/crates/*/src "$ROOT"/crates/*/tests 2>/dev/null)
+if [ -n "$forbidden" ]; then
+    if [ "$SHAPE" != 0 ]; then
+        echo "FAIL [invariant 1]: a committed pin is reached through the gitignored root" >&2
+        echo "      fixtures/ (silent SKIP on every clean checkout and runner):" >&2
+        echo "$forbidden" | sed 's/^/  /' >&2
+        echo "      fix: commit the pin under crates/<crate>/fixtures/ and read it with" >&2
+        echo "      that crate's pin helper (crate_pin / pin_dir), never /../../fixtures/." >&2
+        shape_fail=1
+    else
+        echo "SKIP [invariant 1]: $(printf '%s\n' "$forbidden" | wc -l) site(s) reach a root" >&2
+        echo "      pin through the gitignored fixtures/ (reported, not failed):" >&2
+        echo "$forbidden" | sed 's/^/  /' >&2
+    fi
+else
+    note "  invariant 1: no root-fixture pin path"
+fi
+
+# --- HARD INVARIANT 2: every committed pin is present AND tracked -----------
+# A pin on disk but untracked is lost when the machine's scratchpad is reaped,
+# and its gate then skips GREEN. `tracked` is computed at generation time in a
+# git tree; a runner host has no .git, so it asserts the committed value.
+untracked=$(awk -F'\t' '!/^#/ && ($3 == "captured" || $3 == "recovered-original") && $6 != "yes" {print $1"\t"$6}' "$MANIFEST")
+if [ -n "$untracked" ]; then
+    if [ "$SHAPE" != 0 ]; then
+        echo "FAIL [invariant 2]: committed pin(s) present but NOT tracked by git:" >&2
+        echo "$untracked" | sed 's/^/  /' >&2
+        echo "      fix: git add crates/<crate>/fixtures/<pin> -- the .gitignore negation" >&2
+        echo "      (!crates/*/fixtures/**) must let a plain add work; if it does not, the" >&2
+        echo "      negation is broken and invariant 3 below will say so." >&2
+        shape_fail=1
+    else
+        echo "SKIP [invariant 2]: untracked committed pin(s) (reported, not failed):" >&2
+        echo "$untracked" | sed 's/^/  /' >&2
+    fi
+else
+    note "  invariant 2: every committed pin is tracked"
+fi
+
+# --- HARD INVARIANT 3: the .gitignore negation is intact --------------------
+if ! grep -q '^!crates/\*/fixtures/\*\*$' "$ROOT/.gitignore" 2>/dev/null; then
+    echo "FAIL [invariant 3]: .gitignore has no '!crates/*/fixtures/**' negation, so a" >&2
+    echo "      new pin cannot be added and every recovered pin is untrackable." >&2
+    shape_fail=1
+else
+    note "  invariant 3: .gitignore negation present"
+    if [ -e "$ROOT/.git" ]; then
+        shadowed=$(awk -F'\t' '!/^#/ && $6 == "yes" {print $1}' "$MANIFEST" |
+            while IFS= read -r p; do
+                git -C "$ROOT" check-ignore -q -- "$p" && echo "$p"
+            done)
+        if [ -n "$shadowed" ]; then
+            echo "FAIL [invariant 3]: git still ignores these tracked pins:" >&2
+            echo "$shadowed" | sed 's/^/  /' >&2
+            shape_fail=1
+        else
+            note "  invariant 3: no tracked pin is shadowed by .gitignore"
+        fi
+    else
+        note "  invariant 3: no .git here, check-ignore skipped (hosts assert the committed value)"
+    fi
+fi
+
+# --- HARD INVARIANT 4: the pin-reading GATE census -------------------------
+# The per-pin invariant is blind to a gate that reads N pins through a root
+# literal plus a runtime name list, and to a gate that only asserts inside a
+# helper. scripts/pin-gate-audit.py resolves the root literal, enumerates the
+# runtime names, checks each against a tracked committed copy, and classifies
+# assertions through the helper CALL GRAPH. Counts are printed, not summarised.
+if ! command -v python3 >/dev/null; then
+    echo "FAIL [invariant 4]: python3 is required for the pin-gate audit and is absent" >&2
+    fail=1
+else
+    audit=$("$ROOT/scripts/pin-gate-audit.py" 2>&1)
+    if [ $? -ne 0 ] && [ -z "$audit" ]; then
+        echo "FAIL [invariant 4]: scripts/pin-gate-audit.py did not run" >&2
+        fail=1
+    fi
+    echo "$audit" | awk -F'\t' '/^COUNT/{print "  pin gates: "$2" "$3" "$4" "$5" "$6}' >&2
+    badrows=$(echo "$audit" | awk -F'\t' '/^BADROW/{print "  "$2":"$3"  "$4"  "$5}')
+    bardir=$(echo "$audit" | awk -F'\t' '/^BARDIR/{print "  "$2":"$3"  "$4"  "$5}')
+    absent=$(echo "$audit" | awk -F'\t' '/^NAME/ && $4=="absent"{print "  "$2":"$3"  "$4}')
+    if [ -n "$badrows" ] || [ -n "$bardir" ]; then
+        if [ "$SHAPE" != 0 ]; then
+            echo "FAIL [invariant 4]: pin-reading gates whose pins are not committed" >&2
+            echo "      (a runtime name list over the gitignored root can never be" >&2
+            echo "      satisfied by a committed tree, and a bare directory literal" >&2
+            echo "      feeding one always fails):" >&2
+            printf '%s\n' "$badrows" "$bardir" >&2
+            echo "      fix: commit each pin under crates/<crate>/fixtures/ and read it" >&2
+            echo "      through that crate's pin helper, not /../../fixtures/." >&2
+            shape_fail=1
+        else
+            echo "SKIP [invariant 4]: pin-reading gates with uncommitted pins (reported," >&2
+            echo "      not failed, because EC_REQUIRE_FIXTURES is unset):" >&2
+            printf '%s\n' "$badrows" "$bardir" >&2
+        fi
+    else
+        note "  invariant 4: every pin-reading gate resolves through committed copies"
+    fi
+    # assertless gates are printed, never failed: a #[ignore]d gate that asserts
+    # nothing is a finding for its owner, not a preflight failure.
+    echo "$audit" | awk -F'\t' '/^GATE/ && $5=="no"{print "  FINDING: "$3" reads a pin and asserts nothing in its body or helpers"}' >&2
+fi
+
+# --- RECOVERED-PIN SELF-VALIDATION -----------------------------------------
+# A recovered witness is the historical bytes; a re-encode is a DIFFERENT stream.
+# Hashing what is on disk against the recorded sha256 is the half a shell
+# preflight can decide. The other half is behavioural and needs the gate:
+# `pinned_golden7` records non_last_ref_hits 0->2 in its own doc, and the
+# recovered pin reproduces exactly that; only running the gate proves it.
+badsum=0
+while IFS=$'\t' read -r path required_by class prov status tracked sum; do
+    case $path in
+        \#* | '') continue ;;
+    esac
+    [ "$class" = recovered-original ] || continue
+    abs=$ROOT/$path
+    if [ ! -f "$abs" ]; then
+        echo "FAIL [recovered]: $path is absent" >&2
+        fail=1
+        continue
+    fi
+    have=$(sha256sum -- "$abs" | cut -d' ' -f1)
+    if [ "$have" != "$sum" ]; then
+        echo "FAIL [recovered]: $path hashes $have, the manifest records $sum -- this is" >&2
+        echo "      a DIFFERENT stream (a re-encode), not the recovered original." >&2
+        fail=1
+        badsum=$((badsum + 1))
+    fi
+done <"$MANIFEST"
+[ "$badsum" -eq 0 ] && note "  recovered pins: every recovered-original hash matches"
+echo "  recovered pins: the behavioural half needs the gate, not this script --" >&2
+echo "           run 'cargo test -p ec-av1 pinned_golden7'; it prints non_last_ref_hits" >&2
+echo "           and its doc records the 0->2 delta only the recovered pin reproduces." >&2
+
 # --- VECTORS -------------------------------------------------------------
 vec_rows=$(awk -F'\t' '!/^#/ && $1 ~ /^fixtures\/vectors\//' "$MANIFEST" | wc -l)
-vec_missing=$(awk -F'\t' '!/^#/ && $1 ~ /^fixtures\/vectors\// && $4 != "ok"' "$MANIFEST" | wc -l)
+vec_missing=$(awk -F'\t' '!/^#/ && $1 ~ /^fixtures\/vectors\// && $5 != "ok"' "$MANIFEST" | wc -l)
 echo "  vectors: $vec_rows referenced rows, $vec_missing not ok" >&2
 echo "  vectors: nothing in crates/ reads a .tar.gz; the fleet hosts carry the" >&2
 echo "           EXTRACTED sets, so the blobs are not required at test time" >&2
@@ -160,24 +321,35 @@ if ! "$ROOT/scripts/gen-fixture-library.sh" "$regen" >/dev/null 2>&1; then
     echo "FAIL: scripts/gen-fixture-library.sh did not run" >&2
     exit 1
 fi
-if ! diff -u "$MANIFEST" "$regen" >"$patch" 2>&1; then
+if ! diff -u <(grep -v '^#' "$MANIFEST") <(grep -v '^#' "$regen") >"$patch" 2>&1; then
     if [ "$REQUIRE" != 0 ]; then
-        echo "FAIL: scripts/fixture-library.tsv is stale -- the code reaches fixtures" >&2
-        echo "      this host does not have. Commit the regenerated manifest, or fetch" >&2
-        echo "      the missing library. (patch follows)" >&2
+        echo "FAIL: this tree's library does not match what the code reaches" >&2
+        echo "      (DRIFT: the committed manifest's rows differ from a regeneration" >&2
+        echo "      here). The first difference is the row to act on; '- only here'" >&2
+        echo "      is a path this host reaches and the committed manifest does not," >&2
+        echo "      '+ only committed' is a row this host cannot satisfy. Fetch the" >&2
+        echo "      library, or commit the regenerated manifest. (patch follows)" >&2
         sed -n '1,40p' "$patch" >&2
         fail=1
     else
-        echo "SKIP: scripts/fixture-library.tsv is stale (EC_REQUIRE_FIXTURES unset, so this" >&2
-        echo "      is reported, not failed). The code reaches fixtures this host lacks." >&2
+        echo "SKIP: the library does not match what the code reaches (DRIFT;" >&2
+        echo "      EC_REQUIRE_FIXTURES unset, so this is reported, not failed):" >&2
         sed -n '1,20p' "$patch" >&2
     fi
 else
-    note "  drift: manifest matches the code"
+    note "  drift: manifest rows match the code on this host"
 fi
 
 if [ "$fail" -ne 0 ]; then
-    echo "verify-fixture-library: RED" >&2
+    echo "verify-fixture-library: RED (library verdict: mode i, mode ii or drift)" >&2
     exit 1
 fi
+if [ "$SHAPE" != 0 ] && [ "$shape_fail" -ne 0 ]; then
+    echo "verify-fixture-library: RED (code-shape violations, EC_FIXTURE_SHAPE_STRICT=1)" >&2
+    exit 1
+fi
+# The shape tally is always printed, fatal only under EC_FIXTURE_SHAPE_STRICT.
+for s in $(echo "$audit" | awk -F'\t' '/^BADROW/{c++} END{print c+0}'); do :; done
+echo "  code-shape violations: $(echo "$audit" | awk -F'\t' '/^BADROW/{c++} END{print c+0}')" >&2
+echo "$forbidden" | grep -q . && shape_violations=$((shape_violations + $(echo "$forbidden" | grep -c .)))
 echo "verify-fixture-library: GREEN ($rows rows)"
