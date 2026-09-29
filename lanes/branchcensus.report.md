@@ -10,6 +10,50 @@ this lane only adds this report.
 rebased under it. See **"The census target moved under the run"** below the counts
 before acting on a row.
 
+## What this table's rows guarantee
+
+The first pass of this census produced five wrong or imprecise rows, including
+its single most actionable one. The method behind this revision carries four
+guarantees, recorded in the managed skill `branch-census-patch-id-disposition`
+so the next census inherits them rather than rediscovering them:
+
+- **G1 — the base's committer time is pinned in this header, and that is the
+  half that matters.** The base `3aa16dd1` was committed at
+  **`2026-09-30 01:25:11 +0300`**. The Method block already prints *committer*
+  dates for every row (`%(committerdate:short)`, `%cd`), and that part was never
+  the defect: a row's own date can never reveal that its fix landed on main
+  *after* the census snapshotted main. That is exactly the §C3 trap —
+  `lane-infra-gitdir`'s row correctly printed its own tip's committer date
+  `2026-09-25 06:40:53`, while the main carrier `71f1f09c` has committer
+  `2026-09-30 01:30:50`, five minutes past the base. With the base's instant
+  written down, that comparison is one command instead of a lucky rebase:
+  `git merge-base --is-ancestor <landing> 3aa16dd1`.
+- **G2 — reverse-apply is mandatory over every row, and its hits are marked.**
+  `git apply --reverse --check` on each branch's code diff; success is decisive
+  in the *landed* direction. The 32 outstanding rows carrying a
+  `crates/`/`scripts/`/`tools/`/`.cargo/` delta were all tested (1 hit,
+  §C3); the 4 report-only rows have no code diff to test and are named here
+  rather than left silent.
+- **G3 — three verdicts, never collapsed**: `false-positive` (wrong when
+  written, ancestry-proven), `stale-inside-the-run` (correct, then overtaken),
+  `outstanding` (still unlanded). §C1 is the first kind, §C3 the second; the
+  distinction is what makes the table actionable.
+- **G4 — a twin-flow sweep's subject names one arm, its diff touches both.**
+  Every unlanded commit in every outstanding row was tested for hunks landing
+  in both copies of `decode_inter_block` (§C1, §C5). This is the filter whose
+  absence made §C1 possible.
+
+Two proof shapes were tried and **rejected**, with measured failure rates: a
+post-image line-percentage test (reads ~50% on genuinely-unlanded commits, and
+is blind to a semantic duplicate — 7/13 on a commit that was in fact already
+landed), and grepping a lane's tag comment (proves the *marker* is absent, not
+that the fix is). Neither decides a row here.
+
+**Known remaining blind spot**, stated so no reader over-trusts the table: a
+false positive whose landing commit is neither a twin sweep nor byte-identical
+would be caught by neither detector and would need a per-row read. See "What
+was re-checked, and what was not" for exactly which rows got that read.
+
 ## Method (reproduce with these commands, nothing else)
 
 ```bash
@@ -286,8 +330,12 @@ still stands. Only the stated evidence changes.
 **Not** a false positive: the row was correct when written and went stale inside
 the run. The fix landed as `71f1f09c` (same subject, same patch-id
 `2b7d379f…`), committer date `2026-09-30 01:30:50` — **five minutes after** this
-census's base `3aa16dd1` (`01:25:11`). The author date is `2026-09-25`, which is
-what the table prints, so the staleness is invisible in the row.
+census's base `3aa16dd1` (`01:25:11`). The row's own printed date is its **tip's**
+committer date `2026-09-25 06:40:53`, which is correct per the Method block and
+is *not* the defect — a row's date can never show that its fix landed on main
+after the snapshot. The staleness is only visible by comparing the **carrier's**
+committer date against the base's, which is why the header now pins the base
+instant (G1).
 
 ```bash
 git show 082ef153 --format='' -p | git patch-id --stable        # 2b7d379f…
