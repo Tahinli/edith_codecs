@@ -1,5 +1,15 @@
 target/
 fixtures
+# ...but the per-crate PINS are tracked on purpose: 48 files under
+# crates/ec-av1/fixtures/*.obu are committed fixtures (captured streams with a
+# recorded sha256/recipe in their gate's doc comment) and they must travel
+# with the repo. A bare `fixtures` rule ignores them at EVERY depth, so they
+# are only in history because someone used `git add -f` -- and a new pin then
+# fails a plain `git add` with a hint that reads like noise. Measured
+# 2026-09-29. Negate the crate-level pins (not the root fixtures/ dir, which
+# stays untracked at 1.7 GB).
+!crates/*/fixtures/
+!crates/*/fixtures/**
 __pycache__/
 scripts/aac-tables/sbr-cache.json
 .cache/

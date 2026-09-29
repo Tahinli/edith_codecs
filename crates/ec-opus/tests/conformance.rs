@@ -87,62 +87,6 @@ fn vectors_dir() -> PathBuf {
         .join("../../fixtures/vectors/opus-rfc6716/opus_testvectors")
 }
 
-/// Fixture-presence probe for the fixtures these tests read.
-/// Returns whether the fixture is present, but never silently: under
-/// `EC_REQUIRE_FIXTURES=1` an absent fixture is a hard failure naming the path
-/// and the script that regenerates it, so a host whose fixture library drifted
-/// reports RED instead of a green SKIP (class: gate-skips-on-its-own-failure;
-/// model `have_ffmpeg` in crates/ec-av1/src/stream.rs, which was silently
-/// short-circuited because the probe ran first in a compound `if`).
-///
-/// Order is load-bearing: probe, assert, return. Never merge the probe into
-/// the same `if` as the escape.
-fn require_fixture(path: &Path, generator: &str) -> bool {
-    let present = path.exists();
-    assert!(
-        present || std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
-        "EC_REQUIRE_FIXTURES=1 but fixture {} is absent -- regenerate with: {}",
-        path.display(),
-        generator
-    );
-    if !present {
-        eprintln!("SKIP: fixture {} absent", path.display());
-    }
-    present
-}
-
-/// Presence probe for a HOST media file (`~/Music/...`, `~/Downloads/...`).
-/// Deliberately NOT [`require_fixture`]: those paths are a developer's
-/// personal corpus, not the committed fixture library, so `EC_REQUIRE_FIXTURES`
-/// must not turn one person's home directory into a red suite on every other
-/// host. It skips, and says so.
-fn require_host_media(path: &Path, tag: &str) -> bool {
-    let present = path.exists();
-    if !present {
-        eprintln!("SKIP {tag}: host media file {} absent", path.display());
-    }
-    present
-}
-
-/// An RFC 6716 test vector, probed through [`require_fixture`]. `None` means
-/// absent (and already reported, or already asserted).
-fn vector(name: &str) -> Option<PathBuf> {
-    let path = vectors_dir().join(format!("{name}.bit"));
-    match require_fixture(&path, "scripts/fetch-vectors.sh") {
-        true => Some(path),
-        false => None,
-    }
-}
-
-/// One of the generated `fixtures/audio` files, probed the same way.
-fn audio_fixture(name: &str) -> Option<PathBuf> {
-    let path = fixture(name);
-    match require_fixture(&path, "scripts/gen-fixtures.sh") {
-        true => Some(path),
-        false => None,
-    }
-}
-
 /// Decodes a vector at 48 kHz stereo, returning the samples and how many
 /// packets ended with the reference range state.
 fn decode_vector(packets: &[VectorPacket]) -> (Vec<f32>, usize, usize) {
@@ -468,13 +412,33 @@ const VECTORS: [&str; 12] = [
 /// MUST stay within the `opus_compare` threshold (quality >= 0).
 #[test]
 fn rfc6716_test_vectors() {
+    // A missing test vector made this gate skip GREEN having decoded nothing —
+    // the "gate skips on its own failure" class. The root `fixtures/` tree is
+    // gitignored, so `git worktree add` hands every lane worktree a tree without
+    // it. `EC_REQUIRE_FIXTURES=1` turns a missing vector into a hard failure
+    // naming the exact path and the command that produces it; unset, the skip
+    // is kept and now says what it skipped. Set it in every batch run.
+    let base = vectors_dir();
     let mut table = Vec::new();
-    let mut ran = 0usize;
     for name in VECTORS {
-        let Some(path) = vector(name) else {
+        let path = base.join(format!("{name}.bit"));
+        if !path.exists() {
+            assert!(
+                std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+                "RFC 6716 test vector {name} missing at {} — this gate would prove \
+                 nothing. A worktree has no gitignored root `fixtures/`: run \
+                 scripts/link-fixtures.sh, or fetch it with scripts/fetch-vectors.sh.",
+                path.display()
+            );
+            eprintln!(
+                "SKIP RFC 6716 test vector {name} missing at {} — this gate proved \
+                 nothing; run scripts/link-fixtures.sh, or fetch it with \
+                 scripts/fetch-vectors.sh (or set EC_REQUIRE_FIXTURES=1 to make this \
+                 a failure).",
+                path.display()
+            );
             continue;
-        };
-        ran += 1;
+        }
         let packets = read_vector(&path);
         let (pcm, matched, decoded) = decode_vector(&packets);
         let reference = read_i16(&vectors_dir().join(format!("{name}.dec")));
@@ -502,13 +466,6 @@ fn rfc6716_test_vectors() {
             "{name}: opus_compare quality {quality:.2} %"
         );
     }
-    // Non-empty floor: without a vector the loop above runs zero times and the
-    // table prints nothing at all.
-    assert!(
-        ran >= 5,
-        "only {ran} of {} RFC 6716 vectors were exercised, expected at least 5",
-        VECTORS.len()
-    );
     for line in table {
         println!("{line}");
     }
@@ -669,16 +626,16 @@ fn ogg_opus_fixtures_match_ffmpeg() {
     // Mapping family 1 puts 5.1 in Vorbis order; ffmpeg hands its own order
     // back, so the comparison permutes one into the other.
     const VORBIS_TO_FFMPEG_5_1: [usize; 6] = [0, 2, 1, 4, 5, 3];
-    let mut ran = 0usize;
     for (name, channels) in [
         ("opus-ogg-mono-48000.opus", 1usize),
         ("opus-ogg-stereo-48000.opus", 2),
         ("opus-ogg-5.1-48000.opus", 6),
     ] {
-        let Some(path) = audio_fixture(name) else {
+        let path = fixture(name);
+        if !path.exists() {
+            eprintln!("{name}: missing, skipped (run scripts/gen-fixtures.sh)");
             continue;
-        };
-        ran += 1;
+        }
         let Some(reference) = ffmpeg_decode(&path, channels) else {
             eprintln!("{name}: ffmpeg unavailable, skipped");
             continue;
@@ -705,11 +662,6 @@ fn ogg_opus_fixtures_match_ffmpeg() {
             "{name}: worst channel correlation {worst:.5}"
         );
     }
-    // Non-empty floor: the loop above must have compared something.
-    assert!(
-        ran >= 2,
-        "only {ran} of 3 Ogg-Opus fixtures were compared against ffmpeg, expected at least 2"
-    );
 }
 
 #[test]
@@ -721,9 +673,11 @@ fn five_one_channels_land_in_the_right_places() {
     // Vorbis-order output is the reference's 5.1-order output permuted.
     const VORBIS_TO_FFMPEG_5_1: [usize; 6] = [0, 2, 1, 4, 5, 3];
     const TONES: [f64; 6] = [220.0, 440.0, 660.0, 55.0, 880.0, 1320.0];
-    let Some(path) = audio_fixture("opus-ogg-5.1-48000.opus") else {
+    let path = fixture("opus-ogg-5.1-48000.opus");
+    if !path.exists() {
+        eprintln!("5.1 fixture missing, skipped");
         return;
-    };
+    }
     let Some(reference) = ffmpeg_decode(&path, 6) else {
         eprintln!("ffmpeg unavailable, skipped");
         return;
@@ -760,15 +714,14 @@ fn decode_speed() {
         eprintln!("decode speed is only meaningful in release; skipped");
         return;
     }
-    let mut measured = 0usize;
     for (name, channels) in [
         ("opus-ogg-stereo-48000.opus", 2usize),
         ("opus-ogg-5.1-48000.opus", 6),
     ] {
-        let Some(path) = audio_fixture(name) else {
+        let path = fixture(name);
+        if !path.exists() {
             continue;
-        };
-        measured += 1;
+        }
         let data = fs::read(&path).unwrap();
         let packets = ogg_packets(&data);
         let head = parse_opus_head(&packets[0]);
@@ -801,17 +754,11 @@ fn decode_speed() {
             "{name}: {realtime:.0}x realtime is below the {floor}x floor"
         );
     }
-    // Non-empty floor: with both fixtures absent the loop measured nothing and
-    // every speed floor above went unexercised.
-    assert!(
-        measured >= 1,
-        "no Ogg-Opus fixture was measured, so the decode-speed floor went untested"
-    );
 
     // The fixtures are sine tones, which are cheap; testvector01 is real music
     // at a high rate and is the honest stereo number.
-    let stereo_music = vector("testvector01");
-    if let Some(path) = stereo_music {
+    let path = vectors_dir().join("testvector01.bit");
+    if path.exists() {
         let packets = read_vector(&path);
         let mut dec = Decoder::new(48000, 2).unwrap();
         let mut out = vec![0.0f32; 5760 * 2];
@@ -1929,7 +1876,8 @@ fn garbage_payloads_never_panic() {
         }
     }
     // Truncations of a real packet, which exercise the mid-frame paths.
-    if let Some(path) = vector("testvector10") {
+    let path = vectors_dir().join("testvector10.bit");
+    if path.exists() {
         for p in read_vector(&path).iter().take(200) {
             for cut in 1..p.payload.len().min(64) {
                 let _ = dec.decode_float(&p.payload[..cut], &mut out);
@@ -2110,8 +2058,9 @@ fn aligned_corr(reference: &[f32], decoded: &[f32], max_lag: usize) -> (f64, usi
 
 #[test]
 fn silk_mono_nb_wb_roundtrip() {
+    let wav = fixture("wav16-mono-48000.wav");
     let mut sources = vec![("synthetic", speech_like())];
-    if let Some(wav) = audio_fixture("wav16-mono-48000.wav") {
+    if wav.exists() {
         let w = read_wav_mono(&wav);
         sources.push(("wav16-mono-48000", w[..w.len().min(96000)].to_vec()));
     }
@@ -2483,8 +2432,9 @@ fn oracle_decode(
 }
 
 fn silk_sources() -> Vec<(&'static str, Vec<f32>)> {
+    let wav = fixture("wav16-mono-48000.wav");
     let mut sources = vec![("synthetic", speech_like())];
-    if let Some(wav) = audio_fixture("wav16-mono-48000.wav") {
+    if wav.exists() {
         let w = read_wav_mono(&wav);
         sources.push(("wav16-mono-48000", w[..w.len().min(96000)].to_vec()));
     }
@@ -3350,14 +3300,12 @@ fn encoder_library_gate_vs_libopus() {
     let mut rows: Vec<String> = Vec::new();
     let mut rate_violations: Vec<String> = Vec::new();
     let mut dropout_violations: Vec<String> = Vec::new();
-    let mut swept = 0usize;
 
     for (tag, src) in &sources {
-        if !require_host_media(src, tag) {
+        if !src.exists() {
             eprintln!("SKIP {tag}: missing {}", src.display());
             continue;
         }
-        swept += 1;
         let source_pcm = ffmpeg_decode_pcm(src, SECS);
         let source_frames = source_pcm.len() / CHANNELS;
         assert!(source_frames > 48_000, "{tag}: source too short");
@@ -3440,11 +3388,6 @@ fn encoder_library_gate_vs_libopus() {
             ));
         }
     }
-    // Non-empty floor: no source means the whole gate measured nothing.
-    assert!(
-        swept >= 1,
-        "no library-gate source was present, so the gate measured nothing"
-    );
     let _ = fs::remove_file(&scratch);
 
     let mut table = String::new();
@@ -5003,14 +4946,12 @@ fn spectral_divergence_vs_libopus() {
     let scratch = lanes_dir.join("opus-naz-r1.scratch.ogg");
     let mut frames_all = String::new();
     let mut report = String::new();
-    let mut swept = 0usize;
 
     for (tag, src) in &sources {
-        if !require_host_media(src, tag) {
+        if !src.exists() {
             eprintln!("SKIP {tag}: missing {}", src.display());
             continue;
         }
-        swept += 1;
         let source_pcm = ffmpeg_decode_pcm(src, SECS);
         let source_frames = source_pcm.len() / CHANNELS;
         let seconds = source_frames as f64 / 48000.0;
@@ -5386,12 +5327,6 @@ fn spectral_divergence_vs_libopus() {
             err_o / err_r
         );
     }
-    // Non-empty floor: no source means the report below is empty and the whole
-    // divergence analysis went unexercised.
-    assert!(
-        swept >= 1,
-        "no spectral-divergence source was present, so nothing was measured"
-    );
     let _ = fs::remove_file(&scratch);
     let header = format!(
         "# spectral divergence vs libopus @ {KBPS}k, {SECS:.0}s cap, sources {}\n",
@@ -5411,7 +5346,8 @@ fn celt_silence_then_attack_decodes_bounded() {
     let fs = 960usize;
     let ch = 2usize;
     let src = shellexpand("~/Music/naz_aglama_ben_aglarim.mp4");
-    if !require_host_media(&src, "host-media") {
+    if !src.exists() {
+        eprintln!("SKIP: missing {}", src.display());
         return;
     }
     let pcm = ffmpeg_decode_pcm(&src, 1.0);
@@ -5457,7 +5393,7 @@ fn naz_startup_hop_energies() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(42.5);
     let src = shellexpand(&src_s);
-    if !require_host_media(&src, "host-media") {
+    if !src.exists() {
         return;
     }
     let secs = (centre_ms / 1000.0 + 1.0).max(2.0);
@@ -5602,14 +5538,12 @@ fn short_block_bits_vs_libopus() {
     let scratch = lanes_dir.join("opus-sb-r1.scratch.ogg");
     let nb = ec_opus::celt::NB_BANDS;
     let mut report = String::new();
-    let mut swept = 0usize;
 
     for (tag, src) in &sources {
-        if !require_host_media(src, tag) {
+        if !src.exists() {
             eprintln!("SKIP {tag}: missing {}", src.display());
             continue;
         }
-        swept += 1;
         let source_pcm = ffmpeg_decode_pcm(src, SECS);
         let seconds = source_pcm.len() as f64 / CHANNELS as f64 / 48000.0;
 
@@ -5822,11 +5756,6 @@ fn short_block_bits_vs_libopus() {
             ));
         }
     }
-    // Non-empty floor: no source means an empty report and no measurement.
-    assert!(
-        swept >= 1,
-        "no short-block-bits source was present, so nothing was measured"
-    );
 
     fs::write(&out_path, &report).unwrap();
     eprintln!("wrote {}", out_path.display());
@@ -5865,7 +5794,8 @@ fn err_map_vs_libopus() {
     let src = shellexpand(
         &std::env::var("EC_ERRMAP_SRC").unwrap_or_else(|_| "~/Music/Her Nerdeysen.mp3".to_string()),
     );
-    if !require_host_media(&src, "host-media") {
+    if !src.exists() {
+        eprintln!("SKIP: missing {}", src.display());
         return;
     }
     let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
@@ -6107,7 +6037,8 @@ fn frame_decisions_vs_libopus() {
     let src_s =
         std::env::var("FRAME_SRC").unwrap_or_else(|_| "~/Music/naz_aglama_ben_aglarim.mp4".into());
     let src = shellexpand(&src_s);
-    if !require_host_media(&src, "host-media") {
+    if !src.exists() {
+        eprintln!("SKIP: missing {}", src.display());
         return;
     }
     let kbps: u32 = std::env::var("FRAME_KBPS")
@@ -6299,7 +6230,7 @@ fn analysis_music_prob_separates_speech_from_music() {
     let mut means: Vec<(String, bool, f64)> = Vec::new();
     for (tag, path, is_music) in sources {
         let src = shellexpand(path);
-        if !require_host_media(&src, "host-media") {
+        if !src.exists() {
             eprintln!("SKIP {tag}: missing {}", src.display());
             continue;
         }

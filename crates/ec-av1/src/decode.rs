@@ -2275,6 +2275,119 @@ pub(crate) fn rect_class1_hits() -> usize {
     RECT_CLASS1_HITS.with(|c| c.get())
 }
 
+// lane-av1readcensus: the PER-UNIT coefficient census -- one unit counted
+// per `read_coeffs`/`read_coeffs_rect` call, i.e. per object this decoder
+// actually walks, which is the unit the round-4 `av1444rect` count measured
+// (636 square chroma reads against the oracle's 1086). The counters are
+// 4:4:4-ONLY (`CENSUS_444`, set per frame beside `set_subsampling`), so a
+// 4:2:0 control reads `(0, 0, 0)` -- a walk-shape change at 4:2:0 is another
+// lane's business, and this census must not fire there.
+thread_local! {
+    /// Per-plane unit counts, `[luma, u, v]`, at 4:4:4 only.
+    static CENSUS_444_UNITS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Of [`CENSUS_444_UNITS`], the units that coded at least one coefficient
+    /// (`txb_skip == 0`) -- the per-plane split is only comparable against
+    /// the oracle's when both sides count all-zero units the same way.
+    static CENSUS_444_CODED: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Sequential unit index, so a trace line names its own position in the
+    /// frame's walk rather than relying on line order alone.
+    static CENSUS_UNIT_N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The plane the units read from here on belong to. A thread-local rather
+    /// than a `read_coeffs` parameter because the three luma call sites
+    /// (`decode_rect_split`, `decode_block_rect64`, `read_inter_plane_rect`)
+    /// are not this lane's to edit and would each grow an argument; the
+    /// plane-owning readers stamp it once on entry instead.
+    static CENSUS_PLANE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 4:4:4 (`subsampling_x == 0 && subsampling_y == 0`) for the frame being
+    /// decoded, set per frame from [`crate::stream`].
+    static CENSUS_444: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Current `[luma, u, v]` 4:4:4 coefficient-unit counts.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn census_444_units() -> [usize; 3] {
+    CENSUS_444_UNITS.with(|c| c.get())
+}
+
+/// Current `[luma, u, v]` 4:4:4 counts of units that coded coefficients.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn census_444_coded() -> [usize; 3] {
+    CENSUS_444_CODED.with(|c| c.get())
+}
+
+/// lane-av1readcensus: arms the 4:4:4 census for the frame about to decode,
+/// called once per frame from [`crate::stream`]'s decode loop beside
+/// [`set_subsampling`]. At 4:2:0 (or 4:2:2) every census counter stays zero --
+/// the walk-shape question this census answers is a 4:4:4 one.
+pub(crate) fn set_census_444(ss_x: u8, ss_y: u8) {
+    CENSUS_444.with(|c| c.set(ss_x == 0 && ss_y == 0));
+}
+
+/// lane-av1readcensus: the plane the units read from here on belong to,
+/// stamped by the plane-owning readers ([`read_plane`], [`read_inter_plane`],
+/// [`read_inter_plane_rect`]) on entry.
+pub(crate) fn set_census_plane(plane: usize) {
+    CENSUS_PLANE.with(|c| c.set(plane));
+}
+
+/// lane-av1readcensus: is the per-unit census trace on? Shares
+/// [`coeff_trace_on`]'s per-frame narrowing so one frame's walk can be
+/// dumped without the rest of the stream.
+fn census_trace_on() -> bool {
+    if !crate::envflags::env_flag!("EC_CENSUS_UNIT") {
+        return false;
+    }
+    match COEFF_TRACE_FRAME.with(|c| c.get()) {
+        None => true,
+        Some(w) if w >= usize::MAX - 1 => true,
+        Some(w) => COEFF_TRACE_CUR.with(|c| c.get()) == w,
+    }
+}
+
+/// lane-av1readcensus: one line per coefficient unit this decoder walks, the
+/// twin of the oracle's `EC_COEFF` / `EC_COEFF_VAL` bracket around each
+/// `av1_read_coeffs_txb` call. Pair the two sides by `post_rng` (or by `n`),
+/// never by plane label or by walk position -- the walk order is exactly what
+/// the census is measuring.
+fn census_unit(
+    w: usize,
+    h: usize,
+    tx_type: TxType,
+    eob: usize,
+    all_zero: bool,
+    entry_rng: u32,
+    dec: &SymbolDecoder,
+) {
+    let plane = CENSUS_PLANE.with(|c| c.get()).min(2);
+    let coded = usize::from(!all_zero);
+    CENSUS_UNIT_N.with(|c| c.set(c.get() + 1));
+    hit_do! {
+        CENSUS_444_UNITS.with(|c| {
+            if CENSUS_444.with(|on| on.get()) {
+                let mut v = c.get();
+                v[plane] += 1;
+                c.set(v);
+            }
+        });
+        CENSUS_444_CODED.with(|c| {
+            if CENSUS_444.with(|on| on.get()) {
+                let mut v = c.get();
+                v[plane] += coded;
+                c.set(v);
+            }
+        });
+    }
+    if !census_trace_on() {
+        return;
+    }
+    let n = CENSUS_UNIT_N.with(|c| c.get()) - 1;
+    let post_rng = dec.debug_state().0;
+    eprintln!(
+        "EC_CENSUS_UNIT side=ours n={n} plane={plane} w={w} h={h} tx={tx_type:?} eob={eob} \
+         all_zero={all_zero} entry_rng={entry_rng} post_rng={post_rng}"
+    );
+}
+
 // As [`FILTER_INTRA_RECT_HITS`], counting only the strips BELOW 16x16
 // (8x16/16x8 leaves of a 16x16 HORZ/VERT partition, lane-fistrip r1) -- the
 // shapes whose `use_filter_intra` symbol had no CDF class before this round.
@@ -2777,6 +2890,30 @@ pub(crate) fn lossless_wht_units() -> usize {
     LOSSLESS_WHT_UNITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// lane-whtshape: 4x4 Walsh-Hadamard units reconstructed as part of a LOSSLESS
+/// transform unit that was itself NOT 4x4 -- a shape libaom cannot code.
+/// `read_tx_mode` (`av1/decoder/decodeframe.c:140`) returns `ONLY_4X4` for a
+/// `coded_lossless` frame before it looks at the `tx_mode` symbol,
+/// `read_tx_size` (`:1117`) returns `TX_4X4` before it looks at a tree,
+/// `get_vartx_max_txsize` (`av1/common/blockd.h:1447`) returns `TX_4X4` for
+/// EVERY plane of a lossless block, and of `av1/common/idct.c`'s
+/// `highbd_inv_txfm_add_*_c` only `highbd_inv_txfm_add_4x4_c` carries a
+/// `lossless` branch -- every other size falls through to the IDCT, because
+/// there is no non-4x4 lossless inverse transform to dispatch to. So one of
+/// these is a CALLER sizing a lossless unit wrongly, not a bitstream shape;
+/// read as a before/after delta around one decode it names the caller. Must
+/// read 0 on a stream whose lossless unit geometry is right. Atomic: the
+/// wavefront workers run the transform on their own threads.
+static LOSSLESS_WHT_SPLIT_UNITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// [`LOSSLESS_WHT_SPLIT_UNITS`] -- total over the process, read as a
+/// before/after delta around one decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lossless_wht_split_units() -> usize {
+    LOSSLESS_WHT_SPLIT_UNITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl TxParams {
     /// The one copy of the produce-the-residual code: the inline path calls it
     /// on the parse thread, the wavefront worker calls it on its own, so both
@@ -2784,10 +2921,34 @@ impl TxParams {
     fn run(self, grid: &[i32]) -> Vec<i32> {
         let residual = if self.lossless {
             LOSSLESS_WHT_UNITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            debug_assert_eq!((self.w, self.h), (4, 4));
-            debug_assert_eq!(self.tx_type, TxType::DctDct);
-            crate::transform::dequant_and_inverse_wht4x4(
+            // lane-whtshape: a non-4x4 unit here is this decoder's own
+            // transform-unit geometry being wrong (see
+            // [`LOSSLESS_WHT_SPLIT_UNITS`] for the libaom evidence). It used
+            // to be stopped by a `debug_assert_eq!` that RELEASE never ran:
+            // the 4x4 WHT returned 16 values for a `w * h` block and the
+            // release build died one frame later in the strided copy with an
+            // opaque `range end index 8 out of range for slice of length 0`
+            // that never named lossless or the transform. Counted, and
+            // reconstructed as the raster of 4x4 WHT units
+            // ([`crate::transform::dequant_and_inverse_wht`]) instead: total,
+            // the same in both profiles, and the 4x4 fast path is the same
+            // single call it always was. The old
+            // `debug_assert_eq!(self.tx_type, TxType::DctDct)` is gone with
+            // it: the WHT takes no tx_type (libaom's `av1_iwht4x4_add` does
+            // not either), and `av1_get_tx_type` already answers `DCT_DCT` on
+            // every plane of a lossless block, so asserting an argument
+            // nothing reads was a debug-only panic on a value release
+            // ignores.
+            if self.w != 4 || self.h != 4 {
+                LOSSLESS_WHT_SPLIT_UNITS.fetch_add(
+                    self.w.div_ceil(4) * self.h.div_ceil(4),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            crate::transform::dequant_and_inverse_wht(
                 grid,
+                self.w,
+                self.h,
                 self.bit_depth,
                 self.q_idx,
                 self.dc_delta,
@@ -4521,6 +4682,17 @@ thread_local! {
     /// invisible to every gate because they only counted CODED strips.
     static INTRABC_RECT_SKIPPED_HITS: std::cell::Cell<[usize; 2]> =
         const { std::cell::Cell::new([0, 0]) };
+    /// lane-whtshape: LOSSLESS rect intrabc blocks whose chroma plane block
+    /// [`decode_intrabc_rect`] walked as a `(cw/4) * (ch/4)` PLANE-MAJOR
+    /// raster of TX_4X4 units -- the shape libaom's lossless geometry codes
+    /// (`read_tx_size` returns `TX_4X4` for EVERY plane of a lossless block,
+    /// `get_vartx_max_txsize` likewise, and `read_tx_mode` forced the frame's
+    /// `ONLY_4X4`) -- instead of the single rect unit, which is what put a
+    /// non-4x4 unit on the lossless Walsh-Hadamard path. EXCLUSIVE to this arm:
+    /// no other caller walks a rect intrabc block's chroma, so `>= 1` cannot
+    /// be satisfied by any older route.
+    static INTRABC_RECT_LOSSLESS_CHROMA4_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// lane-av1-intrabc r4: coded (`skip == 0`) rect intrabc blocks reconstructed,
@@ -4550,6 +4722,18 @@ pub(crate) fn reset_intrabc_rect_hits() {
     INTRABC_RECT_VARTX_HITS.with(|c| c.set(0));
     INTRABC_RECT_CODED_HITS.with(|c| c.set([0, 0]));
     INTRABC_RECT_SKIPPED_HITS.with(|c| c.set([0, 0]));
+}
+
+/// lane-whtshape: [`INTRABC_RECT_LOSSLESS_CHROMA4_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn intrabc_rect_lossless_chroma4_hits() -> usize {
+    INTRABC_RECT_LOSSLESS_CHROMA4_HITS.with(|c| c.get())
+}
+
+/// lane-whtshape: zeroes [`INTRABC_RECT_LOSSLESS_CHROMA4_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_rect_lossless_chroma4_hits() {
+    INTRABC_RECT_LOSSLESS_CHROMA4_HITS.with(|c| c.set(0));
 }
 
 /// Current value of [`INTRABC_RECT_VARTX_HITS`].
@@ -4997,6 +5181,32 @@ thread_local! {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn affine_gm_hits() -> usize {
     AFFINE_GM_HITS.with(|c| c.get())
+}
+
+// lane-av1distwtd: how many blocks took the DISTANCE-WEIGHTED compound
+// combine rather than the simple average -- `compound_idx == 0` under
+// `enable_jnt_comp`, whose weights come from
+// [`crate::compound::dist_wtd_comp_weight_assign`] instead of the constant
+// `(8, 8)` split. Counting the `idx == 0` arm (not merely the
+// `compound_idx` symbol read) is what makes this a witness of the TOOL: a
+// stream that carries `enable_jnt_comp = true` in its sequence header but
+// codes every compound block with `compound_idx == 1` leaves this at 0 and
+// decoded identically without the whole distance-weight path.
+thread_local! {
+    static DIST_WTD_COMP_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DIST_WTD_COMP_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn dist_wtd_comp_hits() -> usize {
+    DIST_WTD_COMP_HITS.with(|c| c.get())
+}
+
+/// Resets [`DIST_WTD_COMP_HITS`] to 0.
+#[allow(dead_code)] // test-only
+pub(crate) fn reset_dist_wtd_comp_hits() {
+    DIST_WTD_COMP_HITS.with(|c| c.set(0));
 }
 
 // lane-av1gwarp12: how many 16x16+ blocks built their SINGLE-reference
@@ -7561,6 +7771,11 @@ fn read_coeffs(
 ) -> Result<(Grid, TxType)> {
     let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     let side = coding.side;
+    // lane-av1readcensus: this unit's own entry state, so the census line
+    // carries the pre-read rng and pairs against the oracle's `EC_COEFF`
+    // (which prints `r->ec.rng` before the same `txb_skip` read).
+    let census_entry_rng = dec.debug_state().0;
+    let (census_w, census_h) = rect_shape.unwrap_or((side, side));
     if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") {
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
@@ -7603,6 +7818,15 @@ fn read_coeffs(
     if all_zero {
         // lane-coefgrid: the all-zero unit (60% of the 4K segment's) names the
         // shared zero grid instead of allocating and zeroing its own.
+        census_unit(
+            census_w,
+            census_h,
+            TxType::DctDct,
+            0,
+            true,
+            census_entry_rng,
+            dec,
+        );
         return Ok((Grid::Zero(side * side), TxType::DctDct));
     }
     let mut grid = vec![0i32; side * side];
@@ -7811,6 +8035,15 @@ fn read_coeffs(
         }
         grid[pos] = if negative { -level } else { level };
     }
+    census_unit(
+        census_w,
+        census_h,
+        tx_type,
+        eob,
+        false,
+        census_entry_rng,
+        dec,
+    );
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -7832,18 +8065,31 @@ fn read_coeffs_rect(
     skip_ctx: usize,
     sign_ctx: usize,
     default_tx_type: TxType,
+    // lane-av1chrtx: the plane this unit belongs to (0 luma, 1 U, 2 V) --
+    // printed by the two `EC_COEFF_STEP` traces below, which hardcoded
+    // `plane=0` and so mis-attributed a CHROMA read as a luma one in two
+    // independent lane reports.
+    plane: usize,
 ) -> Result<(Grid, TxType)> {
     let rect_trace = coeff_trace_on();
     let entry_rng = dec.debug_state().0;
+    // lane-av1readcensus: this reader is handed the real plane (lane-av1chrtx
+    // threaded it in for the `EC_COEFF_STEP` traces), so it stamps the census
+    // plane itself rather than inheriting whichever reader did last. The
+    // luma-only readers (`decode_rect_split`, `decode_block_rect64`,
+    // `read_inter_plane_rect`'s corner) are all plane 0 -- the stamp's initial
+    // value -- and the other plane-owning readers stamp on entry.
+    set_census_plane(plane);
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if rect_trace {
         eprintln!(
-            "EC_COEFF_STEP tag=all_zero plane=0 ctx={skip_ctx} entry={entry_rng} all_zero={} rng={}",
+            "EC_COEFF_STEP tag=all_zero plane={plane} ctx={skip_ctx} entry={entry_rng} all_zero={} rng={}",
             all_zero as i32,
             dec.debug_state().0
         );
     }
     if all_zero {
+        census_unit(w, h, TxType::DctDct, 0, true, entry_rng, dec);
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
     let mut grid = vec![0i32; w * h];
@@ -7864,7 +8110,7 @@ fn read_coeffs_rect(
         })?;
         if rect_trace {
             eprintln!(
-                "EC_COEFF_STEP tag=tx_type plane=0 rng={}",
+                "EC_COEFF_STEP tag=tx_type plane={plane} rng={}",
                 dec.debug_state().0
             );
         }
@@ -8047,6 +8293,7 @@ fn read_coeffs_rect(
             nz.join(",")
         );
     }
+    census_unit(w, h, tx_type, eob, false, entry_rng, dec);
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -8076,11 +8323,25 @@ fn read_chroma_coeffs_rect(
     sign_ctx: usize,
     default_tx_type: TxType,
     fctx: &crate::decode::FrameCtx,
+    // lane-av1chrtx: the plane index, threaded to `read_coeffs_rect`'s
+    // `EC_COEFF_STEP` traces (they used to print a hardcoded `plane=0`, so a
+    // V-plane read was indistinguishable from a luma one in the log).
+    plane: usize,
 ) -> Result<(Grid, TxType)> {
     if mono(fctx) {
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
-    read_coeffs_rect(dec, coding, scan, w, h, skip_ctx, sign_ctx, default_tx_type)
+    read_coeffs_rect(
+        dec,
+        coding,
+        scan,
+        w,
+        h,
+        skip_ctx,
+        sign_ctx,
+        default_tx_type,
+        plane,
+    )
 }
 
 /// What one coded block leaves behind for the blocks that read it as a
@@ -11537,6 +11798,7 @@ fn decode_rect_split(
                     tu_skip_ctx,
                     dc_sign_ctx(tu_around.2),
                     TxType::DctDct,
+                    0,
                 )?;
                 let residual = dequant_and_inverse_typed_wh(
                     &tu_grid,
@@ -11962,6 +12224,7 @@ fn decode_rect_split(
                             skip_ctx,
                             dc_sign_ctx(cu_around[plane_idx].2),
                             default_tx,
+                            plane_idx,
                         )?;
                         let residual = dequant_and_inverse_typed_wh(
                             &levels,
@@ -12046,6 +12309,7 @@ fn decode_rect_split(
                 skip_ctx,
                 dc_sign_ctx(around[plane_idx].2),
                 default_tx,
+                plane_idx,
             )?;
             // The same delta_q proof the unsplit rect64 path records
             // (lane-rectsplit r4: lifting the split-transform refusal moved
@@ -13062,12 +13326,34 @@ fn decode_intrabc_rect(
         });
     }
     let (px, py) = (mi_c * MI, mi_r * MI);
-    let (cpx, cpy) = (px / 2, py / 2);
+    // lane-whtshape: a LOSSLESS block's chroma plane block is
+    // `bw >> ss_x` by `bh >> ss_y` at its own origin -- `av1_get_max_uv_txsize`
+    // is `ss_size_lookup[bsize]` (no halving of its own), so at 4:4:4 that is
+    // the block's OWN footprint, not the 4:2:0 halving the lossy arm hard-codes.
+    // Measured on this lane's 4:4:4 lossless witness: with the halving, a
+    // 16x8 intrabc block's chroma plane block came out 8x4 and the lossless
+    // walk below coded 2 units per plane where libaom codes 8.
+    //
+    // Scoped to `lossless` ON PURPOSE. The 4:2:0 halving is right at 4:2:0,
+    // and every pinned 4:4:4 stream that reaches this helper does so LOSSY
+    // (measured: zero pinned fixtures decode a LOSSLESS intrabc rect block),
+    // whose footprint is a separate, already-named open cell --
+    // lanes/av1444rect.report.md's 4:4:4 intra-BC chroma. This lane must not
+    // move it, and a lossless-only split here changes no green pin either way.
+    let (cpx, cpy) = if lossless(fctx) {
+        (px >> ss_x(fctx), py >> ss_y(fctx))
+    } else {
+        (px / 2, py / 2)
+    };
     // `av1_get_max_uv_txsize(bw x bh)`: 4:2:0 halves the footprint and the
     // halved shape's own `max_txsize_rect_lookup` entry IS that size for every
     // shape this helper is called at, so the uv plane block is ONE unit --
     // the same call `decode_token_recon_block`'s own chroma loop makes.
-    let (cw, ch) = (bw / 2, bh / 2);
+    let (cw, ch) = if lossless(fctx) {
+        (bw >> ss_x(fctx), bh >> ss_y(fctx))
+    } else {
+        (bw / 2, bh / 2)
+    };
     // lane-av1-intrabc r2: the square stride the proven INTER path uses
     // (`side`). The residual grids, the prediction windows AND
     // `TxParams::stride` are all laid out at it -- the block's own width
@@ -13157,6 +13443,10 @@ fn decode_intrabc_rect(
     let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
     let luma_tx_type: TxType;
     let (luma_grid, u_grid, v_grid);
+    // lane-whtshape: the LOSSLESS chroma walk's composed plane-major grids,
+    // kept so their per-4x4 slices can be re-stamped over the whole-block
+    // record in the tail. `None` on every other arm.
+    let mut ll_chroma: Option<(Vec<i32>, Vec<i32>)> = None;
     if skip {
         // No residual syntax at all: the prediction IS the block.
         // Residual stride is `side` (and `cside`), not `bw`: reconstruct_mc_rect indexes
@@ -13379,43 +13669,95 @@ fn decode_intrabc_rect(
                     around[1] = c[1];
                     around[2] = c[2];
                 }
-                let (ug, _) = read_inter_plane_rect(
-                    dec,
-                    cdfs,
-                    rect_inter_chroma_set(cw, ch)?,
-                    (cw, ch),
-                    cside,
-                    1,
-                    around[1],
-                    0,
-                    u,
-                    cpx,
-                    cpy,
-                    Pred::Inline(&pred_u, cside),
-                    Some(luma_tx_type),
-                    None,
-                    fctx,
-                )?;
-                u_grid = embed_grid_stride(&ug, cw, ch, cside);
-                let (vg, _) = read_inter_plane_rect(
-                    dec,
-                    cdfs,
-                    rect_inter_chroma_set(cw, ch)?,
-                    (cw, ch),
-                    cside,
-                    2,
-                    around[2],
-                    0,
-                    v,
-                    cpx,
-                    cpy,
-                    Pred::Inline(&pred_v, cside),
-                    Some(luma_tx_type),
-                    None,
-                    fctx,
-                )?;
-                v_grid = embed_grid_stride(&vg, cw, ch, cside);
-                luma_grid = Grid::Zero(side * side);
+                if lossless(fctx) {
+                    // lane-whtshape: at lossless libaom codes TX_4X4 on EVERY
+                    // plane of a block -- `read_tx_size` returns `TX_4X4` for a
+                    // lossless block before it looks at a tree, `read_tx_mode`
+                    // already forced `ONLY_4X4` for the frame, and
+                    // `get_vartx_max_txsize` returns `TX_4X4` for every plane
+                    // -- so this block's chroma plane block is a
+                    // `(cw/4) * (ch/4)` raster of 4x4 units, PLANE-MAJOR
+                    // (`decode_token_recon_block`: every U unit, then every V
+                    // unit), not the single rect unit the two
+                    // `read_inter_plane_rect` calls below read. That single
+                    // 8x4 unit is what reached the lossless WHT with the wrong
+                    // shape (the `debug_assert_eq!((w, h), (4, 4))` this lane
+                    // replaced). Same helper, same walk, as the inter 8x8 and
+                    // 128 paths.
+                    hit!(INTRABC_RECT_LOSSLESS_CHROMA4_HITS);
+                    let mut uo = vec![0i32; cside * cside];
+                    let mut vo = vec![0i32; cside * cside];
+                    read_inter_chroma_lossless(
+                        dec,
+                        cdfs,
+                        neighbours,
+                        u,
+                        v,
+                        Pred::Inline(&pred_u, cside),
+                        Pred::Inline(&pred_v, cside),
+                        (mi_r, mi_c),
+                        (cpx, cpy),
+                        (0, 0),
+                        (cw, ch),
+                        (cw, ch),
+                        cside,
+                        0,
+                        base_q_idx,
+                        &mut uo,
+                        &mut vo,
+                        fctx,
+                    )?;
+                    // The per-unit walk stamped every unit's own coefficient
+                    // context, but the whole-block `record_split_luma_rect_mi`
+                    // in the tail rewrites every chroma cell with ONE composed
+                    // state, which drops the per-unit DC signs and levels (class
+                    // `override-slot-on-one-arm` -- the same one
+                    // `decode_rect_split`'s `ll_chroma_units` replay exists
+                    // for). The grids are kept here and replayed AFTER that
+                    // record, from the same 4x4 slices, so the same states.
+                    u_grid = embed_grid_stride(&Grid::Own(uo.clone()), cw, ch, cside);
+                    v_grid = embed_grid_stride(&Grid::Own(vo.clone()), cw, ch, cside);
+                    ll_chroma = Some((uo, vo));
+                    luma_grid = Grid::Zero(side * side);
+                } else {
+                    let (ug, _) = read_inter_plane_rect(
+                        dec,
+                        cdfs,
+                        rect_inter_chroma_set(cw, ch)?,
+                        (cw, ch),
+                        cside,
+                        1,
+                        around[1],
+                        0,
+                        u,
+                        cpx,
+                        cpy,
+                        Pred::Inline(&pred_u, cside),
+                        Some(luma_tx_type),
+                        None,
+                        fctx,
+                    )?;
+                    u_grid = embed_grid_stride(&ug, cw, ch, cside);
+                    let (vg, _) = read_inter_plane_rect(
+                        dec,
+                        cdfs,
+                        rect_inter_chroma_set(cw, ch)?,
+                        (cw, ch),
+                        cside,
+                        2,
+                        around[2],
+                        0,
+                        v,
+                        cpx,
+                        cpy,
+                        Pred::Inline(&pred_v, cside),
+                        Some(luma_tx_type),
+                        None,
+                        fctx,
+                    )?;
+                    v_grid = embed_grid_stride(&vg, cw, ch, cside);
+                    luma_grid = Grid::Zero(side * side);
+                }
             }
         }
     }
@@ -13443,6 +13785,29 @@ fn decode_intrabc_rect(
             DC_PRED,
             &[&luma_grid, &u_grid, &v_grid],
         );
+    }
+    // lane-whtshape: replay the LOSSLESS walk's per-4x4 chroma states over
+    // the whole-block record above, so the NEXT block reads the per-unit DC
+    // signs and levels libaom's plane-major walk left behind instead of one
+    // composed state for the whole plane block.
+    if let Some((uo, vo)) = ll_chroma {
+        for (plane_idx, comp) in [(1usize, &uo), (2, &vo)] {
+            for ur in 0..ch / 4 {
+                for uc in 0..cw / 4 {
+                    let mut unit = Vec::with_capacity(16);
+                    for r in 0..4 {
+                        unit.extend_from_slice(&comp[(ur * 4 + r) * cside + uc * 4..][..4]);
+                    }
+                    neighbours.record_mi_chroma(
+                        (mi_r + ur * (4 >> ss_y(fctx)), mi_c + uc * (4 >> ss_x(fctx))),
+                        4 << ss_x(fctx),
+                        4 << ss_y(fctx),
+                        plane_idx,
+                        &Grid::Own(unit),
+                    );
+                }
+            }
+        }
     }
     neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
     neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
@@ -14510,6 +14875,7 @@ fn decode_block_rect(
                 0,
                 dc_sign_ctx(around[0].2),
                 TxType::DctDct,
+                0,
             )?;
             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 let (rng, _) = dec.debug_state();
@@ -14558,6 +14924,7 @@ fn decode_block_rect(
                 dc_sign_ctx(around[1].2),
                 u_default_tx,
                 fctx,
+                1,
             )?;
             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 let (rng, _) = dec.debug_state();
@@ -14605,6 +14972,7 @@ fn decode_block_rect(
                 dc_sign_ctx(around[2].2),
                 v_default_tx,
                 fctx,
+                2,
             )?;
             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 let (rng, _) = dec.debug_state();
@@ -15087,6 +15455,7 @@ fn decode_leaf_rect(
             0,
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
+            0,
         )?;
         if crate::envflags::env_flag!("EC_AV1_RECTX_TRACE") {
             let nz: Vec<(usize, i32)> = l_levels
@@ -15141,6 +15510,7 @@ fn decode_leaf_rect(
             dc_sign_ctx(around[1].2),
             u_default_tx,
             fctx,
+            1,
         )?;
         u_levels = u_l;
         let u_residual = dequant_and_inverse_typed_wh(
@@ -15185,6 +15555,7 @@ fn decode_leaf_rect(
             dc_sign_ctx(around[2].2),
             v_default_tx,
             fctx,
+            2,
         )?;
         v_levels = v_l;
         let v_residual = dequant_and_inverse_typed_wh(
@@ -15608,6 +15979,7 @@ fn decode_block_rect4(
             0,
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
+            0,
         )?;
         hit!(RECT4_COEFF_HITS);
         let luma_residual = dequant_and_inverse_typed_wh(
@@ -15758,6 +16130,7 @@ fn decode_block_rect4(
             0,
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
+            0,
         )?;
         let mut planes = Vec::with_capacity(2);
         for plane in 1..3 {
@@ -15783,6 +16156,7 @@ fn decode_block_rect4(
                 dc_sign_ctx(around[plane].2),
                 default_tx,
                 fctx,
+                plane,
             )?;
             planes.push((levels, tx_type));
         }
@@ -17313,6 +17687,7 @@ fn decode_rect4_16_strip(
                         tu_skip_ctx,
                         dc_sign_ctx(tu_around.2),
                         TxType::DctDct,
+                        0,
                     )?;
                     let residual = dequant_and_inverse_typed_wh(
                         &tu_grid,
@@ -17419,6 +17794,7 @@ fn decode_rect4_16_strip(
                 0,
                 dc_sign_ctx(around.2),
                 TxType::DctDct,
+                0,
             )?;
             let residual = dequant_and_inverse_typed_wh(
                 &levels,
@@ -17935,6 +18311,7 @@ fn decode_rect4_16_strip(
                     dc_sign_ctx(around[plane].2),
                     default_tx,
                     fctx,
+                    plane,
                 )?;
                 planes.push((levels, tx_type));
             }
@@ -18441,6 +18818,7 @@ fn decode_block_rect64(
                 0,
                 dc_sign_ctx(around[0].2),
                 TxType::DctDct,
+                0,
             )?
         };
         if coeff_trace_on() {
@@ -18596,6 +18974,7 @@ fn decode_block_rect64(
                             dc_sign_ctx(cu_around[plane_idx].2),
                             TxType::DctDct,
                             fctx,
+                            plane_idx,
                         )?;
                         let residual = dequant_and_inverse_typed_wh(
                             &levels,
@@ -19352,6 +19731,48 @@ fn dump_stage(var: &str, y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     }
 }
 
+/// `EC_AV1_PREFILT_WIDE_DUMP=<prefix>` -> `<prefix>.f<N>`, the pre-loop-filter
+/// reconstruction cropped to each plane's mi-ALIGNED true extent, byte for
+/// byte the shape aomdec's own rung 7 writes (`y_width`/`y_height`,
+/// `uv_width`/`uv_height`), so the two can be diffed directly.
+///
+/// lane-av1444edge: this used to be an inline block in the KEY-frame tile path
+/// only, with a FUNCTION-LOCAL `static IDX2` as its counter. Both facts were
+/// measurement traps, and the second one is why the first went unnoticed:
+/// the inter-frame path (`decode_inter_frame_tile_with_cdfs`) had no wide
+/// prefilter dump at all, so every 4:4:4 lossy divergence localized to an
+/// inter frame had no pre-filter rung to compare against and got attributed to
+/// reconstruction when the oracle could not see it. The `static` also restarted
+/// per monomorphisation, so every frame after the first overwrote `.f0` -- a
+/// per-frame bisection silently compared the LAST decoded frame. The counter
+/// is now the shared per-var [`dump_stage_idx`] map, and the call also sits on
+/// the inter path (skipped when the filter pipeline is active, which has
+/// already deblocked by the time the tile tail runs -- same condition
+/// `capture_filter_replay` guards itself with).
+fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
+    let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_WIDE_DUMP") else {
+        return;
+    };
+    use std::io::Write;
+    let idx = dump_stage_idx("EC_AV1_PREFILT_WIDE_DUMP");
+    let crop = |plane: &PlaneBuf<'_>| -> Vec<u8> {
+        let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
+        for row in 0..plane.true_height {
+            out.extend(
+                plane.data[row * plane.width..][..plane.true_width]
+                    .iter()
+                    .map(|&s| s as u8),
+            );
+        }
+        out
+    };
+    if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+        let _ = f.write_all(&crop(y));
+        let _ = f.write_all(&crop(u));
+        let _ = f.write_all(&crop(v));
+    }
+}
+
 /// The value [`fresh_plane`] fills with under `EC_AV1_PLANE_SENTINEL`: no
 /// legal sample can equal it (reconstruction clamps to `(1 << bit_depth) - 1`,
 /// at most 4095), so a decode that hashes identically under the flag proves
@@ -19822,6 +20243,8 @@ fn read_plane(
     if plane_idx > 0 && mono(fctx) {
         return Ok(Grid::Zero(side * side));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
@@ -20074,6 +20497,7 @@ fn read_rect_chroma_unit(
         usize::from(around.0) + usize::from(around.1) + chroma_skip_offset.unwrap_or(0),
         dc_sign_ctx(around.2),
         default_tx,
+        plane_idx,
     )?;
     let residual = dequant_and_inverse_typed_wh(
         &levels,
@@ -23125,6 +23549,7 @@ fn leaf8_chroma422_unit(
         usize::from(around.0) + usize::from(around.1),
         dc_sign_ctx(around.2),
         default_tx,
+        plane_idx,
     )?;
     let residual = dequant_and_inverse_typed_wh(
         &levels,
@@ -23775,6 +24200,7 @@ fn sub8_leaf_chroma444(
                         skip_ctx,
                         dc_sign_ctx(around[plane_idx].2),
                         default_tx,
+                        plane_idx,
                     )?;
                     let residual = dequant_and_inverse_typed_wh(
                         &levels,
@@ -23954,6 +24380,7 @@ fn sub8_leaf_chroma444(
                     skip_ctx,
                     dc_sign_ctx(around[plane_idx].2),
                     default_tx,
+                    plane_idx,
                 )?;
                 let residual = dequant_and_inverse_typed_wh(
                     &levels,
@@ -25337,6 +25764,7 @@ fn decode_leaf_rect8(
                         skip_ctx,
                         dc_sign_ctx(around.2),
                         TxType::DctDct,
+                        0,
                     )?;
                     if li == 0 {
                         chroma_tx = tx_type;
@@ -25748,6 +26176,7 @@ fn decode_leaf_rect8(
                 0,
                 dc_sign_ctx(around.2),
                 TxType::DctDct,
+                0,
             )?;
             if levels.iter().any(|&l| l != 0) {
                 if vert {
@@ -27565,9 +27994,37 @@ fn read_block_tx_size(
     // `read_block_tx_size` (`decodeframe.c`) sends a lossless block down the
     // `read_tx_size` arm, which returns TX_4X4 before it reads anything.
     if lossless(fctx) {
-        let mut leaves = Vec::new();
-        for row in 0..side / MI {
-            for col in 0..side / MI {
+        // lane-av1lm444loss: libaom CLIPS the transform-unit grid at the frame
+        // edge -- `max_block_high`/`max_block_wide` (`av1_common_int.h:1565`,
+        // `:1579`) fold `mb_to_bottom_edge`/`mb_to_right_edge` into
+        // `block_size_high/wide` before `>> MI_SIZE_LOG2`, so a block that
+        // hangs off the bottom/right codes only the units INSIDE the frame.
+        // `decode_token_recon_block`'s mu walk then bounds every chunk with
+        // `unit_height = ROUND_POWER_OF_TWO(AOMMIN(mu_blocks_high + row,
+        // max_blocks_high), ss_y)`, so the out-of-frame units are never read.
+        //
+        // The unclipped `side / MI` grid is correct arithmetic for a block that
+        // FITS, which is every block of a frame whose height and width are
+        // multiples of the superblock -- so this reads identically on all of
+        // those, and only differs on the partial edge block. Measured on the
+        // 128x96 4:4:4 lossless pin (one 128 root per inter frame, frame 32
+        // mi = 24 tx rows tall): the unclipped grid read 32 rows where the
+        // oracle read 24 -- 256 extra luma units per inter frame (1024 vs
+        // the oracle's 768), the `EC_SYMR` ladder's first fork landing exactly
+        // at that row-24 boundary (`plane=0` luma where the oracle had moved
+        // to `plane=1`), and the pixel diff growing 5596 -> 33561 wrong
+        // samples over the six frames.
+        let side_mi = side / MI;
+        let max_w_mi = side_mi.min(mi_cols.saturating_sub(at_mi.1));
+        let max_h_mi = side_mi.min(mi_rows.saturating_sub(at_mi.0));
+        if max_w_mi != side_mi || max_h_mi != side_mi {
+            LOSSLESS_EDGE_CLIPPED.with(|c| c.set(c.get() + 1));
+            LOSSLESS_EDGE_CLIP_UNITS
+                .with(|c| c.set(c.get() + (side_mi * side_mi - max_w_mi * max_h_mi)));
+        }
+        let mut leaves = Vec::with_capacity(max_w_mi * max_h_mi);
+        for row in 0..max_h_mi {
+            for col in 0..max_w_mi {
                 leaves.push((row, col, 4, 4));
             }
         }
@@ -28047,9 +28504,23 @@ fn read_block_tx_size_rect(
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Option<Vec<(usize, usize, usize, usize)>>> {
     if lossless(fctx) {
-        let mut leaves = Vec::new();
-        for row in 0..bh / MI {
-            for col in 0..bw / MI {
+        // lane-av1lm444loss: the same frame-edge clip as the square builder
+        // above -- `max_block_high`/`max_block_wide` bound a rect block's
+        // transform grid by the part of it inside the frame, so a 1:4 strip
+        // hanging off the bottom codes only its in-frame rows. Identical
+        // arithmetic for a block that fits.
+        let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(at_mi.1));
+        let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(at_mi.0));
+        let full_w_mi = bw / MI;
+        let full_h_mi = bh / MI;
+        if max_w_mi != full_w_mi || max_h_mi != full_h_mi {
+            LOSSLESS_EDGE_CLIPPED.with(|c| c.set(c.get() + 1));
+            LOSSLESS_EDGE_CLIP_UNITS
+                .with(|c| c.set(c.get() + (full_w_mi * full_h_mi - max_w_mi * max_h_mi)));
+        }
+        let mut leaves = Vec::with_capacity(max_w_mi * max_h_mi);
+        for row in 0..max_h_mi {
+            for col in 0..max_w_mi {
                 leaves.push((row, col, 4, 4));
             }
         }
@@ -28200,6 +28671,13 @@ fn read_inter_rect_chroma(
     (write_chroma_w, write_chroma_h): (usize, usize),
     chroma_side: usize,
     mode_for_tx: usize,
+    // lane-av1chrtx: this block's coded luma transform leaves, `(row, col,
+    // tw, th, tx_type)` -- the same list the 4:4:4 four-unit arms resolve
+    // through `covering_leaf_tx_type`. This sibling used to hand EVERY unit
+    // the block-level `luma_tx_type` (the top-left leaf's type), so a rect
+    // inter block whose chroma plane splits (`nx*ny > 1`) over MIXED var-tx
+    // leaves read the wrong type per unit.
+    leaf_tx_types: &[(usize, usize, usize, usize, TxType)],
     luma_tx_type: TxType,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, Grid, Vec<((usize, usize), usize, Grid, usize, usize)>)> {
@@ -28225,7 +28703,12 @@ fn read_inter_rect_chroma(
     let invalid_ss_plane =
         ss_x(fctx) == 1 && ss_y(fctx) == 0 && (write_chroma_w, write_chroma_h) == (4, 32);
     let (uw, uh) = if invalid_ss_plane { (4, 8) } else { (uw, uh) };
-    let inherit_tx_type = Some(luma_tx_type);
+    // lane-av1chrtx: `inherit_tx_type` is resolved PER UNIT below, not once
+    // for the block -- `av1_get_tx_type` (blockd.h:1287-1297) reads
+    // `xd->tx_type_map` at the chroma unit's own position scaled back to
+    // luma, so a unit sitting over a luma leaf that coded NOTHING takes that
+    // leaf's `DCT_DCT` stamp (`decodetxb.c:199-203`), not the block-level
+    // (top-left leaf) type.
     let (nx, ny) = (write_chroma_w / uw, write_chroma_h / uh);
     let multi = nx * ny > 1;
     let set = rect_inter_chroma_set(uw, uh)?;
@@ -28263,6 +28746,7 @@ fn read_inter_rect_chroma(
                     at_mi.0 + cu_row * (span_y / MI),
                     at_mi.1 + cu_col * (span_x / MI),
                 );
+                let unit_rel_mi = (cu_mi.0 - at_mi.0, cu_mi.1 - at_mi.1);
                 let cu_around = if multi {
                     // lane-av1422ctxgather: at ss (1,0) the unit's above
                     // span covers `uw` chroma px = `2*uw` luma mi columns,
@@ -28282,6 +28766,16 @@ fn read_inter_rect_chroma(
                 };
                 let (cu_x, cu_y) = (cpx + cu_col * uw, cpy + cu_row * uh);
                 let cu_pred = src.offset(cu_row * uh * chroma_side + cu_col * uw);
+                let inherit_tx_type =
+                    if let Some(t) = covering_leaf_tx_type(leaf_tx_types, unit_rel_mi) {
+                        hit!(CHROMA_RECT_LEAF_TX_HITS);
+                        if Some(t) != Some(luma_tx_type) {
+                            hit!(CHROMA_RECT_LEAF_TX_DIFF_HITS);
+                        }
+                        Some(t)
+                    } else {
+                        Some(luma_tx_type)
+                    };
                 let cu_grid = read_inter_plane_rect(
                     dec,
                     cdfs,
@@ -28366,6 +28860,8 @@ fn read_inter_plane_rect(
     if plane_idx > 0 && mono(fctx) {
         return Ok((Grid::Zero(w * h), TxType::DctDct));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         // `get_txb_ctx_general`: 0 only when this unit IS the whole plane
         // block; a var-tx leaf passes its own neighbour-table context.
@@ -28442,6 +28938,7 @@ fn read_inter_plane_rect(
             skip_ctx,
             dc_sign_ctx(around.2),
             default_tx_type,
+            plane_idx,
         )?
     };
     let grid = extend_corner(corner, cw, ch, w, h);
@@ -32310,6 +32807,19 @@ thread_local! {
     /// 128x96 4:4:4 lossless stream, 1536 per inter frame (768 per plane),
     /// against the oracle's 1536.
     pub(crate) static MU_CHUNK_WALK_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1lm444loss: lossless blocks whose transform-unit grid was
+    /// CLIPPED at the frame edge -- `max_block_high`/`max_block_wide` cut the
+    /// grid short of the block's own `side / MI`, so libaom codes fewer TX_4X4
+    /// units than the block is wide/tall. Zero on any frame whose height and
+    /// width are multiples of the superblock, so a gate cannot look armed by
+    /// merely decoding.
+    pub(crate) static LOSSLESS_EDGE_CLIPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1lm444loss: the transform units that clip REMOVED -- the
+    /// `(side / MI - clipped) * (side / MI)` overflow the pre-fix walk read
+    /// past the frame bottom/right edge. On the 128x96 4:4:4 lossless pin this
+    /// is 256 per inter frame (8 unclipped luma rows x 32 columns), and 0 on a
+    /// frame that fits.
+    pub(crate) static LOSSLESS_EDGE_CLIP_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`MU_CHUNK_WALKS`], for a gate's own before/after delta.
@@ -32328,6 +32838,19 @@ pub(crate) fn mu_chunk_walk_units() -> usize {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn mu_chunk_order_hits() -> usize {
     MU_CHUNK_ORDER_HITS.with(std::cell::Cell::get)
+}
+/// [`LOSSLESS_EDGE_CLIPPED`] -- lossless blocks whose TX grid the frame-edge
+/// clip shortened, for a gate's own before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lossless_edge_clipped() -> usize {
+    LOSSLESS_EDGE_CLIPPED.with(std::cell::Cell::get)
+}
+
+/// [`LOSSLESS_EDGE_CLIP_UNITS`] -- transform units the clip removed, i.e. the
+/// ones the unclipped pre-fix walk read past the frame edge.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lossless_edge_clip_units() -> usize {
+    LOSSLESS_EDGE_CLIP_UNITS.with(std::cell::Cell::get)
 }
 
 /// [`CHROMA_SPLIT_TX_HITS`], for a gate's own before/after delta.
@@ -34749,27 +35272,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_WIDE_DUMP") {
-        use std::io::Write;
-        static IDX2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let idx = IDX2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let crop_wide = |plane: &PlaneBuf<'_>| -> Vec<u8> {
-            let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
-            for row in 0..plane.true_height {
-                out.extend(
-                    plane.data[row * plane.width..][..plane.true_width]
-                        .iter()
-                        .map(|&s| s as u8),
-                );
-            }
-            out
-        };
-        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            let _ = f.write_all(&crop_wide(&y));
-            let _ = f.write_all(&crop_wide(&u));
-            let _ = f.write_all(&crop_wide(&v));
-        }
-    }
+    dump_prefilter_wide(&y, &u, &v);
     // lane-av1fwd: the encoder's filter search re-decodes this same key
     // frame tile per candidate -- capture it once (see [`FilterReplay`]),
     // on the shape whose tail is the two filter calls and nothing else.
@@ -35436,6 +35939,8 @@ fn read_inter_plane(
     if plane_idx > 0 && mono(fctx) {
         return Ok((Grid::Zero(side * side), TxType::DctDct));
     }
+    // lane-av1readcensus: the units read from here on are this plane's.
+    set_census_plane(plane_idx);
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
@@ -35662,10 +36167,7 @@ fn read_intra_chroma_lossless(
 /// skipped (the returned order is the identity). `changed` is `true` only
 /// when the sort actually permutes the list, so a no-op ordering reads zero
 /// on [`MU_CHUNK_ORDER_HITS`] and cannot make a gate look armed.
-fn mu_chunk_order(
-    leaves: &[(usize, usize, usize, usize)],
-    side: usize,
-) -> (Vec<usize>, bool) {
+fn mu_chunk_order(leaves: &[(usize, usize, usize, usize)], side: usize) -> (Vec<usize>, bool) {
     let identity: Vec<usize> = (0..leaves.len()).collect();
     if side <= 64 {
         return (identity, false);
@@ -37944,6 +38446,39 @@ pub(crate) fn chroma_quad_leaf_tx_diff_hits() -> usize {
     CHROMA_QUAD_LEAF_TX_DIFF_HITS.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// lane-av1chrtx: chroma units of a RECT inter block
+    /// ([`read_inter_rect_chroma`], the sibling of the 4:4:4 four-unit arms)
+    /// that resolved their `tx_type` from the luma leaf covering their OWN
+    /// quadrant instead of the block-level one. A SEPARATE counter from
+    /// [`CHROMA_QUAD_LEAF_TX_HITS`] on purpose: that one gates a 4:2:0 control
+    /// that must stay at exactly 0, and this route IS reachable at 4:2:0, so
+    /// sharing the counter would destroy that control's meaning.
+    pub(crate) static CHROMA_RECT_LEAF_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Of those, how many resolved a type that DIFFERS from the block-level
+    /// one -- the condition that changes pixels. A route counter alone fires
+    /// on every multi-unit rect chroma read, including the blocks whose
+    /// leaves all agree (the exact shape a no-op fix looks green on).
+    pub(crate) static CHROMA_RECT_LEAF_TX_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`CHROMA_RECT_LEAF_TX_HITS`]: rect chroma units that took their type from
+/// the covering luma leaf.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_rect_leaf_tx_hits() -> usize {
+    CHROMA_RECT_LEAF_TX_HITS.with(std::cell::Cell::get)
+}
+
+/// [`CHROMA_RECT_LEAF_TX_DIFF_HITS`]: of those, the units whose covering
+/// leaf's type differs from the block-level one.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_rect_leaf_tx_diff_hits() -> usize {
+    CHROMA_RECT_LEAF_TX_DIFF_HITS.with(std::cell::Cell::get)
+}
+
 fn decode_inter_block(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -38882,6 +39417,10 @@ fn decode_inter_block(
                     if idx == 1 {
                         (8, 8, 1u8)
                     } else {
+                        // lane-av1distwtd: `idx == 0` is the
+                        // distance-weighted arm -- the only branch whose
+                        // weights are NOT the constant (8, 8) split.
+                        hit!(DIST_WTD_COMP_HITS);
                         let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
                             order_hint_bits,
                             order_hint,
@@ -39875,6 +40414,7 @@ fn decode_inter_block(
                         (write_chroma_w, write_chroma_h),
                         chroma_stride,
                         mode_for_tx,
+                        &leaf_tx_types,
                         luma_tx_type,
                         fctx,
                     )?;
@@ -41667,6 +42207,7 @@ fn decode_inter_block(
                         (write_chroma_w, write_chroma_h),
                         chroma_stride,
                         mode_for_tx,
+                        &leaf_tx_types,
                         luma_tx_type,
                         fctx,
                     )?;
@@ -42317,8 +42858,7 @@ fn decode_inter_block(
                 if side > 64 {
                     let chunk = (row / 16, col / 16);
                     let done = pos + 1 == order.len()
-                        || (leaves[order[pos + 1]].0 / 16, leaves[order[pos + 1]].1 / 16)
-                            != chunk;
+                        || (leaves[order[pos + 1]].0 / 16, leaves[order[pos + 1]].1 / 16) != chunk;
                     if !done {
                         continue;
                     }
@@ -44694,6 +45234,7 @@ fn decode_intra_sub8_leaf(
                 0,
                 dc_sign_ctx(around.2),
                 TxType::DctDct,
+                0,
             )?;
             let residual = dequant_and_inverse_typed_wh(
                 &levels,
@@ -45079,6 +45620,7 @@ fn decode_intra_sub8_leaf(
                     skip_ctx,
                     dc_sign_ctx(around.2),
                     uv_tx,
+                    plane,
                 )?;
                 let residual = dequant_and_inverse_typed_wh(
                     &levels,
@@ -46846,6 +47388,10 @@ fn decode_inter_block8(
                         if idx == 1 {
                             (8, 8, 1u8)
                         } else {
+                            // lane-av1distwtd: the 8x8 leaf's own
+                            // distance-weighted arm, same counter as the
+                            // 16x16+ site above.
+                            hit!(DIST_WTD_COMP_HITS);
                             let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
                                 order_hint_bits,
                                 order_hint,
@@ -52496,6 +53042,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    // lane-av1444edge: the inter-frame path's mi-aligned pre-loop-filter
+    // dump, the rung the key-frame path has always had (see
+    // `dump_prefilter_wide`). Placed beside the padded `EC_AV1_PREFILT_DUMP`
+    // above, i.e. before the filter pipeline is released, so the two agree on
+    // the point in the sequence they sample.
+    dump_prefilter_wide(&y, &u, &v);
     // lane-pipefilt: release the rows still pending and wait the pipeline
     // out; from here the picture is deblocked and CDEF-filtered exactly as
     // the whole-frame path leaves it.
@@ -52762,6 +53314,46 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+    /// lane-av1chrtx: [`covering_leaf_tx_type`] resolves a chroma unit's
+    /// `tx_type` from the luma leaf covering the unit's OWN quadrant, and
+    /// reports "no leaf there" as `None` so the caller can fall back to the
+    /// block-level type. Both halves are load-bearing: the 128 mu-chunk tail,
+    /// the 4:4:4 four-unit arms and `read_inter_rect_chroma` all read the
+    /// `None` arm as "this block coded a single luma unit".
+    #[test]
+    fn covering_leaf_tx_type_picks_the_leaf_under_the_unit_or_reports_none() {
+        use TxType::*;
+        // A 32x64 strip's five-leaf tree, in decode order: one 32x32 leaf
+        // over mi rows 0..8, then 16x16 leaves. (row, col) are MI relative
+        // to the block, (tw, th) are PIXELS, MI == 4.
+        let leaves = [
+            (0usize, 0usize, 32usize, 32usize, Idtx),
+            (8, 0, 16, 16, VDct),
+            (8, 4, 16, 16, DctDct),
+            (12, 0, 16, 16, HDct),
+            (12, 4, 16, 16, VDct),
+        ];
+        // The TOP chroma unit (its own mi cell (0,0)) sits over the 32x32
+        // leaf; the LOWER one (mi (8,0)) over the first 16x16 leaf. The
+        // block-level type is the first leaf's, so only the second read
+        // differs -- exactly the condition the gate's DIFF counter counts.
+        assert_eq!(covering_leaf_tx_type(&leaves, (0, 0)), Some(Idtx));
+        assert_eq!(covering_leaf_tx_type(&leaves, (8, 0)), Some(VDct));
+        // Interior cells resolve the same leaf as the cell's top-left: the
+        // lookup is a rectangle containment test, not a raster position.
+        assert_eq!(covering_leaf_tx_type(&leaves, (11, 3)), Some(VDct));
+        assert_eq!(covering_leaf_tx_type(&leaves, (12, 4)), Some(VDct));
+        // The bottom-right corner of the last leaf, and the mi cell just
+        // past the block's own extent, must not fall into a neighbour.
+        assert_eq!(covering_leaf_tx_type(&leaves, (15, 7)), Some(VDct));
+        assert_eq!(covering_leaf_tx_type(&leaves, (16, 0)), None);
+        assert_eq!(covering_leaf_tx_type(&leaves, (0, 8)), None);
+        // A block with no var-tx tree (one coded luma unit) has no leaves at
+        // all: the caller's block-level fallback is the answer, and the
+        // resolver must say so rather than guess.
+        assert_eq!(covering_leaf_tx_type(&[], (0, 0)), None);
+    }
+
     /// lane-av1422warp r33: the OBMC pair-merge snap must move the READ to
     /// libaom's position, not the reported offset.
     ///

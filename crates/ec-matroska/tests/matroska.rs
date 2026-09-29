@@ -32,7 +32,9 @@ fn aac_priming_round_trips_through_codec_delay() {
     let dst = work().join("aac-priming-round-trip.mkv");
     let mut muxer = MatroskaMuxer::new(File::create(&dst).expect("output"));
     let stream = muxer.add_stream(info).expect("stream declared");
-    muxer.set_track_delay(stream, 21_333_333).expect("declare delay"); // 1024/48000s
+    muxer
+        .set_track_delay(stream, 21_333_333)
+        .expect("declare delay"); // 1024/48000s
     for _ in 0..10i64 {
         let mut packet = Packet::new(0, rate, vec![0u8; 8]);
         packet.duration = Some(1024);
@@ -44,7 +46,8 @@ fn aac_priming_round_trips_through_codec_delay() {
     let demuxer =
         MatroskaDemuxer::new(BufReader::new(File::open(&dst).expect("opens"))).expect("reopens");
     assert_eq!(
-        demuxer.streams()[0].initial_padding, 1024,
+        demuxer.streams()[0].initial_padding,
+        1024,
         "CodecDelay round trips to a sample count"
     );
 }
@@ -802,7 +805,11 @@ fn truncated_prefixes_are_eof_not_corrupt() {
             table.join("\n")
         );
     }
-    println!("{}\nidx,cut,class,packets\n{}", path.display(), table.join("\n"));
+    println!(
+        "{}\nidx,cut,class,packets\n{}",
+        path.display(),
+        table.join("\n")
+    );
 }
 
 fn matroska_prefix_class(data: &[u8]) -> (&'static str, u64) {
@@ -822,7 +829,6 @@ fn matroska_prefix_class(data: &[u8]) -> (&'static str, u64) {
         }
     }
 }
-
 
 /// Where our own demuxer's seek lands on a real 5.1 E-AC-3 Matroska, in
 /// *timestamp* -- split from decode, per the round's charter: this measures
@@ -963,7 +969,12 @@ fn same_class_sweep(path: &str, wants: &[f64], tolerance_ms: f64) {
 #[test]
 #[ignore = "sweeps his real library, run manually with --ignored"]
 fn laced_audio_sweep_across_his_library() {
-    let manifest = Path::new("/home/tahinli/Documents/Code/Rust/edith_codecs/fixtures/real-library-manifest.tsv");
+    // lane-h264reallib: `fixtures()` like every sibling, instead of a
+    // hardcoded absolute path into the primary checkout. The absolute form
+    // silently defeated worktree isolation: a run in a worktree or a gate tree
+    // read the MAIN checkout's manifest, so this test measured a different
+    // tree's library than the one it was compiled from.
+    let manifest = &fixtures().join("real-library-manifest.tsv");
     let Ok(rows) = std::fs::read_to_string(manifest) else {
         eprintln!("skipped: {} not present", manifest.display());
         return;
@@ -987,8 +998,7 @@ fn laced_audio_sweep_across_his_library() {
         if !film.exists() {
             continue;
         }
-        let Ok(mut demux) =
-            MatroskaDemuxer::new(BufReader::new(File::open(film).expect("opens")))
+        let Ok(mut demux) = MatroskaDemuxer::new(BufReader::new(File::open(film).expect("opens")))
         else {
             eprintln!("{path}: failed to open");
             continue;
@@ -1004,8 +1014,7 @@ fn laced_audio_sweep_across_his_library() {
         for frac in [0.3, 0.7] {
             let want = duration * frac;
             let target = Timestamp::new(
-                (want * audio.time_base.den() as f64 / audio.time_base.num() as f64).round()
-                    as i64,
+                (want * audio.time_base.den() as f64 / audio.time_base.num() as f64).round() as i64,
                 audio.time_base,
             );
             if demux
@@ -1096,8 +1105,8 @@ fn real_hdr_film_container_states_no_light_metadata() {
 // duplication, pts) or the shared decoder crate, and which physical channel
 // our 5.1 decode calls "channel 0".
 
-use ec_ac3::Ac3Decoder;
 use ec_aac::AacDecoder;
+use ec_ac3::Ac3Decoder;
 
 /// Opens whichever container `path` actually is — both crates implement the
 /// same `Demuxer` trait, so the rest of the harness never has to know which.
@@ -1109,9 +1118,15 @@ fn open_any(path: &Path) -> Box<dyn Demuxer> {
         .read_exact(&mut head)
         .expect("read head");
     if ec_mp4::is_mp4(&head) {
-        Box::new(ec_mp4::Mp4Demuxer::new(BufReader::new(File::open(path).expect("open"))).expect("mp4 opens"))
+        Box::new(
+            ec_mp4::Mp4Demuxer::new(BufReader::new(File::open(path).expect("open")))
+                .expect("mp4 opens"),
+        )
     } else {
-        Box::new(MatroskaDemuxer::new(BufReader::new(File::open(path).expect("open"))).expect("mkv opens"))
+        Box::new(
+            MatroskaDemuxer::new(BufReader::new(File::open(path).expect("open")))
+                .expect("mkv opens"),
+        )
     }
 }
 
@@ -1201,7 +1216,15 @@ fn ffmpeg_decode_planar(path: &Path, channels: usize) -> Vec<Vec<f32>> {
         .args(["-v", "error", "-i"])
         .arg(path)
         .args([
-            "-map", "0:a:0", "-t", "20", "-f", "f32le", "-acodec", "pcm_f32le", "-",
+            "-map",
+            "0:a:0",
+            "-t",
+            "20",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
         ])
         .output()
         .expect("ffmpeg runs");
@@ -1251,8 +1274,14 @@ fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
     let mut best_abs = -1.0f64;
     let mut best = (0i64, 0.0f64);
     for lag in -LAG_MAX..=LAG_MAX {
-        let (oa, ob) = if lag >= 0 { (0usize, lag as usize) } else { ((-lag) as usize, 0usize) };
-        let len = WINDOW.min(ours.len().saturating_sub(oa)).min(theirs.len().saturating_sub(ob));
+        let (oa, ob) = if lag >= 0 {
+            (0usize, lag as usize)
+        } else {
+            ((-lag) as usize, 0usize)
+        };
+        let len = WINDOW
+            .min(ours.len().saturating_sub(oa))
+            .min(theirs.len().saturating_sub(ob));
         if len < 1024 {
             continue;
         }
@@ -1387,7 +1416,11 @@ fn mkv_51_channel_order() {
             pkts.iter().take(5).map(|(p, _)| *p).collect::<Vec<_>>()
         );
         let planes = decode_ac3(&pkts);
-        assert!(!planes.is_empty(), "{}: no channels decoded", path.display());
+        assert!(
+            !planes.is_empty(),
+            "{}: no channels decoded",
+            path.display()
+        );
         let ffref = ffmpeg_decode_planar(path, planes.len());
         for (i, ch) in planes.iter().enumerate() {
             let (lag, c) = best_lag_correlation(ch, &ffref[0]);
