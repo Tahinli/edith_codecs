@@ -205,6 +205,32 @@ for crate in sorted(os.listdir(os.path.join(root, "crates"))):
                         print("{}:{}:{}".format(os.path.relpath(p, root), i, line.strip()))
 PYEOF
 )
+# POSITIVE CONTROL. A comment-stripping bug makes this scan match NOTHING, and
+# "no violations" would then be indistinguishable from a scanner that is blind.
+# So before trusting the result, plant a known forbidden literal in a scratch
+# file and require the scanner to catch it. A scanner that cannot find a literal
+# it is looking at is broken, not clean.
+control=$(mktemp --suffix=.rs)
+printf 'fn probe() { let _ = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/control.obu"); }\n' >"$control"
+control_hit=$(python3 - "$ROOT" "$control" <<'PYEOF'
+import re, sys
+pat = re.compile(r'concat!\(\s*env!\("CARGO_MANIFEST_DIR"\)\s*,\s*"/\.\./\.\./fixtures/[^/"]*\.')
+text = open(sys.argv[2], encoding="utf-8", errors="replace").read()
+text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+print("1" if any(pat.search(l.split("//", 1)[0]) for l in text.splitlines()) else "0")
+PYEOF
+)
+rm -f "$control"
+if [ "$control_hit" != 1 ]; then
+    echo "FAIL [invariant 1]: the scanner's own positive control did not fire -- the" >&2
+    echo "      comment-stripping pass is broken, so 'no violations' would be a" >&2
+    echo "      silent all-clear. Fix the scanner before trusting its verdict." >&2
+    shape_fail=1
+    fail=1
+else
+    note "  invariant 1: positive control fired (the scanner can still see a literal)"
+fi
+
 if [ -n "$forbidden" ]; then
     if [ "$SHAPE" != 0 ]; then
         echo "FAIL [invariant 1]: a committed pin is reached through the gitignored root" >&2

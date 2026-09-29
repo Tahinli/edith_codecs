@@ -258,21 +258,34 @@ That is the measured blind spot, not a sync failure.
 - `pinned_lr_sgr_stream_call_unique_dump` stays `#[ignore]`d for a true reason:
   it prints per-frame mismatch counts and asserts nothing.
 
-## 6. Open, and owned elsewhere
+## 6. The two shape violations: what they were, and who fixed them
 
-Two code-shape violations in `crates/ec-av1`, named on every preflight run and
-fatal under `EC_FIXTURE_SHAPE_STRICT=1`:
+A CORRECTION to an earlier version of this section, because a report naming an
+already-fixed gate sends the next reader to the wrong file.
 
-- `stream.rs` — `pinned_lr_sgr_stream_call_unique_dump` reads
-  `/../../fixtures/lr-sgr-r7.obu` through the gitignored root although that pin
-  is now committed crate-local. One-line fix: `crate_pin("lr-sgr-r7.obu")`.
-- `stream.rs` — `pinned_warp_stream_decodes_pixel_exact`, fourteen pins to commit
-  under `crates/ec-av1/fixtures/` and read through the pin helper, or the gate
-  stays a no-op.
+- `pinned_lr_sgr_stream_call_unique_dump` was named here as reading
+  `/../../fixtures/lr-sgr-r7.obu`. **It does not.** At the base this was measured
+  on, that gate already read `crate_pin("lr-sgr-r7.obu")` (`stream.rs:30519`)
+  and the pin is committed at `crates/ec-av1/fixtures/lr-sgr-r7.obu`.
+- The only invariant-1 hit in the tree was a **DOC COMMENT** inside
+  `pinned_golden7_stream_decodes_pixel_exact` that reproduces the forbidden
+  literal verbatim while explaining the shape it removed. A `grep` cannot tell
+  prose from code. The comment is correct and stays; the scanner was wrong.
+- The one real violation was `pinned_warp_stream_decodes_pixel_exact`
+  (`stream.rs:31386`): the `/../../fixtures` directory literal plus a 14-name
+  runtime list, none of the fourteen committed under the crate.
 
-The four pins recovered this session (`golden4-pin.obu` 137 B `1754023e…`,
-`golden6-mismatch.obu` 452 B `c56909b9…`, `golden7-forwarding-mismatch.obu` 152 B
-`81b3bf65…`, `lr-sgr-r7.obu` 192 B `6b95b20e…`) are committed here with
-`recovered-original` provenance; they lived only in the gitignored root, i.e.
-only in each machine's scratchpad. That recovery is where `committed=7` comes
-from.
+All of it is closed as of `53b851a7` (merging Kerem-5's `2364d7a7`): the warp
+gate's fourteen pins — `warp-mismatch`, `warp-flake-5`, `warp-flake-7`,
+`ii-flake-1/2/3/5/6/7/8/9`, `rect-flake-1/2/3` — are committed under
+`crates/ec-av1/fixtures/` and each is read through `crate_pin` with a string
+literal, and the gate is no longer `#[ignore]`d because a plain run proves it
+executes (`warp_selected_hits` 0 → 113, 1 passed in 1.8 s plus ffmpeg). Census
+after the fix: `total=8 committed=21 uncommitted=0 ignored=0 assertless=0`,
+`code-shape violations: 0`, and shape is fatal by default.
+
+The four pins recovered earlier in this lane (`golden4-pin.obu` 137 B
+`1754023e…`, `golden6-mismatch.obu` 452 B `c56909b9…`,
+`golden7-forwarding-mismatch.obu` 152 B `81b3bf65…`, `lr-sgr-r7.obu` 192 B
+`6b95b20e…`) are committed with `recovered-original` provenance; they lived only
+in the gitignored root, i.e. only in each machine's scratchpad.
