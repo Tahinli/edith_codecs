@@ -829,3 +829,98 @@ worse than no column** — because a 44-row table built on it would send a lane
 after the wrong gates. Two of the four bugs in this lane's scanners were exactly
 this: a slice that stopped at `len()`'s own paren, and a brace count that did not
 skip string literals.
+
+---
+
+# r7 — classify by reading, fix the first, hand back 38
+
+Branch `lane-av1pins5`. Commit `71afc8c9`. Tests and test helpers only. Not
+pushed. **Canonical branch: `lane-av1pins5`**; `av1pinslive` is dropped.
+
+## 1. The classification, printed per site so it is auditable
+
+The sweep now emits, on every run:
+
+```
+ROW <line> | <gate> | <count expr> | bucket | candidate | spec_in_scope | <reason> | pixel_comparing
+```
+
+| bucket | sites | rule |
+|---|---|---|
+| **b** | 37 | live aomenc encode → the count belongs to the **encoder** |
+| **a** | 1 | stream read from disk → the count belongs to the **pin** |
+| **c** | 4 | census/probe → report only, never fix |
+| **?** | 1 | unclassified, **with the reason printed** rather than a guess |
+
+Each gate is classified from its own body, over a **string-aware** extent. Two
+details that changed the answer: 21 of the bucket-b gates encode through a
+*helper* (`screen_intrabc_stream_at_depth`, `run_multi_tile_gate`, `edge32_gate`,
+`rect_tx_tool_gate`, …) rather than calling `aomenc_path()` directly, so a first
+pass that only looked for `aomenc_path()` called six plainly-encoding gates
+"unclassified".
+
+**A third offset bug, same family as the two r6 caught.** The sweep handed its
+body-walk a **line index** where a **byte offset** was required, so every
+body-dependent classification read "unclassified" — 40 of 44, all looking like a
+legitimate result. It is the third time in this lane that a line/byte or
+slice-boundary confusion has silently produced a plausible clean output.
+
+## 2. Fixed: `stream.rs:3895`
+
+`a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact`:
+`ffmpeg_decode_sequence(..., pictures.len())` → `ENCODED_FRAMES` (40), the count
+its own `encode_aomenc_stream(source, w, h, 40, &extra)` call encodes. Our
+decode's length is the thing **under test**, so using it as the oracle's expected
+count was circular. Gate green, 2.05 s, now comparing 40 frames against ffmpeg's
+40 rather than a self-fulfilling number.
+
+**The sweep's "known site" anchor moved with the fix.** It used to assert that
+`pictures.len()` was still present, which went red the moment the fix landed — a
+guard that punishes the fix. It now asserts the *opposite* (no site may pass
+`pictures.len()` again) **and** that the dominant `frames.len()` shape is still
+found, so the sweep cannot go quiet by either route.
+
+## 3. NOT DONE: 38 of the 39 fixable sites
+
+The sweep prints a `candidate` — the numeric frame count in the gate's own encode
+call — and it resolves for exactly **one** gate. The rest encode inside loops or
+through per-gate helpers whose frame-count argument has to be read per gate, and
+only 3 of 44 are a clean one-line swap to something already in scope.
+
+I am handing those back with the method rather than editing 38 call sites on a
+guess, for the same reason r6 refused the 44-row table on an untrustworthy column:
+a plausible-looking bulk edit built on a heuristic I have now shown wrong three
+times in this lane would send the next reader after the wrong lines.
+
+Per-gate recipe for whoever takes it:
+
+* **bucket b** — bind the encoder's frame count to a named const at the encode
+  call (`const ENCODED_FRAMES: usize = <n>;`) and pass that to
+  `ffmpeg_decode_sequence`, exactly as `stream.rs:3895` now does. Where the
+  encode is inside a loop over `cq`/`depth`, the count is the helper's frame-count
+  argument and must be read from that call.
+* **bucket a** — the count is the pinned stream's; take it from the pin's recorded
+  frame count or a length assert on the pinned bytes, not from `decode_stream`.
+* **bucket c** — leave. A census reports; it asserts no verdict, so a wrong count
+  there is not a wrong count.
+
+The sweep prints the full 44-row table on every run, so the ledger cannot drift
+from the source, and the `>= 40` floor plus the two-direction anchor stop the
+class from quietly shrinking or from being "fixed" away.
+
+## 4. State
+
+`lane-av1pins5`, five commits on top of `2e5509e9`. `cargo check -p ec-av1
+--all-targets` clean, **0 warnings**. `gate_coverage` 15, `refusal_inventory` 15,
+`count_vacuity` 2, `pin_inventory` 3, and the fixed gate all green. `#[ignore]`
+unchanged at 34. Lane-scoped `CARGO_TARGET_DIR` with touch-first, per the
+observation that the shared target dir served another worktree's binary.
+
+Not verified: a full `cargo test -p ec-av1` run (project-wide validation is
+Main's).
+
+The rule r7 adds: **a scanner that classifies by reading must print its
+reasoning per row.** Every unclassifiable row in this table carries the sentence
+that disqualified it, so a reader can disagree with a bucket instead of
+inheriting it — and the one `?` in the table is more useful than a confident
+guess would have been.
