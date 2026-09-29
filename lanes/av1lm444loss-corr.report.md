@@ -282,3 +282,75 @@ its value:
 
 Together those two mean the gate fails if the step is wrong AND fails if the
 step is never reached. Neither alone would.
+
+## 10. The 256x256 key frame is RECONSTRUCTION-ONLY (measured, after handover)
+
+`Aras-2` asked the decisive question of this cell and it is answerable, so it
+was answered rather than left open. **My handoff was incomplete in a way that
+mattered, and the correction is recorded here.**
+
+### 10.1 Per-frame read counts, and where the fork actually is
+
+On this lane's 109909 B stream (`testsrc2 256x256 rate=25`, `--sb-size=128
+--passes=1 --threads=1 --row-mt=0 --enable-palette=0 --lag-in-frames=0
+--kf-max-dist=100 --limit=6`, intrabc ENABLED — `Aras-2`'s 109215 B stream has
+`--enable-intrabc=0` and default sb-size, so the two really are different
+streams, as they noted):
+
+| decode_idx | EC_SYMR reads | cumulative |
+|---|---|---|
+| 0 (**key**) | **82697** | 82697 |
+| 1 | 50717 | 133414 |
+| 2 | 120835 | 254249 |
+| 3 | 62579 | 316828 |
+| 4 | 102367 | 419195 |
+| 5 | 121957 | 541152 |
+
+**First fork: read 125511 — inside `decode_idx=1` (82698..133414), not the key
+frame. First fork within the key frame's 82697 reads: NONE.**
+
+### 10.2 What that settles
+
+The key frame's 49 chroma samples (first `U(200,201)` ours 160 vs ref 159) are
+**reconstruction-only**. That frame's entropy is bit-identical end to end, so
+nothing on the entropy side can be their cause — not the mu-chunk walk, not the
+plane threading, not the coefficient sets, not the transform-size derivation.
+`Aras-2`'s r1 walk fix and r6 plane threading are therefore not the cause of
+the 49, and their NOT-SETTLED "per-unit coefficient SETS agree or not" question
+— which is an entropy question — cannot answer it either.
+
+Two independent encodes (109909 B and 109215 B, different `--sb-size` and
+intrabc settings) both show a bit-locked key frame and a ~49-sample
+chroma-only key-frame divergence. That is one confirmed defect, and it is on
+the **reconstruction** side: after `decode_token_recon_block`, so at 4:4:4
+lossless the WHT path (`dequant_and_inverse_wht4x4` / `TxParams::run`), the
+prediction fetch, or the post-recon filter chain.
+
+### 10.3 The correction to my own handoff
+
+I told `Aras-2` that read 125511 was "a genuine block-level walk divergence".
+The mi-label retraction (§8.1) stands, but that framing was still wrong in
+substance, because I had not measured the frame boundary when I sent it. The
+cell has **two symptoms, not one**:
+
+* **(a)** key frame, reconstruction-only, 49 chroma samples;
+* **(b)** frame 1+, an entropy fork at read 125511.
+
+They are not linked by reconstruction: frame 1's entropy does not depend on
+frame 0's pixels, and the CDF state carries across frames untouched by them.
+So **(b) is its own entropy defect** — `Aras-2`'s r1 walk fix closed their (b)
+at read 123121 without closing (a). `Aras-2`'s ordered-(plane, position,
+nz-count) sequence diff remains the right decisive test for (b); for (a) the
+search space is now confined to the reconstruction stage.
+
+### 10.4 A pairing-script bug worth recording
+
+My first ladder script compared the `cdf0` field directly across the two sides.
+That is the one field whose convention differs — ours is PRE-adapt, the
+oracle's is POST-adapt, and the reconciliation is `32768 - ours_cdf0 ==
+theirs` (`msac.rs`'s own `EC_SYMR` doc). The corrected predicate is
+`(value, range, n, symbol, post_rng)`, with the `bit` field carrying a constant
+-15 offset on this stream. Re-running with the right field set **confirmed
+125511** — so the number I reported stands, but it survived a script that could
+not have been trusted to find it. A fork index from a script with a known-bad
+comparison field is a coincidence until re-derived.
