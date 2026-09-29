@@ -5582,23 +5582,52 @@ pub(crate) mod tests {
         }
     }
 
-    /// lane-svt1: an SVT-AV1 (v3.1.2, `-preset 8 -crf 35`) screen key frame
-    /// codes 16x16 PALETTE blocks with `skip == 1` whose `tx_depth` split the
-    /// luma transform. [`crate::decode::decode_block`] armed the palette
-    /// prediction only when the transform covered the whole block, so that one
-    /// block predicted DC off its own edges instead: the right symbols (the
-    /// whole mode ladder diffs clean against an instrumented aomdec) and the
-    /// wrong pixels -- 812 luma samples in frame 0, carried by the V_PRED
-    /// blocks under it to 10122 samples over the 12-frame stream.
+    /// lane-svt1: an SVT-AV1 (v3.1.2, `-preset 8`) screen key frame codes 16x16
+    /// PALETTE blocks with `skip == 1` whose `tx_depth` split the luma
+    /// transform. [`crate::decode::decode_block`] armed the palette prediction
+    /// only when the transform covered the whole block, so that one block
+    /// predicted DC off its own edges instead: the right symbols (the whole mode
+    /// ladder diffs clean against an instrumented aomdec) and the wrong pixels
+    /// -- 812 luma samples in frame 0, carried by the V_PRED blocks under it to
+    /// 10122 samples over the 12-frame stream the defect was found on.
     ///
-    /// No lavfi recipe witnesses it in a stream this decoder otherwise decodes:
-    /// 6 sources x 5 sizes x 6 crf values through `libsvtav1 -preset 8
-    /// -svtav1-params screen-content-mode=1` produced 8 streams that reach the
-    /// path, and every one of them either refuses on an unrelated Golomb tail
-    /// or misses by ~200k samples on unrelated inter-frame defects (both
-    /// recorded in `lanes/svt1.report.md`). So the gate rides the kept stream
-    /// named by `EC_AV1_SVT1_STREAM` and SKIPs when it is unset -- the screen
-    /// crop itself is never committed to `fixtures/`.
+    /// lane-av1pinspec2: the gate used to RIDE an external crop named by
+    /// `EC_AV1_SVT1_STREAM` and SKIP when that was unset, so it never ran on a
+    /// stock box -- which is exactly why its oracle count could not be pinned
+    /// (an assert on a gate that never executes is an unexercised assert wearing
+    /// a pin's clothes). It now runs on the COMMITTED pin
+    /// `crates/ec-av1/fixtures/svt1-split-tx-pin.obu`.
+    ///
+    /// The pin is a REPLAY, not a fresh capture, and the recipe is recorded
+    /// because it reproduces the bytes exactly (two independent encodes on this
+    /// box, SVT-AV1 v3.1.2, both sha256
+    /// `c9d9c0ae934fba72fc9a9374bc36853f290796a8a4d6442140e239669e0b341f`,
+    /// 1838 bytes):
+    ///
+    ///     ffmpeg -v error -f lavfi \
+    ///       -i "smptehdbars=s=192x152:r=12,drawgrid=w=8:h=8:t=1:c=black" \
+    ///       -frames:v 1 -c:v libsvtav1 -preset 8 -crf 50 \
+    ///       -svtav1-params "lp=1:screen-content-mode=1" -g 12 -f obu out.obu
+    ///
+    /// `-frames:v 1` is the part lane-svt1's search lacked: its 6x5x6 sweep ran
+    /// FOUR frames per stream, and the ~200k-sample misses that killed every
+    /// candidate were on the INTER frames (`lanes/svt1.report.md`). One key
+    /// frame has no inter frames, and this one reaches the fixed arm
+    /// (`skip_split_tx_override_hits == 1`) and is pixel-exact.
+    ///
+    /// THE COUNT, and why it is derived from the wire rather than from a
+    /// literal. The oracle is handed the number of frame OBUs this stream
+    /// actually codes, counted with `Av1Parser` below -- never our decode's
+    /// length, which is the thing under test. A header count would OVER-count
+    /// a stream carrying `show_existing_frame` (spec 5.9.5: it codes no pixels,
+    /// so the header count is larger than the shown-frame count), so that case
+    /// is asserted impossible on this pin rather than assumed: the loop refuses
+    /// any frame header with `show_existing_frame` set, which is what makes
+    /// "one header == one shown frame" a checked fact here instead of an
+    /// argument.
+    ///
+    /// `EC_AV1_SVT1_STREAM` still overrides the pin, so a re-capture is one env
+    /// var away; `crate_pin` falls back to `pin_dir()` for the same reason.
     ///
     /// `skip_split_tx_override_hits` is asserted non-zero so the row cannot
     /// pass on a stream that never reaches the fixed arm (class
@@ -5606,29 +5635,67 @@ pub(crate) mod tests {
     #[test]
     fn an_svt_screen_palette_block_with_a_split_transform_decodes_exactly() {
         const NAME: &str = "an_svt_screen_palette_block_with_a_split_transform_decodes_exactly";
-        let Ok(path) = std::env::var("EC_AV1_SVT1_STREAM") else {
-            eprintln!("SKIP {NAME}: EC_AV1_SVT1_STREAM names no stream");
-            return;
-        };
+        const PIN: &str = "svt1-split-tx-pin.obu";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let data = match std::fs::read(&path) {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("SKIP {NAME}: {path}: {e}");
-                return;
-            }
+        let path = match std::env::var("EC_AV1_SVT1_STREAM") {
+            Ok(p) => std::path::PathBuf::from(p),
+            // The name is spelled as a LITERAL here even though `PIN` is right
+            // above, on purpose: `gate_coverage::pin_inventory` matches a pin
+            // read by the quote that follows the callee name, so a const
+            // argument would leave this pin outside the "every pin a gate reads
+            // is a committed crate-local copy" invariant. The dup is the
+            // coverage -- and it is also why this comment must NOT quote that
+            // spelling: the scanner reads prose too, and a quoted spelling here
+            // parses as a pin called " and would not see a const argument, ...".
+            Err(_) => crate_pin("svt1-split-tx-pin.obu"),
         };
+        let data = require_pin(&path, PIN);
+        // The ENCODE's frame count, read off the WIRE: parse this stream's own
+        // OBUs and count the frame headers. `show_existing_frame` is refused
+        // here on purpose -- such a header codes no pixels, so counting it
+        // would make this count larger than the frames the oracle can decode.
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut frame_headers = 0usize;
+        while pos < data.len() {
+            let Ok(obu) = parser.parse_obu(&data[pos..]) else {
+                break;
+            };
+            pos += obu.total_size.max(1);
+            let header = match &obu.kind {
+                ObuKind::Frame(h, _) | ObuKind::FrameHeader(h) => h,
+                _ => continue,
+            };
+            assert!(
+                !header.show_existing_frame,
+                "{NAME}: frame header {frame_headers} sets show_existing_frame, so the header \
+                 count is not the shown-frame count and this gate's oracle budget would be wrong"
+            );
+            frame_headers += 1;
+        }
+        assert!(
+            frame_headers > 0,
+            "{NAME}: {} carries no frame header at all",
+            path.display()
+        );
         crate::decode::reset_skip_split_tx_override_hits();
-        let decoded = decode_stream(&data).expect("the kept SVT-AV1 screen stream decodes");
+        let decoded = decode_stream(&data).expect("the pinned SVT-AV1 screen stream decodes");
         assert!(
             crate::decode::skip_split_tx_override_hits() > 0,
-            "{NAME}: no skipped split-transform palette block in {path} -- the gate would pass blind"
+            "{NAME}: no skipped split-transform palette block in {} -- the gate would pass blind",
+            path.display()
+        );
+        assert_eq!(
+            decoded.len(),
+            frame_headers,
+            "{NAME}: the stream codes {frame_headers} frame(s), the decode showed {}",
+            decoded.len()
         );
         let (width, height) = (decoded[0].width, decoded[0].height);
-        let want = ffmpeg_decode_sequence(&data, width, height, decoded.len());
+        let want = ffmpeg_decode_sequence(&data, width, height, frame_headers);
         for (i, (got, want)) in decoded.iter().zip(&want).enumerate() {
             assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg");
             assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg");
