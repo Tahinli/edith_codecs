@@ -271,6 +271,12 @@ fn main() {
         // lane-thread2: proof the frame-parallel path actually fired (0 at
         // the default EC_AV1_THREADS=1).
         println!("frames_dispatched: {}", ec_av1::stream::frames_dispatched());
+        // lane-av1recipehunt: `intra_rect4_in_inter` above already reports the
+        // 1:4-in-inter shapes; this is the `delta_q` half of the same story --
+        // how many delta_q groups the stream really carried, and how many of
+        // them landed inside a rect64 dequant.
+        let (dq, dq_drift) = ec_av1::stream::rect64_qidx_drift_counters();
+        println!("delta_q: groups_read={dq} rect64_qidx_drift={dq_drift}");
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
