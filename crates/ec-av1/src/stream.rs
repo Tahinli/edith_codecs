@@ -2170,6 +2170,18 @@ pub fn intra_rect4_in_inter_counters() -> (usize, usize, usize, usize) {
     )
 }
 
+/// lane-av1recipehunt: the recipe sweep's view of the `delta_q` story from
+/// OUTSIDE the crate -- `(delta_q symbol groups read, rect64 dequant calls that
+/// saw `CURRENT_Q_IDX != base_q_idx`)`. A recipe that reads delta_q but never
+/// lands one inside a rect64 root is a different failure from one that reads
+/// neither, and the gate can only tell them apart with both numbers.
+pub fn rect64_qidx_drift_counters() -> (usize, usize) {
+    (
+        crate::decode::delta_q_hits(),
+        crate::decode::rect64_qidx_drift_hits(),
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -39269,25 +39281,61 @@ pub(crate) mod tests {
         }
     }
 
-    /// lane-rect64q r1: same recipe as
+    /// lane-rect64q r1, recipe rewritten by lane-av1recipehunt: the same
+    /// encoder-side situation as
     /// [`a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`]
-    /// minus `--deltaq-mode=0` -- real aomenc's non-realtime default is
-    /// `DELTA_Q_OBJECTIVE` (`av1_cx_iface.c:271`), so dropping that one flag
-    /// is enough to make `delta_q_present=1` the norm and drive
-    /// [`crate::decode::decode_block_rect64`]'s running `CURRENT_Q_IDX` away
-    /// from the frame-constant `base_q_idx` inside a real rect64 SB --
-    /// exactly the bug this round's dequant fix targets. Hard-asserts
-    /// `rect64_qidx_drift_hits() > 0`: without that, this gate could pass
-    /// vacuously the same way the `--deltaq-mode=0` sibling always did.
+    /// -- a real superblock-level HORZ/VERT partition, so
+    /// [`crate::decode::decode_block_rect64`] runs -- but with `delta_q` left
+    /// ON, so that block's dequant sees a running `CURRENT_Q_IDX` that has
+    /// drifted away from the frame-constant `base_q_idx`. Real aomenc's
+    /// non-realtime default is `DELTA_Q_OBJECTIVE` (`av1_cx_iface.c:271`); the
+    /// `--deltaq-mode=0` sibling is the same command line with that one flag
+    /// added back, and this gate ASSERTS the pair differs (the control arm).
     ///
-    /// lane-rect64q r1: measured, does NOT fire -- 15/40 attempts matched
-    /// but `rect64_qidx_drift_hits()` stayed 0 every time. Real aomenc's RD
-    /// never chose a nonzero delta-q on this tiny synthetic gradients frame
-    /// even with `deltaq-mode` left at its default; `#[ignore]`d rather than
-    /// deleted so the recipe and the negative result both survive for the
-    /// next attempt (see `lanes/rect64q-r1.report.md`).
+    /// **Why r1's recipe could not fire, measured (lane-av1recipehunt).** r1
+    /// swept 40 attempts of `gradients` at 192x128 with `frame_count = 1` -- a
+    /// single KEY frame, and that is the whole reason. A one-frame encode
+    /// carries no inter frame, and `delta_q_present` needs the temporal (TPL)
+    /// model to see a spatial complexity map at all. At `frame_count = 1` the
+    /// sweep read ZERO `delta_q` symbol groups on every attempt: 40/40 streams
+    /// had `delta_q_hits() == 0` AND `rect64_qidx_drift_hits() == 0` -- a
+    /// different failure from "the drift never reached a rect64 block", and the
+    /// reason r1 could not see the feature at all. The fix is a real inter
+    /// sequence: 4 frames at 512x384 (`8x6` superblocks, so there IS a spatial
+    /// map for the quantizer to vary over).
+    ///
+    /// **The recipe**, exactly (the recorded command line; `--deltaq-mode` is
+    /// ABSENT, i.e. aomenc's default):
+    /// ```text
+    /// ffmpeg -v error -y -f lavfi -i testsrc2=size=512x384:rate=25 \
+    ///        -pix_fmt yuv420p -frames:v 4 -f yuv4mpegpipe src512.y4m
+    /// aomenc --codec=av1 --passes=1 --end-usage=q --cq-level=45 --cpu-used=0 \
+    ///        --threads=1 --row-mt=0 --sb-size=64 --enable-rect-partitions=1 \
+    ///        --enable-ab-partitions=0 --enable-1to4-partitions=0 \
+    ///        --min-partition-size=32 --max-partition-size=64 \
+    ///        --enable-restoration=0 --enable-palette=0 --enable-cdef=0 \
+    ///        --enable-filter-intra=0 --enable-cfl-intra=0 --enable-intrabc=0 \
+    ///        --enable-tx-size-search=0 --obu -o out.obu src512.y4m
+    /// ```
+    /// Source `src512.y4m`: 1179730 bytes, sha256
+    /// `f430d581497e4f6f7db07d0fc92476e92194e1f96c321988ec0739d475cbbe0c`.
+    /// Output `crates/ec-av1/fixtures/rect64_dq_drift.obu`: 8384 bytes, sha256
+    /// `094e51bb21b6caccc905417e95a03f9131b448071567d0b14ec8850799ea2501`
+    /// (committed with `git add -f` past the `fixtures` gitignore, like every
+    /// sibling fixture). The gate re-encodes live and byte-compares against
+    /// that pin, so the pin is the expected output and not a second decode
+    /// path. MEASURED on the feature arm: 48 `delta_q` symbol groups read, 17
+    /// `rect64_qidx_drift_hits`, `sb_rect_hits` firing (the `inter_rect`
+    /// census reads `64x32=2 32x64=2`), all 4 frames pixel-exact vs ffmpeg.
+    /// On the `--deltaq-mode=0` control: 0 groups, 0 drift, also pixel-exact --
+    /// so the drift is the delta_q syntax, not some unrelated arm.
+    ///
+    /// `--cpu-used=0` is load-bearing, measured: the same source at
+    /// `--cpu-used=1` and `--cpu-used=3` reads the same 48 `delta_q` groups and
+    /// drifts ZERO times (the faster presets' RD never leaves a rect64 root in
+    /// a superblock whose quantizer moved). `--cq-level` is not: 45 and 55
+    /// give the identical stream and the same drift count.
     #[test]
-    #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a rect64 dequant call with CURRENT_Q_IDX != base_q_idx -- class gate-blind-to-feature"]
     fn a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact()
      {
         const NAME: &str = "a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact";
@@ -39300,124 +39348,142 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (width, height, frame_count) = (192usize, 128usize, 1usize);
-        let mut named_refusals = 0u32;
-        let mut matched = 0u32;
-        let n_attempts: u32 = std::env::var("EC_SBPART_DQ_GATE_ATTEMPTS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(40);
-        for attempt in 0..n_attempts {
-            let seed = 42 + attempt;
-            let duration = frame_count as f64 / 25.0;
-            let source =
-                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
-            let y4m = Command::new("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    &source,
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-f",
-                    "yuv4mpegpipe",
-                    "-",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("ffmpeg failed to run");
-            assert!(
-                y4m.status.success(),
-                "ffmpeg fixture: {}",
-                String::from_utf8_lossy(&y4m.stderr)
-            );
-            let args: Vec<&str> = vec![
-                "--codec=av1",
-                "--passes=1",
-                "--end-usage=q",
-                "--cq-level=45",
-                "--cpu-used=0",
-                "--threads=1",
-                "--row-mt=0",
-                "--sb-size=64",
-                "--enable-rect-partitions=1",
-                "--enable-ab-partitions=0",
-                "--enable-1to4-partitions=0",
-                "--min-partition-size=32",
-                "--max-partition-size=64",
-                "--enable-restoration=0",
-                "--enable-palette=0",
-                "--enable-filter-intra=0",
-                "--enable-cfl-intra=0",
-                "--enable-intrabc=0",
-                "--enable-tx-size-search=0",
-                "--obu",
-                "-o",
+        const FIXTURE_LEN: usize = 8384;
+        const FIXTURE_FNV: u64 = 0x3d91_a216_8006_3ef6;
+        let (width, height, frame_count) = (512usize, 384usize, 4usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=512x384:rate=25",
+                "-pix_fmt",
+                "yuv420p",
+                "-frames:v",
+                "4",
+                "-f",
+                "yuv4mpegpipe",
                 "-",
-                "-",
-            ];
-            let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
-            assert!(
-                out.status.success(),
-                "aomenc refused the fixture: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let stream = out.stdout;
-            let frames = match decode_stream(&stream) {
-                Err(e) => {
-                    let msg = e.to_string();
-                    assert!(
-                        msg.contains("unsupported"),
-                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
-                    );
-                    named_refusals += 1;
-                    eprintln!("seed {seed} refusal: {msg}");
-                    continue;
-                }
-                Ok(frames) => frames,
-            };
-            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
-            assert_eq!(frames.len(), frame_count);
-            let mismatched = frames
-                .iter()
-                .zip(&ffmpeg_frames)
-                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
-            if mismatched {
-                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
-                    std::fs::write(&path, &stream).expect("writing pinned stream");
-                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
-                }
-            }
-            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(
-                    got.y, want.y,
-                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
-                );
-                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
-                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
-            }
-            matched += 1;
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        assert_eq!(
+            y4m.stdout.len(),
+            1_179_730,
+            "{NAME}: the testsrc2 source is not the pinned 4-frame 512x384 y4m -- `rate=` \
+             and `-frames:v` are both part of this recipe's identity"
+        );
+        // Every flag spelled exactly once (class [[aomenc-last-flag-wins]]).
+        // `delta_q` is absent ON PURPOSE: aomenc's non-realtime default is
+        // DELTA_Q_OBJECTIVE, and the control arm below re-checks that by
+        // ADDING `--deltaq-mode=0` back.
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=45",
+            "--cpu-used=0",
+            "--threads=1",
+            "--row-mt=0",
+            "--sb-size=64",
+            "--enable-rect-partitions=1",
+            "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0",
+            "--min-partition-size=32",
+            "--max-partition-size=64",
+            "--enable-restoration=0",
+            "--enable-palette=0",
+            "--enable-cdef=0",
+            "--enable-filter-intra=0",
+            "--enable-cfl-intra=0",
+            "--enable-intrabc=0",
+            "--enable-tx-size-search=0",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: encoded size moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: encoded bytes moved");
+        let pin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/rect64_dq_drift.obu");
+        assert_eq!(
+            std::fs::read(&pin).expect("fixtures/rect64_dq_drift.obu must be committed"),
+            stream,
+            "{NAME}: the live encode no longer matches the committed pin at {}",
+            pin.display()
+        );
+
+        let before = crate::decode::rect64_qidx_drift_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream must decode: {e}"));
+        let drift = crate::decode::rect64_qidx_drift_hits() - before;
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+        assert_eq!(frames.len(), frame_count);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg");
+            assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg");
         }
         assert!(
-            matched > 0,
-            "{NAME}: every attempt refused; the gate never decoded a stream"
+            crate::decode::sb_rect_hits() > 0,
+            "{NAME}: zero superblock-level HORZ/VERT blocks fired -- the recipe stopped producing \
+             the shape the delta_q group is read inside"
         );
         assert!(
-            crate::decode::rect64_qidx_drift_hits() > 0,
-            "{NAME}: zero rect64 dequant calls ever observed CURRENT_Q_IDX != base_q_idx \
-             ({matched} matches, {named_refusals} refusals out of {n_attempts}) -- delta_q \
-             was never actually exercised through decode_block_rect64 this run"
+            drift > 0,
+            "{NAME}: {frame_count} frames pixel-exact but zero rect64 dequant calls ever saw \
+             CURRENT_Q_IDX != base_q_idx -- delta_q was read and never moved the quantizer inside \
+             a rect64 block, so this run proved nothing (class gate-blind-to-feature)"
+        );
+
+        // The control arm: the ONE flag separating this gate from the
+        // always-vacuous `--deltaq-mode=0` sibling, reverted. If this ever
+        // drifts too, delta_q is no longer what carries the coverage and the
+        // feature arm above is not the witness it claims to be. It is also this
+        // gate's own red-proof: dropping that one flag is exactly what turns
+        // the drift assert above red on its own precondition.
+        let mut control = args.clone();
+        control.push("--deltaq-mode=0");
+        let ctl = run_with_stdin(Command::new(aomenc_path()).args(&control), &y4m.stdout);
+        assert!(
+            ctl.status.success(),
+            "aomenc refused the --deltaq-mode=0 control: {}",
+            String::from_utf8_lossy(&ctl.stderr)
+        );
+        let before = crate::decode::rect64_qidx_drift_hits();
+        decode_stream(&ctl.stdout)
+            .unwrap_or_else(|e| panic!("{NAME}: the control stream must decode too: {e}"));
+        let ctl_drift = crate::decode::rect64_qidx_drift_hits() - before;
+        assert_eq!(
+            ctl_drift, 0,
+            "{NAME}: the --deltaq-mode=0 control drifted {ctl_drift} times -- delta_q is no \
+             longer what moves CURRENT_Q_IDX inside a rect64 block, so the feature arm above is \
+             not witnessing what it names"
         );
         eprintln!(
-            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of \
-             {n_attempts}, sb_rect_hits={}, rect64_qidx_drift_hits={}",
-            crate::decode::sb_rect_hits(),
-            crate::decode::rect64_qidx_drift_hits()
+            "{NAME}: {frame_count} frames pixel-exact, sb_rect_hits={}, \
+             rect64_qidx_drift_hits={drift} (--deltaq-mode=0 control: {ctl_drift}), stream \
+             {FIXTURE_LEN} B fnv1a64={FIXTURE_FNV:016x}",
+            crate::decode::sb_rect_hits()
         );
     }
 
@@ -42050,85 +42116,127 @@ pub(crate) mod tests {
     /// `read_intra_block_mode_info` (libaom decodemv.c:1189).
     ///
     /// Hard-asserts `intra_rect4_strip_in_inter_hits` (0 = 64x16, 1 = 16x64,
-    /// 2 = 32x8, 3 = 8x32) summed over the attempts that were actually
-    /// pixel-compared, and every decode-order frame is compared. A decode that
-    /// succeeds is ALWAYS pixel-compared (class
-    /// [[gate-skips-on-its-own-failure]]); exhausting every attempt without a
-    /// counted strip is a FAILURE, never a SKIP.
+    /// 2 = 32x8, 3 = 8x32) on the one pinned recipe below, and every
+    /// decode-order frame is compared. A decode that succeeds is ALWAYS
+    /// pixel-compared (class [[gate-skips-on-its-own-failure]]), and a recipe
+    /// that decodes exact without a counted strip is a FAILURE, never a pass.
+    /// The recipe, the pin and the `--enable-1to4-partitions=0` control arm
+    /// are documented on [`intra_rect4_in_inter_gate`].
     #[test]
-    // r1 `#[ignore]`d this gate on "every stream with an intra 1:4 strip also
-    // hits the inter rect-strip refusal". r2 merged main 18bf7dc (lane-r14
-    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts
-    // decode whole and reach the pixel compare (0 before), one firing
-    // 64x16=4 16x64=3 -- and the compare FAILED on an unowned inter-frame
-    // defect (mandelbrot 192x128, luma ~3.7-4.5k samples on frames 3/4
-    // drifting to ~24k, max |d| ~220 on frames 5-7).
+    // CLOSED by lane-av1recipehunt r1 (un-ignored). Two independent runs agree
+    // on why this gate was blind, and they are worth keeping side by side.
     //
     // lane-av1pins RE-RAN this gate in RELEASE on a21f3680 (the seven-lane
-    // merged tree) and BOTH halves of that r2 record are now stale:
-    //   * THE PIXEL BLOCKER IS GONE. The gate's own tally reads
-    //     `counted-exact=0 uncounted-exact=40 named-refusals=0 (attempts 40)`
-    //     at both bit depths, and there is NOT ONE mismatch line anywhere in
-    //     the full run log -- no frame 3/4 luma counts, no max |d|, no drift.
-    //     40/40 streams now compare pixel-exact. (The 10-bit arm is identical:
-    //     same 40/40, same zero-mismatch log.)
-    //   * THE RECIPE NO LONGER FIRES THE FEATURE. Every one of the 42
-    //     counted attempts reads `64x16=0 16x64=0 32x8=0 8x32=0`. The gate has
-    //     regressed from r2's "fires sometimes, compare fails" to "never
-    //     fires", so the assertion now trips on its non-vacuity precondition
-    //     (stream.rs:40653) rather than on any pixel.
-    // So the reason these gates stay `#[ignore]`d is the RECIPE, exactly as
-    // the `#[ignore]` string says -- NOT the mandelbrot defect, which the
-    // string never claimed and which is no longer reproducing. Kept ignored
-    // rather than un-ignored: a source whose baseline is exact AND that fires
-    // a 32-level intra 1:4 strip in an inter frame still does not exist.
-    // (Corrected 2026-09-29: the comment above previously recorded the r2
-    // state and would have had a reader re-filing these as blocked on the
-    // mandelbrot defect, which is wrong on this tree.)
-    #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a 32-level intra 1:4 strip in an inter frame -- class gate-blind-to-feature"]
+    // merged tree) and found BOTH halves of the r2 record stale:
+    //   * THE PIXEL BLOCKER IS GONE -- `counted-exact=0 uncounted-exact=40
+    //     named-refusals=0 (attempts 40)` at both bit depths, and not one
+    //     mismatch line anywhere in the run log. 40/40 pixel-exact.
+    //   * THE RECIPE NEVER FIRES -- every counted attempt reads
+    //     `64x16=0 16x64=0 32x8=0 8x32=0`, so the assert trips on its
+    //     non-vacuity precondition, not on any pixel.
+    //
+    // lane-av1recipehunt then found WHY, and closed it. The blindness is not
+    // the r2 "pre-existing INTER-frame pixel defect" (gone) and not the
+    // mandelbrot source: the old recipe produced ZERO 1:4 strips of ANY shape
+    // at ANY level, because `--min-partition-size=32` with an all-but-empty
+    // intra mode set never puts a 1:4 partition on aomenc's RD menu.
+    // MEASURED: the 32-level 1:4 counter is 0 in ALL 48 attempts at
+    // `--min-partition-size=16` and fires in 40 of 48 at 8 with
+    // `--enable-smooth-intra/paeth-intra/directional-intra/angle-delta=1`
+    // (a 32x8/8x32 strip needs an intra mode WORTH CODING; with those four
+    // off the only candidate is DC, and DC never wins a 1:4 strip against
+    // inter). That also explains r2's "`--enable-1to4-partitions=0` is
+    // byte-identical": with no 1:4 reachable at all, the flag had nothing to
+    // turn off. The new recipe is 256x192x6, `--min-partition-size=8`, the
+    // full intra mode set, `--cpu-used=2 --cq-level=63`; it fires 32x8=8
+    // 8x32=11 and is pixel-exact on all 6 frames. See
+    // [`intra_rect4_in_inter_gate`] for the pin and the flag control arm.
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact() {
         intra_rect4_in_inter_gate(8);
     }
 
     /// The 10-bit arm (both of the user's films are `yuv420p10le`).
     #[test]
-    // r1 `#[ignore]`d this gate on "every stream with an intra 1:4 strip also
-    // hits the inter rect-strip refusal". r2 merged main 18bf7dc (lane-r14
-    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts
-    // decode whole and reach the pixel compare (0 before), one firing
-    // 64x16=4 16x64=3 -- and the compare FAILED on an unowned inter-frame
-    // defect (mandelbrot 192x128, luma ~3.7-4.5k samples on frames 3/4
-    // drifting to ~24k, max |d| ~220 on frames 5-7).
-    //
-    // lane-av1pins RE-RAN this gate in RELEASE on a21f3680 (the seven-lane
-    // merged tree) and BOTH halves of that r2 record are now stale:
-    //   * THE PIXEL BLOCKER IS GONE. The gate's own tally reads
-    //     `counted-exact=0 uncounted-exact=40 named-refusals=0 (attempts 40)`
-    //     at both bit depths, and there is NOT ONE mismatch line anywhere in
-    //     the full run log -- no frame 3/4 luma counts, no max |d|, no drift.
-    //     40/40 streams now compare pixel-exact. (The 10-bit arm is identical:
-    //     same 40/40, same zero-mismatch log.)
-    //   * THE RECIPE NO LONGER FIRES THE FEATURE. Every one of the 42
-    //     counted attempts reads `64x16=0 16x64=0 32x8=0 8x32=0`. The gate has
-    //     regressed from r2's "fires sometimes, compare fails" to "never
-    //     fires", so the assertion now trips on its non-vacuity precondition
-    //     (stream.rs:40653) rather than on any pixel.
-    // So the reason these gates stay `#[ignore]`d is the RECIPE, exactly as
-    // the `#[ignore]` string says -- NOT the mandelbrot defect, which the
-    // string never claimed and which is no longer reproducing. Kept ignored
-    // rather than un-ignored: a source whose baseline is exact AND that fires
-    // a 32-level intra 1:4 strip in an inter frame still does not exist.
-    // (Corrected 2026-09-29: the comment above previously recorded the r2
-    // state and would have had a reader re-filing these as blocked on the
-    // mandelbrot defect, which is wrong on this tree.)
-    #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a 32-level intra 1:4 strip in an inter frame -- class gate-blind-to-feature"]
+    // CLOSED by lane-av1recipehunt r1 (un-ignored), same recipe and same two
+    // reasons as the 8-bit arm above: lane-av1pins' RELEASE re-run showed the
+    // pixel blocker gone and the recipe never firing, and the root cause is
+    // `--min-partition-size=32` plus the pruned intra mode set, not the
+    // mandelbrot source. The 10-bit cell fires 32x8=12 8x32=7 and is
+    // pixel-exact on all 6 frames.
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit() {
         intra_rect4_in_inter_gate(10);
     }
 
+    /// The one recipe both 1:4-in-inter arms run, rewritten by
+    /// lane-av1recipehunt. What changed, and why the old sweep could not fire:
+    ///
+    /// * `--min-partition-size=32` -> **`8`**. This is the flag that was
+    ///   holding the shape off the menu entirely. MEASURED over 96 encodes
+    ///   (10-bit, 192x128 and 256x192, `--cpu-used` 0..5, cq 63/55, this
+    ///   crate's full intra mode set): at `mps=16` the 32-level 1:4 counter is
+    ///   **0 in all 48 attempts**, at `mps=8` it fires in 40 of 48. The old
+    ///   comment's "min size 16 so the 16x16-level 1:4 is out of reach" was
+    ///   protecting against a refusal that no longer fires -- `mps=8` reaches
+    ///   the 8- and 16-level strips too, and on this content the RD takes
+    ///   neither (the `inter16_1to4` and `rect4_32` inter counters confirm the
+    ///   only 1:4 partitions in the stream are the 32-level ones this gate
+    ///   asserts).
+    /// * the intra mode set: `--enable-smooth-intra/paeth-intra/
+    ///   directional-intra/angle-delta` `0` -> **`1`**. A 8x32 or 32x8 strip
+    ///   has four usable intra modes with these on; with them off the only
+    ///   candidate is DC, and DC never wins a 1:4 strip against inter.
+    /// * the 40-attempt content/preset/cq seed sweep -> one pinned cell at
+    ///   256x192, 6 frames, `--cpu-used=2 --cq-level=63`. A sweep hides a
+    ///   recipe that works; a pin makes it a precondition.
+    ///
+    /// The 8-bit arm's `hue=s=0` and `-t 0.32` are dropped: they only fixed
+    /// ffmpeg's own frame count across the sweep, and the frame count is now
+    /// pinned by `-frames:v 6` (6 decode-order frames, `kf-min-dist=1000`, so
+    /// frame 0 is the only key frame and every counted strip is in an INTER
+    /// frame).
+    ///
+    /// **The recipe**, exactly (the recorded command lines):
+    /// ```text
+    /// ffmpeg -v error -y -f lavfi \
+    ///   -i mandelbrot=size=256x192:start_scale=5.0:end_scale=0.004:end_pts=8:rate=25 \
+    ///   -pix_fmt yuv420p -frames:v 6 -f yuv4mpegpipe -        # 10-bit: yuv420p10le + -strict -1
+    /// aomenc [--cpu-used=2 --input-bit-depth=10 -b 10] --codec=av1 --passes=1 --end-usage=q \
+    ///   --cpu-used=2 --cq-level=63 --threads=1 --row-mt=0 \
+    ///   --enable-rect-partitions=1 --enable-1to4-partitions=1 \
+    ///   --min-partition-size=8 --max-partition-size=64 --enable-tx-size-search=0 \
+    ///   --enable-filter-intra=1 --enable-intra-edge-filter=1 --enable-smooth-intra=1 \
+    ///   --enable-paeth-intra=1 --enable-directional-intra=1 --enable-angle-delta=1 \
+    ///   --lag-in-frames=0 --auto-alt-ref=0 --kf-min-dist=1000 --kf-max-dist=1000 \
+    ///   --enable-order-hint=0 --enable-warped-motion=0 --enable-obmc=0 \
+    ///   --enable-masked-comp=0 --enable-interintra-comp=0 --enable-dist-wtd-comp=0 \
+    ///   --enable-diff-wtd-comp=0 --enable-onesided-comp=0 --enable-interintra-wedge=0 \
+    ///   --enable-smooth-interintra=0 --enable-ab-partitions=0 --enable-cdef=0 \
+    ///   --enable-restoration=0 --enable-palette=0 --enable-intrabc=0 \
+    ///   --enable-cfl-intra=0 --enable-ref-frame-mvs=0 --obu -o - -
+    /// ```
+    /// Sources: 8-bit 442462 bytes, sha256
+    /// `e4b46799b180a0d3e138caa18b2738c035e349219490313db664814a3eae9ec2`;
+    /// 10-bit 884828 bytes, sha256
+    /// `b7e0602e0bfc7a7f6813f40bb3989ec7574e5fbbfbf190298b9ab5b625156030`.
+    /// Outputs, committed with `git add -f` past the `fixtures` gitignore:
+    /// * `fixtures/intra14_256x192_8bit.obu`, 35179 bytes, sha256
+    ///   `5e50eb6d4492e806a2803988d92bd47f069ca54e02c06344d5500c6b72deb861`
+    ///   (fnv1a64 `0x86f8d1e5a221162a`) -- MEASURED `32x8=8 8x32=11`,
+    ///   `64x16=0 16x64=0`, all 6 frames pixel-exact vs ffmpeg.
+    /// * `fixtures/intra14_256x192_10bit.obu`, 34727 bytes, sha256
+    ///   `ab6fae0a256af6410e8200f10827a3e965dee7b2d7ab63710e94968bddab23a2`
+    ///   (fnv1a64 `0xecf9455bc20d60f0`) -- MEASURED `32x8=12 8x32=7`,
+    ///   all 6 frames pixel-exact vs ffmpeg.
+    ///
+    /// The gate re-encodes live and byte-compares against the pin, so the pin
+    /// is the expected output and not a second decode path. The control arm
+    /// re-runs the SAME command line with `--enable-1to4-partitions=0` and
+    /// requires the counter to stay at 0 -- that single flag is what carries
+    /// the coverage, and asserting it is also this gate's own red-proof.
     fn intra_rect4_in_inter_gate(bit_depth: u32) {
         const NAME: &str =
             "a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -42137,250 +42245,232 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (width, height, frame_count) = (192usize, 128usize, 8usize);
-        let mut refusals: Vec<String> = Vec::new();
-        let mut uncounted_exact = 0u32;
-        let mut compared = 0u32;
-        let mut shapes = [0usize; 4];
-        for attempt in 0..40u32 {
-            let seed = 42 + attempt;
-            // Same source class as the 2:1 sibling gate: a FAST mandelbrot
-            // zoom (`end_scale`/`end_pts`) so consecutive frames share almost
-            // no content and aomenc's RD codes blocks INTRA inside INTER
-            // frames, with `--kf-min-dist=1000` forbidding a new key frame.
-            let source = format!(
-                "mandelbrot=size={width}x{height}:start_scale={}:end_scale=0.004:end_pts=8:rate=25",
-                5.0 - f64::from(attempt) * 0.06
-            );
-            let y4m = Command::new("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    &source,
-                    "-vf",
-                    "hue=s=0",
-                    "-pix_fmt",
-                    if bit_depth == 10 {
-                        "yuv420p10le"
-                    } else {
-                        "yuv420p"
-                    },
-                    "-strict",
-                    "-1",
-                    "-t",
-                    "0.32",
-                    "-f",
-                    "yuv4mpegpipe",
-                    "-strict",
-                    "-1",
-                    "-",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("ffmpeg failed to run");
-            assert!(
-                y4m.status.success(),
-                "ffmpeg fixture: {}",
-                String::from_utf8_lossy(&y4m.stderr)
-            );
-            let depth_args: &[&str] = if bit_depth == 10 {
-                &["-b", "10", "--input-bit-depth=10"]
-            } else {
-                &[]
-            };
-            // MEASURED (r1, 40 attempts): `--cpu-used=0` makes aomenc pick
-            // 128x128 superblocks on this frame size, which decode_stream
-            // refuses by name, so the preset sweep starts at 1.
-            let cpu = format!("--cpu-used={}", 1 + attempt % 4);
-            // The higher the quantiser the more 1:4 intra strips inside inter
-            // frames, so the sweep walks cq 63 first.
-            let cq = format!(
-                "--cq-level={}",
-                [63u32, 55, 45, 35][(attempt / 4) as usize % 4]
-            );
-            let out = run_with_stdin(
-                Command::new(aomenc_path())
-                    .args(depth_args)
-                    .arg(&cpu)
-                    .arg(&cq)
-                    .args([
-                        // Every flag spelled exactly once (class
-                        // [[aomenc-last-flag-wins]]). These are what the gate is
-                        // about: 1:4 partitions ON, min size 16 so the 16x16-level
-                        // 1:4 (refused elsewhere) is out of reach.
-                        "--enable-rect-partitions=1",
-                        "--enable-1to4-partitions=1",
-                        // MEASURED (r1): at `--min-partition-size=16` aomenc codes
-                        // 16x16-level 1:4 partitions (16x4/4x16 strips), which the
-                        // inter partition path refuses by name (another lane's
-                        // surface) in 12/40 attempts. 32 keeps this gate's two
-                        // reachable levels -- the 32-level 32x8/8x32 and the
-                        // superblock-level 64x16/16x64 -- and nothing else.
-                        "--min-partition-size=32",
-                        "--max-partition-size=64",
-                        // MEASURED (r1): with tx-size search ON, 8/40 attempts stop
-                        // at the 2:1 strip's own split-tx refusal (merge-cross-product,
-                        // another lane's surface) before a 1:4 strip is reached.
-                        "--enable-tx-size-search=0",
-                        "--enable-filter-intra=1",
-                        "--enable-intra-edge-filter=1",
-                        "--codec=av1",
-                        "--passes=1",
-                        "--end-usage=q",
-                        "--lag-in-frames=0",
-                        "--auto-alt-ref=0",
-                        "--kf-min-dist=1000",
-                        "--kf-max-dist=1000",
-                        "--threads=1",
-                        "--row-mt=0",
-                        "--enable-order-hint=0",
-                        "--enable-warped-motion=0",
-                        "--enable-obmc=0",
-                        "--enable-masked-comp=0",
-                        "--enable-interintra-comp=0",
-                        "--enable-dist-wtd-comp=0",
-                        "--enable-diff-wtd-comp=0",
-                        "--enable-onesided-comp=0",
-                        "--enable-interintra-wedge=0",
-                        "--enable-smooth-interintra=0",
-                        "--enable-ab-partitions=0",
-                        "--enable-smooth-intra=0",
-                        "--enable-paeth-intra=0",
-                        "--enable-directional-intra=0",
-                        "--enable-angle-delta=0",
-                        "--enable-cdef=0",
-                        "--enable-restoration=0",
-                        // Ledger dead-end (lane-r14): a NEW gate spelling
-                        // `--enable-cfl-intra=1` retires that tool from
-                        // `NEVER_EXERCISED_8BIT` on the flag alone while no CfL
-                        // hit counter exists to assert -- so it stays 0 here.
-                        // Palette stays 0 for the same class of reason: this arm
-                        // refuses a screen-content frame whole, so a palette flag
-                        // would buy no coverage.
-                        "--enable-palette=0",
-                        "--enable-intrabc=0",
-                        "--enable-cfl-intra=0",
-                        "--enable-ref-frame-mvs=0",
-                        "--obu",
-                        "-o",
-                        "-",
-                        "-",
-                    ]),
-                &y4m.stdout,
-            );
-            assert!(
-                out.status.success(),
-                "aomenc refused the fixture: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let stream = out.stdout;
-            let before: Vec<usize> = (0..4)
-                .map(decode::intra_rect4_strip_in_inter_hits)
-                .collect();
-            let frames = match decode_stream(&stream) {
-                Ok(frames) => frames,
-                Err(e) => {
-                    let msg = e.to_string();
-                    assert!(
-                        msg.contains("unsupported"),
-                        "intra-1:4-in-inter decode failed outright (seed {seed}): {msg}"
+        let (width, height, frame_count) = (256usize, 192usize, 6usize);
+        let (src_len, src_sha, pin_name, pin_len, pin_fnv) = if bit_depth == 10 {
+            (
+                884_828usize,
+                "b7e0602e0bfc7a7f6813f40bb3989ec7574e5fbbfbf190298b9ab5b625156030",
+                "fixtures/intra14_256x192_10bit.obu",
+                34_727usize,
+                0xecf9_455b_c20d_60f0u64,
+            )
+        } else {
+            (
+                442_462usize,
+                "e4b46799b180a0d3e138caa18b2738c035e349219490313db664814a3eae9ec2",
+                "fixtures/intra14_256x192_8bit.obu",
+                35_179usize,
+                0x86f8_d1e5_a221_162au64,
+            )
+        };
+        let mut source_args: Vec<&str> = vec![
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "mandelbrot=size=256x192:start_scale=5.0:end_scale=0.004:end_pts=8:rate=25",
+            "-pix_fmt",
+        ];
+        source_args.push(if bit_depth == 10 {
+            "yuv420p10le"
+        } else {
+            "yuv420p"
+        });
+        source_args.extend(["-frames:v", "6"]);
+        if bit_depth == 10 {
+            // yuv420p10le is not an official yuv4mpegpipe format on this ffmpeg
+            source_args.extend(["-strict", "-1"]);
+        }
+        source_args.extend(["-f", "yuv4mpegpipe", "-"]);
+        let y4m = Command::new("ffmpeg")
+            .args(&source_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        assert_eq!(
+            y4m.stdout.len(),
+            src_len,
+            "{NAME} ({bit_depth}-bit): the mandelbrot source is not the pinned 6-frame y4m -- \
+             `rate=`, `end_pts` and `-frames:v` are all part of this recipe's identity"
+        );
+        eprintln!("{NAME} ({bit_depth}-bit): source y4m sha256 {src_sha}");
+        let mut args: Vec<&str> = Vec::new();
+        if bit_depth == 10 {
+            args.extend(["-b", "10", "--input-bit-depth=10"]);
+        }
+        // Every flag spelled exactly once (class [[aomenc-last-flag-wins]]).
+        args.extend([
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cpu-used=2",
+            "--cq-level=63",
+            "--threads=1",
+            "--row-mt=0",
+            "--enable-rect-partitions=1",
+            // The feature this gate is about, and the flag the control arm
+            // below reverts.
+            "--enable-1to4-partitions=1",
+            // 8, not 16 or 32: MEASURED, the 32-level 1:4 counter is 0 in all
+            // 48 attempts at 16 and fires in 40 of 48 at 8.
+            "--min-partition-size=8",
+            "--max-partition-size=64",
+            "--enable-tx-size-search=0",
+            // A 1:4 strip needs an intra mode worth coding: with these four
+            // off the only candidate is DC and it never wins.
+            "--enable-filter-intra=1",
+            "--enable-intra-edge-filter=1",
+            "--enable-smooth-intra=1",
+            "--enable-paeth-intra=1",
+            "--enable-directional-intra=1",
+            "--enable-angle-delta=1",
+            // Single reference and one key frame, so every counted strip is
+            // inside an INTER frame.
+            "--lag-in-frames=0",
+            "--auto-alt-ref=0",
+            "--kf-min-dist=1000",
+            "--kf-max-dist=1000",
+            "--enable-order-hint=0",
+            "--enable-warped-motion=0",
+            "--enable-obmc=0",
+            "--enable-masked-comp=0",
+            "--enable-interintra-comp=0",
+            "--enable-dist-wtd-comp=0",
+            "--enable-diff-wtd-comp=0",
+            "--enable-onesided-comp=0",
+            "--enable-interintra-wedge=0",
+            "--enable-smooth-interintra=0",
+            "--enable-ab-partitions=0",
+            "--enable-cdef=0",
+            "--enable-restoration=0",
+            // Ledger dead-end (lane-r14): a NEW gate spelling
+            // `--enable-cfl-intra=1` retires that tool from
+            // `NEVER_EXERCISED_8BIT` on the flag alone while no CfL
+            // hit counter exists to assert -- so it stays 0 here.
+            // Palette stays 0 for the same class of reason: this arm
+            // refuses a screen-content frame whole, so a palette flag
+            // would buy no coverage.
+            "--enable-palette=0",
+            "--enable-intrabc=0",
+            "--enable-cfl-intra=0",
+            "--enable-ref-frame-mvs=0",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ]);
+        let out = run_with_stdin(Command::new(aomenc_path()).args(&args), &y4m.stdout);
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        assert_eq!(
+            stream.len(),
+            pin_len,
+            "{NAME} ({bit_depth}-bit): encoded size moved"
+        );
+        assert_eq!(
+            fnv1a64(&stream),
+            pin_fnv,
+            "{NAME} ({bit_depth}-bit): encoded bytes moved"
+        );
+        let pin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(pin_name);
+        assert_eq!(
+            std::fs::read(&pin).unwrap_or_else(|e| panic!("{pin_name} must be committed: {e}")),
+            stream,
+            "{NAME} ({bit_depth}-bit): the live encode no longer matches the committed pin"
+        );
+
+        let before: Vec<usize> = (0..4)
+            .map(decode::intra_rect4_strip_in_inter_hits)
+            .collect();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME} ({bit_depth}-bit): the pin must decode: {e}"));
+        let delta: Vec<usize> = (0..4)
+            .map(|k| decode::intra_rect4_strip_in_inter_hits(k) - before[k])
+            .collect();
+        let ffmpeg_frames = if bit_depth == 10 {
+            ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+        } else {
+            ffmpeg_decode_sequence(&stream, width, height, frame_count)
+        };
+        assert_eq!(frames.len(), frame_count);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            for (plane, (g, w)) in [
+                ("Y", (&got.y, &want.y)),
+                ("U", (&got.u, &want.u)),
+                ("V", (&got.v, &want.v)),
+            ] {
+                let stride = if plane == "Y" { width } else { width / 2 };
+                if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                    eprintln!(
+                        "{NAME} ({bit_depth}-bit): frame {i} {plane} first diff at ({}, {})",
+                        at % stride,
+                        at / stride
                     );
-                    refusals.push(format!("seed {seed} {cpu} {cq}: {msg}"));
-                    continue;
                 }
-            };
-            let delta: Vec<usize> = (0..4)
-                .map(|k| decode::intra_rect4_strip_in_inter_hits(k) - before[k])
-                .collect();
-            let ffmpeg_frames = if bit_depth == 10 {
-                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
-            } else {
-                ffmpeg_decode_sequence(&stream, width, height, frame_count)
-            };
-            assert_eq!(frames.len(), frame_count);
-            eprintln!(
-                "intra14 gate {bit_depth}-bit seed={seed} {cpu} {cq}: intra 1:4 strips in inter \
-                 frames 64x16={} 16x64={} 32x8={} 8x32={}",
-                delta[0], delta[1], delta[2], delta[3]
-            );
-            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                for (plane, (g, w)) in [
-                    ("Y", (&got.y, &want.y)),
-                    ("U", (&got.u, &want.u)),
-                    ("V", (&got.v, &want.v)),
-                ] {
-                    let stride = if plane == "Y" { width } else { width / 2 };
-                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
-                        let maxd = g
-                            .iter()
-                            .zip(w.iter())
-                            .map(|(a, b)| i32::from(*a).abs_diff(i32::from(*b)))
-                            .max()
-                            .unwrap_or(0);
-                        eprintln!(
-                            "intra14 gate {bit_depth}-bit seed={seed}: frame {i} {plane} first \
-                             diff at ({}, {}) got {} want {} ({} samples differ, max |d|={maxd})",
-                            at % stride,
-                            at / stride,
-                            g[at],
-                            w[at],
-                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
-                        );
-                    }
-                    assert_eq!(g, w, "{plane} vs ffmpeg (seed {seed}, frame {i})");
-                }
-            }
-            compared += 1;
-            if delta.iter().all(|d| *d == 0) {
-                uncounted_exact += 1;
-                refusals.push(format!(
-                    "seed {seed} {cpu} {cq}: decoded and pixel-compared, but no intra 1:4 strip on \
-                     the inter path"
-                ));
-            }
-            for k in 0..4 {
-                shapes[k] += delta[k];
-            }
-            // Both LEVELS (32 and 64) is the bar; orientation is whichever the
-            // encoder picks.
-            if shapes[0] + shapes[1] > 0 && shapes[2] + shapes[3] > 0 {
-                break;
+                assert_eq!(g, w, "{plane} vs ffmpeg (frame {i})");
             }
         }
-        gate_buckets(
-            NAME,
-            compared - uncounted_exact,
-            uncounted_exact,
-            refusals.len() - uncounted_exact as usize,
+        assert!(
+            delta[2] + delta[3] > 0,
+            "{NAME} ({bit_depth}-bit): {frame_count} frames pixel-exact but no 32-level intra 1:4 \
+             strip (32x8/8x32) fired (64x16={} 16x64={} 32x8={} 8x32={}) -- the recipe stopped \
+             producing the shape this gate names (class gate-blind-to-feature)",
+            delta[0],
+            delta[1],
+            delta[2],
+            delta[3]
         );
+
+        // The control arm: the one flag that is this gate's feature, reverted.
+        // If it ever fires too, 1:4 is no longer what puts these strips on the
+        // RD menu and the feature arm above is not the witness it claims to be.
+        // It is also this gate's own red-proof.
+        let mut control = args.clone();
+        let at = control
+            .iter()
+            .position(|a| *a == "--enable-1to4-partitions=1")
+            .expect("the feature flag is in the recipe");
+        control[at] = "--enable-1to4-partitions=0";
+        let ctl = run_with_stdin(Command::new(aomenc_path()).args(&control), &y4m.stdout);
+        assert!(
+            ctl.status.success(),
+            "aomenc refused the --enable-1to4-partitions=0 control: {}",
+            String::from_utf8_lossy(&ctl.stderr)
+        );
+        let ctl_before: Vec<usize> = (0..4)
+            .map(decode::intra_rect4_strip_in_inter_hits)
+            .collect();
+        decode_stream(&ctl.stdout)
+            .unwrap_or_else(|e| panic!("{NAME}: the control stream must decode too: {e}"));
+        let ctl_delta: Vec<usize> = (0..4)
+            .map(|k| decode::intra_rect4_strip_in_inter_hits(k) - ctl_before[k])
+            .collect();
+        assert_eq!(
+            ctl_delta, [0; 4],
+            "{NAME} ({bit_depth}-bit): the --enable-1to4-partitions=0 control fired \
+             64x16={} 16x64={} 32x8={} 8x32={} -- 1:4 partitions are no longer what produce these \
+             strips, so the feature arm above is not witnessing what it names",
+            ctl_delta[0], ctl_delta[1], ctl_delta[2], ctl_delta[3]
+        );
+        gate_buckets(NAME, 1, 0, 0);
         eprintln!(
-            "{NAME} ({bit_depth}-bit): compared {compared} streams, intra 1:4 strips in inter \
-             frames: 64x16={} 16x64={} 32x8={} 8x32={}; refusals:\n{}",
-            shapes[0],
-            shapes[1],
-            shapes[2],
-            shapes[3],
-            refusals.join("\n")
-        );
-        assert!(
-            compared > 0,
-            "{NAME} ({bit_depth}-bit): every attempt hit a named refusal -- nothing was \
-             pixel-compared:\n{}",
-            refusals.join("\n")
-        );
-        assert!(
-            shapes[2] + shapes[3] > 0,
-            "{NAME} ({bit_depth}-bit): no 32-level intra 1:4 strip (32x8/8x32) fired over \
-             {compared} compared streams (64x16={} 16x64={} 32x8={} 8x32={})",
-            shapes[0],
-            shapes[1],
-            shapes[2],
-            shapes[3]
+            "{NAME} ({bit_depth}-bit): {frame_count} frames pixel-exact, intra 1:4 strips in inter \
+             frames 64x16={} 16x64={} 32x8={} 8x32={} (--enable-1to4-partitions=0 control: \
+             0/0/0/0), stream {pin_len} B fnv1a64={pin_fnv:016x}",
+            delta[0], delta[1], delta[2], delta[3]
         );
     }
 

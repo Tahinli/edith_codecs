@@ -19446,6 +19446,55 @@ mod tests {
         );
     }
 
+    /// lane-av1recipehunt (2026-09-29): this gate is NOT closeable by any
+    /// recipe, and the reason is structural, so do not spend another sweep on
+    /// it. `DRL_CLAMP_HITS` is bumped by `tile::write_inter_mode` (and the two
+    /// compound walks) only when the search chose a `ref_mv_idx` the write-time
+    /// stack could not signal -- and on this tree the search's offer set is
+    /// provably INSIDE the signalable range in every mode:
+    ///   * `NEWMV`: `best_new_mv_syntax` enumerates `for idx in 0..3` (0, 1, 2),
+    ///     and `tile::write_drl_idx`'s ceiling from `start = 0` is
+    ///     `start + 2` = 2. The search's ceiling IS the writer's ceiling.
+    ///   * `NEARMV`: the search's own candidate loop is `for idx in 1..=2` and
+    ///     the writer's ceiling from `start = 1` is 3, but the walk also stops
+    ///     at `entries.len() > idx + 1` and the search only offers an index the
+    ///     stack really holds (`entries.get(idx).is_some()`), so the two
+    ///     bounds coincide.
+    ///   * the compound arms: every compound `InterInfo` the search builds
+    ///     hardcodes `ref_mv_idx: 0`, which is inside the walk's range.
+    /// This is not an inference -- the tree already ASSERTS it, over stack
+    /// sizes 0..=4, in
+    /// [`tests::every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal`]
+    /// (`signalled_drl_idx(entries, start, idx) == idx` for every index either
+    /// pricer offers). That test and this gate are two readings of one
+    /// invariant; the counter this gate waits on can never leave zero.
+    ///
+    /// MEASURED (lane-av1recipehunt), 153 clip x size x frame-count x q
+    /// combinations through `enc_probe` (mandelbrot / testsrc2 / white noise /
+    /// scrolling bands / a 4x4 mosaic / 4-px luminance bands / a panning field
+    /// with a faster band / diagonal bands / alternating hard tiles / three
+    /// independently moving bands; 320x192, 640x384, 1280x768; 8..16 frames;
+    /// q 60..220): `tile::drl_clamp_hits()` = 0 on EVERY one. A trace on
+    /// `best_new_mv_syntax` shows the search DOES pick `idx = 2` often (163
+    /// times on mandelbrot 640x384x8) -- index 2 is exactly what the writer
+    /// signals, so it is a legal pick, not a clamp.
+    ///
+    /// MUTATION PROOF that the recipe was never the problem: widening the
+    /// pricer's offer set (`for idx in 0..3` -> `0..5`, i.e. letting the
+    /// search ask for index 3/4 that the 2-step walk cannot signal) makes the
+    /// counter fire on the very first clips tried -- mandelbrot 640x384x8
+    /// = 9, mandelbrot 320x192x8 = 2, mosaic 320x192x8 = 2, testsrc2 640x384x8
+    /// = 1 -- and the same clips read 0 again the moment the mutation is
+    /// reverted. The binding constraint is the pricer's offer ceiling, which
+    /// no clip can move.
+    ///
+    /// OWNING FIX (not this lane's to make -- the DRL code is another lane's
+    /// surface, and the DRL index range is the spec's, not ours): either widen
+    /// the search's offer set to the spec's own DRL range so the clamp becomes
+    /// reachable and this gate can witness it, or delete the three dead
+    /// `note_drl_clamp` sites and this gate with them. Until one of those
+    /// lands, `#[ignore]` is the honest state and the ignore string below
+    /// stands.
     #[test]
     #[ignore = "sets the process-global superblock size: run it alone"]
     fn a_128_superblock_clip_whose_drl_index_the_write_time_stack_cannot_carry_decodes_exact() {
