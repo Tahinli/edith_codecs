@@ -85,8 +85,56 @@ across two homes (`crates/ec-av1/fixtures/`, committed, 48 files) and the root
 `fixtures/`, gitignored — and `pin_dir()` resolves to the gitignored one, so any pin
 written there is un-reproducible on a fresh clone by construction.
 
+## Defect 3 — the root cause: a worktree has no `fixtures/` at all
+
+`fixtures/` is `.gitignore:2`, so `git worktree add` hands every lane worktree a tree
+without it. Not one gate in ec-av1/ec-h264/ec-flac/ec-opus checks that before skipping,
+so a worktree run measures nothing while looking clean. Fixed on both halves:
+
+- **(b) root cause** — `scripts/link-fixtures.sh` resolves the primary checkout through
+  `git rev-parse --git-common-dir` (works from any linked worktree), symlinks its
+  `fixtures/` in, no-ops with a message when the directory already exists, and refuses
+  loudly (exit 2) when the primary has none. `--check` is the preflight. Verified in a
+  synthetic repo+worktree: links, is idempotent, and refuses with the generator names.
+  Documented in `lanes/COMMON-20260901.md` beside the batch env line.
+- **(a) the assert** — `EC_REQUIRE_FIXTURES=1` (default off, set in every batch unit by
+  the parent) turns each missing-fixture skip into a hard failure naming the path, the
+  generator when one exists, and `scripts/link-fixtures.sh` when the real cause is the
+  missing root directory.
+
+### Per-crate assert sites
+
+| file:line | shape before | shape after | red proof | green proof |
+|---|---|---|---|---|
+| `crates/ec-h264/tests/conformance.rs:299` (`jvt_cavlc_first_idr_bit_exact`) | `!base.is_dir()` → `SKIP: … missing — run scripts/fetch-vectors.sh` | `require_fixtures(&base, "the JVT conformance vectors", "scripts/fetch-vectors.sh")` | `EC_REQUIRE_FIXTURES=1`, `fixtures/` unlinked → panics "the JVT conformance vectors missing at …/vectors/h264-jvt — this gate would prove nothing" | linked: 1 passed (1.58s) |
+| `crates/ec-h264/tests/conformance.rs:406` (`steady_state_decode_loop_zero_alloc`) | `!base.is_dir()` → `SKIP: fixtures missing` | same helper | same env/path | linked: 1 passed (0.73s) |
+| `crates/ec-h264/tests/conformance.rs:490` (`ns_per_macroblock_measurement`) | `!base.is_dir()` → `SKIP: fixtures missing` | same helper | same env/path | linked: 1 passed (9.94s) |
+| `crates/ec-h264/tests/conformance.rs:574` (`corrupt_streams_never_panic`) | `!base.is_dir()` → `SKIP: fixtures missing` | same helper | same env/path | linked: 1 passed (20.85s) |
+| `crates/ec-h264/tests/conformance.rs:1080` (`jvt_full_sequence_bit_exact`) | `!base.is_dir()` → `SKIP: … missing` | same helper | same env/path | linked: 1 passed (5.59s) |
+| `crates/ec-h264/tests/conformance.rs:2323` (`h264_seek_matches_linear_open_gop`) | `!src.is_file()` → `SKIP: no fixtures/video/h264-open-gop.mp4 (run scripts/gen-fixtures.sh)` | same helper, generator `scripts/gen-fixtures.sh` | `EC_REQUIRE_FIXTURES=1` → panics "the open-GOP fixture missing at …/video/h264-open-gop.mp4" | linked: 1 passed (0.75s) |
+| `crates/ec-flac/tests/xiph_vectors.rs:24` (`corpus()`, all 4 gates) | `read_dir().ok()?` → `None` → each gate `eprintln!("skipped: …")` + return | assert in `corpus()` itself — the one place that knows the path — so 4 gates, 1 hunk | `EC_REQUIRE_FIXTURES=1` → panics "the FLAC xiph subset corpus is missing at …/subset" | linked: 4 passed (32.0s) |
+| `crates/ec-opus/tests/conformance.rs:425` (`rfc6716_test_vectors`) | `!path.exists()` → `eprintln!("{name}: missing, skipped")` + `continue` (no env at all) | per-vector assert naming path + `scripts/link-fixtures.sh` + `scripts/fetch-vectors.sh` | `EC_REQUIRE_FIXTURES=1` → panics "RFC 6716 test vector testvector01 missing at …/opus_testvectors/testvector01.bit" | linked: 1 passed (179.2s) |
+| `crates/ec-av1/src/stream.rs:6500` (`a_real_aomenc_lossless_444_key_frame_decodes_sample_exact`) | `Err` → `SKIP … -- regenerate with …` (gate ran 0.05s, decoded nothing) | assert naming path + `scripts/link-fixtures.sh` + regeneration recipe + `EC_AV1_PIN_DIR`; fires on `EC_REQUIRE_FIXTURES` **or** `EC_AV1_REQUIRE_AOMENC` | `EC_REQUIRE_FIXTURES=1` → panics "the pinned 4:4:4 lossless key frame is missing at …/ll444-lossless-key.obu" | default: SKIP with the recipe; both envs: FAILED |
+
+Deliberately **not** converted: the `if path.exists()` arms in ec-opus at 740/1852
+(optional-input blocks inside tests that assert nothing on them) and the
+`~/Music/…` skips at 4985/5378/5607 (personal media, not a fixture manifest — failing
+those on every box would be its own lie).
+
+### Provenance hand-off
+
+The enumeration above is Irem-2's input for `scripts/fixture-library.tsv`; this lane did
+not build the manifest. What the assert messages now guarantee is that every gate that
+reads a fixture names the path it wanted, the generator when one exists, and
+`scripts/link-fixtures.sh` when the cause is the missing root directory.
+
 ## Commits
 
 - `cd81750b` — stream: convert the four skip-on-decode-error gates to attempt loops
 - `0b92c6da` — refusal_inventory: empty GATES_THAT_SKIP_ON_A_DECODE_ERROR
 - `3c302798` — stream: a_real_aomenc_lossless_444_key_frame stops reporting green on a missing pin
+- `62c04b70` — scripts: link-fixtures.sh — give a worktree the gitignored root fixtures/
+- `423ce6be` — stream: the 444 pin arm also honours the repo-wide EC_REQUIRE_FIXTURES
+- `ae94ee6a` — ec-h264: a missing conformance vector FAILS under EC_REQUIRE_FIXTURES
+- `d853d31a` — ec-flac: a missing xiph corpus FAILS under EC_REQUIRE_FIXTURES
+- `3f94c60d` — ec-opus: a missing RFC 6716 vector FAILS under EC_REQUIRE_FIXTURES
