@@ -7162,7 +7162,7 @@ pub(crate) mod tests {
             assert_eq!((f.width, f.height), (W, H), "{NAME}: dimensions");
         }
         if aomdec_path().is_file() {
-            assert_rawvideo_matches(&obu, &stream, NAME, FRAMES);
+            assert_rawvideo_matches(&obu, &stream, NAME, FRAMES, 10);
         } else {
             eprintln!(
                 "SKIP {NAME} aomdec arm: no oracle aomdec at {}",
