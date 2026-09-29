@@ -68,6 +68,34 @@ fn vectors_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/vectors/h264-jvt")
 }
 
+/// A gate that skips when its fixtures are absent reports GREEN having checked
+/// nothing — the "gate skips on its own failure" class. The root `fixtures/`
+/// directory is gitignored, so `git worktree add` hands every lane worktree a
+/// tree without it and the whole conformance suite silently stops testing.
+///
+/// `EC_REQUIRE_FIXTURES=1` turns the skip into a hard failure naming the exact
+/// missing path and the command that produces it; unset (the default), the skip
+/// is kept and now says what it skipped. Set it in every batch run.
+fn require_fixtures(path: &Path, what: &str, generator: &str) -> bool {
+    if path.exists() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+        "{what} missing at {} — this gate would prove nothing. A worktree has no \
+         gitignored root `fixtures/`: run scripts/link-fixtures.sh, or generate \
+         them with {generator}.",
+        path.display()
+    );
+    eprintln!(
+        "SKIP {what} missing at {} — this gate proved nothing; run \
+         scripts/link-fixtures.sh, or generate them with {generator} \
+         (or set EC_REQUIRE_FIXTURES=1 to make this a failure).",
+        path.display()
+    );
+    false
+}
+
 /// Every vector directory `scripts/fetch-vectors.sh` has populated, in name
 /// order.
 ///
@@ -289,11 +317,11 @@ fn compare_sequence(stream: &Path) -> Result<usize, String> {
 #[test]
 fn jvt_cavlc_first_idr_bit_exact() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!(
-            "SKIP: {} missing — run scripts/fetch-vectors.sh",
-            base.display()
-        );
+    if !require_fixtures(
+        &base,
+        "the JVT conformance vectors",
+        "scripts/fetch-vectors.sh",
+    ) {
         return;
     }
     let mut passed = Vec::new();
@@ -396,8 +424,11 @@ fn jvt_cavlc_first_idr_bit_exact() {
 #[test]
 fn steady_state_decode_loop_zero_alloc() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: fixtures missing");
+    if !require_fixtures(
+        &base,
+        "the JVT conformance vectors",
+        "scripts/fetch-vectors.sh",
+    ) {
         return;
     }
     // One stream per entropy coder, and one with B slices and multiple
@@ -480,8 +511,11 @@ fn steady_state_decode_loop_zero_alloc() {
 #[test]
 fn ns_per_macroblock_measurement() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: fixtures missing");
+    if !require_fixtures(
+        &base,
+        "the JVT conformance vectors",
+        "scripts/fetch-vectors.sh",
+    ) {
         return;
     }
     for name in [
@@ -564,8 +598,11 @@ fn perf_whole_sequence() {
 #[test]
 fn corrupt_streams_never_panic() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: fixtures missing");
+    if !require_fixtures(
+        &base,
+        "the JVT conformance vectors",
+        "scripts/fetch-vectors.sh",
+    ) {
         return;
     }
     // One stream per entropy coder, plus one with B slices and multiple
@@ -1070,8 +1107,11 @@ fn p_only_gop_matches_ffmpeg_every_frame() {
 #[test]
 fn jvt_full_sequence_bit_exact() {
     let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: {} missing", base.display());
+    if !require_fixtures(
+        &base,
+        "the JVT conformance vectors",
+        "scripts/fetch-vectors.sh",
+    ) {
         return;
     }
     let mut table = String::new();
@@ -2313,8 +2353,11 @@ fn h264_seek_matches_linear_open_gop() {
         return;
     }
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/video/h264-open-gop.mp4");
-    if !src.is_file() {
-        eprintln!("SKIP: no fixtures/video/h264-open-gop.mp4 (run scripts/gen-fixtures.sh)");
+    if !require_fixtures(
+        &src,
+        "the open-GOP fixture",
+        "scripts/gen-fixtures.sh (fixtures/video/h264-open-gop.mp4)",
+    ) {
         return;
     }
     let dir = scratch("open-gop");
