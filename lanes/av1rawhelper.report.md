@@ -270,3 +270,36 @@ establish the call-site set from the current tree, and then compile a materialis
 (`git merge-tree --write-tree` + `git commit-tree` + worktree + `cargo check`) rather than
 trusting the conflict report. Signature churn during a multi-lane merge wave is the exact
 condition under which `merge-tree` is confidently wrong.
+
+## r2 second pass — main moved again mid-verification
+
+Main advanced 3 merges (`4532caa6` lane-av1pinslive, `bd588822` lane-av1leftwit, `1cc2f250`
+lane-av1txsearch, landing as `8dd07ed7`) between the first r2 rebase and the end of it. Rebased
+again onto `8dd07ed7` (3 commits replayed) and re-established the call-site set from the new
+tip: **still exactly 2 real call sites** (`stream.rs:7071`, `stream.rs:7165`), both now 5-arg on
+the branch, and main's own two sites (`:6889`, `:6983`) remain 4-arg for the merge to resolve.
+Nothing new was stranded by the second wave.
+
+Re-verified on the rebased tip:
+- `cargo check -p ec-av1 --all-targets` — clean, no warnings
+- `the_rawvideo_helper_compares_real_samples_at_the_streams_own_bit_depth` — ok, 1 passed
+- `a_lossless_block_clips_its_transform_grid_at_the_frame_edge` (owner of the stranded site) —
+  ok, 1 passed
+- merged result materialised again against the new main
+  (`merge-tree` tree `e2bb41c8` → merge commit `f8c7eaec`) and compiled:
+  `Finished dev profile in 7.74s`, with all four call sites in the 5-arg form
+
+Final branch tip: `a5584e43` (report) over `f6d45be0` (stranded-site fix) over `970c72cf`
+(the fix itself). Not pushed.
+
+### A second stale-binary trap, same family
+
+`cargo test` reported `0 passed ... 715 filtered out` for
+`a_lossless_block_clips_its_transform_grid_at_the_frame_edge` even though the test existed in
+the source at `stream.rs:7117` — a stale test binary from before the rebase, with 715 tests
+instead of 747. `touch crates/ec-av1/src/stream.rs` before the run restored it. Two independent
+`cargo test` invocations in this lane returned confident green-looking summaries
+(`0 passed, 0 failed` and `Finished in 0.01s`) that were both **serving a stale binary**, so a
+run that reports fewer tests than the previous run is evidence of nothing until the file is
+touched. Same shape as the `merge-tree` lesson: a tool reporting a clean result is not the same
+as the result being correct.
