@@ -6292,12 +6292,13 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/video/h264-2160p-23.976-8bit.mp4");
-        if !clip.exists() {
-            eprintln!("SKIP {NAME}: the 2160p bars fixture is missing");
+        // lane-av1clipprobe: the bare `clip.exists()` -> SKIP had no env
+        // escape, so on a tree with no root `fixtures/` this 128-intra-block
+        // gate reported green having decoded nothing.
+        let Some(clip) = crate::library_fixture::require("video/h264-2160p-23.976-8bit.mp4", NAME)
+        else {
             return;
-        }
+        };
         let (w, h, frames) = (1920usize, 1024usize, 12usize);
         // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
         let src = std::env::temp_dir().join(format!("ec-av1-i128-{}.yuv", std::process::id()));
@@ -45092,12 +45093,15 @@ pub(crate) mod tests {
             // segment, so they do not gate `SEG_LVL_ALT_Q` -- that is the
             // recipe rows' job above -- but they are the rectangular
             // partition coverage rav1e's straddle answer adds.
-            let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
-            if !clip.exists() {
-                eprintln!("SKIP {NAME}: {} missing", clip.display());
+            // lane-av1clipprobe: the one probe. This one is worse than a plain
+            // skip -- it `return`s from the middle of the gate, so everything
+            // asserted above it had already run and the encoder-ladder half
+            // silently never did, leaving a half-executed gate reported green.
+            let Some(clip) =
+                crate::library_fixture::require("video/h264-1080p-23.976-8bit.mp4", NAME)
+            else {
                 return;
-            }
+            };
             for (encoder, points) in [
                 ("librav1e", ["50", "100", "150", "200"]),
                 ("libaom-av1", ["5", "20", "35", "45"]),

@@ -28,6 +28,15 @@
 #   Path::new(               Path::new("...") argument literals
 #   fs::read                fs::read / read_dir / File::open argument literals
 #
+#   library_fixture::     a path passed to the ec-av1 library-fixture resolver
+#                         (`library_fixture::require("video/…", …)`) is
+#                         LIBRARY-RELATIVE, so it anchors at the fixture root
+#                         the preflight validates (EC_FIXTURES first) rather
+#                         than at any crate directory. Without this row shape
+#                         the RESOLVE pass silently lost every clip row the
+#                         moment a gate stopped naming `../../fixtures`
+#                         literally -- the preflight would stop checking the
+#                         exact paths whose absence this lane is about.
 # TWO PASSES:
 #   1. fixture-root / fixture-path literals -> the row is the literal itself.
 #   2. bare media-file literals ("aac-adts-5.1-44100.aac", "entry-tx3g.mp4")
@@ -106,6 +115,20 @@ is_fixture_literal() { # $1 = literal without quotes
     esac
     [[ $lit == *fixtures* || $lit == */vectors/* ]] || return 1
     return 0
+}
+
+# lane-av1clipprobe: a literal that starts with one of the fixture library's
+# own top-level directories is LIBRARY-RELATIVE, not crate-relative: it is what
+# the ec-av1 library-fixture resolver takes (`require("video/…")`), and the
+# other crates' `../../fixtures/<dir>` + `.join("video/…")` pairs resolve to the
+# same manifest path. So it maps to `fixtures/<lit>` -- the same row, whether
+# the consumer spells the root out or hands the relative part to the resolver.
+library_relative() { # $1 = literal without quotes
+    case $1 in
+        audio/* | video/* | bitstreams/* | stills/* | subs/* | realworld/* | \
+        vp8/* | vp9/* | hbd-r5/* | vectors/*) return 0 ;;
+    esac
+    return 1
 }
 
 # Provenance: which script reproduces these bytes. An empty answer is a
@@ -236,6 +259,53 @@ for f in "${FILES[@]}"; do
         row "$path" "$rel:$lineno" >>"$tmp"
         [ -d "$(abs_path "$path")" ] && file_dirs+=("$path")
     done < <(grep -noE '"[^"]*"' "$f")
+
+    # Pass 1b -- the ec-av1 library-fixture RESOLVER's literals (lane-
+    # av1clipprobe). `library_fixture::require("video/…", …)` takes a path
+    # RELATIVE TO THE FIXTURE ROOT, so it is not a crate-relative literal and
+    # Pass 1 cannot classify it -- and a clip gate that had stopped naming
+    # `../../fixtures` literally would have dropped its row from this manifest
+    # entirely, i.e. the preflight would have stopped RESOLVING the very paths
+    # whose silent absence this lane is about. Scoped to lines that actually
+    # call the resolver: a bare `audio/…` literal in another crate keeps
+    # whatever classification it had, so this adds no rows outside ec-av1.
+    while IFS= read -r ln; do
+        lineno=${ln%%:*}
+        while IFS= read -r q; do
+            lit=${q#\"}
+            lit=${lit%\"}
+            library_relative "$lit" || continue
+            path="fixtures/$lit"
+            case $(pin_class "$path") in
+                absent-pin)
+                    row "$path" "$rel:$lineno" absent-pin absent-pin >>"$tmp"
+                    continue ;;
+            esac
+            row "$path" "$rel:$lineno" >>"$tmp"
+            [ -d "$(abs_path "$path")" ] && file_dirs+=("$path")
+        done < <(printf '%s\n' "${ln#*:}" | grep -oE '"[^"]*"')
+    done < <(grep -nE 'library_fixture::(require|require_at|path)\(' "$f")
+    # A resolver call names a FILE inside a library directory; the DIRECTORY row
+    # is what makes RESOLVE check the corpus is present AND non-empty, and it
+    # used to come from the `../../fixtures/video` literal this lane removed.
+    # One row per directory per file, so the manifest does not grow a
+    # duplicate per call site.
+    while IFS= read -r ln; do
+        d=""
+        while IFS= read -r q; do
+            lit=${q#\"}
+            lit=${lit%\"}
+            library_relative "$lit" || continue
+            d="fixtures/${lit%%/*}"
+        done < <(printf '%s\n' "${ln#*:}" | grep -oE '"[^"]*"')
+        [ -n "$d" ] || continue
+        case " ${resolver_dirs:-} " in *" $d "*) continue ;; esac
+        resolver_dirs="${resolver_dirs:-} $d"
+        case $(pin_class "$d") in
+            absent-pin) continue ;;
+        esac
+        row "$d" "$rel:${ln%%:*}" >>"$tmp"
+    done < <(grep -nE 'library_fixture::(require|require_at|path)\(' "$f")
 
     # Pass 2 -- bare media names joined onto this file's fixture directories,
     # then onto the standard top-level library directories (a file may name
