@@ -148,36 +148,97 @@ So the 4:2:0 chroma of an 8x16 luma block is a genuine single `TX_4X8` in libaom
 
 ---
 
-## 4. Deliverable: the claim is now PROVEN, not assumed
+## 4. Deliverable: the claim is now PROVEN by the tree, not argued in this file
 
-`refusal_inventory.rs` gained a `PROVEN` row for the string (it previously had **none** — it was the audit round's single unproven row) and the test that proves it:
+> **The 840-encode sweep in §2 is CORROBORATION, not the proof.** It shows the
+> refusal does not fire on 826 streams that provably code the shape; it cannot
+> show the shape is unreachable in a stream nobody encoded. The proof is the
+> static caller-shape-set derivation in §1, and the deliverable below is what
+> makes the tree enforce it rather than trusting this report.
 
-- **`every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table`** (`refusal_inventory.rs:1571`)
-  1. reads the caller shape set out of `decode.rs`'s own call-site argument lists (paren-balanced argument splitter, so the `(at32.0 + 1, at32.1)` origin argument does not shift the indices), asserts the site count and the shape set;
-  2. reads the `match (chroma_w, chroma_h)` arm heads out of the function's own text and pins the exact six-row set (class `table-and-reader-move-together`: a table edit invalidates the test);
-  3. walks every caller shape under `{(0,0), (1,0), (1,1)}` and asserts a row exists for each;
-  4. asserts the residual as code, not a comment: `(4, 8)` / `(8, 4)` are *not* rows, and no caller shape can produce them.
+`refusal_inventory.rs` gained a `PROVEN` row for the string (it previously had
+**none** — it was the audit round's single unproven row) and the test that proves
+it, in the same file as the sibling enumeration.
 
-The inventory summary moved from **32 proven to 33 proven**; all 16 `refusal_inventory` tests pass.
+### Where the assertions live, and why not inside the sibling test
 
-### Non-vacuity: three red-proofs, then revert
+Main asked for this to be folded into
+`every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table`. It is
+shipped as a sibling test in the same file instead, because that test audits
+`decode_rect_split`'s two `match` tables via a `depth_to_tx_wh` walk — it has no
+caller-shape-set notion at all. Getting `decode_block_rect`'s domain requires a
+paren-balanced argument splitter over the call sites (~60 lines) plus a
+subsampling walk. Folding that in would have made the sibling test answer two
+different claims and would have duplicated the parser to do it. The two tests
+are adjacent and the `PROVEN` row names the new one, so the claim is still
+asserted in exactly one place. Say the word and I will move it.
 
-| mutation | result |
-|---|---|
-| `decode.rs:34490` `32,` → `8,` (an 8x16 caller appears) | **RED** — `the set of strip sizes decode_block_rect is called with changed … An 8x16/16x8 caller makes this refusal LIVE` |
-| a `(4, 8) => (TxbSet::ChromaRect8x4, &SCAN_4X8),` row added to the table | **RED** — `decode_block_rect's chroma table changed -- re-derive the walk below` |
-| `decode.rs:34490` `32,` → `at32.0 * 2,` (a call site stops being a literal) | **RED** — `decode_block_rect is called with a non-literal strip size "at32.0 * 2"` |
+### `every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table` (`refusal_inventory.rs:1571`)
 
-`decode.rs` restored byte-identical after each (`git status` shows `refusal_inventory.rs` as the only modified file).
+1. **Caller shape set**, read out of `decode.rs`'s own call-site argument lists
+   with a paren/bracket-balanced splitter — the `at` argument is
+   `(at32.0 + 1, at32.1)`, whose internal comma shifts every later index by one,
+   so naive indexing reads `at32` as `bw` (I hit this). Asserts the site count
+   (8) and requires `bw`/`bh` to be **integer literals**. This is the invariant
+   that makes the whole argument true, and it is pinned in the shape this crate
+   already uses for such scans: `include_str!("decode.rs")` read at
+   compile time.
+2. **The table**, read out of the function's own text, arm heads only
+   (`(w, h) =>` / `(w, h) |`, never a `(32, 8)` inside prose).
+3. **The walk** — every caller shape under every subsampling an AV1
+   `color_config` can carry, `{(0,0), (1,0), (1,1)}`. Asserts a row for each.
+4. **The exact-table pin**: the table is *exactly* those six rows — no row is a
+   shape no caller can present, which is what makes the `_` arm dead.
+5. **The residual as code, not a comment**: `(4, 8)` / `(8, 4)` are *not* rows,
+   and no caller shape can produce them.
+
+The inventory summary moved from **32 proven to 33 proven**; all 16
+`refusal_inventory` tests pass.
+
+### Ordering note (fixed mid-lane, kept)
+
+Steps 3 and 4 were first written the other way round, and the exact-table pin
+masked the walk: deleting the `(16, 8)` arm failed with "the chroma table
+changed" instead of naming the footprint. **The walk now runs before the pin**, so
+a deleted arm fails naming the strip and its subsampling.
+
+### Non-vacuity: four red-befores, each reverted with `decode.rs` byte-identical
+
+This crate's census tests read compile-time sources via `include_str!`, so
+`decode.rs` is `touch`ed before each re-run — otherwise a stale test binary can
+report the previous state.
+
+| # | mutation | result |
+|---|---|---|
+| A | `decode.rs:14791` — delete the `(16, 8) =>` arm | **RED** at `refusal_inventory.rs:1705` — `a 32x16 strip at subsampling (1,1) has a 16x8 chroma transform with no coefficient table -- the chroma refusal is LIVE` |
+| B | `decode.rs:14801` — delete the `(16, 16) =>` arm (the 4:2:2 row) | **RED** at `refusal_inventory.rs:1705` — `a 32x16 strip at subsampling (1,0) has a 16x16 chroma transform with no coefficient table -- the chroma refusal is LIVE` |
+| C | `decode.rs:34536` — the `PARTITION_VERT` call site's `16,` → `8,` (an 8x16 caller appears) | **RED** at `refusal_inventory.rs:1647` — `the set of strip sizes decode_block_rect is called with changed -- re-derive the chroma domain below. An 8x16/16x8 caller makes this refusal LIVE` |
+| D | `decode.rs:34490` — `32,` → `at32.0 * 2,` (a call site stops being a literal) | **RED** at `refusal_inventory.rs:1631` — `decode_block_rect is called with a non-literal strip size "at32.0 * 2" -- this enumeration can no longer read the caller shape set` |
+
+A and B are the row-coverage arm (they fail **naming the footprint**); C and D
+are the caller-set invariant (they fail before the table is even consulted).
+Restored byte-identical after each; `git status` shows
+`refusal_inventory.rs` as the only modified file.
+
+### What makes the claim survive a future edit
+
+- A new caller with a different size → **C** fires (shape set changed).
+- A caller whose size stops being a literal → **D** fires, because a variable
+  could be anything and the enumeration must not silently under-count.
+- A row deleted → **A**/**B** fires, naming the strip and subsampling.
+- A row *added* for a shape no caller presents → step 4 fires, and step 5 fires
+  if it is `(4, 8)` / `(8, 4)`.
 
 ---
 
 ## 5. Scope and hygiene
 
-- No existing test weakened, renamed, or re-pinned. Net diff: `crates/ec-av1/src/refusal_inventory.rs`, **+240 / -0**.
+- No existing test weakened, renamed, or re-pinned. Net diff vs the lane base
+  `afa13bcf`: `crates/ec-av1/src/refusal_inventory.rs` **+246 / -0** (the new
+  `PROVEN` row plus the new test) and this report.
 - `decode_rect_split` and `read_block_tx_size` untouched (other lanes own them). `decode.rs` untouched.
-- `decode_block_rect` itself untouched — the refusal stays as a named shape guard for the next caller, the repo's convention for a proven-unreachable guard (same as `a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol`).
-- The scratch sweep lived in two `#[ignore]`d tests, ran, and were deleted; the tree diff is the 240-line addition above.
+- `decode_block_rect` itself untouched — the refusal stays as a named shape guard for the next caller, the repo convention for a proven-unreachable guard (same as `a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol`).
+- The scratch sweep lived in two `#[ignore]`d tests, ran, and were deleted; the tree diff is the 246-line addition above.
 - Main untouched: `git -C /home/tahinli/Documents/Code/Rust/edith_codecs status --porcelain` shows no tracked-file modification from this lane. Never pushed.
 
 

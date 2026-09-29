@@ -1695,23 +1695,9 @@ mod tests {
                 arms.insert((w, h));
             }
         }
-        assert_eq!(
-            arms,
-            [
-                (8usize, 16usize),
-                (8, 32),
-                (16, 8),
-                (16, 16),
-                (16, 32),
-                (32, 16)
-            ]
-            .into_iter()
-            .collect::<BTreeSet<(usize, usize)>>(),
-            "decode_block_rect's chroma table changed -- re-derive the walk below"
-        );
-
-        // (3) The enumeration itself: every caller shape under every
-        // subsampling an AV1 color_config can carry.
+        // (3) The enumeration itself -- run BEFORE the exact-table pin below
+        // so a deleted arm fails HERE, naming the footprint, instead of
+        // behind a vaguer "the table changed".
         let mut checked = 0u32;
         for &(bw, bh) in &shapes {
             for (ss_x, ss_y) in [(0usize, 0usize), (1, 0), (1, 1)] {
@@ -1729,7 +1715,24 @@ mod tests {
             "the chroma domain is not two shapes x three formats"
         );
 
-        // (4) The residual, stated as an assertion so it cannot rot: the two
+        // (4) And the table is EXACTLY those six rows -- no row is a shape no
+        // caller can present, which is what makes the `_` arm dead.
+        assert_eq!(
+            arms,
+            [
+                (8usize, 16usize),
+                (8, 32),
+                (16, 8),
+                (16, 16),
+                (16, 32),
+                (32, 16)
+            ]
+            .into_iter()
+            .collect::<BTreeSet<(usize, usize)>>(),
+            "decode_block_rect's chroma table changed -- re-derive the walk above"
+        );
+
+        // (5) The residual, stated as an assertion so it cannot rot: the two
         // 4:2:0 rows an 8x16/16x8 luma strip would need are NOT in this
         // table, and (4,8)/(8,4) is not a shape any caller can produce. If a
         // future caller hands this function an 8x16, step (1) goes red
