@@ -6488,14 +6488,34 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let Ok(stream) = std::fs::read(pin_dir().join("ll444-lossless-key.obu")) else {
-            eprintln!(
-                "SKIP {NAME}: no pinned bytes at {} -- regenerate with \
-                 `testsrc2 128x96` yuv444p 6 frames, aomenc --profile=1 --lossless=1 \
-                 --enable-palette=0 --enable-intrabc=0, cut to the key frame's OBUs",
-                pin_dir().join("ll444-lossless-key.obu").display()
-            );
-            return;
+        // lane-av1skipfix: this arm used to be a bare SKIP, so on any box
+        // without the pin (the root `fixtures/` directory is GITIGNORED --
+        // `.gitignore:2` -- so a fresh clone can never have it) the gate
+        // reported green having decoded nothing. `EC_AV1_REQUIRE_AOMENC=1`
+        // turns it into a hard failure naming the missing pin and its exact
+        // regeneration recipe, so a batch run cannot report green off it.
+        let pin = pin_dir().join("ll444-lossless-key.obu");
+        let stream = match std::fs::read(&pin) {
+            Ok(stream) => stream,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+                    "{NAME}: the pinned 4:4:4 lossless key frame is missing at {} ({e}). \
+                     Regenerate it with `testsrc2 128x96` yuv444p 6 frames, aomenc \
+                     --profile=1 --lossless=1 --enable-palette=0 --enable-intrabc=0, \
+                     cut to the key frame's OBUs -- or point EC_AV1_PIN_DIR at a \
+                     directory that has it.",
+                    pin.display()
+                );
+                eprintln!(
+                    "SKIP {NAME}: no pinned bytes at {} ({e}) -- this gate decoded nothing \
+                     and proves nothing; regenerate with `testsrc2 128x96` yuv444p 6 \
+                     frames, aomenc --profile=1 --lossless=1 --enable-palette=0 \
+                     --enable-intrabc=0, cut to the key frame's OBUs",
+                    pin.display()
+                );
+                return;
+            }
         };
         // Blindness guard: the pinned fixture must really be a lossless frame.
         let mut parser = Av1Parser::new();
