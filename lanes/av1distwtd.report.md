@@ -118,3 +118,112 @@ only**: verified — the only non-comment lines changed are 3 entry *reason
 strings* (`gate_coverage.rs:272, 293, 376`). No flag name, entry membership,
 counter, gate, or decoder behaviour was touched. All 9 `gate_coverage` tests
 green after the change. No stream, gate, or counter behaviour altered, per brief.
+
+---
+
+# r3 appendix: fix the two structural census defects
+
+r2 corrected the false CLAIMS. r3 fixes the LOGIC that generated them, so it
+stops generating them. `crates/ec-av1/src/gate_coverage.rs` only; no gate,
+counter, fixture, or decoder behaviour touched.
+
+## Evidence table — before / after
+
+| measure | before (r2, spelling-only) | after (r3, call-resolving) |
+|---|---|---|
+| gate bodies seen by `gate_bodies()` | 146 | **230** (+84) |
+| of those, classified 10-bit-or-higher | 83 | **107** (+24) |
+| `enable-dual-filter` 8-bit | listed as a hole | **retired** (gate found) |
+| `enable-flip-idtx` 8-bit | listed as a hole | **retired** (gate classified both-depths) |
+| `NEVER_EXERCISED_8BIT` | 3 live entries | **1** (`enable-rect-tx`) |
+| `NEVER_EXERCISED_10BIT` | 3 live entries | **2** (`enable-dual-filter`, `enable-rect-tx`) |
+| tests | 9 | **10** (new `the_detector_sees_the_gates_the_spelling_filter_missed`) |
+
+The three gates the fix had to find, all now found and asserted by the new test:
+
+| gate | was invisible because | now found by |
+|---|---|---|
+| `a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact` | recipe lives in `inter_sb_none_gate` | `encoder_fns` call closure |
+| `a_real_obmc_stream_reads_a_recorded_switchable_filter_for_every_neighbour` | same | `encoder_fns` call closure |
+| `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact` | `ten_bit` recipe, `is_ten_bit` filed it 10-bit-only | `covers_both_depths` pair-of-formats marker |
+
+## The two fixes
+
+**1. `gate_bodies()` — recognise a gate by what it CALLS, not only what it spells.**
+New `fn_units` parses every `fn` in `stream.rs` as `(name, body)`; `encoder_fns`
+computes the transitive closure of fns that reach one naming `aomenc_path()`.
+The filter is now `legacy_gate_tokens(body) || body.contains("aomenc_path()")
+|| enc.iter().any(|e| calls_fn(body, e))`. The call test is deliberately the
+weak half of an OR, so the fix is **strictly additive** — it can add gates but
+can never stop recognising one the old filter did. `calls_fn` requires the name
+to be followed by `(` and not be the tail of a longer identifier, so
+`inter_sb_none_gate` does not "call" `sb_none_gate`.
+
+**2. `covers_both_depths` — the third spelling.** Added
+`body.contains("\"yuv420p\"") && body.contains("\"yuv420p10le\"")`: a body
+naming BOTH fixture formats builds streams at both depths, whatever the
+parameter is called. The quotes matter — a bare `yuv420p` substring test also
+matches `yuv420p10le` and would fire on every 10-bit gate, retiring entries on
+no evidence. This is not a special case for the flip-idtx gate; it is the
+lane-defon/troykf blind spot closed on its third spelling.
+
+## Red-before (three mutations, all reverted; `stream.rs` byte-identical to HEAD)
+
+A detector change can only be shown to find MORE, never to stop missing, so
+each half was shown to be **causal** — neuter it and the retired entry must come
+back.
+
+**Mutation A — the helper-delegation half.** Set `--enable-dual-filter=1` to
+`=0` in both helper-based gates. TWO tests red:
+- `never_exercised_8bit_matches_the_gate_recipes`: *"no 8-bit gate passes `=1`
+  for ["enable-dual-filter"], so no real 8-bit stream exercises them"* — the
+  retired entry correctly RETURNS as a hole.
+- `the_detector_sees_the_gates_the_spelling_filter_missed`: *"seen, but its
+  --enable-dual-filter=1 spelling is not visible to flags_in"*, `left: Some('0')
+  right: Some('1')`. The second red is the valuable one: it separates
+  *recognition broke* from *the gate no longer enables the tool*.
+
+**Mutation B — the legacy path still works.** Set `--enable-dist-wtd-comp=1` to
+`=0` in the r1 gate, a gate the OLD filter already recognised (it spells
+`--passes=1`). Red at BOTH depths: *"no 10-bit gate passes `=1` for
+["enable-dist-wtd-comp"]"* and the 8-bit twin. The spelling path is intact.
+
+**Mutation C — the both-depths half.** Reverted only the pair-of-formats
+clause. TWO tests red: `never_exercised_8bit...`: *"no 8-bit gate passes `=1`
+for ["enable-flip-idtx"]"*, and the new detector test: *"the flip-idtx gate
+spells both fixture formats, so covers_both_depths must credit it to the 8-bit
+bucket as well"*.
+
+All three reverted; `git diff --stat crates/ec-av1/src/stream.rs` is empty, and
+all 10 tests are green.
+
+## `enable-dual-filter` 10-bit: the entry STAYS — a finding, not an oversight
+
+After the fix the 8-bit entry retires and the 10-bit one does not, which is the
+honest outcome and exactly the case Main said to report rather than paper over.
+The only `=1` witness is `a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact`,
+and it calls `inter_sb_none_gate(NAME, false, ...)` — `false` is the `ten_bit`
+parameter, so it builds an 8-bit stream only. Its `ten_bit=true` siblings
+(`..._10bit_inter_sequence_with_a_whole_superblock_block_...` and the 8x8-leaf
+pair) do not spell `--enable-dual-filter=1`. **To retire it: add the 10-bit arm
+— pass `true` to `inter_sb_none_gate` in that gate and assert
+`dual_filter_diff_hits()` still moves there.**
+
+## Row: `enable-tx-size-search` — the one claim this audit could not settle
+
+A third detector limit, and the method for whoever takes it next. After the r3
+fix, 113 of the 230 selected gates name it: **88 pass `=0`, 15 pass `=1`, and 9
+build the value into a `format!`/`String` variable** that neither `flags_in` nor
+`settings_in` can see — both scan for a literal `"--flag=value"` inside one
+segment. So the r2 finding stands and sharpens: the historical "all 49 pass 0"
+claim no longer holds in either direction, and 9 gates are unclassified in an
+**unknown direction**, which is the exact failure mode this file exists to
+prevent.
+
+**What would settle it (method, not a guess):** extend `flags_in`/`settings_in`
+to resolve a local binding the way `gate_bodies` now resolves calls. When a
+segment contains `let <name> = format!("--enable-tx-size-search={tx_search}")`
+(or the `String::from`/`to_string` equivalent), record the TEMPLATE and bind the
+variable's value at each use site. Re-count, and only then decide whether the
+tool is a live hole. Until that exists the 113/88/15 split is a floor, not a
+measurement. This is recorded in-file above `DEFAULT_ON_TOOLS` as well.
