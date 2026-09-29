@@ -28437,7 +28437,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "lane-rectx r3 scratch sweep"]
+    // The recipe SEARCH, not a lane's scratch any more: 9 sources x 7 cq x
+    // rtx on/off, 28 s measured, and it is the evidence that no aomenc rect-tx
+    // recipe mismatches -- which is what the un-ignored rect gates rest on.
+    #[ignore = "recipe search: 9 sources x 7 cq x rtx on/off, 28 s; establishes that no aomenc rect-tx recipe mismatches"]
     fn sweep_rectx_recipes() {
         let _gate_lock = lock_gate_counters();
         let srcs: Vec<String> = vec![
@@ -31516,7 +31519,10 @@ pub(crate) mod tests {
     /// (`EC_TRACE_MODE_STEP=1`) against the exact same bytes fed to the
     /// oracle aomdec, byte for byte. `#[ignore]`d diagnostic, no assertion.
     #[test]
-    #[ignore = "diagnostic, run manually with --nocapture and EC_TINY_FIXTURE_PATH set"]
+    // Panics with `set EC_TINY_FIXTURE_PATH to an .obu file: NotPresent`
+    // without the var -- it has no default and cannot run unattended. Prints
+    // `decoded N frame(s)` or `REFUSED: <err>`; asserts nothing.
+    #[ignore = "diagnostic: needs EC_TINY_FIXTURE_PATH naming an .obu; prints decode/REFUSED, asserts nothing"]
     fn probe_tiny_fixture_trace() {
         let path = std::env::var("EC_TINY_FIXTURE_PATH")
             .expect("set EC_TINY_FIXTURE_PATH to an .obu file");
@@ -32203,7 +32209,10 @@ pub(crate) mod tests {
     /// bisect scratch: decode a pinned stream exactly once -- generic
     /// pin-repro tool, kept for manual use.
     #[test]
-    #[ignore]
+    // Panics with `set EC_AV1_PIN to the .obu path: NotPresent` without the
+    // var. Prints `OK: N frames` or `ERR: <err>` -- a one-line "does this pin
+    // decode at all" check, so it asserts nothing by design.
+    #[ignore = "scratch: decodes the .obu at EC_AV1_PIN and prints OK/ERR; asserts nothing"]
     fn scratch_decode_pinned_stream_once() {
         let path = std::env::var("EC_AV1_PIN").expect("set EC_AV1_PIN to the .obu path");
         let stream = std::fs::read(&path).expect("read pinned stream");
@@ -32215,7 +32224,13 @@ pub(crate) mod tests {
 
     /// scratch: isolate a pinned mismatching stream's first divergent pixel.
     #[test]
-    #[ignore]
+    // Panics with `set EC_AV1_PIN to the .obu path: NotPresent` without the
+    // var, AND the built-in geometry defaults (W=64, H=64, N=1) are wrong for
+    // every real pin: they are the 64x64 seed-42 pin's own numbers, so on any
+    // other pin the run dies inside the ffmpeg oracle with a frame-size
+    // assert (`expected 1 4:2:0 frames ... left 24576 right 6144`) instead of
+    // saying "you forgot the geometry". Set all four.
+    #[ignore = "scratch: needs EC_AV1_PIN plus EC_AV1_PIN_W/H/N at the pin's REAL geometry (defaults 64/64/1 are wrong for every other pin); prints the first divergent pixel per plane"]
     fn scratch_isolate_pinned_mismatch() {
         let path = std::env::var("EC_AV1_PIN").expect("set EC_AV1_PIN to the .obu path");
         let stream = std::fs::read(&path).expect("read pinned stream");
@@ -39685,7 +39700,14 @@ pub(crate) mod tests {
     /// `a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`
     /// via `EC_AV1_GATE_DUMP`. Debug-only, `#[ignore]`d.
     #[test]
-    #[ignore = "debug harness, run manually with EC_AV1_GATE_DUMP_PIN"]
+    // The geometry is HARD-CODED to the seed-42 pin (192x128, one frame):
+    // `ffmpeg_decode_sequence(&stream, 192, 128, 1)` plus the `width = 192` /
+    // `0..128` scan bounds below. Point it at any other pin and it does not
+    // say "wrong size" -- it dies inside the ffmpeg oracle with
+    // `expected 1 4:2:0 frames ... left 196162560 right 36864`. Measured
+    // against `fixtures/sbpart/seed42.obu` (the 192x128 pin it was written
+    // for): `total luma mismatches: 0`.
+    #[ignore = "debug harness: needs EC_AV1_GATE_DUMP_PIN at a 192x128 pin (the geometry is hard-coded; any other size dies in the ffmpeg oracle)"]
     fn debug_part32_r2_sbpart_pin_mismatch_geometry() {
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN").expect("set EC_AV1_GATE_DUMP_PIN");
         let stream = std::fs::read(&path).expect("read pinned stream");

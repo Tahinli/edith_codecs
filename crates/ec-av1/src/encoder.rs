@@ -5568,7 +5568,7 @@ mod tests {
     /// at: 1920x1080, eight real pictures, two passes per cell (ABAB), wall
     /// per cell. Ignored by default (minutes).
     #[test]
-    #[ignore = "1080p wall table: minutes, run it with --ignored"]
+    #[ignore = "wall table, 16 cells x 2 passes at 1080p: 27 min measured; needs a host with >=8 cores"]
     fn tile_wall_table_at_1080p() {
         let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
@@ -5669,7 +5669,12 @@ mod tests {
     /// Measurement, not a pass/fail gate: it asserts only that every cell
     /// produced a stream.
     #[test]
-    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    // MEASURED 1243 s in release on a 12-core workstation. A 4-core VPS
+    // cannot finish it at all: the same run TIMED OUT at 2400 s there
+    // (12 frames x 2 passes x 12 cells), so the 8- and 12-thread rows are
+    // only meaningful on a host with the cores to run them. Do not schedule
+    // it on a 4-core fleet box.
+    #[ignore = "wall measurement: 20 min at 1080p and it TIMES OUT on a 4-core host -- run it on >=8 cores"]
     fn tile_search_wall_1080p() {
         let _knobs = crate::speed::knob_write();
         tile_search_wall(
@@ -5684,7 +5689,7 @@ mod tests {
     /// The same table at the 4K frame size the editor exports (3840x1608),
     /// at the two layouts with enough tiles to fill this box.
     #[test]
-    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    #[ignore = "wall measurement: 12 min at 4K (732 s measured); run it with --ignored --nocapture"]
     fn tile_search_wall_4k() {
         let _knobs = crate::speed::knob_write();
         tile_search_wall(3840, 1608, 6, &[(2, 1), (3, 2)], &[1, 8, 12]);
@@ -5827,14 +5832,14 @@ mod tests {
     /// decode the loop-restoration search rides on, and that search itself.
     /// Measurement, not a pass/fail gate.
     #[test]
-    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    #[ignore = "wall measurement: 36 s at 1080p; run it with --ignored --nocapture"]
     fn filter_stage_wall_1080p() {
         let _knobs = crate::speed::knob_write();
         filter_stage_wall(1920, 1080, 8, (2, 1), &[8]);
     }
 
     #[test]
-    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    #[ignore = "wall measurement: 62 s at 4K; run it with --ignored --nocapture"]
     fn filter_stage_wall_4k() {
         let _knobs = crate::speed::knob_write();
         filter_stage_wall(3840, 1608, 4, (2, 1), &[8, 12]);
@@ -5845,7 +5850,12 @@ mod tests {
     /// it unset it is the colour-bar fixture at the same size, which is what
     /// makes the pair a comparison rather than a number.
     #[test]
-    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    // MEASURED 16 s WITHOUT `EC_AV1_WALL_CLIP`, and what it measures then is
+    // the COLOUR-BAR fixture, not a film: `h264_clip_frames` falls back to
+    // `fixtures/video/h264-1080p-23.976-8bit.mp4` when the var is unset. A
+    // reader who takes the name for the content reads a bars number as a
+    // film number, so the precondition belongs in the reason.
+    #[ignore = "wall measurement: 16 s; MEASURES THE BARS FIXTURE unless EC_AV1_WALL_CLIP names a real film window"]
     fn filter_stage_wall_film() {
         let _knobs = crate::speed::knob_write();
         filter_stage_wall(1920, 768, 4, (2, 1), &[8]);
@@ -6086,10 +6096,23 @@ mod tests {
 
     /// The same round trip at a real 1920x1080 crop of the gate's own clip
     /// -- the size the editor's export actually runs at, where a tile grid
-    /// is worth having. Ignored by default only for its wall (a 1080p
-    /// encode of three pictures), not for any weakness in the check.
+    /// is worth having.
+    ///
+    /// UN-IGNORED by lane-av1probes: it was `#[ignore]`d only for its wall
+    /// ("1080p encode: minutes"), and it is the only 1080p arm in the ignored
+    /// set that actually ASSERTS. Measured 30.6 s in release on the
+    /// workstation (12 cores) and 64 s on a 4-core VPS, so it is affordable
+    /// in the suite. Evidence for the un-ignore: the three tile grids 2x1,
+    /// 2x2 and 4x2 each decode sample-exact through BOTH our decoder and
+    /// ffmpeg (84488 / 84208 / 84685 bytes), and the check is a per-frame
+    /// first-differing-luma-sample comparison, not a length or non-empty
+    /// smoke.
+    ///
+    /// The two skippable halves both route through the crate's EXISTING
+    /// presence probes, not a new shape: `h264_clip_frames` (which itself
+    /// asks `have_ffmpeg()` and `clip.exists()`) and `have_ffmpeg()` for the
+    /// ffmpeg arm. No bare presence check was added.
     #[test]
-    #[ignore = "1080p encode: minutes, run it with --ignored"]
     fn a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders() {
         let _knobs = crate::speed::knob_read();
         let (width, height) = (1920usize, 1080usize);

@@ -2249,7 +2249,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    // The orthonormal-ness table: one alpha per transform pair per size
+    // (measured 0.977-1.031 across 4x4..32x32). It is the only place a
+    // mis-scaled basis shows up, and it prints rather than asserts, so a
+    // drifted alpha is read off the table, not off a failure.
+    #[ignore = "scratch: prints the per-tx-pair orthonormal-ness alpha for 4x4..32x32; the reference table, asserts nothing"]
     fn txrd_gain_probe() {
         for side in [4usize, 8, 16, 32] {
             let residual: Vec<i32> = noise(side * side, 7 + side as u64)
@@ -2381,7 +2385,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    // Prints the 32x32 dequant of a hand-built level vector (DC-only row
+    // against the single-sum and combined shapes) -- the smallest
+    // reproducible view of dequant scale while that path is being changed.
+    // Prints, asserts nothing.
+    #[ignore = "scratch: prints the 32x32 dequant rows for one hand-built level vector; asserts nothing"]
     fn scratch_probe_32x32_dequant() {
         let mut levels = vec![0i32; 32 * 32];
         levels[0] = -2;
