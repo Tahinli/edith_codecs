@@ -2710,11 +2710,32 @@ pub fn skip_split_tx_hits() -> usize {
 // witness this path, so a gate that wants it needs the counter.
 thread_local! {
     static SKIP_SPLIT_TX_OVERRIDE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1chromadc: chroma units of a skipped block whose intra-BC /
+    /// UV-palette override had to be WINDOWED to the unit's own extent --
+    /// i.e. `cn_cols * cn_rows > 1`, which at 4:2:0 never happens (the chroma
+    /// plane block is one 32x32 unit) and at 4:4:4 is every block of 64 and
+    /// above. Counts UNITS, not blocks. EXCLUSIVE to this walk: the other two
+    /// override sites (the luma slot and `decode_intrabc_owned_rect`) have
+    /// their own windows.
+    static SKIP_CHROMA_OVERRIDE_WINDOW_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Current value of [`SKIP_SPLIT_TX_OVERRIDE_HITS`] (blocks).
 pub fn skip_split_tx_override_hits() -> usize {
     SKIP_SPLIT_TX_OVERRIDE_HITS.with(|c| c.get())
+}
+
+/// lane-av1chromadc: [`SKIP_CHROMA_OVERRIDE_WINDOW_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn skip_chroma_override_window_hits() -> usize {
+    SKIP_CHROMA_OVERRIDE_WINDOW_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`SKIP_CHROMA_OVERRIDE_WINDOW_HITS`] before a gate's own decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn reset_skip_chroma_override_window_hits() {
+    SKIP_CHROMA_OVERRIDE_WINDOW_HITS.with(|c| c.set(0));
 }
 
 /// Zeroes [`SKIP_SPLIT_TX_OVERRIDE_HITS`] before a gate's own decode attempt.
@@ -21671,8 +21692,42 @@ fn decode_block(
                     )
                 };
                 let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx_h);
+                // lane-av1chromadc: the chroma override is a whole
+                // `chroma_side x chroma_height` buffer and
+                // `PlaneBuf::reconstruct` uses the buffer it takes as the
+                // UNIT's own `chroma_tx x chroma_tx_h` prediction, so a
+                // multi-unit plane block must hand each unit its own window of
+                // it. Handing the whole buffer (the pre-fix shape) made every
+                // unit predict from the top-left one: at 4:2:0 the chroma plane
+                // block is a single 32x32 unit, so the whole buffer IS that
+                // unit's window and the bug is invisible -- which is why every
+                // 4:2:0 gate stayed green -- and at 4:4:4 a 64x64 block's 64x64
+                // plane block is a 2x2 grid whose right and bottom columns were
+                // a copy of its top-left unit.
+                // MEASURED on `fixtures/r512.obu` (4:4:4 8-bit 512x512, three
+                // frames): frame 0's skipped 64x64 intra-BC block at
+                // `mi=(112,80)` `px=(320,448)` reconstructed its `cu=(1,0)`
+                // unit at `px=(352,448)` as a flat 241 where the oracle has
+                // 202 -- byte-identical to its `cu=(0,0)` prediction, sum
+                // 882176 and all -- and the coded 64x64 to its right then read
+                // 202/175 against the oracle's 165/166. Gate:
+                // `a_444_skipped_64x64_square_block_windows_its_chroma_override_per_unit`.
+                let chroma_window = |buf: &[u16]| -> Vec<u16> {
+                    if cn_cols == 1 && cn_rows == 1 {
+                        return buf.to_vec();
+                    }
+                    let mut window = Vec::with_capacity(chroma_tx * chroma_tx_h);
+                    for row in 0..chroma_tx_h {
+                        let at = (cu_row * chroma_tx_h + row) * chroma_side + cu_col * chroma_tx;
+                        window.extend_from_slice(&buf[at..at + chroma_tx]);
+                    }
+                    window
+                };
                 if let Some((ub, _)) = &palette_uv_bufs {
-                    set_palette_pred(ub.clone(), fctx);
+                    if cn_cols * cn_rows > 1 {
+                        hit!(SKIP_CHROMA_OVERRIDE_WINDOW_HITS);
+                    }
+                    set_palette_pred(chroma_window(ub), fctx);
                 }
                 push_intra_unit(
                     1,
@@ -21690,7 +21745,7 @@ fn decode_block(
                     fctx,
                 );
                 if let Some((_, vb)) = &palette_uv_bufs {
-                    set_palette_pred(vb.clone(), fctx);
+                    set_palette_pred(chroma_window(vb), fctx);
                 }
                 push_intra_unit(
                     2,
