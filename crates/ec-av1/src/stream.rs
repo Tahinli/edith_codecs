@@ -47988,4 +47988,187 @@ pub(crate) mod tests {
             );
         }
     }
+    /// lane-ibc444c: the 4:4:4 intra-BC chroma cell. `decode_intrabc_rect`
+    /// sized a rect intra-BC block's chroma plane block with a hardcoded 4:2:0
+    /// halving (`bw / 2`, `bh / 2`, origin `px / 2`).
+    /// `av1_get_max_uv_txsize` (`av1/common/blockd.h`) is `ss_size_lookup[bsize]`
+    /// and applies NO halving of its own, and `get_vartx_max_txsize` (`:1447`)
+    /// then reads that plane block as `max_txsize_rect_lookup[plane_bsize]`. So
+    /// at 4:4:4 an 8x16 luma block's chroma plane block is 8x16 and libaom
+    /// codes it as ONE TX_8X16, while the halving read the same 8x16 footprint
+    /// as ONE 4x8 rect unit.
+    ///
+    /// **Localised by trace, not by reading** (`EC_IBCTX`, this commit's rung
+    /// on `read_coeffs_rect`, paired against the oracle's `EC_ECDUMP_IN` by
+    /// STREAM BIT POSITION — never by the 16-bit `rng`, which collides at this
+    /// scale, and never by a plane label, which is the ORACLE's side of the
+    /// pairing):
+    ///
+    /// ```text
+    /// oracle  bit 6870  plane=0 mi=(92,104) tx=7  (TX_8X16) all_zero=0
+    /// ours    bit 6885  8x16 skip_ctx=0  decode.rs (read_inter_plane_rect)
+    /// oracle  bit 6878  plane=1 mi=(92,104) tx=7  (TX_8X16) all_zero=1
+    /// ours    bit 6893  4x8  skip_ctx=0  decode.rs            <-- FORK
+    /// oracle  bit 6879  plane=2 mi=(92,104) tx=7  (TX_8X16) all_zero=1
+    /// ours    bit 6902  4x8  skip_ctx=0  decode.rs
+    /// ```
+    ///
+    /// The `txb_skip` VALUE first disagrees one unit before the bit position
+    /// does: the oracle skips the U unit, we do not, we burn 14 extra bits, and
+    /// every later symbol decodes from the wrong place. Reverting the two
+    /// arithmetic lines reproduces luma sample **205264** as the first wrong
+    /// sample — the exact ceiling `lanes/av1444rect.report.md` rounds 3-4
+    /// documented — which is the red-before proof.
+    ///
+    /// **The 4:4:4 pixel arm is a PREFIX, not an exactness claim, and the
+    /// residual is an ENTROPY fork — NOT a reconstruction one.** An earlier
+    /// round of this lane claimed the coefficient ladder was "bit-exact for all
+    /// 2359 oracle units" and inferred from that the tail was reconstruction.
+    /// **That claim was wrong and is retracted** (see this branch's report r2):
+    /// the walk compared entry bits at matching LIST INDICES across two traces
+    /// of different lengths, and the square `read_coeffs` reader logs an
+    /// `all_zero` step even for a read that consumes ZERO bits, so it paired
+    /// 0-bit lines against real units. Measured on this branch, with the
+    /// 0-bit filter applied to BOTH sides:
+    ///
+    /// ```text
+    /// oracle all_zero reads               2395   (2359 with a real position)
+    /// our   all_zero lines               3999
+    /// our   lines that consumed bits      1326
+    /// 1:1 entry-bit matches, monotone merge  71
+    /// ```
+    ///
+    /// We perform ~1069 FEWER real symbol reads than the oracle. A
+    /// reconstruction-only defect cannot make a symbol count come up short, so
+    /// the tail is a second entropy fork, first visible in U and V at
+    /// **(x=160, y=80) = mi (20, 40)**, spreading to the whole x[320,640)
+    /// y[160,480) quadrant. (A figure of "1910 units matching 1:1 with 486 vs
+    /// 486 non-zero-bit reads" was relayed to this lane and does NOT reproduce
+    /// here — re-measure before quoting either number.)
+    ///
+    /// **The next reader must pair by BIT INTERVAL, not by index.** The oracle's
+    /// `EC_ECDUMP_IN` prints only the ENTRY position; there is no post position,
+    /// and entry bits alone drift the moment per-unit bit consumption differs.
+    /// The unblock is one line of oracle instrumentation OUTSIDE the repo —
+    /// print `aom_reader_tell(r)` after the `aom_read_symbol` at
+    /// `~/.cache/aom-oracle/src/av1/decoder/decodetxb.c:158` — then pair on
+    /// `(entry, post)`, which is exact and collision-free. Coordinate the
+    /// rebuild with the main session; every lane's oracle binary moves.
+    ///
+    /// 4:2:0 identity is a first-class arm, not a claim: `ss_x = ss_y = 1`
+    /// makes `bw >> ss_x` the same arithmetic as the halving, and the pinned
+    /// 4:2:0 twin (`420_intrabc_rect4_witness.obu`) is asserted byte-exact
+    /// against the oracle in the same run.
+    #[test]
+    fn a_444_intrabc_rect_chroma_plane_block_is_the_block_footprint() {
+        const NAME: &str = "a_444_intrabc_rect_chroma_plane_block_is_the_block_footprint";
+        const F444: &str = "444_intrabc_rect4_witness.obu";
+        const F444_LEN: usize = 1016;
+        const F420: &str = "420_intrabc_rect4_witness.obu";
+        const F420_LEN: usize = 890;
+        let read = |name: &str, file: &str, len: usize| -> Vec<u8> {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("fixtures/{file}"));
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{name}: pinned fixture {file} missing: {e}"));
+            assert_eq!(bytes.len(), len, "{name}: {file} length moved");
+            bytes
+        };
+        let stream444 = read(NAME, F444, F444_LEN);
+        let stream420 = read(NAME, F420, F420_LEN);
+        // The defect only exists where `ss_size_lookup` != the 4:2:0 halving.
+        assert_444_header(&stream444, NAME, 8);
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_ibc_rect_chroma_footprint_444_hits();
+        let frames = decode_stream(&stream444)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned 4:4:4 witness was refused: {e}"));
+        let hits = crate::decode::ibc_rect_chroma_footprint_444_hits();
+        assert_eq!(frames.len(), 1, "{NAME}: frame count");
+        assert!(
+            hits > 0,
+            "{NAME}: no rect intra-BC block was sized at 4:4:4 -- the corrected \
+             footprint never ran, so this gate is measuring the hardcoded 4:2:0 \
+             halving (class gate-blind-to-feature)"
+        );
+
+        // lane-av1oraclepost: main's shared probe. With
+        // EC_AV1_REQUIRE_AOMDEC / EC_AV1_REQUIRE_AOMENC set it is a HARD
+        // failure, so a batch run cannot report GREEN with the compare never
+        // run -- ONE presence-check shape in the crate.
+        if !aomdec_available(NAME) {
+            eprintln!("{NAME}: {hits} rect intra-BC block(s) sized at 4:4:4; pixel arm SKIPPED");
+            return;
+        }
+
+        // 4:2:0 identity FIRST and in full.
+        decode_all_frames_vs_oracle(&stream420, &format!("{NAME}-420"));
+
+        // 4:4:4 is a per-plane exact PREFIX, not an exactness claim, and the
+        // doc above says why. Asserting "wrong by exactly N" would encode the
+        // open entropy fork as expected behaviour; the floor is the honest form
+        // and it only ever grows.
+        const PLANE: usize = 640 * 480;
+        const EXACT_PREFIX: [usize; 3] = [PLANE, 51360, 51360];
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let in_obu = dir.join("in.obu");
+        std::fs::write(&in_obu, &stream444).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&in_obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        let _ = decode_stream(&stream444).expect("second decode");
+        set_final_dump_prefix(None);
+        let aom_dump = std::fs::read(format!("{}.f0", aom_prefix.display())).expect("oracle dump");
+        let our_dump = std::fs::read(format!("{}.f0", ours_prefix.display())).expect("our dump");
+        assert_eq!(
+            our_dump.len(),
+            aom_dump.len(),
+            "{NAME}: our frame is {} bytes, the oracle's is {}",
+            our_dump.len(),
+            aom_dump.len()
+        );
+        assert_eq!(aom_dump.len(), 3 * PLANE, "{NAME}: 8-bit 4:4:4 640x480");
+        for (plane, name) in [(0usize, "Y"), (1, "U"), (2, "V")] {
+            let at = plane * PLANE;
+            let floor = EXACT_PREFIX[plane];
+            if our_dump[at..at + floor] == aom_dump[at..at + floor] {
+                continue;
+            }
+            let first = (0..floor)
+                .find(|&s| our_dump[at + s] != aom_dump[at + s])
+                .unwrap_or(floor);
+            panic!(
+                "{NAME}: plane {name} diverges from the oracle at sample {first} of {PLANE} \
+                 (x={}, y={}) -- the exact prefix this gate pins is {floor} and it only \
+                 grows; the chroma tail is the OPEN entropy fork in \
+                 lanes/ibc444c.report.md r2",
+                first % 640,
+                first / 640
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "{NAME}: {hits} rect intra-BC block(s) sized at 4:4:4; 4:2:0 twin \
+             byte-exact; 4:4:4 luma byte-exact (307200/307200), U and V byte-exact to \
+             sample 51360 -- the chroma tail is the OPEN entropy fork \
+             (lanes/ibc444c.report.md r2), NOT an assertion"
+        );
+    }
 }
