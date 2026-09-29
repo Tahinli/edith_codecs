@@ -902,3 +902,96 @@ s = s.replace(anchor, anchor + dump, 1)
 open(path, "w").write(s)
 print("postcdef dump instrumented")
 PYC
+
+# --- depth contract for the four u8-narrowing dump rungs ------------------
+# PREFILT (rung 1), POSTDEBLOCK (rung 3), PREFILT_WIDE (rung 7) and POSTCDEF
+# are paired with ec-av1 decoder rungs that narrow every sample with `as u8`,
+# so the oracle side owes ONE BYTE PER SAMPLE at every depth. As instrumented
+# above they wrote `fwrite(plane + r*stride, 1, w, f)`, which is wrong twice
+# over on a high-bit-depth stream:
+#   1. YV12_BUFFER_CONFIG stores plane pointers in HALVED form -- aom_ports/mem.h
+#      defines CONVERT_TO_BYTEPTR(x) = x >> 1 -- so the real address is
+#      CONVERT_TO_SHORTPTR(p) (p << 1). Pointer arithmetic on the raw uint8_t*
+#      therefore yields an unrelated half-address, and fwrite faults inside
+#      memmove: SIGSEGV (exit 139) with a 0-byte file, on EVERY HBD stream, for
+#      all four rungs, while rung 12 (which does convert) works. A lane hitting
+#      it sees a crashed aomdec and cannot tell it from a decoder defect.
+#   2. y_stride/uv_stride count SAMPLES, so `+ r*stride` in bytes also picks the
+#      wrong row even where the address happens to be readable.
+# At 8 bit neither applies: buf is the real pointer and flags is 0, so the
+# bytes emitted are bit-for-bit what these rungs always wrote. This block owns
+# the contract for all four, runs last, and is a REPAIR pass: it rewrites the
+# loops an earlier (or pre-fix) instrumentation left behind, so re-running this
+# script on an already-instrumented tree fixes it in place.
+python3 - "$F" <<'PYN'
+import re
+import sys
+
+path = sys.argv[1]
+s = open(path).read()
+
+helper = '''/* EC_INSTRUMENTED_NARROW_ROW: emit one plane row as ONE BYTE PER SAMPLE, the
+ * shape the ec-av1 decoder's own EC_AV1_*_DUMP rungs write (they narrow every
+ * sample with `as u8`).
+ *
+ * Two HBD traps this replaces, both fatal until fixed:
+ *  1. YV12_BUFFER_CONFIG stores plane pointers in HALVED form: the real
+ *     address is `CONVERT_TO_SHORTPTR(p)` (aom_ports/mem.h defines
+ *     `CONVERT_TO_BYTEPTR(x) = x >> 1`), so `p + r*stride` computed on the raw
+ *     uint8_t* is an unrelated address. `fwrite(y_buffer + r*y_stride, 1, w,
+ *     f)` on a 10/12-bit stream therefore hands fwrite a half-address that
+ *     faults inside memmove -- SIGSEGV with a 0-byte file, which reads as a
+ *     decoder crash rather than a broken rung.
+ *  2. y_stride/uv_stride count SAMPLES, so a byte-wise `+ r*stride` addresses
+ *     the wrong row as well.
+ * At 8 bit neither applies: the pointer is the real one and the bytes written
+ * are exactly what the rung always emitted. */
+static void ec_dump_narrow_row(FILE *f, const YV12_BUFFER_CONFIG *b,
+                               const uint8_t *plane8, int stride, int row,
+                               int w) {
+  if (!(b->flags & YV12_FLAG_HIGHBITDEPTH)) {
+    fwrite(plane8 + (size_t)row * stride, 1, (size_t)w, f);
+    return;
+  }
+  const uint16_t *p = CONVERT_TO_SHORTPTR(plane8) + (size_t)row * stride;
+  uint8_t *narrow = (uint8_t *)aom_malloc((size_t)w);
+  if (!narrow) return;
+  for (int c = 0; c < w; ++c) narrow[c] = (uint8_t)(p[c] & 0xFF);
+  fwrite(narrow, 1, (size_t)w, f);
+  aom_free(narrow);
+}
+
+'''
+
+if "EC_INSTRUMENTED_NARROW_ROW" not in s:
+    # Must precede every user: the POSTCDEF rung was refactored into a static
+    # helper that sits ABOVE av1_decode_tg_tiles_and_wrapup, so anchor there
+    # when it exists and at the function itself otherwise.
+    for anchor in ("static void ec_dump_postcdef(const AV1_COMMON *cm, int num_planes) {",
+                   "void av1_decode_tg_tiles_and_wrapup(AV1Decoder *pbi, const uint8_t *data,"):
+        if anchor in s:
+            s = s.replace(anchor, helper + anchor, 1)
+            break
+    else:
+        raise SystemExit("narrow-row helper: no anchor before the dump rungs")
+    print("narrow-row helper inserted")
+
+row_loop = re.compile(
+    r"for \(int ec_r = 0; ec_r < ec_b->(\w+); \+\+ec_r\)\n"
+    r"(\s*)fwrite\(ec_b->(\w+)_buffer \+ ec_r \* ec_b->(\w+), 1,\s*\n?\s*ec_b->(\w+),\s*\n?\s*ec_f\);")
+
+
+def narrow(match):
+    rows, indent, plane, stride, width = match.groups()
+    return ("for (int ec_r = 0; ec_r < ec_b->%s; ++ec_r)\n%s"
+            "ec_dump_narrow_row(ec_f, ec_b, ec_b->%s_buffer, ec_b->%s, ec_r,\n"
+            "%s%s ec_b->%s);" % (rows, indent, plane, stride, indent, indent, width))
+
+
+s, rewritten = row_loop.subn(narrow, s)
+if rewritten:
+    print("narrow-row depth fix: rewrote %d plane row loops" % rewritten)
+else:
+    print("narrow-row depth fix: no legacy row loop left (already depth-correct)")
+open(path, "w").write(s)
+PYN
