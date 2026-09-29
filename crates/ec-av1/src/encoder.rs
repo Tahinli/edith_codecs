@@ -2878,10 +2878,14 @@ mod tests {
     fn the_facade_codes_the_same_bytes_as_encode_sequence() {
         let _knobs = crate::speed::knob_read();
         let frames = 12usize;
-        let film = h264_clip_frames(640, 384, frames).unwrap_or_else(|| {
-            eprintln!("no h264 clip: the facade identity gate runs on a synthetic card");
-            (0..frames).map(|t| test_card(64, 64, t)).collect()
-        });
+        let film = h264_clip_frames("the facade identity film arm", 640, 384, frames)
+            .unwrap_or_else(|| {
+                // The probe inside already printed the ONE line naming the
+                // resolved path and the escape hatch, so this is a note about
+                // what runs instead — not a second SKIP.
+                eprintln!("  ...so the film arm runs on a synthetic card, not real film");
+                (0..frames).map(|t| test_card(64, 64, t)).collect()
+            });
         let screen: Vec<Picture> = (0..frames).map(|t| screen_card(64, 64, t)).collect();
         let pyramid = Pyramid::from_env().expect("the pyramid is this build's default");
         for (content, pictures, is_screen) in [("film", &film, false), ("screen", &screen, true)] {
@@ -3248,8 +3252,24 @@ mod tests {
     /// to this facade's own input size, and re-coded through the facade so the
     /// rate-target surface is exercised at the entry point a caller actually
     /// drives.
-    fn h264_clip_frames(width: usize, height: usize, frames: usize) -> Option<Vec<Picture>> {
+    ///
+    /// lane-av1clipprobe: the ABSENCE of this clip used to be a bare
+    /// `clip.exists()` -> `None`, and every caller turned that into a `SKIP`
+    /// line and a return -- so a tree with no root `fixtures/` printed
+    /// `SKIP the 1080p tile round trip: no fixture` and libtest reported `ok`:
+    /// green with nothing asserted, and no env that made it RED. The presence
+    /// check now lives in the crate's one library-fixture probe
+    /// (`library_fixture::require_at`), which fails under `EC_REQUIRE_FIXTURES` /
+    /// `EC_AV1_REQUIRE_FFMPEG` / `EC_AV1_REQUIRE_AOMENC` and otherwise prints
+    /// that ONE line.
+    fn h264_clip_frames(
+        what: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Option<Vec<Picture>> {
         if !have_ffmpeg() {
+            eprintln!("SKIP {what}: no ffmpeg");
             return None;
         }
         // lane-av1speed3: the wall tables below are read on REAL film as
@@ -3257,14 +3277,24 @@ mod tests {
         // gate's own vocabulary), and the film crop lives outside the repo --
         // `EC_AV1_WALL_CLIP` names it. Unset everywhere else, so every other
         // caller still gets the fixture.
+        //
+        // lane-av1clipprobe: the default path resolves through `EC_FIXTURES`
+        // first, which is the root `scripts/verify-fixture-library.sh`
+        // validates -- so the preflight's verdict and these bytes are the same
+        // tree, and GREEN-with-an-absent-root is no longer reachable by
+        // pointing EC_FIXTURES somewhere the gates do not read.
         let clip = match std::env::var("EC_AV1_WALL_CLIP") {
             Ok(p) => std::path::PathBuf::from(p),
-            Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4"),
+            Err(_) => crate::library_fixture::path("video/h264-1080p-23.976-8bit.mp4"),
         };
-        if !clip.exists() {
+        // `what` is the CALLING GATE's name, carried in so that both exits from
+        // this function print exactly one line naming it: the ffmpeg line
+        // above, and the probe's line naming the resolved path. Callers
+        // therefore `return` on `None` WITHOUT printing a second one -- the
+        // second "no fixture" line per gate was the noise that hid this defect.
+        let Some(clip) = crate::library_fixture::require_at(clip, what) else {
             return None;
-        }
+        };
         let out = Command::new("ffmpeg")
             .args(["-v", "error", "-i", clip.to_str().unwrap()])
             .args(["-frames:v", &frames.to_string()])
@@ -3313,8 +3343,12 @@ mod tests {
     #[test]
     fn bytes_per_frame_target_settles_within_20_percent() {
         let _knobs = crate::speed::knob_read();
-        let Some(pictures) = h264_clip_frames(640, 384, 24) else {
-            eprintln!("SKIP bytes_per_frame_target_settles_within_20_percent: no ffmpeg/fixture");
+        let Some(pictures) = h264_clip_frames(
+            "bytes_per_frame_target_settles_within_20_percent",
+            640,
+            384,
+            24,
+        ) else {
             return;
         };
         let target_bytes = 4_000u32;
@@ -3364,10 +3398,12 @@ mod tests {
     fn bitrate_target_lands_within_5_percent_over_48_frames() {
         let _knobs = crate::speed::knob_read();
         let (width, height, frames) = (640usize, 384usize, 48usize);
-        let Some(pictures) = h264_clip_frames(width, height, frames) else {
-            eprintln!(
-                "SKIP bitrate_target_lands_within_5_percent_over_48_frames: no ffmpeg/fixture"
-            );
+        let Some(pictures) = h264_clip_frames(
+            "bitrate_target_lands_within_5_percent_over_48_frames",
+            width,
+            height,
+            frames,
+        ) else {
             return;
         };
         let fps = 24.0;
@@ -3457,10 +3493,12 @@ mod tests {
     #[test]
     fn bytes_per_frame_controller_never_oscillates_past_its_clamp() {
         let _knobs = crate::speed::knob_read();
-        let Some(pictures) = h264_clip_frames(640, 384, 24) else {
-            eprintln!(
-                "SKIP bytes_per_frame_controller_never_oscillates_past_its_clamp: no ffmpeg/fixture"
-            );
+        let Some(pictures) = h264_clip_frames(
+            "bytes_per_frame_controller_never_oscillates_past_its_clamp",
+            640,
+            384,
+            24,
+        ) else {
             return;
         };
         let config = EncoderConfig {
@@ -5573,8 +5611,7 @@ mod tests {
         let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (1920usize, 1080usize);
-        let Some(sources) = h264_clip_frames(width, height, 8) else {
-            eprintln!("SKIP tile_wall_table_at_1080p: no fixture");
+        let Some(sources) = h264_clip_frames("tile_wall_table_at_1080p", width, height, 8) else {
             return;
         };
         let layouts = [(0u32, 0u32), (1, 0), (1, 1), (2, 1)];
@@ -5817,11 +5854,9 @@ mod tests {
         }
         // Real gate content, where the CDEF preset search actually chooses
         // `bits > 0` and the tile is re-coded, one tile and four.
-        if let Some(sources) = h264_clip_frames(640, 384, 3) {
+        if let Some(sources) = h264_clip_frames("the gate-clip arm", 640, 384, 3) {
             run(&sources, 640, 384, (0, 0));
             run(&sources, 640, 384, (1, 1));
-        } else {
-            eprintln!("SKIP the gate-clip arm: no fixture or no ffmpeg");
         }
         crate::decode::set_verify_final_replay(false);
     }
@@ -5869,8 +5904,8 @@ mod tests {
         threads: &[usize],
     ) {
         let _gate_lock = crate::stream::tests::lock_gate_counters();
-        let Some(sources) = h264_clip_frames(width, height, frames) else {
-            eprintln!("SKIP the filter-stage breakdown: no fixture or no ffmpeg");
+        let Some(sources) = h264_clip_frames("the filter-stage breakdown", width, height, frames)
+        else {
             return;
         };
         crate::par::set_stage_times(true);
@@ -5941,8 +5976,8 @@ mod tests {
         threads: &[usize],
     ) {
         let _gate_lock = crate::stream::tests::lock_gate_counters();
-        let Some(sources) = h264_clip_frames(width, height, frames) else {
-            eprintln!("SKIP the tile-search wall table: no fixture or no ffmpeg");
+        let Some(sources) = h264_clip_frames("the tile-search wall table", width, height, frames)
+        else {
             return;
         };
         let run = |cols_log2: u32, rows_log2: u32, t: usize| -> (std::time::Duration, usize) {
@@ -6038,18 +6073,27 @@ mod tests {
         layouts: &[(u32, u32)],
         threads: &[usize],
     ) {
-        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
         let listed = Command::new("ffmpeg")
             .args(["-hide_banner", "-encoders"])
             .output();
         let has_rav1e = listed
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("librav1e"))
             .unwrap_or(false);
-        if !has_rav1e || !clip.exists() {
-            eprintln!("SKIP the rav1e reference: no librav1e or no fixture");
+        // lane-av1clipprobe: this was `!has_rav1e || !clip.exists()` behind ONE
+        // line, which is how the clip's absence hid inside a tool-absence
+        // message and could not fail under any require env. The two causes are
+        // now separate, and only the clip goes through the fixture probe, so
+        // either way this helper prints exactly ONE line.
+        if !has_rav1e {
+            eprintln!("SKIP the rav1e reference: ffmpeg has no librav1e encoder");
             return;
         }
+        let Some(clip) = crate::library_fixture::require(
+            "video/h264-1080p-23.976-8bit.mp4",
+            "the rav1e reference",
+        ) else {
+            return;
+        };
         eprintln!("| rav1e layout | threads | wall | fps | bytes |");
         for &(c, r) in layouts {
             for &t in threads {
@@ -6109,15 +6153,29 @@ mod tests {
     /// smoke.
     ///
     /// The two skippable halves both route through the crate's EXISTING
-    /// presence probes, not a new shape: `h264_clip_frames` (which itself
-    /// asks `have_ffmpeg()` and `clip.exists()`) and `have_ffmpeg()` for the
-    /// ffmpeg arm. No bare presence check was added.
+    /// presence probes, not a new shape: `h264_clip_frames` (which itself asks
+    /// `have_ffmpeg()` and `library_fixture::require_at`) and `have_ffmpeg()`
+    /// for the ffmpeg arm. No bare presence check was added.
+    ///
+    /// lane-av1clipprobe: with the root `fixtures/` absent this gate printed
+    /// `SKIP the 1080p tile round trip: no fixture` and libtest reported `ok`
+    /// — a 1080p gate that asserts nothing on every linked worktree, and no
+    /// env that made it RED. `library_fixture::require_at` now fails under
+    /// `EC_REQUIRE_FIXTURES` / `EC_AV1_REQUIRE_FFMPEG` / `EC_AV1_REQUIRE_AOMENC`
+    /// and otherwise prints exactly ONE line naming the resolved path, and the
+    /// path it resolves honours `EC_FIXTURES` — the root
+    /// `scripts/verify-fixture-library.sh` validates — so the preflight's
+    /// verdict and these bytes cannot be different trees again.
     #[test]
     fn a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders() {
         let _knobs = crate::speed::knob_read();
         let (width, height) = (1920usize, 1080usize);
-        let Some(sources) = h264_clip_frames(width, height, 3) else {
-            eprintln!("SKIP the 1080p tile round trip: no fixture");
+        let Some(sources) = h264_clip_frames(
+            "a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders",
+            width,
+            height,
+            3,
+        ) else {
             return;
         };
         for (cols_log2, rows_log2) in [(1u32, 0u32), (1, 1), (2, 1)] {
@@ -6176,8 +6234,12 @@ mod tests {
             return;
         }
         let (width, height) = (640, 384);
-        let Some(pictures) = h264_clip_frames(width, height, 8) else {
-            eprintln!("SKIP quality_target_is_monotone_in_bytes_and_psnr: no fixture");
+        let Some(pictures) = h264_clip_frames(
+            "quality_target_is_monotone_in_bytes_and_psnr",
+            width,
+            height,
+            8,
+        ) else {
             return;
         };
         let mut prev_bytes = 0usize;
