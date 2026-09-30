@@ -2293,17 +2293,28 @@ pub(crate) fn rect_class1_hits() -> usize {
 // lane-av1readcensus: the PER-UNIT coefficient census -- one unit counted
 // per `read_coeffs`/`read_coeffs_rect` call, i.e. per object this decoder
 // actually walks, which is the unit the round-4 `av1444rect` count measured
-// (636 square chroma reads against the oracle's 1086). The counters are
-// 4:4:4-ONLY (`CENSUS_444`, set per frame beside `set_subsampling`), so a
-// 4:2:0 control reads `(0, 0, 0)` -- a walk-shape change at 4:2:0 is another
-// lane's business, and this census must not fire there.
+// (636 square chroma reads against the oracle's 1086).
+//
+// lane-av1422census422 widened the arming. The counters used to be
+// 4:4:4-ONLY (`CENSUS_444`), so at 4:2:2 -- a chroma format an AV1
+// `color_config` can carry and libaom's writer emits -- every
+// `census_444_units()` / `census_444_coded()` read zero BY CONSTRUCTION: a
+// byte-exact 4:2:2 gate asserting those counters would be asserting a
+// literal, and would be green while proving nothing about that stream. The
+// census is now armed for every chroma format that leaves at least one luma
+// axis unsubsampled -- (0,0) 4:4:4 and (1,0) 4:2:2 -- and 4:2:0 (1,1) stays
+// off, so the existing 4:4:4 exact counts and the 4:2:0 zero control are
+// unmoved by the widening. The counters are per-PLANE, not per-format, so a
+// 4:2:2 cell's `[luma, u, v]` split is directly comparable with a 4:4:4
+// cell's on the same walk shape.
 thread_local! {
-    /// Per-plane unit counts, `[luma, u, v]`, at 4:4:4 only.
-    static CENSUS_444_UNITS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
-    /// Of [`CENSUS_444_UNITS`], the units that coded at least one coefficient
-    /// (`txb_skip == 0`) -- the per-plane split is only comparable against
-    /// the oracle's when both sides count all-zero units the same way.
-    static CENSUS_444_CODED: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Per-plane unit counts, `[luma, u, v]`, at 4:4:4 and 4:2:2.
+    static CENSUS_NONSUB_UNITS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Of [`CENSUS_NONSUB_UNITS`], the units that coded at least one
+    /// coefficient (`txb_skip == 0`) -- the per-plane split is only
+    /// comparable against the oracle's when both sides count all-zero units
+    /// the same way.
+    static CENSUS_NONSUB_CODED: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
     /// Sequential unit index, so a trace line names its own position in the
     /// frame's walk rather than relying on line order alone.
     static CENSUS_UNIT_N: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2313,29 +2324,36 @@ thread_local! {
     /// are not this lane's to edit and would each grow an argument; the
     /// plane-owning readers stamp it once on entry instead.
     static CENSUS_PLANE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// 4:4:4 (`subsampling_x == 0 && subsampling_y == 0`) for the frame being
-    /// decoded, set per frame from [`crate::stream`].
-    static CENSUS_444: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// At least one luma axis unsubsampled -- (0,0) 4:4:4 or (1,0) 4:2:2 --
+    /// for the frame being decoded, set per frame from [`crate::stream`].
+    /// 4:2:0 (1,1) arms nothing.
+    static CENSUS_NONSUB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Current `[luma, u, v]` 4:4:4 coefficient-unit counts.
-#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
-pub(crate) fn census_444_units() -> [usize; 3] {
-    CENSUS_444_UNITS.with(|c| c.get())
+/// Current `[luma, u, v]` coefficient-unit counts, per plane. Zero at 4:2:0
+/// by design ([`set_census_nonsub`] arms nothing there).
+pub fn census_nonsub_units() -> [usize; 3] {
+    CENSUS_NONSUB_UNITS.with(|c| c.get())
 }
 
-/// Current `[luma, u, v]` 4:4:4 counts of units that coded coefficients.
-#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
-pub(crate) fn census_444_coded() -> [usize; 3] {
-    CENSUS_444_CODED.with(|c| c.get())
+/// Current `[luma, u, v]` counts of units that coded coefficients.
+pub fn census_nonsub_coded() -> [usize; 3] {
+    CENSUS_NONSUB_CODED.with(|c| c.get())
 }
 
-/// lane-av1readcensus: arms the 4:4:4 census for the frame about to decode,
-/// called once per frame from [`crate::stream`]'s decode loop beside
-/// [`set_subsampling`]. At 4:2:0 (or 4:2:2) every census counter stays zero --
-/// the walk-shape question this census answers is a 4:4:4 one.
-pub(crate) fn set_census_444(ss_x: u8, ss_y: u8) {
-    CENSUS_444.with(|c| c.set(ss_x == 0 && ss_y == 0));
+/// lane-av1readcensus: arms the coefficient-unit census for the frame about
+/// to decode, called once per frame from [`crate::stream`]'s decode loop
+/// beside [`set_subsampling`]. Armed for every chroma format with an
+/// unsubsampled luma axis -- 4:4:4 (0,0) and 4:2:2 (1,0) -- and NOT for
+/// 4:2:0 (1,1), where the walk-shape question this census answers does not
+/// arise, so a 4:2:0 control can still assert exactly zero.
+///
+/// lane-av1422census422 widened this from `(ss_x == 0 && ss_y == 0)`. The
+/// old condition made 4:2:2 silently UNCUNTABLE rather than uncounted. The
+/// two format pairs keep disjoint conditions, so neither the 4:4:4 exact
+/// counts nor the 4:2:0 zero control can move because of this.
+pub(crate) fn set_census_nonsub(ss_x: u8, ss_y: u8) {
+    CENSUS_NONSUB.with(|c| c.set(ss_x == 0 || ss_y == 0));
 }
 
 /// lane-av1readcensus: the plane the units read from here on belong to,
@@ -2377,15 +2395,15 @@ fn census_unit(
     let coded = usize::from(!all_zero);
     CENSUS_UNIT_N.with(|c| c.set(c.get() + 1));
     hit_do! {
-        CENSUS_444_UNITS.with(|c| {
-            if CENSUS_444.with(|on| on.get()) {
+        CENSUS_NONSUB_UNITS.with(|c| {
+            if CENSUS_NONSUB.with(|on| on.get()) {
                 let mut v = c.get();
                 v[plane] += 1;
                 c.set(v);
             }
         });
-        CENSUS_444_CODED.with(|c| {
-            if CENSUS_444.with(|on| on.get()) {
+        CENSUS_NONSUB_CODED.with(|c| {
+            if CENSUS_NONSUB.with(|on| on.get()) {
                 let mut v = c.get();
                 v[plane] += coded;
                 c.set(v);

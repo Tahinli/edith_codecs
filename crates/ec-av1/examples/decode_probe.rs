@@ -292,6 +292,27 @@ fn main() {
         // them landed inside a rect64 dequant.
         let (dq, dq_drift) = ec_av1::stream::rect64_qidx_drift_counters();
         println!("delta_q: groups_read={dq} rect64_qidx_drift={dq_drift}");
+        // lane-av1422census422: the per-plane coefficient-unit census, armed
+        // for 4:4:4 and 4:2:2 (4:2:0 arms nothing, so a 4:2:0 recipe sweep
+        // reads `luma=0 u=0 v=0` BY DESIGN and must not read that as "the
+        // walk was empty" -- `units_total` is the UNCONDITIONAL per-frame
+        // total, so the two together say whether the census was armed at
+        // all). This is what makes a 4:2:2 non-vacuity requirement
+        // writable: before the widening every per-plane field read zero on a
+        // 4:2:2 cell BY CONSTRUCTION, so a byte-exact 4:2:2 gate could
+        // assert it and prove nothing about the stream it had decoded.
+        let cu = ec_av1::decode::census_nonsub_units();
+        let cc = ec_av1::decode::census_nonsub_coded();
+        println!(
+            "census_units: luma={} u={} v={} | coded: luma={} u={} v={} | units_total={}",
+            cu[0],
+            cu[1],
+            cu[2],
+            cc[0],
+            cc[1],
+            cc[2],
+            ec_av1::decode::census_unit_n(),
+        );
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
