@@ -9293,6 +9293,93 @@ pub(crate) mod tests {
              {shown} shown frame(s) exact per plane, mid-cell chroma publications {mid:?}"
         );
     }
+
+    /// lane-av1mixllfork: per-segment MIXED LOSSLESS + an alt-ref structure.
+    /// The first fork was entropy read **30889** of f1 (paired `EC_SYMR`:
+    /// identical `pre[0..1]`, `n`, `s` on both sides, `post_rng` 42076 vs
+    /// 54010), and the pre-fix `cdf0` at that read was 22401 vs the oracle's
+    /// 15299 -- **not** the usual `32768 - x` ICDF mirror, i.e. two different
+    /// reads, not one wrong CDF row.
+    ///
+    /// What each side read there: libaom `decodetxb.c:158`, the luma `txb_skip`
+    /// of a TX_4X4 unit at `mi=(6,1)` `bc=0 br=0`; ours an untagged `n=2`
+    /// symbol that a `set_symr_cdf` sweep over all six MV-stack copies
+    /// (`ii16/newmv16/…/refmvB`, `inter8` phase inherited) ruled out as every
+    /// inter mode-info read, leaving the one read that block makes *between*
+    /// its `refmv` and its coefficients: the var-tx tree's `tx_size_cat1`.
+    /// libaom's own reason it reads nothing: `parse_decode_block`
+    /// (`decodeframe.c:1237`) carries `!xd->lossless[mbmi->segment_id]` as a
+    /// **conjunct** of the tx-mode-select condition, and `read_tx_size`
+    /// (`:1208`) answers TX_4X4 on the same flag. This tree tested
+    /// `tx_select && !skip` and put `lossless(fctx) && !skip` in the `else if`
+    /// arm instead, so on a lossless SEGMENT of a mixed-lossless frame it read
+    /// a `tx_size_cat1` symbol libaom never reads, and the very next block's
+    /// `txb_skip` forked. `SUB8_LOSSLESS_NO_VARTX` counts the leaves that
+    /// newly take the lossless arm, so this gate cannot pass vacuously on a
+    /// stream whose sub-8 leaves all sit in lossy segments.
+    ///
+    /// The trigger really is the CONJUNCTION: `--cq-level=0` with AQ makes
+    /// *some* segments lossless and others not (`--cq-level=20`, `--cq-level=32`,
+    /// `--lossless=1` and `--aq-mode=0` are all byte-exact on this recipe), and
+    /// `--auto-alt-ref=0` makes it exact at 5, 6, 8 and 12 frames. After the
+    /// fix the whole-stream `EC_SYMR` ladder is bit-identical: **96997 reads,
+    /// 96997 paired, zero divergence** -- not just up to the fork.
+    ///
+    /// Recipe (ffmpeg 8.1.3 `testsrc2`, shared oracle `aomenc`, 18525 bytes):
+    /// ```text
+    /// ffmpeg -f lavfi -i testsrc2=size=256x128:rate=25 -frames:v 5 \
+    ///        -pix_fmt yuv420p src5b.y4m
+    /// aomenc --codec=av1 --obu -o c_mix5.obu --passes=1 --cpu-used=4 \
+    ///        --limit=5 --end-usage=q --cq-level=0 --aq-mode=1 src5b.y4m
+    /// ```
+    /// sha256 `3e06b5641e6a0f5a3f4ac8f114d4ee48c88638429e9eaafe6b4483e24f1dbc3a`.
+    /// The tree pins fixture identity by fnv1a64; a `const SHA256` compared
+    /// against itself would be the tautology lane-av1422anom exists to kill.
+    #[test]
+    fn a_420_mixed_lossless_alt_ref_sub8_vartx_witness_is_byte_exact_in_decode_order() {
+        const NAME: &str =
+            "a_420_mixed_lossless_alt_ref_sub8_vartx_witness_is_byte_exact_in_decode_order";
+        let _gate_lock = lock_gate_counters();
+        const FILE: &str = "420_mixll_altref_256x128_5f.obu";
+        const BYTES: usize = 18525;
+        const FNV1A64: u64 = 16348502764482216576;
+        let path = crate_pin(FILE);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: the committed pin {FILE} is missing ({e})"));
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FNV1A64, "{NAME}: {FILE} bytes drifted");
+        let before = crate::decode::sub8_lossless_no_vartx();
+        let (decoded, hidden) = decode_all_frames_vs_oracle(&data, NAME);
+        let suppressed = crate::decode::sub8_lossless_no_vartx() - before;
+        assert_eq!(
+            decoded, 6,
+            "{NAME}: the oracle decoded {decoded} frames in DECODE order; the 5-frame \
+             altref recipe codes 5 source frames plus a hidden alt-ref picture"
+        );
+        assert_eq!(
+            hidden, 1,
+            "{NAME}: {decoded} decode-order dumps against {decoded} - {hidden} shown outputs \
+             means the gate saw the hidden picture no shown-frame compare can reach"
+        );
+        assert!(
+            suppressed > 0,
+            "{NAME}: no sub-8 (4x8/8x4) inter leaf on a LOSSLESS segment read no var-tx \
+             symbol ({suppressed} of them did), so this witness does not exercise the \
+             ordering at all (class gate-blind-to-feature) -- re-encode per the recipe above"
+        );
+        let (wy, wu, wv, shown, exact) =
+            count_rawvideo_diffs(&data, NAME, None).expect("the two sides must be byte-comparable");
+        assert_eq!(
+            (wy, wu, wv, exact),
+            (0, 0, 0, shown),
+            "{NAME}: shown-frame per-plane diff vs `aomdec --rawvideo`"
+        );
+        eprintln!(
+            "{NAME}: {decoded} decode-order frame(s) byte-exact ({hidden} hidden), \
+             {shown} shown frame(s) exact per plane, {suppressed} sub-8 leaf/leaves on a \
+             lossless segment read no var-tx symbol"
+        );
+    }
     /// lane-av1444rect r2 — the SAME class as the gate above, second
     /// instance: `decode_rect4_16_intrabc` applied the 4:2:0 pair geometry at
     /// ss (0,0), where `is_chroma_reference` makes an intra-BC 1:4 strip its
