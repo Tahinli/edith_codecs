@@ -29941,14 +29941,23 @@ fn read_block_tx_size(
             4
         };
         // The gate's non-vacuity arm, on the DECISION, sampled BEFORE the
-        // write: this publish OVERWRITES a size some earlier block of the same
-        // frame had left in one of the columns it covers -- the only way a
-        // later `get_tx_size_context` / `txfm_partition_context` reader can
-        // see it. On a frame whose blocks all sit in lossless segments nothing
-        // reads either band (libaom's `read_tx_size` returns before
-        // `get_tx_size_context`, and the var-tx tree is gated on
-        // `!xd->lossless`), so a wholly-lossless stream whose inter blocks are
-        // all non-skip leaves this at zero.
+        // write: this publish CHANGES at least one of the above-band cells it
+        // covers -- the cell did not already hold `pub_above`, so a later
+        // `get_tx_size_context` / `txfm_partition_context` reader in the same
+        // tile column reads a value the publish produced.
+        //
+        // CORRECTED 2026-09-30 (refutation pass `lanes/refute-av1txctxband2`):
+        // an earlier version of this comment, and of the static's doc, claimed
+        // the write counts only when it OVERWRITES "a size some earlier block
+        // had left", and that a wholly-lossless all-non-skip stream leaves it
+        // at zero. MEASURED FALSE: 420_lossless_tallinter_8x16.obu fires 48,
+        // ALL with every covered column still at `TXFM_CTX_INIT` -- a first
+        // write into a fresh tile column counts here too, because the test is
+        // "the cell did not already hold this value", not "some block wrote a
+        // different value earlier". Of the pin's 944 fires, 183 are that
+        // first-touch case. The count is still a decision (no reader, no
+        // intra-only frame, no unchanged column), so the gate keeps its teeth;
+        // only the doc's stronger reading was wrong.
         let overwrote = !fctx.intra_only.with(std::cell::Cell::get)
             && (0..side_mi).any(|i| n.above_txfm.get(at_mi.1 + i) != Some(&pub_above));
         set_txfm_ctxs(n, at_mi, 4, side_mi, side_mi, skip && is_inter);
@@ -34821,14 +34830,24 @@ thread_local! {
     /// doing.
     pub(crate) static SUB8_LOSSLESS_NO_VARTX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// lane-av1txctxband2: SQUARE lossless blocks on an INTER frame whose
-    /// `set_txfm_ctxs` publish CHANGED an above-band cell -- i.e. the write
-    /// overwrote a size some earlier block of the same frame had left, which
-    /// is the only way a later `get_tx_size_context` /
-    /// `txfm_partition_context` reader can see it. Zero on an intra-only
+    /// `set_txfm_ctxs` publish CHANGED at least one above-band cell it covers
+    /// (the cell did not already hold the published size), so a later
+    /// `get_tx_size_context` / `txfm_partition_context` reader in the same
+    /// tile column reads a value this publish produced. Zero on an intra-only
     /// frame (where `fill_lf_grid_rect_inner` publishes the same 4x4 value at
-    /// the same footprint) and on a wholly-lossless stream whose inter blocks
-    /// are all non-skip (nothing reads either band there), so a gate cannot
-    /// look armed by merely decoding a lossless fixture.
+    /// the same footprint).
+    ///
+    /// CORRECTED 2026-09-30 (refutation pass `lanes/refute-av1txctxband2`):
+    /// this doc previously claimed the hit meant "overwrote a size some
+    /// earlier block left" and that a wholly-lossless all-non-skip stream
+    /// leaves it at zero. MEASURED FALSE -- `420_lossless_tallinter_8x16.obu`
+    /// fires **48**, all of them first touches of a column still at
+    /// `TXFM_CTX_INIT`; `420_lossless_arf_1to4_320x240_5f.obu` fires 320, 53 of
+    /// them first touches. Of the pin's 944, **183 are first-touch**. The
+    /// predicate tests "the cell did not already hold this value", which is
+    /// the decision that matters (no reader, no intra-only frame, no unchanged
+    /// column still reads 0), but it is NOT the strictly narrower causal claim
+    /// the old text made.
     pub(crate) static LOSSLESS_SQ_TXFM_BAND_OVERWRITE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
