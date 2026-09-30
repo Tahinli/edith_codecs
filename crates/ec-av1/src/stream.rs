@@ -50911,6 +50911,137 @@ exit 0
         }
     }
 
+    /// lane-av1444palw: the gate for the arm
+    /// `a_444_lossy_palette_chroma_unit_window_is_byte_exact_at_352x242_10bit`
+    /// could NOT reach -- the HORIZONTAL half of the same 32-capped chroma
+    /// walk in `decode_block_rect64` (`palette_window(pbuf, chroma_w,
+    /// cu_col * uw, cu_row * uh, uw, uh)`, the arms at decode.rs:20131 and
+    /// :20199). Its `cu_col` term is the axis the corpus census never
+    /// exercised: a 106-fixture trace of that walk found 16 windowed units and
+    /// every one had `nw == 1`, i.e. only the `cu_row` term (`nh = 2`) was
+    /// ever load-bearing.
+    ///
+    /// **What makes `nw >= 2` reachable.** At ss (0,0) the chroma plane block
+    /// equals the luma one, so a 64-WIDE luma rect block keeps `cw = 64` and
+    /// the 32-cap tiles it into `nw = 2` units. `decode_block_rect64` is the
+    /// only function owning this walk at a 64-wide block, reached from
+    /// `PARTITION_HORZ`/`HORZ_A`/`HORZ_B` (64x32) and `HORZ_4` (64x16). The
+    /// cells here came from sweeping `--min-partition-size` x `--cq-level` over
+    /// a 4:4:4 testsrc2 640x480 cell encoded with the lane-av1rect14
+    /// `ibc640` flag set (rect + 1:4 partitions, `--min-partition-size=8
+    /// --sb-size=64 --tune-content=screen --enable-palette=1
+    /// --enable-intrabc=1 --enable-tx-size-search=0 --cpu-used=0
+    /// --lag-in-frames=0 --kf-max-dist=1 --limit=1 --threads=1
+    /// --tile-columns=0 --passes=1 --end-usage=q --profile=1`):
+    /// `--min-partition-size=8` is what yields the 64-wide strip, and
+    /// `cq-level=45` is what makes the chroma palette win on it. Census read
+    /// off `EC_PALWALK=1`, the diagnostic rung this lane added to
+    /// `decode_block_rect64`:
+    ///
+    /// * 10-bit `cq 45`: `bw=64 bh=16 cw=64 ch=16 uw=32 uh=16 nw=2 nh=1 puv=1`
+    ///   -- the RECT-unit arm (`uw != uh`) carrying a chroma palette, `nw = 2`.
+    /// * 12-bit `cq 45`: `bw=64 bh=32 cw=64 ch=32 uw=32 uh=32 nw=2 nh=1 puv=1`
+    ///   -- the SQUARE-unit arm carrying a chroma palette, `nw = 2`, on the
+    ///   12-bit chroma plane no prior gate had built.
+    ///
+    /// **Both cells are byte-exact against the instrumented `aomdec`** per
+    /// plane over the single decode-order frame (10-bit 0/0/0, 12-bit 0/0/0),
+    /// and the comparator's liveness is proved by a one-byte oracle tamper
+    /// moving the mismatch count 0 -> 1 at each depth.
+    ///
+    /// **Red without the per-unit window, by this gate's own numbers.**
+    /// Reverting both `palette_window` calls to the whole-block buffer (the
+    /// counter left armed) gives 0 / 25553 / 26139 on the 10-bit cell, first
+    /// wrong sample decode frame 0 plane U row 96 col 448 (mutant 810, oracle
+    /// 763; plane V the same sample 891 vs 767), and 0 / 6400 / 6400 on the
+    /// 12-bit cell, first wrong sample plane U row 352 col 160 (866 vs 2004).
+    /// Both are the `cu_col = 1` unit reading the block's column 0 -- this arm,
+    /// not a cascade.
+    ///
+    /// **Non-vacuity.** (1) pinned bytes: 3301 / 2571 with FNV-1a64 and
+    /// sha256 asserted. (2) the DERIVED condition: the counter is guarded on
+    /// `nw * nh > 1`, so a hit proves the tiled arm ran, and the floors below
+    /// are re-measured on these two streams (the pinned gate's floor of 4 was
+    /// a floor from ONE stream, not a census). (3) 640x480 with
+    /// FULL-RESOLUTION chroma, so a 4:2:0 extent cannot pass. (4) the crate's
+    /// own one-byte oracle-comparator liveness control.
+    #[test]
+    fn a_444_palette_chroma_horizontal_unit_window_is_byte_exact_10bit_and_12bit() {
+        const NAME: &str =
+            "a_444_palette_chroma_horizontal_unit_window_is_byte_exact_10bit_and_12bit";
+        // (fixture, len, fnv1a64, bit_depth, min_windowed_units)
+        const ARMS: [(&str, usize, u64, usize, usize); 2] = [
+            (
+                "fixtures/444_palette_chroma_hstrip_640x480_10b.obu",
+                3301,
+                0x6f94_da75_95cd_9a17,
+                10,
+                8,
+            ),
+            (
+                "fixtures/444_palette_chroma_hstrip_640x480_12b.obu",
+                2571,
+                0x65a5_8561_c1f3_538e,
+                12,
+                4,
+            ),
+        ];
+        const W: usize = 640;
+        const H: usize = 480;
+        let _guard = lock_gate_counters();
+        for (fixture, len, fnv, depth, min_units) in ARMS {
+            let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture);
+            let stream = std::fs::read(&obu).unwrap_or_else(|e| {
+                panic!(
+                    "{NAME}: pinned fixture {fixture} is missing ({e}) -- the gate cannot \
+                     run, which is a failure, not a skip"
+                )
+            });
+            assert_eq!(stream.len(), len, "{NAME}: {fixture} length moved");
+            assert_eq!(fnv1a64(&stream), fnv, "{NAME}: {fixture} bytes moved");
+
+            crate::decode::reset_chroma_palette_window_hits();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: {fixture} no longer decodes cleanly: {e}"));
+            let windowed = crate::decode::chroma_palette_window_hits();
+            assert!(
+                windowed >= min_units,
+                "{NAME}: {fixture} ran {windowed} windowed palette chroma unit(s), expected \
+                 at least {min_units} -- the 32-cap tiled chroma walk did not reach enough \
+                 palette blocks, so the horizontal windowing under test never ran and this \
+                 gate is blind to the defect (class gate-blind-to-feature)"
+            );
+            assert_eq!(
+                frames.len(),
+                1,
+                "{NAME}: {fixture} decode-order frame count"
+            );
+            for (i, f) in frames.iter().enumerate() {
+                assert_eq!(
+                    (f.width, f.height),
+                    (W, H),
+                    "{NAME}: {fixture} frame {i} dimensions"
+                );
+                assert_eq!(
+                    f.u.len(),
+                    W * H,
+                    "{NAME}: {fixture} frame {i} chroma plane is {} samples; at 4:4:4 it must \
+                     be full resolution ({W}x{H}) -- a {depth}-bit decoder that kept the \
+                     4:2:0 extent cannot pass this compare",
+                    f.u.len()
+                );
+            }
+            if aomdec_available(NAME) {
+                let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+                eprintln!(
+                    "{NAME}: {fixture} ({depth}-bit) {decoded} decode-order frame(s) \
+                     ({hidden} hidden) byte-exact vs aomdec, {windowed} windowed palette \
+                     chroma unit(s)"
+                );
+            }
+        }
+    }
+
     /// lane-av1cfl: the 4:4:4 CfL AC body is a DIFFERENT function from the
     /// 4:2:0 one, and this gate is the proof that the format-blind
     /// `cfl_ac_q3_at` (`bw / 2, bh / 2`, a 2x2 luma average per chroma
