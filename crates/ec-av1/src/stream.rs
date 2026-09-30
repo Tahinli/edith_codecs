@@ -10295,6 +10295,167 @@ pub(crate) mod tests {
         (oracle_frames, hidden)
     }
 
+    /// lane-av1422anom: a COUNTING oracle comparison.
+    ///
+    /// [`assert_rawvideo_matches`] is the right tool for "these must be equal"
+    /// and the wrong tool for a lane that has to classify many cells: it
+    /// panics on the first differing byte, so it answers one cell per process
+    /// and cannot report a magnitude. This returns the count instead.
+    ///
+    /// It exists because the previous lane's per-cell counter was tautological:
+    /// it packed our own decoded samples into `ours` and then compared `ours`
+    /// against the same samples, never touching the oracle's bytes, so it
+    /// reported "0 wrong" on every cell including one that differs from
+    /// `aomdec` in 1612 samples. [`the_counting_oracle_diff_reports_a_real_difference`]
+    /// below is the test that keeps that mistake from recurring.
+    ///
+    /// Returns `(wrong_y, wrong_u, wrong_v, frames_total, frames_exact)`, or
+    /// `None` when the two sides are not byte-comparable at all (a size
+    /// mismatch, which is a different failure and must not read as "exact").
+    fn count_rawvideo_diffs(
+        stream: &[u8],
+        name: &str,
+    ) -> Option<(usize, usize, usize, usize, usize)> {
+        let dir = std::env::temp_dir().join(format!("ec-av1-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, stream).expect("writing the stream");
+        let raw = dir.join("aomdec.raw");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "--rawvideo", "-o"])
+            .arg(&raw)
+            .arg(&obu)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{name}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let want = std::fs::read(&raw).expect("aomdec rawvideo output");
+        let _ = std::fs::remove_dir_all(&dir);
+        let bit_depth = stream_bit_depth(stream, name);
+        let decoded = decode_stream(stream).expect("decode for comparison");
+        let ours = pack_rawvideo(&decoded, bit_depth, name);
+        if ours.len() != want.len() {
+            return None;
+        }
+        let bpp = if bit_depth == 8 { 1 } else { 2 };
+        // The plane split comes from the FIRST decoded picture, not from a
+        // formula: a 4:2:0 picture's chroma is a quarter of the luma, a
+        // 4:2:2/4:4:4 chroma is not, and a wrong split silently attributes
+        // every wrong sample to the wrong plane.
+        let f0 = decoded.first().expect("a decoded picture");
+        let (w, h) = (f0.width, f0.height);
+        let (ys, us) = (w * h * bpp, f0.u.len() * bpp);
+        let mut wrong = [0usize; 3];
+        for (i, (&a, &b)) in ours.iter().zip(&want).enumerate() {
+            if a == b {
+                continue;
+            }
+            let pi = if i < ys {
+                0
+            } else if i < ys + us {
+                1
+            } else {
+                2
+            };
+            wrong[pi] += 1;
+        }
+        let per = ys + 2 * us;
+        let frames = decoded.len();
+        let exact = (0..frames)
+            .filter(|k| ours[k * per..(k + 1) * per] == want[k * per..(k + 1) * per])
+            .count();
+        Some((wrong[0], wrong[1], wrong[2], frames, exact))
+    }
+
+    /// lane-av1422anom: the non-vacuity test for [`count_rawvideo_diffs`].
+    ///
+    /// A cell-classifying counter that cannot report a difference is worse
+    /// than no counter, because it reports "exact" for everything. This
+    /// proves the counting path fires: it decodes the pinned odd-height 4:2:0
+    /// witness, which is KNOWN to differ from the oracle, and asserts a
+    /// non-zero per-plane count. If a future edit makes the helper return
+    /// zeros for a stream that really does differ, this goes red by name.
+    #[test]
+    fn the_counting_oracle_diff_reports_a_real_difference() {
+        const NAME: &str = "the_counting_oracle_diff_reports_a_real_difference";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("420_oddheight_320x232.obu");
+        let data = std::fs::read(&path).expect("the pinned witness is missing");
+        let (wy, wu, wv, frames, exact) =
+            count_rawvideo_diffs(&data, NAME).expect("the two sides must be byte-comparable");
+        assert!(
+            wy + wu + wv > 0,
+            "{NAME}: the pinned witness differs from `aomdec --rawvideo`, so a correct \
+             comparison MUST report a non-zero count -- reporting zero here means the \
+             comparison stopped reading the oracle's bytes"
+        );
+        assert!(
+            exact < frames,
+            "{NAME}: at least one frame of the pinned witness is not byte-identical to \
+             the oracle, so frames_exact must be below the frame count"
+        );
+        eprintln!("{NAME}: witness reports Y={wy} U={wu} V={wv}, frames_exact={exact}/{frames}");
+    }
+
+    /// lane-av1422anom: the odd-frame-HEIGHT 4:2:0 reconstruction defect,
+    /// pinned and ratcheted.
+    ///
+    /// This is NOT a 4:2:2 cell and needs no bypass -- it is ordinary 4:2:0,
+    /// reachable by any user today. The 320x232 stream (luma height 232, i.e.
+    /// not the 240 that every existing 4:2:0 fixture happens to use)
+    /// reconstructs 17658 chroma samples wrongly out of 593920, in 3 of 16
+    /// shown frames, and the wrong samples are present in the decoder's own
+    /// `EC_AV1_PREFILT_DUMP` -- the post-reconstruction, PRE-loop-filter
+    /// stage -- so deblock, CDEF and loop restoration are all exonerated.
+    /// The 4:2:0 controls at heights 240 and 242 are byte-exact, so it is the
+    /// height, not the width, and not "odd" in the mod-2 sense (232 and 248
+    /// are both even and both fail).
+    ///
+    /// The gate is a RATCHET, not an exactness gate: it pins the measured
+    /// wrong-sample counts, so the defect cannot change silently, and whoever
+    /// fixes it is forced to update these numbers deliberately. An exactness
+    /// gate cannot be written until the fix lands.
+    #[test]
+    fn the_pinned_420_oddheight_witness_is_pinned_and_ratchets_its_reconstruction_defect() {
+        const NAME: &str =
+            "the_pinned_420_oddheight_witness_is_pinned_and_ratchets_its_reconstruction_defect";
+        const FILE: &str = "420_oddheight_320x232.obu";
+        const BYTES: usize = 15773;
+        // sha256 6832c3cd867f5fc491b45fd67f77c38453db0ca6d461e7d225e6276f4d0784c8,
+        // recorded in `lanes/av1422anom.report.md`. The tree pins fixture
+        // identity by fnv1a64, asserted below. A `const SHA256` compared
+        // against itself would be a tautology -- the exact bug this lane
+        // exists to kill -- so it is not written.
+        const FNV1A64: u64 = 0x37877f15307c3b;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(FILE);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: pinned witness {FILE} is missing ({e})"));
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FNV1A64, "{NAME}: {FILE} bytes drifted");
+        let (wy, wu, wv, frames, exact) =
+            count_rawvideo_diffs(&data, NAME).expect("the two sides must be byte-comparable");
+        assert_eq!(
+            (wy, wu, wv),
+            (0, 200, 17658),
+            "{NAME}: the measured defect moved. If this is now EXACT the \
+             reconstruction defect is FIXED -- update this gate to assert \
+             (0, 0, 0) and delete the ratchet comment, and say so in the \
+             report. Any other value is a change nobody has accounted for."
+        );
+        assert_eq!(frames, 16, "{NAME}: shown frame count");
+        assert_eq!(exact, 0, "{NAME}: byte-exact shown frames");
+    }
+
     /// lane-hidden r2: the `--arnr-maxframes=0` SECOND ARM of an existing
     /// gate -- the gate's own recipe is never changed, this re-encodes the
     /// same fixture with libaom's temporal alt-ref filter switched off and
