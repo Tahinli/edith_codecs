@@ -239,6 +239,22 @@ Three corrections their run established and I fold in here:
 
 No forced-`ctx` production code is in either branch.
 
+**Standing obligation, recorded so the next reader knows this number is expected
+to move:** when Kerem-8 lands the band write, this lane re-measures `m5_640x480`
+on the combined tip and updates the §0 verdict row and this section's cell status
+from `REFUSED` to byte-exact. `lane-av1offtile` has taken the same obligation for
+their §6. The cell status is the ONE number in this report that a later commit
+can legitimately change; nothing else here depends on the band write.
+
+**Reconciling the two override sweeps.** My first sweep forced the context
+**globally** (every `tx_size_cat0` read in the stream), which is why its
+non-answer rows differ from the per-site sweep's: a global override perturbs
+every site of the category and forks earlier, while a per-site override touches
+only the fork's block. The **answer row is the same in both** — `ctx=1` makes the
+stream bit-identical — so the two tables agree where it matters and differ only
+where they were asked different questions. A ladder comparison should always say
+which sweep it ran.
+
 **The band itself is wrong, not the context formula.** Replaying every
 `EC_TXUPD` band write up to read 179 378, the last write to mi column 110 is a
 **skipped** 16-px-wide inter block at `mi=(36,108)` (`skip_inter=true`,
