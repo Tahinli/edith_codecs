@@ -301,7 +301,47 @@ const REFUSALS: &[&str] = &[
 /// `a_real_aomenc_mixed_lossless_segment_frame_decodes_sample_exact` is the
 /// witness.
 #[cfg(test)]
-const PROVEN: &[(&str, &str)] = &[
+/// Which KIND of proof each [`PROVEN`] row carries.
+///
+/// A 2-tuple made every row look equally proven, which is the whole defect:
+/// a row whose gate drives a hand-built stream into the guard and a row
+/// whose gate sweeps an alphabet and shows nothing reaches it are held to
+/// the same standard and read the same way. `label()` is what the tests
+/// print, so the distinction is visible in the suite's own output.
+///
+/// lane-av1refusalclaim r3 also proposed a third variant, `TablePin`
+/// ("the arms are pinned exactly but the domain the table is REACHED over
+/// is unestablished"). It is deliberately NOT carried: the one row it was
+/// minted for now has a gate that establishes the reach domain
+/// (`every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table`
+/// reads the eight `decode_block_rect` call sites' own literal `bw`/`bh`,
+/// pins the resulting chroma table exactly, and asserts the `(4,8)`/`(8,4)`
+/// residual is UNPRODUCIBLE), so `Enumeration` is the honest tag and a
+/// variant with no row would be dead weight. Re-add it the day a gate really
+/// pins a table without measuring its caller domain -- and give it a row.
+#[cfg(test)]
+enum Proof {
+    /// A written stream REACHES the guard and is refused by this exact
+    /// string: the gate goes RED if the guard is removed.
+    NegativeGate,
+    /// The gate enumerates every input the guard can be reached over and
+    /// shows that none of them reaches it: it proves UNREACHABILITY, so it
+    /// is GREEN if the guard is removed.
+    Enumeration,
+}
+
+#[cfg(test)]
+impl Proof {
+    fn label(&self) -> &'static str {
+        match self {
+            Proof::NegativeGate => "NEGATIVE (reaches the guard; red on removal)",
+            Proof::Enumeration => "ENUMERATION (proves unreachability; green on removal)",
+        }
+    }
+}
+
+#[cfg(test)]
+const PROVEN: &[(&str, &str, Proof)] = &[
     // lane-t900 r20, census: three real streams present exactly the 18
     // `(side, write_w, write_h)` triples `INTER_BLOCK_SHAPES` lists, and
     // `rect_inter_residual_supported` covers every rectangular one -- the only
@@ -318,6 +358,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
         "a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable",
+        Proof::Enumeration,
     ),
     // lane-t900 r20, census: the shapes that can reach `decode_intra_rect_in_inter`'s
     // size-group/tx-category lookup are the ten rectangular census shapes with
@@ -326,6 +367,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)",
         "every_intra_in_inter_shape_the_census_lists_has_a_size_group_row",
+        Proof::Enumeration,
     ),
     // lane-t900 r20, census: the only sub-8 footprints three real streams
     // present are the 16x4/4x16 strips of a 16x16-level 1:4 partition, whose
@@ -334,6 +376,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
         "a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable",
+        Proof::Enumeration,
     ),
     // lane-t900 r20, census: the rect transform tables and scans, enumerated
     // over the shapes the measured block-shape domain hands each helper (block
@@ -347,14 +390,17 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a rectangular inter luma transform unit whose shape has no coefficient table set here",
         "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+        Proof::Enumeration,
     ),
     (
         "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
         "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+        Proof::Enumeration,
     ),
     (
         "a rectangular transform unit whose shape has no coefficient scan table here",
         "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+        Proof::Enumeration,
     ),
     // lane-t900 r21, enumeration: a var-tx leaf is never larger than the unit
     // the tree was entered with, and both callers enter at or below their own
@@ -363,10 +409,12 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "an inter var-tx tree with a leaf transform larger than 32x32",
         "a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered",
+        Proof::Enumeration,
     ),
     (
         "an inter var-tx tree with a leaf transform larger than 64x64",
         "a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered",
+        Proof::Enumeration,
     ),
     // Pre-existing proofs, registered by lane-t900 r21: a negative gate (a
     // hand-built 12-bit sequence header is refused BY THIS EXACT STRING rather
@@ -380,32 +428,38 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a 32x32 partition type this decoder does not code (value={part32})",
         "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+        Proof::Enumeration,
     ),
     (
         "an INTER 32x32 partition type this decoder does not code (value={part32})",
         "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+        Proof::Enumeration,
     ),
     (
         "a 128x128 superblock partition value outside the 8-symbol alphabet",
         "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+        Proof::Enumeration,
     ),
     // lane-t900 r24, enumeration: the key-frame superblock root's own `match`
     // has an arm for all ten `partition_w64` values.
     (
         "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
         "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+        Proof::Enumeration,
     ),
     // lane-t900 r24, enumeration: the inter 16x16-level if/else chain's
     // branches name all ten `partition_w16` values between them.
     (
         "an inter 16x16-level partition value outside NONE/HORZ/VERT/SPLIT/AB/1:4",
         "every_partition_value_of_an_if_chain_alphabet_is_named_by_a_branch",
+        Proof::Enumeration,
     ),
     // lane-t900 r24, enumeration: every (CDF width, symbol) pair a tx_type row
     // can present maps to a distinct member of that width's own set.
     (
         "a tx_type symbol outside its CDF's own set: {t}",
         "every_tx_type_symbol_of_every_cdf_width_maps_into_its_own_set",
+        Proof::Enumeration,
     ),
     // lane-t900 r24 + lane-av1txr RE-PIN, measured: the reader covers spec
     // 5.11.40's whole value domain (`0..=(1 << 20) - 2`, both ends of every
@@ -419,6 +473,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a Golomb tail longer than this decoder reads",
         "read_golomb_reads_every_value_a_conformant_stream_can_carry",
+        Proof::Enumeration,
     ),
     // lane-t900 r25, enumeration: `parse_tile_group` is the only producer of
     // the `tiles` vector `decode_stream` tests, and its success path always
@@ -427,6 +482,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a frame OBU with no tile group",
         "a_frame_obu_that_parses_always_carries_at_least_one_tile",
+        Proof::Enumeration,
     ),
     // lane-t900 r25, negative gates: hand-built streams that reach each
     // refusal by name and output no picture (a `show_existing_frame` header
@@ -434,10 +490,12 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a show_existing_frame header naming an empty reference slot",
         "a_show_existing_frame_header_naming_an_empty_slot_is_refused_by_name",
+        Proof::NegativeGate,
     ),
     (
         "an inter frame with no key frame before it",
         "an_inter_frame_opening_a_stream_is_refused_by_name",
+        Proof::NegativeGate,
     ),
     // lane-t900 r25, enumeration: a motion_mode/obmc symbol is read only under
     // `is_motion_variation_allowed_bsize` (min side >= 8), and each of the 17
@@ -446,6 +504,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a motion_mode symbol for a block shape with no CDF row here",
         "every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row",
+        Proof::Enumeration,
     ),
     // lane-av112bit: real-aomenc 12-bit streams, each refused by name
     // (the gates encode with aomenc --bit-depth=12 and assert the exact
@@ -470,6 +529,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported, and 4:4:0 (0,1) is not a codable cell",
         "a_non_420_subsampled_sequence_header_is_refused_by_name",
+        Proof::NegativeGate,
     ),
     // lane-av1txr-r2 paired, lane-av1-qmatrix RETIRED with its gate: the
     // refusal's witness is now
@@ -488,6 +548,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "an intra mode this decoder does not code (round 2)",
         "every_intra_mode_symbol_of_the_y_mode_alphabet_is_coded",
+        Proof::Enumeration,
     ),
     // lane-t900 r26, enumeration: `compute_image_size` is 0 only for a zero
     // frame width/height, which no path a header can code produces (swept
@@ -495,6 +556,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a frame with no mode-info grid",
         "every_frame_size_a_header_can_code_has_a_mode_info_grid",
+        Proof::Enumeration,
     ),
     // lane-t900 r26, negative gates: written streams that reach each refusal
     // by name (a 64x32 inter frame over a 64x64 reference; a stream opening on
@@ -511,6 +573,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
         "a_selected_reference_with_an_empty_ref_frame_idx_slot_refuses_by_name",
+        Proof::NegativeGate,
     ),
     // lane-t900 r27, negative gate + census: a written key frame carrying
     // each of the three mode-overriding features (over three segment ids) is
@@ -536,6 +599,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
         "a_frame_whose_segmentation_overrides_a_block_mode_is_refused_by_name",
+        Proof::NegativeGate,
     ),
     // lane-t900 r27, structural audit + witness: `record_inter_rect_mi` is the
     // single writer of the interp-filter neighbour band, and no call site
@@ -549,6 +613,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "an OBMC neighbour whose switchable interp filter was never recorded",
         "every_inter_record_publishes_an_obmc_readable_filter",
+        Proof::Enumeration,
     ),
     // lane-t900 r28: all three scaled-reference (superres) refusals -- the
     // 8x8 partition leaf, the sub-8x8 inter block and warp -- are LIFTED and
@@ -564,10 +629,12 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
         "every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table",
+        Proof::Enumeration,
     ),
     (
         "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
         "every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table",
+        Proof::Enumeration,
     ),
     // lane-av1-refusalaudit, enumeration + witness2 hunt: decode_block_rect64's
     // chroma-unit table covers every conformant 64-axis strip unit in both
@@ -581,6 +648,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a 64-axis strip whose chroma unit has no coefficient table",
         "every_chroma_unit_a_64_axis_strip_can_present_has_a_coefficient_table",
+        Proof::Enumeration,
     ),
     // lane-av1rect8x16, enumeration: `decode_block_rect`'s `_` arm. The nine
     // textual `decode_block_rect(` matches are 1 declaration + 8 call sites
@@ -602,6 +670,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a rectangular chroma transform whose size has no coefficient table",
         "every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table",
+        Proof::Enumeration,
     ),
     // lane-t900 r33, enumeration: each of the four symbols this guard tests is
     // read under a size gate that no 128-pixel side passes (the call site's
@@ -610,6 +679,7 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
         "no_128_root_half_reads_a_cfl_filter_intra_or_palette_symbol",
+        Proof::Enumeration,
     ),
     // lane-av1txr: the sub-8x8 intrabc refusal this census pinned is GONE (the
     // capability landed; see the note in `REFUSALS`). The census gate survives
@@ -628,10 +698,12 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a reference picture whose height does not match this frame's own true size",
         "an_inter_frame_shorter_than_its_reference_is_refused_by_name",
+        Proof::NegativeGate,
     ),
     (
         "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
         "an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name",
+        Proof::NegativeGate,
     ),
 ];
 
@@ -703,7 +775,8 @@ pub(crate) fn pins_refusal(src: &str, refusal: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, PROVEN, REFUSALS, squash_source,
+        CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, PROVEN, Proof, REFUSALS,
+        squash_source,
     };
     use std::collections::BTreeSet;
 
@@ -2544,7 +2617,7 @@ mod tests {
         let mut neither: Vec<&str> = Vec::new();
         let mut unanchored: Vec<String> = Vec::new();
         let mut unbounded: Vec<String> = Vec::new();
-        for (reason, gate) in PROVEN {
+        for (reason, gate, _kind) in PROVEN {
             assert!(
                 found.contains(*reason),
                 "{reason:?} is listed as proven but is no longer a decode-path refusal -- \
@@ -2646,7 +2719,7 @@ mod tests {
     #[test]
     fn every_named_gate_body_is_bounded_in_these_files() {
         let mut resolved = 0usize;
-        for (reason, gate) in PROVEN {
+        for (reason, gate, _kind) in PROVEN {
             let body =
                 gate_body(gate).unwrap_or_else(|why| panic!("{reason:?} names {gate}: {why}"));
             assert!(
@@ -2666,6 +2739,82 @@ mod tests {
                 .unwrap_or_else(|| panic!("{file}: the last function {last}() has no boundary"));
             assert!(sibling_fn(body, leading_indent(src, at)).is_none());
         }
+    }
+
+    /// The taxonomy is a CLAIM about each row, so it carries its own
+    /// non-vacuity: every variant is used by at least one row (a variant no
+    /// row can be in is not a category), the two labels do not collapse into
+    /// one string, and the row lane-av1refusalclaim r3 wanted to RE-TAG is
+    /// tagged from evidence inside its own gate BODY -- never from the
+    /// gate's name, which is the only thing the previous 2-tuple carried.
+    ///
+    /// r3 minted a `TablePin` variant because "a rectangular chroma transform
+    /// whose size has no coefficient table" was pinned to a table whose
+    /// REACHED-OVER domain had never been measured. Main has since replaced
+    /// that row's gate with one that reads the eight `decode_block_rect` call
+    /// sites' own literal `bw`/`bh`, pins the resulting chroma table exactly,
+    /// and asserts the `(4,8)`/`(8,4)` residual is UNPRODUCIBLE. `Enumeration`
+    /// is therefore the honest tag and `TablePin` is not carried; if a later
+    /// edit weakens that gate back to a bare table pin, the three evidence
+    /// pins below go red instead of leaving the row quietly overclaiming.
+    #[test]
+    fn every_proven_row_names_which_kind_of_proof_it_carries() {
+        let mut negative = 0usize;
+        let mut enumeration = 0usize;
+        for (reason, gate, kind) in PROVEN {
+            eprintln!("  {} -- {reason:?} -> {gate}", kind.label());
+            match kind {
+                Proof::NegativeGate => negative += 1,
+                Proof::Enumeration => enumeration += 1,
+            }
+        }
+        assert_eq!(
+            negative + enumeration,
+            PROVEN.len(),
+            "a PROVEN row carries no proof kind, so the table says nothing about it"
+        );
+        assert!(
+            negative > 0,
+            "no row is tagged NEGATIVE, so the NegativeGate variant is dead weight"
+        );
+        assert!(
+            enumeration > 0,
+            "no row is tagged ENUMERATION, so the Enumeration variant is dead weight"
+        );
+        assert_ne!(
+            Proof::NegativeGate.label(),
+            Proof::Enumeration.label(),
+            "the two kinds print the same string, so the taxonomy is one category in two hats"
+        );
+
+        let (reason, gate, kind) = PROVEN
+            .iter()
+            .find(|(reason, _, _)| {
+                *reason == "a rectangular chroma transform whose size has no coefficient table"
+            })
+            .map(|(reason, gate, kind)| (*reason, *gate, kind))
+            .expect("the (4,8) chroma-table row left PROVEN");
+        assert!(
+            matches!(kind, Proof::Enumeration),
+            "{reason:?} is tagged {:?}, but its gate enumerates the caller domain",
+            kind.label()
+        );
+        let body = gate_body(gate).unwrap_or_else(|why| panic!("{reason:?} names {gate}: {why}"));
+        for evidence in [
+            "the number of decode_block_rect call sites changed",
+            "for residual in [(4usize, 8usize), (8, 4)]",
+            "the caller set can now produce a 4x8/8x4 chroma shape",
+        ] {
+            assert!(
+                body.contains(evidence),
+                "{gate} no longer carries {evidence:?}, so the Enumeration tag on {reason:?} \
+                 claims a reach domain the gate has stopped measuring"
+            );
+        }
+        eprintln!(
+            "refusal inventory: {negative} NEGATIVE, {enumeration} ENUMERATION of {} PROVEN rows",
+            PROVEN.len()
+        );
     }
 
     /// Lane-av1refusalspan: the invariant that catches a boundary that
