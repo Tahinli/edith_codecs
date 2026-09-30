@@ -35486,8 +35486,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             if crate::envflags::env_flag!("EC_TRACE") {
                                                 eprintln!(
                                                     "EC_PART mi_row={} mi_col={} bsize=6 ctx={} tell={} rng={}",
-                                                    at16.0,
-                                                    at16.1,
+                                                    sr * SUB_MI as usize,
+                                                    sc * SUB_MI as usize,
                                                     ctx16,
                                                     dec.debug_bitpos(),
                                                     dec.debug_state().0
@@ -35497,13 +35497,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             if crate::envflags::env_flag!("EC_TRACE") {
                                                 eprintln!(
                                                     "EC_PART_VAL mi_row={} mi_col={} bsize=6 value={}",
-                                                    at16.0, at16.1, part16
+                                                    sr * SUB_MI as usize,
+                                                    sc * SUB_MI as usize,
+                                                    part16
                                                 );
                                             }
                                             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                                 eprintln!(
                                                     "TRACE partition_w16 mi=({},{}) ctx={ctx16} value={part16}",
-                                                    at16.0, at16.1
+                                                    sr * SUB_MI as usize,
+                                                    sc * SUB_MI as usize
                                                 );
                                             }
                                             if part16 == PARTITION_NONE {
@@ -53388,11 +53391,21 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 dec.debug_state().0
                             );
                         }
+                        // lane-av1tilerows: this rung printed the RAW 32-grid
+                        // index (`r32`, `c32`) into its `mi_row=`/`mi_col=`
+                        // fields — a factor of `BLOCK_MI` (8) off — while the
+                        // `TRACE part32_pre` line immediately above and the
+                        // `EC_AV1_TRACE` line immediately below both print
+                        // `r32 * BLOCK_MI` correctly. A rung whose coordinates
+                        // are wrong is worse than no rung: it cannot be paired
+                        // against libaom's per-level `EC_PART_VAL` dump, which
+                        // is the only way to locate a partition-walk
+                        // divergence. Behaviour-free: env-gated print only.
                         if crate::envflags::env_flag!("EC_TRACE_PART") {
                             eprintln!(
                                 "EC_PART mi_row={} mi_col={} bsize=9 ctx={} rng={}",
-                                (r32 as usize),
-                                (c32 as usize),
+                                r32 * BLOCK_MI,
+                                c32 * BLOCK_MI,
                                 ctx32,
                                 dec.debug_state().0
                             );
