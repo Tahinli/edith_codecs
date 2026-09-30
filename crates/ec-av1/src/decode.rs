@@ -20082,7 +20082,11 @@ fn decode_block_rect64(
                     let levels = if uw == uh {
                         let plane = if plane_idx == 1 { &mut *u } else { &mut *v };
                         if let Some((ub, vb)) = &palette_uv_bufs {
-                            set_palette_pred((if plane_idx == 1 { ub } else { vb }).clone(), fctx);
+                            let pbuf = if plane_idx == 1 { ub } else { vb };
+                            set_palette_pred(
+                                palette_window(pbuf, chroma_w, cu_col * uw, cu_row * uh, uw, uh),
+                                fctx,
+                            );
                         }
                         read_plane(
                             dec,
@@ -20136,7 +20140,11 @@ fn decode_block_rect64(
                             block_iqmatrix(fctx, plane_idx, uw, uh, tx_type),
                         );
                         if let Some((ub, vb)) = &palette_uv_bufs {
-                            set_palette_pred((if plane_idx == 1 { ub } else { vb }).clone(), fctx);
+                            let pbuf = if plane_idx == 1 { ub } else { vb };
+                            set_palette_pred(
+                                palette_window(pbuf, chroma_w, cu_col * uw, cu_row * uh, uw, uh),
+                                fctx,
+                            );
                         }
                         push_intra_rect(
                             plane_idx,
