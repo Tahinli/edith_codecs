@@ -3,7 +3,18 @@
 Base `6d564cd6`, worktree `~/.cache/wt/av1422remeasure`, branch
 `lane-av1422remeasure`. Report-only: **no source change is committed**, and the
 `EC_AV1_ALLOW_422_PROBE` bypass was patch-run-restore and is **not** in any
-commit (`git diff` against `6d564cd6` is empty at the tip).
+commit. Every number below was measured on `6d564cd6`, as chartered.
+
+**Main moved under the lane** (two commits, `lane-av1odd440` → `0ea32904`,
+merged in after the measurements). It does not disturb any conclusion: the
+4:2:2 guard is the same single `subsampling_x != subsampling_y` test on the
+same line, with only the message extended to also name 4:4:0 as uncodable, and
+`440_request_is_422.obu` is a hand-built header probe, not a decodable cell.
+Re-verified on the merged tip: the four committed 4:2:2 refusal-by-name gates,
+`a_non_420_subsampled_sequence_header_is_refused_by_name`,
+`decode::tests::a_422_reference_claims_the_full_chroma_height` and
+`decode::chroma422_pair_plane_matches_the_ss_size_lookup_cells` — **7 passed /
+0 failed**.
 
 ## Verdict
 
@@ -258,7 +269,8 @@ presented view.**
 
 ## Gates run
 
-On the clean tree at the tip (`git diff` vs `6d564cd6` empty), scoped:
+On the clean tree at `6d564cd6` (no source diff — the lane commits only this
+report), scoped:
 
 - `the_pinned_422_bigblock_witnesses_are_present_and_refuse_by_name` — pass
 - `the_pinned_422_intrabc_sb128_strip_witnesses_refuse_by_name` — pass
@@ -269,6 +281,12 @@ On the clean tree at the tip (`git diff` vs `6d564cd6` empty), scoped:
 - `a_non_420_subsampled_sequence_header_is_refused_by_name` — pass
 - scoped battery `422 420 chroma chroma_422 rawvideo subsampling aomenc_444 hidden`
   — **61 passed / 0 failed / 0 ignored**
+
+Re-run after merging main's `0ea32904`: the four refusal-by-name gates plus
+`a_non_420_subsampled_sequence_header_is_refused_by_name`,
+`decode::tests::a_422_reference_claims_the_full_chroma_height` and
+`decode::chroma422_pair_plane_matches_the_ss_size_lookup_cells` —
+**7 passed / 0 failed**.
 
 ## Instrumentation disclosure
 
