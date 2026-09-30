@@ -33,6 +33,7 @@ pub mod intra;
 pub mod loopfilter;
 pub(crate) mod mc;
 pub mod modes;
+mod stack_budget;
 pub mod stream;
 pub mod tables;
 pub mod tokens;
