@@ -339,9 +339,32 @@ ctxs mi=(36,108) tx=16 skip_inter=true   <- the last write before the read
 ```
 
 A **skipped 16 px inter block** at `mi=(36,108)` with `w_mi=4` publishing **16**,
-and **nothing writes that column in between**. libaom has **4** there — it makes
-a band write in rows 37..79 that this tree does not. Class
-`context-band-not-published`.
+and — as far as this rung can show — nothing writing that column in between.
+libaom reads **4** at the reader. Class `context-band-not-published`.
+
+**CORRECTION (after Kerem-8's landing, `f2dd27b0`).** Two things in that
+paragraph were over-claimed and both are now settled against the fix:
+
+1. **"nothing writes that column in between" was not provable from this
+   instrument.** A replay filtered to `EC_TXUPD` can only ever show the publish
+   sites that CARRY the rung; several publishers are hand-rolled
+   `for i in 0..w_mi { band[..] = x }` loops with no trace at all. So the
+   negative result was under-determined by the instrument, not a measurement.
+   Kerem-8's method, which does settle it: walk the mi-map COLUMN upward at the
+   reader's own site (`BlkCell::org`/`dim`/`skip` + `inter_grid` + the deblock tx
+   grids + the live band value), which names the abutting block and its shape in
+   one pass.
+2. **"a band write in rows 37..79" was the wrong location.** The missing publish
+   was the abutting block itself: the **8x8 INTRA lossless block at
+   `mi(78,110)`, rows 78-79**. `read_block_tx_size`'s lossless early return
+   published nothing, because it skips the SYMBOL READ and not the PUBLISH.
+   libaom's `parse_decode_block` is an either/or and a lossless block always
+   takes the else branch, whose `set_txfm_ctxs(TX_4X4, w, h,
+   skip_txfm && is_inter_block(mbmi))` runs for it.
+
+What survived unchanged and was right: the **last rung-visible write** really was
+the skipped 16 px inter block at `mi=(36,108)` publishing 16, and the reader
+really did inherit 16 where libaom has 4.
 
 **What reproduces and what does not.** Every number, the operand pair, and the
 named band write reproduce exactly. **The forced `ctx` is a symptom mask and
@@ -422,6 +445,55 @@ is what made `mi=(80,110)` reachable in a state where its context matters at all
 (with base + their clip alone the cell reads 860 431 and no `ctx` value moves it).
 Those two facts are what make the chain *ordered* rather than merely
 *sequential*, and they are the reason the operand pair is readable now.
+
+## 6d. OUTCOME MEASURED: Kerem-8's band write, `f2dd27b0` — outcome 1
+
+The standing obligation from §6c, discharged. **The operand pair was measured
+first, on the pixel numbers, exactly as agreed** — and the outcome is 1.
+
+Tree: `f2dd27b0` (lane/av1txctxband2, base `0bfee517`, which already contains
+this lane's clip). Read with this lane's own rungs, **no forced ctx anywhere**:
+
+| | before (`9abe724a` + this clip) | after (`f2dd27b0`) | oracle |
+|---|---|---|---|
+| `above_txfm` / `abv` | **16** | **4** | `abv=4` |
+| `left_txfm` / `lft` | 8 | 8 | `lft=8` |
+| `above` | true | **false** | `above=0` |
+| `ctx` | 2 | **1, reached on its own** | `ctx=1` |
+
+```text
+OURS    EC_TXCTX mi=80,110 own=8x4 above_txfm=4 left_txfm=8 above=false left=true
+ORACLE  EC_TXCTXB mi=80,110 bsize=2 maxw=8 maxh=4 hasup=1 hasleft=1 abv=4 lft=8 above=0 left=1 ctx=1
+```
+
+Every operand now agrees with the oracle and `ctx` reaches 1 **without the
+override**. Then, and only then, the consequence:
+
+```text
+mix_640x480_5.obu  OK: 5 frames decoded, 640x480      (was REFUSED on the combined tip)
+pixels             byte-exact vs aomdec --rawvideo
+paired EC_SYMR     ours 457907 | oracle 457907 | FULL LOCKSTEP on pre[0]/pre[1]/n/s/post_rng
+                   (211 of the oracle's lines carry a negative pre[2] and were counted)
+```
+
+**What this settles.**
+
+* The **band was the cause**, not the `ctx` formula and not the `decode_leaf_rect8`
+  arm. The `ctx=1` lock of §6b is **retired as a symptom mask** and is in no
+  branch.
+* The chain is confirmed **end to end**: off-tile walk (this lane) -> var-tx
+  conjunct (Emre-5) -> TXFM_CONTEXT band publish (Kerem-8). Each link was
+  necessary: this lane's clip moved 176x144's fork and did nothing on 640x480;
+  Emre-5's conjunct is what made `mi=(80,110)` reachable in a state where its
+  context mattered (860 431 reads without it, 521 856 with it); Kerem-8's publish
+  is what made the ctx answer match.
+* 640x480 moves from "REFUSED, ~80 %-wrong pixels" to **byte-exact** on this
+  tip. Emre-5 owns updating their §4.3 verdict row.
+
+**This is the one outcome in the table that needed no second reading.** Outcome 2
+(above_txfm stays 16, ctx reaches 1) would have looked identical in the pixel
+compare and been missed entirely; reading the pair first is what made the
+distinction available at all.
 
 ## 7. Class sweep
 
