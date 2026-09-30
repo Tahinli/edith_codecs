@@ -29914,6 +29914,47 @@ fn read_block_tx_size(
                 leaves.push((row, col, 4, 4));
             }
         }
+        // lane-av1txctxband2: a lossless block still runs libaom's
+        // `set_txfm_ctxs` at the tail of `parse_decode_block`
+        // (decodeframe.c:1260). Its `read_tx_size` returned `TX_4X4` on the
+        // FIRST line (decodeframe.c:1214) -- the early return skips the symbol
+        // read, not the PUBLISH -- so `tx_size_wide[TX_4X4] == 4` goes over the
+        // block's own width/height, and a SKIPPED inter block instead records
+        // its block size (the `skip && is_inter` term).
+        //
+        // This early return published nothing, so on a MIXED frame every
+        // lossless square block left the band holding whatever an earlier,
+        // lossy block wrote. Measured on the 640x480 mixed-lossless+altref
+        // cell (`420_mixll_altref_640x480_5f.obu`, 87 537 B): the abutting
+        // 8x8 INTRA lossless block at mi(78,110) left `above_txfm[110]` at
+        // the 16 a skipped 16-px inter block at mi(36,108) had written 43 mi
+        // rows earlier, and the 8x4 intra leaf with `use_filter_intra` at
+        // mi(80,110) then read `tx_size_cat0[2]` where libaom reads row 1
+        // (oracle `EC_TXCTXB` `abv=4 lft=8 above=0 left=1 ctx=1`). The tile
+        // desynced there and the frame refused.
+        //
+        // The RECT twin [`read_block_tx_size_rect`] has published on this arm
+        // since lane-av1lm444loss; only the square arm had the hole.
+        let pub_above: u8 = if skip && is_inter {
+            (side_mi * MI) as u8
+        } else {
+            4
+        };
+        // The gate's non-vacuity arm, on the DECISION, sampled BEFORE the
+        // write: this publish OVERWRITES a size some earlier block of the same
+        // frame had left in one of the columns it covers -- the only way a
+        // later `get_tx_size_context` / `txfm_partition_context` reader can
+        // see it. On a frame whose blocks all sit in lossless segments nothing
+        // reads either band (libaom's `read_tx_size` returns before
+        // `get_tx_size_context`, and the var-tx tree is gated on
+        // `!xd->lossless`), so a wholly-lossless stream whose inter blocks are
+        // all non-skip leaves this at zero.
+        let overwrote = !fctx.intra_only.with(std::cell::Cell::get)
+            && (0..side_mi).any(|i| n.above_txfm.get(at_mi.1 + i) != Some(&pub_above));
+        set_txfm_ctxs(n, at_mi, 4, side_mi, side_mi, skip && is_inter);
+        if overwrote {
+            hit!(LOSSLESS_SQ_TXFM_BAND_OVERWRITE_HITS);
+        }
         return Ok((4, Some(leaves)));
     }
     if !fctx.tx_select_inter.with(std::cell::Cell::get) {
@@ -34779,6 +34820,16 @@ thread_local! {
     /// term the conjunct uses, so a hit means the suppression is the conjunct's
     /// doing.
     pub(crate) static SUB8_LOSSLESS_NO_VARTX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1txctxband2: SQUARE lossless blocks on an INTER frame whose
+    /// `set_txfm_ctxs` publish CHANGED an above-band cell -- i.e. the write
+    /// overwrote a size some earlier block of the same frame had left, which
+    /// is the only way a later `get_tx_size_context` /
+    /// `txfm_partition_context` reader can see it. Zero on an intra-only
+    /// frame (where `fill_lf_grid_rect_inner` publishes the same 4x4 value at
+    /// the same footprint) and on a wholly-lossless stream whose inter blocks
+    /// are all non-skip (nothing reads either band there), so a gate cannot
+    /// look armed by merely decoding a lossless fixture.
+    pub(crate) static LOSSLESS_SQ_TXFM_BAND_OVERWRITE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`MU_CHUNK_WALKS`], for a gate's own before/after delta.
@@ -34810,6 +34861,14 @@ pub(crate) fn lossless_edge_clipped() -> usize {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn lossless_edge_clip_units() -> usize {
     LOSSLESS_EDGE_CLIP_UNITS.with(std::cell::Cell::get)
+}
+/// [`LOSSLESS_SQ_TXFM_BAND_OVERWRITE_HITS`] -- square lossless inter blocks
+/// whose `set_txfm_ctxs` publish overwrote a size an earlier block of the
+/// same frame had left in the above band, for a gate's own before/after
+/// delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn lossless_sq_txfm_band_overwrite_hits() -> usize {
+    LOSSLESS_SQ_TXFM_BAND_OVERWRITE_HITS.with(std::cell::Cell::get)
 }
 /// [`SUB8_LOSSLESS_NO_VARTX`] -- sub-8 inter leaves on a lossless segment that
 /// read no var-tx symbol, for a gate's own before/after delta.
