@@ -8749,7 +8749,10 @@ fn read_coeffs_rect(
             // the pairing had to guess whether a golomb had been read. This
             // rung reads no bits: it prints the state after the read it labels.
             let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=post_golomb c={} pos={pos} level={level} rng={rng}", (packed >> 4));
+            eprintln!(
+                "EC_COEFF_STEP tag=post_golomb c={} pos={pos} level={level} rng={rng}",
+                (packed >> 4)
+            );
         }
         grid[pos] = if negative { -level } else { level };
     }
@@ -9650,6 +9653,60 @@ impl Neighbours {
         ref_frame: i8,
         fctx: &crate::decode::FrameCtx,
     ) {
+        self.fill_lf_grid_rect_inner(at_mi, w_mi, h_mi, tx_px, tx_h_px, ref_frame, true, fctx)
+    }
+
+    /// [`Self::fill_lf_grid_rect`] for a block whose transform tree ALREADY
+    /// published its own `TXFM_CONTEXT` bands -- every body that ran
+    /// [`read_block_tx_size_rect`] / [`read_block_tx_size`] / an inline
+    /// var-tx tree of its own.
+    ///
+    /// libaom's `parse_decode_block` (`decodeframe.c:1227-1236`) is an
+    /// EITHER/OR: the var-tx branch calls `read_tx_size_vartx`, which
+    /// publishes through `txfm_partition_update` PER LEAF
+    /// (`av1_common_int.h:1684-1695`) and never calls `set_txfm_ctxs`; the
+    /// `else` branch calls `read_tx_size` + `set_txfm_ctxs` exactly once, over
+    /// the whole block. So on the var-tx path there is NO whole-footprint
+    /// publish to reproduce, and one written here is not merely redundant --
+    /// it OVERWRITES the leaves' sizes with the block's own.
+    ///
+    /// lane-av1oddheightfork3, measured on the pinned
+    /// `420_oddheight_320x236_diverging.obu` (Y 234349 / U 56957 / V 52981,
+    /// 0/16 frames): the INTRABC 8x16 block at mi(44,58) split into two 8x8
+    /// leaves, whose per-leaf writes put `8` into `left_txfm[44..48]`, and
+    /// this publish then put the BLOCK's `16` back over those same four
+    /// cells. The next block, the INTRABC 8x16 at mi(44,60), read
+    /// `txfm_partition_context` with `left = 16` where libaom has `8` (the
+    /// `above` operand agreed at 8 on both sides, printed by the oracle rung
+    /// `EC_VARTXCTX` in `scripts/instrument-aom-oracle.sh`), took ctx 12
+    /// against libaom's 13, decoded `is_split = 0` against libaom's `1`, and
+    /// read no children against libaom's two -- the frame's first divergent
+    /// read.
+    fn fill_lf_grid_rect_after_vartx(
+        &mut self,
+        at_mi: (usize, usize),
+        w_mi: usize,
+        h_mi: usize,
+        tx_px: u8,
+        tx_h_px: u8,
+        ref_frame: i8,
+        fctx: &crate::decode::FrameCtx,
+    ) {
+        self.fill_lf_grid_rect_inner(at_mi, w_mi, h_mi, tx_px, tx_h_px, ref_frame, false, fctx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_lf_grid_rect_inner(
+        &mut self,
+        at_mi: (usize, usize),
+        w_mi: usize,
+        h_mi: usize,
+        tx_px: u8,
+        tx_h_px: u8,
+        ref_frame: i8,
+        publish_txfm_bands: bool,
+        fctx: &crate::decode::FrameCtx,
+    ) {
         let (mi_r, mi_c) = at_mi;
         // `av1_get_max_uv_txsize` under 4:2:0: the block's chroma extent is
         // half its luma one (min 4 px, the smallest transform), capped at
@@ -9677,7 +9734,7 @@ impl Neighbours {
             fill_span(&mut self.ref_grid, start, w_mi, ref_frame);
             fill_span(&mut self.delta_lf_grid, start, w_mi, snapshot);
         }
-        if fctx.intra_only.with(std::cell::Cell::get) {
+        if publish_txfm_bands && fctx.intra_only.with(std::cell::Cell::get) {
             // libaom's `parse_decode_block` runs `set_txfm_ctxs(mbmi->tx_size,
             // xd->width, xd->height, mbmi->skip_txfm && is_inter_block(mbmi),
             // xd)` for EVERY block, an intra-only frame's included, and
@@ -14666,7 +14723,11 @@ fn decode_intrabc_rect(
     neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
     neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
-    neighbours.fill_lf_grid_rect(
+    // lane-av1oddheightfork3: `read_block_tx_size_rect` ran above, so the
+    // bands are the tree's own per-leaf publication (libaom's var-tx branch
+    // never calls `set_txfm_ctxs`) -- publishing the block's own size over
+    // them here is the defect this call site carried.
+    neighbours.fill_lf_grid_rect_after_vartx(
         (mi_r, mi_c),
         bw / MI,
         bh / MI,
@@ -15294,7 +15355,9 @@ fn decode_intrabc_128rect(
     neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
     neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
-    neighbours.fill_lf_grid_rect(
+    // lane-av1oddheightfork3: see `decode_intrabc_rect`'s call -- the tree
+    // published the bands, so no whole-footprint publish here.
+    neighbours.fill_lf_grid_rect_after_vartx(
         (mi_r, mi_c),
         bw / MI,
         bh / MI,
@@ -17755,7 +17818,9 @@ fn decode_intrabc_owned_rect(
     neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
     neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, 0, [0u16; 8]);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
-    neighbours.fill_lf_grid_rect(
+    // lane-av1oddheightfork3: see `decode_intrabc_rect`'s call -- the tree
+    // published the bands, so no whole-footprint publish here.
+    neighbours.fill_lf_grid_rect_after_vartx(
         (mi_r, mi_c),
         bw / MI,
         bh / MI,
@@ -18115,6 +18180,12 @@ fn decode_rect4_16_intrabc(
                 leaves.push((row, col, 4usize, 4usize));
             }
         }
+        // libaom's `else` branch (`!xd->lossless` fails the var-tx
+        // condition): `set_txfm_ctxs(TX_4X4, ..)` over the block's own
+        // width/height. Same reason as `read_block_tx_size_rect`'s arm --
+        // it is what makes this body's `fill_lf_grid_rect_after_vartx`
+        // suppression sound.
+        txfm_partition_update_rect(neighbours, lmi, (4, 4), (bw, bh));
         Some(leaves)
     } else {
         let ctx = txfm_partition_ctx_rect(
@@ -18433,7 +18504,10 @@ fn decode_rect4_16_intrabc(
     }
     neighbours.record_mode_mi(lmi.0, lmi.1, mi_w, mi_h, DC_PRED);
     neighbours.fill_skip_grid_rect(lmi, mi_w, mi_h, skip);
-    neighbours.fill_lf_grid_rect(lmi, mi_w, mi_h, tx_w as u8, tx_h as u8, 0, fctx);
+    // lane-av1oddheightfork3: this body reads its own var-tx tree inline
+    // (`read_var_tx_size` per child), so the bands are per-leaf already; the
+    // whole-footprint publish overwrote them with the block's own size.
+    neighbours.fill_lf_grid_rect_after_vartx(lmi, mi_w, mi_h, tx_w as u8, tx_h as u8, 0, fctx);
     for cell in 0..mi_w {
         if let Some(slot) = neighbours.above_side_mi.get_mut(lmi.1 + cell) {
             *slot = bw as u8;
@@ -29191,6 +29265,74 @@ fn sub_tx_size_map_matches_libaom() {
     }
 }
 
+/// lane-av1oddheightfork3: `txfm_partition_update_rect`'s EXTENT is the
+/// transform NODE (`txb`), its VALUE is the resolved leaf -- the rule
+/// `txfm_partition_update` states as
+/// `bsize = txsize_to_bsize[txb_size]; bh = mi_size_high[bsize];
+/// bw = mi_size_wide[bsize]; left_ctx[0..bh] = tx_size_high[tx_size];
+/// above_ctx[0..bw] = tx_size_wide[tx_size]` (`av1_common_int.h:1684-1695`).
+///
+/// The 320x236 ticket named the RECT case as the suspect ("`txsize_to_bsize`
+/// for a rect `txb_size` is the awkward part"). It is not: for every
+/// `TX_SIZE`, `mi_size_wide[txsize_to_bsize[t]] * MI == tx_size_wide[t]`, which
+/// is what makes `txb_w / MI` the right cell count. This test pins that
+/// identity from libaom's OWN `mi_size_wide`/`mi_size_high` rows (blockd.h)
+/// -- transcribed, not derived from the shape -- and then pins the primitive
+/// on a rect node, where an extent taken from the leaf instead of the node
+/// would write 1 cell where libaom writes 2 and 1 where libaom writes 4.
+#[test]
+fn txfm_partition_update_rect_extent_is_the_node_not_the_leaf() {
+    // libaom `blockd.h`: (bsize, mi_size_wide, mi_size_high) for every
+    // `txsize_to_bsize` image a `TX_SIZE` can name.
+    const BSIZES: [(&str, usize, usize); 12] = [
+        ("BLOCK_4X4", 1, 1),
+        ("BLOCK_4X8", 1, 2),
+        ("BLOCK_8X4", 2, 1),
+        ("BLOCK_8X8", 2, 2),
+        ("BLOCK_8X16", 2, 4),
+        ("BLOCK_16X8", 4, 2),
+        ("BLOCK_16X16", 4, 4),
+        ("BLOCK_16X32", 4, 8),
+        ("BLOCK_32X16", 8, 4),
+        ("BLOCK_32X32", 8, 8),
+        ("BLOCK_4X16", 1, 4),
+        ("BLOCK_16X4", 4, 1),
+    ];
+    for (name, mi_w, mi_h) in BSIZES {
+        // `tx_size_wide`/`tx_size_high` of the TX_SIZE that maps to this
+        // bsize, and the same quantity as a pixel size.
+        let (tx_w, tx_h) = (mi_w * MI, mi_h * MI);
+        assert_eq!(tx_w / MI, mi_w, "{name}: width identity");
+        assert_eq!(tx_h / MI, mi_h, "{name}: height identity");
+    }
+
+    // The primitive on a RECT node: an 8x16 node whose TX_4X4 early-return
+    // leaf resolved (libaom `read_tx_size_vartx`'s `sub_txs == TX_4X4` arm,
+    // which calls `txfm_partition_update(..., TX_4X4, tx_size)` with the
+    // PARENT as the node).
+    let fctx = &crate::decode::FrameCtx::new();
+    let mut n = Neighbours::new(4, 4, 32, 32, fctx);
+    for cell in n.above_txfm.iter_mut() {
+        *cell = 0;
+    }
+    for cell in n.left_txfm.iter_mut() {
+        *cell = 0;
+    }
+    txfm_partition_update_rect(&mut n, (4, 4), (4, 4), (8, 16));
+    assert_eq!(
+        &n.above_txfm[4..6],
+        &[4, 4],
+        "the node's OWN width (2 mi) carries the leaf's width"
+    );
+    assert_eq!(
+        &n.left_txfm[4..8],
+        &[4, 4, 4, 4],
+        "the node's OWN height (4 mi) carries the leaf's height"
+    );
+    assert_eq!(n.above_txfm[6], 0, "and nothing past the node's extent");
+    assert_eq!(n.left_txfm[8], 0, "and nothing past the node's extent");
+}
+
 /// The domain of var-tx leaf sizes, enumerated against the two refusals that
 /// name a leaf "larger than 32x32" / "larger than 64x64".
 ///
@@ -29939,6 +30081,14 @@ fn read_block_tx_size_rect(
                 leaves.push((row, col, 4, 4));
             }
         }
+        // A lossless segment takes libaom's `else` branch (the var-tx
+        // condition carries `!xd->lossless[mbmi->segment_id]`), so
+        // `read_tx_size` returns `TX_4X4` and `set_txfm_ctxs` publishes it
+        // over the block's own width/height. The grid's own values (4x4) are
+        // identical either way, so this write is only what keeps the
+        // caller's `fill_lf_grid_rect_after_vartx` suppression sound: a
+        // mixed frame's lossy neighbour reads this block's bands.
+        txfm_partition_update_rect(n, at_mi, (4, 4), (bw, bh));
         return Ok(Some(leaves));
     }
     if skip {
