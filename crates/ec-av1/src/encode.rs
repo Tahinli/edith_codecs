@@ -1907,12 +1907,21 @@ pub struct Encoded {
     /// must feed the decoder this, exactly as `decode_stream` feeds it what
     /// the frame's `primary_ref_frame` slot holds (same class as
     /// `tx_select`: a header bit a raw tile decode cannot guess).
-    pub(crate) start_cdfs: CdfSnapshot,
+    ///
+    /// BOXED (lane-av1stacksweep), and this is the whole point: the payload is
+    /// a 15232-byte `Cdfs`, and `Encoded` is returned BY VALUE from a
+    /// four-deep `Result<Encoded>` constructor chain, so an inline copy of two
+    /// of them made `Encoded` 30728 bytes -- 99.2% of this struct was these
+    /// two fields, and it was the largest by-value return in the crate.
+    /// `DpbSlot::cdfs` was boxed for the same reason in lane-av1enchang; this
+    /// is the other copy of the same table. The VALUES are untouched, so the
+    /// bitstream is byte-identical; `crate::stack_budget` gates the result.
+    pub(crate) start_cdfs: Box<CdfSnapshot>,
     /// What this frame stores into the slots it refreshes (spec 7.20,
     /// `crate::stream::stored_cdfs_for`): its end-of-tile tables with the
     /// counts reset when `disable_frame_end_update_cdf` is off, and what it
     /// started from when it is on.
-    pub(crate) next_cdfs: CdfSnapshot,
+    pub(crate) next_cdfs: Box<CdfSnapshot>,
     /// This frame header's chosen deblocking parameters
     /// ([`crate::filter_search::pick_deblock`]) — `reconstruction` is the
     /// picture the decoder produces UNDER them, so a test that decodes
@@ -9694,8 +9703,8 @@ pub(crate) fn encode_key_frame_inner(
         switchable_motion_mode: false,
         screen,
         reduced_tx_set: header.reduced_tx_set,
-        next_cdfs: start_cdfs.clone(),
-        start_cdfs,
+        next_cdfs: Box::new(start_cdfs.clone()),
+        start_cdfs: Box::new(start_cdfs),
         loop_filter: header.loop_filter,
         cdef: header.cdef,
         loop_restoration: header.loop_restoration,
@@ -15539,8 +15548,8 @@ pub(crate) fn encode_inter_frame(
         switchable_motion_mode,
         screen,
         reduced_tx_set: header.reduced_tx_set,
-        start_cdfs,
-        next_cdfs,
+        start_cdfs: Box::new(start_cdfs),
+        next_cdfs: Box::new(next_cdfs),
         loop_filter: header.loop_filter,
         cdef: header.cdef,
         loop_restoration: header.loop_restoration,

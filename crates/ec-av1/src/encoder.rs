@@ -1430,7 +1430,7 @@ pub struct Av1Encoder {
     /// inter frame reads (spec 7.20): the tables that frame's tile writer
     /// must start from, since the header leaves
     /// `disable_frame_end_update_cdf` off. `None` before the first frame.
-    carried_cdfs: Option<crate::encode::CdfSnapshot>,
+    carried_cdfs: Option<Box<crate::encode::CdfSnapshot>>,
     /// The last key frame's own (padded) reconstruction: `GOLDEN_FRAME`,
     /// which stays in DPB slot 1 until the next key frame refreshes it.
     golden: Option<Picture>,
@@ -1974,7 +1974,11 @@ impl Av1Encoder {
         let slot = DpbSlot {
             picture: encoded.reconstruction.clone(),
             order_hint,
-            cdfs: Box::new(encoded.next_cdfs.clone()),
+            // `next_cdfs` is already a `Box<CdfSnapshot>` (lane-av1stacksweep),
+            // so this is a pointer copy rather than a second boxing -- the
+            // same fix lane-av1enchang made here, now that the producer hands
+            // over a box instead of an inline 15232-byte `Cdfs`.
+            cdfs: encoded.next_cdfs.clone(),
         };
         for &s in slots {
             self.dpb[s as usize] = Some(slot.clone());
