@@ -19,6 +19,7 @@ mi=(80,110) …)`, plus the same claim independently re-measured by
 | The reader that broke | the 8x4 intra leaf with `use_filter_intra` at **mi=(80,110)**, `tx_size_cat0[2]` where libaom reads row 1. |
 | `420_mixll_altref_640x480_5f.obu` (87537 B) | **REFUSED** at base → **6/6 decode-order frames byte-exact**; whole-stream paired `EC_SYMR` ladder **457 907 / 457 907 bit-identical, zero divergence** |
 | `420_mixll_altref_640x480_6f.obu` (115615 B) | **REFUSED** at base → **7/7 decode-order frames byte-exact** |
+| the three `m_256x128` / `m_320x240` **residue** arms `lane-av1mixllconj` §7 handed over as unnamed | **THE SAME DEFECT — red at base (96319 / 208704 / 19398 differing bytes) → 7/7, 6/6, 7/7 byte-exact**, now fixtures + a second gate (§6.2) |
 | Corpus sweep, 110 committed fixtures | **EXACT 100 → 100, REFUSED 10 → 10, RED 0 → 0, FRAMECOUNT 0 → 0** — all ten refusals are the pre-existing by-name 4:2:2 chroma refusal. **Zero rows change**: the fix is a strict no-op on everything already correct, and it is the two NEW 640x480 fixtures that go REFUSED → 6/6 and 7/7 EXACT. |
 | Recipe's closed cells | re-measured with the fix: 256x128 pin **6/6 EXACT**, 176x144 **6/6 EXACT**, 352x288 **6/6 EXACT**, the 4:4:4 arm green in the corpus (§6.1) |
 | Class sweep | 5 sites of `context-band-not-published`; **1 was this defect (fixed), 1 is a real libaom-fidelity gap that IS reached but has NO observable effect on any fixture measured (`read_block_tx_size_rect`'s lossless arm, missing the `skip && is_inter` term — 29/1/9/6/16 measured hits), 2 are unobservable by construction, 1 is a deliberate gate that measurement clears** (§7) |
@@ -287,7 +288,37 @@ by the project's 4:2:2 decision.
 | 176x144 of the same recipe, regenerated and re-encoded here | **6/6 decode-order EXACT** (oracle 6 dumps, 0 differing bytes) |
 | 352x288 of the same recipe, regenerated and re-encoded here | **6/6 decode-order EXACT** (oracle 6 dumps, 0 differing bytes) |
 | the 4:4:4 arm | green; every `440_*` fixture in the §6 sweep is `EXACT` except the one by-name 4:2:2 refusal |
-| `m_320x240`, `m5_320x240`, the 6-frame `m_256x128` residuals named by `lane-av1mixllconj` §7 | **not claimed closed, and not measured here** — they are generated cells, not committed fixtures, so the §6 sweep does not cover them and no number in this report speaks to them |
+| the `m_320x240` / `m5_320x240` / 6-frame `m_256x128` **residue** that `lane-av1mixllconj` §7 left unnamed ("separate defects this change shrinks but does not remove") | **THE SAME DEFECT, and closed.** Measured on `f2dd27b0~1` they are red; with this lane's one publish they are **7/7, 6/6 and 7/7 byte-exact** (§6.2), and they now carry their own fixtures and gate `a_420_mixed_lossless_residue_arms_are_byte_exact_in_decode_order` |
+
+### 6.2 The residue arms, measured and gated
+
+`lane-av1mixllconj` §7 named three residuals on this same recipe and explicitly
+declined to claim them: *"separate defects this change shrinks but does not
+remove."* They are not separate. Each is a lossy block whose
+`get_tx_size_context` / `txfm_partition_context` read a band that a lossless
+block above it should have published into and did not — this lane's defect, at
+smaller frame sizes.
+
+```text
+                             at f2dd27b0~1 (= 0bfee517)        with this lane's publish
+420_mixll_256x128_6f.obu   7 dumps, red f1..f6:              7/7 byte-exact
+                             6051 / 4115 / 2962 / 26566 / 41876 / 14749
+420_mixll_320x240_5f.obu   6 dumps, red f1..f5:              6/6 byte-exact
+                             15031 / 16259 / 21932 / 65405 / 90077
+420_mixll_320x240_6f.obu   7 dumps, red f6 only: 19398       7/7 byte-exact
+```
+
+Decode order, per differing frame, against `aomdec`'s `EC_AV1_FINAL_DUMP`, both
+sides bit-depth-correct, hidden alt-ref frames included. The recipes reproduce
+`lane-av1mixllconj` §1's byte counts and sha prefixes (`37fbe7cb…`, `40d613fd…`).
+`m5_320x240`'s f2/f3 here read 16259 / 21932 against the 16006 / 21930 that
+report's §7 table records, because that table predates `lane-av1offtile`'s
+chroma-plane clip; f1/f4/f5 and both other cells match it exactly.
+
+All three are committed as fixtures and asserted by
+`a_420_mixed_lossless_residue_arms_are_byte_exact_in_decode_order`, pinned by
+fnv1a64. They are excluded from the §6 corpus sweep (which is the pre-existing
+corpus plus nothing else), so the zero-row diff in §6 is unaffected.
 
 ## 7. Class sweep — `context-band-not-published`
 
@@ -365,8 +396,9 @@ SITE3-PATCHED 420_mixll_altref_640x480_6f:      oracle=7  diffbytes=0
 
 ## 9. Fix-now | deferred(<unblock>) | accepted
 
-* **fix-now** — the one-call publish, its route counter and accessor, the two
-  fixtures and the gate. Landed in this commit.
+* **fix-now** — the one-call publish, its route counter and accessor, FIVE
+  fixtures (the two 640x480 cells plus the three residue arms of §6.2) and TWO
+  gates. Landed in this commit.
 * **fix-now** — the class sweep (§7), because it is what found the site.
 * **deferred(unblock: a cell where a SKIPPED inter rect strip sits on a LOSSLESS
   segment AND a lossy block later reads its column — the five fixtures that
@@ -377,23 +409,41 @@ SITE3-PATCHED 420_mixll_altref_640x480_6f:      oracle=7  diffbytes=0
 * **accepted** — §7 site 2's missing publish on a `tx_mode != TX_MODE_SELECT`
   frame. Unreachable by construction (both readers are gated on SELECT); closing
   it would add a write nothing reads.
-* **accepted** — the §6 residuals `lane-av1mixllconj` §7 names on the 6-frame
-  256x128 and the 320x240 arms. Not this class, not measured here, not claimed.
+* **fix-now (second commit)** — the three residue arms of §6.2. `lane-av1mixllconj`
+  §7 handed them over as unnamed separate defects; measured, they are this
+  lane's defect, and they are now fixtures and a gate rather than a report note.
 
 ## 10. Scoped test command and output
 
 ```text
 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-av1txctxband2 EC_NOMEMGUARD=1 \
-  cargo test -p ec-av1 --lib -- a_420_mixed_lossless_alt_ref_640x480_txfm_band_publish \
-                                  a_420_mixed_lossless_alt_ref_sub8_vartx
+  cargo test -p ec-av1 --lib -- a_420_mixed_lossless
 ```
 
 ```text
-running 2 tests
-test stream::tests::a_420_mixed_lossless_alt_ref_640x480_txfm_band_publish_is_byte_exact_in_decode_order ... ok
+running 3 tests
 test stream::tests::a_420_mixed_lossless_alt_ref_sub8_vartx_witness_is_byte_exact_in_decode_order ... ok
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 805 filtered out; finished in 2.06s
+test stream::tests::a_420_mixed_lossless_alt_ref_640x480_txfm_band_publish_is_byte_exact_in_decode_order ... ok
+test stream::tests::a_420_mixed_lossless_residue_arms_are_byte_exact_in_decode_order ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 805 filtered out; finished in 2.51s
 ```
+
+The same command with the one `set_txfm_ctxs` call removed — the mutation proof
+across all three, and note the residue gate fails on a PIXEL diff while the
+640x480 gate fails on the REFUSAL, so neither gate is carried by the other:
+
+```text
+test …640x480_txfm_band_publish… ... FAILED
+    this decoder refused the stream: unsupported: AV1 tile (a Golomb tail longer than this decoder reads)
+test …mixed_lossless_residue_arms… ... FAILED
+    420_mixll_256x128_6f.obu: decode-order frame 1 of 7 (6 shown, 1 hidden) differs from the
+    oracle at byte 16584 (ours 96 vs 91), 6051 bytes differ
+test …alt_ref_sub8_vartx_witness… ... ok          <-- lane-av1mixllconj's gate, untouched by this fix
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 805 filtered out
+```
+
+**6051** is the hand-measured base red for that frame's f1 in §6.2 — the mutation
+reproduces the number the pre-fix tree produced, not a different one.
 
 The corpus sweep (§6) is the regression evidence for everything else: 110
 fixtures swept before and after with **zero rows changing**.
