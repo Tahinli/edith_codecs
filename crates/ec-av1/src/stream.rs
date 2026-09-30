@@ -1831,20 +1831,39 @@ fn decode_frame(
         [flat; 3]
     };
     crate::decode::set_qm_levels(levels, fctx);
-    // lane-av112bit: the frame-level half of the 12-bit gate -- screen
-    // content tools. Neither palette nor intrabc has a 12-bit witness (the
-    // 12-bit gates are natural content), and both hang off this header bit:
-    // `allow_screen_content_tools` is what lets a block code a palette or
-    // read a `use_intrabc` symbol. Refusing the FRAME by name keeps every
-    // palette/intrabc code path 12-bit-unreachable rather than unwitnessed
-    // and trusted. Gate:
-    // `a_12bit_screen_content_stream_is_refused_by_name`.
-    if bit_depth == 12 && header.allow_screen_content_tools {
-        return Err(Error::unsupported(
-            "AV1 decode_stream",
-            "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
-        ));
-    }
+    // lane-av112bit's screen-content refusal is LIFTED by lane-av1screen12.
+    // The claim it carried -- "a 12-bit frame with screen content tools
+    // (allow_screen_content_tools=1: neither palette nor intrabc has a
+    // 12-bit witness)" -- named a gap WIDER than the one it was written for:
+    // `allow_screen_content_tools` only decides whether an intra block reads
+    // the `palette_y_mode`/`palette_uv_mode` symbols and whether a leaf reads
+    // `use_intrabc`, and BOTH of those reconstructions read their colours and
+    // their frame copy at the frame's own `bit_depth` (`read_palette_colors_y`
+    // / `_uv` take `bit_depth(fctx)`, the colour-index map writes u16 samples).
+    // Nothing about them is 8/10-bit-shaped.
+    //
+    // Measured, with this guard lifted, all three arms decode BYTE-EXACT
+    // against the instrumented `aomdec --rawvideo` AND against ffmpeg, each
+    // with a +1 control on the oracle's own bytes:
+    //
+    // | arm | pin | frames | screen | allow_intrabc | palette / palette-UV / intrabc |
+    // | --- | --- | --- | --- | --- | --- |
+    // | palette | `screen12_palette.obu` | 2 | 2 | 0 | 76 / 43 / 0 |
+    // | palette+intrabc | `screen12_intrabc.obu` | 1 | 1 | 1 | 36 / 34 / 11 |
+    // | lossless+palette | `screen12_lossless_palette.obu` | 2 | 2 | 0 | 80 / 59 / 0 |
+    //
+    // Gates: `a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact`,
+    // `a_real_aomenc_12bit_intrabc_screen_stream_decodes_pixel_exact`,
+    // `a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact`.
+    //
+    // ON THE OLD "INTRABC IS UNPRODUCIBLE" NOTE: the earlier claim that
+    // 12-bit `allow_intrabc` has no producer was a RECIPE artefact, not an
+    // encoder limit. libaom decides that frame-header bit from its own
+    // content detector (`encoder.c:2404`), not from `--tune-content=screen`:
+    // an untiled `smptebars=size=128x96` source reads `allow_intrabc = 0`
+    // with AND without the flag, while the 256x192 `-vf tile=2x2` source the
+    // 8/10-bit intrabc census already uses reads `allow_intrabc = 1` with
+    // and without it -- at 8, at 10 AND at 12 bits (measured).
     // lane-dpm1: a LOSSLESS frame (`qindex == 0` with zero deltas, spec 5.9.12)
     // is a different tile syntax, and this decoder has none of it: libaom
     // forces TX_4X4 with the WALSH-HADAMARD transform over every block (so no
@@ -13587,9 +13606,28 @@ exit 0
         depth: usize,
         extra: &[&str],
     ) -> Vec<u8> {
-        assert!(depth == 8 || depth == 10, "unsupported bit depth {depth}");
+        // lane-av1screen12: depth 12 joins 8 and 10. The SAME recipe (`-vf
+        // tile=2x2` over `smptebars=size=128x96:rate=25`,
+        // `--tune-content=screen --enable-intrabc=1`, cq30,
+        // `--enable-tx-size-search=0`) that keeps `allow_intrabc` at 8 and 10
+        // bits keeps it at 12 bits too -- measured, and pinned by
+        // `a_real_aomenc_12bit_intrabc_screen_stream_decodes_pixel_exact`.
+        // That is why "neither palette nor intrabc has a 12-bit witness" was
+        // false: the intrabc half WAS producible, `--tune-content=screen`
+        // alone just is not what decides the frame-header bit (libaom's
+        // content detector is).
+        assert!(
+            depth == 8 || depth == 10 || depth == 12,
+            "unsupported bit depth {depth}"
+        );
+        // `if depth == 10` is SPELLED, not matched, because
+        // `gate_coverage::covers_both_depths` recognises this two-depth
+        // helper by that literal (the lane-defon/troykf blind spot with
+        // `depth` spelled instead of `bit_depth`).
         let pix_fmt = if depth == 10 {
             "yuv420p10le"
+        } else if depth == 12 {
+            "yuv420p12le"
         } else {
             "yuv420p"
         };
@@ -15595,36 +15633,229 @@ exit 0
         );
     }
 
-    /// The 12-bit screen-content refusal: a real `--tune-content=screen
-    /// --enable-palette=1 --enable-intrabc=1` frame carries
-    /// `allow_screen_content_tools = 1` and is refused by name at the frame
-    /// gate -- palette and intrabc have no 12-bit witness.
-    #[test]
-    fn a_12bit_screen_content_stream_is_refused_by_name() {
-        const NAME: &str = "a_12bit_screen_content_stream_is_refused_by_name";
-        let _gate_lock = lock_gate_counters();
-        if !have_ffmpeg() {
-            eprintln!("SKIP {NAME}: no ffmpeg");
-            return;
+    /// lane-av1screen12: how many frames of `stream` carry
+    /// `allow_screen_content_tools`, and how many of THOSE carry
+    /// `allow_intrabc`. Both are read out of the frame headers this crate
+    /// parsed, never taken from the flags handed to the encoder (class
+    /// `tool-disabled-in-every-gate`): on this oracle build
+    /// `--tune-content=screen` does NOT by itself decide the frame-header
+    /// `allow_intrabc` bit -- an untiled `smptebars=size=128x96` source reads
+    /// `false` with and without the flag, while the 256x192 `tile=2x2` source
+    /// the intrabc census uses reads `true` with and without it (measured;
+    /// libaom's content detector, `encoder.c:2404`, is what decides it).
+    fn screen_and_intrabc_frame_counts(stream: &[u8]) -> (u32, u32) {
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let (mut screen, mut intrabc) = (0u32, 0u32);
+        while pos < stream.len() {
+            let Ok(obu) = parser.parse_obu(&stream[pos..]) else {
+                break;
+            };
+            pos += obu.total_size.max(1);
+            let header = match &obu.kind {
+                ObuKind::Frame(h, _) => Some(&**h),
+                ObuKind::FrameHeader(h) => Some(&**h),
+                _ => None,
+            };
+            if let Some(h) = header
+                && h.allow_screen_content_tools
+            {
+                screen += 1;
+                if h.allow_intrabc {
+                    intrabc += 1;
+                }
+            }
         }
-        if !have_aomenc() {
-            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
-            return;
+        (screen, intrabc)
+    }
+
+    /// The three committed 12-bit screen-content witnesses, by literal name
+    /// (a pin name built from a loop variable leaves the pin census
+    /// unproven), with the length and `fnv1a64` each gate asserts. sha256,
+    /// recorded in the gates' doc comments and in
+    /// `lanes/av1screen12.report.md`:
+    ///
+    /// * `screen12_palette.obu` 3616 bytes,
+    ///   `adfe26c67c08a7e986db2743b914ecc3e214c56dd2abbdfd17ebf99f06de64c8`
+    /// * `screen12_intrabc.obu` 482 bytes,
+    ///   `a3b6b94cabdd09a12057c4688990d55495826b87a14332c386d319629070382e`
+    /// * `screen12_lossless_palette.obu` 11698 bytes,
+    ///   `ec7942c96763593e6d8e4b3fb23c03930bba3bb743102d0cf552fe73ae11c203`
+    const PIN_LEN_PALETTE: usize = 3616;
+    const PIN_FNV_PALETTE: u64 = 0xf9bb_d408_61d6_f0da;
+    const PIN_LEN_INTRABC: usize = 482;
+    const PIN_FNV_INTRABC: u64 = 0xae83_3eb7_9380_263b;
+    const PIN_LEN_LOSSLESS: usize = 11698;
+    const PIN_FNV_LOSSLESS: u64 = 0x6e28_41c7_7b0a_f9db;
+
+    /// lane-av1screen12: the shared body of the three 12-bit screen-content
+    /// gates. Every assertion a "this arm really is 12-bit screen content,
+    /// and this decoder reproduces it" claim needs, in one place:
+    ///
+    /// 1. the committed PIN is the witness -- its length and fnv1a64 are
+    ///    pinned, and `require_pin` HARD-fails on a missing copy rather than
+    ///    testing nothing;
+    /// 2. the live recipe reproduces that pin byte for byte (aomenc present),
+    ///    so the recipe in the doc comment is not decoration;
+    /// 3. the stream's OWN sequence header says 12-bit and its frame headers
+    ///    say `allow_screen_content_tools` (and `allow_intrabc` for the arm
+    ///    that wants it);
+    /// 4. the decode ENGAGED the feature -- `palette_hits()` /
+    ///    `palette_uv_hits()` / `intrabc_hits()` deltas are hard-asserted,
+    ///    because a stream that merely carries the header bit would leave the
+    ///    arm it claims to witness untested (class `gate-blind-to-feature`);
+    /// 5. every sample of every frame matches the instrumented `aomdec
+    ///    --rawvideo` (`assert_rawvideo_matches`), and independently ffmpeg;
+    /// 6. THE CONTROL: the same counting comparator, run twice -- clean it
+    ///    must report zero wrong samples in all three planes, and with ONE
+    ///    bit flipped in the ORACLE's own frame-0 luma high byte it must
+    ///    report exactly one wrong luma byte and one fewer exact frame. That
+    ///    is the proof the comparator READS the oracle side: a comparator
+    ///    that compared our samples with themselves would report 0 both
+    ///    times (class `oracle-diff-counter-tautology`).
+    ///
+    /// Flip index 1 is the high byte of the first luma sample of frame 0.
+    /// A 12-bit sample's high byte holds bits 8..15 only, so flipping its low
+    /// bit can never carry into another byte: the move is exactly +1 wrong
+    /// byte in the Y plane, which is what makes "+1 in the right plane and
+    /// frame" a real statement rather than a hope.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_12bit_screen_content_arm(
+        name: &str,
+        pin: &'static str,
+        live: Vec<u8>,
+        pin_len: usize,
+        pin_fnv: u64,
+        frames: usize,
+        width: usize,
+        height: usize,
+        want_intrabc: bool,
+    ) {
+        let path = crate_pin(pin);
+        let stream = require_pin(&path, pin);
+        assert_eq!(
+            stream.len(),
+            pin_len,
+            "{name}: the committed pin {pin} is {} bytes, this gate names {pin_len}",
+            stream.len()
+        );
+        assert_eq!(fnv1a64(&stream), pin_fnv, "{name}: the committed pin {pin} moved");
+        if have_aomenc() {
+            assert_eq!(
+                live.len(),
+                pin_len,
+                "{name}: the live recipe produced {} bytes, the committed pin {pin} is \
+                 {pin_len} -- aomenc changed, re-pin it",
+                live.len()
+            );
+            assert_eq!(
+                fnv1a64(&live),
+                pin_fnv,
+                "{name}: the live recipe no longer reproduces the committed pin {pin}"
+            );
         }
-        let y4m = Command::new("ffmpeg")
+        assert_12bit_sequence_header(&stream, name);
+        let (screen_frames, intrabc_frames) = screen_and_intrabc_frame_counts(&stream);
+        assert!(
+            screen_frames > 0,
+            "{name}: no frame carries allow_screen_content_tools -- this is not a \
+             screen-content stream and the arm would prove nothing"
+        );
+        assert_eq!(
+            intrabc_frames > 0,
+            want_intrabc,
+            "{name}: {intrabc_frames} frame(s) carry allow_intrabc, the gate wants {}",
+            u32::from(want_intrabc)
+        );
+
+        let pal_before = crate::decode::palette_hits();
+        let paluv_before = crate::decode::palette_uv_hits();
+        let ibc_before = crate::decode::intrabc_hits();
+        let decoded = decode_stream(&stream).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(decoded.len(), frames, "{name}: frame count");
+        let palette = crate::decode::palette_hits() - pal_before;
+        let palette_uv = crate::decode::palette_uv_hits() - paluv_before;
+        let intrabc = crate::decode::intrabc_hits() - ibc_before;
+        assert!(
+            palette > 0,
+            "{name}: the stream decoded no palette block -- the 12-bit palette syntax \
+             would be untested (class gate-blind-to-feature)"
+        );
+        assert!(
+            palette_uv > 0,
+            "{name}: the stream decoded no chroma palette block -- the 12-bit palette-UV \
+             syntax would be untested (class gate-blind-to-feature)"
+        );
+        if want_intrabc {
+            assert!(
+                intrabc > 0,
+                "{name}: allow_intrabc is set but no block decoded use_intrabc=1 -- the \
+                 12-bit intra-block-copy syntax would be untested (class \
+                 gate-blind-to-feature)"
+            );
+        }
+
+        if aomdec_available(name) {
+            let dir = std::env::temp_dir().join(format!("ec-av1-{name}-arm"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let obu = dir.join("in.obu");
+            std::fs::write(&obu, &stream).expect("writing the stream");
+            assert_rawvideo_matches(&obu, &stream, name, frames, 12);
+            let _ = std::fs::remove_dir_all(&dir);
+            // The +1 control (part 6): clean is all-zero, one flipped oracle
+            // byte is exactly +1 luma byte and one fewer exact frame.
+            let clean = count_rawvideo_diffs(&stream, name, None)
+                .unwrap_or_else(|| panic!("{name}: our packed output and the oracle's rawvideo differ in SIZE"));
+            assert_eq!(
+                clean,
+                (0, 0, 0, frames, frames),
+                "{name}: {frames} frame(s) must be byte-exact against the oracle before the \
+                 control arm means anything"
+            );
+            let flipped = count_rawvideo_diffs(&stream, name, Some(1))
+                .unwrap_or_else(|| panic!("{name}: the control arm lost the size check"));
+            assert_eq!(
+                flipped,
+                (1, 0, 0, frames, frames - 1),
+                "{name}: flipping bit 0 of the ORACLE's frame-0 luma high byte must move the \
+                 count by exactly +1 luma byte and cost exactly one exact frame -- if this \
+                 reports 0 the comparator never read the oracle (class \
+                 oracle-diff-counter-tautology)"
+            );
+        }
+        if have_ffmpeg() {
+            let theirs = ffmpeg_decode_sequence_12bit(&stream, width, height, frames);
+            assert_eq!(theirs.len(), frames, "{name}: ffmpeg frame count");
+            for (i, (ours, want)) in decoded.iter().zip(&theirs).enumerate() {
+                assert_eq!(ours.y, want.y, "{name}: 12-bit luma vs ffmpeg (frame {i})");
+                assert_eq!(ours.u, want.u, "{name}: 12-bit U vs ffmpeg (frame {i})");
+                assert_eq!(ours.v, want.v, "{name}: 12-bit V vs ffmpeg (frame {i})");
+            }
+        }
+        eprintln!(
+            "{name}: {frames} 12-bit frame(s) byte-exact vs aomdec --rawvideo and ffmpeg, \
+             {screen_frames} screen frame(s), {intrabc_frames} allow_intrabc, {palette} palette \
+             + {palette_uv} palette-UV + {intrabc} intrabc block(s)"
+        );
+    }
+
+    /// Renders a 12-bit y4m for the 12-bit screen-content gates. `tiled`
+    /// applies `-vf tile=2x2`, which is what takes the source from 128x96 to
+    /// the 256x192 shape libaom's content detector clears the (stricter)
+    /// IntraBC threshold on.
+    fn y4m_12bit_screen_source(src: &str, tiled: bool) -> Vec<u8> {
+        let mut ff = Command::new("ffmpeg");
+        ff.args(["-v", "error", "-f", "lavfi", "-i", src, "-t", "0.2"]);
+        if tiled {
+            ff.args(["-vf", "tile=2x2"]);
+        }
+        let out = ff
             .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "smptebars=s=128x128:r=25",
                 "-pix_fmt",
                 "yuv420p12le",
                 "-strict",
                 "-1",
-                "-frames:v",
-                "2",
                 "-f",
                 "yuv4mpegpipe",
                 "-",
@@ -15635,25 +15866,134 @@ exit 0
             .output()
             .expect("ffmpeg failed to run");
         assert!(
-            y4m.status.success(),
-            "ffmpeg failed to render the 12-bit screen fixture: {}",
-            String::from_utf8_lossy(&y4m.stderr)
+            out.status.success(),
+            "ffmpeg failed for the 12-bit screen source {src}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
-        let stream = encode_12bit(
-            &y4m.stdout,
-            1,
-            &[
-                "--tune-content=screen",
-                "--enable-palette=1",
-                "--enable-intrabc=1",
-            ],
+        out.stdout
+    }
+
+    /// lane-av1screen12: a 12-bit PALETTE screen-content stream, palette on
+    /// and palette-UV on, `allow_intrabc` off.
+    ///
+    /// Recipe: `ffmpeg -f lavfi -i testsrc2=s=160x128:r=25 -pix_fmt
+    /// yuv420p12le -strict -1` (2 frames, 160x128 4:2:0) piped to
+    /// [`encode_12bit`] with `--tune-content=screen --enable-palette=1
+    /// `--enable-intrabc=1`; pin `screen12_palette.obu` (3616 bytes, sha256
+    /// `adfe26c67c08a7e986db2743b914ecc3e214c56dd2abbdfd17ebf99f06de64c8`).
+    ///
+    /// What it replaces: this is the arm the blanket refusal "a 12-bit frame
+    /// with screen content tools" blocked while decoding exactly.
+    #[test]
+    fn a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact";
+        const PIN: &str = "screen12_palette.obu";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let y4m = y4m_12bit_screen_source("testsrc2=s=160x128:r=25", false);
+        let live = if have_aomenc() {
+            encode_12bit(
+                &y4m,
+                2,
+                &[
+                    "--tune-content=screen",
+                    "--enable-palette=1",
+                    "--enable-intrabc=1",
+                ],
+            )
+        } else {
+            Vec::new()
+        };
+        assert_12bit_screen_content_arm(
+            NAME, PIN, live, PIN_LEN_PALETTE, PIN_FNV_PALETTE, 2, 160, 128, false,
         );
-        let err = decode_stream(&stream).unwrap_err().to_string();
-        assert!(
-            err.contains(
-                "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)"
-            ),
-            "{NAME}: expected the 12-bit screen content refusal, got: {err}"
+    }
+
+    /// lane-av1screen12: a 12-bit screen-content stream whose KEY frame sets
+    /// `allow_intrabc = 1` and really codes `use_intrabc` blocks.
+    ///
+    /// Recipe: [`screen_intrabc_stream_at_depth`] at depth 12 -- the same
+    /// shape the 8/10-bit intrabc census and the sb128 intrabc witness use:
+    /// `-vf tile=2x2` over `smptebars=size=128x96:rate=25` (256x192),
+    /// `--tune-content=screen --enable-intrabc=1 --enable-palette=1
+    /// --cq-level=30 --enable-tx-size-search=0 --min-partition-size=8
+    /// --max-partition-size=32 --sb-size=64 --kf-max-dist=1 --limit=1`, so
+    /// ONE 12-bit key frame; pin `screen12_intrabc.obu` (482 bytes, sha256
+    /// `a3b6b94cabdd09a12057c4688990d55495826b87a14332c386d319629070382e`).
+    ///
+    /// This arm is the one the old refusal's "nor intrabc" half named, and it
+    /// is why the refusal could be LIFTED rather than narrowed: it decodes
+    /// byte-exact at 12 bits and `intrabc_hits()` proves the blocks really
+    /// reconstructed from the current frame.
+    #[test]
+    fn a_real_aomenc_12bit_intrabc_screen_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_12bit_intrabc_screen_stream_decodes_pixel_exact";
+        const PIN: &str = "screen12_intrabc.obu";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let live = if have_aomenc() {
+            // `--enable-palette=1` LAST (aomenc keeps the last occurrence), so
+            // this 12-bit arm carries BOTH screen-content syntaxes rather than
+            // intra-block copy alone.
+            screen_intrabc_stream_at_depth(
+                "smptebars=size=128x96:rate=25",
+                "30",
+                "0",
+                true,
+                false,
+                12,
+                &["--enable-palette=1"],
+            )
+        } else {
+            Vec::new()
+        };
+        assert_12bit_screen_content_arm(
+            NAME, PIN, live, PIN_LEN_INTRABC, PIN_FNV_INTRABC, 1, 256, 192, true,
+        );
+    }
+
+    /// lane-av1screen12: a 12-bit LOSSLESS screen-content stream with
+    /// palette and palette-UV on.
+    ///
+    /// Recipe: the palette arm's source and flags plus `--lossless=1`, so the
+    /// frame is `CodedLossless` (base_q_idx 0, WHT on every plane) AND
+    /// screen-content -- two 12-bit tile-syntax interactions in one frame;
+    /// pin `screen12_lossless_palette.obu` (11698 bytes, sha256
+    /// `ec7942c96763593e6d8e4b3fb23c03930bba3bb743102d0cf552fe73ae11c203`).
+    #[test]
+    fn a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact";
+        const PIN: &str = "screen12_lossless_palette.obu";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let y4m = y4m_12bit_screen_source("testsrc2=s=160x128:r=25", false);
+        let live = if have_aomenc() {
+            encode_12bit(
+                &y4m,
+                2,
+                &[
+                    "--tune-content=screen",
+                    "--enable-palette=1",
+                    "--enable-intrabc=1",
+                    "--lossless=1",
+                ],
+            )
+        } else {
+            Vec::new()
+        };
+        assert_12bit_screen_content_arm(
+            NAME, PIN, live, PIN_LEN_LOSSLESS, PIN_FNV_LOSSLESS, 2, 160, 128, false,
         );
     }
 
