@@ -16,17 +16,24 @@
 >    (the same term the conjunct uses) and the pin's delta reads **10, not 40**; the gate still asserts `> 0`,
 >    remains green, and its doc names both numbers. Same class as the palette counter correction: a hit that
 >    fires for a population the fix does not touch is not a non-vacuity arm.
-> 2. **The corpus buckets do not reproduce**: the pass swept 110 fixtures on both trees and measures
->    **base 106 = 96 EXACT / 0 RED / 9 FRAMECOUNT / 1 ORACLE_FAIL** (`440_request_is_422.obu`, which `aomdec`
->    itself refuses) and **tip 110 = 100 EXACT / 0 RED / 9 FRAMECOUNT / 1**, with the SUBSTANCE intact and
->    stronger: conjunct-out -> tip is exactly ONE status change (the pin RED 186625 B -> EXACT), zero
->    EXACT->RED, zero new refusals, zero frame-count change; base -> tip is 0 status changes across the 106
->    shared fixtures plus 4 added (all EXACT); tip -> clip-out is 0 status changes (the off-tile clip is
->    corpus-inert). The report's "107 fixtures" and its 64/34/9/0 -> 65/33/9/0 split match neither tree
->    (base 106, main 110) -- use the pass's absolute buckets.
+> 2. **The corpus buckets do not reproduce, and the CAUSE IS NOW DIAGNOSED rather than left as two
+>    incompatible sweeps**: the lane compared OUR `EC_AV1_DECODE_ORDER_DUMP` against the oracle's
+>    `EC_AV1_FINAL_DUMP`, but our dump NARROWS every plane to u8 (`stream.rs:2189`,
+>    `let narrow = |v: &[u16]| v.iter().map(|&s| s as u8)` -- the code even says in a comment that it
+>    "predates 10-bit support and is an 8-bit-oracle comparison only"), while the oracle's dump is
+>    bit-depth correct. On an 8-bit stream that is a fair compare; on 10/12-bit it mismatches on EVERY frame
+>    BY CONSTRUCTION. Nearly all 34 of the lane's RED rows were HBD fixtures
+>    (`444_lossy_superres_*_10bit/12bit`, `hg_*`, `intra14_256x192_10bit`, `palette_screen_*_10bit`, ...) that
+>    were "red" because u16 samples were halved, not because a pixel differed. With those out, the RED count
+>    collapses to the pass's own 0 -- which is why the correct buckets are **base 106 = 96 EXACT / 0 RED / 9
+>    FRAMECOUNT / 1 ORACLE_FAIL** and **tip 110 = 100 / 0 / 9 / 1**. The SUBSTANCE of the lane's sweep is
+>    untouched and its zero-EXACT->RED result stands. Class recorded in the skill
+>    `oracle-raw-packing-depth-audit`: an all-HBD red set is the signature of a narrowed-dump compare, and a
+>    documented trap is not a neutralised trap -- the compare path has to encode the depth, not a comment.
 > 3. **The cited oracle rung `EC_AV1_DECODE_ORDER_DUMP` does not exist** in the shared oracle build (only
->    `EC_AV1_FINAL_DUMP`, `decodeframe.c:5699`). The measurement it supports was made with the decode-order
->    dump path the crate's own helpers use; the rung NAME in the text is wrong and no test depends on it.
+>    `EC_AV1_FINAL_DUMP`, `decodeframe.c:5699`) -- it is OUR rung, 8-bit-only, which is the same fact as
+>    correction 2 wearing a different coat. The measurement it supports was made with the decode-order dump
+>    path the crate's own helpers use; the rung NAME in the text is wrong and no test depends on it.
 
 
 Base `main` = `6bb66a4a`. Worktree `/home/tahinli/.cache/wt/av1mixllconj`, target dir
