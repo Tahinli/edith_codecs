@@ -6495,6 +6495,33 @@ thread_local! {
     static INTER16_SUB8_PIECE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-arfchroma: chroma transform-unit publications whose block started
+// MID-CELL -- the condition `record_mi_chroma`'s origin alignment exists for.
+// A 4x4 chroma unit is `1 << ss` luma mi per axis, so a block whose mi origin
+// is not step-aligned (a 16x4 / 4x16 1:4 strip at 4:2:0 has an ODD mi row or
+// column) publishes a context cell whose origin is the step-aligned mi BELOW
+// or RIGHT of its own. Counted per publication, `[row_misaligned,
+// col_misaligned, both]`, so a gate can prove the witness really walks the
+// realigned path instead of passing on a stream whose chroma units all happen
+// to start on a cell boundary.
+thread_local! {
+    static CHROMA_MIDCELL_PUB_HITS: std::cell::Cell<[usize; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
+}
+
+/// ChROMA publications that started mid-cell: `[row, col, both]`. See
+/// [`CHROMA_MIDCELL_PUB_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn chroma_midcell_pub_hits() -> [usize; 3] {
+    CHROMA_MIDCELL_PUB_HITS.with(std::cell::Cell::get)
+}
+
+/// Zeroes [`CHROMA_MIDCELL_PUB_HITS`] so a gate can measure its own decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn reset_chroma_midcell_pub_hits() {
+    CHROMA_MIDCELL_PUB_HITS.with(|c| c.set([0; 3]));
+}
+
 // lane-intra16x4: INTRA-coded strips of an inter 16x16-level 1:4 partition --
 // [0] 16x4, [1] 4x16, [2] the odd (chroma-reference) ones, which carry the
 // pair's single 8x4 (4x8) chroma unit for BOTH strips.
@@ -10910,6 +10937,31 @@ impl Neighbours {
         plane: usize,
         grid: &[i32],
     ) {
+        // lane-arfchroma: a 4x4 CHROMA transform unit is `4 << ss` luma px per
+        // axis, i.e. `1 << ss` LUMA mi, so its context cell is the step-aligned
+        // group of mi a block may only PART of. A block starting mid-cell (a
+        // 16x4 / 4x16 1:4 strip, whose mi row/col is ODD at 4:2:0) stamped its
+        // own origin plus the mi row/col BELOW it, so the strip above a block
+        // handed that block a "left neighbour" libaom never had -- its chroma
+        // cell is one row up -- and the block's chroma `txb_skip` context came
+        // out one base high (ours 2, libaom 7+1 = 8, at 320x240 frame 2 block
+        // mi (4,0) of the 4:2:0 lossless alt-ref witness). Align the origin
+        // DOWN to the cell: that is where libaom's per-plane 2-D
+        // `left/above_context_map` cell lives, indexed in the PLANE's own 4x4
+        // units rather than in luma mi.
+        let (step_x, step_y) = (w_px / MI, h_px / MI);
+        // the flags read the CALLER's origin, before the shadowing align below
+        let (row_mid, col_mid) = (mi_r & (step_y - 1) != 0, mi_c & (step_x - 1) != 0);
+        if row_mid || col_mid {
+            CHROMA_MIDCELL_PUB_HITS.with(|c| {
+                let mut v = c.get();
+                v[0] += usize::from(row_mid);
+                v[1] += usize::from(col_mid);
+                v[2] += usize::from(row_mid && col_mid);
+                c.set(v);
+            });
+        }
+        let (mi_r, mi_c) = (mi_r & !(step_y - 1), mi_c & !(step_x - 1));
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
         let state = neighbour_state(grid);
