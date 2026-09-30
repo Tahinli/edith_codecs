@@ -74,6 +74,41 @@ fn reach_sb_px(fctx: &crate::decode::FrameCtx) -> usize {
     fctx.reach_sb_px.with(|c| c.get())
 }
 
+/// [`reach_sb_px`] in 4x4 mode-info units -- libaom's `sb_mi_size` in
+/// `has_top_right`/`has_bottom_left` (`mi_size_high[sb_size]`), which is what
+/// [`Reach::of_tu_chroma`] masks the block's mi position with.
+pub(crate) fn reach_sb_mi(fctx: &crate::decode::FrameCtx) -> usize {
+    reach_sb_px(fctx) / 4
+}
+
+/// `scale_chroma_bsize(bsize, ss_x, ss_y)` (libaom `reconintra.c:1649`,
+/// called from `av1_predict_intra_block` at `:1823`) in 4x4 mode-info units:
+/// the block shape a CHROMA plane's reach is answered against. Only the
+/// BLOCK_4X4 / BLOCK_4X8 / BLOCK_8X4 / BLOCK_4X16 / BLOCK_16X4 family is
+/// remapped -- every other block size passes through, so at `ss (0,0)` and
+/// for any block of 8 or more this is the block's own `(bw/4, bh/4)`.
+pub(crate) fn chroma_mi_shape(bw: usize, bh: usize, ss_x: usize, ss_y: usize) -> (usize, usize) {
+    match (bw, bh, ss_x, ss_y) {
+        // BLOCK_4X4 -> BLOCK_8X8 / BLOCK_8X4 / BLOCK_4X8 / itself.
+        (4, 4, 1, 1) => (2, 2),
+        (4, 4, 1, 0) => (2, 1),
+        (4, 4, 0, 1) => (1, 2),
+        // BLOCK_4X8 -> BLOCK_8X8 / BLOCK_8X8 / BLOCK_4X8 / itself.
+        (4, 8, 1, _) => (2, 2),
+        (4, 8, 0, 1) => (1, 2),
+        // BLOCK_8X4 -> BLOCK_8X8 / BLOCK_8X4 / BLOCK_8X8 / itself.
+        (8, 4, 1, 0) => (2, 1),
+        (8, 4, 1, 1) | (8, 4, 0, 1) => (2, 2),
+        // BLOCK_4X16 -> BLOCK_8X16 / BLOCK_8X16 / BLOCK_4X16 / itself.
+        (4, 16, 1, _) => (2, 4),
+        (4, 16, 0, 1) => (1, 4),
+        // BLOCK_16X4 -> BLOCK_16X8 / BLOCK_16X4 / BLOCK_16X8 / itself.
+        (16, 4, 1, 0) => (4, 1),
+        (16, 4, 1, 1) | (16, 4, 0, 1) => (4, 2),
+        _ => (bw / 4, bh / 4),
+    }
+}
+
 /// How heavily the mode search weighs rate against squared error, in units of
 /// the quantizer's reconstruction step squared per bit.
 ///
@@ -4059,6 +4094,130 @@ impl Reach {
             } else {
                 block.below_left
             },
+        }
+    }
+
+    /// libaom's own `has_top_right`/`has_bottom_left` for one transform unit
+    /// of a CHROMA plane, at the plane granularity libaom uses there
+    /// (`reconintra.c:203` / `reconintra.c:381`).
+    ///
+    /// Two things make a chroma unit's answer differ from the same unit's
+    /// LUMA answer, and [`Self::of_tu`] has neither:
+    ///
+    /// 1. libaom runs a chroma plane through `scale_chroma_bsize(bsize,
+    ///    ss_x, ss_y)` (`reconintra.c:1823`, definition `:1649`) before
+    ///    either call, and that remap is not the identity. At 4:2:2
+    ///    (`ss (1,0)`) a BLOCK_4X4 luma leaf becomes BLOCK_8X4 -- TWO mi
+    ///    wide and one mi tall.
+    /// 2. `has_bottom_left`'s "leftmost column of superblock" arm
+    ///    (`reconintra.c:429-435`) is then reached at `blk_col_in_sb == 0`,
+    ///    which the one-mi-wide luma BLOCK_4X4 reads as column 1 and the
+    ///    per-block table denies. [`Self::of_tu`] has no such arm at all: it
+    ///    ends at `block.below_left`, the BLOCK-level answer, which stands in
+    ///    for the table plus both superblock arms and so agrees with libaom
+    ///    only where neither superblock arm is the deciding step.
+    ///
+    /// `mi_bw`/`mi_bh` are the PLANE-scaled block's mi extent ([`Self`]'s
+    /// caller supplies it from [`chroma_mi_shape`], never the luma block's),
+    /// and `col_off`/`row_off`/`tx_w`/`tx_h` are LUMA pixels as at every other
+    /// `Reach` call site -- libaom's plane units are one `tx_size_*_unit`
+    /// (`1 << (2 + ss)` luma pixels) wide, and each comparison below is
+    /// restated in luma pixels rather than rescaled twice. The
+    /// 128-wide arm libaom guards on `block_size_wide[bsize] > 64` is not
+    /// transcribed: every caller keeps such blocks on [`Self::of_tu`].
+    ///
+    /// `above_avail` is libaom's `top_available && right_available` and
+    /// `below_avail` its `bottom_available && left_available` -- the early
+    /// returns at `reconintra.c:204` / `:383`. The caller states them because
+    /// libaom's two edge tests are TILE bounds over the TRANSFORM's plane
+    /// extent (`mi_col + ((col_off + txw) << ss_x) < mi_col_end`,
+    /// `mi_row + ((row_off + txh) << ss_y) < mi_row_end`,
+    /// `reconintra.c:1815-1817`) while `top_available`/`left_available` are
+    /// `y0 > 0` / `x0 > 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn of_tu_chroma(
+        mi_bw: usize,
+        mi_bh: usize,
+        mi_row: usize,
+        mi_col: usize,
+        sb_mi: usize,
+        col_off: usize,
+        row_off: usize,
+        tx_w: usize,
+        tx_h: usize,
+        ss_x: usize,
+        ss_y: usize,
+        above_avail: bool,
+        below_avail: bool,
+    ) -> Self {
+        if !above_avail && !below_avail {
+            return Self::none();
+        }
+        let bw_log2 = mi_bw.trailing_zeros() as usize;
+        let bh_log2 = mi_bh.trailing_zeros() as usize;
+        let blk_row = (mi_row & (sb_mi - 1)) >> bh_log2;
+        let blk_col = (mi_col & (sb_mi - 1)) >> bw_log2;
+        // `plane_bw_unit`/`plane_bh_unit` (`reconintra.c:208` / `:414`) in
+        // libaom's plane units, restated in the luma pixels of the offsets.
+        let plane_bw = (mi_bw >> ss_x).max(1) << (2 + ss_x);
+        let plane_bh = (mi_bh >> ss_y).max(1) << (2 + ss_y);
+        let (tr, bl) = Self::plane_reach_tables(mi_bw, mi_bh);
+        Self {
+            above_right: above_avail
+                && (if row_off > 0 {
+                    col_off + tx_w < plane_bw
+                } else if col_off + tx_w < plane_bw {
+                    true
+                } else if blk_row == 0 {
+                    // Top row of superblock: the top-right pixels are in the
+                    // superblock above.
+                    true
+                } else if ((blk_col + 1) << bw_log2) >= sb_mi {
+                    // Rightmost column: they fall in the superblock to the
+                    // right, which is not decoded yet.
+                    false
+                } else {
+                    Self::bit(tr, (blk_row << (5 - bw_log2)) + blk_col)
+                }),
+            below_left: below_avail
+                && (if col_off > 0 {
+                    // Bottom-left pixels are in the bottom-left block.
+                    false
+                } else if row_off + tx_h < plane_bh {
+                    true
+                } else if blk_col == 0 {
+                    // `reconintra.c:429-435`: `blk_start_row_off + row_off +
+                    // count < sb_height_unit`, compared in plane units. Both
+                    // `>> ss_y` floors are lifted out of the comparison
+                    // instead of being evaluated, so the luma-pixel
+                    // restatement is exact.
+                    let from_block = (blk_row << bh_log2) >> ss_y;
+                    let sb_height = (sb_mi >> ss_y).saturating_sub(from_block);
+                    row_off + tx_h < sb_height << (2 + ss_y)
+                } else if ((blk_row + 1) << bh_log2) >= sb_mi {
+                    // Bottom row (and not the leftmost column): the
+                    // superblock below is not decoded yet.
+                    false
+                } else {
+                    Self::bit(bl, (blk_row << (5 - bw_log2)) + blk_col)
+                }),
+        }
+    }
+
+    /// The `has_tr_*`/`has_bl_*` pair for a block of `mi_bw` x `mi_bh` mi --
+    /// libaom's `get_has_tr_table`/`get_has_bl_table` indexed by the
+    /// PLANE-scaled `BLOCK_SIZE`, so one shape can be a rectangle where
+    /// [`Self::table`] would read a square's row (a 4:2:2 chroma BLOCK_8X4,
+    /// which is [`Self::of_tu_chroma`]'s whole reason for existing).
+    fn plane_reach_tables(mi_bw: usize, mi_bh: usize) -> (&'static [u8], &'static [u8]) {
+        if mi_bw != mi_bh {
+            return rect_reach_tables(mi_bw * 4, mi_bh * 4);
+        }
+        let row = Self::table(mi_bw * 4);
+        if VERT_AB_PARTITION.with(std::cell::Cell::get) && row < HAS_TOP_RIGHT_VERT.len() {
+            (&HAS_TOP_RIGHT_VERT[row], &HAS_BOTTOM_LEFT_VERT[row])
+        } else {
+            (&HAS_TOP_RIGHT[row], &HAS_BOTTOM_LEFT[row])
         }
     }
 
