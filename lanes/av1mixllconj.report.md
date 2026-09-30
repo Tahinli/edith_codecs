@@ -1,41 +1,5 @@
 # lane-av1mixllconj — the per-segment `lossless` answer ALREADY agrees with libaom; the var-tx **conjunct** lands, and the 640x480 "regression" is a SECOND, independent defect on a cell that was never correct
 
-> **CORRECTIONS FROM THE REFUTATION PASS (added by Main 2026-09-30; VERDICT: PARTIAL — every DECODER claim
-> reproduced exactly, three REPORT/doc figures did not).** The pass reproduced the pin (6/6 decode-order dumps
-> byte-exact, shown rawvideo 245760 B with 0 differing bytes), the whole-stream ladder (96997 oracle lines /
-> 96997 ours / 0 unparsed / 96997 paired bit-identical / first divergence NONE), the conjunct-out red
-> (f1..f5 = 33724/34251/44500/36688/37462, gate FAILED at decode-order frame 1 byte 33, ours 82 vs 81, ladder
-> first divergence at read 30889), the per-segment derivation, the premise reversal on base (m5_640x480 f1..f5
-> = 352066/414286/313795/399471/422078 of 460800 -- the report's exact numbers, 76/70/68/87/92 % wrong), and the
-> off-tile arithmetic re-derived independently. Corrections:
->
-> 1. **`SUB8_LOSSLESS_NO_VARTX` was NOT the decision counter it claimed to be** (doc at
->    `decode.rs:34766-34772`, and my merge message repeated the claim): the pass measured **33 hits on a build
->    with the conjunct REMOVED**, because the `else if lossless(fctx) && !skip` arm also serves leaves whose
->    `tx_select_inter` is OFF -- leaves the conjunct does not touch. The hit is now guarded on `tx_select_inter`
->    (the same term the conjunct uses) and the pin's delta reads **10, not 40**; the gate still asserts `> 0`,
->    remains green, and its doc names both numbers. Same class as the palette counter correction: a hit that
->    fires for a population the fix does not touch is not a non-vacuity arm.
-> 2. **The corpus buckets do not reproduce, and the CAUSE IS NOW DIAGNOSED rather than left as two
->    incompatible sweeps**: the lane compared OUR `EC_AV1_DECODE_ORDER_DUMP` against the oracle's
->    `EC_AV1_FINAL_DUMP`, but our dump NARROWS every plane to u8 (`stream.rs:2189`,
->    `let narrow = |v: &[u16]| v.iter().map(|&s| s as u8)` -- the code even says in a comment that it
->    "predates 10-bit support and is an 8-bit-oracle comparison only"), while the oracle's dump is
->    bit-depth correct. On an 8-bit stream that is a fair compare; on 10/12-bit it mismatches on EVERY frame
->    BY CONSTRUCTION. Nearly all 34 of the lane's RED rows were HBD fixtures
->    (`444_lossy_superres_*_10bit/12bit`, `hg_*`, `intra14_256x192_10bit`, `palette_screen_*_10bit`, ...) that
->    were "red" because u16 samples were halved, not because a pixel differed. With those out, the RED count
->    collapses to the pass's own 0 -- which is why the correct buckets are **base 106 = 96 EXACT / 0 RED / 9
->    FRAMECOUNT / 1 ORACLE_FAIL** and **tip 110 = 100 / 0 / 9 / 1**. The SUBSTANCE of the lane's sweep is
->    untouched and its zero-EXACT->RED result stands. Class recorded in the skill
->    `oracle-raw-packing-depth-audit`: an all-HBD red set is the signature of a narrowed-dump compare, and a
->    documented trap is not a neutralised trap -- the compare path has to encode the depth, not a comment.
-> 3. **The cited oracle rung `EC_AV1_DECODE_ORDER_DUMP` does not exist** in the shared oracle build (only
->    `EC_AV1_FINAL_DUMP`, `decodeframe.c:5699`) -- it is OUR rung, 8-bit-only, which is the same fact as
->    correction 2 wearing a different coat. The measurement it supports was made with the decode-order dump
->    path the crate's own helpers use; the rung NAME in the text is wrong and no test depends on it.
-
-
 Base `main` = `6bb66a4a`. Worktree `/home/tahinli/.cache/wt/av1mixllconj`, target dir
 `$HOME/.cache/cargo-target-av1mixllconj`, `EC_NOMEMGUARD=1`. Oracle
 `~/.cache/aom-oracle/build/{aomdec,aomenc}` (shared, untouched; not rebuilt, not
@@ -506,11 +470,18 @@ generated cell, exactly as the prior lane warned.
   band write itself is not identified to a call site — the replay only shows
   that libaom has a write in rows 37..79 at mi column 110 and this tree has
   none. That is the next lane's job, and it is NOT this lane's hunks.
-* **10/12-bit arm of the class sweep: not synthesized.** This ffmpeg cannot emit
-  a >8-bit y4m and a hand-built 16-bit-LE one is rejected by the shared
-  `aomenc` (`Loss of framing in Y4M input data`). The committed HBD corpus is
-  covered by the §5 regression; that is a regression, not a sweep of this class
-  at HBD.
+* **10/12-bit arm of the class sweep: not synthesized, and my stated reason for
+  that was refuted.** I wrote that no >8-bit y4m source was obtainable. What I
+  actually measured is narrower: this ffmpeg (8.1.3) failed `Conversion failed!`
+  on `yuv420p10le` / `yuv420p12le` / `yuv444p10le` / `gray10le` from both a lavfi
+  source and a y4m input, and the ONE hand-built 16-bit-LE y4m I tried was
+  rejected by the shared `aomenc` with `Loss of framing in Y4M input data`
+  (0-byte output). That is a statement about two attempts of mine, not an
+  impossibility: two lanes this wave built 10/12-bit y4m by hand. So the gap is
+  closable, and it is **not mine** — lane `Esra2` owns the 10-bit arm, with the
+  order the diff settles first and the operand pair second. The committed HBD
+  corpus is covered by the §5 regression, which is a regression and not a sweep
+  of this class at HBD.
 * The class is content-dependent: everything above is `testsrc2` at five sizes.
   The 106 committed fixtures that do not come from this recipe are the
   regression evidence (§5), not a sweep of the class.
