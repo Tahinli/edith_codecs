@@ -21274,27 +21274,47 @@ fn read_plane(
     if lossless(fctx) {
         coding.tx_type = None;
     }
-    // Luma's `default_tx_type` is only a fallback for the sizes whose
-    // `TxbSet` carries no symbol at all (32-point and up), which the spec
-    // fixes at `DCT_DCT` regardless of mode; a chroma plane's `tx_type` is
-    // *never* its own coded symbol (`coding.tx_type` is always `None` for
-    // every `TxbSet::Chroma*`), so it would take `Intra_Mode_To_Tx_Type` of
-    // the plane's own predicted mode (`default_intra_tx_type`) -- except
-    // `av1_get_ext_tx_set_type` (`blockd.h`) resolves chroma at `tx_size_sqr
-    // >= TX_32X32` to `EXT_TX_SET_DCTONLY`, which forces the result back to
-    // `DCT_DCT` no matter what the mode-indexed table said (`TxbSet::Chroma8`
-    // and `Chroma16` never hit this — every value `default_intra_tx_type` can
-    // produce is already a member of both `TX_SET_INTRA_1`/`_2`, so nothing
-    // narrows there — only `Chroma32` and up do).
-    let default_tx_type = if plane_idx == 0 || side >= 32 {
+    // A chroma plane's `tx_type` is *never* its own coded symbol
+    // (`coding.tx_type` is always `None` for every `TxbSet::Chroma*`), so it is
+    // resolved, not read. Three cases, in libaom's own order
+    // (`av1_get_tx_type` / `av1_get_ext_tx_set_type`, `blockd.h`):
+    //
+    // * **intra** chroma: `intra_mode_to_tx_type(mbmi, PLANE_TYPE_UV)` -- the
+    //   plane's own predicted mode (`default_intra_tx_type`) -- then clamped by
+    //   `av1_get_ext_tx_set_type`. At 32 points and up that set is
+    //   `EXT_TX_SET_DCTONLY` (the `is_inter ? EXT_TX_SET_DCT_IDTX :
+    //   EXT_TX_SET_DCTONLY` line), which forces `DCT_DCT` no matter what the
+    //   mode-indexed table said. `TxbSet::Chroma8`/`Chroma16` never hit this --
+    //   every value `default_intra_tx_type` can produce is already a member of
+    //   both `TX_SET_INTRA_1`/`_2`, so nothing narrows there -- only
+    //   `Chroma32` and up do.
+    // * **inter** chroma, i.e. [`INTRABC_CHROMA_TX`]: the same
+    //   `xd->tx_type_map` cell the luma unit stamped (`blk_row <<=
+    //   pd->subsampling_y`, `blk_col <<= pd->subsampling_x`), reduced by the
+    //   INTER transform set. At **32 points** that set is
+    //   `EXT_TX_SET_DCT_IDTX`, NOT `EXT_TX_SET_DCTONLY` -- so a 32-point
+    //   inter chroma unit inherits the luma's coded `IDTX`, and the identity
+    //   transform (a plain copy) is what libaom actually runs.
+    //   [`reduce_inherited_chroma_tx_type`] is that reduction verbatim.
+    // * 64 points and up is `EXT_TX_SET_DCTONLY` for both, which the same
+    //   reduction already yields.
+    //
+    // The `side >= 32` -> `DCT_DCT` clamp this replaces was written for the
+    // intra case (and read as libaom's clamp at `tx_size_sqr_up >= TX_32X32`),
+    // but libaom's cap is `txsize_sqr_up_map[tx_size] > TX_32X32` -- 64 and up
+    // -- so it also swallowed a 32-point INTER chroma unit's inherited `IDTX`
+    // and ran `DCT_DCT` where libaom ran the identity transform.
+    // Sub-32 units keep the raw inherited type exactly as before.
+    let default_tx_type = if plane_idx == 0 {
         TxType::DctDct
     } else if let Some(inherited) = fctx.intrabc_chroma_tx.with(std::cell::Cell::get) {
-        // See [`INTRABC_CHROMA_TX`]: an intrabc block is an inter block for
-        // `av1_get_tx_type`, so chroma inherits luma's coded type (the
-        // `side >= 32` arm above is already libaom's `EXT_TX_SET_DCTONLY`
-        // clamp at `tx_size_sqr_up >= TX_32X32`, matching
-        // [`read_inter_plane`]'s own `side < 32` guard).
-        inherited
+        if side >= 32 {
+            reduce_inherited_chroma_tx_type(inherited, side, side, fctx)
+        } else {
+            inherited
+        }
+    } else if side >= 32 {
+        TxType::DctDct
     } else {
         default_intra_tx_type(predict_mode as u8)
     };
@@ -21477,12 +21497,20 @@ fn read_rect_chroma_unit(
     if ss_x(fctx) == 1 && ss_y(fctx) == 0 && w != h {
         hit!(CHROMA422_RECT_HITS);
     }
-    let default_tx = if w.max(h) >= 32 {
+    // The same three cases as [`read_plane`], for the same reason: at 32 points
+    // an INTER chroma unit's transform set is `EXT_TX_SET_DCT_IDTX` (the luma's
+    // coded `IDTX` survives) where the intra set is `EXT_TX_SET_DCTONLY`, and
+    // an armed [`INTRABC_CHROMA_TX`] slot means the block IS an inter block.
+    let default_tx = if let Some(inherited) = fctx.intrabc_chroma_tx.with(std::cell::Cell::get) {
+        if w.max(h) >= 32 {
+            reduce_inherited_chroma_tx_type(inherited, w, h, fctx)
+        } else {
+            inherited
+        }
+    } else if w.max(h) >= 32 {
         TxType::DctDct
     } else {
-        fctx.intrabc_chroma_tx
-            .with(std::cell::Cell::get)
-            .unwrap_or_else(|| default_intra_tx_type(uv_predict_mode as u8))
+        default_intra_tx_type(uv_predict_mode as u8)
     };
     let mut coding = cdfs.txb(set, uv_predict_mode);
     let (levels, tx_type) = read_coeffs_rect(
