@@ -9384,6 +9384,98 @@ pub(crate) mod tests {
              lossless segment read no var-tx symbol"
         );
     }
+
+    /// lane-av1txctxband2: the 640x480 cell of the same mixed-lossless
+    /// recipe — the THIRD defect `lanes/av1mixllconj.report.md` §4.3 /
+    /// §11 handed over, class `context-band-not-published`.
+    ///
+    /// libaom's `parse_decode_block` (`decodeframe.c:1251-1261`) is an
+    /// EITHER/OR: the var-tx branch's condition carries
+    /// `!xd->lossless[mbmi->segment_id]` as a conjunct, and the `else` branch
+    /// runs `read_tx_size` **and then `set_txfm_ctxs`**. `read_tx_size`'s
+    /// FIRST line (`decodeframe.c:1214`) returns `TX_4X4` on a lossless
+    /// segment — so a lossless block skips the symbol read, NOT the publish.
+    /// This decoder's `read_block_tx_size` returned from its own lossless early
+    /// return with nothing written, so on a MIXED frame every lossless square
+    /// block left the `TXFM_CONTEXT` above band holding whatever an earlier,
+    /// lossy block had put there. The RECT twin (`read_block_tx_size_rect`)
+    /// has published on the same arm since lane-av1lm444loss; only the square
+    /// arm had the hole.
+    ///
+    /// Measured on `420_mixll_altref_640x480_5f.obu`: the abutting 8x8 INTRA
+    /// lossless block at mi(78,110) left `above_txfm[110]` at the 16 a skipped
+    /// 16-px inter block at mi(36,108) had written 43 mi rows earlier, and the
+    /// 8x4 intra leaf with `use_filter_intra` at mi(80,110) then read
+    /// `tx_size_cat0[2]` where libaom reads row 1 — the oracle's own
+    /// `EC_TXCTXB` prints `mi=80,110 abv=4 lft=8 above=0 left=1 ctx=1` against
+    /// our `above_txfm=16 left_txfm=8 above=1 left=1 ctx=2`. The tile desynced
+    /// there and the frame REFUSED (`a Golomb tail longer than this decoder
+    /// reads`); at base the same cell decoded every frame but got 70–92 % of
+    /// every inter frame wrong.
+    ///
+    /// `LOSSLESS_SQ_TXFM_BAND_OVERWRITE_HITS` counts the lossless square inter
+    /// blocks whose publish actually OVERWROTE a size an earlier block of the
+    /// same frame had left in the column — so the gate cannot pass vacuously
+    /// on a stream that merely decodes a lossless fixture. After the fix the
+    /// whole-stream paired `EC_SYMR` ladder is bit-identical: **457 907 reads,
+    /// 457 907 paired, zero divergence** — not just up to the fork.
+    ///
+    /// Recipe (ffmpeg 8.1.3 `testsrc2`, shared oracle `aomenc`, 87537 bytes):
+    /// ```text
+    /// ffmpeg -f lavfi -i testsrc2=size=640x480:rate=25 -frames:v 5 \
+    ///        -pix_fmt yuv420p src640.y4m
+    /// aomenc --codec=av1 --obu -o 420_mixll_altref_640x480_5f.obu --passes=1 \
+    ///        --cpu-used=4 --limit=5 --end-usage=q --cq-level=0 --aq-mode=1 src640.y4m
+    /// ```
+    /// sha256 `3d505fd2e0bbb7ca3680a8e338d712a81defc947b955a4b7b82de6718301e73c`;
+    /// the tree pins fixture identity by fnv1a64, not a `const SHA256` compared
+    /// against itself.
+    #[test]
+    fn a_420_mixed_lossless_alt_ref_640x480_txfm_band_publish_is_byte_exact_in_decode_order() {
+        const NAME: &str = "a_420_mixed_lossless_alt_ref_640x480_txfm_band_publish_is_byte_exact_\
+                            in_decode_order";
+        let _gate_lock = lock_gate_counters();
+        const FILE: &str = "420_mixll_altref_640x480_5f.obu";
+        const BYTES: usize = 87537;
+        const FNV1A64: u64 = 12707865649077681891;
+        let path = crate_pin(FILE);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: the committed pin {FILE} is missing ({e})"));
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FNV1A64, "{NAME}: {FILE} bytes drifted");
+        let before = crate::decode::lossless_sq_txfm_band_overwrite_hits();
+        let (decoded, hidden) = decode_all_frames_vs_oracle(&data, NAME);
+        let overwrote = crate::decode::lossless_sq_txfm_band_overwrite_hits() - before;
+        assert_eq!(
+            decoded, 6,
+            "{NAME}: the oracle decoded {decoded} frames in DECODE order; the 5-frame \
+             altref recipe codes 5 source frames plus a hidden alt-ref picture"
+        );
+        assert_eq!(
+            hidden, 1,
+            "{NAME}: {decoded} decode-order dumps against {decoded} - {hidden} shown outputs \
+             means the gate saw the hidden picture no shown-frame compare can reach"
+        );
+        assert!(
+            overwrote > 0,
+            "{NAME}: no lossless square block on an inter frame published a txfm band that \
+             OVERWROTE an earlier block's size ({overwrote} of them did), so this witness does \
+             not exercise the missing publish at all (class gate-blind-to-feature) -- re-encode \
+             per the recipe above"
+        );
+        let (wy, wu, wv, shown, exact) =
+            count_rawvideo_diffs(&data, NAME, None).expect("the two sides must be byte-comparable");
+        assert_eq!(
+            (wy, wu, wv, exact),
+            (0, 0, 0, shown),
+            "{NAME}: shown-frame per-plane diff vs `aomdec --rawvideo`"
+        );
+        eprintln!(
+            "{NAME}: {decoded} decode-order frame(s) byte-exact ({hidden} hidden), \
+             {shown} shown frame(s) exact per plane, {overwrote} lossless square inter \
+             block(s) overwrote a stale above-band size"
+        );
+    }
     /// lane-av1444rect r2 — the SAME class as the gate above, second
     /// instance: `decode_rect4_16_intrabc` applied the 4:2:0 pair geometry at
     /// ss (0,0), where `is_chroma_reference` makes an intra-BC 1:4 strip its
