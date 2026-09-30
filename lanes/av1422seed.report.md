@@ -457,3 +457,98 @@ python3 scripts/shape422-diff.py s422_320x246 sweep/s422_320x246.obu
 `cells.json` entries are `{"name": ..., "path": ...}`. The comparator derives
 geometry from the sequence header itself and needs no other argument; it raises
 rather than reporting a count it cannot justify.
+
+---
+
+## 9. Round 2 addendum — independent re-verification of the merged fix, and the flip control §1.1/§7 could not run
+
+This lane lands **no decoder change**. `lane/av1422luma` `459e425d` (merged to
+main as `298be661`) closed the arm this report localised, and this round's job
+was to check that claim rather than restate it. Two things came out of that,
+one of them new to the tree.
+
+### 9.1 The merged tree, measured here, not read off the sibling's report
+
+`main` = `298be661`, my read-only branch rebased onto it, the local-only 4:2:2
+probe bypass applied to `stream.rs:1803` for the run and reverted after (the
+refusal is intact in the committed tree — `git diff main -- crates/` is empty).
+Same comparator, same binary, same ffmpeg 8.1.3:
+
+| cell | round 1 (pre-fix) | merged `298be661` |
+|---|---|---|
+| `s422_322x240` | 0 / 22003 / 21625 | **0 / 0 / 0** |
+| `s422_320x246` | 0 / 7810 / 5531 | **0 / 0 / 0** |
+| `s422_322x246` | 0 / 3437 / 2222 | **0 / 0 / 0** |
+| `s422_352x242_10b` | 0 / 4653 / 3777 | **0 / 0 / 0** |
+| `s422_416x242_10b` | 0 / 5740 / 4348 | **0 / 0 / 0** |
+
+Controls on the same binary: `s420_320x240`, `s420_320x246`,
+`s420_352x242_10b`, `s444_320x240`, `s444_320x242_10b` — **5/5 BYTE-EXACT**,
+so the 4:2:0 pair arm and the 4:4:4 `own444` arm are untouched by the new
+`own422` predicate. The whole `s422_*` sweep reads 17/18 byte-exact, with
+`s422_384x240` unchanged at 0/1780/1871 — the separate frame-1 altref residual
+`lane/av1422late` owns, correctly NOT attributed to this arm.
+
+**A stale-ref trap worth recording.** My first re-measurement of this round ran
+against `0c77bad5`, a `main` ref my worktree had cached *before* the fix
+merged, and reproduced the pre-fix numbers exactly (0/7810/5531 on
+`s422_320x246`) — the kind of result that reads as "the fix does not work" and
+is entirely an artefact of the branch pointer. `git log -1 main` at the time
+already disagreed with the merge that had actually landed. Re-resolving
+`main` first is what turned the same command into `0/0/0`. Class:
+`stale-binary-false-readings`, on the ref rather than the binary.
+
+### 9.2 The flip control: now run, and committed as `scripts/flipctl-422.py`
+
+§1.1 and §7 both recorded this as NOT DONE, and the whole corpus verdict rests
+on it: nothing above distinguishes "our planes match ffmpeg's" from "this
+comparator never looked at ffmpeg". It is now run.
+
+`scripts/flipctl-422.py` flips **one sample** and requires the count to move by
+**exactly +1 in that plane and 0 in every other plane**, in two independent
+directions:
+
+* **oracle arm** — flip one ffmpeg sample. On a `0/0/0` cell this is the only
+  thing that can move, so a surviving zero means the comparator is not reading
+  the oracle.
+* **ours arm** — flip one of our samples, oracle untouched. This is the
+  direction every number in this report is read in.
+
+It maps decode→display **once** and pins the mapping across the flip: the
+census's own `flipctl.py` re-derives that mapping from LUMA identity inside
+every `compare` call, so a flipped sample destroys the very key it maps on and
+the control aborts instead of measuring (that is why it never ran — the script
+was broken, not unrun). Every decode→display *solution* is exercised, so an
+ambiguous mapping cannot hide a failure behind the one that got picked.
+Two shown display frames per cell (first and middle), three sample indices
+per plane (first, middle, last), both depths.
+
+**324 arms, 324 PASS, 0 FAIL** over five 4:2:2 target cells, `s422_416x250_10b`,
+two 4:2:0 cells and two 4:4:4 cells — including the 2-solution mapping class
+(`s420_352x242_10b`, 72 arms, hidden frame 16), which is where a comparator
+that quietly picks one assignment would show up. All baselines were `0/0/0`,
+so every arm is a `+1`-off-zero test: the strongest form of this control.
+
+```sh
+python3 scripts/flipctl-422.py cells.json
+```
+
+### 9.3 Still not measured, stated rather than hidden
+
+* **The post-fix `EC_AV1_PLANE_SENTINEL=1` unwritten-sample census was not
+  re-run this round.** §3's census is the PRE-fix one (a 4×8 unwritten hole per
+  chroma plane at row 128, cols 144..151) and it stands as recorded; the scan
+  itself is still the temporary four-line edit §8 step 3 describes and is
+  still not committed. What the merged tree does establish instead is
+  *implied* coverage, not measured census: a sample that reconstruction never
+  wrote still holds `PLANE_SENTINEL` = `0xDEAD` = 57005, which is above the
+  10-bit maximum and unreachable by ffmpeg at either depth, so a per-plane
+  byte-exact count on every shown frame of all five cells *cannot* coexist
+  with an unwritten sample in those planes. That is an inference from the
+  sentinel's value, not a census run — a lane that wants the direct artifact
+  should land the scan as a committed env-gated pass, which this lane did not
+  do because the arm it was measuring is already merged.
+* No gate was added. `INTRABC_RECT4_OWN_CHROMA422_HITS` on the merged tree is
+  the route counter the sibling lane describes, and 4:2:2 still refuses at the
+  sequence header, so a committed byte-exact gate on a 4:2:2 cell is not
+  reachable without the probe bypass.
