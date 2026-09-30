@@ -37446,7 +37446,16 @@ fn read_intra_chroma_lossless(
                     } else {
                         &mut *v_out
                     },
-                    stride * stride,
+                    // lane-av1422lpf site 7: `stride * blk_h`, the intra twin
+                    // of site 1. `read_intra_chroma_lossless`'s own
+                    // `(blk_w, blk_h)` parameter is the block's whole CHROMA
+                    // PLANE BLOCK, per-axis, and the walk below addresses up
+                    // to row `org_y + reg_h - 1` at `stride` -- so the
+                    // requirement is `stride * blk_h` and `stride * stride`
+                    // underruns by exactly the ratio the plane block's height
+                    // exceeds its width. Identical number at 4:2:0
+                    // (`blk_h == stride`) and 4:4:4.
+                    stride * blk_h,
                 );
                 for row in 0..4 {
                     let start = (oy + row) * stride + ox;
@@ -37610,7 +37619,29 @@ fn read_inter_chroma_lossless(
                     } else {
                         &mut *v_out
                     },
-                    stride * stride,
+                    // lane-av1422lpf site 1: `stride * blk_h`, NOT
+                    // `stride * stride`. The composed `u_out`/`v_out` grid is
+                    // the block's whole CHROMA PLANE BLOCK read at `stride`,
+                    // and libaom's plane block is PER-AXIS
+                    // (`(bw >> ss_x) x (bh >> ss_y)`, decodeframe.c's
+                    // `dec->uv_buffer` extent) -- square only when
+                    // `ss_x == ss_y`. The walk above addresses row
+                    // `org_y + reg_h - 1` at column `org_x + reg_w`, and every
+                    // call site passes a region that is a sub-rect of `blk`
+                    // with `org` inside `blk`, so the requirement is exactly
+                    // `stride * blk_h` (the last row's end
+                    // `(blk_h - 1) * stride + blk_w` fits because
+                    // `blk_w <= stride` at all nine call sites).
+                    //
+                    // Where the plane block IS square -- 4:2:0 (`side/2` both
+                    // axes) and 4:4:4 (`side` both axes) on a square block --
+                    // `blk_h == stride` and this reduces to the old
+                    // `stride * stride` verbatim, so it cannot move a byte
+                    // there. It is not 4:2:2-only either: a 64x128 4:2:0 block
+                    // has a 32x64 chroma plane block, and `ll420_a.obu`
+                    // (`range end index 1028 out of range for slice of
+                    // length 1024`) panicked on the old expression.
+                    stride * blk_h,
                 );
                 for row in 0..4 {
                     let start = (oy + row) * stride + ox;
@@ -40025,10 +40056,37 @@ fn decode_inter_block(
         Some(s) if s.has_chroma => {
             // 4:2:0: the PAIR's 8x4 / 4x8. 4:4:4: the strip's own 16x4 /
             // 4x16 (lane-av1-444; no pair at ss 0/0).
+            //
+            // lane-av1422lpf site 4: the VERT arm's third shape. A
+            // `PARTITION_VERT_4` strip is 4x16 luma and pairs on COLUMNS
+            // while `ss_x == 1` (`is_chroma_reference` on `mi_col` parity,
+            // av1_common_int.h:1454), so the pair is 8x16 luma -- and 4:2:2
+            // subsamples X ONLY (`subsampling_x = 1, subsampling_y = 0`,
+            // spec 5.5.2's `color_config`), which leaves the pair's chroma
+            // plane block at 8>>1 x 16>>0 = **4x16**, twice as tall as the
+            // 4:2:0 pair's 4x8. The old `else` handed 4:2:2 the 4:2:0 shape,
+            // halving `write_chroma_h` for the WHOLE of `decode_inter_block`
+            // at ss (1,0) -- `chroma_stride`/`chroma_buf_h` at 40017 and so
+            // every prediction buffer, every grid and every mu-chunk replay
+            // below. Measured on `W_intrabc.obu` frame 1: a 4x16 vert strip
+            // got `chroma_stride = 4`, `chroma_buf_h = 8`, a 32-sample grid,
+            // and the lossless TX_4x4 replay's last unit row read index 64 of
+            // it (`range end index 36 out of range for slice of length 32`
+            // at the composed-grid read).
+            //
+            // The HORZ arm needs no third shape at 4:2:2 and gets none: a
+            // HORZ_4 strip pairs on ROWS only while `ss_y == 1`, and 4:2:2
+            // has `ss_y == 0`, so each 16x4 strip is its own chroma reference
+            // and its own 8x4 chroma block -- the number `(8, 4)` already
+            // returns. At 4:2:0 (`ss_x == ss_y == 1`) the pair halves on both
+            // axes and at 4:4:4 there is no pair at all, so both of those
+            // arms are untouched by this line.
             if ss_x(fctx) == 0 && ss_y(fctx) == 0 {
                 if s.horz { (16, 4) } else { (4, 16) }
             } else if s.horz {
                 (8, 4)
+            } else if ss_y(fctx) == 0 {
+                (4, 16)
             } else {
                 (4, 8)
             }
@@ -41548,7 +41606,33 @@ fn decode_inter_block(
                                         (cc * chunk_chroma_w, cr * chunk_chroma_h),
                                         (chunk_chroma_w, chunk_chroma_h),
                                         (write_chroma_w, write_chroma_h),
-                                        chroma_side,
+                                        // lane-av1422lpf site 5: the stride
+                                        // the walk indexes `su`/`sv` at is the
+                                        // PREDICTION BUFFER's own
+                                        // `chroma_stride` -- the same number
+                                        // `su`/`sv` were built at, and the one
+                                        // the composed `u_units`/`v_units`
+                                        // grid is sized and written at (site
+                                        // 1's `stride * blk_h`). `chroma_side`
+                                        // is the ENCLOSING SQUARE
+                                        // (`max(side >> ss_x, side >> ss_y)`)
+                                        // and at 4:2:2 it is the LUMA side: a
+                                        // 128x128 block's chroma plane block is
+                                        // 64x128, so the walk addressed
+                                        // `oy * 128 + ox` on a 64-wide, 8192-
+                                        // sample buffer and the last unit row
+                                        // ran off the end
+                                        // (`offset 8192 .. 8580 of 8192`,
+                                        // X_intrabc_tiled frame 1, at
+                                        // `push_mc_rect_tx`).
+                                        //
+                                        // At 4:2:0 `chroma_stride ==
+                                        // chroma_side == side >> 1` and at
+                                        // 4:4:4 both are `side`, so this
+                                        // argument is the same number on every
+                                        // shape this decoder admits except
+                                        // 4:2:2.
+                                        chroma_stride,
                                         mode_for_tx,
                                         base_q_idx,
                                         &mut u_units,
@@ -43335,7 +43419,13 @@ fn decode_inter_block(
                                         (cc * chunk_chroma_w, cr * chunk_chroma_h),
                                         (chunk_chroma_w, chunk_chroma_h),
                                         (write_chroma_w, write_chroma_h),
-                                        chroma_side,
+                                        // lane-av1422lpf site 5 (the compound
+                                        // twin of the single-reference fix at
+                                        // 41572): the prediction buffer's own
+                                        // `chroma_stride`, never the enclosing
+                                        // square `chroma_side`. Identical
+                                        // number at 4:2:0 and 4:4:4.
+                                        chroma_stride,
                                         mode_for_tx,
                                         base_q_idx,
                                         &mut u_units,
@@ -44310,10 +44400,21 @@ fn decode_inter_block(
                             (px, py),
                             (cpx, cpy),
                             side,
-                            (chroma_side, chroma_side),
+                            // lane-av1422lpf site 6 (the intra-in-inter twin of
+                            // site 5 at 41572): the plane block's own per-axis
+                            // shape and stride, never the enclosing square.
+                            // `palette_uv_bufs` is the decoded colour-index map
+                            // at `(write_w >> ss_x, write_h >> ss_y)` (44144),
+                            // i.e. per-axis already, and the lossless walk
+                            // windows it at this `stride` -- at 4:2:2 a
+                            // 16-wide square stride over an 8-wide map put the
+                            // third unit row at index 180 of 128 samples
+                            // (`palette_window`, decode.rs:2946; measured on
+                            // `Y_intrabc_10b.obu`).
+                            (chroma_stride, chroma_buf_h),
                             (cc * chunk_chroma_w, cr * chunk_chroma_h),
                             (chunk_chroma_w, chunk_chroma_h),
-                            chroma_side,
+                            chroma_stride,
                             reach,
                             (y.width, y.height),
                             mode,
@@ -44589,10 +44690,15 @@ fn decode_inter_block(
                     (px, py),
                     (cpx, cpy),
                     side,
-                    (chroma_side, chroma_side),
+                    // lane-av1422lpf site 6 (the whole-block twin of the mu
+                    // chunk fix at 44374): the plane block's own per-axis shape
+                    // and its own stride, never the enclosing square
+                    // `chroma_side`. At 4:2:0 and 4:4:4 all three are the same
+                    // number.
+                    (chroma_stride, chroma_buf_h),
                     (0, 0),
-                    (chroma_side, chroma_side),
-                    chroma_side,
+                    (chroma_stride, chroma_buf_h),
+                    chroma_stride,
                     reach,
                     (y.width, y.height),
                     mode,
@@ -45047,7 +45153,25 @@ fn decode_inter_block(
                     for (plane, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
                         let mut unit = Vec::with_capacity(cu * cu);
                         for rr in 0..cu {
-                            let start = (cr * cu + rr) * chroma_side + cc * cu;
+                            // lane-av1422lpf site 2: the composed grid this
+                            // replays is the block's CHROMA PLANE BLOCK at
+                            // `chroma_stride` -- the same per-axis stride
+                            // site 1 sized `u_out`/`v_out` at and the same
+                            // `read_inter_chroma_lossless` wrote them at
+                            // (`src.offset(..)` + `(oy + row) * stride + ox`).
+                            // `chroma_side` is the ENCLOSING SQUARE
+                            // (`max(side >> ss_x, side >> ss_y)`), which is
+                            // the plane block's own width only when
+                            // `ss_x == ss_y`: at 4:2:2 it is the full luma
+                            // side, twice a strip block's plane-block width,
+                            // and the last unit row ran off the end
+                            // (`range end index 68 out of range for slice of
+                            // length 64`, W_intrabc frame 1).
+                            //
+                            // At 4:2:0 (`chroma_stride == chroma_side ==
+                            // side >> 1`) and 4:4:4 (`side`) the two are the
+                            // same number and this line is unchanged.
+                            let start = (cr * cu + rr) * chroma_stride + cc * cu;
                             unit.extend_from_slice(&grid[start..start + cu]);
                         }
                         units.push((
