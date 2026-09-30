@@ -1,5 +1,22 @@
 # lane-av1oddheightfork3 — the 320x236 / 322x248 fork is CLOSED: a whole-block TXFM_CONTEXT publish was overwriting a var-tx tree's per-leaf sizes
 
+> **REFUTATION PASS `lanes/refute-av1-w3b.report.md` (2026-09-30): CONFIRMED, and it went further than this
+> report did.** The cell is byte-exact 0/0/0 on 16/16 from oracle bytes (both sides 1,812,480 B,
+> `cmp`-identical); red-before reproduces digit for digit (Y 234,349 / U 56,957 / V 52,981, 0/16, frame 0
+> alone wrong); the gate reds by name under the same revert. NEW, and the reason the narrow suppression is
+> correct rather than lucky: **18 publishing callers remain**, and suppressing the publish for ALL of them
+> reds **36 of 94** comparable committed fixtures plus 3 hard decode refusals (Golomb-tail desync) — so the
+> whole-block publish is not dead code. Baseline sweep was also broader than this report's: 95 of 104
+> comparable, 95/95 exact.
+> TWO CORRECTIONS: (a) the line citations have drifted — the writer is `decode.rs:9749` on main, not 9734,
+> and the lossless publishes are `:30147` / `:18187`, not `:30020` / `:18185` (statements correct, line
+> numbers off by 1..127 from intervening merges); (b) **a COVERAGE GAP this report should carry in
+> `not_done`**: the TX_4X4 publishes added to the two LOSSLESS arms (`decode.rs:18187`, `:30147`) are
+> reached by NO committed fixture — reverting only those two and re-sweeping all 104 fixtures gives 94/94
+> exact with ZERO red. Correct per libaom and provably harmless, but it is unmeasured evidence, not
+> evidence.
+
+
 Base `2005a35d` + the predecessor's instrument commit `b8af62fa`, branch
 `lane-av1oddheightfork2`, worktree `~/.cache/wt/av1oddheightfork2`.
 
