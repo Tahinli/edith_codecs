@@ -1807,8 +1807,16 @@ fn crop_plane<T: Copy>(source: &[T], padded_width: usize, width: usize, height: 
 /// region a decoder produces, which is the public contract for what a caller
 /// sees back — the padded planes the encoder coded against never leave this
 /// module. Identity when the reconstruction is already that size.
+///
+/// The chroma extent is `ROUND_POWER_OF_TWO(size, 1)` -- `(size + 1) / 2`,
+/// libaom's `av1_common_plane_width` (`av1/common/av1_common_int.h`) -- so an
+/// ODD declared luma size keeps the chroma column a decoder keeps (a 65-wide
+/// 4:2:0 frame has 33, not 32). Every even size is unaffected: `(2k+1)/2 ==
+/// k`, so this is a no-op for every caller `encode_key_frame`'s even-size
+/// check lets through.
 pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> Encoded {
     let reconstruction = &encoded.reconstruction;
+    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
     let cropped = if reconstruction.width == width && reconstruction.height == height {
         reconstruction.clone()
     } else {
@@ -1816,18 +1824,8 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
             width,
             height,
             y: crop_plane(&reconstruction.y, reconstruction.width, width, height),
-            u: crop_plane(
-                &reconstruction.u,
-                reconstruction.width / 2,
-                width / 2,
-                height / 2,
-            ),
-            v: crop_plane(
-                &reconstruction.v,
-                reconstruction.width / 2,
-                width / 2,
-                height / 2,
-            ),
+            u: crop_plane(&reconstruction.u, reconstruction.width / 2, cw, ch),
+            v: crop_plane(&reconstruction.v, reconstruction.width / 2, cw, ch),
         }
     };
     Encoded {
@@ -2201,9 +2199,17 @@ fn unspecified_color_config() -> ColorConfig {
 /// which is all a player picks a colour transform from and which
 /// [`crate::encoder::Colour`] is the facade's own name for.
 ///
+/// `color_config` also carries the chroma shape, and that is what a coverage
+/// witness needs: nothing in this crate's ENCODER codes a shape other than
+/// 4:2:0, but a sequence header can still be written at any
+/// `subsampling_x`/`subsampling_y` the spec allows, which is how the 4:4:0
+/// header witness is built. It builds HEADERS only -- pair the pair it
+/// returns with a tile from [`encode_key_frame`] (4:2:0) or
+/// [`encode_key_frame_at_size`].
+///
 /// # Errors
 /// The same as [`key_frame_headers`].
-pub(crate) fn key_frame_headers_colour(
+pub fn key_frame_headers_colour(
     width: usize,
     height: usize,
     base_q_idx: u8,
@@ -8892,6 +8898,60 @@ pub fn encode_sequence(
         deadzone,
         &crate::decode::FrameCtx::for_encoder(),
     )
+}
+
+/// Codes one padded picture as a key frame whose HEADER declares
+/// `frame_width` x `frame_height` -- a frame size the picture's own
+/// `width`/`height` need not be, and in particular need not be even.
+///
+/// [`encode_key_frame`] derives the declared size from the picture and
+/// refuses an odd one, which is a property of a 4:2:0 SOURCE (an odd luma
+/// column has no chroma sample of its own to be fed), not of the format: a
+/// 65-wide 4:2:0 frame is a legal AV1 frame, with
+/// `ROUND_POWER_OF_TWO(65, 1) = 33` chroma columns (libaom
+/// `av1_common_plane_width` / `ROUND_POWER_OF_TWO`, `av1/common/
+/// av1_common_int.h`), and aomenc never emits one only because it rounds the
+/// coded size down to even before it looks at the picture
+/// (`av1enc_set_frame_size`). This is the entry that can produce one, and it
+/// is what the odd-luma coverage fixture is built with: the caller hands
+/// over a picture already padded to the block grid and names the size to
+/// declare, so the block walk codes exactly the `mi_cols`/`mi_rows` a
+/// decoder derives from the declared size (spec `compute_image_size`).
+///
+/// # Errors
+/// Returns an error when `picture` is not a whole number of 32x32 blocks
+/// ([`Picture::check`]'s own rule), when either declared size is zero or
+/// larger than the padded picture's, or when the mode search fails -- the
+/// same conditions [`encode_key_frame`] reports for a malformed picture.
+pub fn encode_key_frame_at_size(
+    picture: &Picture,
+    frame_width: usize,
+    frame_height: usize,
+    base_q_idx: u8,
+    deadzone: f64,
+) -> Result<Encoded> {
+    picture.check()?;
+    if frame_width == 0
+        || frame_height == 0
+        || frame_width > picture.width
+        || frame_height > picture.height
+    {
+        return Err(Error::unsupported(
+            "AV1 encode",
+            "the declared frame size must be nonzero and fit inside the padded picture",
+        ));
+    }
+    let encoded = encode_key_frame_inner(
+        picture,
+        base_q_idx,
+        deadzone,
+        &KEY_FRAME_MODES,
+        split_blocks(),
+        (frame_width, frame_height),
+        unspecified_color_config(),
+        &crate::decode::FrameCtx::for_encoder(),
+    )?;
+    Ok(crop_encoded(&encoded, frame_width, frame_height))
 }
 
 pub(crate) fn encode_key_frame_with_ctx(

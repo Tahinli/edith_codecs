@@ -116,7 +116,15 @@ const REFUSALS: &[&str] = &[
     // hardcoded 4:2:0, the probe emits 4:2:0 planes only); it is now refused
     // at the sequence header. Gate:
     // `a_non_420_subsampled_sequence_header_is_refused_by_name`.
-    "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
+    // lane-av1odd440: the string gained its 4:4:0 clause. `subsampling_y` is
+    // coded only when `subsampling_x` is 1 (spec 5.5.2; libaom
+    // `av1_read_color_config`, `av1/decoder/decodeframe.c:4171-4175`, and its
+    // writer's own `assert(..., "4:4:0 subsampling not allowed in AV1")` at
+    // `av1/encoder/bitstream.c:2467-2468`), so (0,1) cannot reach this check --
+    // the reachable set is 4:2:0, 4:2:2 and 4:4:4, and only 4:2:2 lands here.
+    // Gate: `the_440_cell_is_not_a_codable_chroma_shape`, which enumerates
+    // the whole reachable set through this crate's own writer AND reader.
+    "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported, and 4:4:0 (0,1) is not a codable cell",
     // lane-av1txr-r2 added, lane-av1-qmatrix RETIRED: the third member of the
     // silent-garbage family (`using_qmatrix`/`qm_y`/`qm_u`/`qm_v`, refused by
     // name at the frame header) now DEQUANTISES through libaom's
@@ -437,9 +445,11 @@ const PROVEN: &[(&str, &str)] = &[
     // lane-av1txr: the guard's own gate builds a profile-1 and a profile-2
     // sequence header by hand and asserts each refuses by name while the
     // profile-0 CONTROL still decodes -- the refusal is exercised, not merely
-    // present.
+    // present. lane-av1odd440 adds the second gate named here, which
+    // enumerates every chroma shape a `color_config` can code and pins the
+    // bytes a 4:4:0 request actually produces (`440_request_is_422.obu`).
     (
-        "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
+        "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported, and 4:4:0 (0,1) is not a codable cell",
         "a_non_420_subsampled_sequence_header_is_refused_by_name",
     ),
     // lane-av1txr-r2 paired, lane-av1-qmatrix RETIRED with its gate: the
@@ -1866,10 +1876,12 @@ mod tests {
             .find("fn suppress_internal_lf_edges(")
             .expect("suppress_internal_lf_edges is gone");
         let body_start = start + src[start..].find('{').expect("no body");
-        let body = &src[body_start..body_start + src[body_start..].find("\n    }").expect("no end")];
+        let body =
+            &src[body_start..body_start + src[body_start..].find("\n    }").expect("no end")];
 
         assert!(
-            body.contains("((w_mi * MI) >> ss_x(fctx))") && body.contains("((h_mi * MI) >> ss_y(fctx))"),
+            body.contains("((w_mi * MI) >> ss_x(fctx))")
+                && body.contains("((h_mi * MI) >> ss_y(fctx))"),
             "suppress_internal_lf_edges must publish the block's own chroma extent per axis \
              -- `w_mi * MI >> ss_x(fctx)`, not a hardcoded `/2`"
         );
