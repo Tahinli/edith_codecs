@@ -284,6 +284,81 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 803 filtered out; fi
 
 **Scoped regression** — exact command and output in §10.
 
+## 6b. JOINT REPRODUCTION: Emre-5's 640x480 `tx_size_cat0` ctx finding
+
+Emre-5 (lane-av1mixllconj) localised the 640x480 residual that remains after
+their var-tx conjunct to a third defect and asked me to reproduce it on my own
+tree rather than repeat it as an attributed claim. **Reproduced in full**, on a
+scratch worktree at their tip `9abe724a` with this commit's `decode.rs` patch
+applied on top (`git apply --3way`, clean).
+
+**The method detail that matters, because I got it wrong first time:** their
+line `decode.rs:47264` is the **`cat0`** arm of `decode_leaf_rect8`; the
+`tx_size_cat1[ctx]` call is a different site (`decode.rs:18835`). I keyed the
+override on the `cat1` site first and got **five identical 521 856-read runs for
+ctx 0..4** — the override never fired at all. Re-keyed on the `cat0` site:
+
+```text
+EC_TXCTX_SITE mi_row=80 mi_col=110 bw=8 bh=4 ctx=2      <- ours, natural
+```
+
+| forced ctx | our reads | locked vs oracle | oracle reads |
+|---|---:|---|---:|
+| natural (=2) | 521 856 | first divergence **179 378** | 457 907 |
+| 0 | 286 327 | first divergence 179 378 | 457 907 |
+| **1** | **457 907** | **457 907 — bit-identical over ALL of them** | 457 907 |
+| 3 | 179 378 | first divergence 179 378 | 457 907 |
+| 4 | 179 378 | first divergence 179 378 | 457 907 |
+
+Lockstep compares the **convention-free** fields only — `pre[0]`, `pre[1]`,
+`n`, `s`, `post_rng`. `pre[2]` is a bit counter carrying a per-site constant
+offset and `cdf0` the 32768-x ICDF mirror; neither is signal. The comparator's
+third field is `-?\d+`, not `\d+`: **211 of the oracle's 457 907 lines carry a
+NEGATIVE `pre[2]`** and a `\d+` field drops them silently.
+
+**The operands, from this tree's own rungs:**
+
+```text
+ORACLE  EC_TXCTXB mi=80,110 bsize=2 maxw=8 maxh=4 hasup=1 hasleft=1 abv=4  lft=8  above=0 left=1 ctx=1
+OURS    EC_TXCTX  mi=80,110 own=8x4 ha=true hl=true intra_only=false above_txfm=16 left_txfm=8
+                                          above=true left=true          ctx=2 (natural)
+```
+
+`left_txfm = 8` matches the oracle's `lft = 8`. The whole disagreement is the
+**`above` TERM**, driven by the band (**16 vs 4**) — not by the context formula.
+
+**The band write, replayed.** `EC_TXUPD` (`rect` and `ctxs` rungs together),
+restricted to the frame containing the fork and to writes whose column span
+covers mi column 110 with `mi_r < 80`, in decode order:
+
+```text
+ctxs mi=(20,108) tx=16
+ctxs mi=(24,104) tx=32
+ctxs mi=(32,108) tx=16
+ctxs mi=(36,108) tx=16 skip_inter=true   <- the last write before the read
+```
+
+A **skipped 16 px inter block** at `mi=(36,108)` with `w_mi=4` publishing **16**,
+and **nothing writes that column in between**. libaom has **4** there — it makes
+a band write in rows 37..79 that this tree does not. Class
+`context-band-not-published`.
+
+**What reproduces and what does not.** Every number, the operand pair, and the
+named band write reproduce exactly. **The forced `ctx` is a symptom mask and
+neither of us ships it** — the defect is the missing band write. This lane
+changed no production code for it: the override was a temporary env-gated probe
+in a throwaway worktree and is not in this commit
+(`git show HEAD:crates/ec-av1/src/decode.rs | grep -c EC_TXCTX_SITE` is `0`).
+The finding belongs to Emre-5's lane.
+
+**Precondition, and it is load-bearing.** The override only bites **with their
+var-tx conjunct landed**. On this lane's tree alone (`main` + this clip, no
+conjunct) `mix_640x480_5.obu` reads **860 431** times against the oracle's
+457 907, and ctx 0..4 at the keyed site give **860 431 for every value** — the
+walk never reaches `mi=(80,110)` in a state where the override matters. The
+chain is strictly ordered: off-tile walk (this lane) -> var-tx conjunct
+(Emre-5) -> TXFM_CONTEXT band gap (Emre-5).
+
 ## 7. Class sweep
 
 **Source.** Every chroma unit walk in `decode.rs` that derives a unit count from
@@ -340,9 +415,11 @@ generate, not a proof of unreachability.** The instrumentation has been removed;
   640x480 residual to a **third** defect — a missing TXFM_CONTEXT band write
   above mi column 110 (`decode.rs:47264`, forcing `ctx=1` there makes 640x480
   bit-identical over all 457 907 reads), class
-  `context-band-not-published`, which is theirs to carry and is not mine. My own
-  measurement is only the "red at base, unchanged by this patch" half of that;
-  the `ctx` attribution is Emre-5's and I did not verify it.
+  `context-band-not-published`, which is theirs to carry and is not mine.
+  **§6b is my own full reproduction of that claim** — the read counts, the
+  457 907/457 907 lockstep, all three operand prints, and the `mi=(36,108)`
+  band write — so it is now a joint fact on two trees rather than an attributed
+  one.
 * **The class sweep is a corpus + generated-cells negative**, §7. A wider sweep
   (10/12-bit, 4:4:4 edge cells, screen content) was not run; §7's instrumented
   walks are the ones a future sweep should re-arm.
