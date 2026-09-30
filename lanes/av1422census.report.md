@@ -1,14 +1,22 @@
 # lane-av1422census — the 4:2:2 census, re-measured with a proven-live comparator
 
-> **STALENESS ANNOTATION ADDED BY MAIN (2026-09-30).** This census was measured at `main` = `cc9f2668`.
-> `1686dc8a` landed 23 minutes later with a SOURCE FIX inside it (`b8eed69f`, in `sub8_leaf_chroma422`:
-> a skipped intrabc chroma leaf now predicts its DV frame copy, libaom `decodeframe.c:1040-1043`), and
-> `lanes/av1422ctintrabc.report.md` measures `Q_odd320x242`, `O_odd322x242`, `AB_inter_warp_odd` and
-> `S_odd326x242_10b` BYTE-EXACT on the later tree. So every DIVERGES verdict in the tables below for those
-> four cells -- and any fresh-sweep cell of the same class -- describes the tree as it was, not the tree as
-> it is. The comparator work, the cell derivation, the liveness proof and the negative controls all stand;
-> only the verdict column is affected. `lanes/av1422census2.report.md` re-derives the whole table on the
-> current tree and carries the DELTA. Do not quote the numbers below as current.
+> **STALENESS ANNOTATION ADDED BY MAIN (2026-09-30), WIDENED THE SAME DAY after the re-measurement
+> (`lanes/av1422census2.report.md`) read it back and called the first version UNDER-SCOPED.** This census was
+> measured at `main` = `cc9f2668`. `1686dc8a` landed 23 minutes later with a SOURCE FIX inside it (`b8eed69f`,
+> in `sub8_leaf_chroma422`: a skipped intrabc chroma leaf now predicts its DV frame copy, libaom
+> `decodeframe.c:1040-1043`), and that fix moved **12 named cells**, not the four I first listed:
+> **CLOSED (10)** -- `Q_odd320x242` (0/9603/14456), `O_odd322x242` (0/985/722), `AB_inter_warp_odd`
+> (0/3705/4366), `S_odd326x242_10b` (0/301/751), `R422_320x242` (0/6337/8398), `s422_320x242` (0/6337/8398),
+> `s422_326x240` (0/734/0), `s422_326x246` (0/24078/25112), `s422_320x242_10b` (0/3915/5612),
+> `s422_352x250_10b` (0/3876/1786);
+> **SHRUNK, NOT CLOSED (2)** -- `s422_320x246` 0/38348/59491 -> 0/8339/5903 and `s422_322x246` 0/24964/25438
+> -> 0/3603/2324. Every DIVERGES verdict below for those cells describes the tree as it was, not as it is, and
+> a reader who takes "the same class" to mean "fully closed" will quote `38348/59491` as if it were current.
+> The comparator work, the cell derivation, the liveness proof and the negative controls all stand; only the
+> verdict column is affected. CURRENT TABLE (re-derived on the current tree): 4:2:2 51 cells, **44 byte-exact,
+> 7 diverging** (was 34/17), with the 4:2:0 control 22/22 and the 4:4:4 control 21/22 exact on BOTH trees.
+> The DELTA, the per-cell detail and the correction of the refusal count (50 -> 51) are in
+> `lanes/av1422census2.report.md` section 3.1. Do not quote the numbers below as current.
 
 
 **Outcome in one line: the standing "4:2:2 refuses by name" decision's input
