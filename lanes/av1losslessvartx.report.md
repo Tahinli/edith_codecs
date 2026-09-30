@@ -122,6 +122,24 @@ mixed cells are exact. That is out of this lane's scope and is **not** a
 defect introduced here — it is recorded so the next census does not re-derive
 it.
 
+> **ANNOTATION ADDED BY MAIN 2026-09-30: the paragraph above is REFUTED, and so is
+> its "pre-existing defect" reading.** There is no extra frame and no frame-count
+> ceiling. 5 SOURCE frames legitimately produce 6 CODED frames because of the
+> altref + `show_existing_frame` encode recipe: 7 frame headers = 6 coded (2 of
+> them hidden alt-refs) + 1 `show_existing_frame`, and shown = 6 - 2 + 1 = 5. The
+> oracle agrees on every number (6 decode-order dumps, `aomdec --rawvideo`
+> 576,000 B = 5 frames), and ALL SIX decode-order frames are byte-exact, including
+> on a plain `--cq-level=20 --lossless=0` 5-frame stream. Measured across ALL 105
+> committed fixtures at the time: 96 decodable, **96/96 dump counts match the
+> oracle exactly** (the other 9 are 4:2:2 and refuse by name), plus a 308-stream
+> generated sweep over frame counts 3..24 x 6 quantisers x AQ/altref/lag/kf flags
+> where the counts match everywhere. The shape is already pinned green by
+> `a420_lossless_alt_ref_1to4_strip_witness_is_byte_exact_in_decode_order`
+> (stream.rs:9250, asserting decoded == 6 and hidden == 1). Full refutation:
+> `lanes/av1framecount.report.md`. The one REAL defect this lane's sweep was
+> adjacent to — the mixed-lossless pixel divergence, red from frame 1 — is a
+> separate item and is still open.
+
 ## 5. The libaom predicate, quoted
 
 The candidate reason on file is **correct as a statement about the var-tx
