@@ -9472,6 +9472,83 @@ pub(crate) mod tests {
              block(s) overwrote a stale above-band size"
         );
     }
+
+    /// lane-av1txctxband2 r2: the SAME one-line publish, three MORE cells —
+    /// the mixed-lossless RESIDUE `lanes/av1mixllconj.report.md` §7 left
+    /// explicitly unnamed ("separate defects this change shrinks but does not
+    /// remove"). **They are the same defect.** All three are this recipe's
+    /// mixed-lossless+altref stream at 256x128 (6 frames) and 320x240 (5 and 6
+    /// frames); each has a lossy block whose `get_tx_size_context` /
+    /// `txfm_partition_context` read a band a lossless block above should have
+    /// published into and did not.
+    ///
+    /// Measured on `f2dd27b0~1` (= `0bfee517`, the tip before this lane's
+    /// publish) against `aomdec`'s `EC_AV1_FINAL_DUMP`, decode order, per
+    /// differing frame:
+    ///
+    /// ```text
+    /// 420_mixll_256x128_6f.obu  7 dumps  red f1..f6: 6051 / 4115 / 2962 / 26566 / 41876 / 14749
+    /// 420_mixll_320x240_5f.obu  6 dumps  red f1..f5: 15031 / 16259 / 21932 / 65405 / 90077
+    /// 420_mixll_320x240_6f.obu  7 dumps  red f6 only: 19398
+    /// ```
+    ///
+    /// With the publish: **7/7, 6/6 and 7/7 byte-exact**, 0 differing bytes on
+    /// every plane of every decode-order frame. `m5_320x240`'s f2/f3 here
+    /// (16259 / 21932) differ from the 16006 / 21930 `lane-av1mixllconj` §7
+    /// records, because that table was taken before `lane-av1offtile`'s
+    /// chroma-plane clip merged; f1/f4/f5 and both other cells match it exactly.
+    ///
+    /// Recipe (ffmpeg 8.1.3 `testsrc2`, shared oracle `aomenc`; `--limit` is the
+    /// only variable per cell):
+    /// ```text
+    /// ffmpeg -f lavfi -i testsrc2=size=<W>x<H>:rate=25 -frames:v <N> -pix_fmt yuv420p src.y4m
+    /// aomenc --codec=av1 --obu -o <cell>.obu --passes=1 --cpu-used=4 --limit=<N> \
+    ///        --end-usage=q --cq-level=0 --aq-mode=1 src.y4m
+    /// ```
+    /// sha256 `8a203e52…` (22336 B), `40d613fd…` (28716 B), `37fbe7cb…`
+    /// (38686 B); pinned below by fnv1a64, not a `const SHA256` compared
+    /// against itself.
+    #[test]
+    fn a_420_mixed_lossless_residue_arms_are_byte_exact_in_decode_order() {
+        const NAME: &str = "a_420_mixed_lossless_residue_arms_are_byte_exact_in_decode_order";
+        let _gate_lock = lock_gate_counters();
+        // (file, bytes, fnv1a64, decode-order frames, hidden)
+        const CELLS: [(&str, usize, u64, usize, usize); 3] = [
+            ("420_mixll_256x128_6f.obu", 22336, 5694016005779287373, 7, 1),
+            ("420_mixll_320x240_5f.obu", 28716, 5855109243102450179, 6, 1),
+            ("420_mixll_320x240_6f.obu", 38686, 49021385186397678, 7, 1),
+        ];
+        for (file, bytes, fnv, frames, hidden) in CELLS {
+            let path = crate_pin(file);
+            let data = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: the committed pin {file} is missing ({e})"));
+            assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
+            assert_eq!(fnv1a64(&data), fnv, "{NAME}: {file} bytes drifted");
+            let before = crate::decode::lossless_sq_txfm_band_overwrite_hits();
+            let (decoded, got_hidden) = decode_all_frames_vs_oracle(&data, file);
+            let overwrote = crate::decode::lossless_sq_txfm_band_overwrite_hits() - before;
+            assert_eq!(
+                decoded, frames,
+                "{NAME}/{file}: the oracle decoded {decoded} frames in DECODE order"
+            );
+            assert_eq!(
+                got_hidden, hidden,
+                "{NAME}/{file}: {decoded} decode-order dumps against {decoded} - {got_hidden} \
+                 shown outputs means the gate saw {hidden} hidden alt-ref picture/ies"
+            );
+            assert!(
+                overwrote > 0,
+                "{NAME}/{file}: no lossless square block on an inter frame published a txfm \
+                 band that OVERWROTE an earlier block's size ({overwrote} of them did), so this \
+                 cell does not exercise the missing publish at all (class \
+                 gate-blind-to-feature) -- re-encode per the recipe above"
+            );
+            eprintln!(
+                "{NAME}/{file}: {decoded} decode-order frame(s) byte-exact ({got_hidden} hidden), \
+                 {overwrote} lossless square inter block(s) overwrote a stale above-band size"
+            );
+        }
+    }
     /// lane-av1444rect r2 — the SAME class as the gate above, second
     /// instance: `decode_rect4_16_intrabc` applied the 4:2:0 pair geometry at
     /// ss (0,0), where `is_chroma_reference` makes an intra-BC 1:4 strip its
