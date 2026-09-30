@@ -34770,6 +34770,14 @@ thread_local! {
     /// lossless frame codes no `tx_size_cat1` symbol there. Zero on any frame
     /// whose sub-8 leaves all sit in lossy segments, so a gate cannot look
     /// armed by merely decoding.
+    ///
+    /// CORRECTED 2026-09-30 by the refutation pass (`lanes/refute-av1mixllconj`):
+    /// the hit was UNCONDITIONAL inside the else-if, which also serves leaves
+    /// whose `tx_select_inter` is off -- the pass measured **33 hits on a build
+    /// with the conjunct REMOVED**, i.e. it was counting a population the
+    /// conjunct does not touch. It is now guarded on `tx_select_inter`, the same
+    /// term the conjunct uses, so a hit means the suppression is the conjunct's
+    /// doing.
     pub(crate) static SUB8_LOSSLESS_NO_VARTX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -48438,7 +48446,16 @@ fn decode_inter_sub8_rect2(
                 &mut leaves,
             );
         } else if lossless(fctx) && !skip {
-            hit!(SUB8_LOSSLESS_NO_VARTX);
+            // COUNTED ONLY WHEN THE SUPPRESSION IS THE CONJUNCT'S WORKING: the
+            // else-if also fires for a leaf whose `tx_select_inter` is off,
+            // where the tree would not have run either way. The refutation pass
+            // measured 33 hits on a build with the conjunct REMOVED, which is
+            // exactly that population -- so an unconditional hit proves only
+            // "a lossless sub-8 leaf was walked", not "the conjunct suppressed
+            // a tree". Guard it on the same term the conjunct uses.
+            if fctx.tx_select_inter.with(std::cell::Cell::get) {
+                hit!(SUB8_LOSSLESS_NO_VARTX);
+            }
             // lane-lossless2: `read_block_tx_size` returns TX_4X4 before it
             // ever looks at `max_txsize_rect_lookup`, so an 8x4/4x8 leaf is
             // TWO 4x4 units, not one rect one.

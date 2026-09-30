@@ -1,5 +1,34 @@
 # lane-av1mixllconj — the per-segment `lossless` answer ALREADY agrees with libaom; the var-tx **conjunct** lands, and the 640x480 "regression" is a SECOND, independent defect on a cell that was never correct
 
+> **CORRECTIONS FROM THE REFUTATION PASS (added by Main 2026-09-30; VERDICT: PARTIAL — every DECODER claim
+> reproduced exactly, three REPORT/doc figures did not).** The pass reproduced the pin (6/6 decode-order dumps
+> byte-exact, shown rawvideo 245760 B with 0 differing bytes), the whole-stream ladder (96997 oracle lines /
+> 96997 ours / 0 unparsed / 96997 paired bit-identical / first divergence NONE), the conjunct-out red
+> (f1..f5 = 33724/34251/44500/36688/37462, gate FAILED at decode-order frame 1 byte 33, ours 82 vs 81, ladder
+> first divergence at read 30889), the per-segment derivation, the premise reversal on base (m5_640x480 f1..f5
+> = 352066/414286/313795/399471/422078 of 460800 -- the report's exact numbers, 76/70/68/87/92 % wrong), and the
+> off-tile arithmetic re-derived independently. Corrections:
+>
+> 1. **`SUB8_LOSSLESS_NO_VARTX` was NOT the decision counter it claimed to be** (doc at
+>    `decode.rs:34766-34772`, and my merge message repeated the claim): the pass measured **33 hits on a build
+>    with the conjunct REMOVED**, because the `else if lossless(fctx) && !skip` arm also serves leaves whose
+>    `tx_select_inter` is OFF -- leaves the conjunct does not touch. The hit is now guarded on `tx_select_inter`
+>    (the same term the conjunct uses) and the pin's delta reads **10, not 40**; the gate still asserts `> 0`,
+>    remains green, and its doc names both numbers. Same class as the palette counter correction: a hit that
+>    fires for a population the fix does not touch is not a non-vacuity arm.
+> 2. **The corpus buckets do not reproduce**: the pass swept 110 fixtures on both trees and measures
+>    **base 106 = 96 EXACT / 0 RED / 9 FRAMECOUNT / 1 ORACLE_FAIL** (`440_request_is_422.obu`, which `aomdec`
+>    itself refuses) and **tip 110 = 100 EXACT / 0 RED / 9 FRAMECOUNT / 1**, with the SUBSTANCE intact and
+>    stronger: conjunct-out -> tip is exactly ONE status change (the pin RED 186625 B -> EXACT), zero
+>    EXACT->RED, zero new refusals, zero frame-count change; base -> tip is 0 status changes across the 106
+>    shared fixtures plus 4 added (all EXACT); tip -> clip-out is 0 status changes (the off-tile clip is
+>    corpus-inert). The report's "107 fixtures" and its 64/34/9/0 -> 65/33/9/0 split match neither tree
+>    (base 106, main 110) -- use the pass's absolute buckets.
+> 3. **The cited oracle rung `EC_AV1_DECODE_ORDER_DUMP` does not exist** in the shared oracle build (only
+>    `EC_AV1_FINAL_DUMP`, `decodeframe.c:5699`). The measurement it supports was made with the decode-order
+>    dump path the crate's own helpers use; the rung NAME in the text is wrong and no test depends on it.
+
+
 Base `main` = `6bb66a4a`. Worktree `/home/tahinli/.cache/wt/av1mixllconj`, target dir
 `$HOME/.cache/cargo-target-av1mixllconj`, `EC_NOMEMGUARD=1`. Oracle
 `~/.cache/aom-oracle/build/{aomdec,aomenc}` (shared, untouched; not rebuilt, not

@@ -9316,7 +9316,11 @@ pub(crate) mod tests {
     /// a `tx_size_cat1` symbol libaom never reads, and the very next block's
     /// `txb_skip` forked. `SUB8_LOSSLESS_NO_VARTX` counts the leaves that
     /// newly take the lossless arm, so this gate cannot pass vacuously on a
-    /// stream whose sub-8 leaves all sit in lossy segments.
+    /// stream whose sub-8 leaves all sit in lossy segments. (Corrected
+    /// 2026-09-30: the counter is now guarded on `tx_select_inter`, because the
+    /// refutation pass measured 33 hits on a build with the conjunct REMOVED --
+    /// the arm also serves leaves whose tx-select is off. The pin's own delta
+    /// is 10, not the 40 the lane first reported; both numbers are measured.)
     ///
     /// The trigger really is the CONJUNCTION: `--cq-level=0` with AQ makes
     /// *some* segments lossless and others not (`--cq-level=20`, `--cq-level=32`,
