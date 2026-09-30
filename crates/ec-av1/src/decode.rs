@@ -29955,6 +29955,37 @@ fn read_inter_rect_chroma(
                         }
                         Some(t)
                     } else {
+                        // lane-av1ichromatx: the ONE remaining site in
+                        // `decode_inter_block` that can hand a chroma unit a
+                        // BLOCK-level type on a split plane. `covering_leaf_tx_
+                        // type` found nothing, i.e. no luma leaf covers this
+                        // unit's own MI cell -- which is exactly the shape a
+                        // block that coded a SINGLE luma transform has (its
+                        // leaf list is empty, so every lookup misses). For
+                        // that block `luma_tx_type` IS the type of the one
+                        // luma unit whose stamp covers the whole plane, so the
+                        // fallback is correct there.
+                        //
+                        // What is NOT correct is a fallback on a plane with
+                        // `leaves` NON-empty: then some luma leaf does exist,
+                        // it simply does not cover this unit's cell, and the
+                        // block-level value is a DIFFERENT leaf's type. The
+                        // assertion below is what closes that shape, so the
+                        // fallback can never again be a silent mistype: the
+                        // class is "block-level where the unit's own cell
+                        // says otherwise", and this is its last site.
+                        hit!(CHROMA_RECT_BLOCK_TX_FALLBACK);
+                        if multi {
+                            hit!(CHROMA_RECT_BLOCK_TX_FALLBACK_MULTI);
+                        }
+                        debug_assert!(
+                            leaf_tx_types.is_empty(),
+                            "lane-av1ichromatx: a multi-unit rect chroma plane fell back to the \
+                             block-level tx_type while {} luma leaves were coded -- the unit's own \
+                             av1_get_tx_type cell is then some other leaf's stamp, not \
+                             luma_tx_type",
+                            leaf_tx_types.len()
+                        );
                         Some(luma_tx_type)
                     };
                 let cu_grid = read_inter_plane_rect(
@@ -39717,6 +39748,41 @@ pub(crate) fn chroma_rect_leaf_tx_hits() -> usize {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn chroma_rect_leaf_tx_diff_hits() -> usize {
     CHROMA_RECT_LEAF_TX_DIFF_HITS.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// lane-av1ichromatx: [`read_inter_rect_chroma`] units that fell through
+    /// `covering_leaf_tx_type` to the BLOCK-level `luma_tx_type`, and of those
+    /// the ones whose chroma plane is MULTI-unit (`nx*ny > 1`) -- the only
+    /// shape where two units of one plane can disagree, i.e. where a
+    /// block-level value could actually mistype a unit.
+    ///
+    /// Why this needs its own number: `CHROMA_RECT_LEAF_TX_HITS` counts the
+    /// units that took the covering leaf, so it says nothing about the units
+    /// that did NOT -- and the fallback is the only remaining place in
+    /// `decode_inter_block` where a chroma unit is handed a block-level type
+    /// on a split plane.
+    pub(crate) static CHROMA_RECT_BLOCK_TX_FALLBACK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Of [`CHROMA_RECT_BLOCK_TX_FALLBACK`], how many were on a multi-unit
+    /// chroma plane -- the non-vacuity bar for the assertion at that site.
+    pub(crate) static CHROMA_RECT_BLOCK_TX_FALLBACK_MULTI: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`CHROMA_RECT_BLOCK_TX_FALLBACK`]: rect chroma units handed the block-level
+/// type because no luma leaf covered their own MI cell.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_rect_block_tx_fallback() -> usize {
+    CHROMA_RECT_BLOCK_TX_FALLBACK.with(std::cell::Cell::get)
+}
+
+/// [`CHROMA_RECT_BLOCK_TX_FALLBACK_MULTI`]: of those, the ones whose chroma
+/// plane had more than one unit.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_rect_block_tx_fallback_multi() -> usize {
+    CHROMA_RECT_BLOCK_TX_FALLBACK_MULTI.with(std::cell::Cell::get)
 }
 
 fn decode_inter_block(
