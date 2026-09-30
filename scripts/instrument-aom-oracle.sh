@@ -1349,3 +1349,180 @@ s = s.replace(anchor, new, 1)
 open(path, "w").write(s)
 print("EC_VARTX/EC_VARTXCTX instrumented (read_tx_size_vartx)")
 PYVX
+
+# --- rung 19: EC_PIB, EVERY av1_predict_intra_block call (lane-av1422ctattr) ---
+# WHY. Three lanes of 4:2:2 chroma archaeology stalled on ONE blind spot:
+# `av1_predict_intra_block` has an early `if (use_palette) { ...; return; }`
+# and TWO early `return`s after it (the 8-bit non-directional site and the
+# hbd one), so EC_PREDOUT8 / EC_PREDND only print on SOME of the paths that
+# write a block. A chroma region where no rung fires is therefore
+# un-attributable: "libaom used dc_top" was an inference from the predicted
+# VALUE, not a printed flag, and the whole ladder looked like it had no block
+# there at all. EC_PIB prints the CALL IDENTITY -- before any early return --
+# so the question "which call wrote this pixel, and did it return early" is
+# answerable from the trace instead of from arithmetic.
+#
+# Field order is deliberately identical to EC_PREDOUT8/EC_PRED for the fields
+# they share, so a rung 16 line and a rung 19 line for the same block read as
+# one line. `use_palette` is the early-return bit: use_palette=1 with no
+# EC_PREDOUT8/EC_PRED twin line IS a palette write.
+#
+# Env: EC_PIB=1. Optional EC_PIBWIN="mi_row_lo:mi_row_hi:mi_col_lo:mi_col_hi"
+# (any field < 0 means "any") so a seed's own block can be isolated without
+# dumping a whole frame.
+python3 - "$I" <<'PYPIB'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_PIB " in s:
+    print("EC_PIB already instrumented (no-op)")
+    sys.exit(0)
+
+anchor = """  const int is_hbd = is_cur_buf_hbd(xd);
+
+  assert(mode < INTRA_MODES);"""
+new = """  const int is_hbd = is_cur_buf_hbd(xd);
+
+  /* EC_INSTRUMENTED_PIB: the call IDENTITY, printed BEFORE the palette
+     early return so every call is visible. */
+  if (getenv("EC_PIB")) {
+    const char *ec_w = getenv("EC_PIBWIN");
+    int ec_r0 = -1, ec_r1 = -1, ec_c0 = -1, ec_c1 = -1;
+    if (ec_w) sscanf(ec_w, "%d:%d:%d:%d", &ec_r0, &ec_r1, &ec_c0, &ec_c1);
+    if ((ec_r0 < 0 || (xd->mi_row >= ec_r0 && xd->mi_row <= ec_r1)) &&
+        (ec_c0 < 0 || (xd->mi_col >= ec_c0 && xd->mi_col <= ec_c1))) {
+      fprintf(stderr,
+              "EC_PIB mi_row=%d mi_col=%d plane=%d row_off=%d col_off=%d "
+              "txw=%d txh=%d mode=%d use_palette=%d filter_intra=%d bsize=%d "
+              "px=%d py=%d hbd=%d\\n",
+              xd->mi_row, xd->mi_col, plane, row_off, col_off, txwpx, txhpx,
+              mode, use_palette, (int)filter_intra_mode, (int)mbmi->bsize,
+              col_off << MI_SIZE_LOG2, row_off << MI_SIZE_LOG2, (int)is_hbd);
+    }
+  }
+
+  assert(mode < INTRA_MODES);"""
+assert anchor in s, "av1_predict_intra_block prologue moved"
+s = s.replace(anchor, new, 1)
+
+# --- rung 20: EC_DCIN, the DC path's availability INPUTS (lane-av1422ctattr) --
+# `dc_predictor`'s four variants are selected by (have_top, have_left) and
+# scaled by (n_top_px, n_left_px); EC_PREDOUT8 prints none of them, only the
+# RESULT and the mode. So a predicted value that "looks like dc_top" is an
+# inference. EC_DCIN prints the four operands, the two edge SUMS they are
+# taken from, the availability BITS themselves (including the per-plane
+# chroma_* narrowing in set_mi_row_col), and the variant id the four-way
+# select picked -- so the variant is a printed field, not an inference.
+#
+# Variant id: 0 = dc (both edges), 1 = dc_top, 2 = dc_left, 3 = dc_128.
+#
+# Installed at BOTH 8-bit and high-bitdepth non-directional sites, before the
+# predictor call. Env: EC_DCIN=1 (EC_PIBWIN filters it too).
+nd_anchor = """    build_non_directional_intra_predictors(ref, ref_stride, dst, dst_stride,
+                                           mode, tx_size, n_top_px, n_left_px);"""
+nd_new = """    /* EC_INSTRUMENTED_DCIN (8-bit non-directional): the availability INPUTS
+       and the DC variant they select. */
+    if (getenv("EC_DCIN")) {
+      long ec_atop = 0, ec_aleft = 0;
+      int ec_i;
+      for (ec_i = 0; ec_i < n_top_px; ++ec_i) ec_atop += ref[ec_i];
+      for (ec_i = 0; ec_i < n_left_px; ++ec_i) ec_aleft += ref[ec_i * ref_stride];
+      fprintf(stderr,
+              "EC_DCIN mi_row=%d mi_col=%d plane=%d row_off=%d col_off=%d "
+              "txw=%d txh=%d mode=%d have_top=%d have_left=%d n_top=%d "
+              "n_left=%d atop=%ld aleft=%ld dcv=%d up=%d left=%d cup=%d "
+              "cleft=%d ss_x=%d ss_y=%d bsize=%d\\n",
+              xd->mi_row, xd->mi_col, plane, row_off, col_off, txwpx, txhpx,
+              mode, have_top, have_left, n_top_px, n_left_px, ec_atop,
+              ec_aleft,
+              (n_top_px > 0 ? (n_left_px > 0 ? 0 : 1)
+                           : (n_left_px > 0 ? 2 : 3)),
+              xd->up_available, xd->left_available, xd->chroma_up_available,
+              xd->chroma_left_available, ss_x, ss_y, (int)mbmi->bsize);
+    }
+    build_non_directional_intra_predictors(ref, ref_stride, dst, dst_stride,
+                                           mode, tx_size, n_top_px, n_left_px);"""
+assert nd_anchor in s, "8-bit non-directional predictor call moved"
+s = s.replace(nd_anchor, nd_new, 1)
+
+hbd_anchor = """      highbd_build_non_directional_intra_predictors(
+          ref, ref_stride, dst, dst_stride, mode, tx_size, n_top_px, n_left_px,
+          xd->bd);"""
+hbd_new = """      /* EC_INSTRUMENTED_DCIN (high bitdepth non-directional): the hbd twin. */
+      if (getenv("EC_DCIN")) {
+        const uint16_t *ec_r16 = CONVERT_TO_SHORTPTR(ref);
+        long ec_atop = 0, ec_aleft = 0;
+        int ec_i;
+        for (ec_i = 0; ec_i < n_top_px; ++ec_i) ec_atop += ec_r16[ec_i];
+        for (ec_i = 0; ec_i < n_left_px; ++ec_i)
+          ec_aleft += ec_r16[ec_i * ref_stride];
+        fprintf(stderr,
+                "EC_DCIN mi_row=%d mi_col=%d plane=%d row_off=%d col_off=%d "
+                "txw=%d txh=%d mode=%d have_top=%d have_left=%d n_top=%d "
+                "n_left=%d atop=%ld aleft=%ld dcv=%d up=%d left=%d cup=%d "
+                "cleft=%d ss_x=%d ss_y=%d bsize=%d\\n",
+                xd->mi_row, xd->mi_col, plane, row_off, col_off, txwpx, txhpx,
+                mode, have_top, have_left, n_top_px, n_left_px, ec_atop,
+                ec_aleft,
+                (n_top_px > 0 ? (n_left_px > 0 ? 0 : 1)
+                             : (n_left_px > 0 ? 2 : 3)),
+                xd->up_available, xd->left_available, xd->chroma_up_available,
+                xd->chroma_left_available, ss_x, ss_y, (int)mbmi->bsize);
+      }
+      highbd_build_non_directional_intra_predictors(
+          ref, ref_stride, dst, dst_stride, mode, tx_size, n_top_px, n_left_px,
+          xd->bd);"""
+if hbd_anchor in s:
+    s = s.replace(hbd_anchor, hbd_new, 1)
+else:
+    print("WARN: hbd non-directional call anchor not found; EC_DCIN is 8-bit only")
+
+open(path, "w").write(s)
+print("EC_PIB/EC_DCIN instrumented (av1_predict_intra_block)")
+PYPIB
+
+# --- rung 21: EC_DP, the per-block branch taken in decode_token_recon_block ---
+# WHY. `decode_token_recon_block` has two arms -- intra (the only one whose
+# prediction prints a rung) and inter (`predict_inter_block_visit`, no
+# intra rung at all) -- AND, inside the intra arm, `if (plane && !xd-
+# >is_chroma_ref) break;`, so a chroma plane can be skipped entirely. A
+# region where NO prediction rung fires is consistent with all three, and the
+# rung ladder alone cannot tell them apart. EC_DP prints the branch decision
+# for every block: which arm, whether chroma is reconstructed at all, and the
+# max_unit geometry the loop walks. Env: EC_DP=1.
+python3 - "$F" <<'PYDP'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_DP mi_row=" in s:
+    print("EC_DP already instrumented (no-op)")
+    sys.exit(0)
+
+anchor = """  MB_MODE_INFO *mbmi = xd->mi[0];
+
+  if (!is_inter_block(mbmi)) {"""
+new = """  MB_MODE_INFO *mbmi = xd->mi[0];
+
+  /* EC_INSTRUMENTED_DP: the branch decode_token_recon_block takes for this
+     block -- intra vs inter, and whether the chroma planes are reconstructed
+     at all (`plane && !xd->is_chroma_ref`).  Anchored on the `mbmi` +
+     `if (!is_inter_block)` pair, not on the function signature, because the
+     signature's parameter wrapping is not stable across libaom revisions
+     (v3.13.3 wraps `ThreadData *const td, aom_reader *r,` onto one line). */
+  if (getenv("EC_DP")) {
+    fprintf(stderr,
+            "EC_DP mi_row=%d mi_col=%d bsize=%d inter=%d chroma_ref=%d "
+            "skip_txfm=%d bw=%d bh=%d planes=%d is_intrabc=%d\\n",
+            xd->mi_row, xd->mi_col, (int)bsize, (int)is_inter_block(mbmi),
+            (int)xd->is_chroma_ref, (int)mbmi->skip_txfm,
+            (int)max_block_wide(xd, bsize, 0),
+            (int)max_block_high(xd, bsize, 0), num_planes,
+            (int)is_intrabc_block(mbmi));
+  }
+
+  if (!is_inter_block(mbmi)) {"""
+assert anchor in s, "decode_token_recon_block prologue moved"
+s = s.replace(anchor, new, 1)
+open(path, "w").write(s)
+print("EC_DP instrumented (decode_token_recon_block)")
+PYDP
