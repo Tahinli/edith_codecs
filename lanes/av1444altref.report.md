@@ -1,5 +1,19 @@
 # lane-av1444altref — 4:4:4 LOSSLESS + alt-ref chroma residual: FIXED, GATED
 
+> **CORRECTIONS from the independent refutation pass `lanes/refute-av1-w3a.report.md` (2026-09-30).** The
+> FIX and its GATE stand, and were re-measured from scratch: the merge's first parent `a20aba01` and the
+> lane base `3698787d` both give `ll444_c` 8/18 decode-order exact with Y 0 / U 185 / V 212, while
+> `9367642a` and every descendant give 18/18 exact 0/0/0 — so "exact before" cannot masquerade as "this
+> commit fixed it". The gate's comparator was read and DOES read both sides (not the av1422anom
+> tautology), and the mutation number (0/147/170) reproduces exactly.
+> Two figures are WRONG as labels, not as fixes:
+> (1) **§1's decode-order per-picture table**: 9 of 10 entries reproduce exactly, but **f13 is 15**,
+> not 80.
+> (2) **§1's "TOTAL 317" in a decode-order table**: the decode-order total is **397** (0 Y / 185 U / 212 V).
+> 397 − 317 = 80 = the hidden picture, i.e. **317 is the DISPLAY-order figure**; it reproduces exactly on
+> that basis (0/147/170). The report's own per-picture list also sums to 462, not 317.
+
+
 Base `3698787d` (main), worktree `~/.cache/wt/av1444altref`, branch `lane-av1444altref`.
 Round 3 (Ege-3 → Mehmet-2). **The 317-byte chroma residual is gone: `ll444_c`
 now decodes byte-exact against the oracle aomdec on all 18 decode-order pictures

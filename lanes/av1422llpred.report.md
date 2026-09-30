@@ -1,5 +1,12 @@
 # lane-av1422llpred — 4:2:2 chroma intra prediction divergence
 
+> **CORRECTION from the independent refutation pass `lanes/refute-av1-w3a.report.md` (2026-09-30).** The
+> fix and its headline numbers stand. One regression row is wrong: `X_intrabc_tiled` is not "no change" —
+> on the report's own display-order basis its **U plane moves 421744 -> 421746 (+2 samples)**; `W_intrabc`
+> is exactly delta 0. Two samples out of 1.3 M is not a regression that matters, but "no change" was a
+> claim and it was not measured.
+
+
 Target: `probe/ll422_allintra.obu` (320x240, 4:2:2 lossless all-intra, 1 frame).
 Base: `2005a35d` (both prior fixes already landed). Baseline reproduced exactly:
 **Y 0 / U 3126 / V 3139**.

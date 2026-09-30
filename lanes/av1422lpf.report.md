@@ -1,5 +1,22 @@
 # lane-av1422lpf — the `--lossless=1` 4:2:2 inter chroma panic family is SEVEN sites, and all seven are fixed
 
+> **CORRECTIONS from the independent refutation pass `lanes/refute-av1-w3a.report.md` (2026-09-30).** The
+> FIX stands — the seven panic sites and their before/after panic lines were re-measured and reproduce
+> exactly (`exit 101` at `decode.rs:37565:24` on `aef4fa67`, `17/17` pictures with `exit 0` on
+> `3698787d`). Three claims in this report do NOT reproduce and are withdrawn:
+> (1) **§4.1** the "a Golomb tail longer than this decoder reads" refusal on `W_intrabc`/`X_intrabc_tiled`
+> does not occur at `3698787d` — both decode 17/17 pictures with zero refusal lines (the llintra lane had
+> already retracted it; now independently confirmed).
+> (2) **§5** "decode-order (rung 12) comparison was not run on the three cells — they do not decode to
+> completion" is false: they do, and rung 12 was run on both sides, 17 frames per side at the expected
+> per-frame geometry.
+> (3) **§1.1** the "Site 1 is NOT 4:2:2-specific" evidence (a 4:2:0 panic `range end index 1028 out of
+> range for slice of length 1024` on `ll420_a.obu`) does not reproduce on the pinned `regress_420/ll420_a.obu`
+> at `aef4fa67` (`exit 0`; all four `ll420_*` are 16/16 byte-exact at `18643bb5` and `3698787d`). That panic
+> shape was produced only on `ll422_noibc`, a **4:2:2** cell — and the cell this report used is pinned by
+> no sha, so the claim is not reproducible. The site's 4:2:2-specificity is therefore UNPROVEN here.
+
+
 Base `aef4fa67` (main), worktree `~/.cache/wt/av1422lpf`, branch
 `lane-av1422lpf`. **All seven panics are gone. The three cells still do not
 decode byte-exact** — §4 says exactly where that residual lives and why it is

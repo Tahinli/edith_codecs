@@ -1,5 +1,16 @@
 # lane-av1422llinter2 — the lossless 4:2:2 inter divergence is FIXED
 
+> **CORRECTIONS from the independent refutation pass `lanes/refute-av1-w3a.report.md` (2026-09-30).** The
+> fix, its class sweep and its reachability all CONFIRMED, and this merge's claim is the one the pass
+> states most strongly: the three fixed arms were re-measured with temporary counters — single-ref /
+> compound / intra-in-inter fire 131/356/202 on `W_intrabc`, 148/376/178 on `X_intrabc_tiled`,
+> 3/166/565 on `Y_intrabc_10b`. Two arithmetic slips in this report: **§6 says "24 of 31 exact before"
+> where its own table gives 23**, and the class sweep describes `decode.rs:24618`
+> (`else if chroma_444 && lossless`) as "already shape-generic" when it is statically UNREACHABLE
+> (24544 subsumes it) — the conclusion "no fourth reachable site" still holds, but the reason phrased there
+> is wrong.
+
+
 Tip: `main` = `cc211d13` (Merge lane-av1422llinter). Worktree
 `/home/tahinli/.cache/wt/av1422llinter2`, branch `lane-av1422llinter2`, commit
 `475c45ac`. One source file changed: `crates/ec-av1/src/decode.rs`. The 4:2:2
