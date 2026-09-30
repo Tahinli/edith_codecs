@@ -8632,12 +8632,12 @@ fn read_coeffs_rect(
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, w * h);
             let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
-            if rect_trace {
-                eprintln!(
-                    "EC_COEFF_STEP tag=base_eob c={scan_idx} pos={pos} ctx={ctx} level={v} rng={}",
-                    dec.debug_state().0
-                );
-            }
+            // lane-av1oddheightfork2: the `base_eob` rung moved to the end of
+            // the loop body (below). libaom prints its `tag=base_eob` AFTER
+            // that coefficient's own br loop (decodetxb.c:317-338), so the rung
+            // has to carry the POST-br level and rng to be the oracle's twin;
+            // printed here it labelled the pre-br read and every rect unit's
+            // ladder disagreed with aomdec by exactly its br tail.
             v
         } else {
             let ctx = if class == TxClass::TwoD {
@@ -8705,9 +8705,14 @@ fn read_coeffs_rect(
             nz_buf[nz_n] = ((scan_idx as u16) << 4) | level as u16;
             nz_n += 1;
         }
-        if rect_trace {
+        if rect_trace && scan_idx == eob - 1 {
+            // the oracle's `tag=base_eob`: POST-br level, POST-br rng, with the
+            // same `get_lower_levels_ctx_eob` ctx (the same `eob_coeff_ctx`).
+            let ctx = eob_coeff_ctx(scan_idx, w * h);
             let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=base c={scan_idx} pos={pos} level={level} rng={rng}");
+            eprintln!(
+                "EC_COEFF_STEP tag=base_eob c={scan_idx} pos={pos} ctx={ctx} level={level} rng={rng}"
+            );
         }
     }
     if rect_trace {
@@ -8735,6 +8740,17 @@ fn read_coeffs_rect(
         } else {
             level
         };
+        if rect_trace {
+            // lane-av1oddheightfork2: the twin of the square reader's
+            // `coeff_step_post_golomb`. The oracle's `EC_COEFF_STEP
+            // tag=post_golomb` (decodetxb.c, after read_golomb) fires for a RECT
+            // unit exactly as it does for a square one, but this reader had no
+            // rung for it, so every rect unit's ladder was one step short and
+            // the pairing had to guess whether a golomb had been read. This
+            // rung reads no bits: it prints the state after the read it labels.
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_STEP tag=post_golomb c={} pos={pos} level={level} rng={rng}", (packed >> 4));
+        }
         grid[pos] = if negative { -level } else { level };
     }
     // lane-d792: the rect unit's LEVEL grid in row-major (w) order, the
@@ -29991,22 +30007,24 @@ fn read_block_tx_size_rect(
         hit!(RECT_INTER_TU_HITS);
         return Ok(None);
     }
-    let ctx = txfm_partition_ctx_rect(
-        n.above_txfm[at_mi.1],
-        n.left_txfm[at_mi.0],
-        bw.max(bh),
-        tx_w,
-        tx_h,
-    );
+    // lane-av1oddheightfork2: `above_px` / `left_px` are the two
+    // `TXFM_CONTEXT` inputs of `txfm_partition_ctx_rect`, i.e. the exact
+    // operands of libaom's `*above_ctx < txw` / `*left_ctx < txh`
+    // (av1_common_int.h:1750-1753). They are printed so a ctx disagreement
+    // with aomdec's `EC_VARTX` rung names WHICH neighbour is wrong instead of
+    // only the arithmetic difference. Trace-only; reads no bits.
+    let (above_px, left_px) = (n.above_txfm[at_mi.1], n.left_txfm[at_mi.0]);
+    let ctx = txfm_partition_ctx_rect(above_px, left_px, bw.max(bh), tx_w, tx_h);
     let split = dec.symbol(&mut cdfs.txfm_partition[ctx]) == 1;
     hit!(TXFM_SPLIT_READS);
     if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
         let (rng, _) = dec.debug_state();
         eprintln!(
-            "EC_ISTEP mi_row={} mi_col={} name=txfm_split_rect val={} ctx={ctx} rng={rng}",
+            "EC_ISTEP mi_row={} mi_col={} name=txfm_split_rect val={} ctx={ctx} above={above_px} left={left_px} maxblk={} tx={tx_w}x{tx_h} rng={rng}",
             at_mi.0,
             at_mi.1,
-            u8::from(split)
+            u8::from(split),
+            bw.max(bh),
         );
     }
     if !split {
