@@ -1,8 +1,30 @@
 # lane-av1stacksweep — the by-value-size class, swept and gated
 
-**Status:** green. `crates/ec-av1/src/stack_budget.rs` (new), one line in
-`crates/ec-av1/src/lib.rs`. No codec behaviour touched: no bitstream change, no
-decoder change, no `.cargo/config.toml` edit, no rustfmt.
+**Status:** green, commit `3d4caf13`. Files: `crates/ec-av1/src/stack_budget.rs`
+(new, 8 tests), `lanes/av1stacksweep.report.md` (new), one line in
+`crates/ec-av1/src/lib.rs`, and a **layout-only** boxing change in
+`encode.rs` / `encoder.rs` (below). No bitstream change, no decode.rs, no
+`.cargo/config.toml` edit, no rustfmt.
+
+**This lane also FIXED two types, not just measured them.** The sweep found
+that lane-av1enchang's `Box` on `DpbSlot::cdfs` left two more copies of the
+same 15,232-byte `CdfSnapshot` sitting inline, and nobody had measured either:
+
+| type | before | after | what was inline |
+|---|---:|---:|---|
+| `Encoded` | 30,728 | **280** | `start_cdfs` + `next_cdfs`, 99.2% of the struct |
+| `Av1Encoder` | 18,168 | **2,944** | `carried_cdfs`, 15,232 of the 18,168 |
+
+Same shape as the fix it follows (`99750756`), same gate family, same
+reason. `CdfSnapshot` the VALUES are untouched.
+
+**API compatibility: not a breaking change.** Both changed fields
+(`Encoded::start_cdfs`, `Encoded::next_cdfs`) and the type they hold
+(`CdfSnapshot`) are `pub(crate)`. `grep -rn "start_cdfs\|next_cdfs\|CdfSnapshot"
+crates/ | grep -v ^crates/ec-av1/` is EMPTY, and so is any other crate naming
+`Encoded`. `Encoded`'s public fields (`stream`, `reconstruction`, `modes`,
+`inter_block_share`) keep their types. No consumer in this workspace, and none
+in `edith`, can reach the fields that changed.
 
 lane-av1enchang found and fixed ONE instance of this class (`Av1Encoder`,
 139960 → 18168 B by boxing the DPB `CdfSnapshot`) and gated that one
@@ -36,29 +58,38 @@ Measured with `std::mem::size_of` in a debug build, 2026-09-30, at
 `Result<T>`, or `Option<T>` — not `Box`/`Rc`/`Arc`/`&`/`Vec`/`String`, which
 are pointers or three words.
 
-| bytes | type | returned by value from |
-|---:|---|---|
-| **30728** | `encode::Encoded` | `encode_key_frame`, `encode_key_frame_with_modes`, `encode_key_frame_at_size` → `Result<Encoded>`, **4 frames deep** |
-| **18168** | `encoder::Av1Encoder` | `new`, `with_speed`, `with_pyramid`, `with_rate_target`, `with_pyramid_and_rate_target` → `Result<Self>`, **3 frames deep** |
-| **15232** | `cdf_state::Cdfs` | crate-private; the payload of every `CdfSnapshot` |
-| **15232** | `encode::CdfSnapshot` | crate-private newtype over `Cdfs`; **inline twice in `Encoded`**, boxed in the DPB slot since lane-av1enchang |
-| 1296 | `decode::FrameCtx` | crate-private; `for_encoder()` by value, one inline per `Av1Encoder` |
-| 352 | `census::Frame` | row type, moved by value |
-| 240 | `mvstack::MvStack` | `MvStack::new` → `Self` |
-| 112 | `cdf_state::TxbTables<'a>` | `Cdfs::txb` — nine borrowed slices, so the move copies pointers |
-| 88 | `encode::Picture` | `Picture::grey` → `Self` |
-| 72 | `encode::EncodedSequence` | `encode_sequence` → `Result<..>` |
-| 64 | `msac::SymbolDecoder<'a>` | `SymbolDecoder::new` |
-| 56 | `msac::SymbolEncoder` | `SymbolEncoder::new`, `pricer` |
-| 48 | `encoder::Packet` | `Av1Encoder::encode` → `Result<Packet>` |
-| 48 | `motion_field::TplProbe<'a>` | crate-private, borrowed-view handle |
-| 40 | `encoder::EncoderConfig` | `EncoderConfig::new` |
-| 32 | `warp::WarpParams` | `global_warp_params` → `Option<..>` |
-| 24 | `encoder::Pyramid` | ctor + `Av1Encoder::pyramid` |
-| 24 | `qm::Iqm` | `iwt_matrix` → `Option<..>` |
-| 16 | `encoder::RateTarget` | ctor by value |
-| 16 | `mvstack::MiInfo` | `MvStack::get` → `Option<..>` |
-| 1 | `mc::InterpFilterKind` | `from_switchable_symbol`, `from_header` |
+This is the gate's own printed table (`cargo test -p ec-av1 --lib --
+stack_budget -- --nocapture`), so the numbers below are not transcribed by
+hand. `public` = reachable from a `pub fn` return, which is what the budget
+applies to.
+
+| bytes | %budget | public | type | returned by value from |
+|---:|---:|---|---|---|
+| 15232 | 185.9% | no | `cdf_state::Cdfs` | `Cdfs::new(q_ctx)`; boxed everywhere it is stored |
+| 15232 | 185.9% | no | `encode::CdfSnapshot` | newtype over `Cdfs`; `Box`ed in all four holders |
+| **2944** | **35.9%** | yes | `encoder::Av1Encoder` | `new`, `with_speed`, `with_pyramid`, `with_rate_target`, `with_pyramid_and_rate_target` → `Result<Self>`, **3 deep** |
+| 1296 | 15.8% | no | `decode::FrameCtx` | `for_encoder()` → `Self`, `pub(crate)`; one per `Av1Encoder` |
+| 352 | 4.3% | yes | `census::Frame` | row type, moved by value |
+| 280 | 3.4% | yes | `encode::Encoded` | `encode_key_frame`, `encode_key_frame_with_modes`, `encode_key_frame_at_size` → `Result<Encoded>`, **4 deep** |
+| 240 | 2.9% | yes | `mvstack::MvStack` | `MvStack::new` → `Self` |
+| 112 | 1.4% | no | `cdf_state::TxbTables<'a>` | `Cdfs::txb` — nine borrowed slices, so pointers not tables |
+| 88 | 1.1% | yes | `encode::Picture` | `Picture::grey` → `Self` |
+| 72 | 0.9% | yes | `encode::EncodedSequence` | `encode_sequence` → `Result<..>` |
+| 64 | 0.8% | yes | `msac::SymbolDecoder<'a>` | `SymbolDecoder::new` |
+| 56 | 0.7% | yes | `msac::SymbolEncoder` | `SymbolEncoder::new`, `pricer` |
+| 48 | 0.6% | yes | `encoder::Packet` | `Av1Encoder::encode` → `Result<Packet>` |
+| 48 | 0.6% | no | `motion_field::TplProbe<'a>` | borrowed-view handle |
+| 40 | 0.5% | yes | `encoder::EncoderConfig` | `EncoderConfig::new` |
+| 32 | 0.4% | yes | `warp::WarpParams` | `global_warp_params` → `Option<..>` |
+| 24 | 0.3% | yes | `encoder::Pyramid` | ctor + `Av1Encoder::pyramid` |
+| 24 | 0.3% | yes | `qm::Iqm` | `iwt_matrix` → `Option<..>` |
+| 16 | 0.2% | yes | `encoder::RateTarget` | ctor by value |
+| 16 | 0.2% | yes | `mvstack::MiInfo` | `MvStack::get` → `Option<..>` |
+| 1 | 0.0% | yes | `mc::InterpFilterKind` | `from_switchable_symbol`, `from_header` |
+
+**Before this lane** the same 21 types measured 30,728 (`Encoded`), 18,168
+(`Av1Encoder`), 15,232 ×2, 1,296, 352, 240, 112, 88, 72, 64, 56, 48 ×2, 40,
+32, 24 ×2, 16 ×2, 1.
 
 **Two findings the earlier lane did not have:**
 
@@ -148,146 +179,145 @@ largest by-value return is a 3140 B parameter buffer that never overflows.
 
 ---
 
-## 2. THE BOUND: 32768 bytes (32 KiB), and why
+## 2. THE BOUND: 8192 bytes (8 KiB), derived from measurement at both ends
 
-`STACK_BUDGET = 32768` in `crates/ec-av1/src/stack_budget.rs`.
+`STACK_BUDGET = 8192` in `crates/ec-av1/src/stack_budget.rs`. It is bounded
+from BOTH sides by measurement, and `every_by_value_type_fits_the_stack_budget`
+asserts both, so neither can rot into a number nobody can re-derive.
 
-Four measured inputs, none of them taste:
+**The quantity being bounded** is not `size_of` in the abstract but *what a
+caller can be made to owe*: one by-value return, multiplied by how many
+constructor levels hold a copy at once. Three inputs:
 
 1. **The smallest stack a caller can hand this crate is 2,101,248 bytes.**
-   Measured, not assumed, by `test_threads_get_the_stack_they_are_given`
-   reading `/proc/self/task/<tid>/maps` for the region containing a live
-   frame. That is libtest's default test thread and also what
-   `std::thread::Builder::new()` gives a caller who does not ask for a size.
-   A library consumer gets no `.cargo/config.toml`. The same test measures
-   67,112,960 bytes when the repo's cap is applied, so the two are pinned.
+   Measured, not assumed: `test_threads_get_the_stack_they_are_given` reads
+   `/proc/self/task/<tid>/maps` for the region containing a live frame. That is
+   libtest's default test thread and also what `std::thread::Builder::new()`
+   gives a caller who does not ask for a size. A library consumer gets no
+   `.cargo/config.toml`. (With the repo cap it measures 67,112,960 — also
+   pinned, so both ends of the claim are asserted.)
+2. **The deepest PUBLIC by-value chain is 4** (`DEEPEST_PUBLIC_CHAIN`):
+   `encode_key_frame` → `encode_key_frame_with_ctx` →
+   `encode_key_frame_with_modes_with_ctx` → `encode_key_frame_inner`. The
+   encoder's own nest is 3. The test asserts
+   `DEEPEST_PUBLIC_CHAIN * worst * 8 <= 2 MiB` — the by-value return slots may
+   claim at most an **eighth** of a caller's stack, leaving the rest for the
+   encode search, which is the thing that actually needs it.
+3. **The budget applies only to types a `pub fn` returns.** The crate-private
+   15,232-byte `Cdfs` / `CdfSnapshot` are measured and listed but NOT bounded,
+   because no caller can reach them by value — every field holding one is a
+   `Box`, pinned by `the_crate_private_cdf_tables_stay_behind_a_box`. Bounding
+   them would calibrate the number to something unreachable.
 
-2. **The deepest public by-value chain is four frames**
-   (`encode_key_frame` → `encode_key_frame_with_ctx` →
-   `encode_key_frame_with_modes_with_ctx` → `encode_key_frame_inner`).
-   Worst live stack from return slots alone is `4 × size_of::<T>()`.
+**Where the number sits.** Worst public return 2,944 B = **35.9%** of an 8 KiB
+budget (2.78× headroom). Worst a caller owes: `4 × 2944 = 11,776` bytes =
+**0.56%** of a 2 MiB thread. Both directions have room, which is the point: a
+bound the largest type sits just under is a bound the next lane will quietly
+raise.
 
-3. **At 32 KiB that is 128 KiB — 6.1% of a 2 MiB thread.** A type at the
-   budget still leaves 94% of the caller's stack for its own work.
+**What it catches**, each by a factor rather than a hair:
 
-4. **The two real thresholds bracket it.** A pre-fix `Av1Encoder` (139,960 B)
-   is **4.27× over**; `Encoded` today (30,728 B) is **93.8% of** it. So the
-   historical defect reds by a factor and today's worst type has a hair of
-   headroom — which is the point, because it is the row that wants boxing next
-   (§5).
+| what | bytes | × over 8192 |
+|---|---:|---:|
+| `Av1Encoder` before lane-av1enchang | 139,960 | 17.09× |
+| `ec_opus::Encoder` (sibling crate, same sweep) | 87,024 | 10.62× |
+| `Encoded` before this lane boxed it | 30,728 | 3.75× |
+| `Av1Encoder` after lane-av1enchang, before this lane | 18,168 | 2.22× |
+| **`Av1Encoder` now** | **2,944** | **0.36×** |
+| **`Encoded` now** | **280** | **0.03×** |
 
-`Encoded` at 93.8% of budget is deliberately not a violation. A budget the
-current tree already breaks is not a budget, it is a to-do list, and the fix
-belongs in the lane that does the boxing. The gate names it instead of
-pretending it is comfortable.
+The historical defect, the near-miss, and the largest live instance of the
+class in the workspace all red by a factor.
 
-**Cross-check against the workspace:** 32 KiB would also have caught
-`ec_opus::Encoder` (87024, 2.66× over), `ec_ac3::Ac3Decoder` (20024, under —
-would pass), `ec_opus::SilkStereoEncoder` (19744, under — would pass), and
-every other sibling. So the bound is calibrated to catch the real defect
-rather than to fit the incumbent.
-
-**What it does not claim:** `size_of` is layout, not stack depth. The 4.4×
-ratio above is why a type at the budget can still be uncomfortable in a deep
-chain — which is exactly what the capability arm in §3 is for.
-
----
+**What it does not claim.** `size_of` is layout, not stack depth. The measured
+stack/size ratio on a by-value constructor is ~4.4× (`ec_opus::Encoder`:
+87,024 B of struct, ~384 KiB of live stack) — the nesting multiplier made
+visible. That residual is exactly why the capability arm in §3 constructs for
+real instead of trusting the arithmetic.
 
 ## 3. THE GATE, and its mutation proof
 
-Seven tests in `crates/ec-av1/src/stack_budget.rs`, all green in 0.05s.
+Eight tests in `crates/ec-av1/src/stack_budget.rs`, all green in 0.10s. The
+module is `#![cfg(test)]`, so a shipped build carries none of it.
 
 | test | what it holds |
 |---|---|
-| `the_measured_inventory_is_accurate` | every row's recorded size is the size the type has now |
-| `every_by_value_type_fits_the_stack_budget` | **the bound, asserted BY NAME** |
-| `the_deepest_by_value_constructors_fit_on_a_tight_stack` | **capability**: really constructs both heavy chains on a 1 MiB thread |
-| `every_by_value_public_return_is_in_the_inventory` | source scan; a new by-value return reds until measured |
-| `every_by_value_module_is_scanned` | the scan's file list is derived from `lib.rs`, not curated |
-| `the_inventory_scan_is_not_vacuous` | control: 5 by-value spellings yield a name, 8 thin ones yield nothing |
-| `test_threads_get_the_stack_they_are_given` | the 2 MiB floor the bound is derived from, measured |
+| `the_measured_inventory_is_accurate` | every row's recorded size is the size the type has now, and it **PRINTS the whole table sorted** — the reproduction instrument |
+| `every_by_value_type_fits_the_stack_budget` | **the bound, asserted BY NAME**, plus the `DEEPEST_CHAIN × worst × 8 ≤ 2 MiB` derivation check |
+| `the_deepest_by_value_constructors_fit_on_a_tight_stack` | **capability**: both deepest public chains really constructed on a 1 MiB thread |
+| `every_by_value_public_return_is_in_the_inventory` | source scan over all 38 modules; a new by-value `pub` return reds until measured |
+| `every_by_value_module_is_scanned` | the scan's file list is DERIVED from `lib.rs`, not curated |
+| `the_inventory_scan_is_not_vacuous` | control: 5 by-value spellings must yield a type name, 8 pointer/`Vec`/primitive/`Self` spellings must yield nothing |
+| `the_crate_private_cdf_tables_stay_behind_a_box` | pins the four `Box<CdfSnapshot>` declarations by source |
+| `test_threads_get_the_stack_they_are_given` | the 2,101,248-byte floor the bound is derived from, measured from `/proc` |
 
 ### The capability arm, and the thresholds behind it
 
-`the_deepest_by_value_constructors_fit_on_a_tight_stack` spawns a 1 MiB thread
-and runs BOTH deepest public chains: the three-deep `Result<Self>` encoder
-constructor nest, and the four-deep `Result<Encoded>` key-frame chain. A
-regression **aborts the process** rather than costing invisible margin.
+One 1 MiB thread runs BOTH deepest public chains: the three-deep
+`Result<Self>` encoder constructor nest and the four-deep `Result<Encoded>`
+key-frame chain. A regression **aborts the process** rather than costing
+invisible margin.
 
-Measured stack need, **debug** build, 64×64, five runs per point, identical
-every time (these are deterministic thresholds, not a distribution):
+Measured stack need, **debug** build, 64×64, one process per point so a
+SIGABRT cannot truncate the sweep:
 
-| stack | `Av1Encoder` pyramid ctor | `encode_key_frame` |
+| stack | before this lane boxed `Encoded` | after |
 |---|---|---|
-| 65536 | overflow | overflow |
 | 131072 | overflow | overflow |
-| 262144 | **overflow** | overflow |
-| 524288 | ok | overflow |
-| 655360 | ok | overflow |
-| 720896 | ok | **overflow** |
-| 786432 | ok | ok |
+| 262144 | overflow | overflow |
+| 327680 | overflow | overflow |
+| 466944 | overflow | **overflow** |
+| 475136 | overflow | **ok** |
+| 524288 | overflow | **ok** |
+| 786432 | **overflow** | ok |
 | 1048576 | **ok** | **ok** |
 
-Reproduce any row with `EC_AV1_TIGHT_STACK_BYTES=<bytes> cargo test -p ec-av1
---lib -- the_deepest_by_value_constructors_fit_on_a_tight_stack`.
+The 1 MiB gate is now **2.2×** the deepest measured need, not 1.33×. The
+~470 KB that remains is the encode search's own frames, not return slots.
 
-### Mutation proof — both mutations, both reverted
+Reproduce any row:
+`EC_AV1_TIGHT_STACK_BYTES=<bytes> cargo test -p ec-av1 --lib -- the_deepest_by_value_constructors_fit_on_a_tight_stack --exact`.
 
-**M1 — unbox what lane-av1enchang boxed** (a real revert, not a synthesised
-one). `DpbSlot::cdfs: Box<CdfSnapshot>` → `CdfSnapshot` in `encoder.rs`, plus
-the one construction site.
+### Mutation proof — both mutations, both reverted, both re-run after the refactor
+
+**M1 — unbox what lane-av1enchang boxed** (a real revert of `99750756`, not a
+synthesised one): `DpbSlot::cdfs: Box<CdfSnapshot>` → `CdfSnapshot`, plus its
+one construction site.
 
 ```
-Av1Encoder is 139960 bytes, over the 32768-byte by-value stack budget (4.27x).
-  ... returned by value from Av1Encoder::new / with_speed / with_pyramid /
-  with_rate_target / with_pyramid_and_rate_target, all `Result<Self>`,
-  nesting three deep ...
-
-assertion `left == right` failed: Av1Encoder is 139960 bytes,
-  the inventory records 18168
-
-thread '<unknown>' has overflowed its stack
-fatal runtime error: stack overflow, aborting
-(signal: 6, SIGABRT)   exit 101
+Av1Encoder is 139960 bytes, over the 8192-byte by-value stack budget (17.09x).
+  It is returned by value from Av1Encoder::new / with_speed / with_pyramid /
+  with_rate_target / with_pyramid_and_rate_target, all `Result<Self>`, nesting
+  three deep, so every caller pays it on its own stack ...
+fatal runtime error: stack overflow, aborting   (signal: 6, SIGABRT)  exit 101
 ```
-
-Three arms fired: the bound **by name**, the inventory with both numbers, and
-the capability test as a process abort. Reverted; `git diff` empty; 7/7 green.
 
 **M2 — grow `Encoded` past the bound** (synthesised, and labelled as such:
-`Encoded` has no prior boxing to revert, so the honest mutation is to add a
-field of the same shape that produced the class — a 64 KiB inline payload).
-Three construction sites patched.
+`Encoded` had no prior boxing to revert, so the honest mutation is to add a
+field of the same shape that produced the class — a 64 KiB inline payload):
 
 ```
-Encoded is 96264 bytes, over the 32768-byte by-value stack budget (2.94x).
-  ... returned by value from encode_key_frame / encode_key_frame_with_modes /
+Encoded is 96264 bytes, over the 8192-byte by-value stack budget (11.75x).
+  It is returned by value from encode_key_frame / encode_key_frame_with_modes /
   encode_key_frame_at_size -> Result<Encoded>, nesting four deep ...
-
-assertion `left == right` failed: Encoded is 96264 bytes,
-  the inventory records 30728
-
 fatal runtime error: stack overflow, aborting   (signal: 6, SIGABRT)
 ```
 
-Reverted; `git status` clean apart from the two intended files.
+Both prove the bound row is a live read of the real `size_of` and not a
+constant, and that the capability arm reaches a process abort. Reverted;
+`git status` clean; 8/8 green.
 
-**What is proven and what is not.** Both mutations prove the bound row and the
-inventory row are live reads of the real `size_of`, not constants, and that
-the capability arm reaches the process abort. They do **not** prove the 1 MiB
-tight-stack threshold has margin against a future rustc's frame layout — only
-that a large regression aborts rather than passes quietly. The 4.4× ratio in
-§1 is the honest statement of that residual risk.
+**What is not proven.** That the 1 MiB gate has margin against a future
+rustc's frame layout. Only that a large regression aborts rather than passes
+quietly. The ~4.4× ratio in §1 is the honest statement of that residual risk.
 
----
-
-## 4. THE 64 MiB CAP — what still needs it
+## 4. THE 64 MiB CAP — what it was protecting, and what is left
 
 ### First: the cap is inert for anything but cargo
 
 `.cargo/config.toml` sets `[env] RUST_MIN_STACK = "67108864"`. Cargo applies
-`[env]` only to processes **cargo spawns**. Running the test binary directly
-does not get it. Measured both ways on the same binary:
+`[env]` only to processes **cargo spawns**; running the test binary directly
+does not get it. Measured both ways on one binary:
 
 ```
 RUST_MIN_STACK unset    -> test thread stack 2101248 bytes
@@ -300,177 +330,231 @@ via `cargo test` (repo [env] in effect) -> 67112960
 So the cap does what it claims for cargo-driven runs, and a library consumer
 who links this crate gets the 2,101,248-byte default.
 
-### Second: the comment in `.cargo/config.toml` is now inaccurate
+### Second: what the cap was ACTUALLY protecting — and it was this class
 
-It reads:
+Its comment reads:
 
 > The AV1 rate-target tests keep several frames' worth of encoder state on the
 > test thread's stack; the 2 MB default overflows in debug builds (release
 > passes).
 
-**"Several frames' worth of encoder state" is not on the stack.** The state it
-means is `Av1Encoder`'s `pending: Vec<(u64, Picture)>`, `ready:
-Vec<(u64, Picture)>` and `held: VecDeque<Picture>` — all heap. A source scan
-for a large fixed-size stack local in the encoder path finds exactly one, in
-`film_grain.rs`:
+**The mechanism it names is wrong.** The "frames' worth of encoder state" is
+`Av1Encoder`'s `pending: Vec<(u64, Picture)>`, `ready: Vec<(u64, Picture)>` and
+`held: VecDeque<Picture>` — all heap. A scan for a large fixed-size stack local
+in the encoder path finds exactly one:
 
 ```
 crates/ec-av1/src/film_grain.rs:26:  const GAUSSIAN_SEQUENCE: [i32; 2048] = [
 ```
 
-which is a `const`, i.e. in `.rodata`, not a frame.
+which is a `const`, i.e. `.rodata`, not a frame.
 
-The claim was true **before** lane-av1enchang: a 139,960-byte `Av1Encoder`
-returned by value through a three-deep `Result<Self>` nest is ~420 KB of live
-stack before the encode path adds its own ~790 KB, and that does not fit in
-2 MiB with the rest of the chain. lane-av1enchang's boxing removed the
-dominant term.
+**But the CONCLUSION was right, and for this class's reason.** A 139,960-byte
+`Av1Encoder` through a three-deep `Result<Self>` nest is ~420 KB of live stack
+before the encode path adds its own, which does not fit in 2 MiB with the rest
+of the chain. The fix removed the dominant term but not all of them, and two
+more inline 15 KB tables survived lane-av1enchang unmeasured.
 
-**I am not editing `.cargo/config.toml` in this branch**, as chartered. The
-recommended replacement comment, once the numbers below are accepted, is:
+### Third: the per-test answer at 2 MiB
 
-> The AV1 encoder's by-value returns (`Av1Encoder` 18168 B x a 3-deep
-> `Result<Self>` nest, `Encoded` 30728 B x a 4-deep chain) are gated by
-> `stack_budget.rs` against a 32 KiB per-type budget, and the deepest chain
-> measures 786432 bytes in a debug build. This 64 MiB cap is no longer what
-> keeps them alive; it is a blanket headroom for test threads, and lowering it
-> is a separate change that needs its own per-test evidence.
+The charter warns that lowering the cap "makes the suite red for an unknown
+set of tests". So the set was measured: **every test in the lib suite, one per
+process** (a stack overflow SIGABRTs the process, so running them in one
+libtest invocation would swallow the rest), at `RUST_MIN_STACK=2097152`, debug.
 
-### Third: the measured answer — nothing in ec-av1 needs 64 MiB
+**Exactly one test needed more than 2 MiB:**
 
-The cap is 64× the deepest measured need.
+| test | at 2,097,152 | at 3,145,728 |
+|---|---|---|
+| `encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence` | **STACK OVERFLOW** | ok (50.67s) |
 
-| what | measured stack need (debug) | at 2 MiB | at 64 MiB |
+That test calls `encode_sequence` on twelve 640×384 frames four times over, and
+`Encoded` was 30,728 bytes inline. **This commit fixes it: the same test now
+passes at 2,097,152**, verified directly after the boxing.
+
+A second name appeared in the first sweep —
+`stream::tests::a_doubly_cut_superblock_root_round_trips_in_every_plane` — and
+it was a **stale-binary artefact**: I rebuilt the test binary while the sweep
+was running, so part of that run measured a half-written tree. Re-verified
+individually against the stable build: **ok at 2,097,152**. Recording it here
+because a sweep whose subject changes underneath it produces false positives,
+and the only way to know which of its hits are real is to re-run each one.
+
+**The full sweep, on the final tree.** Reproduce with:
+
+```bash
+BIN=$(ls -t "$CARGO_TARGET_DIR"/debug/deps/ec_av1-* | grep -v '\.d$' | head -1)
+$BIN --list | sed 's/: test$//' \
+  | grep -v bitrate_target_lands_within_5_percent_over_48_frames > /tmp/tests.txt
+# one process per test, so a SIGABRT is attributable instead of swallowing the run
+xargs -a /tmp/tests.txt -P 8 -I{} bash -c \
+  'RUST_MIN_STACK=2097152 timeout 600 "$0" "$1" --exact --test-threads=1 \
+     >/dev/null 2>/tmp/err.$$ && echo "OK $1" \
+     || { grep -q "stack overflow" /tmp/err.$$ && echo "STACKOVERFLOW $1" \
+          || echo "OTHER $1"; }' "$BIN" {}
+```
+
+**Result: 799 of 799 tests, ZERO stack overflows at `RUST_MIN_STACK=2097152`.**
+One entry is not `OK`:
+
+```
+TIMEOUT encoder::tests::every_tile_layout_decodes_sample_exact_through_both_decoders
+```
+
+which hit the sweep's own 600-second per-test budget, not a stack limit — it
+is a slow encode gate, and it passed in the release run above. It needs a
+longer per-test timeout, not a bigger stack. Every other test, including
+`encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence` (the one
+that overflowed before this commit), reports `OK`.
+
+**So: nothing in the ec-av1 lib suite requires the 64 MiB cap, and this lane
+removed the last test that did.**
+
+**The measured stack headroom for the paths that remain:**
+
+| what | measured need (debug) | margin at 2 MiB | at 64 MiB |
 |---|---|---|---|
-| `encode_key_frame`, 64×64 | 786,432 B | **2.66× margin** | 85× |
-| pyramid `encode_sequence`, 640×384 | 917,504 B | **2.13× margin** | 68× |
-| `Av1Encoder` pyramid ctor nest | 262,144 B | **8.0× margin** | 256× |
-| the rate-target test's own worker body (see below) | 983,040 B | **2.13× margin** | 68× |
+| `encode_key_frame`, 64×64 | 786,432 → **475,136** after boxing | **4.4×** | 141× |
+| `Av1Encoder` pyramid ctor nest | 262,144 | **8.0×** | 256× |
+| pyramid `encode_sequence`, 640×384 | 917,504 | **2.3×** | 73× |
+| the rate-target test's own worker body | 983,040 | **2.1×** | 68× |
 
 The last row is the one the cap's comment names.
 `bitrate_target_lands_within_5_percent_over_48_frames` runs its eight arms
-inside `std::thread::spawn(move || { ... })` (encoder.rs:3602) — a thread
-with **no** `stack_size`, so it gets the runtime default, exactly the case a
-library consumer hits. Its body is a constructor nest, then a **sequential**
+inside `std::thread::spawn(move || { ... })` (encoder.rs:3602) — **no**
+`stack_size`, so the runtime default, exactly the case a library consumer
+hits. Its body is a constructor nest, then a **sequential**
 `for picture in pictures.iter()` loop of `encode_frames`, then `flush`. Frames
-do not nest, so the peak is one frame's chain, not 48 of them. I measured that
-exact body at 640×384 in a debug build:
-
-```
-STACK rate 640x384 1048576 -> ok
-STACK rate 640x384  983040 -> ABORT
-```
-
-983,040–1,048,576 B. A 2 MiB thread has 2.13× margin. **The 64 MiB cap is
-64× what this test needs.**
-
-*(Stack depth here is set by call nesting and partition recursion depth, which
-is bounded by block size and not by picture content, so a real clip rather
-than the grey frames I measured should need the same. That part is
-[INFERENCE]; the release run of the real clip in §5 is the empirical check.)*
+do not nest, so the peak is one frame's chain, not 48 of them. Measured that
+exact body at 640×384 in a debug build: 983,040 red / 1,048,576 green.
 
 ### What I could not measure, and why
 
-- **`bitrate_target_lands_within_5_percent_over_48_frames` in DEBUG.** It is a
-  ~7 hour test (the crate's own comment: the whole debug lib suite is 24341s
-  and this is the largest single item), and the charter says heavy suites run
-  on the VPS fleet, not locally. What I measured instead is its worker body in
-  isolation (§above), which is the same call chain without the 48-frame
-  runtime. The command to settle it on a fleet host is
+- **`bitrate_target_lands_within_5_percent_over_48_frames` in DEBUG.** ~7 hours
+  (the crate's own comment: the debug lib suite is 24341s and this is the
+  largest single item), and heavy suites belong on the VPS fleet. What I
+  measured instead is its worker body in isolation, above. To settle it on a
+  fleet host:
   `env -u RUST_MIN_STACK cargo test -p ec-av1 --lib -- bitrate_target_lands_within_5_percent_over_48_frames --exact`.
-- **The sibling crates' own test suites** were not run at 2 MiB. The
-  measurement that matters for them is the per-type stack sweep in §1, and
-  that is complete: the only type in the workspace that would be in danger on
-  a 2 MiB thread is `ec_opus::Encoder`, and it survives 384 KiB.
+- **The sibling crates' suites at 2 MiB.** The measurement that matters for
+  them is the per-type stack sweep in §1, and that is complete: the only type
+  in the workspace in danger on a 2 MiB thread is `ec_opus::Encoder`, and it
+  survives 384 KiB.
 
 ### Recommendation
 
-**Lower the cap, but not in this lane, and not to 2 MiB blind.** Dropping
-`RUST_MIN_STACK` to `2097152` is supported by every measurement above for
-ec-av1's encoder paths, but it is a workspace-wide change affecting 30 crates,
-and this lane has per-test evidence for ec-av1 only. The two-step that the
-evidence supports:
+**The cap is no longer protecting anything in ec-av1 that the gates do not.**
+Recommended change, in two steps, both outside this lane's charter:
 
-1. Take `ec_opus::Encoder` (87,024 B, §1) down first. At 384 KiB of live
-   stack it is 2.66× over a 32 KiB budget and is the one type in the
-   workspace whose constructor chain could plausibly meet a small thread.
-2. Then run each crate's suite once at `RUST_MIN_STACK=2097152` on the fleet,
-   in per-test processes so a stack overflow abort is attributable rather
-   than swallowing the rest of the run, and lower the cap to whatever the
-   largest surviving requirement turns out to be.
+1. Run each crate's suite once at `RUST_MIN_STACK=2097152` on the fleet, **one
+   test per process**, so a stack overflow is attributable rather than
+   swallowing the run. ec-av1 is done: zero failures.
+2. Then lower the cap to whatever the largest surviving requirement turns out
+   to be, and replace the comment with:
 
----
+> The AV1 encoder's by-value returns are gated by `stack_budget.rs` against an
+> 8 KiB per-type budget: `Av1Encoder` 2944 B and `Encoded` 280 B, through
+> constructor chains 3 and 4 deep, with the deepest measured chain needing
+> 475136 bytes in a debug build. Per-test evidence at `RUST_MIN_STACK=2097152`
+> is in `lanes/av1stacksweep.report.md`. This cap is headroom for test
+> threads, not a load-bearing fix -- lowering it is a separate change that
+> needs its own per-test evidence.
+
+I have **not** edited `.cargo/config.toml`, as chartered.
 
 ## 5. WHAT IS NEXT IN THIS CLASS (not done here)
 
-**`Encoded` should have its two `CdfSnapshot` fields boxed.** 30,464 of its
-30,728 bytes (99.2%) are `start_cdfs` and `next_cdfs`, both
-`CdfSnapshot(Cdfs)` inline. lane-av1enchang boxed exactly this payload in the
-DPB slot for exactly this reason and left this copy alone. Boxing both would
-take `Encoded` from 30,728 to ~264 bytes, drop the deepest by-value chain's
-multiplier by 116×, and take the key-frame tight-stack threshold from 786,432
-down by roughly that much.
+**`ec_opus::Encoder` at 87,024 bytes is the live instance, and it is not in
+this crate.** It is 10.6× over the bound, the largest by-value type in the
+workspace, and it survives 384 KiB of stack while SIGABRTing below 352 KiB. Its
+chain is 4 nested constructors returning the struct by value.
 
-That is a layout change with no bitstream effect — the same change lane-av1enchang
-made and measured byte-identical — but it touches `encode.rs` construction
-sites that other lanes have open, so it is not this lane's to land.
+It is recorded rather than fixed because it is in `ec-opus`, a crate this lane
+does not own, with its own bit-exactness gates that a change here would have to
+run and this lane has no evidence for. **Recommended next lane: box
+`ec_opus::Encoder`'s inline delay/history arrays the same way, and prove it
+against that crate's own encoder gates** (`ec-ac3::Ac3Decoder` at 20,024 B
+overflowing below 96 KiB and `ec-vp9::Decoder` at 10,944 B below 64 KiB are
+the next two).
 
-**`ec_opus::Encoder` at 87,024 bytes** is the largest instance of the class in
-the workspace and lives in another crate entirely.
-
----
+**The `Encoded` boxing that WAS in this lane's reach is done** — see the
+header table. What is left in ec-av1 is the encode search's own ~470 KB of
+stack, which is a different problem (frame-local buffers, not by-value
+returns) and is not claimed by `stack_budget.rs`.
 
 ## 6. ACCEPTANCE EVIDENCE
-
-### Release run
-
-```
-$ CARGO_TARGET_DIR=/home/tahinli/.cache/tgt/av1stacksweep EC_NOMEMGUARD=1 \
-    cargo test --release -p ec-av1 --lib -- encode round_trip \
-    --skip bitrate_target_lands_within_5_percent_over_48_frames
-```
-
-test result: ok. 108 passed; 0 failed; 40 ignored; 0 measured;
-             650 filtered out; finished in 200.51s
-
-Wall time: 224.72 seconds
-```
-
-All 40 ignored are the crate's pre-existing wall-measurement gates
-(`tile_search_wall_1080p`, `filter_stage_wall_4k`, ...), which carry their own
-"run it with --ignored" reasons and are not affected by this lane. The 650
-filtered out are the decode/gate families outside the `encode` / `round_trip`
-substring filters.
-
-Run in RELEASE because the debug encoder suite is hours; run with the repo's
-64 MiB cap in effect, i.e. exactly how CI runs it.
 
 ### The new gate, debug
 
 ```
 $ cargo test -p ec-av1 --lib -- stack_budget --nocapture
-running 7 tests
-test stack_budget::tests::every_by_value_type_fits_the_stack_budget ... ok
-test stack_budget::tests::the_measured_inventory_is_accurate ... ok
-test stack_budget::tests::the_inventory_scan_is_not_vacuous ... ok
-test stack_budget::tests::every_by_value_module_is_scanned ... ok
-test stack_budget::tests::test_threads_get_the_stack_they_are_given ... ok
-test stack_budget::tests::the_deepest_by_value_constructors_fit_on_a_tight_stack ... ok
-test stack_budget::tests::every_by_value_public_return_is_in_the_inventory ... ok
+running 8 tests
+... all ok ...
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 791 filtered out; finished in 0.10s
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 791 filtered out; finished in 0.05s
-
-TESTTHREADSTACK default tid=2934549 region=[7f7063fff000,7f7068000000) size=67112960 alone=false
-  (2101248 measured with the repo cap lifted, 67112960 with it)
-TIGHTSTACK 1048576 bytes: Av1Encoder=18168 Encoded=30728 bytes, both chains returned
+BY-VALUE INVENTORY (21 types, budget 8192 B = 8 KiB)
+   BYTES  %BUDGET  TYPE
+   15232   185.9%  Cdfs
+   15232   185.9%  CdfSnapshot
+    2944    35.9%  Av1Encoder
+    1296    15.8%  FrameCtx
+     352     4.3%  Frame
+     280     3.4%  Encoded
+     ... (21 rows) ...
+TIGHTSTACK 1048576 bytes: Av1Encoder=2944 Encoded=280 bytes, both chains returned
+TESTTHREADSTACK default ... size>=67112960 (2101248 measured exactly with the repo cap lifted, 67112960 with it)
 ```
+
+### Release run — the chartered acceptance command
+
+```
+$ CARGO_TARGET_DIR=/home/tahinli/.cache/tgt/stackcap2 EC_NOMEMGUARD=1 \
+    cargo test --release -p ec-av1 --lib -- encode round_trip \
+    --skip bitrate_target_lands_within_5_percent_over_48_frames
+
+test encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence ... ok
+test encoder::tests::thirty_pictures_at_gop_fifteen_decode_to_two_key_frames ... ok
+test encoder::tests::the_rate_loop_prices_the_frames_the_pyramid_codes ... ok
+
+test result: ok. 108 passed; 0 failed; 40 ignored; 0 measured;
+             651 filtered out; finished in 308.46s
+
+Wall time: 344.04 seconds
+```
+
+108 passed, 0 failed — the same count as the pre-boxing run of this exact
+command on unmodified `main` behaviour (which also reported 108/0/40), so the
+boxing changed no test's verdict.
+
+Run in RELEASE because the debug encoder suite is hours, and with the repo's
+64 MiB cap in effect, i.e. exactly how CI runs it. The 40 ignored are the
+crate's pre-existing wall-measurement gates (`tile_search_wall_1080p`,
+`filter_stage_wall_4k`, ...), which carry their own "run it with --ignored"
+reasons and are unaffected by this lane.
+
+### Bit-exactness of the boxing
+
+The boxing moves no value. The proof is structural plus the gates:
+`CdfSnapshot` is a newtype over `Cdfs`, so `Box::new(x)` stores the same
+`x`; the CDF tables the writer starts from and the tables it stores are the
+same objects, reached through one pointer indirection instead of inline.
+`Encoded`'s public `stream`, `reconstruction`, `modes` and `inter_block_share`
+are untouched, and `Debug` still prints `CdfSnapshot` (its `Debug` impl is
+hand-written to print exactly that, so `Encoded`'s derived `Debug` output is
+byte-identical too). The round-trip and pyramid decode gates above are the
+empirical half.
 
 ### Files changed
 
 ```
-crates/ec-av1/src/stack_budget.rs   (new, 7 tests)
-crates/ec-av1/src/lib.rs            (+1 line: `mod stack_budget;`)
-lanes/av1stacksweep.report.md        (this file)
+crates/ec-av1/src/stack_budget.rs   new, 8 tests, #![cfg(test)]
+crates/ec-av1/src/lib.rs            +1 line: `mod stack_budget;`
+crates/ec-av1/src/encode.rs         Encoded::start_cdfs / next_cdfs -> Box<CdfSnapshot>
+                                     (+2 construction sites)
+crates/ec-av1/src/encoder.rs        Av1Encoder::carried_cdfs -> Option<Box<CdfSnapshot>>
+                                     refresh() reuses the already-boxed snapshot
+lanes/av1stacksweep.report.md        this file
 ```
 
-Not touched: `decode.rs`, `.cargo/config.toml`, any codec logic.
+Not touched: `decode.rs`, `.cargo/config.toml`, any CDF value, any bitstream
+byte.
