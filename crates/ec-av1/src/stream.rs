@@ -10248,7 +10248,6 @@ pub(crate) mod tests {
         }
         std::path::PathBuf::from("ffmpeg")
     }
-
     /// The instrumented `aomdec` beside the `aomenc` oracle
     /// (`scripts/build-aom-oracle.sh` + `scripts/instrument-aom-oracle.sh`).
     fn aomdec_path() -> std::path::PathBuf {
@@ -10369,9 +10368,13 @@ pub(crate) mod tests {
     /// Returns `(wrong_y, wrong_u, wrong_v, frames_total, frames_exact)`, or
     /// `None` when the two sides are not byte-comparable at all (a size
     /// mismatch, which is a different failure and must not read as "exact").
+    /// `flip` flips ONE bit of the ORACLE's own bytes before comparing, so
+    /// [`the_counting_oracle_diff_detects_one_flipped_oracle_byte`] can prove
+    /// the comparison still reads the oracle on a stream that is now exact.
     fn count_rawvideo_diffs(
         stream: &[u8],
         name: &str,
+        flip: Option<usize>,
     ) -> Option<(usize, usize, usize, usize, usize)> {
         let dir = std::env::temp_dir().join(format!("ec-av1-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -10393,7 +10396,15 @@ pub(crate) mod tests {
             "{name}: the oracle aomdec refused the stream: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let want = std::fs::read(&raw).expect("aomdec rawvideo output");
+        let mut want = std::fs::read(&raw).expect("aomdec rawvideo output");
+        if let Some(i) = flip {
+            assert!(
+                i < want.len(),
+                "{name}: flip index {i} is past the oracle's {} bytes",
+                want.len()
+            );
+            want[i] ^= 0x01;
+        }
         let _ = std::fs::remove_dir_all(&dir);
         let bit_depth = stream_bit_depth(stream, name);
         let decoded = decode_stream(stream).expect("decode for comparison");
@@ -10431,17 +10442,26 @@ pub(crate) mod tests {
         Some((wrong[0], wrong[1], wrong[2], frames, exact))
     }
 
-    /// lane-av1422anom: the non-vacuity test for [`count_rawvideo_diffs`].
+    /// lane-av1422h232: the non-vacuity test for [`count_rawvideo_diffs`].
     ///
     /// A cell-classifying counter that cannot report a difference is worse
-    /// than no counter, because it reports "exact" for everything. This
-    /// proves the counting path fires: it decodes the pinned odd-height 4:2:0
-    /// witness, which is KNOWN to differ from the oracle, and asserts a
-    /// non-zero per-plane count. If a future edit makes the helper return
-    /// zeros for a stream that really does differ, this goes red by name.
+    /// than no counter, because it reports "exact" for everything -- that is
+    /// exactly how lane-av1422remeasure's "18/18 byte-exact" table was
+    /// produced (it compared our own packed samples against the same
+    /// samples, never reading `aomdec`'s output).
+    ///
+    /// It used to lean on the pinned witness DIFFERING to prove the counting
+    /// path fires. That witness is byte-exact now (lane-av1422hrtx fixed the
+    /// 32-point inter chroma `tx_type`), so "it differs" is no longer
+    /// available and a witness-based version of this test would be vacuous by
+    /// construction. Instead this proves the same property directly and
+    /// unconditionally: flipping ONE bit of the ORACLE's own bytes must move
+    /// the count by exactly one, in the plane that bit is in, and knock exactly
+    /// one frame out of `frames_exact`. A comparator that had stopped reading
+    /// the oracle reports the baseline numbers again and fails by name.
     #[test]
-    fn the_counting_oracle_diff_reports_a_real_difference() {
-        const NAME: &str = "the_counting_oracle_diff_reports_a_real_difference";
+    fn the_counting_oracle_diff_detects_one_flipped_oracle_byte() {
+        const NAME: &str = "the_counting_oracle_diff_detects_one_flipped_oracle_byte";
         // lane-av1cmpaudit2: same mutex as every other oracle gate -- this
         // one reads `aomdec_path()`, so it must not overlap a sibling's
         // tampered-oracle run.
@@ -10451,19 +10471,32 @@ pub(crate) mod tests {
             .join("420_oddheight_320x232.obu");
         let data = std::fs::read(&path).expect("the pinned witness is missing");
         let (wy, wu, wv, frames, exact) =
-            count_rawvideo_diffs(&data, NAME).expect("the two sides must be byte-comparable");
-        assert!(
-            wy + wu + wv > 0,
-            "{NAME}: the pinned witness differs from `aomdec --rawvideo`, so a correct \
-             comparison MUST report a non-zero count -- reporting zero here means the \
-             comparison stopped reading the oracle's bytes"
+            count_rawvideo_diffs(&data, NAME, None).expect("the two sides must be byte-comparable");
+        assert_eq!(
+            (wy, wu, wv, exact),
+            (0, 0, 0, frames),
+            "{NAME}: the pinned witness must decode byte-exactly against `aomdec --rawvideo`"
         );
-        assert!(
-            exact < frames,
-            "{NAME}: at least one frame of the pinned witness is not byte-identical to \
-             the oracle, so frames_exact must be below the frame count"
-        );
-        eprintln!("{NAME}: witness reports Y={wy} U={wu} V={wv}, frames_exact={exact}/{frames}");
+        // Frame 0 byte 0 is luma; byte 90_000 is inside frame 0's chroma.
+        for (idx, plane) in [(0usize, 0usize), (90_000, 1)] {
+            let (wy, wu, wv, _, exact) = count_rawvideo_diffs(&data, NAME, Some(idx))
+                .expect("the two sides must be byte-comparable");
+            let got = [wy, wu, wv];
+            assert_eq!(
+                got.iter().sum::<usize>(),
+                1,
+                "{NAME}: flipping oracle byte {idx} must report exactly ONE wrong sample \
+                 across all planes -- got {got:?}. Reporting the unflipped numbers means \
+                 the comparison stopped reading the oracle's bytes"
+            );
+            assert_eq!(got[plane], 1, "{NAME}: byte {idx} is in plane {plane}");
+            assert_eq!(
+                exact,
+                frames - 1,
+                "{NAME}: one flipped byte spoils one frame"
+            );
+        }
+        eprintln!("{NAME}: baseline exact, each flipped oracle byte reported as exactly 1");
     }
 
     /// lane-av1cmpaudit2: the permanent CONTROL for the class
@@ -10536,8 +10569,9 @@ pub(crate) mod tests {
                 (1, 0),
                 "{NAME}: arm 1 expects one decode-order frame and no hidden frames"
             );
-            let (wy, wu, wv, n, exact) = count_rawvideo_diffs(&stream, "oracle-control-arm1-count")
-                .expect("arm 1: the two sides must be byte-comparable");
+            let (wy, wu, wv, n, exact) =
+                count_rawvideo_diffs(&stream, "oracle-control-arm1-count", None)
+                    .expect("arm 1: the two sides must be byte-comparable");
             assert_eq!(
                 (wy, wu, wv),
                 (0, 0, 0),
@@ -10632,7 +10666,7 @@ exit 0
                 decode_all_frames_vs_oracle(&stream, "oracle-control-arm2-alldumps");
             });
             let count_red = {
-                let counted = count_rawvideo_diffs(&stream, "oracle-control-arm2-count")
+                let counted = count_rawvideo_diffs(&stream, "oracle-control-arm2-count", None)
                     .unwrap_or_else(|| {
                         panic!(
                             "{NAME}: a single flipped oracle byte must NOT change the buffer \
@@ -11070,28 +11104,32 @@ exit 0
         );
     }
 
-    /// lane-av1422anom: the odd-frame-HEIGHT 4:2:0 reconstruction defect,
-    /// pinned and ratcheted.
+    /// lane-av1422chrtx: the odd-frame-HEIGHT 4:2:0 witness, pinned and now
+    /// EXACT (lane-av1422anom had pinned it as a ratchet on its own defect).
     ///
     /// This is NOT a 4:2:2 cell and needs no bypass -- it is ordinary 4:2:0,
-    /// reachable by any user today. The 320x232 stream (luma height 232, i.e.
-    /// not the 240 that every existing 4:2:0 fixture happens to use)
-    /// reconstructs 17658 chroma samples wrongly out of 593920, in 3 of 16
-    /// shown frames, and the wrong samples are present in the decoder's own
-    /// `EC_AV1_PREFILT_DUMP` -- the post-reconstruction, PRE-loop-filter
-    /// stage -- so deblock, CDEF and loop restoration are all exonerated.
-    /// The 4:2:0 controls at heights 240 and 242 are byte-exact, so it is the
-    /// height, not the width, and not "odd" in the mod-2 sense (232 and 248
-    /// are both even and both fail).
+    /// reachable by any user. lane-av1422anom pinned it as a RATCHET asserting
+    /// its own measured defect `(0, 200, 17658)`, and said whoever fixed it
+    /// must flip that to exactness. That is done, and the flip is the
+    /// deliverable:
     ///
-    /// The gate is a RATCHET, not an exactness gate: it pins the measured
-    /// wrong-sample counts, so the defect cannot change silently, and whoever
-    /// fixes it is forced to update these numbers deliberately. An exactness
-    /// gate cannot be written until the fix lands.
+    /// the defect was a chroma `tx_type`, not a geometry. libaom's
+    /// `av1_get_ext_tx_set_type` (`blockd.h`) resolves a **32-point** chroma
+    /// unit to `EXT_TX_SET_DCT_IDTX` when the block `is_inter` -- so an
+    /// Intra-Block-Copy block whose luma coded `IDTX` runs the identity
+    /// transform on its chroma. `read_plane`'s `side >= 32` clamp forced
+    /// `DCT_DCT` there (its `DCT_DCT` cap is really libaom's
+    /// `txsize_sqr_up_map[tx_size] > TX_32X32`, i.e. 64 and up), so the
+    /// residual was a 32-point IDCT where libaom's was a plain copy of the
+    /// dequantized coefficients `>>2`. The wrong samples sat in one 64x64
+    /// IBC block's 32x32 chroma unit at chroma (128,96) on frame 0, and
+    /// propagated from there through the inter frames.
+    ///
+    /// `the_counting_oracle_diff_detects_one_flipped_oracle_byte` is the
+    /// non-vacuity control that keeps the `0` above worth anything.
     #[test]
-    fn the_pinned_420_oddheight_witness_is_pinned_and_ratchets_its_reconstruction_defect() {
-        const NAME: &str =
-            "the_pinned_420_oddheight_witness_is_pinned_and_ratchets_its_reconstruction_defect";
+    fn the_pinned_420_oddheight_witness_is_pinned_and_decodes_byte_exact() {
+        const NAME: &str = "the_pinned_420_oddheight_witness_is_pinned_and_decodes_byte_exact";
         // lane-av1cmpaudit2: same mutex as every other oracle gate.
         let _gate_lock = lock_gate_counters();
         const FILE: &str = "420_oddheight_320x232.obu";
@@ -11110,17 +11148,22 @@ exit 0
         assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
         assert_eq!(fnv1a64(&data), FNV1A64, "{NAME}: {FILE} bytes drifted");
         let (wy, wu, wv, frames, exact) =
-            count_rawvideo_diffs(&data, NAME).expect("the two sides must be byte-comparable");
+            count_rawvideo_diffs(&data, NAME, None).expect("the two sides must be byte-comparable");
         assert_eq!(
             (wy, wu, wv),
-            (0, 200, 17658),
-            "{NAME}: the measured defect moved. If this is now EXACT the \
-             reconstruction defect is FIXED -- update this gate to assert \
-             (0, 0, 0) and delete the ratchet comment, and say so in the \
-             report. Any other value is a change nobody has accounted for."
+            (0, 0, 0),
+            "{NAME}: the pinned 320x232 witness must decode byte-exactly against \
+             `aomdec --rawvideo` on every plane. It was a RATCHET asserting its own \
+             measured defect (0, 200, 17658); lane-av1422chrtx flipped it to exactness \
+             when the 32-point INTER chroma `tx_type` (EXT_TX_SET_DCT_IDTX, not \
+             EXT_TX_SET_DCTONLY) was fixed. Any non-zero value here is a regression -- \
+             name it in the report."
         );
         assert_eq!(frames, 16, "{NAME}: shown frame count");
-        assert_eq!(exact, 0, "{NAME}: byte-exact shown frames");
+        assert_eq!(
+            exact, frames,
+            "{NAME}: every shown frame must be byte-exact"
+        );
     }
 
     /// lane-hidden r2: the `--arnr-maxframes=0` SECOND ARM of an existing
