@@ -306,6 +306,17 @@ by name.
    intra-BC block with a residual rather than pure prediction) is not
    distinguished from the skip cell by any pin here; `r512.obu`'s two
    multi-unit blocks are both `skip=1`.
-6. **No VPS run.** Everything above is local: one gate at a time plus two
+6. **`scripts/pin-gate-audit.py` does not see EITHER new gate** (nor the two
+   pre-existing `r512.obu` gates it sits next to): it recovers a pin name only
+   from a literal `"/fixtures/..."` string, a `crate_pin("X")` /
+   `pin_dir().join("X")` call, or a 3+-item list, and this whole family builds
+   its path as `PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+   "fixtures/{FILE}"))` off a `const FILE`. The audit therefore reports
+   `total=9 gates / 22 names, uncommitted=0` on this branch and exits 0, which
+   is a true pass for what it looks at and a SILENT GAP for this family. The
+   fnv1a64 asserts in both gates are the real pin check and they do run; I did
+   not widen the audit's detector, because a detector change is its own change
+   with its own self-test and belongs in a lane that owns the audit.
+7. **No VPS run.** Everything above is local: one gate at a time plus two
    ~250 s wide-family runs. Per the project's standing rule the full suite
    belongs on the fleet; I did not request or consume a fleet slot.
