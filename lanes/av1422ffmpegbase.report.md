@@ -520,3 +520,211 @@ than a silently-missing arm.
 - **Six of the seven diverging cells are chroma-only and share a first-divergence row
   band (row 62, U columns 134–207).** That is a shape observation for whoever owns the
   chroma arm, not an attribution: no trace was taken here.
+
+---
+
+# ADDENDUM (2026-10-01) — re-measured on `3d56fb60`: **94 of 95 byte-exact, 50 of 51 4:2:2**
+
+**No cell moved the wrong way. Not one 4:2:0 cell and not one 4:4:4 cell changed
+verdict: 22/22 and 22/22 byte-exact before and after, every one of them produced by a
+CLEAN build of the tree, none touched by the 4:2:2 change.** The 4:2:2 delta is six cells
+closing, one cell unmoved, and the 4:2:0/4:4:4 controls are bit-identical across the
+change.
+
+| | `affe70dc` (this report's §2) | `3d56fb60` (this addendum) |
+|---|---|---|
+| 4:2:2 | 44 exact / 7 diverging | **50 exact / 1 diverging** |
+| 4:2:0 | 22 exact | 22 exact (0 moved) |
+| 4:4:4 | 22 exact | 22 exact (0 moved) |
+| whole set | 88 exact / 7 diverging | **94 exact / 1 diverging** |
+
+`3d56fb60` = `298be661` (lane-av1422luma: `decode_rect4_16_intrabc` gives ss (1,0) its own
+chroma) plus `b8eed69f`; both verified ancestors of `3d56fb60`.
+
+## A1. The delta, per cell
+
+| cell | format | `affe70dc` | `3d56fb60` | |
+|---|---|---|---|---|
+| `s422_320x246` | 4:2:2 | DIVERGES 0/7810/5531 | **BYTE-EXACT 0/0/0** | closed |
+| `s422_322x240` | 4:2:2 | DIVERGES 0/22003/21625 | **BYTE-EXACT 0/0/0** | closed |
+| `s422_322x246` | 4:2:2 | DIVERGES 0/3437/2222 | **BYTE-EXACT 0/0/0** | closed |
+| `s422_352x242_10b` | 4:2:2 | DIVERGES 0/4653/3777 | **BYTE-EXACT 0/0/0** | closed |
+| `s422_416x242_10b` | 4:2:2 | DIVERGES 0/5740/4348 | **BYTE-EXACT 0/0/0** | closed |
+| `s422_416x250_10b` | 4:2:2 | DIVERGES 99011/61486/60106 | **BYTE-EXACT 0/0/0** | closed — **the luma-wrong cell** |
+| `s422_384x240` | 4:2:2 | DIVERGES 0/1780/1871 | **DIVERGES 0/1780/1871** | **unmoved, to the sample** |
+| all other 45 4:2:2 cells | 4:2:2 | BYTE-EXACT | BYTE-EXACT | unchanged |
+| all 44 4:2:0 / 4:4:4 controls | | BYTE-EXACT | BYTE-EXACT | unchanged |
+
+**These are this lane's own numbers, from my instrument, not lane av1422luma's.** The six
+closures match the six the lane reported; `s422_384x240` was predicted to stay and does,
+with a count that is *byte-for-byte the same* as on `affe70dc` — every plane, every frame,
+first bad sample still display frame 6, U (row 174, col 32), ours 133 vs ffmpeg 132, bbox
+U rows 167–190 cols 19–34 / V rows 169–192 cols 19–35, still only 10 of 16 frames carrying
+a wrong sample. The per-frame vectors of the two trees are **identical lists**. Whatever
+`298be661` changed, it changed nothing in that cell, which is the expected shape for a
+residual whose owner is the separate group-tail chroma SKIP arm.
+
+## A2. Full 4:2:2 table on `3d56fb60`
+| cell | geometry | ss | depth | disp frames | verdict @3d56fb60 | Y/U/V @3d56fb60 | verdict @affe70dc | Y/U/V @affe70dc |
+|---|---|---|---|---|---|---|---|---|
+| `W_intrabc` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `X_intrabc_tiled` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `Y_intrabc_10b` | 320x240 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `422_sb128_3f` | 128x128 | 10 | 8 | 3 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `422_residual_compound_warp_nolr_16f` | 256x288 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `422_residual_compound_warp_16f` | 256x288 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `422_intrabc_sb128_strip_notxsearch` | 384x320 | 10 | 8 | 5 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `422_intrabc_sb128_strip` | 384x320 | 10 | 8 | 5 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `422_allskip_2f` | 128x128 | 10 | 8 | 2 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `V_tile2x2_odd` | 322x242 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `U_tilerows1` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `T_tilecols2` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `S_odd326x242_10b` | 326x242 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `R_odd322x240` | 322x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `Q_odd320x242` | 320x242 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `O_odd322x242` | 322x242 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `L_tiled` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `K_sct` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `J_10bit_lr0` | 320x240 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `I_10bit_mandel` | 320x240 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `H_10bit_testsrc2` | 320x240 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `F_allintra` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `E_noglobal` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `D_bars` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `C_mandel320` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `B_testsrc2_cpu6` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `A_testsrc2_cpu0` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `AD_inter_nogm` | 320x240 | 10 | 8 | 40 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `AB_inter_warp_odd` | 322x242 | 10 | 8 | 40 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `AA_inter_compound` | 320x240 | 10 | 8 | 40 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `ll422_noibc` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `ll422_allintra` | 320x240 | 10 | 8 | 1 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `R422_320x242` | 320x242 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_320x240` | 320x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_320x242` | 320x242 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_320x242_10b` | 320x242 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_320x246` | 320x246 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | DIVERGES | 0/7810/5531 |
+| `s422_320x250_10b` | 320x250 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_322x240` | 322x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | DIVERGES | 0/22003/21625 |
+| `s422_322x242` | 322x242 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_322x246` | 322x246 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | DIVERGES | 0/3437/2222 |
+| `s422_326x240` | 326x240 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_326x242` | 326x242 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_326x246` | 326x246 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_352x242_10b` | 352x242 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | DIVERGES | 0/4653/3777 |
+| `s422_352x250_10b` | 352x250 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_384x240` | 384x240 | 10 | 8 | 16 | DIVERGES | 0/1780/1871 | DIVERGES | 0/1780/1871 |
+| `s422_384x242` | 384x242 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_384x246` | 384x246 | 10 | 8 | 16 | BYTE-EXACT | 0/0/0 | BYTE-EXACT | 0/0/0 |
+| `s422_416x242_10b` | 416x242 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | DIVERGES | 0/5740/4348 |
+| `s422_416x250_10b` | 416x250 | 10 | 10 | 16 | BYTE-EXACT | 0/0/0 | DIVERGES | 99011/61486/60106 |
+
+## A3. Controls, on `3d56fb60` — 44/44 exact
+
+All 44 produced by the **clean** build
+(`/home/tahinli/.cache/tgt/cleanmain_v2/release/examples/dump_yuv`, from a detached
+worktree at `3d56fb60` with `git status --porcelain` empty), 22 4:2:0 + 22 4:4:4,
+**44 BYTE-EXACT, 0 diverging, 0 errors, 0 frame-count mismatches** — the same verdict each
+one had on `affe70dc`. Per-cell rows and the 22+22 breakdown are unchanged from §2 and are
+not re-pasted here; the machine record is `full_ff_controls_3d56.json`.
+
+## A4. Instrument discipline for this run
+
+1. **sha256 of all 95 cells re-verified** against `cells_full.json`: 0 drift, 0 missing.
+   The nine committed pins were re-pathed to the `3d56fb60` worktree before hashing, so the
+   bytes hashed are the bytes that tree ships.
+2. **Geometry from `ffprobe`, never a y4m header and never a file size**; frame length
+   derived from it; a length disagreement is a hard error; a count over zero frames is a
+   hard error.
+3. **Display order on both sides**, hidden alt-refs excluded — the mapping rule is §0/§3.2
+   of this report, unchanged: `dump_yuv` is display-order+shown+depth-from-header,
+   `ffmpeg -f rawvideo` is display-order+shown, and a decode-order count is not comparable
+   without subtracting the hidden frame's own counts.
+4. **Depth-correct both sides**; the u8-narrowing dump was not used anywhere.
+5. **The probe/bypass split is now an ASSERTED ARGUMENT, not a constant.** The driver takes
+   `FF_DUMP_YUV` and records it on every result row as `probe`. The 4:2:2 rows were produced
+   by a patch-run-restore build in a scratch detached worktree; the 4:2:0/4:4:4 control
+   rows by a **separate clean build of the same tree**, so a bypassed binary cannot serve
+   the controls. `--probe-records` proves the split on every run and fails if it is wrong:
+
+   ```
+   {"probe_split_control": "PASS", "cell": "W_intrabc",
+    "clean_build": "REFUSES", "bypass_build": "BYTE-EXACT"}
+   ```
+
+   The clean build was re-checked after the bypass was torn down: it still prints
+   `REFUSED: … a chroma format of 4:2:2 (subsampling_x != subsampling_y) …`.
+6. **Bypass hygiene.** Scratch worktree `/home/tahinli/.cache/wt/probe422_v2` at `3d56fb60`,
+   the guard at `stream.rs:1803` patched to `if false && seq.subsampling_x != …` under the
+   `TEMP-PROBE-BYPASS: EC_AV1_ALLOW_422_PROBE` marker. The diff was **2 lines**
+   (`git diff --stat`: 1 file, 2 insertions, 1 deletion — verified before building, because
+   a two-line edit tool silently dropped a neighbouring comment line on the first attempt in
+   this lane and had to be repaired). Restored with
+   `git checkout -- crates/ec-av1/src/stream.rs`, `git status --porcelain` **empty**,
+   worktree removed, and **the bypassed target directory
+   `/home/tahinli/.cache/tgt/probe422_v2bypass` deleted** together with the previous run's
+   `tgt/probe422base`, so no bypassed binary survives on disk to be picked up by a later
+   run of this driver. The path the driver is documented to use is the clean build.
+
+## A5. Liveness re-run on the `3d56fb60` dumps — 23 arms, 23 PASS, 0 FAIL
+
+Re-run before these verdicts were read. One oracle sample's bit 0 flipped, one named plane
+of one named display frame; the count must move exactly +1 in that plane with every other
+plane and frame unchanged; the file is restored before the next arm.
+
+| cell | frame | plane | baseline Y/U/V @3d56fb60 | Δ | verdict |
+|---|---|---|---|---|---|
+| `s422_320x242` | 0 / 0 / 15 | Y / U / V | 0/0/0 | +1 Y, +1 U, +1 V | PASS |
+| `W_intrabc` | 0 / 7 / 15 | Y / U / V | 0/0/0 | +1 Y, +1 U, +1 V | PASS |
+| `422_allskip_2f` | 0 | U | 0/0/0 | +1 U | PASS |
+| `Y_intrabc_10b` | 0 / 3 / 15 | Y / U / V | 0/0/0 | +1 Y, +1 U, +1 V | PASS |
+| `AB_inter_warp_odd` | 39 | U | 0/0/0 | +1 U | PASS |
+| `s422_320x246` | 0 / 0 / 11 | Y / U / V | **0/0/0** (was 0/7810/5531) | +1 Y, +1 U, +1 V | PASS |
+| `s422_322x240` | 5 | U | **0/0/0** (was 0/22003/21625) | +1 U | PASS |
+| `s422_352x242_10b` | 0 | U | **0/0/0** (was 0/4653/3777) | +1 U | PASS |
+| `s422_416x250_10b` | 0 / 5 | Y / U | **0/0/0** (was 99011/61486/60106) | +1 Y, +1 U | PASS |
+| **`s422_384x240`** | 14 | V | **0/1780/1871** | **+1 V → 0/1780/1872** | **PASS** |
+| `s444_352x242_10b` | 4 | U | 0/0/0 | +1 U | PASS |
+| `s420_320x240` | 0 | U | 0/0/0 | +1 U | PASS |
+| `ll420_a` (4:2:0) | 0 | Y | 0/0/0 | +1 Y | PASS |
+| `ll444_a` (4:4:4) | 0 | V | 0/0/0 | +1 V | PASS |
+
+The one arm that now carries the load is `s422_384x240`: it is the only cell still red, its
+baseline is non-zero, and the flip moves **that** plane by exactly one while Y stays 0 and
+every other frame is unmoved. A comparator that had quietly stopped reading the oracle
+would report 0/0/0 here too; it reports 1780/1871 and moves by one. Sample values:
+`s422_384x240` V f14 oracle byte 2718720 `eb`→`ea`; `s422_416x250_10b` Y f0 `3f01`→`3e01`;
+`Y_intrabc_10b` U f3 `6801`→`6901`.
+
+**23 arms, 23 PASS, 0 FAIL.** Six of the seven non-zero baselines from §6 are now exact, so
+that class of arm is currently carried by one cell — re-run this control whenever the
+remaining divergence closes, or the liveness proof loses its non-zero arm.
+
+## A6. What this addendum does and does not change in §4
+
+§4's lift checklist is unaffected as a plan, and its gate requirement is now one step
+closer: the base it will be judged on is **50/51 4:2:2 with one known residual**, and that
+residual is a single named cell (`s422_384x240`, 384x240 8-bit, chroma-only, 10 of 16 frames,
+identical before and after `298be661`) with an owner lane already working it. Everything
+§4 says about the guard site, the two `refusal_inventory.rs` rows, the seven tests to
+invert, the pin convention and the 51/51 gate stands as written, and the 42-uncommitted-cells
+capture task is now the same task — it is a prerequisite to the gate, not to the fix.
+
+Not established by this addendum: no attribution of the `s422_384x240` residual (no trace
+was taken; it is measured, bounded and unchanged), and no claim about 4:2:2 shapes the 95
+cells do not contain.
+
+## A7. Note on the instrument that landed on main while this ran
+
+`3d56fb60` also carries `scripts/run422-ffmpeg.py` + `scripts/cmp422-ffmpeg.py` +
+`scripts/flipctl-422.py` (lane av1422seed). It solves the decode→display mapping
+explicitly and reports `mapping_solutions`, so it additionally **proves the mapping is
+unique** for a cell — a property my instrument does not assert, because it never mixes the
+two bases: it pairs `dump_yuv` (display order, shown only) against `ffmpeg -f rawvideo`
+(display order, shown only) and therefore has no mapping to be ambiguous about. The two
+instruments are independent and they agree on this tree: both put 50 of 51 4:2:2 exact with
+only `s422_384x240` diverging. Where they differ in *form*: that one decodes with
+`EC_AV1_FINAL_DUMP` (decode order) and maps forward; this one decodes with `dump_yuv`
+(display order) and maps nothing. Two instruments that reach the same verdict by different
+routes is worth more than either alone, and this report's numbers are its own, not that
+lane's.
