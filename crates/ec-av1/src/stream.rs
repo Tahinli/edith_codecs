@@ -4274,6 +4274,10 @@ pub(crate) mod tests {
     fn a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact() {
         const NAME: &str =
             "a_real_aomenc_segmentation_stream_with_map_inheritance_decodes_pixel_exact";
+        // lane-av1cmpaudit2: this gate reaches the oracle without the gate
+        // mutex, so a sibling flipping `EC_AV1_AOMDEC` (the one-byte-wrong
+        // oracle control) could hand it a tampered oracle mid-compare.
+        let _gate_lock = lock_gate_counters();
         if !have_aomenc() {
             eprintln!("SKIP {NAME}: no aomenc");
             return;
@@ -10195,9 +10199,35 @@ pub(crate) mod tests {
         present
     }
 
+    // lane-av1cmpaudit2: this thread's oracle override, set by
+    // `set_oracle_path` and consulted by `aomdec_path` ahead of the env var.
+    //
+    // It is thread-local for the same reason `FINAL_DUMP_PREFIX` is: the
+    // control test `every_oracle_comparator_reds_on_a_one_byte_wrong_oracle`
+    // has to hand the helpers a DELIBERATELY WRONG oracle, and a
+    // process-global `std::env::set_var` could not do that safely -- the
+    // crate denies `unsafe_code`, and even where it did not, one test's
+    // tampered oracle would leak into every sibling test's comparison
+    // running on another thread. A thread-local override confines the wrong
+    // oracle to the one thread that asked for it.
+    thread_local! {
+        static ORACLE_PATH: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Points this thread's oracle helpers at `path`. `None` restores the
+    /// real `aomdec`.
+    fn set_oracle_path(path: Option<std::path::PathBuf>) {
+        ORACLE_PATH.with(|c| *c.borrow_mut() = path);
+    }
+
+
     /// The instrumented `aomdec` beside the `aomenc` oracle
     /// (`scripts/build-aom-oracle.sh` + `scripts/instrument-aom-oracle.sh`).
     fn aomdec_path() -> std::path::PathBuf {
+        if let Some(p) = ORACLE_PATH.with(|c| c.borrow().clone()) {
+            return p;
+        }
         if let Some(p) = std::env::var_os("EC_AV1_AOMDEC") {
             return std::path::PathBuf::from(p);
         }
@@ -10385,6 +10415,10 @@ pub(crate) mod tests {
     #[test]
     fn the_counting_oracle_diff_reports_a_real_difference() {
         const NAME: &str = "the_counting_oracle_diff_reports_a_real_difference";
+        // lane-av1cmpaudit2: same mutex as every other oracle gate -- this
+        // one reads `aomdec_path()`, so it must not overlap a sibling's
+        // tampered-oracle run.
+        let _gate_lock = lock_gate_counters();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
             .join("420_oddheight_320x232.obu");
@@ -10403,6 +10437,218 @@ pub(crate) mod tests {
              the oracle, so frames_exact must be below the frame count"
         );
         eprintln!("{NAME}: witness reports Y={wy} U={wu} V={wv}, frames_exact={exact}/{frames}");
+    }
+
+    /// lane-av1cmpaudit2: the permanent CONTROL for the class
+    /// `comparator-that-never-reads-the-oracle`.
+    ///
+    /// The retracted predecessor lane's per-cell counter reported "0 wrong"
+    /// on 18/18 cells -- including cells that differ from `aomdec
+    /// --rawvideo` in 17658 samples -- because it packed OUR decoded samples
+    /// into a buffer and compared that buffer against the same samples.
+    /// `aomdec`'s output was written, length-checked, and never read.
+    /// Nothing about that mistake is visible from the outside: the helper's
+    /// signature, its panic text and its return type are all exactly what a
+    /// working comparator has, and no amount of reading the source of a
+    /// healthy-looking helper proves the next one is healthy.
+    ///
+    /// So the class is pinned here from the other direction.
+    /// `EC_AV1_AOMDEC` is already the crate's oracle override, so this test
+    /// points every oracle helper at a shim that runs the REAL `aomdec` and
+    /// then corrupts exactly ONE byte of whatever it wrote -- the
+    /// `--rawvideo` output and the `EC_AV1_FINAL_DUMP` frame 0 -- leaving
+    /// every other sample a genuine decode. On a pin that IS byte-exact
+    /// against the real oracle:
+    ///
+    /// 1. **arm 1, real oracle: every helper is GREEN.** Without this arm,
+    ///    arm 2's red could just be a stream that was never exact.
+    /// 2. **arm 2, one-byte-wrong oracle: every helper is RED.** A helper
+    ///    that stays green here is the retracted defect itself: it cannot
+    ///    fail, so its green is worth nothing.
+    ///
+    /// One test, five helpers, and it goes red for the exact mistake that
+    /// was retracted. Measured over this file: the other 62 tests that
+    /// reach an oracle helper all take `lock_gate_counters()` before their
+    /// first oracle call, which is what makes the process-global
+    /// `EC_AV1_AOMDEC` safe to flip here.
+    #[test]
+    fn every_oracle_comparator_reds_on_a_one_byte_wrong_oracle() {
+        const NAME: &str = "every_oracle_comparator_reds_on_a_one_byte_wrong_oracle";
+        let _gate_lock = lock_gate_counters();
+        if !aomdec_available(NAME) {
+            return;
+        }
+        let pin = crate_pin("420_odd65x65_key.obu");
+        let stream = std::fs::read(&pin).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: the control's pin {} is missing ({e}) -- restore the committed copy",
+                pin.display()
+            )
+        });
+        assert_eq!(
+            stream_bit_depth(&stream, NAME),
+            8,
+            "{NAME}: the control's pin must be the 8-bit cell the shim corrupts"
+        );
+        let plane_samples = {
+            let frames = decode_stream(&stream).expect("the control's pin must decode");
+            let f = &frames[0];
+            [f.y.len(), f.u.len(), f.v.len()]
+        };
+
+        // ---- arm 1: the real oracle, every comparator green ------------
+        {
+            let obu = std::env::temp_dir().join(format!("{NAME}-arm1.obu"));
+            std::fs::write(&obu, &stream).expect("writing the pin for arm 1");
+            assert_rawvideo_matches(&obu, &stream, "oracle-control-arm1-rawvideo", 1, 8);
+            let _ = std::fs::remove_file(&obu);
+            let (frames, hidden) =
+                decode_all_frames_vs_oracle(&stream, "oracle-control-arm1-alldumps");
+            assert_eq!(
+                (frames, hidden),
+                (1, 0),
+                "{NAME}: arm 1 expects one decode-order frame and no hidden frames"
+            );
+            let (wy, wu, wv, n, exact) =
+                count_rawvideo_diffs(&stream, "oracle-control-arm1-count")
+                    .expect("arm 1: the two sides must be byte-comparable");
+            assert_eq!(
+                (wy, wu, wv),
+                (0, 0, 0),
+                "{NAME}: arm 1 runs against the REAL oracle, so every plane must be zero"
+            );
+            assert_eq!(
+                (n, exact),
+                (1, 1),
+                "{NAME}: arm 1 expects one shown frame that is byte-identical"
+            );
+            let (differing, first) = key_frame_diffs(&stream, "oracle-control-arm1-kf");
+            assert_eq!(
+                (differing, first),
+                (0, None),
+                "{NAME}: arm 1's key frame must be byte-identical to the oracle's"
+            );
+            let [y, u, v] =
+                oracle_plane_diffs(&stream, "oracle-control-arm1-planes", plane_samples);
+            assert_eq!(
+                [y, u, v],
+                [0, 0, 0],
+                "{NAME}: arm 1 must be zero on every plane against the real oracle"
+            );
+        }
+
+        // ---- the one-byte-wrong oracle ---------------------------------
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let shim = dir.join("one-byte-wrong-aomdec.sh");
+        // The real oracle's path rides in a sibling file rather than inside
+        // the script, so a path with a quote or a space cannot mangle it and
+        // the script body needs no `format!` escaping at all.
+        std::fs::write(dir.join("real-aomdec"), aomdec_path().as_os_str().as_encoded_bytes())
+            .expect("recording the real oracle's path for the shim");
+        // Byte 7 of both the `--rawvideo` output and the `EC_AV1_FINAL_DUMP`
+        // frame 0 is inside the Y plane, and its value is rotated by 128 so
+        // the write always changes it. Nothing else is touched: the stream,
+        // the geometry, the frame count and every other sample are a genuine
+        // `aomdec` decode.
+        let script = r#"#!/bin/sh
+REAL=$(cat "$(dirname "$0")/real-aomdec")
+rawvideo=0
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$a" = "--rawvideo" ]; then rawvideo=1; fi
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+"$REAL" "$@" || exit $?
+flip() {
+  [ -s "$1" ] || return 0
+  b=$(od -An -tu1 -j 7 -N 1 "$1" 2>/dev/null | tr -d ' \n')
+  [ -n "$b" ] || return 0
+  esc=$(printf '\\%03o' $(( (b + 128) % 256 )))
+  printf "$esc" | dd of="$1" bs=1 seek=7 count=1 conv=notrunc 2>/dev/null
+  return 0
+}
+[ "$rawvideo" = 1 ] && flip "$out"
+[ -n "$EC_AV1_FINAL_DUMP" ] && flip "$EC_AV1_FINAL_DUMP.f0"
+exit 0
+"#;
+        std::fs::write(&shim, script).expect("writing the oracle shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("the oracle shim must be executable");
+        }
+
+        // ---- arm 2: same pin, oracle off by ONE byte -------------------
+        // The override is THREAD-LOCAL, so the tampered oracle is confined
+        // to this thread and no sibling test can see it; it is still cleared
+        // before any result is asserted, so a red arm cannot leave this
+        // test's own later work reading a wrong oracle.
+        let reds: [bool; 5];
+        {
+            set_oracle_path(Some(shim.clone()));
+            let panicked = |f: &dyn Fn()| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+            };
+            let rawvideo_red = panicked(&|| {
+                let obu = std::env::temp_dir().join(format!("{NAME}-arm2.obu"));
+                std::fs::write(&obu, &stream).expect("writing the pin for arm 2");
+                assert_rawvideo_matches(&obu, &stream, "oracle-control-arm2-rawvideo", 1, 8);
+            });
+            let _ = std::fs::remove_file(std::env::temp_dir().join(format!("{NAME}-arm2.obu")));
+            let dumps_red = panicked(&|| {
+                decode_all_frames_vs_oracle(&stream, "oracle-control-arm2-alldumps");
+            });
+            let count_red = {
+                let counted = count_rawvideo_diffs(&stream, "oracle-control-arm2-count")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{NAME}: a single flipped oracle byte must NOT change the buffer \
+                             LENGTH -- returning None means the shim corrupted more than the \
+                             comparison"
+                        )
+                    });
+                counted.0 + counted.1 + counted.2 > 0 && counted.4 < counted.3
+            };
+            let kf_red = {
+                let (differing, first) = key_frame_diffs(&stream, "oracle-control-arm2-kf");
+                differing > 0 && first.is_some()
+            };
+            let planes_red = {
+                let [y, u, v] =
+                    oracle_plane_diffs(&stream, "oracle-control-arm2-planes", plane_samples);
+                y + u + v > 0
+            };
+            set_oracle_path(None);
+            let _ = std::fs::remove_dir_all(&dir);
+            reds = [rawvideo_red, dumps_red, count_red, kf_red, planes_red];
+        }
+        // One assert, naming EVERY comparator that stayed green: a partial
+        // run would report the first and hide whether the other four are
+        // covered.
+        let blind: Vec<&str> = [
+            ("assert_rawvideo_matches", reds[0]),
+            ("decode_all_frames_vs_oracle", reds[1]),
+            ("count_rawvideo_diffs", reds[2]),
+            ("key_frame_diffs", reds[3]),
+            ("oracle_plane_diffs", reds[4]),
+        ]
+        .into_iter()
+        .filter(|(_, red)| !red)
+        .map(|(what, _)| what)
+        .collect();
+        assert!(
+            blind.is_empty(),
+            "{NAME}: {} of 5 oracle comparators stayed GREEN against an oracle that is wrong \
+             by exactly one byte -- {blind:?} -- they cannot fail, so their green proves \
+             nothing (class `comparator-that-never-reads-the-oracle`)",
+            blind.len()
+        );
+        eprintln!("{NAME}: all five oracle comparators red on a one-byte-wrong oracle");
     }
 
     /// lane-av1422anom: the odd-frame-HEIGHT 4:2:0 reconstruction defect,
@@ -10427,6 +10673,8 @@ pub(crate) mod tests {
     fn the_pinned_420_oddheight_witness_is_pinned_and_ratchets_its_reconstruction_defect() {
         const NAME: &str =
             "the_pinned_420_oddheight_witness_is_pinned_and_ratchets_its_reconstruction_defect";
+        // lane-av1cmpaudit2: same mutex as every other oracle gate.
+        let _gate_lock = lock_gate_counters();
         const FILE: &str = "420_oddheight_320x232.obu";
         const BYTES: usize = 15773;
         // sha256 6832c3cd867f5fc491b45fd67f77c38453db0ca6d461e7d225e6276f4d0784c8,
@@ -38150,6 +38398,9 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "lane-sb128 r2 diagnostic: is the frame-6 mismatch sb128-specific?"]
     fn sb128_r2_control_sb64() {
+        // lane-av1cmpaudit2: this control reaches the oracle, so it takes
+        // the gate mutex like every other one.
+        let _gate_lock = lock_gate_counters();
         let (width, height) = (256usize, 192usize);
         let y4m = Command::new("ffmpeg")
             .args([
