@@ -2720,6 +2720,29 @@ pub(crate) fn palette_split_tx_hits() -> usize {
 }
 
 thread_local! {
+    /// lane-av1444d10: chroma PREDICTION units on the 32-capped tiled chroma
+    /// walk (`decode_block_rect`'s `uw/uh = min(chroma, 32)` units) that were
+    /// handed a WINDOWED slice of their block's palette buffer -- i.e. the
+    /// units that are NOT the block's top-left corner. Counts units, not
+    /// blocks, and only units whose block actually has a UV palette, so a
+    /// stream without a tiled palette chroma block leaves it at zero.
+    static CHROMA_PALETTE_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CHROMA_PALETTE_WINDOW_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn chroma_palette_window_hits() -> usize {
+    CHROMA_PALETTE_WINDOW_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`CHROMA_PALETTE_WINDOW_HITS`] so a gate can read it as a DELTA
+/// (it is process-wide, like every counter here).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_chroma_palette_window_hits() {
+    CHROMA_PALETTE_WINDOW_HITS.with(|c| c.set(0));
+}
+
+thread_local! {
     /// lane-pal8 r1: square 8x8 LEAVES ([`decode_leaf8`]) that actually use a
     /// palette (Y or UV) -- the shape every 8-bit `--tune-content=screen`
     /// stream stopped on, since aomenc palettes square blocks at 8 bit and
@@ -20082,7 +20105,12 @@ fn decode_block_rect64(
                     let levels = if uw == uh {
                         let plane = if plane_idx == 1 { &mut *u } else { &mut *v };
                         if let Some((ub, vb)) = &palette_uv_bufs {
-                            set_palette_pred((if plane_idx == 1 { ub } else { vb }).clone(), fctx);
+                            let pbuf = if plane_idx == 1 { ub } else { vb };
+                            set_palette_pred(
+                                palette_window(pbuf, chroma_w, cu_col * uw, cu_row * uh, uw, uh),
+                                fctx,
+                            );
+                            hit!(CHROMA_PALETTE_WINDOW_HITS);
                         }
                         read_plane(
                             dec,
@@ -20136,7 +20164,12 @@ fn decode_block_rect64(
                             block_iqmatrix(fctx, plane_idx, uw, uh, tx_type),
                         );
                         if let Some((ub, vb)) = &palette_uv_bufs {
-                            set_palette_pred((if plane_idx == 1 { ub } else { vb }).clone(), fctx);
+                            let pbuf = if plane_idx == 1 { ub } else { vb };
+                            set_palette_pred(
+                                palette_window(pbuf, chroma_w, cu_col * uw, cu_row * uh, uw, uh),
+                                fctx,
+                            );
+                            hit!(CHROMA_PALETTE_WINDOW_HITS);
                         }
                         push_intra_rect(
                             plane_idx,
