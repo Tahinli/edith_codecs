@@ -23,7 +23,7 @@ reproduced to a one-line override.
 | 256x128 pin (`--limit=5`) | **6/6 decode-order byte-exact**; paired `EC_SYMR` **96 997 / 96 997 bit-identical over the WHOLE stream** (§3.1) |
 | 4:4:4 arm (`--profile=1`, 8 frames) | **9/9 exact**, red on f1..f8 before |
 | 176x144 / 352x288 (refuse at base) | 352x288 → **7/7 exact**; 176x144 → decodes 7/7 (still red from the already-handed-off `mi=(32,32)` defect, which `lane-av1offtile`'s clip then closes — §7b) |
-| 640x480 — **CONTROL NOT MET** | refuses at frame 3 instead of decoding. Base decodes it **70–92 % wrong on every frame** (§4.1). Refusal cause = a second defect, named and one-line-reproduced in §4.3. |
+| 640x480 — **CONTROL NOW MET (closed by `lane-av1txctxband2`)** | on main + `f2dd27b0`: **6/6 and 7/7 byte-exact, 457 907/457 907 paired reads bit-identical**, operand pair `above_txfm=4 above=false` now EQUALS libaom's. Measured here, §4.4. |
 | Corpus sweep, 107 committed fixtures | **exactly one status change: `420_mixll_altref_256x128_5f` RED → EXACT.** Zero EXACT→RED, zero new REFUSED, zero FRAMECOUNT change (§5) |
 | Composition with `714fb55b` (`lane-av1offtile`) | cherry-picked for measurement and reverted; the two clips close **every** cell of this recipe at 256x128 / 176x144 / 352x288 / 4:4:4 and leave the 640x480 residual byte-for-byte unchanged (§7b) |
 | Class sweep | all 10 `else if lossless(fctx)` sites and all 9 `read_var_tx_size` gates re-derived against libaom's own `if`: **exactly the 2 fixed sites were in the class, no third site** (§6) |
@@ -298,6 +298,78 @@ this tree does not make — class `context-band-not-published`, the same class
 `decode.rs:27595`'s comment already names. **Not this lane's hunks, and not
 fixable from a one-line context change: a forced `ctx` is a symptom mask, not a
 fix.**
+
+## 4.4. RESOLVED — the control is met, and the operand-pair assertion picked outcome 1
+
+`lane-av1txctxband2` (`f2dd27b0`) landed the band write. Re-measured **here**, on
+a scratch tree at `main` + `f2dd27b0`, with the §4.3 protocol applied in the order
+it specifies (the fix's `git diff` first, then the operand pair, then the pixels):
+
+**Operand pair, our side, after the fix — this is the assertion, not a log line:**
+
+```text
+EC_TXCTX mi=80,110 own=8x4 ha=true hl=true above_txfm=4 left_txfm=8            above_inter=false left_inter=false above=false left=true
+```
+
+against libaom's own rung, unchanged:
+
+```text
+EC_TXCTXB mi=80,110 bsize=2 maxw=8 maxh=4 hasup=1 hasleft=1 abv=4 lft=8 above=0 left=1 ctx=1
+```
+
+`above_txfm` went **16 -> 4** and `above` **true -> false** **on its own**, and the
+pair now equals the oracle's term for term. That is **outcome 1** of the three in
+§4.3: the band write was the cause, the ctx=1 lock is **retired** as a symptom
+mask, and the chain *off-tile chroma walk -> var-tx conjunct -> band gap* is
+confirmed end to end. This lane's §4.3 was causally right, not merely
+directionally right — the residual was the band, not the ctx formula or the
+`decode_leaf_rect8` arm.
+
+**Pixels, on the same binary:**
+
+| cell | after | before |
+|---|---|---|
+| `m5_640x480` (87 537 B) | **6/6 byte-exact** | 4/6 dumps then REFUSED |
+| `m_640x480` (115 615 B) | **7/7 byte-exact** | 5/7 dumps then REFUSED |
+| `m_176x144` | **7/7 byte-exact** | 7 dumps, red |
+| `m_352x288` | **7/7 byte-exact** | 7/7 |
+| `m5_256x128` (the pin) | **6/6 byte-exact** | 6/6 |
+| `m444_8` (4:4:4) | **9/9 byte-exact** | 9/9 |
+
+**Whole-stream ladder on the cell that refused:**
+
+```text
+ours=457907 (unparsed 0)  oracle=457907 (unparsed 0)
+bit-identical over all 457907 paired reads
+```
+
+457 907 — the exact number my forced-`ctx=1` override produced, reached here by the
+missing publish instead of by a mask. That equality is the point: the mask and the
+repair land on the same read count, which is why the pixel run alone could not have
+told them apart, and why §4.3 made the operand pair the assertion.
+
+**What MY diagnosis got wrong, kept because it changes how the next lane replays a
+band.** I reported "nothing writes mi column 110 between read 157 577 and the
+read". That was **true of my trace and false of the decoder**: several publish
+sites are hand-rolled `for i in 0..w_mi { band[..] = x }` loops with no trace
+rung, so an untraced publish is invisible to a rung-level replay. Kerem-8 named the
+block by walking the mi-map column instead (`BlkCell::org`/`dim`/`skip`, inter_grid,
+deblock tx grids) and then one env tag on `read_block_tx_size` named the arm. **The
+absence of a rung is not the absence of a write** — the replay proves only what it
+can see, and a band diagnosis built on it is bounded by the sites that log.
+
+**The cause, in libaom's terms (Kerem-8's finding, corroborated by my `ctx=1`
+compass):** `parse_decode_block` is an either/or, and a lossless block always
+takes the ELSE branch, whose `set_txfm_ctxs(TX_4X4, xd->width, xd->height,
+skip_txfm && is_inter_block(mbmi))` **runs for it** — `read_tx_size` returns
+`TX_4X4` on its first line, so the early return skips the SYMBOL READ, not the
+PUBLISH. Our square `read_block_tx_size` early-returned without publishing; the
+RECT twin had published on that same arm since lane-av1lm444loss. The missing write
+is the 8x8 INTRA lossless block at `mi=(78,110)`.
+
+**Standing obligation discharged.** This lane's one unmet regression control is met.
+Nothing in this report remains open on this lane; the residual reds on the 6-frame
+256x128 and 320x240 arms, and the >8-bit arm, are filed with their own owners.
 
 ## 5. Corpus sweep — 107 committed fixtures, before and after
 
