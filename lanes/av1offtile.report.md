@@ -359,6 +359,68 @@ walk never reaches `mi=(80,110)` in a state where the override matters. The
 chain is strictly ordered: off-tile walk (this lane) -> var-tx conjunct
 (Emre-5) -> TXFM_CONTEXT band gap (Emre-5).
 
+## 6c. Re-measure PROTOCOL for the 640x480 cell (word-for-word with `lanes/av1mixllconj.report.md` §4.3)
+
+**Two reports describing the same discriminator in different words is how
+outcome 2 gets argued away.** This table is the canonical text; the twin in
+`lanes/av1mixllconj.report.md` is byte-identical. Copy it, do not paraphrase it.
+
+**The pixel run cannot discriminate the two candidate causes.** A green
+byte-exact compare against the oracle is EQUALLY consistent with the TXFM band
+write being closed and with the forced-`ctx=1` mask doing the work — because
+that mask makes the cell exact on its own (§6b: ctx=1 gives 457 907/457 907
+bit-identical without any band change). The pixel run reports the CONSEQUENCE.
+The operand pair is the cause, and the pair is readable from rungs that already
+exist **before the fix lands**.
+
+**Earliest discriminator, no decode needed — read the diff first.** A
+band-write site touched with `decode_leaf_rect8` untouched settles it: the band
+was the cause. The reverse settles the other way: the band was a symptom and
+§4.3 was directionally right but causally wrong.
+
+**Then the operand pair**, re-read on the same two rungs at `mi=(80,110)`:
+
+```text
+oracle  EC_TXCTXB mi=80,110 abv=4 lft=8 above=0 left=1 ctx=1
+ours    EC_TXCTX  mi=80,110 above_txfm=? left_txfm=8 above=? left=true
+```
+
+| # | `above_txfm` after the fix | `ctx` after the fix | reading |
+|---|---|---|---|
+| 1 | **4** | **1** (reached on its own) | The band write at `mi=(36,108)` was publishing 16 where libaom has 4. The fix closed the band; the `ctx=1` lock is **retired as a symptom mask** and the chain off-tile walk -> var-tx conjunct -> band gap is confirmed end to end. |
+| 2 | **16** | 1 | **The dangerous one.** The fix was in the ctx formula or the arm, the band is still wrong, and the cell's exactness is a MASK, not a repair. A green pixel compare reports this as success. |
+| 3 | 4 | not 1 | A further defect remains. The cell should NOT go exact; if it does, another mask is in play. |
+
+**Assert this, do not log it.** The table's outcomes are an assertion, not a
+line a reader has to notice — outcome 2 in particular passes a pixel compare
+cleanly, so an assert is the only form that fails loudly.
+
+**Comparison conventions for the run**, so the numbers are comparable with the
+ones already in these reports:
+
+* Compare on the **convention-free** `EC_SYMR` fields only — `pre[0]`, `pre[1]`,
+  `n`, `s`, `post_rng`. `pre[2]` is a bit counter carrying a per-site constant
+  offset and `cdf0` the 32768-x ICDF mirror; neither is signal.
+* The third field's regex is **`-?\d+`**, not `\d+`. The oracle prints a
+  NEGATIVE `pre[2]` on a stream-dependent fraction of lines (211 of this
+  stream's 457 907; 52 of 96 997 on the 256x128 pin) because it tracks
+  bit-counter wraparound. A `\d+` field drops them and the pair count reads
+  short, which looks like a length mismatch rather than a comparator bug.
+* **Name which override sweep produced any ctx table.** Per-site (keyed on one
+  `lmi`) and global (every site of the category) give different non-answer rows
+  without contradicting: a global override perturbs sites that are not the fork.
+  §6b's table is PER-SITE.
+* Resolve line numbers against the tree you are on and record the **FUNCTION**,
+  not the line: the site is the `tx_size_cat0` arm of `fn decode_leaf_rect8`,
+  and a merge moves every line below it.
+
+**Ordering, as evidence rather than sequence.** This lane's fix moved 176x144's
+first divergence from read 25 792 to 29 411 and changed **nothing** on 640x480;
+Emre-5's conjunct is what makes `mi=(80,110)` reachable in a state where its
+context matters at all. Those two facts are what make the chain ORDERED rather
+than merely sequential — and they are also why the operand pair is readable
+pre-fix.
+
 ## 7. Class sweep
 
 **Source.** Every chroma unit walk in `decode.rs` that derives a unit count from
