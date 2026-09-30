@@ -1604,7 +1604,6 @@ fn tu_reach(
 /// twice as wide as it is tall). Same predicate as [`tu_reach`]; the
 /// square mismatch counter only means anything when the footprint actually
 /// is square.
-#[allow(clippy::too_many_arguments)]
 fn tu_reach_rect(
     bw: usize,
     bh: usize,
@@ -3971,7 +3970,6 @@ fn wave_barrier(fctx: &crate::decode::FrameCtx) {
 
 /// Performs an intra write at its push site when the tile registered its
 /// planes for inline reconstruction ([`ReconPlanes`]); `false` when the
-/// caller must record it for the wavefront workers instead.
 #[allow(unsafe_code)]
 #[allow(clippy::too_many_arguments)]
 fn inline_intra(
@@ -8749,7 +8747,10 @@ fn read_coeffs_rect(
             // the pairing had to guess whether a golomb had been read. This
             // rung reads no bits: it prints the state after the read it labels.
             let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=post_golomb c={} pos={pos} level={level} rng={rng}", (packed >> 4));
+            eprintln!(
+                "EC_COEFF_STEP tag=post_golomb c={} pos={pos} level={level} rng={rng}",
+                (packed >> 4)
+            );
         }
         grid[pos] = if negative { -level } else { level };
     }
@@ -21327,7 +21328,6 @@ impl PlaneBuf<'_> {
 /// Reads one plane's transform block, reconstructs it into `plane` at
 /// `(x, y)`/`side`, and records what it leaves behind in `neighbours`.
 #[allow(clippy::too_many_arguments)]
-
 fn read_plane(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -25865,17 +25865,63 @@ fn sub8_leaf_chroma422(
     // overwrites exactly the cell the first one wrote, as libaom's
     // `av1_set_entropy_contexts` per-TU writes do.
     let ctx_mi = (lmi.0, lmi.1 & !1);
-    // lane-av1-422kf2: the square unit takes the leaf's OWN reach: a split
-    // leaf is a standalone BLOCK_4X4 (square table), a rect pair's strip is
-    // `of_rect` on the strip's true (8x4 / 4x8) shape -- libaom passes the
-    // LEAF's bsize to `has_top_right`/`has_bottom_left`, so a rect strip's
-    // answer comes from `has_tr_8x4`/`has_tr_4x8` at the strip's mi, not
-    // from a 4x4-block lookup.
-    let reach = if leaf_shape == (4, 4) {
-        Reach::of(4, px, py, y.width, y.height, fctx)
-    } else {
-        Reach::of_rect(leaf_shape.0, leaf_shape.1, px, py, y.width, y.height, fctx)
-    };
+    // lane-av1-422kf2: the square unit takes the leaf's OWN reach, but at the
+    // CHROMA plane's granularity, not the luma leaf's. libaom passes the leaf
+    // through `scale_chroma_bsize(bsize, ss_x, ss_y)` first
+    // (`reconintra.c:1823`, definition `:1649`) and only then calls
+    // `has_top_right`/`has_bottom_left` with it, so a rect strip's answer
+    // comes from `has_tr_8x4`/`has_tr_4x8` at the strip's mi, not from a
+    // 4x4-block lookup. At 4:2:2 (`ss (1,0)`) that remap is NOT the identity:
+    // a BLOCK_4X4 luma leaf is answered as BLOCK_8X4, TWO mi wide and one mi
+    // tall.
+    //
+    // MEASURED, `probe/ll422_allintra.obu` (320x240, 4:2:2 lossless
+    // all-intra) against the instrumented `aomdec`: the FIRST wrong chroma
+    // prediction in decode order is unit 2818, plane U, chroma (96,32) --
+    // the leaf at mi(8,49). The oracle's own `EC_PRED` prints `plane=1
+    // row_off=0 col_off=0 txw=4 txh=4 mode=7 p_angle=203 have_top=1
+    // have_left=1 n_top=4 n_left=4 n_tr=-1 n_bl=4 bsize=2`, and `bsize=2`
+    // is BLOCK_8X4 -- the remap, not the BLOCK_4X4 leaf libaom decoded. That
+    // `n_bl=4` is the "leftmost column of superblock" arm: `blk_col_in_sb =
+    // (mi_col & (sb_mi-1)) >> bw_in_mi_log2 = (49 & 15) >> 1 = 0`
+    // (`reconintra.c:421`), where the one-mi-wide luma BLOCK_4X4 reads column
+    // 1, and `blk_start_row_off + row_off + 1 < sb_height_unit` is
+    // `8 + 0 + 1 < 16 >> 0` (`reconintra.c:429-435`). Squared on the luma
+    // leaf, `Reach::of(4, ..)` instead read `has_bl_4x4[byte 32] bit 1`
+    // (`84 = 0b0101_0100`, bit 1 clear) and answered FALSE, so
+    // `PlaneBuf::edges` fed the predictor a 4-sample left column where
+    // libaom fed 8. `build_directional_and_filter_intra_predictors`
+    // (`reconintra.c:1150-1158`) copies `n_left_px` into `left_col[0..3]` and
+    // only `if (n_bottomleft_px > 0)` the next `n_bottomleft_px`, so with the
+    // denial `av1_dr_prediction_z3_c` reads its base term off a replicated
+    // tail -- interior-only, with row0/col0 and the coefficients untouched.
+    // 4:2:0 and 4:4:4 never reach this arm: the reader is 4:2:2-only (its
+    // sibling `sub8_leaf_chroma444` owns those), and the remap is the
+    // identity for a leaf of 8 or more at every subsampling.
+    let (mi_bw, mi_bh) =
+        crate::encode::chroma_mi_shape(leaf_shape.0, leaf_shape.1, ss_x(fctx), ss_y(fctx));
+    // libaom's two edge tests are TILE bounds over the TRANSFORM's plane
+    // extent and its `have_top`/`have_left` flags are `y0 > 0` / `x0 > 0`
+    // (`reconintra.c:1804-1806`, `:1815-1817`); the tile end is the frame end
+    // for every leaf this reader owns, and the unit is one TX_4X4 chroma
+    // transform wide and tall (`4 << ss` luma px per axis).
+    let tx_w = 4 << ss_x(fctx);
+    let tx_h = 4 << ss_y(fctx);
+    let reach = Reach::of_tu_chroma(
+        mi_bw,
+        mi_bh,
+        lmi.0,
+        lmi.1,
+        crate::encode::reach_sb_mi(fctx),
+        0,
+        0,
+        tx_w,
+        tx_h,
+        ss_x(fctx),
+        ss_y(fctx),
+        py > 0 && px + (tx_w << ss_x(fctx)) < y.width,
+        px > 0 && py + (tx_h << ss_y(fctx)) < y.height,
+    );
     let chroma_around = neighbours.around_mi_422_chroma(ctx_mi, 8, 4);
     // lane-av1422sub8pix: the CfL AC signal spans the UNIT's luma footprint,
     // anchored at the same FLOORED luma x the write/prediction anchor below
