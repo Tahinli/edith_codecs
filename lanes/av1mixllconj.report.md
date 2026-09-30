@@ -214,6 +214,31 @@ forced  ctx=0 : 286327 reads   forced ctx=2 : 521856
 forced  ctx=3 : 179378 reads   forced ctx=4 : 179378
 ```
 
+**Joint fact, reproduced on two trees.** `lane-av1offtile` re-measured this on
+`9abe724a` + their chroma clip (`git apply --3way`, clean) with the same
+per-site override and got the same lock: `ctx 1 -> ours=457907` against
+`oracle 457907`, bit-identical over all of them, while the natural value gives
+521 856 with the first divergence at 179 378. Their operand reads and their
+`EC_TXUPD` replay reproduce mine exactly, including the four writes to mi column
+110 in that frame and the last one being the skipped 16-px inter block at
+`mi=(36,108)`. Their record is `lanes/av1offtile.report.md` §6b, tip `3a9676ed`.
+Three corrections their run established and I fold in here:
+
+* the site is the `tx_size_cat0` arm of **`decode_leaf_rect8`**, and the
+  override only bites **with this lane's conjunct landed** — on base + their
+  clip alone the cell reads 860 431 and no `ctx` value changes anything, because
+  the block is never reached in a state where it matters. Dependency order:
+  off-tile chroma walk -> var-tx conjunct -> band gap.
+* resolving my line number against MY tree is what caught their first attempt
+  (they keyed the `tx_size_cat1` site and got five identical runs, which reads
+  as "the claim does not reproduce").
+* the `EC_SYMR` comparator's third field must accept a **negative**
+  `pre[2]`: 211 of this stream's 457 907 oracle lines carry one, and a `\d+`
+  third field drops them, which is the same silent under-count that made my own
+  first pass read "96945 paired" instead of 96997 on the pin.
+
+No forced-`ctx` production code is in either branch.
+
 **The band itself is wrong, not the context formula.** Replaying every
 `EC_TXUPD` band write up to read 179 378, the last write to mi column 110 is a
 **skipped** 16-px-wide inter block at `mi=(36,108)` (`skip_inter=true`,
@@ -414,8 +439,11 @@ generated cell, exactly as the prior lane warned.
   `mi=(80,110)` on a 640x480 mixed-lossless cell, rows 37..79, mi column 110 —
   the last write this tree makes is a skipped 16-px inter block at `mi=(36,108)`
   publishing 16 where libaom has 4)** — that is the whole 640x480 cell, and the
-  one regression control this lane does not meet. Owner: whoever holds
-  `context-band-not-published`; §4.3 hands it a one-line reproduction.
+  one regression control this lane does not meet. **Owner: `Kerem-8`, lane
+  `lane/av1txctxband2`**, which has claimed the band-write family; §4.3 and the
+  joint reproduction in `lanes/av1offtile.report.md` §6b hand it the numbers, the
+  per-site override and the `EC_TXUPD` replay, so the chain need not run through
+  this lane.
 * **deferred(identification of the residual reds on the 6-frame 256x128,
   320x240 and 176x144 arms)** — the 176x144 one is `lane-av1golomb320`'s
   `mi=(32,32)` fork; the other two are unnamed and this lane does not claim
