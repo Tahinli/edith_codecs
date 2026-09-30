@@ -2005,10 +2005,34 @@ mod tests {
     /// (`(chroma_w.min(32), chroma_h.min(32))`), so the enumeration walks the
     /// strip domain -- the 64-axis 2:1 and 1:4 footprints, the only shapes the
     /// two callers (`read_sb128_root`, `decode_intra_rect_in_inter`) hand the
-    /// function -- through both supported chroma formats (4:4:4 and 4:2:0;
-    /// every mixed format is refused at the sequence header) against the
-    /// `match` arms read out of decode.rs itself (class
+    /// function -- through every chroma format an AV1 `color_config` can
+    /// carry, against the `match` arms read out of decode.rs itself (class
     /// `table-and-reader-move-together`).
+    ///
+    /// lane-av1422census422 widened the format domain from `{(0,0), (1,1)}`
+    /// to `{(0,0), (1,0), (1,1)}`. The old walk justified stopping at two
+    /// formats with "every mixed format is refused at the sequence header" --
+    /// a proof that DEPENDS on that guard, so the moment the guard is lifted
+    /// the enumeration keeps passing while covering nothing about 4:2:2, with
+    /// no failure and no output change. The sibling enumeration
+    /// `every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table`
+    /// (same file, the 32-level strips) already walked `(1,0)` and said why:
+    /// `ec-av1-syntax`'s `color_config` only ever READS `subsampling_y` when
+    /// `subsampling_x == 1` (`sequence.rs:481`), so `(0,1)` is uncodable and
+    /// the reachable set is exactly these three. That sibling was RIGHT and
+    /// this half was wrong: "the header refuses it" is a statement about
+    /// today's tree, not about the strip domain, and a domain that shrinks
+    /// silently when a guard moves is not an enumeration. `(1,0)` is walked
+    /// here anyway, so this proof does not depend on the guard staying.
+    ///
+    /// The 32-per-axis cap is what keeps 4:2:2 covered without new table
+    /// arms: a 4:2:0 32x64 strip is a 16x32 chroma unit and its 4:2:2
+    /// counterpart is a 16x64 one, but the cap resolves BOTH to `(16, 32)`
+    /// (likewise 16x64 -> `(8, 32)`). So 4:2:2 lands entirely inside the
+    /// existing five arms and the `hit == handled` non-vacuity assert below is
+    /// unchanged. That is a measured result, not an assumption: this
+    /// paragraph describes the widened walk in this test's own body, which
+    /// asserts both the per-unit table membership and the 12-unit count.
     ///
     /// lane-av1-witness2 hunted the shape with 8 real aomenc key-frame encodes
     /// (screen+intrabc, rect+1:4, sb 64 and 128, cq 10..63, cpu-used 0..2):
@@ -2126,9 +2150,13 @@ mod tests {
                 if ratio != 2 && ratio != 4 {
                     continue;
                 }
-                // (ss_x, ss_y): (0, 0) is 4:4:4, (1, 1) is 4:2:0. The mixed
-                // formats are refused by name at the sequence header.
-                for (ss_x, ss_y) in [(0usize, 0usize), (1, 1)] {
+                // (ss_x, ss_y): (0, 0) is 4:4:4, (1, 0) is 4:2:2, (1, 1) is
+                // 4:2:0. `(0, 1)` is uncodable -- `color_config` reads
+                // `subsampling_y` only when `subsampling_x == 1`
+                // (sequence.rs:481) -- so these three are the whole
+                // reachable set, and each is walked whether or not the
+                // sequence header still refuses it.
+                for (ss_x, ss_y) in [(0usize, 0usize), (1, 0), (1, 1)] {
                     let (chroma_w, chroma_h) = (bw >> ss_x, bh >> ss_y);
                     let unit = (chroma_w.min(32), chroma_h.min(32));
                     assert!(
@@ -2143,8 +2171,9 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 8,
-            "the strip domain is not the four 64-axis strips x two supported formats"
+            checked, 12,
+            "the strip domain is not the four 64-axis strips x three codable \
+             chroma formats (4:4:4, 4:2:2, 4:2:0)"
         );
         assert_eq!(
             hit, handled,
