@@ -56,6 +56,7 @@ mod refusal_inventory;
 mod restoration;
 pub mod sequence;
 pub mod speed;
+mod stack_budget;
 pub mod stream;
 mod superres;
 pub mod tile;
