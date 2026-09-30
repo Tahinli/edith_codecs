@@ -352,6 +352,42 @@ most likely a counting-shape difference (our var-tx leaves versus libaom's
 unit walk) rather than a walk defect; it is NOT established either way, and I
 am not claiming it.
 
+### Round 6 — the caller is NAMED
+
+Main's ask was to name the caller of the `read_coeffs_rect(4, 8, skip_ctx=0)`
+shape. Done with `#[track_caller]` on `read_coeffs_rect` and on
+`read_inter_plane_rect`, which turns every call into a file:line tag with no
+backtrace and no per-site edit. One run, exact answer:
+
+| bit | call site | plane | x, y | w x h | around |
+|---|---|---|---|---|---|
+| 6885 | `decode.rs:13165` | 0 | 416, 368 | 8x16 | (0,0,0) |
+| **6893 (the fork)** | **`decode.rs:13184`** | **1 (U)** | **208, 184** | **4x8** | **(0,0,0)** |
+| 6902 | `decode.rs:13202` | 2 (V) | 208, 184 | 4x8 | (0,0,0) |
+
+All three are inside **`decode_intrabc_rect`** (`decode.rs:12955`), its
+non-lossless whole-block rect arm — the `read_inter_plane_rect` triple for
+luma then U then V off one shared
+`around_mi_rect((mi_r, mi_c), bw, bh)` gather. The luma unit is 8x16, the
+chroma units 4x8, which at ss (0,0) means a **4x8 chroma unit under a 4x16
+luma plane block** — the sub-8 unit walk, which is exactly the prior Selin2-2's
+census established and exactly the class shape.
+
+So the third instance of this lane's class is not a pair extent at all in its
+outward form: it is one gather, taken at the LUMA footprint, serving a CHROMA
+unit whose own extent is half that on the long axis. At 4:2:0 the two coincide
+after subsampling, which is why the 4:2:0 twin is byte-exact; at 4:4:4 they do
+not.
+
+**A second observation that is NOT yet established and I am not claiming:** at
+this same bit the oracle reports mi (90,108) — luma px (360,432) — while our
+chroma unit is at px (208,184), mi (46,52). Every read before this one paired
+exactly, so both decoders are at the same bit position after the same number of
+reads, which is hard to reconcile with a different block. Either the oracle's
+`xd->mi_row/mi_col` is not naming the same block our `x, y` name, or there is a
+position divergence I have not localised. Not established; recorded so the next
+lane does not have to rediscover the discrepancy.
+
 **Handed back, not landed.** The remaining 4:4:4 intra-BC defect is a **4x8
 rect coefficient unit**, present with 1:4 and rect partitions both disabled,
 and it is neither of the two candidates the follow-up named. Landing a partial
@@ -370,10 +406,16 @@ fork left in this cell.
 
 ## 7. Residue handed on, not fixed here
 
-- **4:4:4 intra-BC chroma** — a 4x8 rect coefficient unit: read 12465,
-  mi (90,108), `read_coeffs_rect(w=4, h=8, skip_ctx=0)` at bit 6893; U and V
-  first wrong at index 20532. Per §6; both originally-named candidates
-  eliminated by measurement, so this needs a fresh start, not a continuation.
+- **4:4:4 intra-BC chroma** — a 4x8 rect coefficient unit. CALLER NAMED in
+  round 6: `decode_intrabc_rect` (`decode.rs:12955`), the non-lossless
+  whole-block rect arm, at `decode.rs:13184` (U) and `13202` (V). One gather,
+  `around_mi_rect((mi_r, mi_c), bw, bh)`, taken at the LUMA footprint and
+  serving a 4x8 chroma unit under a 4x16 luma plane block; at 4:2:0 the two
+  coincide after subsampling (hence the exact 4:2:0 twin) and at 4:4:4 they do
+  not. Fork read 12465, bit 6893, U and V first wrong at index 20532. Both
+  originally-named candidates and the token-order hypothesis remain dead by
+  measurement. Unexplained and unclaimed: at that bit the oracle reports mi
+  (90,108) while our unit is at px (208,184) — see §6.
 - **H2** and **H3** are with Kaan-2 as of this writing (Selin2-2's round
   closed with the census committed); §5's retraction is the record they need.
 - **H4** — 4:4:4 lossless + tile rows, hard divergence. Own lane; untouched.

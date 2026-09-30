@@ -308,3 +308,49 @@ no-op for the only format with committed coverage on this path.
 
 **Net class status: the class is closed except for this one site, which is
 proven reachable and documented rather than silently changed.**
+
+## 17. Round 9 — on merged main (`e719050d`): the fork is GONE
+
+Main absorbed seven lanes at `e719050d`, including a 128-root token-walk
+change (`mu_chunk_order`) that sits squarely in the area rounds 3-8 were
+chasing. Re-measured on a clean detached worktree at `e719050d` (`main` is
+already checked out elsewhere); my fix `4e151813` is an ancestor there and
+the reach call is ss-aware, so the base is sound.
+
+**Step 1 — does the fork still exist? NO.**
+
+Same recipe and stream (`v2_c40.obu`, 4:4:4 lossy cq-40, `--sb-size=128`,
+256x256, 36 shown frames):
+
+| tree | wrong per frame |
+|---|---|
+| my base (rounds 3-8) | 1415 ... 62614 ... diverges throughout |
+| **merged main `e719050d`** | **0 on all 36 frames** |
+
+And the entropy, which is the authoritative measure:
+
+    oracle reads 217570   merged-main reads 217570
+    ENTROPY LOCKSTEP over 217570 reads
+
+Identical read COUNTS and no value/range/symbol/post_rng divergence over the
+entire stream. The read-41976 fork, the 32-vs-64 transform-class
+disagreement, and every downstream desync are absent on main.
+
+**Which merged change owns it — partially answered, and I will not guess past
+what I measured.** The obvious candidate in my named area is av1h5's
+`mu_chunk_order` ("read a 128 root's tokens CHUNK-major, not block-raster",
+absent from my base). Ablated it: `4155c7c7` + my fix + `8a91ee14` alone
+**still diverges** (1415, 1582, 478, 62614, 60028, ...). So that commit is
+NOT sufficient on its own. I could not build the all-three-av1h5 arm — the
+cherry-pick of `34b56884`/`f6fbad26` onto my base **conflicts** — so this
+round reports one negative result and stops, rather than attributing.
+
+**What this means for rounds 3-8.** The 128-root leaf-size disagreement those
+rounds named is real, was correctly localised to the 128-root token walk, and
+is fixed on main by one of the seven merged lanes. What produced it: the
+`EC_SYMR` read-class tags (which proved both decoders were in the SAME read
+function and that the difference was table class, not symbol class), the
+`n=7` disambiguation against libaom's `eob_flag_cdf64`, and the four
+retractions that kept a wrong fix from shipping. The parked inter-64x64
+`EC_PART_VAL` alignment fix stays parked — main now answers the question
+outright, so it is no longer needed.

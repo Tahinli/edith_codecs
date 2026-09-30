@@ -3028,6 +3028,14 @@ fn cfl_src_rect(px: usize, py: usize, bw: usize, bh: usize) -> CflSrc {
 /// `reconstruct_mc_rect` reads both of its buffers at.
 #[derive(Clone, Copy)]
 pub(crate) struct TxParams {
+    /// The plane this unit belongs to (0 luma, 1 U, 2 V), carried from the
+    /// reader that OWNS the unit. `dequant_and_inverse_wht4x4`'s `EC_DQCOEFF`
+    /// twin prints it so its ladder pairs with the oracle's: the per-unit
+    /// census plane could not, because the callers that route a lossless 4x4
+    /// unit into the WHT are not all the ones that stamp the census plane
+    /// (measured on `ll444-lossless-key.obu`: 1663 of 1663 chroma units paired
+    /// by count, 1660 of them against an empty grid).
+    pub(crate) plane: usize,
     pub(crate) w: usize,
     pub(crate) h: usize,
     pub(crate) bit_depth: u8,
@@ -3118,6 +3126,7 @@ impl TxParams {
             }
             crate::transform::dequant_and_inverse_wht(
                 grid,
+                self.plane,
                 self.w,
                 self.h,
                 self.bit_depth,
@@ -8029,6 +8038,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_EOBPT_CDF {eob_pt:?} range={range} value={value}");
     }
+    crate::msac::SymbolDecoder::set_symr_cdf("eob_pt");
     let group = dec.symbol(eob_pt) + 1;
     if trace {
         eprintln!("TRACE eob_pt value={group} rng={}", dec.debug_state().0);
@@ -8277,6 +8287,7 @@ fn read_coeffs(
         if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") && len == 3 {
             eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
         }
+        crate::msac::SymbolDecoder::set_symr_cdf("tx_type");
         let t = dec.symbol(tx_type_cdf);
         crate::census::tx_type(len, t);
         if coeff_trace_on() {
@@ -21465,6 +21476,19 @@ fn read_plane(
     // filter-intra is on) -- caller passes the raw filter-intra mode 0..4 in
     // `filter_intra`, only meaningful for `plane_idx == 0` (chroma has no
     // filter-intra in AV1).
+    // lane-av1444chr: per-TU mode trace with the PLANE named. `PlaneBuf`'s own
+    // `OUR_PRED` rung cannot carry it (reconstruction does not know its
+    // plane), and a rung whose plane has to be guessed from the values has
+    // already produced wrong claims twice this session -- `read_coeffs_rect`
+    // labelling its unit `plane=0`, and a sweep reading a second-luma-unit
+    // phantom out of that label (class `rung-mislabels-plane`). Diagnostic
+    // only: no gate asserts decode behaviour off this line.
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
+        eprintln!(
+            "OUR_MODE plane={plane_idx} x={x} y={y} side={side} mode={predict_mode} \
+             ad={angle_delta} fi={filter_intra:?} reach={reach:?}"
+        );
+    }
     let tx_mode = if plane_idx == 0 {
         fi_tx_row(tx_mode, filter_intra)
     } else {
@@ -21554,6 +21578,7 @@ fn read_plane(
     let levels = extend_corner(grid, tx_side, tx_side, side, side);
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let tx = TxParams {
+        plane: plane_idx,
         w: side,
         h: side,
         bit_depth: bit_depth(fctx),
@@ -27204,6 +27229,7 @@ fn decode_leaf_rect8(
                     // fixture: the DCT route left ±1..30 sample errors on every
                     // walked leaf's luma.
                     let tx = TxParams {
+                        plane: 0,
                         w: tw,
                         h: th,
                         bit_depth: crate::decode::bit_depth(fctx),
@@ -30606,6 +30632,7 @@ fn read_inter_plane_rect(
     // stride, so the dense `w x h` residual is re-laid at that stride
     // (`TxParams::stride`) after the inverse transform.
     let tx = TxParams {
+        plane: plane_idx,
         w,
         h,
         bit_depth: bit_depth(fctx),
@@ -37711,6 +37738,7 @@ fn read_inter_plane(
     let grid = extend_corner(grid, tx_side, tx_side, side, side);
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let tx = TxParams {
+        plane: plane_idx,
         w: side,
         h: side,
         bit_depth: bit_depth(fctx),
