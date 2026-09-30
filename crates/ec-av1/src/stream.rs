@@ -10413,31 +10413,59 @@ pub(crate) mod tests {
             return None;
         }
         let bpp = if bit_depth == 8 { 1 } else { 2 };
-        // The plane split comes from the FIRST decoded picture, not from a
-        // formula: a 4:2:0 picture's chroma is a quarter of the luma, a
-        // 4:2:2/4:4:4 chroma is not, and a wrong split silently attributes
-        // every wrong sample to the wrong plane.
-        let f0 = decoded.first().expect("a decoded picture");
-        let (w, h) = (f0.width, f0.height);
-        let (ys, us) = (w * h * bpp, f0.u.len() * bpp);
+        // lane-av1cmpframe: the plane split is PER FRAME and comes from each
+        // decoded frame's OWN plane lengths -- never from a formula, and
+        // never from the first picture.
+        //
+        // The first-picture form was wrong on every multi-frame stream: it
+        // compared a byte index against frame 0's thresholds forever, so
+        // every sample after frame 0's luma was attributed to the LAST
+        // plane. On `420_oddheight_320x236_diverging` (16 frames of 320x236
+        // 4:2:0, whose frame is 113 280 bytes and whose V plane therefore
+        // holds 302 080 bytes in total) it reported `wrong_v = 330 673` --
+        // more wrong V bytes than exist. The per-frame byte totals and the
+        // frame-exact count were sound; only the per-plane attribution was
+        // not, and a wrong attribution is the one thing a per-plane report
+        // is read for.
+        //
+        // `pack_rawvideo` already lays the bytes out per frame from the same
+        // plane lengths, so this table is exactly the layout it produced.
+        let mut spans: Vec<[usize; 4]> = Vec::with_capacity(decoded.len());
+        let mut off = 0usize;
+        for f in &decoded {
+            let (y, u, v) = (f.y.len() * bpp, f.u.len() * bpp, f.v.len() * bpp);
+            spans.push([off, off + y, off + y + u, off + y + u + v]);
+            off += y + u + v;
+        }
+        assert_eq!(
+            off,
+            ours.len(),
+            "{name}: the per-frame plane table covers {off} bytes but the packed output is {}",
+            ours.len()
+        );
         let mut wrong = [0usize; 3];
+        let mut frame = 0usize;
         for (i, (&a, &b)) in ours.iter().zip(&want).enumerate() {
+            while frame + 1 < spans.len() && i >= spans[frame][3] {
+                frame += 1;
+            }
             if a == b {
                 continue;
             }
-            let pi = if i < ys {
+            let s = spans[frame];
+            let pi = if i < s[1] {
                 0
-            } else if i < ys + us {
+            } else if i < s[2] {
                 1
             } else {
                 2
             };
             wrong[pi] += 1;
         }
-        let per = ys + 2 * us;
         let frames = decoded.len();
-        let exact = (0..frames)
-            .filter(|k| ours[k * per..(k + 1) * per] == want[k * per..(k + 1) * per])
+        let exact = spans
+            .iter()
+            .filter(|s| ours[s[0]..s[3]] == want[s[0]..s[3]])
             .count();
         Some((wrong[0], wrong[1], wrong[2], frames, exact))
     }
@@ -10497,6 +10525,177 @@ pub(crate) mod tests {
             );
         }
         eprintln!("{NAME}: baseline exact, each flipped oracle byte reported as exactly 1");
+    }
+
+    /// lane-av1cmpframe: the control for the class
+    /// `comparator-that-attributes-the-wrong-plane`.
+    ///
+    /// [`count_rawvideo_diffs`] used to derive its plane split from the FIRST
+    /// decoded picture and compare every byte index against those frame-0
+    /// thresholds. On a multi-frame stream that attributes every sample after
+    /// frame 0's luma to the LAST plane: on the pinned 320x236 stream below
+    /// (16 frames of 320x236 4:2:0, 113 280 bytes per frame, so plane V holds
+    /// 302 080 bytes in total) it reported `wrong_v = 330 673` -- more wrong V
+    /// bytes than exist. The per-frame totals and the frame-exact count were
+    /// sound, so the defect was invisible to every gate that only asserted
+    /// zeros; it corrupted exactly the numbers a per-plane report exists to
+    /// give.
+    ///
+    /// Three arms, each of which the old attribution FAILS:
+    ///
+    /// 1. **Arithmetic.** Each plane's count must be at most that plane's own
+    ///    byte capacity summed over frames, and the three must sum to the
+    ///    independently computed total. The old code reported 330 673 wrong V
+    ///    bytes in a 302 080-byte plane.
+    /// 2. **A later frame's U.** Flipping one byte inside frame 5's U plane
+    ///    must move U by exactly one and leave Y and V at their baseline.
+    ///    The old code has no frame-5 U at all -- byte 600 000 is past every
+    ///    frame-0 threshold, so it landed in V.
+    /// 3. **Frame attribution.** `frames_exact` must equal the number of
+    ///    frames this test counts itself, per frame, from the decoded
+    ///    pictures' own plane lengths.
+    ///
+    /// The pin is asserted only for IDENTITY (bytes + fnv1a64) and for
+    /// comparability. Whether the stream currently diverges is deliberately
+    /// NOT asserted: this is a control for the INSTRUMENT, and it must keep
+    /// biting after the odd-height entropy fork is fixed.
+    #[test]
+    fn the_counting_oracle_diff_attributes_planes_per_frame() {
+        const NAME: &str = "the_counting_oracle_diff_attributes_planes_per_frame";
+        let _gate_lock = lock_gate_counters();
+        const FILE: &str = "420_oddheight_320x236_diverging.obu";
+        const BYTES: usize = 16562;
+        // sha256 84e4d1ab56620af1c5b78e1aa3d2d67496a492f2e127198c82dd1d68b01c6200.
+        // The tree pins fixture identity by fnv1a64; a `const SHA256`
+        // compared against itself would be the tautology this lane exists to
+        // kill, so it is not written.
+        const FNV1A64: u64 = 521889434652397870;
+        let data = crate_pin(FILE);
+        let data = std::fs::read(&data)
+            .unwrap_or_else(|e| panic!("{NAME}: the committed pin {FILE} is missing ({e})"));
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FNV1A64, "{NAME}: {FILE} bytes drifted");
+        let bit_depth = stream_bit_depth(&data, NAME);
+        let bpp = if bit_depth == 8 { 1 } else { 2 };
+
+        // ---- this test's own reading of the oracle, from scratch ---------
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, &data).expect("writing the stream");
+        let raw = dir.join("aomdec.raw");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "--rawvideo", "-o"])
+            .arg(&raw)
+            .arg(&obu)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let want = std::fs::read(&raw).expect("aomdec rawvideo output");
+        let _ = std::fs::remove_dir_all(&dir);
+        let decoded = decode_stream(&data).expect("the pinned stream decodes");
+        let ours = pack_rawvideo(&decoded, bit_depth, NAME);
+        assert_eq!(ours.len(), want.len(), "{NAME}: the two sides differ in size");
+
+        // The per-frame plane table, built from each decoded picture's OWN
+        // plane lengths -- the same source `pack_rawvideo` lays the bytes out
+        // from, and never a formula.
+        let mut spans: Vec<[usize; 4]> = Vec::with_capacity(decoded.len());
+        let mut capacity = [0usize; 3];
+        let mut off = 0usize;
+        for f in &decoded {
+            let (y, u, v) = (f.y.len() * bpp, f.u.len() * bpp, f.v.len() * bpp);
+            spans.push([off, off + y, off + y + u, off + y + u + v]);
+            capacity[0] += y;
+            capacity[1] += u;
+            capacity[2] += v;
+            off += y + u + v;
+        }
+        assert_eq!(off, ours.len(), "{NAME}: the plane table covers the buffer");
+
+        // The truth, counted here with no help from the helper under test.
+        let mut truth = [0usize; 3];
+        let mut truth_exact = 0usize;
+        for s in &spans {
+            let mut frame_exact = true;
+            for (p, a, b) in [(0usize, s[0], s[1]), (1, s[1], s[2]), (2, s[2], s[3])] {
+                let n = ours[a..b]
+                    .iter()
+                    .zip(&want[a..b])
+                    .filter(|(x, y)| x != y)
+                    .count();
+                truth[p] += n;
+                frame_exact &= n == 0;
+            }
+            truth_exact += usize::from(frame_exact);
+        }
+
+        let (wy, wu, wv, frames, exact) =
+            count_rawvideo_diffs(&data, NAME, None).expect("the two sides must be byte-comparable");
+        eprintln!(
+            "{NAME}: pinned {FILE} as wrongY={wy} wrongU={wu} wrongV={wv} over {frames} frames, \
+             {exact} exact; this test's own count {truth:?} with {truth_exact} exact frames; \
+             plane capacities {capacity:?}"
+        );
+        assert_eq!(frames, decoded.len(), "{NAME}: frame count");
+        assert_eq!(
+            [wy, wu, wv],
+            truth,
+            "{NAME}: the helper's per-plane split must equal an independent per-frame count"
+        );
+        assert_eq!(exact, truth_exact, "{NAME}: frames_exact");
+        for p in 0..3 {
+            assert!(
+                truth[p] <= capacity[p],
+                "{NAME}: plane {p} counts {} wrong bytes but holds only {}",
+                truth[p],
+                capacity[p]
+            );
+        }
+
+        // ---- arm 2: a byte inside a LATER frame's U plane. --------------
+        // Frame 5's U plane's first byte. The old first-picture attribution
+        // has no frame-5 U at all: that byte is past every frame-0 threshold,
+        // so it landed in V.
+        let u5 = spans[5][1];
+        let (fy, fu, fv, fframes, fexact) = count_rawvideo_diffs(&data, NAME, Some(u5))
+            .expect("the two sides must be byte-comparable");
+        let flipped = [fy, fu, fv];
+        assert_eq!(fframes, frames, "{NAME}: frame count under the flip");
+        assert_eq!(
+            flipped.iter().sum::<usize>(),
+            truth.iter().sum::<usize>() + 1,
+            "{NAME}: flipping one byte inside frame 5's U plane must add exactly one wrong \
+             byte -- got {flipped:?} against this test's own count {truth:?}"
+        );
+        assert_eq!(
+            flipped[1],
+            truth[1] + 1,
+            "{NAME}: byte {u5} is inside frame 5's U plane"
+        );
+        assert_eq!(flipped[0], truth[0], "{NAME}: byte {u5} is not in luma");
+        assert_eq!(
+            flipped[2], truth[2],
+            "{NAME}: byte {u5} must NOT be attributed to V -- the first-picture attribution \
+             puts every byte past frame 0's luma in V"
+        );
+        let want_exact = if truth_exact < frames {
+            truth_exact
+        } else {
+            frames - 1
+        };
+        assert_eq!(
+            fexact, want_exact,
+            "{NAME}: one flipped byte inside frame 5 leaves frames_exact at {want_exact}"
+        );
     }
 
     /// lane-av1cmpaudit2: the permanent CONTROL for the class
@@ -51611,4 +51810,5 @@ exit 0
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 }
