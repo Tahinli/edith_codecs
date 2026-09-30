@@ -18982,12 +18982,19 @@ fn decode_rect4_16_strip(
                             // never reads (measured: key frame 0, 4:4:4 lossless
                             // 16x4 strip at (104,26), U 29 + V 34 samples wrong,
                             // entropy bit-identical over 351109 EC_SYMR reads).
-                            let cu_reach = tu_reach(
+                            // lane-av1422llpred r2: this site had the OTHER half
+                            // of the same shape -- `tu_reach` takes ONE size for
+                            // both axes, so a subsampled chroma unit's height
+                            // came from `<< ss_x` instead of `<< ss_y` (a TX_4x4
+                            // chroma unit is `4 << ss_x` luma px wide but
+                            // `4 << ss_y` tall). Identical at 4:2:0/4:4:4.
+                            let cu_reach = tu_reach_rect(
                                 pw,
                                 ph,
                                 ox << ss_x(fctx),
                                 oy << ss_y(fctx),
                                 4 << ss_x(fctx),
+                                4 << ss_y(fctx),
                                 pair_reach,
                                 ppx,
                                 ppy,
@@ -19069,12 +19076,17 @@ fn decode_rect4_16_strip(
                             // Same ss-aware luma footprint as the skip arm
                             // above -- `ox * 2 / 8` is the 4:2:0-only form and
                             // mis-answers `of_tu` at 4:4:4 (see there).
-                            let cu_reach = tu_reach(
+                            // lane-av1422llpred r2: and the SKIP arm's fix
+                            // missed the other half of the same shape -- one
+                            // size for both axes makes the height come from
+                            // `<< ss_x`, so only 4:2:2 can reach it.
+                            let cu_reach = tu_reach_rect(
                                 pw,
                                 ph,
                                 ox << ss_x(fctx),
                                 oy << ss_y(fctx),
                                 4 << ss_x(fctx),
+                                4 << ss_y(fctx),
                                 pair_reach,
                                 ppx,
                                 ppy,
@@ -37565,12 +37577,13 @@ fn read_intra_chroma_lossless(
                 let cu_around = neighbours.around_mi(cu_mi, MI);
                 // The unit's origin and extent in LUMA pixels: `<< ss` at
                 // 4:2:0 (8x8 luma for a 4x4 chroma unit), identity at 4:4:4.
-                let cu_reach = tu_reach(
+                let cu_reach = tu_reach_rect(
                     side,
                     side,
                     ox << ss_x(fctx),
                     oy << ss_y(fctx),
                     4 << ss_x(fctx),
+                    4 << ss_y(fctx),
                     reach,
                     px,
                     py,
