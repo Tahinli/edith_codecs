@@ -21476,6 +21476,19 @@ fn read_plane(
     // filter-intra is on) -- caller passes the raw filter-intra mode 0..4 in
     // `filter_intra`, only meaningful for `plane_idx == 0` (chroma has no
     // filter-intra in AV1).
+    // lane-av1444chr: per-TU mode trace with the PLANE named. `PlaneBuf`'s own
+    // `OUR_PRED` rung cannot carry it (reconstruction does not know its
+    // plane), and a rung whose plane has to be guessed from the values has
+    // already produced wrong claims twice this session -- `read_coeffs_rect`
+    // labelling its unit `plane=0`, and a sweep reading a second-luma-unit
+    // phantom out of that label (class `rung-mislabels-plane`). Diagnostic
+    // only: no gate asserts decode behaviour off this line.
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
+        eprintln!(
+            "OUR_MODE plane={plane_idx} x={x} y={y} side={side} mode={predict_mode} \
+             ad={angle_delta} fi={filter_intra:?} reach={reach:?}"
+        );
+    }
     let tx_mode = if plane_idx == 0 {
         fi_tx_row(tx_mode, filter_intra)
     } else {
