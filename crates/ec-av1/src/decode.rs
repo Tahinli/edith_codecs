@@ -3028,6 +3028,14 @@ fn cfl_src_rect(px: usize, py: usize, bw: usize, bh: usize) -> CflSrc {
 /// `reconstruct_mc_rect` reads both of its buffers at.
 #[derive(Clone, Copy)]
 pub(crate) struct TxParams {
+    /// The plane this unit belongs to (0 luma, 1 U, 2 V), carried from the
+    /// reader that OWNS the unit. `dequant_and_inverse_wht4x4`'s `EC_DQCOEFF`
+    /// twin prints it so its ladder pairs with the oracle's: the per-unit
+    /// census plane could not, because the callers that route a lossless 4x4
+    /// unit into the WHT are not all the ones that stamp the census plane
+    /// (measured on `ll444-lossless-key.obu`: 1663 of 1663 chroma units paired
+    /// by count, 1660 of them against an empty grid).
+    pub(crate) plane: usize,
     pub(crate) w: usize,
     pub(crate) h: usize,
     pub(crate) bit_depth: u8,
@@ -3118,6 +3126,7 @@ impl TxParams {
             }
             crate::transform::dequant_and_inverse_wht(
                 grid,
+                self.plane,
                 self.w,
                 self.h,
                 self.bit_depth,
@@ -21556,6 +21565,7 @@ fn read_plane(
     let levels = extend_corner(grid, tx_side, tx_side, side, side);
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let tx = TxParams {
+        plane: plane_idx,
         w: side,
         h: side,
         bit_depth: bit_depth(fctx),
@@ -27206,6 +27216,7 @@ fn decode_leaf_rect8(
                     // fixture: the DCT route left ±1..30 sample errors on every
                     // walked leaf's luma.
                     let tx = TxParams {
+                        plane: 0,
                         w: tw,
                         h: th,
                         bit_depth: crate::decode::bit_depth(fctx),
@@ -30608,6 +30619,7 @@ fn read_inter_plane_rect(
     // stride, so the dense `w x h` residual is re-laid at that stride
     // (`TxParams::stride`) after the inverse transform.
     let tx = TxParams {
+        plane: plane_idx,
         w,
         h,
         bit_depth: bit_depth(fctx),
@@ -37713,6 +37725,7 @@ fn read_inter_plane(
     let grid = extend_corner(grid, tx_side, tx_side, side, side);
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let tx = TxParams {
+        plane: plane_idx,
         w: side,
         h: side,
         bit_depth: bit_depth(fctx),
