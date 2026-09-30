@@ -11879,6 +11879,65 @@ exit 0
         );
     }
 
+    /// lane-av1oddheightfork3: the 320x236 cell this lane CLOSED, as a
+    /// permanent BYTE-EXACTNESS gate against the live oracle -- not a route
+    /// counter, not a source scan. It compares our decoded samples with
+    /// `aomdec --rawvideo`'s own bytes plane by plane, and asserts every
+    /// frame is byte-exact.
+    ///
+    /// **The defect it pins.** Before the fix this cell measured
+    /// `Y 234349 / U 56957 / V 52981, 0 of 16 frames exact` -- reproduced on
+    /// this lane's own tree by reverting the fix, matching
+    /// `lanes/av1oddluma.report.md` and `lanes/av1cmpframe.report.md` digit
+    /// for digit. The first divergent read is the `txfm_partition` symbol of
+    /// the INTRABC 8x16 block at mi(44,60): our `TXFM_CONTEXT` grid held the
+    /// BLOCK's own `16` in `left_txfm[44]` where libaom holds the split
+    /// leaf's `8` (the operand pair is printed by the oracle rung
+    /// `EC_VARTXCTX`, `scripts/instrument-aom-oracle.sh`), so `ctx` was 12
+    /// against libaom's 13 and `is_split` 0 against 1.
+    ///
+    /// **Non-vacuity.** `the_counting_oracle_diff_detects_one_flipped_oracle_byte`
+    /// is the comparator control and does not depend on any witness
+    /// diverging; the mutation proof that this gate BITES the defect it
+    /// names is in `lanes/av1oddheightfork3.report.md` (revert the
+    /// `fill_lf_grid_rect_after_vartx` call sites -> this test reds BY NAME
+    /// with the numbers above).
+    #[test]
+    fn the_pinned_420_oddheight_320x236_witness_decodes_byte_exact() {
+        const NAME: &str = "the_pinned_420_oddheight_320x236_witness_decodes_byte_exact";
+        let _gate_lock = lock_gate_counters();
+        const FILE: &str = "420_oddheight_320x236_diverging.obu";
+        const BYTES: usize = 16562;
+        // sha256 84e4d1ab56620af1c5b78e1aa3d2d67496a492f2e127198c82dd1d68b01c6200.
+        // Identity is pinned by fnv1a64 (the same value
+        // `the_counting_oracle_diff_attributes_planes_per_frame` asserts) --
+        // a `const SHA256` compared against itself would be the tautology
+        // this lane exists to kill.
+        const FNV1A64: u64 = 521889434652397870;
+        let data = crate_pin(FILE);
+        let data = std::fs::read(&data)
+            .unwrap_or_else(|e| panic!("{NAME}: the committed pin {FILE} is missing ({e})"));
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FNV1A64, "{NAME}: {FILE} bytes drifted");
+        let (wy, wu, wv, frames, exact) =
+            count_rawvideo_diffs(&data, NAME, None).expect("the two sides must be byte-comparable");
+        assert_eq!(
+            (wy, wu, wv),
+            (0, 0, 0),
+            "{NAME}: the pinned 320x236 cell must decode byte-exactly against \
+             `aomdec --rawvideo` on every plane. It measured \
+             (234349, 56957, 52981) with 0 of 16 frames exact until \
+             lane-av1oddheightfork3 fixed the TXFM_CONTEXT whole-block \
+             publish that overwrote a var-tx tree's per-leaf sizes. Any \
+             non-zero value here is a regression -- name it in the report."
+        );
+        assert_eq!(frames, 16, "{NAME}: shown frame count");
+        assert_eq!(
+            exact, frames,
+            "{NAME}: every shown frame must be byte-exact"
+        );
+    }
+
     /// lane-hidden r2: the `--arnr-maxframes=0` SECOND ARM of an existing
     /// gate -- the gate's own recipe is never changed, this re-encodes the
     /// same fixture with libaom's temporal alt-ref filter switched off and

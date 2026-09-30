@@ -1291,3 +1291,61 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("EC_PREDND instrumented (non-directional, high bitdepth)")
 PYND
+
+# --- rung 18: var-tx partition CONTEXT OPERANDS (lane-av1oddheightfork3) ----
+# `EC_VARTX` itself was hand-added to the oracle tree and was NOT in this
+# generator, so a rebuild from the script dropped it (the rung-loss class:
+# every rung must be derived here or the next lane loses it). This block
+# installs BOTH, from a pristine upstream file, idempotently, and is the only
+# place either print may be edited.
+#
+# Why the operands: `txfm_partition_context` (av1_common_int.h:1747-1769) is
+# `category * 3 + (*above_ctx < txw) + (*left_ctx < txh)`, so a ctx
+# disagreement with our decoder names WHICH `TXFM_CONTEXT` neighbour band
+# differs only if both operands are printed -- `EC_VARTX` alone gives the sum
+# (ctx) and nothing under it. `above` is read at `+ blk_col` of the row band,
+# `left` at `+ blk_row` of the column band; those indices are in the print so
+# a reader can tell a band-offset bug from a value bug. Env-gated on
+# EC_VARTXCTX (a separate flag from EC_VARTX so an existing EC_VARTX ladder
+# log stays byte-identical to before this rung).
+python3 - "$F" <<'PYVX'
+import re, sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_VARTXCTX" in s:
+    print("EC_VARTXCTX already instrumented (no-op)")
+    sys.exit(0)
+
+anchor = "  is_split = aom_read_symbol(r, ec_ctx->txfm_partition_cdf[ctx], 2, ACCT_STR);\n"
+assert anchor in s, "read_tx_size_vartx symbol read moved"
+
+# Drop a hand-added EC_VARTX print (the tree this block first ran against
+# carried one that this script never derived), so the derived text is the
+# only definition and a re-run is a no-op rather than a duplicate print.
+legacy = re.search(
+    r'  if \(getenv\("EC_VARTX"\) != NULL\)\n'
+    r'    fprintf\(stderr,\n'
+    r'            "EC_VARTX mi=\(%d,%d\).*?\(int\)aom_reader_tell\(r\)\);\n',
+    s, re.S)
+if legacy:
+    s = s[:legacy.start()] + s[legacy.end():]
+
+new = anchor + """  if (getenv("EC_VARTX") != NULL)
+    fprintf(stderr,
+            "EC_VARTX mi=(%d,%d) row=%d col=%d ctx=%d n=2 s=%d bitpos=%d\\n",
+            xd->mi_row, xd->mi_col, blk_row, blk_col, ctx, is_split,
+            (int)aom_reader_tell(r));
+  /* EC_INSTRUMENTED_VARTXCTX: the two TXFM_CONTEXT operands of `ctx`. */
+  if (getenv("EC_VARTXCTX") != NULL)
+    fprintf(stderr,
+            "EC_VARTXCTX mi=(%d,%d) row=%d col=%d above=%d left=%d txw=%d "
+            "txh=%d ctx=%d\\n",
+            xd->mi_row, xd->mi_col, blk_row, blk_col,
+            (int)xd->above_txfm_context[blk_col],
+            (int)xd->left_txfm_context[blk_row], (int)tx_size_wide[tx_size],
+            (int)tx_size_high[tx_size], ctx);
+"""
+s = s.replace(anchor, new, 1)
+open(path, "w").write(s)
+print("EC_VARTX/EC_VARTXCTX instrumented (read_tx_size_vartx)")
+PYVX
