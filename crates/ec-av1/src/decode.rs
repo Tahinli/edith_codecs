@@ -26002,7 +26002,95 @@ fn sub8_leaf_chroma422(
     // chroma px 44..47 from luma 88..95, while a `px`-anchored source
     // averaged luma 92..99 and every CFL unit of the group mismatched).
     let ac = alpha.map(|_| cfl_src_rect((lmi.1 & !1) * MI, py, 8, 4));
-    let grids: (Grid, Grid) = if skip {
+    let grids: (Grid, Grid) = if let Some(dv) = intrabc_dv.filter(|_| skip) {
+        // lane-av1422ctattr: a SKIPPED intrabc chroma leaf still predicts the
+        // frame copy at its DV. libaom's `decode_token_recon_block` takes the
+        // INTER arm for an intrabc block (`is_inter_block` counts it,
+        // `blockd.h:373`) and `predict_inter_block_visit` runs
+        // `dec_build_inter_predictor` REGARDLESS of `skip_txfm` -- only the
+        // residual read is dropped. Measured on the 4:2:2 seed of
+        // `R422_320x242.obu` / `Q_odd320x242.obu` (chroma U(116,160)):
+        //   oracle  EC_DP mi_row=40 mi_col=58 bsize=2 inter=1 skip_txfm=1 is_intrabc=1
+        //           EC_ISTEP mi_row=40 mi_col=58 name=intrabc val=1 rng=39264
+        //           EC_DV   mi_row=40 mi_col=58 dv_col=0 dv_row=-1024 rng=40116
+        //   ours    the SAME symbol and the SAME DV (parse in sync), then
+        //           OUR_PRED x=116 y=160 plane=1 mode=0 row0=[182,182,182,182]
+        // i.e. this `if skip` arm was taken and the `else if let Some(dv)`
+        // frame copy below never ran. 202 = (808+2)/4 is not a `dc_top`: there
+        // is NO DC variant at all on the oracle side, because
+        // `av1_predict_intra_block` is never called for an intrabc block.
+        // `sub8_leaf_chroma444` already orders its arms this way
+        // (`intrabc_dv.filter(|_| skip)` first, lane-av1ibcskip2); this arm is
+        // that one, at 4:2:2's square 4x4 chroma unit.
+        let mut ub = vec![0u16; 16];
+        mc::predict_with_filter(
+            &u.data,
+            u.width,
+            u.true_width,
+            u.true_height,
+            mv_to_q4(cpx, dv.1, ss_x(fctx)),
+            mv_to_q4(cpy, dv.0, ss_y(fctx)),
+            4,
+            4,
+            mc::InterpFilterKind::Bilinear,
+            &mut ub,
+            fctx,
+        );
+        hit!(SKIPPED_INTRABC_DV_COPY_HITS);
+        let zeros = &ZERO_RESIDUAL[..16];
+        set_palette_pred(ub, fctx);
+        push_intra(
+            1,
+            cpx,
+            cpy,
+            4,
+            DC_PRED,
+            0,
+            reach,
+            zeros,
+            None,
+            None,
+            smooth_neighbor_uv,
+            fctx,
+        );
+        let mut vb = vec![0u16; 16];
+        mc::predict_with_filter(
+            &v.data,
+            v.width,
+            v.true_width,
+            v.true_height,
+            mv_to_q4(cpx, dv.1, ss_x(fctx)),
+            mv_to_q4(cpy, dv.0, ss_y(fctx)),
+            4,
+            4,
+            mc::InterpFilterKind::Bilinear,
+            &mut vb,
+            fctx,
+        );
+        set_palette_pred(vb, fctx);
+        push_intra(
+            2,
+            cpx,
+            cpy,
+            4,
+            DC_PRED,
+            0,
+            reach,
+            zeros,
+            None,
+            None,
+            smooth_neighbor_uv,
+            fctx,
+        );
+        // The same arm-without-clear route the 4:2:0 tails and
+        // [`sub8_leaf_chroma444`] count: a skipped leaf reads no coefficient,
+        // so the inherited chroma `tx_type` is dropped unconsumed.
+        if fctx.intrabc_chroma_tx.with(std::cell::Cell::get).is_some() {
+            hit!(SKIPPED_INTRABC_CHROMA_ARM_HITS);
+            fctx.intrabc_chroma_tx.with(|c| c.set(None));
+        }
+        (Grid::Zero(16), Grid::Zero(16))
+    } else if skip {
         // A skipped chroma-reference leaf still predicts (the CfL contribution
         // survives a skip); no coefficient symbol exists.
         if alpha.is_some() {
