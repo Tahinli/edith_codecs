@@ -50751,9 +50751,11 @@ exit 0
     /// (2) 17 decode-order frames at 352x242 with FULL-RESOLUTION chroma, so
     /// a decoder that kept the 4:2:0 extent cannot pass the compare.
     /// (3) `decode::chroma_palette_window_hits()` read as a delta must be at
-    /// least 1: the fixed lines are the only thing that increments it, so a
-    /// gate that passes without them running would be
-    /// gate-blind-to-feature. (4) The oracle comparator this gate leans on has
+    /// least 1. After the refutation pass read the numbers back, that counter
+    /// is guarded on `nw * nh > 1`, so it fires ONLY for units of a block the
+    /// 32-cap actually tiled -- a hit is therefore proof that the tiled arm ran,
+    /// not merely that some palette chroma block existed, and a gate that
+    /// passed with the tiled arm removed would be gate-blind-to-feature. (4) The oracle comparator this gate leans on has
     /// its own per-plane one-byte-flip liveness control in the crate
     /// (`every_oracle_comparator_reds_on_a_one_byte_wrong_oracle`).
     #[test]
