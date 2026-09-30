@@ -46931,12 +46931,28 @@ exit 0
         if !aomdec_available(NAME) {
             return;
         }
-        for (pin, frames, shown) in [
-            ("troy_sb128_inter_witness.obu", 16usize, 15usize),
-            ("gm_small_side_witness.obu", 34, 33),
-        ] {
-            let stream = std::fs::read(crate_pin(pin))
-                .unwrap_or_else(|e| panic!("{NAME}: reading {pin}: {e}"));
+        // The pin paths are BOUND HERE, from literals, rather than built from
+        // the loop variable: `crate_pin`'s argument has to be a literal the
+        // fixture-library census can resolve, or invariant 4 reports this gate
+        // as UNPROVEN ("name built at runtime -- this census cannot resolve
+        // it") and a preflight that checks code shape goes RED.
+        let pins: [(&str, std::path::PathBuf, usize, usize); 2] = [
+            (
+                "troy_sb128_inter_witness.obu",
+                crate_pin("troy_sb128_inter_witness.obu"),
+                16usize,
+                15usize,
+            ),
+            (
+                "gm_small_side_witness.obu",
+                crate_pin("gm_small_side_witness.obu"),
+                34usize,
+                33usize,
+            ),
+        ];
+        for (pin, path, frames, shown) in pins {
+            let stream =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("{NAME}: reading {pin}: {e}"));
             let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
             assert_eq!(
                 (decoded, hidden),
