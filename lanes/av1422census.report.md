@@ -1,5 +1,16 @@
 # lane-av1422census — the 4:2:2 census, re-measured with a proven-live comparator
 
+> **STALENESS ANNOTATION ADDED BY MAIN (2026-09-30).** This census was measured at `main` = `cc9f2668`.
+> `1686dc8a` landed 23 minutes later with a SOURCE FIX inside it (`b8eed69f`, in `sub8_leaf_chroma422`:
+> a skipped intrabc chroma leaf now predicts its DV frame copy, libaom `decodeframe.c:1040-1043`), and
+> `lanes/av1422ctintrabc.report.md` measures `Q_odd320x242`, `O_odd322x242`, `AB_inter_warp_odd` and
+> `S_odd326x242_10b` BYTE-EXACT on the later tree. So every DIVERGES verdict in the tables below for those
+> four cells -- and any fresh-sweep cell of the same class -- describes the tree as it was, not the tree as
+> it is. The comparator work, the cell derivation, the liveness proof and the negative controls all stand;
+> only the verdict column is affected. `lanes/av1422census2.report.md` re-derives the whole table on the
+> current tree and carries the DELTA. Do not quote the numbers below as current.
+
+
 **Outcome in one line: the standing "4:2:2 refuses by name" decision's input
 was stale — of 50 distinct 4:2:2 cells measured today, 34 decode byte-exact and
 16 diverge, and the divergence is not one odd geometry: 12 of 18 fresh
