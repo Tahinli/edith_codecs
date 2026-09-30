@@ -37763,28 +37763,26 @@ fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
 /// **every `w >= 2 && h >= 2`**. No stream this decoder accepts reaches a
 /// 1-pixel chroma plane; the pinned fixture's chroma is 128x144.
 ///
-/// **Open gap, 4:2:0 at odd dimensions (pre-existing).** The 4:2:0 arm is
-/// left at the old `(width / 2, height / 2)` floor, which is what the
-/// two-way test this replaces produced -- that was the point, since no
-/// 4:2:0 stream changed shape. It is nevertheless the wrong shape for an
-/// odd-dimension 4:2:0 reference: the producer stored
-/// `round_ss(w, 1) x round_ss(h, 1)`, so the floor arm under-declares.
-/// Measured over the `1..=128` square, running each 4:2:0 count through
-/// this very function: 12160 of the 16384 pairs come back smaller than the
-/// plane actually holds, 12033 of those with `w >= 2` and 127 in the
-/// `w == 1` column (at `w == 1, h == 1` the 4:4:4 arm catches the count
-/// and `(1, 1)` is exact). Under-declaration at `h == 1` is **zero** over
-/// the whole square: there the 4:2:0 count equals the 4:2:2 count, routes
-/// into the 4:2:2 arm, and lands on the correct
-/// `(round_ss(w, 1), 1)`. The `w == 1` residue is a *shape* error, not a
-/// misroute -- the floor fallback simply cannot express
-/// `(1, round_ss(h, 1))`. It is left alone because it predates this lane,
-/// is identical to the parent, and no in-tree coverage exercises an
-/// odd-dimension 4:2:0 reference. A ceil fallback
-/// (`(round_ss(w, 1), round_ss(h, 1))`) would close it, at the cost of
-/// departing from the parent on every odd-dimension 4:2:0 shape with
-/// nothing in the tree to justify the change; that call belongs to a lane
-/// that can bring odd-dimension 4:2:0 fixtures with it.
+/// **4:2:0 at odd dimensions: CLOSED by lane-av1odd440.** The arm used to be
+/// the old `(width / 2, height / 2)` floor, which was what the two-way test
+/// this replaces produced -- harmless then, since no 4:2:0 stream changed
+/// shape, and wrong for an odd-dimension 4:2:0 reference: the producer
+/// stored `round_ss(w, 1) x round_ss(h, 1)`, so the floor arm
+/// under-declared. Measured over the `1..=128` square, running each 4:2:0
+/// count through this very function: 12160 of the 16384 pairs came back
+/// smaller than the plane actually holds, 12033 of those with `w >= 2` and
+/// 127 in the `w == 1` column, where the floor cannot even express
+/// `(1, round_ss(h, 1))`. It was left alone pending "a lane that can bring
+/// odd-dimension 4:2:0 fixtures with it" -- this is that lane: the pinned
+/// `420_odd65x65_key.obu` is a real 65x65 4:2:0 key frame (declared at
+/// `encode::encode_key_frame_at_size`, because aomenc rounds the coded size
+/// down to even and cannot produce one) whose chroma planes are 33x33, and
+/// the gate `an_odd_luma_420_key_frame_decodes_pixel_exact` decodes it
+/// sample-exact against `aomdec`. The arm is now the producer's own crop,
+/// so a 4:2:0 reference at ANY size routes back to the shape the producer
+/// wrote. Even sizes are untouched: `(2k + 1) / 2 == k`, so every 4:2:0
+/// reference this decoder met before this lane claims exactly the same
+/// shape it did then.
 fn ref_chroma_shape(len: usize, width: usize, height: usize) -> (usize, usize) {
     let half_w = round_ss(width, 1);
     if len == width * height {
@@ -37792,7 +37790,7 @@ fn ref_chroma_shape(len: usize, width: usize, height: usize) -> (usize, usize) {
     } else if len == half_w * height {
         (half_w, height)
     } else {
-        (width / 2, height / 2)
+        (round_ss(width, 1), round_ss(height, 1))
     }
 }
 
@@ -54696,6 +54694,14 @@ mod tests {
     /// exact defect this lane fixed, one dimension over. So the table below
     /// is driven off `round_ss`, not off hand-written numbers, and sweeps
     /// odd and even widths.
+    ///
+    /// lane-av1odd440: the 4:2:0 arm's expectation is the PRODUCER's crop,
+    /// `round_ss(w, 1) x round_ss(h, 1)`, not the `(w / 2, h / 2)` floor it
+    /// used to name -- the floor under-declares every odd-dimension 4:2:0
+    /// reference, which is the shape the pinned `420_odd65x65_key.obu` cell
+    /// finally makes reachable (see [`ref_chroma_shape`]). For every EVEN
+    /// size the two spellings are the same number, so the arms that were
+    /// already correct are unchanged by the edit.
     #[test]
     fn a_reference_chroma_sample_count_routes_back_to_its_own_format() {
         for w in [2usize, 3, 4, 5, 8, 9, 16, 17, 64, 65, 128, 129] {
@@ -54707,7 +54713,11 @@ mod tests {
                         round_ss(w, 1) * round_ss(h, 0),
                         (round_ss(w, 1), h),
                     ),
-                    ("4:2:0", round_ss(w, 1) * round_ss(h, 1), (w / 2, h / 2)),
+                    (
+                        "4:2:0",
+                        round_ss(w, 1) * round_ss(h, 1),
+                        (round_ss(w, 1), round_ss(h, 1)),
+                    ),
                 ];
                 for (name, len, want) in cases {
                     assert_eq!(
