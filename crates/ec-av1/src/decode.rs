@@ -2722,10 +2722,20 @@ pub(crate) fn palette_split_tx_hits() -> usize {
 thread_local! {
     /// lane-av1444d10: chroma PREDICTION units on the 32-capped tiled chroma
     /// walk (`decode_block_rect`'s `uw/uh = min(chroma, 32)` units) that were
-    /// handed a WINDOWED slice of their block's palette buffer -- i.e. the
-    /// units that are NOT the block's top-left corner. Counts units, not
-    /// blocks, and only units whose block actually has a UV palette, so a
-    /// stream without a tiled palette chroma block leaves it at zero.
+    /// handed a STRICT sub-slice of their block's palette buffer -- i.e. the
+    /// units of a block the 32-cap actually TILED (`nw * nh > 1`).
+    ///
+    /// CORRECTED 2026-09-30 after the refutation pass `lanes/refute-av1444d10`
+    /// read the numbers back: the previous comment claimed it counted "the
+    /// units that are NOT the block's top-left corner", which is not what the
+    /// code did -- the hit was unconditional, so a block's corner unit fired it
+    /// too AND a single-unit block (whose window is a pure re-stride copy of
+    /// the whole buffer) fired it as well. That made a hit prove only that some
+    /// palette chroma block existed, not that the tiled arm ran. The `bigger`
+    /// guard now makes the counter discriminate. On the pinned fixture the
+    /// measured value is unchanged at 4 (one block with nw = 1, nh = 2 x two
+    /// planes x two unit rows); a stream whose palette chroma blocks are all
+    /// single-unit now leaves it at zero.
     static CHROMA_PALETTE_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -2980,6 +2990,18 @@ fn palette_window(
     w: usize,
     h: usize,
 ) -> Vec<u16> {
+    // `stride` is the BLOCK's own chroma width, so a caller that handed over a
+    // mismatched stride could read in-bounds GARBAGE instead of panicking --
+    // a silent misread, which is the one failure mode this walk must not have.
+    // The refutation pass (`lanes/refute-av1444d10.report.md`, risk (e)) named
+    // that as the only thing keeping the tiled walk safe, so the invariant is
+    // closed loudly here instead of resting on an `unsupported` return
+    // elsewhere that a future shape could remove.
+    assert!(
+        w <= stride && ox + w <= stride && (oy + h) * stride <= buf.len(),
+        "palette window {w}x{h} at ({ox},{oy}) does not fit a {}-entry buffer at stride {stride}",
+        buf.len()
+    );
     (0..h)
         .flat_map(|r| buf[(oy + r) * stride + ox..][..w].iter().copied())
         .collect()
@@ -20110,7 +20132,16 @@ fn decode_block_rect64(
                                 palette_window(pbuf, chroma_w, cu_col * uw, cu_row * uh, uw, uh),
                                 fctx,
                             );
-                            hit!(CHROMA_PALETTE_WINDOW_HITS);
+                            // Counted only when the window is a STRICT sub-slice of the
+                            // block's buffer, i.e. when the 32-cap actually tiled the
+                            // block: at nw * nh == 1 the window is a re-stride copy of
+                            // the whole buffer and windowing is load-bearing for
+                            // nothing. The `bigger` guard is what makes a hit PROOF
+                            // that the tiled arm ran, rather than proof that some
+                            // palette chroma block existed.
+                            if bigger {
+                                hit!(CHROMA_PALETTE_WINDOW_HITS);
+                            }
                         }
                         read_plane(
                             dec,
@@ -20169,7 +20200,16 @@ fn decode_block_rect64(
                                 palette_window(pbuf, chroma_w, cu_col * uw, cu_row * uh, uw, uh),
                                 fctx,
                             );
-                            hit!(CHROMA_PALETTE_WINDOW_HITS);
+                            // Counted only when the window is a STRICT sub-slice of the
+                            // block's buffer, i.e. when the 32-cap actually tiled the
+                            // block: at nw * nh == 1 the window is a re-stride copy of
+                            // the whole buffer and windowing is load-bearing for
+                            // nothing. The `bigger` guard is what makes a hit PROOF
+                            // that the tiled arm ran, rather than proof that some
+                            // palette chroma block existed.
+                            if bigger {
+                                hit!(CHROMA_PALETTE_WINDOW_HITS);
+                            }
                         }
                         push_intra_rect(
                             plane_idx,
