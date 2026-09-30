@@ -9255,7 +9255,7 @@ pub(crate) mod tests {
         const FILE: &str = "420_lossless_arf_1to4_320x240_5f.obu";
         const BYTES: usize = 28394;
         const FNV1A64: u64 = 16971188390893372935;
-        let path = crate_pin(FILE);
+        let path = crate_pin("420_lossless_arf_1to4_320x240_5f.obu");
         let data = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{NAME}: the committed pin {FILE} is missing ({e})"));
         assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
@@ -10930,7 +10930,7 @@ pub(crate) mod tests {
         // The first-picture form was wrong on every multi-frame stream: it
         // compared a byte index against frame 0's thresholds forever, so
         // every sample after frame 0's luma was attributed to the LAST
-        // plane. On `420_oddheight_320x236_diverging` (16 frames of 320x236
+        // plane. On `420_oddheight_320x236` (16 frames of 320x236
         // 4:2:0, whose frame is 113 280 bytes and whose V plane therefore
         // holds 302 080 bytes in total) it reported `wrong_v = 330 673` --
         // more wrong V bytes than exist. The per-frame byte totals and the
@@ -11073,14 +11073,14 @@ pub(crate) mod tests {
     fn the_counting_oracle_diff_attributes_planes_per_frame() {
         const NAME: &str = "the_counting_oracle_diff_attributes_planes_per_frame";
         let _gate_lock = lock_gate_counters();
-        const FILE: &str = "420_oddheight_320x236_diverging.obu";
+        const FILE: &str = "420_oddheight_320x236.obu";
         const BYTES: usize = 16562;
         // sha256 84e4d1ab56620af1c5b78e1aa3d2d67496a492f2e127198c82dd1d68b01c6200.
         // The tree pins fixture identity by fnv1a64; a `const SHA256`
         // compared against itself would be the tautology this lane exists to
         // kill, so it is not written.
         const FNV1A64: u64 = 521889434652397870;
-        let data = crate_pin(FILE);
+        let data = crate_pin("420_oddheight_320x236.obu");
         let data = std::fs::read(&data)
             .unwrap_or_else(|e| panic!("{NAME}: the committed pin {FILE} is missing ({e})"));
         assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
@@ -11906,7 +11906,7 @@ exit 0
     fn the_pinned_420_oddheight_320x236_witness_decodes_byte_exact() {
         const NAME: &str = "the_pinned_420_oddheight_320x236_witness_decodes_byte_exact";
         let _gate_lock = lock_gate_counters();
-        const FILE: &str = "420_oddheight_320x236_diverging.obu";
+        const FILE: &str = "420_oddheight_320x236.obu";
         const BYTES: usize = 16562;
         // sha256 84e4d1ab56620af1c5b78e1aa3d2d67496a492f2e127198c82dd1d68b01c6200.
         // Identity is pinned by fnv1a64 (the same value
@@ -11914,7 +11914,7 @@ exit 0
         // a `const SHA256` compared against itself would be the tautology
         // this lane exists to kill.
         const FNV1A64: u64 = 521889434652397870;
-        let data = crate_pin(FILE);
+        let data = crate_pin("420_oddheight_320x236.obu");
         let data = std::fs::read(&data)
             .unwrap_or_else(|e| panic!("{NAME}: the committed pin {FILE} is missing ({e})"));
         assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");

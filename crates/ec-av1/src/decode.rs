@@ -9671,8 +9671,9 @@ impl Neighbours {
     /// it OVERWRITES the leaves' sizes with the block's own.
     ///
     /// lane-av1oddheightfork3, measured on the pinned
-    /// `420_oddheight_320x236_diverging.obu` (Y 234349 / U 56957 / V 52981,
-    /// 0/16 frames): the INTRABC 8x16 block at mi(44,58) split into two 8x8
+    /// `420_oddheight_320x236.obu` (then diverging: Y 234349 / U 56957 /
+    /// V 52981, 0/16 frames; byte-exact since this lane): the INTRABC 8x16
+    /// block at mi(44,58) split into two 8x8
     /// leaves, whose per-leaf writes put `8` into `left_txfm[44..48]`, and
     /// this publish then put the BLOCK's `16` back over those same four
     /// cells. The next block, the INTRABC 8x16 at mi(44,60), read
