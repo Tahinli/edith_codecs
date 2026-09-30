@@ -27201,7 +27201,16 @@ fn decode_leaf_rect8(
             // libaom's `set_txfm_ctxs` runs at `parse_decode_block`'s tail, so
             // a unit's own `txb_skip_ctx` read must see the PRE-block bands.
             let mut publish = Some((bw, bh));
-            if tx_select && !skip {
+            // lane-av1mixllfork: libaom `parse_decode_block` (decodeframe.c:1237)
+            // gates the var-tx tree on `!xd->lossless[mbmi->segment_id]` as a
+            // CONJUNCT of the tx_mode-select condition, not as the `else` arm --
+            // `read_tx_size` (`decodeframe.c:1208`) answers TX_4X4 on the same
+            // flag. A frame whose segments disagree (per-segment mixed
+            // lossless: `--cq-level=0` with AQ) therefore reads NO tree symbol
+            // on its lossless blocks. Ordering the test the other way round
+            // reads a `tx_size_cat1` symbol the oracle never reads and forks
+            // the very next block's `txb_skip`.
+            if tx_select && !skip && !lossless(fctx) {
                 // `max_block_wide`/`max_block_high`: the frame's own mi grid,
                 // so a leaf hanging over the right/bottom edge reads no split
                 // symbol for the units outside it (as in `decode_block`).
@@ -34662,6 +34671,14 @@ thread_local! {
     /// is 256 per inter frame (8 unclipped luma rows x 32 columns), and 0 on a
     /// frame that fits.
     pub(crate) static LOSSLESS_EDGE_CLIP_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1mixllfork: sub-8 (4x8 / 8x4) inter leaves whose var-tx tree
+    /// was SUPPRESSED because their own segment is lossless -- libaom's
+    /// `parse_decode_block` carries `!xd->lossless[mbmi->segment_id]` as a
+    /// conjunct of the tree condition (`decodeframe.c:1237`), so a mixed-
+    /// lossless frame codes no `tx_size_cat1` symbol there. Zero on any frame
+    /// whose sub-8 leaves all sit in lossy segments, so a gate cannot look
+    /// armed by merely decoding.
+    pub(crate) static SUB8_LOSSLESS_NO_VARTX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`MU_CHUNK_WALKS`], for a gate's own before/after delta.
@@ -34693,6 +34710,12 @@ pub(crate) fn lossless_edge_clipped() -> usize {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn lossless_edge_clip_units() -> usize {
     LOSSLESS_EDGE_CLIP_UNITS.with(std::cell::Cell::get)
+}
+/// [`SUB8_LOSSLESS_NO_VARTX`] -- sub-8 inter leaves on a lossless segment that
+/// read no var-tx symbol, for a gate's own before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn sub8_lossless_no_vartx() -> usize {
+    SUB8_LOSSLESS_NO_VARTX.with(std::cell::Cell::get)
 }
 
 /// [`CHROMA_SPLIT_TX_HITS`], for a gate's own before/after delta.
@@ -48301,7 +48324,12 @@ fn decode_inter_sub8_rect2(
         // skipped one codes nothing and records its BLOCK size in both txfm
         // contexts (`set_txfm_ctxs`' `skip_inter` arm).
         let mut leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
-        if fctx.tx_select_inter.with(std::cell::Cell::get) && !skip {
+        // lane-av1mixllfork: the same libaom ordering fix as the intrabc rect
+        // leaf's (`parse_decode_block`, decodeframe.c:1237): the per-segment
+        // `lossless` flag is a CONJUNCT of the var-tx condition, not its
+        // `else` arm, so a lossless SEGMENT of a mixed-lossless inter frame
+        // reads no `tx_size_cat1` symbol here and codes TX_4X4 per plane.
+        if fctx.tx_select_inter.with(std::cell::Cell::get) && !skip && !lossless(fctx) {
             let max_w_mi = w_mi.min((mi_cols as usize).saturating_sub(cmi));
             let max_h_mi = h_mi.min((mi_rows as usize).saturating_sub(rmi));
             read_var_tx_size(
@@ -48318,6 +48346,7 @@ fn decode_inter_sub8_rect2(
                 &mut leaves,
             );
         } else if lossless(fctx) && !skip {
+            hit!(SUB8_LOSSLESS_NO_VARTX);
             // lane-lossless2: `read_block_tx_size` returns TX_4X4 before it
             // ever looks at `max_txsize_rect_lookup`, so an 8x4/4x8 leaf is
             // TWO 4x4 units, not one rect one.
