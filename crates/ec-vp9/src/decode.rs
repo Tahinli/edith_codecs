@@ -126,12 +126,22 @@ impl Planes {
 /// for the `VP90` codec.
 pub struct Decoder {
     parser: Vp9Parser,
-    ctx: FrameContext,
+    /// The frame context in force for the frame being parsed.
+    ///
+    /// Boxed for the same reason as `frame_ctxs` below: a `FrameContext` is
+    /// 2039 bytes, and leaving this one inline put 73% of the whole `Decoder`
+    /// back on the stack. `Stack`: crate::stack_budget.
+    ctx: Box<FrameContext>,
     refs: [Option<RefFrame>; 8],
     /// Frame scratch, live only inside `decode_keyframe`.
     planes: Option<Planes>,
     /// The four stored frame contexts (spec 6.2 `frame_context_idx`).
-    frame_ctxs: [FrameContext; 4],
+    ///
+    /// Boxed because a `FrameContext` is 2039 bytes and four of them inline
+    /// are 8156 of the 10944 a `Decoder` costs a caller that takes one BY
+    /// VALUE from `Decoder::new`. Indexing and whole-array assignment read
+    /// through the box. `Stack`: crate::stack_budget.
+    frame_ctxs: Box<[FrameContext; 4]>,
     /// The previous frame's per-8x8 MV field and segment map
     /// (`prev_frame->mvs` / `last_frame_seg_map`).
     prev_mvs: Vec<crate::inter::MvRef>,
@@ -203,12 +213,12 @@ impl Decoder {
     pub fn new() -> Self {
         Decoder {
             parser: Vp9Parser::new(),
-            ctx: FrameContext::new(true),
+            ctx: Box::new(FrameContext::new(true)),
             refs: [const { None }; 8],
             planes: None,
             frame_ctxs: {
                 let d = FrameContext::new(false);
-                [d.clone(), d.clone(), d.clone(), d]
+                Box::new([d.clone(), d.clone(), d.clone(), d])
             },
             prev_mvs: Vec::new(),
             prev_seg: Vec::new(),
@@ -277,8 +287,8 @@ impl Decoder {
         // (libvpx `get_partition_probs`), which our `new(true)` models on the
         // active copy only.
         let d = FrameContext::new(false);
-        self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
-        self.ctx = FrameContext::new(true);
+        self.frame_ctxs = Box::new([d.clone(), d.clone(), d.clone(), d]);
+        self.ctx = Box::new(FrameContext::new(true));
         self.prev_mvs.clear();
         self.prev_seg.clear();
         self.last = LastFrameFacts {
@@ -310,7 +320,7 @@ impl Decoder {
         let pic = self.decode_keyframe(&hdr, frame, ch.tx_mode)?;
         if hdr.refresh_frame_context {
             self.ctx.reset_inter_partition();
-            self.frame_ctxs[hdr.frame_context_idx as usize] = self.ctx.clone();
+            self.frame_ctxs[hdr.frame_context_idx as usize] = self.ctx.as_ref().clone();
         }
         // Reference refresh (spec 8.10): a keyframe updates all slots.
         let frame = RefFrame {
@@ -349,7 +359,7 @@ impl Decoder {
         let hdr = hdr.clone();
         if hdr.error_resilient_mode || hdr.reset_frame_context == 3 {
             let d = FrameContext::new(false);
-            self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
+            self.frame_ctxs = Box::new([d.clone(), d.clone(), d.clone(), d]);
         } else if hdr.reset_frame_context == 2 {
             self.frame_ctxs[0] = FrameContext::new(false);
         }
@@ -357,7 +367,7 @@ impl Decoder {
         let mut ctx = self.frame_ctxs[0].clone();
         let stored_partition = ctx.partition;
         ctx.use_key_partition();
-        self.ctx = ctx;
+        self.ctx = Box::new(ctx);
         self.prev_seg.clear();
         self.prev_mvs.clear();
         self.last = LastFrameFacts {
@@ -378,7 +388,7 @@ impl Decoder {
             // Store back with the partition probs the context arrived with:
             // the const key table is not a `FRAME_CONTEXT` field.
             self.ctx.partition = stored_partition;
-            self.frame_ctxs[0] = self.ctx.clone();
+            self.frame_ctxs[0] = self.ctx.as_ref().clone();
         }
         // Reference refresh (spec 8.10): only `refresh_frame_flags` slots.
         let frame = RefFrame {
@@ -448,11 +458,11 @@ impl Decoder {
         // "reset after this frame" and takes no action at frame start.
         if hdr.reset_frame_context == 3 {
             let d = FrameContext::new(false);
-            self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
+            self.frame_ctxs = Box::new([d.clone(), d.clone(), d.clone(), d]);
         } else if hdr.reset_frame_context == 2 {
             self.frame_ctxs[hdr.frame_context_idx as usize] = FrameContext::new(false);
         }
-        self.ctx = self.frame_ctxs[hdr.frame_context_idx as usize].clone();
+        self.ctx = Box::new(self.frame_ctxs[hdr.frame_context_idx as usize].clone());
 
         // Reference slots (spec 7.2): `ref_frame_idx[i]` names the slot LAST,
         // GOLDEN and ALTREF use. libvpx validates every named reference's
@@ -642,7 +652,7 @@ impl Decoder {
             key: false,
         };
         if hdr.refresh_frame_context {
-            self.frame_ctxs[hdr.frame_context_idx as usize] = self.ctx.clone();
+            self.frame_ctxs[hdr.frame_context_idx as usize] = self.ctx.as_ref().clone();
         }
         if crate::interdump_enabled() {
             eprintln!(

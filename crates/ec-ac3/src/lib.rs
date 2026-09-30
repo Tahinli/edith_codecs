@@ -62,6 +62,7 @@ pub mod bsi;
 pub mod eac3;
 pub mod exps;
 pub mod mantissa;
+mod stack_budget;
 pub mod syncinfo;
 pub mod tables;
 pub mod transform;
@@ -72,8 +73,8 @@ pub mod encode;
 
 pub use decode::Syntax;
 pub use decoder::{Ac3Decoder, Downmix, FrameInfo, Options};
-pub use encode::{Ac3Encoder, EncodeStats, EncoderConfig};
 pub use ec_core::Error;
+pub use encode::{Ac3Encoder, EncodeStats, EncoderConfig};
 
 /// Samples per channel one audio block produces.
 pub use transform::BLOCK_SAMPLES;

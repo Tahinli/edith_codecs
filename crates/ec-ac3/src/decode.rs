@@ -43,9 +43,14 @@ pub(crate) struct Core {
     pub(crate) nfchans: usize,
     pub(crate) lfeon: bool,
     /// Decoded exponents per channel, valid up to that channel's `endmant`.
-    pub(crate) exps: [[u8; COEFFS]; CHANNELS],
+    ///
+    /// Boxed, with `bap`, `coeffs` and `delay`, because the four are 16896 of
+    /// `Core`'s 19728 bytes and `Core` sits inline in the `Ac3Decoder` that
+    /// `Ac3Decoder::new` hands a caller BY VALUE. Indexing and `&mut self.f[ch]`
+    /// read through the box unchanged. `Stack`: crate::stack_budget.
+    pub(crate) exps: Box<[[u8; COEFFS]; CHANNELS]>,
     /// Bit allocation pointers per channel.
-    pub(crate) bap: [[u8; COEFFS]; CHANNELS],
+    pub(crate) bap: Box<[[u8; COEFFS]; CHANNELS]>,
     /// Exponent strategy of the current block per channel.
     pub(crate) expstr: [Strategy; CHANNELS],
     pub(crate) endmant: [usize; CHANNELS],
@@ -83,8 +88,8 @@ pub(crate) struct Core {
     /// Dynamic range gain for program 1 and, in 1+1 mode, program 2.
     pub(crate) dynrng: [f32; 2],
     // Output.
-    pub(crate) coeffs: [[f32; COEFFS]; CHANNELS],
-    pub(crate) delay: [[f32; COEFFS]; MAX_FBW + 1],
+    pub(crate) coeffs: Box<[[f32; COEFFS]; CHANNELS]>,
+    pub(crate) delay: Box<[[f32; COEFFS]; MAX_FBW + 1]>,
     pub(crate) imdct: Imdct,
     pub(crate) dither: Dither,
     /// Fraction of the `dynrng` compression to apply (§7.7.1).
@@ -135,8 +140,8 @@ impl Core {
             acmod: Acmod::Stereo,
             nfchans: 2,
             lfeon: false,
-            exps: [[0; COEFFS]; CHANNELS],
-            bap: [[0; COEFFS]; CHANNELS],
+            exps: Box::new([[0; COEFFS]; CHANNELS]),
+            bap: Box::new([[0; COEFFS]; CHANNELS]),
             expstr: [Strategy::Reuse; CHANNELS],
             endmant: [0; CHANNELS],
             strtmant: [0; CHANNELS],
@@ -163,8 +168,8 @@ impl Core {
             blksw: [false; MAX_FBW],
             dithflag: [true; MAX_FBW],
             dynrng: [1.0; 2],
-            coeffs: [[0.0; COEFFS]; CHANNELS],
-            delay: [[0.0; COEFFS]; MAX_FBW + 1],
+            coeffs: Box::new([[0.0; COEFFS]; CHANNELS]),
+            delay: Box::new([[0.0; COEFFS]; MAX_FBW + 1]),
             imdct: Imdct::new(),
             dither: Dither::default(),
             drc_scale: 1.0,
@@ -194,12 +199,12 @@ impl Core {
 
     /// Drop everything a seek invalidates.
     pub(crate) fn reset(&mut self) {
-        for d in &mut self.delay {
+        for d in self.delay.iter_mut() {
             d.fill(0.0);
         }
         self.cplinu = false;
         self.dynrng = [1.0; 2];
-        self.exps = [[0; COEFFS]; CHANNELS];
+        self.exps = Box::new([[0; COEFFS]; CHANNELS]);
     }
 
     /// Adopt a frame header: channel configuration for the blocks that follow.

@@ -73,16 +73,17 @@ pub mod range;
 pub mod silk;
 pub(crate) mod silk_enc;
 pub mod silk_enc_write;
+mod stack_budget;
 
 pub use celt::CeltDecoder;
 pub use celt_enc::CeltFrameDiag;
 pub use encoder::{Application, Encoder};
-pub use silk_enc_write::SilkFrameDiag;
 pub use multistream::MultistreamDecoder;
 pub use multistream_enc::MultistreamEncoder;
 pub use packet::{Bandwidth, Mode, Packet, Toc};
 pub use range::{RangeDecoder, RangeEncoder};
 pub use silk::{SilkDecIndices, SilkDecoder};
+pub use silk_enc_write::SilkFrameDiag;
 pub use silk_enc_write::{SilkEncoder, SilkStereoEncoder};
 
 use ec_core::{Error, Result};
@@ -99,7 +100,11 @@ pub struct Decoder {
     channels: usize,
     downsample: usize,
     celt: CeltDecoder,
-    silk: SilkDecoder,
+    /// Boxed because a `SilkDecoder` is 6304 bytes, 83% of what a `Decoder`
+    /// costs a caller taking one BY VALUE from `Decoder::new`. It is the
+    /// decoder's largest field and its only large one; `celt` is 1168.
+    /// `Stack`: crate::stack_budget.
+    silk: Box<SilkDecoder>,
     /// The CELT overlap window, reused for redundancy cross-fades.
     celt_window: Vec<f32>,
     /// Per-frame scratch, allocated once: the SILK layer's output and the
@@ -154,7 +159,7 @@ impl Decoder {
             channels,
             downsample,
             celt: CeltDecoder::new(channels, downsample),
-            silk: SilkDecoder::new(sample_rate, channels),
+            silk: Box::new(SilkDecoder::new(sample_rate, channels)),
             celt_window: celt::overlap_window(),
             silk_pcm: vec![0; 5760 * channels],
             redundant: vec![0.0; 240 * channels],

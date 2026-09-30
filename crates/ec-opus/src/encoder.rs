@@ -99,15 +99,28 @@ pub struct Encoder {
     mode: Option<Mode>,
     /// Lazily created on first use so the mode can flip between packets
     /// without paying for the unused layer's state.
-    silk_nb: Option<SilkEncoder>,
-    silk_mb: Option<SilkEncoder>,
-    silk_wb: Option<SilkEncoder>,
-    silk_stereo_nb: Option<SilkStereoEncoder>,
-    silk_stereo_mb: Option<SilkStereoEncoder>,
-    silk_stereo_wb: Option<SilkStereoEncoder>,
+    ///
+    /// The six slots are behind `Box` because of what they cost the CALLER.
+    /// A `SilkStereoEncoder` is 19744 bytes and a `SilkEncoder` 6648, so six
+    /// inline slots put 79176 bytes on the stack of every `Encoder` that a
+    /// `pub fn` hands back by value -- 10.6x the crate's by-value stack
+    /// budget, on a type `Encoder::new` returns and a caller constructs
+    /// inside its own frame. Only one of the six is ever alive at a time
+    /// (the mode decides), so the heap pays for one and the stack pays for
+    /// six pointers. `Stack`: crate::stack_budget.
+    silk_nb: Option<Box<SilkEncoder>>,
+    silk_mb: Option<Box<SilkEncoder>>,
+    silk_wb: Option<Box<SilkEncoder>>,
+    silk_stereo_nb: Option<Box<SilkStereoEncoder>>,
+    silk_stereo_mb: Option<Box<SilkStereoEncoder>>,
+    silk_stereo_wb: Option<Box<SilkStereoEncoder>>,
     /// Scratch space for the SILK packet payload, sized once so the steady-state
     /// loop (`steady_state_encode_loop_zero_alloc`) doesn't allocate.
-    silk_buf: [u8; MAX_SILK_PACKET_BYTES],
+    ///
+    /// Boxed for the same reason as the slots above: `MAX_SILK_PACKET_BYTES` is
+    /// 4088 bytes, and an inline array that size is a third of the whole
+    /// budget on the `Encoder` that a caller holds by value.
+    silk_buf: Box<[u8; MAX_SILK_PACKET_BYTES]>,
     /// Hybrid: the last `Encoder::hybrid_silk_delay_48k` samples of SILK-layer input.
     silk_delay: Vec<f32>,
     /// Scratch space for the zero-stuffed SILK/hybrid input, sized once so
@@ -188,7 +201,7 @@ impl Encoder {
             silk_stereo_nb: None,
             silk_stereo_mb: None,
             silk_stereo_wb: None,
-            silk_buf: [0u8; MAX_SILK_PACKET_BYTES],
+            silk_buf: Box::new([0u8; MAX_SILK_PACKET_BYTES]),
             silk_delay: Vec::new(),
             silk_stuff: Vec::new(),
             align_input: false,
@@ -263,7 +276,12 @@ impl Encoder {
     /// The CELT layer's delay in 48 kHz samples: one MDCT overlap, plus
     /// libopus's `delay_compensation` when the alignment is on.
     fn celt_look_ahead_48k(&self) -> usize {
-        CELT_OVERLAP_48K + if self.align_input { CELT_DELAY_COMP_48K } else { 0 }
+        CELT_OVERLAP_48K
+            + if self.align_input {
+                CELT_DELAY_COMP_48K
+            } else {
+                0
+            }
     }
 
     /// How far the hybrid path delays the SILK layer's input so its output
@@ -412,7 +430,9 @@ impl Encoder {
                 if !self.auto_silk(equiv, ve) {
                     return None;
                 }
-                let bw = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth_at(equiv, ve));
+                let bw = self
+                    .bandwidth
+                    .unwrap_or_else(|| self.auto_bandwidth_at(equiv, ve));
                 // 40/60 ms frames are SILK-only (Hybrid supports 10/20 ms):
                 // cap at Wide so a high equiv rate does not fall through to
                 // an impossible CELT 40/60 ms packet.
@@ -458,7 +478,9 @@ impl Encoder {
         if self.mode.is_none() && !self.auto_silk(equiv, ve) {
             return None;
         }
-        let bw = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth_at(equiv, ve));
+        let bw = self
+            .bandwidth
+            .unwrap_or_else(|| self.auto_bandwidth_at(equiv, ve));
         match bw {
             Bandwidth::SuperWide | Bandwidth::Full => Some(bw),
             // A forced Hybrid with a narrow/medium/wide bandwidth still codes
@@ -564,13 +586,13 @@ impl Encoder {
             let enc = match fs_khz {
                 8 => self
                     .silk_stereo_nb
-                    .get_or_insert_with(|| SilkStereoEncoder::new(false)),
+                    .get_or_insert_with(|| Box::new(SilkStereoEncoder::new(false))),
                 12 => self
                     .silk_stereo_mb
-                    .get_or_insert_with(SilkStereoEncoder::new_mediumband),
+                    .get_or_insert_with(|| Box::new(SilkStereoEncoder::new_mediumband())),
                 _ => self
                     .silk_stereo_wb
-                    .get_or_insert_with(|| SilkStereoEncoder::new(true)),
+                    .get_or_insert_with(|| Box::new(SilkStereoEncoder::new(true))),
             };
             enc.set_bitrate(self.bitrate);
             for i in 0..frame_count {
@@ -589,7 +611,7 @@ impl Encoder {
         self.silk_buf[pos] = 0x80 | frame_count as u8;
         pos += 1;
         for &len in &lens[..frame_count - 1] {
-            Self::write_frame_len(&mut self.silk_buf, &mut pos, len - 1)?;
+            Self::write_frame_len(&mut self.silk_buf[..], &mut pos, len - 1)?;
         }
         for i in 0..frame_count {
             let len = lens[i] - 1;
@@ -636,31 +658,38 @@ impl Encoder {
                 let enc = match fs_khz {
                     8 => self
                         .silk_stereo_nb
-                        .get_or_insert_with(|| SilkStereoEncoder::new(false)),
+                        .get_or_insert_with(|| Box::new(SilkStereoEncoder::new(false))),
                     12 => self
                         .silk_stereo_mb
-                        .get_or_insert_with(SilkStereoEncoder::new_mediumband),
+                        .get_or_insert_with(|| Box::new(SilkStereoEncoder::new_mediumband())),
                     _ => self
                         .silk_stereo_wb
-                        .get_or_insert_with(|| SilkStereoEncoder::new(true)),
+                        .get_or_insert_with(|| Box::new(SilkStereoEncoder::new(true))),
                 };
                 enc.set_bitrate(self.bitrate);
                 let n =
-                    enc.encode_frame_ms(&self.silk_stuff, &mut self.silk_buf, frame_48k / 48)?;
+                    enc.encode_frame_ms(&self.silk_stuff, &mut self.silk_buf[..], frame_48k / 48)?;
                 self.final_range = enc.final_range();
                 return Ok((self.silk_buf[0], &self.silk_buf[1..n]));
             }
             Self::zero_stuff_mono(pcm, frame_size, self.upsample, &mut self.silk_stuff);
             let enc = match fs_khz {
-                8 => self.silk_nb.get_or_insert_with(|| SilkEncoder::new(false)),
-                12 => self.silk_mb.get_or_insert_with(SilkEncoder::new_mediumband),
-                _ => self.silk_wb.get_or_insert_with(|| SilkEncoder::new(true)),
+                8 => self
+                    .silk_nb
+                    .get_or_insert_with(|| Box::new(SilkEncoder::new(false))),
+                12 => self
+                    .silk_mb
+                    .get_or_insert_with(|| Box::new(SilkEncoder::new_mediumband())),
+                _ => self
+                    .silk_wb
+                    .get_or_insert_with(|| Box::new(SilkEncoder::new(true))),
             };
             // Keep SILK's own reservoir-based rate control tracking the
             // Encoder's current target on every frame — cheap (an Option<u32>
             // store) and catches set_bitrate calls made between frames.
             enc.set_bitrate(self.bitrate);
-            let n = enc.encode_frame_ms(&self.silk_stuff, &mut self.silk_buf, frame_48k / 48)?;
+            let n =
+                enc.encode_frame_ms(&self.silk_stuff, &mut self.silk_buf[..], frame_48k / 48)?;
             self.final_range = enc.final_range();
             return Ok((self.silk_buf[0], &self.silk_buf[1..n]));
         }
@@ -698,9 +727,9 @@ impl Encoder {
                 ));
             }
         };
-        let bandwidth = self
-            .bandwidth
-            .unwrap_or_else(|| self.auto_bandwidth_at(self.equiv_rate(frame_48k), self.voice_est()));
+        let bandwidth = self.bandwidth.unwrap_or_else(|| {
+            self.auto_bandwidth_at(self.equiv_rate(frame_48k), self.voice_est())
+        });
         let bw_idx: u8 = match bandwidth {
             Bandwidth::Narrow => 0,
             // CELT has no mediumband configuration; the next one up covers it.
@@ -857,7 +886,12 @@ impl Encoder {
     /// not ported — every VoIP frame still gets this DC reject.
     /// Ships off with the alignment knob: `dc_reject` alone (without the
     /// input delay) has never been measured on the library gate.
-    fn dc_reject<'a>(&mut self, pcm: &'a [f32], frame_size: usize, out: &'a mut Vec<f32>) -> &'a [f32] {
+    fn dc_reject<'a>(
+        &mut self,
+        pcm: &'a [f32],
+        frame_size: usize,
+        out: &'a mut Vec<f32>,
+    ) -> &'a [f32] {
         if !self.align_input {
             return pcm;
         }
@@ -1001,11 +1035,13 @@ impl Encoder {
         if self.channels == 2 {
             let silk = self
                 .silk_stereo_wb
-                .get_or_insert_with(|| SilkStereoEncoder::new(true));
+                .get_or_insert_with(|| Box::new(SilkStereoEncoder::new(true)));
             silk.set_bitrate(silk_rate);
             silk.encode_hybrid_ms(&delayed, &mut self.range, frame_ms)?;
         } else {
-            let silk = self.silk_wb.get_or_insert_with(|| SilkEncoder::new(true));
+            let silk = self
+                .silk_wb
+                .get_or_insert_with(|| Box::new(SilkEncoder::new(true)));
             silk.set_bitrate(silk_rate);
             silk.encode_hybrid_ms(&delayed, &mut self.range, frame_ms)?;
         }
@@ -1066,9 +1102,15 @@ impl Encoder {
             (b.saturating_sub(1).clamp(2, cap), 0)
         };
         self.range.reset(budget);
-        let n =
-            self.celt
-                .encode(&mut self.range, pcm, frame_size, 0, end, vbr_rate, &self.info)?;
+        let n = self.celt.encode(
+            &mut self.range,
+            pcm,
+            frame_size,
+            0,
+            end,
+            vbr_rate,
+            &self.info,
+        )?;
         self.final_range = self.range.range();
         Ok(n)
     }
@@ -1146,7 +1188,11 @@ mod tests {
         let mut e = Encoder::new(48000, 1, Application::Voip).unwrap();
         e.set_bitrate(8000);
         assert_eq!(e.look_ahead(480), 58, "10ms NB SILK");
-        assert_eq!(e.look_ahead(240), CELT_OVERLAP_48K, "5ms frame falls back to CELT");
+        assert_eq!(
+            e.look_ahead(240),
+            CELT_OVERLAP_48K,
+            "5ms frame falls back to CELT"
+        );
         assert_eq!(e.look_ahead(960), 58, "20ms NB SILK");
 
         // 16k VoIP is hybrid-FB since the libopus threshold port (CELT overlap).
@@ -1154,7 +1200,11 @@ mod tests {
         assert_eq!(e.look_ahead(960), CELT_OVERLAP_48K, "20ms hybrid FB");
 
         e.set_bitrate(32000);
-        assert_eq!(e.look_ahead(960), CELT_OVERLAP_48K, "20ms hybrid, CELT's delay");
+        assert_eq!(
+            e.look_ahead(960),
+            CELT_OVERLAP_48K,
+            "20ms hybrid, CELT's delay"
+        );
 
         let mut e = Encoder::new(48000, 2, Application::Voip).unwrap();
         e.set_bitrate(8000);
