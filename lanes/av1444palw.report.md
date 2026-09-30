@@ -1,5 +1,45 @@
 # lane-av1444palw — the 4:4:4 palette chroma walk's HORIZONTAL arm (nw >= 2) and a 12-bit cell
 
+> **CORRECTIONS FROM THE REFUTATION PASS (added by Main 2026-09-30; VERDICT: PARTIAL — the merged code, the
+> fixtures and the gate SURVIVED independent refutation, three report FIGURES did not).** The reviewer
+> reproduced the reach independently on the pinned bytes (10-bit: `mi=22,8 px=128 py=352 bw=64 bh=16 cw=64
+> ch=16 uw=32 uh=16 nw=2 nh=1 puv=1`, the RECT-unit arm; 12-bit: the same block with `cw=64 ch=32 uw=uh=32
+> nw=2 nh=1`, the SQUARE-unit arm; both sha256s matched), re-measured exactness with its own comparator
+> (Y/U/V = 0/0/0 at both depths, one-byte oracle flip moving the count 0 -> 1 at BOTH depths) and reproduced
+> the mutation exactly (byte 738176, 54278 differing bytes). Corrections:
+>
+> 1. **Reach census (§ around lines 41-53): "exactly three committed fixtures carry this walk" is wrong.** All
+>    110 committed `.obu` re-swept with `EC_PALWALK=1`: **19 fixtures print the walk** (17 pre-existing --
+>    `hg_intra14_witness` 259, `hg_ss600_key_frame` 153, `troy_sb128_inter_witness` 99, `hg_ss300_key_frame`
+>    101, `troy_kf2700` 93, `hg_head_mvclamp_witness` 69, `hg_arf_witness` 41, `hg_rect64_intra16x4_witness`
+>    41, `420_intrabc_rect4_witness` 30, `rect64_dq_drift` 19, `r512` 18, `gm_small_side_witness` 10,
+>    `superres_alltools_sb128_320x180` 3, `444_rect_strip_leaf_tx_type` 2, `444_sb128rect_lr_witness` 2, plus
+>    the two new cells), and **three pre-existing fixtures DO carry an `nw>=2` walk** (`r512`,
+>    `444_rect_strip_leaf_tx_type`, `444_sb128rect_lr_witness`). The LOAD-BEARING sub-claim survives and is now
+>    measured: only three fixtures corpus-wide carry a CHROMA PALETTE on this walk at all -- the two new cells
+>    (`nw=2`) and `r512_rect2x1_1x2_444` (`nw=1 nh=2`) -- so "no pre-existing `nw>=2` chroma-palette block"
+>    holds. The table was not measured over the corpus it names.
+> 2. **Per-plane mutation counts (lines ~131-137) do not reconcile with the report's own totals.** On the u16
+>    surface the mutation differs by `26832 + 27446 = 54278` (10-bit) and `6656 + 6656 = 13312` (12-bit) --
+>    those sums equal the headline totals exactly, while the printed per-plane rows (`0/25553/26139` and
+>    `0/6400/6400`) sum to 51692 and 12800. The per-plane row comes from a DIFFERENT surface than the headline
+>    above it; one of the two must be re-derived. Treat both as unpinned until then.
+> 3. **Drop the "it is the `cu_col=1` unit, not a cascade" reasoning (lines ~138-140).** Luma 0 rules out
+>    luma-side neighbour context, not a chroma cascade: with BOTH sites reverted the 10-bit diff spans 372 rows
+>    and columns 128..639, and the first wrong sample (frame 0 plane U r96 c448) lies outside every
+>    palette-bearing walked block. The claim holds only for the ARM-ISOLATED mutation, and that is the better
+>    statement: **rect-unit arm alone reds the 10-bit cell (first wrong r352 c160, inside the horizontal block)
+>    and leaves 12b at 0/0/0; square-unit arm alone reds 12b AND 10b.** That isolation also corrects the
+>    in-code comment about this counter: windowing is load-bearing for EVERY tiled block, and `nw>1` is merely
+>    the case the corpus could not reach (comment in `decode.rs` corrected, and the counter doc no longer
+>    invites the "only the horizontal term matters" reading). The reviewer also read the counter floors
+>    directly: 8 and 4 on the new cells, 4 on the pinned gate's cell, and **0 on `420_intrabc_rect4_witness`**
+>    -- direct proof the guard cannot be satisfied by a single-unit stream.
+> 4. **`EC_PALWALK` printed the label `py` for two different quantities** (`decode.rs:20166-20168`): the block's
+>    pixel origin and, later, `palette_y.is_some()`. The second is renamed `py_pal` in the same commit as this
+>    annotation, so a census script cannot silently read the wrong one.
+
+
 ## Verdict
 
 | claim | before this lane | after |
