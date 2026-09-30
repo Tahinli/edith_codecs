@@ -20154,6 +20154,22 @@ fn decode_block_rect64(
             }
         };
         let bigger = nw * nh > 1;
+        // lane-av1444palw: the reach census for the horizontal arm of this
+        // walk. `EC_PALWALK=1` prints, per rect64 block, the plane-block
+        // geometry, the unit grid it was tiled into, and whether a chroma
+        // palette was present -- so a fixture search can tell `nw >= 2` (the
+        // arm nothing had reached) from `nh >= 2` (the arm the corpus census
+        // already covered), and can see WHY a candidate block did not fire.
+        // Diagnostic only; no decode behaviour depends on it.
+        if crate::envflags::env_flag!("EC_PALWALK") {
+            eprintln!(
+                "EC_PALWALK mi={r},{c} px={px} py={py} bw={bw} bh={bh} cw={chroma_w} \
+                 ch={chroma_h} uw={uw} uh={uh} nw={nw} nh={nh} ast={allow_screen_content_tools} \
+                 puv={} py={}",
+                palette_uv.is_some() as i32,
+                palette_y.is_some() as i32
+            );
+        }
         let mut u_levels = vec![0i32; chroma_w * chroma_h];
         let mut v_levels = vec![0i32; chroma_w * chroma_h];
         // The tiled units below stamp their own coefficient context

@@ -21,3 +21,22 @@ file: crates/ec-av1/src/decode.rs:2721-2731  confidence: 0.75
 
 The doc comment on CHROMA_PALETTE_WINDOW_HITS (decode.rs:2721-2731, added by eb73ef89) says it counts 'units that are NOT the block's top-left corner', but the hit! sits unconditionally next to set_palette_pred(palette_window(...)) on both fixed lines, so it also fires for nw*nh==1 blocks where the window is a pure re-stride copy of the whole buffer — the exact units the comment says it excludes. Measured on the pinned fixture the two coincide (all 4 hits are nw=1, nh=2), so nothing is mis-gated today, but a reader auditing non-vacuity would conclude the counter proves the TILED arm ran, which the counter cannot distinguish: a stream whose palette chroma blocks are all single-unit would still produce hits >= 1 and pass the reachability assert. Fix the comment to say 'units handed a windowed slice (all palette chroma units on the 32-capped walk; the window is a no-op when nw*nh==1)' and let the MIN_WINDOWED_UNITS floor plus the byte compare carry the tiled-arm claim, or gate the hit! on bigger (nw*nh > 1) if the tiled arm is what it is meant to witness.
 
+
+---
+
+## Addendum (lane-av1444palw): the counter floor of 4 was never a census
+
+`a_444_lossy_palette_chroma_unit_window_is_byte_exact_at_352x242_10bit` asserts
+`MIN_WINDOWED_UNITS = 4`, documented there as "measured 4 on this stream". That
+is a floor from ONE stream and stays correct as a floor, but it must not be read
+as "this walk runs 4 units". Re-measured per stream across every committed
+palette-chroma stream (`EC_PALWALK=1`, the rung added in
+`decode_block_rect64` by lane-av1444palw):
+
+| stream | windowed units | of which `nw >= 2` |
+| --- | --- | --- |
+| `444_lossy_palette_chroma_352x242_10b.obu` | 4 | 0 |
+| `444_palette_chroma_hstrip_640x480_10b.obu` (new, lane-av1444palw) | 8 | 4 |
+| `444_palette_chroma_hstrip_640x480_12b.obu` (new, lane-av1444palw) | 4 | 4 |
+
+Totals: 16 units, 8 on the horizontal arm. See `lanes/av1444palw.report.md`.
