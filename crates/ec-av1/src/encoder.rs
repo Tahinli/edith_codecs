@@ -1477,11 +1477,22 @@ pub struct Av1Encoder {
 
 /// One decoded-picture-buffer slot: what a `refresh_frame_flags` bit stores
 /// and what a `ref_frame_idx` entry reads back.
+///
+/// lane-av1enchang: the `CdfSnapshot` is BOXED, not held by value. Eight
+/// inline copies made [`Av1Encoder`] 139960 bytes, and that struct is
+/// returned by value through three nested `Result<Self>` constructors
+/// ([`Av1Encoder::with_pyramid_and_rate_target`] ->
+/// [`Av1Encoder::with_pyramid`] -> [`Av1Encoder::new`]), so an unoptimized
+/// build put several of those on the stack at once: the pyramid path
+/// overflowed libtest's 2 MiB test thread and aborted the whole crate suite
+/// with `fatal runtime error: stack overflow`. One heap box per DPB slot
+/// brings the struct from 139960 bytes down to 18168 (measured). The tables'
+/// VALUES are untouched.
 #[derive(Debug, Clone)]
 struct DpbSlot {
     picture: Picture,
     order_hint: u32,
-    cdfs: crate::encode::CdfSnapshot,
+    cdfs: Box<crate::encode::CdfSnapshot>,
 }
 
 /// The encoder stays `Send` now that it owns a `FrameCtx` (whose cells are
@@ -1963,7 +1974,7 @@ impl Av1Encoder {
         let slot = DpbSlot {
             picture: encoded.reconstruction.clone(),
             order_hint,
-            cdfs: encoded.next_cdfs.clone(),
+            cdfs: Box::new(encoded.next_cdfs.clone()),
         };
         for &s in slots {
             self.dpb[s as usize] = Some(slot.clone());
@@ -3379,6 +3390,35 @@ mod tests {
         );
     }
 
+    /// One (bitrate, pyramid) arm's tally, built on the worker thread and
+    /// handed back through the progress channel
+    /// (`bitrate_target_lands_within_5_percent_over_48_frames`). Per LEVEL,
+    /// so a miss reads as WHICH level's model is off rather than as one
+    /// aggregate percentage.
+    struct ArmResult {
+        /// [`RateLoop::target`] as the arm's own encoder computed it.
+        targets: [f64; 3],
+        coded: usize,
+        bytes: [usize; 4],
+        count: [usize; 4],
+    }
+
+    impl ArmResult {
+        fn take(&mut self, packets: Vec<Packet>) {
+            for packet in packets {
+                self.coded += packet.data.len();
+                let i = match packet.level {
+                    Level::Key => 0,
+                    Level::Arf => 1,
+                    Level::Leaf => 2,
+                    Level::ShowExisting => 3,
+                };
+                self.bytes[i] += packet.data.len();
+                self.count[i] += 1;
+            }
+        }
+    }
+
     /// [`RateTarget::Bitrate`] lands the achieved bitrate within ±5% of the
     /// target over 48 frames of a real clip, flat and under a pyramid alike,
     /// across a 5x span of bitrates. This is the accuracy claim of the
@@ -3394,6 +3434,103 @@ mod tests {
     /// frame are the same at 1.5 and 2 Mbit/s) and the leaves sit at 1 + 12
     /// `leaf_q_offset`, so this clip cannot be made to spend much past
     /// 2.4 Mbit/s under the default pyramid however the budget is split.
+    ///
+    /// # Bounded
+    ///
+    /// Each arm's encode runs on a worker thread under a per-CALL
+    /// wall-clock ceiling, so this gate FAILS rather than hanging when an
+    /// encode stops terminating (lane-av1enchang: a 3h20m wedge on one host
+    /// and 30min on another, both here, both with the test thread spinning
+    /// and no child process for the crate's child timeout to reap). The cost
+    /// is real and is why the budget is not tight: the two high bitrate arms
+    /// walk `q_idx` from the seed 100 down into the 20s to spend an
+    /// 8000-byte budget on a 640x384 clip, and a frame at `q_idx` 25 costs
+    /// ~15s in a debug build (~1s optimized) against ~0.5s at `q_idx` 100.
+    /// lane-av1enchang: the PYRAMID CONSTRUCTORS fit on a tight stack.
+    ///
+    /// `Av1Encoder` used to be 139960 bytes BY VALUE, because each of the
+    /// eight `DpbSlot`s held a 15 KB `CdfSnapshot` inline. The pyramid
+    /// constructors nest three deep -- `with_pyramid_and_rate_target` ->
+    /// `with_pyramid` -> `new` -- and each level materialises the struct in
+    /// an unoptimized build, so ~840 KB of stack was live at the innermost
+    /// `Ok(Self { .. })`. On libtest's default 2 MiB test thread that aborts:
+    /// `fatal runtime error: stack overflow, aborting`, reproduced on the
+    /// pre-fix binary at `crates/ec-av1/src/encoder.rs:1519` via
+    /// `coredumpctl debug`.
+    ///
+    /// Boxing the snapshot brought the struct to 18168 bytes. This gate pins
+    /// that: it builds BOTH constructors on a thread with a deliberately
+    /// tight stack, so the old layout ABORTS THE PROCESS and the new one
+    /// returns. It runs in milliseconds, where proving the same thing through
+    /// the 48-frame gate takes 6m35s.
+    ///
+    /// Both thresholds were swept, in an unoptimized build:
+    ///
+    /// | stack | pre-fix (`CdfSnapshot` by value) | post-fix (boxed) |
+    /// |---|---|---|
+    /// | 256 KiB | overflow | overflow |
+    /// | 384 KiB | overflow | ok |
+    /// | 512 KiB | overflow | ok |
+    /// | 1 MiB   | **overflow** | **ok** |
+    /// | 2 MiB   | **overflow** (libtest's default) | ok |
+    /// | 3 MiB   | ok | ok |
+    ///
+    /// 1 MiB is the gate: 2.7x what the boxed layout needs and 2x below what
+    /// the old one did, so it is nowhere near either threshold and cannot
+    /// flake. The pre-fix row at 1 MiB is the red -- which is also why
+    /// `.cargo/config.toml` carries `RUST_MIN_STACK = 67108864`, a
+    /// workspace-local band-aid this gate makes unnecessary for this struct.
+    ///
+    /// `EC_AV1_TIGHT_STACK_BYTES` overrides the size, which is how the sweep
+    /// above is reproduced.
+    #[test]
+    fn the_pyramid_constructors_fit_on_a_tight_stack() {
+        // 1 MiB: see the threshold table on this test. Red before the Box,
+        // green after, with 2.7x margin either way.
+        const STACK: usize = 1024 * 1024;
+        let stack: usize = std::env::var("EC_AV1_TIGHT_STACK_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(STACK);
+        let config = EncoderConfig {
+            width: 640,
+            height: 384,
+            base_q_idx: 100,
+            gop: 48,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let rate = RateTarget::Bitrate {
+            bits_per_second: 1_536_000,
+            frames_per_second: 24.0,
+        };
+        let handle = std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(move || {
+                let flat = Av1Encoder::with_rate_target(config, rate)
+                    .expect("with_rate_target")
+                    .rate_loop
+                    .is_some();
+                let pyr =
+                    Av1Encoder::with_pyramid_and_rate_target(config, Pyramid::default(), rate)
+                        .expect("with_pyramid_and_rate_target")
+                        .pyramid
+                        .is_some();
+                (flat, pyr)
+            })
+            .expect("spawn tight-stack thread");
+        let (flat, pyr) = handle
+            .join()
+            .unwrap_or_else(|_| panic!("the encoder constructors overflowed a {stack}-byte stack"));
+        assert!(flat, "with_rate_target lost its rate loop");
+        assert!(pyr, "with_pyramid_and_rate_target lost its pyramid");
+        eprintln!(
+            "TIGHTSTACK {stack} bytes: Av1Encoder={} bytes, both constructors returned",
+            std::mem::size_of::<Av1Encoder>()
+        );
+    }
+
     #[test]
     fn bitrate_target_lands_within_5_percent_over_48_frames() {
         let _knobs = crate::speed::knob_read();
@@ -3407,6 +3544,7 @@ mod tests {
             return;
         };
         let fps = 24.0;
+        let pictures = std::sync::Arc::new(pictures);
         for bits_per_second in [384_000u32, 768_000, 1_536_000, 2_000_000] {
             let config = EncoderConfig {
                 width,
@@ -3422,32 +3560,104 @@ mod tests {
                 frames_per_second: fps,
             };
             for pyramid in [None, Some(Pyramid::default())] {
-                let mut enc = match pyramid {
-                    None => Av1Encoder::with_rate_target(config, rate).unwrap(),
-                    Some(p) => Av1Encoder::with_pyramid_and_rate_target(config, p, rate).unwrap(),
-                };
-                let targets = enc.rate_loop.as_ref().unwrap().target;
-                let mut coded = 0usize;
-                // Per level, so a miss reads as WHICH level's model is off
-                // rather than as one aggregate percentage.
-                let (mut bytes, mut count) = ([0usize; 4], [0usize; 4]);
-                let mut take = |packets: Vec<Packet>| {
-                    for packet in packets {
-                        coded += packet.data.len();
-                        let i = match packet.level {
-                            Level::Key => 0,
-                            Level::Arf => 1,
-                            Level::Leaf => 2,
-                            Level::ShowExisting => 3,
-                        };
-                        bytes[i] += packet.data.len();
-                        count[i] += 1;
+                let arm = format!("{bits_per_second} bps pyramid {}", pyramid.is_some());
+                // lane-av1enchang: a BACKSTOP, not a fix. This gate is NOT
+                // hung and NOT regressed -- it is a ~7 hour test in an
+                // unoptimized build (measured: the whole `ec-av1` lib suite
+                // takes 24341s, and this test is the largest single item in
+                // it), and it PASSES. What it lacked was any way to FAIL: a
+                // future non-terminating encode would wedge the suite for
+                // hours with no diagnostic, which is exactly how wave3j and
+                // wave3h were lost. So the arm runs on a worker thread and
+                // THIS thread watches a per-CALL deadline, purely so that
+                // case reports itself.
+                //
+                // The budget is PER CALL, not per test, and it is valued from
+                // a measured run so it cannot turn a correct-but-slow build
+                // red. Measured on this gate's own workload (48 frames of
+                // 640x384): one `encode_frames` call is 0.78s..1.04s
+                // optimized and 8.6s..12.2s debug on the flat arms. A
+                // PYRAMID call codes a whole mini-GOP at once, so its worst
+                // single call is `Pyramid::default().mini_gop` frames
+                // (~9), i.e. ~110s debug. 1800s is therefore ~16x that
+                // worst honest call: no plausible host trips it, and a real
+                // non-terminating encode is reported in 30 minutes instead
+                // of never. `EC_AV1_ENCODE_CALL_BUDGET_SECS` overrides it,
+                // which is how the backstop is proven to bite.
+                let budget = std::time::Duration::from_secs(
+                    std::env::var("EC_AV1_ENCODE_CALL_BUDGET_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1800),
+                );
+                let total = pictures.len() + 1;
+                // Shared, not cloned: the 48 decoded frames are ~35 MB of
+                // `u16` luma+chroma, and all eight arms want the same ones.
+                let pictures = std::sync::Arc::clone(&pictures);
+                // `None` is a progress ticket: THIS call returned. `Some` is
+                // the arm's result, sent after `flush` -- which is itself a
+                // call that can spin, so it needs a ticket too, not a bare
+                // `join` that would block forever.
+                let (tx, rx) = std::sync::mpsc::channel::<Option<ArmResult>>();
+                let worker = std::thread::spawn(move || {
+                    let mut enc = match pyramid {
+                        None => Av1Encoder::with_rate_target(config, rate).unwrap(),
+                        Some(p) => {
+                            Av1Encoder::with_pyramid_and_rate_target(config, p, rate).unwrap()
+                        }
+                    };
+                    let targets = enc.rate_loop.as_ref().unwrap().target;
+                    let mut out = ArmResult {
+                        targets,
+                        coded: 0,
+                        bytes: [0; 4],
+                        count: [0; 4],
+                    };
+                    for picture in pictures.iter() {
+                        out.take(enc.encode_frames(picture).unwrap());
+                        if tx.send(None).is_err() {
+                            return;
+                        }
+                    }
+                    out.take(enc.flush().unwrap());
+                    let _ = tx.send(Some(out));
+                });
+                let started = std::time::Instant::now();
+                let mut calls = 0usize;
+                let out = loop {
+                    match rx.recv_timeout(budget) {
+                        // The result IS the last thing the worker sends, so
+                        // receiving it means every call returned. A worker
+                        // that panicked sends nothing and arrives as
+                        // `Disconnected` below, which re-joins it and
+                        // surfaces the real panic.
+                        Ok(Some(out)) => break out,
+                        Ok(None) => calls += 1,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                            "AV1 bitrate gate SLOW, NOT HUNG: the {arm} arm's encode did not \
+                             return within {}s (arm elapsed {:.0}s, stuck on call {} of {total} \
+                             -- the call that never came back). This gate is a ~7 hour test in \
+                             an unoptimized build and it PASSES, so a red here is NOT a slow \
+                             host: the budget is per CALL and the worst honest call measured \
+                             is ~1s optimized / ~110s debug on a pyramid arm, so reaching this \
+                             panic means an encode call that is NOT RETURNING. \
+                             EC_AV1_ENCODE_CALL_BUDGET_SECS raises the budget.",
+                            budget.as_secs(),
+                            started.elapsed().as_secs_f64(),
+                            calls + 1,
+                        ),
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            worker.join().expect("encode worker panicked");
+                            panic!("AV1 encode worker for {arm} died without a result");
+                        }
                     }
                 };
-                for picture in &pictures {
-                    take(enc.encode_frames(picture).unwrap());
-                }
-                take(enc.flush().unwrap());
+                let ArmResult {
+                    targets,
+                    coded,
+                    bytes,
+                    count,
+                } = out;
                 let seconds = frames as f64 / fps;
                 let achieved = coded as f64 * 8.0 / seconds;
                 let error = achieved / f64::from(bits_per_second) - 1.0;
@@ -3478,7 +3688,6 @@ mod tests {
             }
         }
     }
-
     /// The `BytesPerFrame` controller's own windup bound: no frame's coded
     /// `base_q_idx` step exceeds [`RateLoop::STEP_CLAMP`], across a real
     /// clip's full range of content (so a scene cut can't be the one frame
