@@ -199,6 +199,23 @@ cells by their **first-divergence decode frame**:
 | `s422_352x242_10b` | 0 | 17/17 | chroma only |
 | `s444_352x242_10b` | 0 | 17/17 | 4:4:4, chroma only |
 | `s422_384x240` | **1** | 11/17 | chroma only |
+[CORRECTED 2026-09-30 by lane-av1422444b: the `s444_352x242_10b` row above is
+SUPERSEDED and this cell is NOT among the still-diverging cells at current main. The
+row is a true reading of `ed7c99bc`, which was 36 commits behind `affe70dc` when this
+correction was made; the fix is `f3afa5b7` ("window the 32-capped chroma palette
+buffer per unit"), an ancestor of main, and it is 4:4:4-SPECIFIC — `decode_block_rect64`
+caps chroma units at 32, so at `ss=00` a 64-axis luma strip's chroma is TILED and each
+tiled unit had been handed the WHOLE block's palette prediction buffer, which
+`PlaneBuf::reconstruct` reads as its first `side*side` entries. Measured at `affe70dc`:
+0/0/0 vs ffmpeg 8.1.3 (`-pix_fmt yuv444p10le`) on all 16 shown frames AND 0/0/0 vs
+instrumented aomdec on all 17 decode-order frames (16 shown + 1 hidden altref), with no
+first divergence and an empty wrong-sample bbox. The pinned gate
+`a_444_lossy_palette_chroma_unit_window_is_byte_exact_at_352x242_10bit`
+(`crates/ec-av1/src/stream.rs:51024`) was proven to bite by mutation on the current
+tree: with `palette_window` reverted in both tiled arms it fails at decode frame 0
+byte 328192 (ours 209 vs 216), 0/1112/1362 through the ffmpeg comparator. Original
+figures left standing above as the record of what was believed on `ed7c99bc`. Full
+report: `lanes/av1422444b.report.md`.]
 
 `S_odd326x242_10b` and `s422_352x250_10b` were 10-bit cells that closed; `s422_352x242_10b`
 and `s422_416x242_10b` are 10-bit cells that did not. So **bit depth does not separate
@@ -284,6 +301,19 @@ trees.
 
 That the supported formats are bit-identical across the fix is the load-bearing control:
 the delta in §3.1 is 4:2:2-specific.
+[CORRECTED 2026-09-30 by lane-av1422444b: the "4:4:4 controls: 21 of 22, with the
+single exception `s444_352x242_10b` (0/1166/1413 — identical counts on both trees)"
+sentence above is true only of the TWO trees this census had (`cc9f2668` and
+`ed7c99bc`). At current main `affe70dc` — 36 commits past `ed7c99bc` — that exception
+is GONE: `f3afa5b7` fixed it, so all 22 of 22 4:4:4 cells are byte-exact and the
+"identical counts on both trees" reading was a property of the census's own tree pair,
+not of the format. Measured at main: `s444_352x242_10b` is 0/0/0 vs ffmpeg 8.1.3 on all
+16 shown frames and 0/0/0 vs instrumented aomdec on all 17 decode-order frames. The
+control this paragraph was carrying still holds, and now holds twice over: the §3.1
+delta is 4:2:2-specific, AND the 4:4:4 palette fix left 4:2:0 bit-identical (69 of 69
+committed 4:2:0 fixtures and 18 of 18 fresh 4:2:0 sweep cells byte-exact at main, zero
+skips) — 4:2:0 is structurally immune, since `nw * nh == 1` on every 4:2:0 block so the
+32-cap never tiles. Original sentence left standing above.]
 
 ---
 
@@ -420,6 +450,21 @@ and shipped pixels.
 | **D — not 4:2:2: 10-bit 4:4:4 chroma** | 1: `s444_352x242_10b` | `--cpu-used 0`, 352x242 10-bit 4:4:4 | 2579 samples |
 | **E — NEW, found here: luma desync at `--cpu-used 2`** | 1: `rc2_s422_320x242` | **`--cpu-used 2`**, 320x242 8-bit | **890107 samples** |
 
+[CORRECTED 2026-09-30 by lane-av1422444b: class D is now EMPTY. `f3afa5b7` fixed
+`s444_352x242_10b` and is an ancestor of main; `ed7c99bc`, the tree this table was
+measured on, was 36 commits behind `affe70dc` at the time of this correction. Measured
+at main: 0/0/0 vs ffmpeg 8.1.3 on all 16 shown frames and 0/0/0 vs instrumented aomdec
+on all 17 decode-order frames, and the whole 4:4:4 surface is clean — 18/18 fresh 4:4:4
+sweep cells, 18/18 fresh 4:2:0 controls, 36/36 committed 4:4:4 fixtures, 69/69
+committed 4:2:0 fixtures, zero skips. The defect was 4:4:4-SPECIFIC and had nothing to
+do with the 4:2:2 family: `decode_block_rect64` caps chroma units at 32, so at `ss=00` a
+64-axis luma strip's chroma is TILED and each tiled unit was handed the whole block's
+palette prediction buffer. The sensitive axis is CHROMA UNIT COUNT, not frame width or
+height, which is why the sibling geometries at the same depth were already exact and
+why this cell's "geometry-sensitive" framing was misleading. The class D row above is
+left standing as the record of what was believed on `ed7c99bc`. Full report:
+`lanes/av1422444b.report.md`.]
+
 **Worst current 4:2:2 divergence:** `s422_416x250_10b`, 230275 wrong samples. Worst
 overall including the new class E: `rc2_s422_320x242`, 890107 wrong samples including
 436945 luma. Smallest current 4:2:2: `s422_384x240`, 4063.
@@ -436,6 +481,17 @@ overall including the new class E: `rc2_s422_320x242`, 890107 wrong samples incl
   and class E if a `--cpu-used 2` stream ever arrives) fail in the **luma plane**.
 * A lift would **not** fix class D: `s444_352x242_10b` is a 4:4:4 defect, already
   reachable, already diverging with the refusal standing, unchanged by the fix.
+  [CORRECTED 2026-09-30 by lane-av1422444b: this constraint is GONE. Class D is empty
+  at main — `f3afa5b7` fixed `s444_352x242_10b` and is an ancestor of main, while
+  `ed7c99bc` (the tree these numbers were measured on) was 36 commits behind `affe70dc`
+  at the time of this correction. Re-measured at main: 0/0/0 vs ffmpeg 8.1.3 on all 16
+  shown frames and 0/0/0 vs instrumented aomdec on all 17 decode-order frames, and the
+  full 4:4:4 surface is clean (18/18 fresh 4:4:4 sweep cells, 36/36 committed 4:4:4
+  fixtures, zero skips). So a lift is no longer constrained by a 4:4:4 exception: every
+  cell outside 4:2:2 is byte-exact, and 4:2:0 is structurally immune to that fix
+  (`nw * nh == 1` on every 4:2:0 block, so the 32-cap never tiles) — 69/69 committed
+  4:2:0 fixtures and 18/18 fresh 4:2:0 sweep cells byte-exact at main. The two 4:2:2
+  bullets above are unaffected by this correction. Sentence left standing above.]
 * A lift would **not** reach class E, which is invisible at every recipe the census swept.
 * The lift's blast radius is not bounded by this census: §8.
 
