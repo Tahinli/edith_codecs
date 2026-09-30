@@ -1910,10 +1910,14 @@ fn decode_frame(
     // 4:2:0 one never inherits the wrong plane count.
     crate::decode::set_mono(seq.mono_chrome, fctx);
     crate::decode::set_subsampling(seq.subsampling_x, seq.subsampling_y, fctx);
-    // lane-av1readcensus: the 4:4:4 coefficient-unit census is armed here,
-    // off the same sequence-header subsampling -- at 4:2:0/4:2:2 every census
-    // counter reads zero, so a 4:2:0 control can assert exactly that.
-    crate::decode::set_census_444(seq.subsampling_x, seq.subsampling_y);
+    // lane-av1readcensus: the coefficient-unit census is armed here, off the
+    // same sequence-header subsampling. lane-av1422census422 widened it from
+    // 4:4:4-only to "any format with an unsubsampled luma axis", so a 4:2:2
+    // cell's per-plane unit counts are readable and a 4:2:2 gate can assert
+    // a non-vacuous walk; 4:2:0 still reads zero, so the 4:2:0 control in
+    // `a_pixel_exact_444_stream_walks_the_same_coefficient_units_the_oracle_does`
+    // keeps asserting exactly that.
+    crate::decode::set_census_nonsub(seq.subsampling_x, seq.subsampling_y);
     // lane-av1txr: spec 5.9.2 `disable_cdf_update` -- a frame that sets it
     // codes every tile symbol against the CDFs it started with, so the tile
     // readers must not adapt (libaom `decodeframe.c:2909`:
@@ -24395,16 +24399,16 @@ exit 0
             [now[0] - before[0], now[1] - before[1], now[2] - before[2]]
         };
 
-        let u0 = crate::decode::census_444_units();
-        let c0 = crate::decode::census_444_coded();
+        let u0 = crate::decode::census_nonsub_units();
+        let c0 = crate::decode::census_nonsub_coded();
         let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
         assert_eq!(
             frames + hidden,
             8,
             "{NAME}: expected 8 decode-order frames (6 shown + 2 hidden)"
         );
-        let walked = delta(crate::decode::census_444_units(), u0);
-        let coded = delta(crate::decode::census_444_coded(), c0);
+        let walked = delta(crate::decode::census_nonsub_units(), u0);
+        let coded = delta(crate::decode::census_nonsub_coded(), c0);
 
         // The oracle's own census on the same stream, paired by post_rng:
         // 3764 units per plane, 975 / 1793 / 1859 of them coded.
@@ -24436,15 +24440,15 @@ exit 0
             .join("fixtures/444_lossy_rect4_inter_witness.obu");
         let stream2 = std::fs::read(&path2)
             .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path2.display()));
-        let m0 = crate::decode::census_444_units();
-        let mc0 = crate::decode::census_444_coded();
+        let m0 = crate::decode::census_nonsub_units();
+        let mc0 = crate::decode::census_nonsub_coded();
         let (frames2, hidden2) = decode_all_frames_vs_oracle(&stream2, NAME);
         assert!(
             frames2 + hidden2 > 0,
             "{NAME}: the mixed-shape 4:4:4 arm decoded no frames"
         );
-        let walked2 = delta(crate::decode::census_444_units(), m0);
-        let coded2 = delta(crate::decode::census_444_coded(), mc0);
+        let walked2 = delta(crate::decode::census_nonsub_units(), m0);
+        let coded2 = delta(crate::decode::census_nonsub_coded(), mc0);
         assert_eq!(
             walked2,
             [629, 372, 372],
@@ -24464,21 +24468,21 @@ exit 0
                 .join("fixtures/av1_192x128_8bit_intra64_in_inter.obu"),
         )
         .unwrap_or_else(|e| panic!("{NAME}: reading the 4:2:0 control: {e}"));
-        let k0 = crate::decode::census_444_units();
-        let kc0 = crate::decode::census_444_coded();
+        let k0 = crate::decode::census_nonsub_units();
+        let kc0 = crate::decode::census_nonsub_coded();
         let k_frames = decode_stream(&control)
             .unwrap_or_else(|e| panic!("{NAME}: the 4:2:0 control no longer decodes: {e}"))
             .len();
         assert!(k_frames > 0, "{NAME}: the 4:2:0 control decoded no frames");
         assert_eq!(
-            delta(crate::decode::census_444_units(), k0),
+            delta(crate::decode::census_nonsub_units(), k0),
             [0, 0, 0],
-            "{NAME}: the 4:4:4 census fired on the 4:2:0 control"
+            "{NAME}: the coefficient-unit census fired on the 4:2:0 control"
         );
         assert_eq!(
-            delta(crate::decode::census_444_coded(), kc0),
+            delta(crate::decode::census_nonsub_coded(), kc0),
             [0, 0, 0],
-            "{NAME}: the 4:4:4 coded-unit census fired on the 4:2:0 control"
+            "{NAME}: the coded-unit census fired on the 4:2:0 control"
         );
     }
 
