@@ -147,6 +147,41 @@ check "rung 17 EC_PREDND install sites (hbd non-directional)" "$pnd" "1"
 pndm=$(grep -c 'txw=%d txh=%d mode=%d n_top=%d n_left=%d' "$WORK/derived-intra.c" || true)
 check "rung 17 EC_PREDND site carries mode=" "$pndm" "1"
 
+# --- rungs 19/20: the intra-prediction IDENTITY + DC INPUTS rungs ---------
+# EC_PREDOUT8/EC_PREDND print only SOME of the writes inside
+# `av1_predict_intra_block`: the palette branch returns before either, and so
+# do the two non-directional early returns' opposite number. A chroma region
+# where no rung fires was therefore un-attributable -- three lanes of 4:2:2
+# work stalled on exactly that (lanes/av1422ctrigger §5b). EC_PIB prints the
+# CALL IDENTITY before any early return, so "did a call happen and did it
+# return early" is readable from the trace.
+pib=$(grep -c 'EC_PIB mi_row=%d mi_col=%d plane=%d row_off=%d col_off=%d' "$WORK/derived-intra.c" || true)
+check "rung 19 EC_PIB install sites (av1_predict_intra_block prologue)" "$pib" "1"
+
+pibb=$(grep -c 'txw=%d txh=%d mode=%d use_palette=%d' "$WORK/derived-intra.c" || true)
+check "rung 19 EC_PIB carries use_palette= (the early-return bit)" "$pibb" "1"
+
+# EC_DCIN is what makes the DC VARIANT a printed field instead of an
+# inference from the predicted value: four lanes read "libaom used dc_top"
+# out of the number 202 without the availability operands being visible.
+dcin=$(grep -c 'EC_DCIN mi_row=%d mi_col=%d plane=%d row_off=%d col_off=%d' "$WORK/derived-intra.c" || true)
+check "rung 20 EC_DCIN install sites (8-bit + hbd non-directional)" "$dcin" "2"
+
+dcina=$(grep -c 'n_left=%d atop=%ld aleft=%ld dcv=%d up=%d left=%d cup=%d' "$WORK/derived-intra.c" || true)
+check "rung 20 EC_DCIN prints availability operands + dcv + availability bits" "$dcina" "2"
+
+# --- rung 21: EC_DP, the branch decode_token_recon_block takes --------------
+# The inter arm (`predict_inter_block_visit`) prints NO intra rung, and the
+# intra arm itself skips chroma on `!xd->is_chroma_ref`, so a block that
+# emits no prediction rung is consistent with three different writers.
+# EC_DP is what separates them -- it is how the INTRABC writer at the 4:2:2
+# seed was named (lanes/av1422ctattr §4).
+dp=$(grep -c 'EC_DP mi_row=%d mi_col=%d bsize=%d inter=%d chroma_ref=%d' "$WORK/derived.c" || true)
+check "rung 21 EC_DP install sites (decode_token_recon_block)" "$dp" "1"
+
+dpa=$(grep -c 'skip_txfm=%d bw=%d bh=%d planes=%d is_intrabc=%d' "$WORK/derived.c" || true)
+check "rung 21 EC_DP carries is_intrabc= (the intra/inter branch bit)" "$dpa" "1"
+
 # Rung 16 claims to be idempotent in BOTH directions: an install on a
 # pristine file, AND an upgrade of the no-`mode=` form the oracle tree's git
 # HEAD carries. Rebuild the no-mode form, re-derive, and require the result to
