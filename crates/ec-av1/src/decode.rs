@@ -2403,6 +2403,21 @@ fn census_unit(
     );
 }
 
+/// How many transform units this thread has read since the last
+/// [`reset_census_unit_n`] (lane-av1offtile). The per-unit oracle twin is
+/// `EC_ECDUMP_IN`, one line per `read_coeffs_txb` call, so this count IS
+/// directly comparable with an oracle `EC_ECDUMP_IN` census -- which is what
+/// makes "we walk N units where libaom walks M" a gated claim rather than an
+/// inference from the desync's position.
+pub fn census_unit_n() -> usize {
+    CENSUS_UNIT_N.with(|c| c.get())
+}
+
+/// Reset [`census_unit_n`] to zero (lane-av1offtile).
+pub fn reset_census_unit_n() {
+    CENSUS_UNIT_N.with(|c| c.set(0));
+}
+
 /// lane-av1ibcfork: this decoder's half of the per-unit BIT INTERVAL -- the
 /// exact mirror of the oracle's `EC_ECDUMP_IN` / `EC_ECDUMP_OUT` /
 /// `EC_ECDUMP_END` triple (`aom-oracle2/src/av1/decoder/decodetxb.c`: one
@@ -6700,6 +6715,15 @@ thread_local! {
     /// asserting the reach fix must see this nonzero, or the fixture never
     /// exercised the fixed path.
     static SUB8_CHROMA444_LOSSLESS_TU_REACH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-av1offtile: 4x4 chroma units a lossless HORZ/VERT strip's plane-
+    /// major walk skipped because their top-left sample falls outside the
+    /// CHROMA plane. libaom bounds that walk per plane (`max_block_wide/high`,
+    /// av1_common_int.h:1565); this walk used to count the block's own
+    /// `chroma_w / 4` x `chroma_h / 4`. Zero means no stream decoded a
+    /// lossless strip overhanging the frame edge -- a gate asserting the
+    /// clip must see this nonzero.
+    static RECT_SPLIT_LOSSLESS_CHROMA_OFFTILE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
@@ -6728,6 +6752,19 @@ pub fn skip_lossless_band_reset_hits() -> usize {
 /// must see this nonzero.
 pub fn rect_split_lossless_chroma444_hits() -> usize {
     RECT_SPLIT_LOSSLESS_CHROMA444_HITS.with(|c| c.get())
+}
+
+/// How many 4x4 chroma units a lossless HORZ/VERT strip's plane-major walk
+/// skipped for falling outside the chroma plane (lane-av1offtile). Zero means
+/// no stream decoded a lossless strip overhanging the frame edge -- a gate
+/// asserting the clip must see this nonzero.
+pub fn rect_split_lossless_chroma_offtile_hits() -> usize {
+    RECT_SPLIT_LOSSLESS_CHROMA_OFFTILE_HITS.with(|c| c.get())
+}
+
+/// Reset [`rect_split_lossless_chroma_offtile_hits`] to zero (lane-av1offtile).
+pub fn reset_rect_split_lossless_chroma_offtile_hits() {
+    RECT_SPLIT_LOSSLESS_CHROMA_OFFTILE_HITS.with(|c| c.set(0));
 }
 
 /// How many unskipped intrabc 8x4/4x8 leaves a lossless frame walked luma as
@@ -12859,6 +12896,36 @@ fn decode_rect_split(
         for plane_idx in 1..=2 {
             for cu_row in 0..ch_n {
                 for cu_col in 0..cw_n {
+                    // lane-av1offtile: the CHROMA twin of the luma walk's
+                    // `max_blocks_wide/high` clip (decode.rs:12516, lane-hgkf
+                    // r1). libaom computes those bounds per PLANE
+                    // (`max_block_wide(xd, plane_bsize, plane)`,
+                    // av1_common_int.h:1565 -- `mb_to_right_edge >>
+                    // (3 + pd->subsampling_x)`, then `>> MI_SIZE_LOG2`), so a
+                    // chroma unit whose top-left sample falls outside the
+                    // CHROMA plane is never coded. This walk counted
+                    // `chroma_w / 4` x `chroma_h / 4` units off the BLOCK's
+                    // own extent instead.
+                    //
+                    // MEASURED on `mix_176x144_6.obu` (4:2:0 8-bit,
+                    // --cq-level=0 --aq-mode=1 altref; the 48x16 bottom-right
+                    // sliver, block mi=(32,32) px=(128,128) bw=64 bh=32):
+                    // the chroma plane is 88x72, so `cw_n` must be
+                    // `(88 - 64) / 4 = 6` and `ch_n` `(72 - 64) / 4 = 2` --
+                    // the oracle's own `EC_ECDUMP_IN` for that block is
+                    // exactly 12 units per plane (bc 0..5 x br 0..1). Ours
+                    // walked 8 x 4 = 32 per plane: 20 phantom units x 2
+                    // planes = the 40 extra `txb_skip` reads after SYMR
+                    // 25791, all at `mi=(32,32)`, all `all_zero`, all with
+                    // the bit position FROZEN at 36288 -- reads out of a
+                    // tile already exhausted, which is what turned the
+                    // desync 11 970 reads later into a hard
+                    // `REFUSED: unsupported: AV1 tile (a Golomb tail longer
+                    // than this decoder reads)`.
+                    if cpx + cu_col * 4 >= u.true_width || cpy + cu_row * 4 >= u.true_height {
+                        hit!(RECT_SPLIT_LOSSLESS_CHROMA_OFFTILE_HITS);
+                        continue;
+                    }
                     let cu_mi = (mi_r + cu_row * (span_y / MI), mi_c + cu_col * (span_x / MI));
                     // lane-av1422llintra: at ss (1, 0) one chroma column
                     // spans TWO luma mi columns, so the plain rect walk sums

@@ -52186,6 +52186,112 @@ exit 0
     /// makes `bw >> ss_x` the same arithmetic as the halving, and the pinned
     /// 4:2:0 twin (`420_intrabc_rect4_witness.obu`) is asserted byte-exact
     /// against the oracle in the same run.
+    /// lane-av1offtile: a lossless HORZ/VERT strip's PLANE-MAJOR 4x4 chroma
+    /// walk is bounded by the CHROMA PLANE, not by the block's own footprint.
+    ///
+    /// libaom bounds every transform walk per PLANE -- `max_block_wide` /
+    /// `max_block_high` (`av1_common_int.h:1565`) add `mb_to_right_edge >>
+    /// (3 + pd->subsampling_x)` to the plane block's size before the
+    /// `>> MI_SIZE_LOG2`, and `av1_foreach_transformed_block_in_plane`
+    /// (`decodeframe.c:1124`) drops any unit whose `blk_col`/`blk_row` is past
+    /// them. `decode_rect_split`'s luma walk carries that clip
+    /// (`decode.rs`, the `tu_px >= y.true_width` guard lane-hgkf r1 added for
+    /// the LUMA plane); its lossless chroma walk counted `chroma_w / 4` x
+    /// `chroma_h / 4` off the block instead, so a block overhanging the bottom-
+    /// right frame edge read chroma transform units that do not exist.
+    ///
+    /// MEASURED on `mix176_offtile_chroma_clip.obu`, whose bytes are frame 0
+    /// of the 4:2:0 8-bit `mix_176x144_6.obu`
+    /// (`ffmpeg -f lavfi -i testsrc2=size=176x144:rate=25 -frames:v 6
+    /// -pix_fmt yuv420p`, then `aomenc --codec=av1 --obu --passes=1
+    /// --cpu-used=4 --limit=6 --end-usage=q --cq-level=0 --aq-mode=1`; the
+    /// whole 6-frame stream is 20 069 B, sha256
+    /// `02b15d0d5b08aa5aebf139aee94c31b4f8363d14649c238cd7a19a9785ef124a`,
+    /// and this fixture is its first 4 581 B -- the temporal delimiter,
+    /// sequence header and frame-0 OBU, nothing else). The bottom-right
+    /// superblock is the 48x16 sliver of a 176x144 frame, and its block at
+    /// `mi=(32,32)` `px=(128,128)` is `bw=64 bh=32`, so the chroma plane
+    /// block (`cpx=64 cpy=64`, plane 88x72) is 32x16 where only 24x8 is coded.
+    /// That is `cw_n` 8 -> 6 and `ch_n` 4 -> 2: **20 phantom units per plane,
+    /// 40 in total**, and 40 is exactly the extra-read count the paired
+    /// `EC_SYMR` ladder measures (ours 25792..25831, the oracle doing a
+    /// range-coder init for the next frame there).
+    ///
+    /// The unit count below is the load-bearing number, not the pixels: the
+    /// 40 phantom reads all carry `all_zero` and consume no data (the bit
+    /// position freezes at 36288), so frame 0's pixels are byte-exact EITHER
+    /// WAY and a pixel compare alone would be blind to this defect. Frame 0's
+    /// transform-unit count is 2413 without the clip and 2373 with it, and
+    /// **2373 is the oracle's own count** -- the number of `EC_ECDUMP_IN`
+    /// lines the shared `aomdec` prints for the same bytes. Reverting the
+    /// clip restores 2413 and fails this assert; that is the mutation proof.
+    ///
+    /// What the 40 reads cost, on the FULL 6-frame stream rather than this
+    /// prefix: the desync is 11 970 reads downstream of them, where the
+    /// exhausted tile yields an unbounded `read_golomb` tail and the decoder
+    /// refuses with `unsupported: AV1 tile (a Golomb tail longer than this
+    /// decoder reads)` -- a supported 4:2:0 8-bit cell lost to a walk that ran
+    /// off its own tile. Fixing the walk moves the first remaining divergence
+    /// on the full stream from SYMR 25 792 to 29 411, a different block at a
+    /// different geometry (the var-tx/`lossless` conjunct lane-av1mixllfork
+    /// and lane-av1golomb320 own), and both this clip and that one applied
+    /// together decode the cell and match the oracle byte for byte. That
+    /// composition is measured, not claimed: this gate pins only the walk
+    /// this commit fixes.
+    #[test]
+    fn a_420_lossless_rect_chroma_walk_is_bounded_by_the_chroma_plane() {
+        const NAME: &str = "a_420_lossless_rect_chroma_walk_is_bounded_by_the_chroma_plane";
+        const FIXTURE: &str = "mix176_offtile_chroma_clip.obu";
+        const FIXTURE_LEN: usize = 4581;
+        const FIXTURE_FNV: u64 = 0x5e31be5efc9c3c1d;
+        /// The oracle's own `EC_ECDUMP_IN` count for these bytes.
+        const ORACLE_UNITS: usize = 2373;
+        const W: usize = 176;
+        const H: usize = 144;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("fixtures/{FIXTURE}"));
+        let stream = read_pin(&path, FIXTURE_LEN, FIXTURE_FNV, NAME);
+        assert_eq!(
+            stream_bit_depth(&stream, NAME),
+            8,
+            "{NAME}: the pinned witness is not 8-bit"
+        );
+
+        let _guard = lock_gate_counters();
+        crate::decode::reset_rect_split_lossless_chroma_offtile_hits();
+        crate::decode::reset_census_unit_n();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned witness no longer decodes: {e}"));
+        assert_eq!(frames.len(), 1, "{NAME}: frame count");
+        assert_eq!(
+            (frames[0].width, frames[0].height),
+            (W, H),
+            "{NAME}: dimensions"
+        );
+
+        // Non-vacuity: the clip must have run on this fixture, or the unit
+        // count below is just "the walk happened to be short here" (class
+        // gate-blind-to-feature).
+        let clipped = crate::decode::rect_split_lossless_chroma_offtile_hits();
+        assert!(
+            clipped > 0,
+            "{NAME}: no lossless rect chroma unit fell outside the chroma plane -- \
+             the corrected walk never ran, so this gate is measuring the \
+             unclipped one (class gate-blind-to-feature)"
+        );
+
+        // The oracle-anchored red-before/green-after: 2413 without the clip.
+        let units = crate::decode::census_unit_n();
+        assert_eq!(
+            units, ORACLE_UNITS,
+            "{NAME}: frame 0 walked {units} transform units, the oracle's own \
+             EC_ECDUMP_IN census for these bytes is {ORACLE_UNITS}"
+        );
+
+        decode_all_frames_vs_oracle(&stream, NAME);
+    }
+
     #[test]
     fn a_444_intrabc_rect_chroma_plane_block_is_the_block_footprint() {
         const NAME: &str = "a_444_intrabc_rect_chroma_plane_block_is_the_block_footprint";
