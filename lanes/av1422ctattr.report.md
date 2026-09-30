@@ -1,5 +1,20 @@
 # lane-av1422ctattr — the seed's 202 is an INTRABC frame copy, not a `dc_top`; and the defect is FIXED, all seven cells byte-exact
 
+> **NOTE ADDED BY MAIN LATER (2026-09-30).** This report DOES carry the fix (its own title says so), but the
+> MERGE MESSAGE for `1686dc8a` did not: I wrote that message from the lane's short output, which described
+> only the attribution and the rungs, so the merge reads as if the commit were instruments-only. Commit
+> `b8eed69f` inside it actually replaced `if skip {` in `sub8_leaf_chroma422` with
+> `if let Some(dv) = intrabc_dv.filter(|_| skip) { <bilinear frame copy at the DV> } else if skip {` -- the
+> last 4:2:2 corpus divergence. libaom does this because `predict_inter_block_visit` runs
+> `dec_build_inter_predictor` REGARDLESS of `skip_txfm` for an inter/intrabc block
+> (`decodeframe.c:1040-1043`); only the residual read is skipped. Independently reproduced by mutation and
+> re-measured in `lanes/av1422ctintrabc.report.md`.
+> CONSEQUENCE, recorded because it bit the decision table: the census (`lanes/av1422census.report.md`) was
+> taken 23 minutes BEFORE this merge (`cc9f2668`), so its verdicts for `Q_odd320x242`, `O_odd322x242`,
+> `AB_inter_warp_odd` and `S_odd326x242_10b` are stale; `lanes/av1422census2.report.md` re-measures the
+> whole table on the current tree.
+
+
 **Outcome in one line: both instrument gaps are closed, the oracle's `202` at the
 seed is attributed to a named call site (`dec_build_inter_predictor`, via
 `predict_inter_block`, because the block is INTRABC and `av1_predict_intra_block`
