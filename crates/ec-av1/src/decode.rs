@@ -2743,6 +2743,57 @@ pub(crate) fn reset_palette_sb_strip_hits() {
     PALETTE_SB_STRIP_HITS.with(|c| c.set(0));
 }
 
+thread_local! {
+    /// lane-av1rectreach: units of `decode_rect_split`'s `chroma_tiled` walk
+    /// whose PER-UNIT reach ([`tu_reach_rect`], libaom's per-unit
+    /// `has_top_right` / `has_bottom_left`) DIFFERS from the block-level
+    /// `reach` this walk used to hand every unit -- i.e. units for which the
+    /// two answers are not interchangeable. This is what a gate needs before
+    /// it compares the walk byte-exactly: if the two agreed everywhere, the
+    /// substitution could not change a single predicted sample and the
+    /// exactness assert would be measuring a witness the fix cannot touch.
+    ///
+    /// What it does NOT prove is that the argument handed to the unit reader
+    /// is the per-unit one -- the count is taken from the same expression
+    /// either way, so deleting the substitution reds the exactness assert
+    /// rather than this counter. That is the right way round: the assert is
+    /// the claim, this is only the floor under it.
+    static RECT_TILED_CHROMA_UNIT_REACH_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Chroma units of the same walk whose grid is exactly 2x1 (a 4:4:4
+    /// 64x32 chroma plane block as two 32x32 units).
+    static RECT_TILED_CHROMA_2X1_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Chroma units of the same walk whose grid is exactly 1x2 (4:4:4 32x64,
+    /// or 16x64 as two 16x32s).
+    static RECT_TILED_CHROMA_1X2_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Chroma units of the same walk in any other multi-unit grid (2x2 and up
+    /// -- only reachable at 4:2:2, which is refused, so this stays 0 on
+    /// every admitted stream; kept so the match above is exhaustive).
+    static RECT_TILED_CHROMA_NXN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current values of the four `RECT_TILED_CHROMA_*` counters, in the order
+/// `(unit_reach_differs, 2x1, 1x2, other multi-unit)`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn rect_tiled_chroma_grid_hits() -> (usize, usize, usize, usize) {
+    (
+        RECT_TILED_CHROMA_UNIT_REACH_HITS.with(|c| c.get()),
+        RECT_TILED_CHROMA_2X1_HITS.with(|c| c.get()),
+        RECT_TILED_CHROMA_1X2_HITS.with(|c| c.get()),
+        RECT_TILED_CHROMA_NXN_HITS.with(|c| c.get()),
+    )
+}
+
+/// Zeroes the four `RECT_TILED_CHROMA_*` counters (gate tests call this
+/// before their own decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_rect_tiled_chroma_grid_hits() {
+    RECT_TILED_CHROMA_UNIT_REACH_HITS.with(|c| c.set(0));
+    RECT_TILED_CHROMA_2X1_HITS.with(|c| c.set(0));
+    RECT_TILED_CHROMA_1X2_HITS.with(|c| c.set(0));
+    RECT_TILED_CHROMA_NXN_HITS.with(|c| c.set(0));
+}
+
 // lane-t900 r22: palette blocks reconstructed inside an INTER frame (the
 // intra-in-inter path, `decode_inter_block`/`decode_inter_block8`) -- counted
 // apart from [`PALETTE_HITS`] so a witness gate can prove the INTER-frame
@@ -12786,6 +12837,58 @@ fn decode_rect_split(
                             fctx,
                         );
                     }
+                    // libaom computes `has_top_right` PER TRANSFORM UNIT (defined
+                    // reconintra.c:196, called from `av1_build_intra_predictors` at
+                    // reconintra.c:1847 with the txb walk's own
+                    // `blk_col`/`blk_row`), never per block: the
+                    // `row_off == 0` arm asks `col_off + top_right_count_unit
+                    // < plane_bw_unit`, so the FIRST unit of a 2-wide chroma
+                    // grid reads its above-right out of the already-reconstructed
+                    // block ABOVE even when the block's own right edge is the
+                    // frame's. Passing this walk's block-level `reach` gave
+                    // every unit the same answer, and `PlaneBuf::edges`
+                    // (decode.rs:20840) truncates the above row at
+                    // `own_across` when `above_right` is false -- so a
+                    // directional unit whose angle is below 90
+                    // (`need_right`, intra.rs:546) predicted with a 32-sample
+                    // above row where libaom used 64.
+                    // MEASURED on `fixtures/r512_rect2x1_1x2_444.obu`
+                    // (4:4:4 8-bit 256x256, one frame): frame 0 plane U 130
+                    // samples and plane V 30 samples wrong, every one of them
+                    // in the right 6 columns of the `cu=(0,0)` unit at
+                    // `mi=(48,48)` `px=(192,192)` -- the unit whose above-right
+                    // the block reach denied. Row0 and col0 of the prediction
+                    // matched the oracle exactly and the prediction SUM did
+                    // not (172662 vs 171512 on U, 125978 vs 126008 on V), so
+                    // the residual read is bit-identical and the divergence is
+                    // prediction-side, not entropy. Gate:
+                    // `a_444_rect_strip_chroma_tiled_2x1_and_1x2_units_take_their_own_above_right_reach`.
+                    let cu_reach = tu_reach_rect(
+                        bw,
+                        bh,
+                        (cu_col * uw) << ss_x(fctx),
+                        (cu_row * uh) << ss_y(fctx),
+                        uw << ss_x(fctx),
+                        uh << ss_y(fctx),
+                        reach,
+                        px,
+                        py,
+                        y.width,
+                        y.height,
+                        fctx,
+                    );
+                    if cu_reach.above_right != reach.above_right
+                        || cu_reach.below_left != reach.below_left
+                    {
+                        hit!(RECT_TILED_CHROMA_UNIT_REACH_HITS);
+                    }
+                    if nw * nh > 1 {
+                        match (nw, nh) {
+                            (2, 1) => hit!(RECT_TILED_CHROMA_2X1_HITS),
+                            (1, 2) => hit!(RECT_TILED_CHROMA_1X2_HITS),
+                            _ => hit!(RECT_TILED_CHROMA_NXN_HITS),
+                        }
+                    }
                     // 32x32 does not fit read_coeffs_rect's scratch (768). The
                     // square reader is the path every other 32x32 chroma unit uses.
                     let levels = if uw == uh {
@@ -12800,7 +12903,7 @@ fn decode_rect_split(
                             m.mode,
                             m.uv_predict_mode,
                             m.angle_delta_uv,
-                            reach,
+                            cu_reach,
                             plane,
                             cu_x,
                             cu_y,
@@ -12848,7 +12951,7 @@ fn decode_rect_split(
                             uh,
                             m.uv_predict_mode,
                             m.angle_delta_uv,
-                            reach,
+                            cu_reach,
                             &residual,
                             cfl,
                             None,

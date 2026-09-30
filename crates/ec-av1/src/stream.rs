@@ -171,6 +171,18 @@ pub fn reset_skip_chroma_override_window_hits() {
     crate::decode::reset_skip_chroma_override_window_hits()
 }
 
+/// lane-av1rectreach: the `chroma_tiled` walk's per-unit reach and grid-shape
+/// counters, as `(unit_reach_differs_from_block, 2x1 units, 1x2 units, other
+/// multi-unit units)`. See [`crate::decode::rect_tiled_chroma_grid_hits`].
+pub fn rect_tiled_chroma_grid_hits() -> (usize, usize, usize, usize) {
+    crate::decode::rect_tiled_chroma_grid_hits()
+}
+
+/// Gate-side reset for the lane-av1rectreach counters above.
+pub fn reset_rect_tiled_chroma_grid_hits() {
+    crate::decode::reset_rect_tiled_chroma_grid_hits()
+}
+
 /// `(y, uv)` palette blocks RECONSTRUCTED inside an inter frame (lane-t900
 /// r22) -- the counter a screen-content witness gate reads to prove it
 /// exercises the inter-frame palette path, not the key frame's.
@@ -50330,6 +50342,273 @@ pub(crate) mod tests {
                     first / 512
                 );
             }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// lane-av1rectreach, the 2x1 / 1x2 half of the class sweep
+    /// `a_444_skipped_64x64_square_block_windows_its_chroma_override_per_unit`
+    /// opened: `decode_rect_split`'s `chroma_tiled` walk is the THIRD site that
+    /// walks a 4:4:4 chroma plane block as a grid of Chroma32 units, and the
+    /// only one that handed every unit the BLOCK's reach.
+    ///
+    /// The other two are already per-unit and are not touched by this gate:
+    /// `decode_block`'s skip arm (`chroma_window`, lane-av1chromadc) and
+    /// `decode_block`'s coded arm (its own `tu_reach_rect`) both resolve
+    /// `has_top_right` per transform unit, the way libaom's
+    /// `av1_build_intra_predictors` does
+    /// (`has_top_right`, defined reconintra.c:196, called from
+    /// `av1_build_intra_predictors` at reconintra.c:1847),
+    /// fed the chroma txb walk's own `blk_col`/`blk_row`).
+    ///
+    /// Witness `fixtures/r512_rect2x1_1x2_444.obu`, 2697 B,
+    /// sha256 `a009ec580a1ff24250be53e11b8d09616da71e095cefd5eb621c941d40a8688b`:
+    ///
+    /// ```text
+    /// ffmpeg -f lavfi -i testsrc2=size=256x256:rate=1:duration=1 -pix_fmt yuv444p \
+    ///   -f rawvideo in.yuv
+    /// aomenc --codec=av1 -w 256 -h 256 --i444 --sb-size=64 --enable-palette=1 \
+    ///   --enable-rect-partitions=1 --enable-1to4-partitions=1 \
+    ///   --min-partition-size=32 --cq-level=40 --profile=1 --obu --limit=1 \
+    ///   -o r512_rect2x1_1x2_444.obu in.yuv
+    /// ```
+    ///
+    /// (aom-affine aomenc, one key frame, 4:4:4 8-bit 256x256.) It reaches
+    /// BOTH grid shapes: a 64x32 chroma plane block as `nw=2 nh=1` of 32x32
+    /// and a 32x64 one as `nw=1 nh=2`.
+    ///
+    /// RED-BEFORE, on the unpatched tree, measured with `EC_AV1_FINAL_DUMP`
+    /// (aomdec) against `set_final_dump_prefix` (ours), 786432 B per frame:
+    /// frame 0 plane Y 0 wrong, plane U 130 wrong, plane V 30 wrong -- all of
+    /// them in the right 6 columns of the `cu=(0,0)` unit at `mi=(48,48)`
+    /// `px=(192,192)`, a 64x32 block whose right edge IS the frame's, so the
+    /// block-level reach denied an above-right that libaom's per-unit
+    /// `col_off + top_right_count_unit < plane_bw_unit` (0 + 8 < 16) grants.
+    /// After: 0 wrong on all three planes.
+    #[test]
+    fn a_444_rect_strip_chroma_tiled_2x1_and_1x2_units_take_their_own_above_right_reach() {
+        const NAME: &str =
+            "a_444_rect_strip_chroma_tiled_2x1_and_1x2_units_take_their_own_above_right_reach";
+        const FILE: &str = "r512_rect2x1_1x2_444.obu";
+        const LEN: usize = 2697;
+        const SHA: &str = "a009ec580a1ff24250be53e11b8d09616da71e095cefd5eb621c941d40a8688b";
+        const W: usize = 256;
+        const PLANE: usize = W * W;
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{FILE}"));
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: pinned fixture {FILE} missing: {e}"));
+        assert_eq!(stream.len(), LEN, "{NAME}: {FILE} length moved");
+        assert_444_header(&stream, NAME, 8);
+        // The byte pin is fnv1a64, the same load-bearing-identity hash every
+        // other pinned gate here uses; the sha256 in this test's comment is
+        // the provenance half. A silent stream swap under the same name
+        // cannot stay green.
+        assert_eq!(
+            fnv1a64(&stream),
+            0x2751ccaa079cc422,
+            "{NAME}: {FILE} bytes drifted from the fnv1a64 pin above (provenance sha256 \
+             {SHA}) -- regenerate the stream with the recipe in this test's comment and \
+             re-pin the length, the fnv1a64 and the sha256 together"
+        );
+
+        let _guard = lock_gate_counters();
+        reset_rect_tiled_chroma_grid_hits();
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, &stream).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        if let Err(e) = decode_stream(&stream) {
+            panic!("{NAME}: this decoder refused the witness: {e}");
+        }
+        set_final_dump_prefix(None);
+
+        // Non-vacuity, in the order the claim depends on it: the walk must
+        // have reached a 2x1 AND a 1x2 grid, and at least one unit must have
+        // a per-unit reach that DIFFERS from the block-level one. Without the
+        // last one the two answers would be interchangeable everywhere and
+        // the exactness below would be measuring a witness the fix cannot
+        // touch. (It does not check the argument identity -- see
+        // `RECT_TILED_CHROMA_UNIT_REACH_HITS`; the exactness assert below is
+        // what reds when the substitution is deleted.)
+        let (reach_hits, h2x1, h1x2, h_nxn) = rect_tiled_chroma_grid_hits();
+        assert!(
+            h2x1 >= 4 && h1x2 >= 4,
+            "{NAME}: the walk reached {h2x1} unit(s) in a 2x1 grid and {h1x2} in a 1x2 grid \
+             (other multi-unit shapes: {h_nxn}), expected at least 4 of each -- the witness \
+             stopped exercising one of the two grid shapes, so half the claim is vacuous"
+        );
+        assert!(
+            reach_hits >= 1,
+            "{NAME}: {reach_hits} chroma unit(s) had a per-unit reach differing from the \
+             block-level one, expected at least 1 -- on the unpatched tree every unit took \
+             the block's reach, so the exactness below is vacuous"
+        );
+
+        let aom_dump = std::fs::read(format!("{}.f0", aom_prefix.display()))
+            .unwrap_or_else(|e| panic!("{NAME}: oracle dump f0 missing: {e}"));
+        let our_dump = std::fs::read(format!("{}.f0", ours_prefix.display()))
+            .unwrap_or_else(|e| panic!("{NAME}: our dump f0 missing: {e}"));
+        assert_eq!(
+            our_dump.len(),
+            3 * PLANE,
+            "{NAME}: frame 0 is not 8-bit 4:4:4 256x256"
+        );
+        for (plane, pname) in [(0usize, "Y"), (1, "U"), (2, "V")] {
+            let at = plane * PLANE;
+            if our_dump[at..at + PLANE] == aom_dump[at..at + PLANE] {
+                continue;
+            }
+            let first = (0..PLANE)
+                .find(|&s| our_dump[at + s] != aom_dump[at + s])
+                .unwrap_or(PLANE);
+            let wrong = (0..PLANE)
+                .filter(|&s| our_dump[at + s] != aom_dump[at + s])
+                .count();
+            panic!(
+                "{NAME}: frame 0 plane {pname} is byte-exact nowhere -- first divergence at \
+                 sample {first} of {PLANE} (x={}, y={}), {wrong} samples wrong. Each unit of \
+                 this walk must resolve `has_top_right` over ITS OWN extent \
+                 (reconintra.c:196/1847), not the block's: the seed unit is cu=(0,0) of \
+                 64x32 chroma grid at mi=(48,48) px=(192,192), whose right 6 columns are the \
+                 ones the truncated above row moved.",
+                first % W,
+                first / W
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The UV-PALETTE half of the same class, and the cell
+    /// `lanes/av1chromadc.report.md` §5 left explicitly UNMEASURED ("every
+    /// multi-unit walk on this witness is `src=intrabc`; the UV-palette source
+    /// never reaches a multi-unit chroma walk here, so its arm of the sweep is
+    /// argued from the shared code path, not witnessed"). This witness is the
+    /// measurement: it puts a UV-palette block on a 1x2 16x64 chroma grid
+    /// (`mi=(32,12)`) as well as plenty of non-palette ones.
+    ///
+    /// Witness `fixtures/r512_rect1x2_444_palette.obu`, 2250 B,
+    /// sha256 `fad03c69087f316c1a117e8d8a70769d161b332bce7b2998e646312bb78fb067`:
+    ///
+    /// ```text
+    /// ffmpeg -f lavfi -i testsrc2=size=256x256:rate=1:duration=1 -pix_fmt yuv444p \
+    ///   -f rawvideo in.yuv
+    /// aomenc --codec=av1 -w 256 -h 256 --i444 --sb-size=64 --enable-palette=1 \
+    ///   --enable-rect-partitions=1 --enable-1to4-partitions=1 \
+    ///   --min-partition-size=16 --cq-level=40 --profile=1 --obu --limit=1 \
+    ///   -o r512_rect1x2_444_palette.obu in.yuv
+    /// ```
+    ///
+    /// (`--min-partition-size=16` is what puts the 16x64 chroma grid on a
+    /// strip at all; at 32 the encoder only ever picks 32x64 / 64x32.) The
+    /// per-unit reach the fix installs is the same line for the palette and
+    /// the non-palette unit -- the palette only supplies the PREDICTION
+    /// (`palette_window`, decode.rs:12784), never the reach -- so this gate
+    /// exists to pin the prediction source down, not to re-prove the reach.
+    #[test]
+    fn a_444_rect_strip_chroma_tiled_1x2_palette_grid_decodes_byte_exact() {
+        const NAME: &str = "a_444_rect_strip_chroma_tiled_1x2_palette_grid_decodes_byte_exact";
+        const FILE: &str = "r512_rect1x2_444_palette.obu";
+        const LEN: usize = 2250;
+        const SHA: &str = "fad03c69087f316c1a117e8d8a70769d161b332bce7b2998e646312bb78fb067";
+        const W: usize = 256;
+        const PLANE: usize = W * W;
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{FILE}"));
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: pinned fixture {FILE} missing: {e}"));
+        assert_eq!(stream.len(), LEN, "{NAME}: {FILE} length moved");
+        assert_444_header(&stream, NAME, 8);
+        assert_eq!(
+            fnv1a64(&stream),
+            0x7759753a0d3f75a2,
+            "{NAME}: {FILE} bytes drifted from the fnv1a64 pin above (provenance sha256 \
+             {SHA}) -- regenerate the stream with the recipe in this test's comment and \
+             re-pin the length, the fnv1a64 and the sha256 together"
+        );
+
+        let _guard = lock_gate_counters();
+        reset_rect_tiled_chroma_grid_hits();
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, &stream).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        if let Err(e) = decode_stream(&stream) {
+            panic!("{NAME}: this decoder refused the witness: {e}");
+        }
+        set_final_dump_prefix(None);
+
+        let (_reach_hits, h2x1, h1x2, _h_nxn) = rect_tiled_chroma_grid_hits();
+        assert!(
+            h1x2 >= 4,
+            "{NAME}: the walk reached {h1x2} unit(s) in a 1x2 grid ({h2x1} in a 2x1), expected \
+             at least 4 of the 1x2 -- the witness stopped exercising the arm"
+        );
+
+        let aom_dump = std::fs::read(format!("{}.f0", aom_prefix.display()))
+            .unwrap_or_else(|e| panic!("{NAME}: oracle dump f0 missing: {e}"));
+        let our_dump = std::fs::read(format!("{}.f0", ours_prefix.display()))
+            .unwrap_or_else(|e| panic!("{NAME}: our dump f0 missing: {e}"));
+        assert_eq!(
+            our_dump.len(),
+            3 * PLANE,
+            "{NAME}: frame 0 is not 8-bit 4:4:4 256x256"
+        );
+        for (plane, pname) in [(0usize, "Y"), (1, "U"), (2, "V")] {
+            let at = plane * PLANE;
+            if our_dump[at..at + PLANE] == aom_dump[at..at + PLANE] {
+                continue;
+            }
+            let first = (0..PLANE)
+                .find(|&s| our_dump[at + s] != aom_dump[at + s])
+                .unwrap_or(PLANE);
+            let wrong = (0..PLANE)
+                .filter(|&s| our_dump[at + s] != aom_dump[at + s])
+                .count();
+            panic!(
+                "{NAME}: frame 0 plane {pname} is byte-exact nowhere -- first divergence at \
+                 sample {first} of {PLANE} (x={}, y={}), {wrong} samples wrong.",
+                first % W,
+                first / W
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
