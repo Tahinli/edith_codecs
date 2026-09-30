@@ -8029,6 +8029,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_EOBPT_CDF {eob_pt:?} range={range} value={value}");
     }
+    crate::msac::SymbolDecoder::set_symr_cdf("eob_pt");
     let group = dec.symbol(eob_pt) + 1;
     if trace {
         eprintln!("TRACE eob_pt value={group} rng={}", dec.debug_state().0);
@@ -8277,6 +8278,7 @@ fn read_coeffs(
         if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") && len == 3 {
             eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
         }
+        crate::msac::SymbolDecoder::set_symr_cdf("tx_type");
         let t = dec.symbol(tx_type_cdf);
         crate::census::tx_type(len, t);
         if coeff_trace_on() {
