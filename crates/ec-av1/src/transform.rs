@@ -1381,6 +1381,15 @@ pub fn dequant_and_inverse_typed_wh(
         // the twin of the oracle's `EC_DQCOEFF` rung (whose own layout is
         // column-major `input[c * h + r]`), so a residual mismatch whose
         // levels already agree is separable into dequant vs transform.
+        //
+        // LOSSY PATH ONLY (lane-av1loss444mm): a LOSSLESS 4x4 unit never
+        // reaches this function -- `decode.rs` routes it to
+        // `dequant_and_inverse_wht4x4` -- so on a lossless stream this rung
+        // printed NOTHING while the oracle's printed thousands of lines, and
+        // that silence reads as "no coefficients" rather than "wrong function".
+        // The lossless twin is `OUR_DQW` in `dequant_and_inverse_wht4x4`,
+        // below; both carry `plane=` so a chroma grid can be told from a luma
+        // one (the oracle's line carries it too).
         if crate::envflags::env_flag!("EC_DQCOEFF") {
             let nz: Vec<String> = dq
                 .iter()
@@ -3144,6 +3153,7 @@ pub fn inverse_wht4x4(dq: &[i32]) -> Vec<i32> {
 /// marker contract).
 pub fn dequant_and_inverse_wht4x4(
     levels: &[i32],
+    plane: usize,
     bit_depth: u8,
     q_idx: i32,
     dc_delta: i32,
@@ -3160,6 +3170,35 @@ pub fn dequant_and_inverse_wht4x4(
         crate::quant::dequant_wh_into(
             levels, &mut dq, 4, 4, bit_depth, q_idx, dc_delta, ac_delta, None,
         );
+        // lane-av1loss444mm: the LOSSLESS half of the oracle's `EC_DQCOEFF`
+        // twin. Same env var, same `pos:value` nonzero form, PLUS `plane=`
+        // -- which is what makes the two ladders pairable: without it a 4x4
+        // chroma grid is indistinguishable from a luma one and an
+        // order-paired comparison of the two sides collapses (measured on
+        // `ll444-lossless-key.obu`: equal unit counts and value ratios of
+        // exactly 1.0, yet 16 of 2053 units matched).
+        if crate::envflags::env_flag!("EC_DQCOEFF") {
+            let nz: Vec<String> = dq[..16]
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v != 0)
+                .map(|(i, &v)| format!("{i}:{v}"))
+                .collect();
+            // `lv=` is the RAW level grid the dequant consumed: if `nz` is
+            // empty while `lv` is not, `dequant_wh_into` is what zeroed it, and
+            // this line says so instead of leaving the next lane to infer it.
+            let lv: Vec<String> = levels[..16]
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v != 0)
+                .map(|(i, &v)| format!("{i}:{v}"))
+                .collect();
+            eprintln!(
+                "OUR_DQW plane={plane} w=4 h=4 q={q_idx} dcd={dc_delta} acd={ac_delta} nz={} lv={}",
+                nz.join(","),
+                lv.join(",")
+            );
+        }
         inverse_wht4x4(&dq[..16])
     })
 }
@@ -3200,6 +3239,7 @@ pub fn dequant_and_inverse_wht4x4(
 /// Returns the same empty-grid marker as [`dequant_and_inverse_wht4x4`].
 pub fn dequant_and_inverse_wht(
     levels: &[i32],
+    plane: usize,
     w: usize,
     h: usize,
     bit_depth: u8,
@@ -3208,7 +3248,7 @@ pub fn dequant_and_inverse_wht(
     ac_delta: i32,
 ) -> Vec<i32> {
     if w == 4 && h == 4 {
-        return dequant_and_inverse_wht4x4(levels, bit_depth, q_idx, dc_delta, ac_delta);
+        return dequant_and_inverse_wht4x4(levels, plane, bit_depth, q_idx, dc_delta, ac_delta);
     }
     if crate::decode::is_zero_grid(levels) {
         return Vec::new();
@@ -3227,7 +3267,8 @@ pub fn dequant_and_inverse_wht(
                     };
                 }
             }
-            let res = dequant_and_inverse_wht4x4(&tile, bit_depth, q_idx, dc_delta, ac_delta);
+            let res =
+                dequant_and_inverse_wht4x4(&tile, plane, bit_depth, q_idx, dc_delta, ac_delta);
             // An all-zero tile dequantizes to the same empty marker a 4x4
             // caller passes straight through, and `out` is already zero --
             // copying out of it would index an empty slice.
@@ -3342,12 +3383,13 @@ mod lossless_tx_tests {
         };
         for &(w, h) in &[(8usize, 4usize), (4, 8), (8, 8), (16, 4), (4, 16), (16, 16)] {
             let levels: Vec<i32> = (0..w * h).map(|_| next()).collect();
-            let got = super::dequant_and_inverse_wht(&levels, w, h, 10, 0, 0, 0);
+            let got = super::dequant_and_inverse_wht(&levels, 0, w, h, 10, 0, 0, 0);
             let mut want = vec![0i32; w * h];
             for ty in 0..h / 4 {
                 for tx in 0..w / 4 {
                     let unit = super::dequant_and_inverse_wht4x4(
                         &tile_of(&levels, w, tx, ty),
+                        0,
                         10,
                         0,
                         0,
@@ -3382,7 +3424,7 @@ mod lossless_tx_tests {
         levels[0] = 400;
         levels[1] = -240;
         levels[2] = 88;
-        let got = super::dequant_and_inverse_wht(&levels, 8, 4, 10, 0, 0, 0);
+        let got = super::dequant_and_inverse_wht(&levels, 0, 8, 4, 10, 0, 0, 0);
         assert_eq!(got.len(), 32, "8x4 residual length");
         let mut want = vec![0i32; 32];
         for (tx, ty) in [(0usize, 0usize), (1, 0)] {
@@ -3392,7 +3434,7 @@ mod lossless_tx_tests {
                     t[r * 4 + c] = levels[(ty * 4 + r) * 8 + tx * 4 + c];
                 }
             }
-            let unit = super::dequant_and_inverse_wht4x4(&t, 10, 0, 0, 0);
+            let unit = super::dequant_and_inverse_wht4x4(&t, 0, 10, 0, 0, 0);
             if unit.is_empty() {
                 continue;
             }
@@ -3422,8 +3464,8 @@ mod lossless_tx_tests {
                 })
                 .collect();
             assert_eq!(
-                super::dequant_and_inverse_wht(&levels, 4, 4, 8, 0, 0, 0),
-                super::dequant_and_inverse_wht4x4(&levels, 8, 0, 0, 0),
+                super::dequant_and_inverse_wht(&levels, 0, 4, 4, 8, 0, 0, 0),
+                super::dequant_and_inverse_wht4x4(&levels, 0, 8, 0, 0, 0),
                 "levels={levels:?}"
             );
         }
@@ -3437,7 +3479,7 @@ mod lossless_tx_tests {
     #[test]
     fn a_non_4x4_all_zero_lossless_unit_keeps_the_empty_marker() {
         assert!(
-            super::dequant_and_inverse_wht(&[0i32; 32], 8, 4, 10, 0, 0, 0).is_empty(),
+            super::dequant_and_inverse_wht(&[0i32; 32], 0, 8, 4, 10, 0, 0, 0).is_empty(),
             "an all-zero 8x4 lossless unit must stay the empty marker"
         );
     }
