@@ -110,7 +110,30 @@ const REFUSALS: &[&str] = &[
     // compound-warp witness
     // (`a_real_compound_global_warp_12bit_stream_decodes_pixel_exact`, 28
     // compound warp blocks) are byte-exact vs ffmpeg.
-    "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
+    // lane-av1screen12: screen content tools LEFT the 12-bit refusal set. The
+    // string was "a 12-bit frame with screen content tools
+    // (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit
+    // witness)" -- a guard BROADER than the gap it named, because
+    // `allow_screen_content_tools` only opens the `palette_y_mode` /
+    // `palette_uv_mode` symbols and the leaf `use_intrabc` symbol, and both
+    // reconstructions are already depth-parameterised
+    // (`read_palette_colors_y` / `_uv` read at `bit_depth(fctx)`, the
+    // colour-index map writes u16 samples). Three 12-bit arms decode
+    // BYTE-EXACT against the instrumented `aomdec --rawvideo` and against
+    // ffmpeg, each with a +1 control on the oracle's own bytes:
+    // `a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact`
+    // (pin `screen12_palette.obu`, 2 frames, 76 palette / 43 palette-UV),
+    // `a_real_aomenc_12bit_intrabc_screen_stream_decodes_pixel_exact` (pin
+    // `screen12_intrabc.obu`, 1 frame, `allow_intrabc = 1`, 36 palette /
+    // 34 palette-UV / 11 intrabc blocks) and
+    // `a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact`
+    // (pin `screen12_lossless_palette.obu`, 2 frames, 80 palette /
+    // 59 palette-UV, `CodedLossless` AND screen content in the same frame).
+    // The companion "12-bit intrabc has no producer" note was a RECIPE
+    // artefact: libaom sets that frame-header bit from its content detector
+    // (`encoder.c:2404`), so an untiled `smptebars=size=128x96` source gives
+    // `allow_intrabc = 0` with AND without `--tune-content=screen`, while the
+    // 256x192 `-vf tile=2x2` source gives `= 1` at 8, 10 and 12 bits.
     // lane-av1txr: the silent-garbage guard. A 4:4:4/4:2:2 stream used to
     // decode with no refusal and wrong pixels (every chroma extent is
     // hardcoded 4:2:0, the probe emits 4:2:0 planes only); it is now refused
@@ -438,10 +461,6 @@ const PROVEN: &[(&str, &str)] = &[
     // that refused pre-lift) and the compound-warp arm witnesses through
     // `a_real_compound_global_warp_12bit_stream_decodes_pixel_exact`
     // (hard `compound_warp_hits > 0`).
-    (
-        "a 12-bit frame with screen content tools (allow_screen_content_tools=1: neither palette nor intrabc has a 12-bit witness)",
-        "a_12bit_screen_content_stream_is_refused_by_name",
-    ),
     // lane-av1txr: the guard's own gate builds a profile-1 and a profile-2
     // sequence header by hand and asserts each refuses by name while the
     // profile-0 CONTROL still decodes -- the refusal is exercised, not merely
