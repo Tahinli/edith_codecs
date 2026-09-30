@@ -239,6 +239,40 @@ Three corrections their run established and I fold in here:
 
 No forced-`ctx` production code is in either branch.
 
+**Re-measure protocol — the operand pair, not the pixel run, is the
+discriminator.** When the band write lands, a green 640x480 pixel compare
+establishes only that the cell is exact; it cannot say WHICH cause closed,
+because the ctx=1 lock would produce the same green. Assert on the two rungs
+instead, on the same tree, after the fix:
+
+```text
+oracle  EC_TXCTXB mi=80,110 abv=4 lft=8 above=0 left=1 ctx=1
+ours    EC_TXCTX  mi=80,110 above_txfm=? left_txfm=8 above=? left=true
+```
+
+Three outcomes, and they are genuinely distinct:
+
+| `above_txfm` after the fix | `ctx` after | what it means |
+|---|---|---|
+| 4 | 1 on its own | the band write at `mi=(36,108)` was publishing 16 where libaom has 4; the fix closed the band and the ctx=1 lock is **retired** as a symptom mask. This section's chain is confirmed end to end. |
+| **16** | 1 anyway | the fix was in the ctx formula or the arm, **the band is still wrong**, and the cell going exact is the mask doing the work rather than a repair. This is the case worth catching: the pixel run alone reports it as success. |
+| 4 | not 1 | something else is still there and the cell should NOT go exact. If it does, a further defect is being masked too. |
+
+This is an ASSERTION, not a log line, precisely because the second outcome is the
+one a green pixel compare hides. The cheaper first discriminator is the diff
+itself: a band-write site touched with `decode_leaf_rect8` untouched means the
+band was the cause; the reverse means the band was a symptom and §4.3 was
+directionally right but causally wrong. `git diff --stat` answers it without a
+decode run at all.
+
+**The off-tile link is evidence for the ORDER, not just a step in it.**
+`lane-av1offtile`'s chroma-plane walk moved the 176x144 first divergence from
+25 792 to 29 411 and changed **nothing at all** on 640x480; the var-tx conjunct
+is what made `mi=(80,110)` reachable in a state where its context matters at all
+(with base + their clip alone the cell reads 860 431 and no `ctx` value moves it).
+Those two facts are what make the chain *ordered* rather than merely
+*sequential*, and they are the reason the operand pair is readable now.
+
 **Standing obligation, recorded so the next reader knows this number is expected
 to move:** when Kerem-8 lands the band write, this lane re-measures `m5_640x480`
 on the combined tip and updates the §0 verdict row and this section's cell status
