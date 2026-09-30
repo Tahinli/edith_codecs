@@ -1,5 +1,13 @@
 # lane-av1enchang — `bitrate_target_lands_within_5_percent_over_48_frames`: a MEASUREMENT, not a hang
 
+> **CORRECTION from the independent refutation pass `lanes/refute-av1-w3b.report.md` (2026-09-30).** The
+> boxing and the tight-stack gate CONFIRMED — un-boxing `DpbSlot::cdfs` gives `fatal runtime error: stack
+> overflow, aborting` (SIGABRT exit 101) as reported, and the size gate reds by name. ONE NUMBER IS STALE:
+> `Av1Encoder` is **2,944 B** today, not 18,168 — 18,168 was correct when this merged, and `d202b8b4`
+> boxed `carried_cdfs` the same day. Quote 2,944; the gate's red is
+> `Av1Encoder is 124736 bytes, 15.23x over budget` = 2,944 + 7 x 15,232 (the eight DPB slots).
+
+
 Branch `lane-av1enchang`, off `main` `3698787d`. One source file,
 `crates/ec-av1/src/encoder.rs`, plus this report.
 
