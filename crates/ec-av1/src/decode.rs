@@ -6116,6 +6116,27 @@ thread_local! {
     static INTRABC_RECT4_OWN_CHROMA444_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-av1422luma: the ss (1,0) twin of `INTRABC_RECT4_OWN_CHROMA444_HITS`
+// -- how many intra-BC 1:4 strips at 4:2:2 took the own-chroma (no pair)
+// route. Same caveat as the 4:4:4 counter: it proves REACH and nothing else,
+// and 4:2:2 is refused at the sequence header, so no committed test can read
+// it (the count in `lanes/av1422luma.report.md` is from a bypassed probe build).
+thread_local! {
+    static INTRABC_RECT4_OWN_CHROMA422_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRABC_RECT4_OWN_CHROMA422_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn intrabc_rect4_own_chroma422_hits() -> usize {
+    INTRABC_RECT4_OWN_CHROMA422_HITS.with(std::cell::Cell::get)
+}
+
+/// Resets [`INTRABC_RECT4_OWN_CHROMA422_HITS`] before a decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_intrabc_rect4_own_chroma422_hits() {
+    INTRABC_RECT4_OWN_CHROMA422_HITS.with(|c| c.set(0));
+}
+
 /// Current value of [`INTRABC_RECT4_OWN_CHROMA444_HITS`].
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intrabc_rect4_own_chroma444_hits() -> usize {
@@ -18218,10 +18239,31 @@ fn decode_rect4_16_intrabc(
     // `--enable-intrabc=0` at the same settings is byte-exact, and the 4:2:0
     // twin of the same recipe is byte-exact.
     //
-    // 4:2:0 and 4:2:2 keep every constant below verbatim -- the arm is gated on
-    // the full ss (0,0), not on a per-axis shift, so `pw / 2` and the literal
-    // halving are untouched for both.
+    // 4:2:0 alone keeps every constant below verbatim: a 1:4 strip's chroma
+    // plane block is 4:2:0's PAIR (the block above / beside it), because at
+    // ss (1,1) the strip's 8x2 chroma lies INSIDE that neighbour's chroma.
+    //
+    // lane-av1422luma: at ss (1,0) that containment is gone -- 4:2:2 subsamples
+    // x only, so the strip's chroma is 8x4 (full height) at the STRIP'S OWN
+    // origin, and libaom's own clause agrees: `is_chroma_reference`
+    // (av1_common_int.h:1454) ends in `|| !subsampling_y`, which answers TRUE
+    // for every block at ss_y 0. Reading the strip's chroma at the 4:2:0 pair
+    // origin instead puts the unit one mi row high: on `s422_416x250_10b`
+    // (416x250 10-bit, sha256 d6aa7f45...) that is the V/U pair's `txb_skip`
+    // read at mi (51,84) -- ctx 2 where the oracle reads 8, `all_zero` decoded
+    // as 1 instead of 0, and the frame desyncs from there (luma included).
+    // The origin half is `lane/av1422seed`'s unlanded hunk, reproduced here so
+    // the arm is measurable whole; the gather and the publication extents
+    // below are this lane's. VERT_4 stays on the pair: `ss_size_lookup
+    // [BLOCK_4X16][1][0]` is BLOCK_INVALID at 4:2:2, so only HORZ reaches it.
     let own444 = ss_x(fctx) == 0 && ss_y(fctx) == 0;
+    let own422 = ss_x(fctx) == 1 && ss_y(fctx) == 0 && horz;
+    if own422 && has_chroma {
+        hit!(INTRABC_RECT4_OWN_CHROMA422_HITS);
+    }
+    // One predicate for "this strip IS its own chroma reference": the strip's
+    // own mi position, its own luma extent, and per-axis subsampled sizes.
+    let own_chroma = own444 || own422;
     if ss_x(fctx) == 0 && ss_y(fctx) == 0 && has_chroma {
         hit!(INTRABC_RECT4_OWN_CHROMA444_HITS);
     }
@@ -18232,9 +18274,13 @@ fn decode_rect4_16_intrabc(
     } else {
         (8, 16)
     };
-    let (cw, ch) = if own444 { (bw, bh) } else { (pw / 2, ph / 2) };
+    let (cw, ch) = if own_chroma {
+        (bw >> ss_x(fctx), bh >> ss_y(fctx))
+    } else {
+        (pw / 2, ph / 2)
+    };
     let pair_mi = if has_chroma {
-        if own444 {
+        if own_chroma {
             lmi
         } else if horz {
             (lmi.0 - 1, lmi.1)
@@ -18245,8 +18291,8 @@ fn decode_rect4_16_intrabc(
         lmi
     };
     let (cpx, cpy) = if has_chroma {
-        if own444 {
-            (px, py)
+        if own_chroma {
+            (px >> ss_x(fctx), py >> ss_y(fctx))
         } else {
             (pair_mi.1 * MI / 2, pair_mi.0 * MI / 2)
         }
@@ -18528,7 +18574,25 @@ fn decode_rect4_16_intrabc(
                 Grid::Own(vo)
             };
         } else if has_chroma {
-            let around = neighbours.around_mi_rect(pair_mi, pw, ph);
+            // lane-av1422luma: the own-chroma route reads its context over its
+            // OWN extent; at ss (1,0) it additionally goes through the
+            // every-second-column gather (one chroma 4-px column spans two
+            // luma mi columns, so the per-mi gather would count each column's
+            // whole-unit dc sign twice and OR in cells the unit does not
+            // cover) -- the same choice the `decode_rect4_16` chroma arm
+            // makes at `decode.rs:19577`. 4:4:4 keeps the per-mi gather: at
+            // ss_x 0 a chroma column IS a luma mi column, so sampling would
+            // halve its own above span.
+            let (gmi, gw, gh) = if own_chroma {
+                (lmi, bw, bh)
+            } else {
+                (pair_mi, pw, ph)
+            };
+            let around = if own422 {
+                neighbours.around_mi_422_chroma(gmi, gw, gh)
+            } else {
+                neighbours.around_mi_rect(gmi, gw, gh)
+            };
             let (ug, _) = read_inter_plane_rect(
                 dec,
                 cdfs,
@@ -18589,7 +18653,18 @@ fn decode_rect4_16_intrabc(
         luma_grid = g;
         chroma_stamped_per_unit = false;
         if has_chroma {
-            let around = neighbours.around_mi_rect(pair_mi, pw, ph);
+            // lane-av1422luma: as the lossless twin above -- own extent, and
+            // the sampled gather at 4:2:2 only.
+            let (gmi, gw, gh) = if own_chroma {
+                (lmi, bw, bh)
+            } else {
+                (pair_mi, pw, ph)
+            };
+            let around = if own422 {
+                neighbours.around_mi_422_chroma(gmi, gw, gh)
+            } else {
+                neighbours.around_mi_rect(gmi, gw, gh)
+            };
             let (ug, _) = read_inter_plane_rect(
                 dec,
                 cdfs,
@@ -18652,24 +18727,33 @@ fn decode_rect4_16_intrabc(
     let mut last_uv = None;
     if has_chroma {
         hit!(RECT4_16_CHROMA_HITS);
-        neighbours.record_uv_mode_mi(pair_mi.0, pair_mi.1, pw / MI, ph / MI, DC_PRED);
+        // lane-av1422luma: the uv-mode publication and the left/above skip
+        // state below are the STRIP's own at 4:2:2 / 4:4:4 -- publishing the
+        // pair extent (one mi row off, `ph`/`pw`) is what the NEXT block's
+        // chroma skip context then reads.
+        let (rmi, rw, rh) = if own_chroma {
+            (lmi, bw, bh)
+        } else {
+            (pair_mi, pw, ph)
+        };
+        neighbours.record_uv_mode_mi(rmi.0, rmi.1, rw / MI, rh / MI, DC_PRED);
         if !chroma_stamped_per_unit {
             let u_state = neighbour_state(&u_grid);
             let v_state = neighbour_state(&v_grid);
             let round_up_even = |n: usize| n.div_ceil(2) * 2;
             let bound_h = round_up_even(neighbours.mi_rows);
             let bound_w = round_up_even(neighbours.mi_cols);
-            for cell in 0..(ph / MI) {
-                if pair_mi.0 + cell < bound_h
-                    && let Some(slot) = neighbours.left.get_mut(pair_mi.0 + cell)
+            for cell in 0..(rh / MI) {
+                if rmi.0 + cell < bound_h
+                    && let Some(slot) = neighbours.left.get_mut(rmi.0 + cell)
                 {
                     slot[1] = u_state;
                     slot[2] = v_state;
                 }
             }
-            for cell in 0..(pw / MI) {
-                if pair_mi.1 + cell < bound_w
-                    && let Some(slot) = neighbours.above.get_mut(pair_mi.1 + cell)
+            for cell in 0..(rw / MI) {
+                if rmi.1 + cell < bound_w
+                    && let Some(slot) = neighbours.above.get_mut(rmi.1 + cell)
                 {
                     slot[1] = u_state;
                     slot[2] = v_state;
