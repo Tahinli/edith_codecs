@@ -38054,14 +38054,30 @@ fn read_inter_chroma_lossless(
     Ok(())
 }
 
-/// The 8x8 inter leaf's lossless 4:4:4 chroma arm (lane-av1-llinter), shared
-/// by the single-ref and compound paths: the plane block is a 2x2 raster of
-/// TX_4X4 units (`av1_get_tx_size`: lossless returns TX_4X4 for EVERY plane,
-/// not just luma), read by the same per-unit walk the bigger inter blocks
-/// run. Returns the two block grids composed at stride 8 (`Grid::Zero` when
-/// every unit hung off the frame edge) and leaves each unit's own coefficient
-/// context stamped in the neighbour bands -- the caller's tail must not let
-/// its whole-block `record_mi` overwrite them.
+/// The 8x8 inter leaf's lossless chroma arm (lane-av1-llinter), shared by the
+/// single-ref and compound paths, for every plane block BIGGER than 4x4:
+/// libaom's `read_tx_size` (`av1/decoder/decodeframe.c:1197`,
+/// `if (xd->lossless[xd->mi[0]->segment_id]) return TX_4X4;`) returns TX_4X4
+/// for EVERY plane of a lossless block, not just luma, so the plane block is
+/// a raster of TX_4X4 units read by the same per-unit walk the bigger inter
+/// blocks run.
+///
+/// **The plane block is PER-AXIS**, `av1_ss_size_lookup[BLOCK_8X8][ss_x][ss_y]`
+/// (`av1/common/blockd.h:1186`): BLOCK_8X8 at 4:4:4 (2x2 units), BLOCK_4X8 at
+/// 4:2:2 (1x2 units), BLOCK_4X4 at 4:2:0 (one unit, `get_txb_ctx`'s
+/// `plane_bsize == txsize_to_bsize[tx_size]` branch, ctx_offset 7 -- the one
+/// shape that keeps the single-unit read and is NOT routed here). Gating this
+/// arm on the 4:4:4 shape instead left 4:2:2 coding its 4x8 plane block as ONE
+/// TX_4X8 unit at ctx_offset 7, where libaom reads TWO TX_4X4 units at
+/// ctx_offset 10 (`av1/common/txb_common.h:430-433`): the first unit's
+/// `txb_skip` symbol then came out of the wrong CDF row, which desynchronised
+/// the coder for the rest of the frame.
+///
+/// `(blk_w, blk_h)` is that per-axis plane block and `stride` the composed
+/// grid's row pitch (the leaf's `chroma_w`); the grids are `stride * blk_h`
+/// (`Grid::Zero` when every unit hung off the frame edge) and each unit's own
+/// coefficient context is left stamped in the neighbour bands -- the caller's
+/// tail must not let its whole-block `record_mi` overwrite them.
 #[allow(clippy::too_many_arguments)]
 fn leaf8_inter_chroma_lossless(
     dec: &mut SymbolDecoder,
@@ -38073,6 +38089,10 @@ fn leaf8_inter_chroma_lossless(
     sv: Pred<'_>,
     at_mi: (usize, usize),
     (cpx, cpy): (usize, usize),
+    // The leaf's CHROMA PLANE BLOCK, per axis, and the composed grid's row
+    // pitch -- `(8, 8)`/`8` at 4:4:4, `(4, 8)`/`4` at 4:2:2.
+    (blk_w, blk_h): (usize, usize),
+    stride: usize,
     base_q_idx: u8,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, Grid)> {
@@ -38088,23 +38108,24 @@ fn leaf8_inter_chroma_lossless(
         at_mi,
         (cpx, cpy),
         (0, 0),
-        (8, 8),
-        (8, 8),
-        8,
+        (blk_w, blk_h),
+        (blk_w, blk_h),
+        stride,
         0,
         base_q_idx,
         &mut uo,
         &mut vo,
         fctx,
     )?;
+    let n = stride * blk_h;
     Ok((
         if uo.is_empty() {
-            Grid::Zero(64)
+            Grid::Zero(n)
         } else {
             Grid::Own(uo)
         },
         if vo.is_empty() {
-            Grid::Zero(64)
+            Grid::Zero(n)
         } else {
             Grid::Own(vo)
         },
@@ -49983,12 +50004,15 @@ fn decode_inter_block8(
                         fctx,
                     )?;
                     luma_grid = grid8;
-                    // 4:4:4 lossless 8x8 inter leaf: the chroma plane block is
-                    // the 8x8 leaf itself, read as one unit by the 444 walk
-                    // (`chroma_w == 8` is `SIDE >> ss_x == 8`, i.e. ss_x 0).
-                    // The 4:2:2 rect unit and the 4:2:0/4:4:4 square read are
-                    // the `else` below, dispatched on `chroma_422`.
-                    if chroma_w == 8 && lossless(fctx) && !mono(fctx) {
+                    // Lossless 8x8 inter leaf: `av1_get_tx_size` returns
+                    // TX_4X4 for EVERY plane of a lossless block
+                    // (`decodeframe.c:1197`), so the chroma plane block is a
+                    // raster of TX_4X4 units whenever it is BIGGER than one --
+                    // 4:4:4's 8x8 (2x2) and 4:2:2's 4x8 (1x2). Only 4:2:0's
+                    // 4x4 keeps the single-unit read, where
+                    // `plane_bsize == txsize_to_bsize[tx_size]` puts
+                    // `get_txb_ctx`'s ctx_offset at 7.
+                    if lossless(fctx) && (chroma_w > 4 || chroma_h > 4) && !mono(fctx) {
                         let (ug, vg) = leaf8_inter_chroma_lossless(
                             dec,
                             cdfs,
@@ -49999,6 +50023,8 @@ fn decode_inter_block8(
                             sv,
                             leaf_mi,
                             (cpx, cpy),
+                            (chroma_w, chroma_h),
+                            chroma_w,
                             base_q_idx,
                             fctx,
                         )?;
@@ -50942,11 +50968,10 @@ fn decode_inter_block8(
                 fctx,
             )?;
             luma_grid = grid8;
-            // 4:4:4 lossless 8x8 inter leaf (compound twin of the single-ref
-            // arm above): the chroma plane block is the 8x8 leaf itself, read
-            // as one unit by the 444 walk. The 4:2:2 rect unit and the
-            // 4:2:0/4:4:4 square read are the `else` below.
-            if chroma_w == 8 && lossless(fctx) && !mono(fctx) {
+            // Lossless 8x8 inter leaf, compound twin of the single-ref arm
+            // above -- same per-axis plane block (4:4:4 8x8, 4:2:2 4x8) and
+            // the same "bigger than one TX_4X4" gate.
+            if lossless(fctx) && (chroma_w > 4 || chroma_h > 4) && !mono(fctx) {
                 let (ug, vg) = leaf8_inter_chroma_lossless(
                     dec,
                     cdfs,
@@ -50957,6 +50982,8 @@ fn decode_inter_block8(
                     sv,
                     leaf_mi,
                     (cpx, cpy),
+                    (chroma_w, chroma_h),
+                    chroma_w,
                     base_q_idx,
                     fctx,
                 )?;
@@ -51564,19 +51591,22 @@ fn decode_inter_block8(
             } else {
                 (around[1], around[2])
             };
-            if chroma_w == 8 && lossless(fctx) && !mono(fctx) {
-                // lane-av1-llintra8: lossless codes TX_4X4 on EVERY plane
-                // (`av1_get_tx_size`, blockd.h:1383), so this intra leaf's 8x8
-                // chroma plane block is a 2x2 raster of TX_4X4 units per
-                // plane, plane-major -- the same per-unit walk the >=16x16
-                // intra-in-inter block runs, not one TX_8X8 unit (whose WHT
-                // hits `TxParams::run`'s `(8, 8) != (4, 4)` lossless assert).
-                // The walk stamps each unit's own coefficient context
-                // (`record_mi_chroma` inside it), so the tail's whole-block
-                // `record_mi` gets its chroma half saved/restored around --
-                // the same rule the INTER arms'
-                // `leaf8_inter_chroma_lossless` obeys. 4:2:0 keeps its single
-                // TX_4X4 unit in the `else` below.
+            // lane-av1-llintra8: lossless codes TX_4X4 on EVERY plane
+            // (`av1_get_tx_size`, blockd.h:1383), so this intra leaf's chroma
+            // plane block is a raster of TX_4X4 units per plane, plane-major
+            // -- the same per-unit walk the >=16x16 intra-in-inter block
+            // runs, not one TX_8X8 unit (whose WHT hits `TxParams::run`'s
+            // `(8, 8) != (4, 4)` lossless assert). The plane block is
+            // PER-AXIS, `av1_ss_size_lookup[BLOCK_8X8][ss_x][ss_y]`: 8x8 at
+            // 4:4:4 (2x2 units) and 4x8 at 4:2:2 (1x2), so both walk here and
+            // only 4:2:0's 4x4 keeps the single-unit read in the `else`
+            // below (`plane_bsize == txsize_to_bsize[tx_size]`, ctx_offset 7).
+            // The walk stamps each unit's own coefficient context
+            // (`record_mi_chroma` inside it), so the tail's whole-block
+            // `record_mi` gets its chroma half saved/restored around --
+            // the same rule the INTER arms'
+            // `leaf8_inter_chroma_lossless` obeys.
+            if lossless(fctx) && (chroma_w > 4 || chroma_h > 4) && !mono(fctx) {
                 let (mut uo, mut vo) = (Vec::new(), Vec::new());
                 read_intra_chroma_lossless(
                     dec,
@@ -51588,9 +51618,9 @@ fn decode_inter_block8(
                     (px, py),
                     (cpx, cpy),
                     SIDE,
-                    (chroma_w, chroma_w),
+                    (chroma_w, chroma_h),
                     (0, 0),
-                    (chroma_w, chroma_w),
+                    (chroma_w, chroma_h),
                     chroma_w,
                     reach,
                     (y.width, y.height),
@@ -51605,12 +51635,12 @@ fn decode_inter_block8(
                     fctx,
                 )?;
                 u_grid = if uo.is_empty() {
-                    Grid::Zero(64)
+                    Grid::Zero(chroma_w * chroma_h)
                 } else {
                     Grid::Own(uo)
                 };
                 v_grid = if vo.is_empty() {
-                    Grid::Zero(64)
+                    Grid::Zero(chroma_w * chroma_h)
                 } else {
                     Grid::Own(vo)
                 };
