@@ -8783,6 +8783,98 @@ pub(crate) mod tests {
              the one that forked the ladder at read 32813)"
         );
     }
+
+    /// lane-arfchroma: 4:2:0 **lossless** with an alt-ref frame and 1:4 inter
+    /// strips. Ordinary, user-reachable aomenc output, no bypass: before the
+    /// fix this cell diverged in 15 of 16 shown frames (1 088 573 wrong
+    /// samples, only frames 0-1 exact) or -- one knob away, e.g.
+    /// `--sb-size=64`, `--enable-dual-filter=0`, `--max-reference-frames=3`,
+    /// or the same stream cut to 5-12 frames -- REFUSED outright with
+    /// `a Golomb tail longer than this decoder reads`. The refusal was this
+    /// divergence arriving at a named guard, not an independent gap: the
+    /// `16-frame` variant of this exact cell now decodes byte-exact.
+    ///
+    /// Mechanism (paired rungs, `EC_COEFF_STEP` / `EC_ECDUMP` against
+    /// aomdec, 320x240, 5 frames): the first forked read is frame 2's 8x8
+    /// inter block at mi (4,0) (ref0 = 7 = ALTREF, mv (36,0), NEWMV), its
+    /// CHROMA U `txb_skip` read. All four LUMA units match read for read, and
+    /// the chroma read's pre-state `(rng 35592)` is IDENTICAL on both sides --
+    /// only the context differs: ours 2, libaom 8
+    /// (`7 + get_entropy_context`, `txb_common.h:360`). `EC_ECDUMP` names the
+    /// cause: libaom's chroma left neighbour is `[0]` and ours is coded. The
+    /// publisher is the 16x4 (1:4) strip above it: `record_mi_chroma`
+    /// published the unit at the BLOCK's mi origin, but a 4x4 chroma unit is
+    /// `1 << ss` luma mi per axis, so a strip whose mi row is ODD at 4:2:0
+    /// starts mid-cell and its state landed one mi row too low -- into the
+    /// cell of the block that read it. libaom's per-plane
+    /// `left/above_context_map` is indexed in the PLANE's own 4x4 units
+    /// (`entropy.h:87`, `txb_common.h:429`), so the cell's origin is the
+    /// step-aligned mi, which is what the fix aligns to.
+    ///
+    /// The gate asserts three things, in this order: the pin's identity, the
+    /// mid-cell route counter (so it cannot pass on a stream whose chroma
+    /// units all start on a cell boundary -- class
+    /// gate-blind-to-feature), and then BOTH comparisons: decode order
+    /// (which sees the hidden alt-ref frame no shown-frame gate can) and the
+    /// per-plane shown-frame count.
+    ///
+    /// Recipe (both sides reproducible, 28394 bytes):
+    /// ```text
+    /// ffmpeg -f lavfi -i testsrc2=size=320x240:rate=25 -frames:v 5 \
+    ///        -pix_fmt yuv420p y.yuv
+    /// aomenc --codec=av1 --obu --lossless=1 -w 320 -h 240 \
+    ///        --lag-in-frames=25 --auto-alt-ref=1 --limit=5 -o w.obu y.yuv
+    /// ```
+    /// sha256 c5507ed97f74ca495b71449fda24f5fe2fcfa34eed38988a69141d45b126627c.
+    /// The tree pins fixture identity by fnv1a64; a `const SHA256` compared
+    /// against itself would be the tautology lane-av1422anom exists to kill.
+    #[test]
+    fn a_420_lossless_alt_ref_1to4_strip_witness_is_byte_exact_in_decode_order() {
+        const NAME: &str =
+            "a_420_lossless_alt_ref_1to4_strip_witness_is_byte_exact_in_decode_order";
+        // lane-av1cmpaudit2: same mutex as every other oracle gate.
+        let _gate_lock = lock_gate_counters();
+        const FILE: &str = "420_lossless_arf_1to4_320x240_5f.obu";
+        const BYTES: usize = 28394;
+        const FNV1A64: u64 = 16971188390893372935;
+        let path = crate_pin(FILE);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: the committed pin {FILE} is missing ({e})"));
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FNV1A64, "{NAME}: {FILE} bytes drifted");
+        crate::decode::reset_chroma_midcell_pub_hits();
+        let (decoded, hidden) = decode_all_frames_vs_oracle(&data, NAME);
+        assert_eq!(
+            decoded, 6,
+            "{NAME}: the oracle decoded {decoded} frames in DECODE order; the 5-frame recipe \
+             carries 5 source frames, one of them a hidden alt-ref picture plus a \
+             `show_existing_frame` header"
+        );
+        assert_eq!(
+            hidden, 1,
+            "{NAME}: this cell exists for the HIDDEN alt-ref frame -- {decoded} decode-order \
+             dumps against {decoded} - {hidden} shown outputs means the gate saw the picture no \
+             shown-frame compare can reach"
+        );
+        let mid = crate::decode::chroma_midcell_pub_hits();
+        assert!(
+            mid[2] > 0 || mid[0] + mid[1] > 0,
+            "{NAME}: no chroma transform unit was published from a mid-cell origin \
+             ({mid:?} = [row, col, both]), so this witness does not exercise the origin \
+             alignment at all (class gate-blind-to-feature) -- re-encode per the recipe above"
+        );
+        let (wy, wu, wv, shown, exact) =
+            count_rawvideo_diffs(&data, NAME, None).expect("the two sides must be byte-comparable");
+        assert_eq!(
+            (wy, wu, wv, exact),
+            (0, 0, 0, shown),
+            "{NAME}: shown-frame per-plane diff vs `aomdec --rawvideo`"
+        );
+        eprintln!(
+            "{NAME}: {decoded} decode-order frame(s) byte-exact ({hidden} hidden), \
+             {shown} shown frame(s) exact per plane, mid-cell chroma publications {mid:?}"
+        );
+    }
     /// lane-av1444rect r2 — the SAME class as the gate above, second
     /// instance: `decode_rect4_16_intrabc` applied the 4:2:0 pair geometry at
     /// ss (0,0), where `is_chroma_reference` makes an intra-BC 1:4 strip its
@@ -10603,7 +10695,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let decoded = decode_stream(&data).expect("the pinned stream decodes");
         let ours = pack_rawvideo(&decoded, bit_depth, NAME);
-        assert_eq!(ours.len(), want.len(), "{NAME}: the two sides differ in size");
+        assert_eq!(
+            ours.len(),
+            want.len(),
+            "{NAME}: the two sides differ in size"
+        );
 
         // The per-frame plane table, built from each decoded picture's OWN
         // plane lengths -- the same source `pack_rawvideo` lays the bytes out
@@ -51810,5 +51906,4 @@ exit 0
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }
