@@ -1,8 +1,9 @@
 # lane-av1readcensus — the 4:4:4 coefficient-read count asymmetry, settled
 
-**Branch:** `lane-av1readcensus`, worktree `~/.cache/wt/av1readcensus`, stacked on
-`lane-av1chrtx` (`ff7cf47c`, whose `d791c464` threaded the real plane index into
-`read_coeffs_rect`'s traces — the census pairs on that).
+**Branch:** `lane-av1chrtx` (my charter's branch), worktree `~/.cache/wt/av1chrtx`.
+The census commit `ea97eb0c` sits on top of `ff7cf47c`, whose `d791c464` threaded
+the real plane index into `read_coeffs_rect`'s traces — the census pairs on that,
+and reuses its `plane` argument rather than adding a second one.
 
 **Verdict: COUNTING SHAPE — and not even that. On every pixel-exact 4:4:4 arm
 there is no asymmetry at all: both sides walk the same number of units, in the
