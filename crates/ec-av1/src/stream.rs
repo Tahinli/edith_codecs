@@ -22040,6 +22040,62 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1ichromatx: the LAST site in `decode_inter_block` that can hand a
+    /// chroma unit the BLOCK-level `luma_tx_type` instead of the unit's own
+    /// `tx_type_map` cell is [`read_inter_rect_chroma`]'s fallback: the branch
+    /// taken when `covering_leaf_tx_type` finds no luma leaf covering the
+    /// unit's own MI cell. The decode closes it with an assertion (a
+    /// multi-unit chroma plane may only reach the fallback when the block
+    /// coded a SINGLE luma transform, whose stamp covers the whole plane and
+    /// makes `luma_tx_type` that unit's own cell).
+    ///
+    /// This gate is the measurement behind that assertion, on the witness that
+    /// reaches it: `fixtures/444_rect_strip_leaf_tx_type.obu` (26839 bytes,
+    /// sha256 `06174a66e92aaeb751a8e86db59711fcb1f18d74bde2d77e1ef1be7983eb7c80`).
+    /// Measured there: the rect arm is called twice, BOTH on a multi-unit
+    /// chroma plane (`nx*ny > 1`), and 4 of its 8 units take the block-level
+    /// fallback -- every one of them with an EMPTY leaf list, i.e. the
+    /// single-luma-unit shape the assertion allows. So `multi_fallback >= 2`
+    /// here is the number that says the guarded shape is REACHED (a fallback
+    /// count of 0 would leave the assertion vacuous), and the decoded frames
+    /// stay byte-exact against instrumented aomdec, which is what says the
+    /// fallback still hands the right value on that shape.
+    ///
+    /// Non-vacuity, by mutation: forcing the covering-leaf resolve to miss on a
+    /// multi-unit plane (`…unit_rel_mi).filter(|_| !multi)`) turns the
+    /// assertion RED on this same witness --
+    /// `a multi-unit rect chroma plane fell back to the block-level tx_type
+    /// while 5 luma leaves were coded` -- so the closure is not a comment.
+    #[test]
+    fn a_multi_unit_rect_chroma_plane_only_falls_back_to_the_block_type_on_a_single_luma_unit() {
+        const NAME: &str = "a_multi_unit_rect_chroma_plane_only_falls_back_to_the_block_type_on_a_single_luma_unit";
+        const FIXTURE_LEN: usize = 26839;
+        const FIXTURE_FNV: u64 = 0xc77f_310c_036d_ff73;
+        let _gate_lock = lock_gate_counters();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_rect_strip_leaf_tx_type.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+
+        let fb0 = crate::decode::chroma_rect_block_tx_fallback();
+        let fbm0 = crate::decode::chroma_rect_block_tx_fallback_multi();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the witness no longer decodes: {e}"))
+            .len();
+        let fb = crate::decode::chroma_rect_block_tx_fallback() - fb0;
+        let fbm = crate::decode::chroma_rect_block_tx_fallback_multi() - fbm0;
+        assert_eq!(frames, 3, "{NAME}: expected 3 shown frames");
+        assert!(
+            fbm >= 2,
+            "{NAME}: only {fbm} block-level fallbacks landed on a MULTI-unit chroma plane \
+             ({fb} in total) -- the shape the decode's assertion guards is no longer reached, so \
+             that assertion is vacuous on this witness"
+        );
+        eprintln!("{NAME}: {fb} block-level chroma fallbacks, {fbm} of them on a multi-unit plane");
+    }
+
     /// lane-av1readcensus: the 4:4:4 coefficient-UNIT census, pinned.
     ///
     /// The lane report `av1444rect` round 4 left an unexplained signal: 636
