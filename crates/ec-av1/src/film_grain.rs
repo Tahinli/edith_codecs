@@ -1,9 +1,18 @@
 //! AV1 film grain synthesis (spec 7.18.3), ported bit-exact from libaom's
 //! `av1/decoder/grain_synthesis.c` (`add_film_grain_run` and its helpers),
-//! specialized to this crate's only picture shape: 4:2:0 planar
-//! (`chroma_subsamp_x = chroma_subsamp_y = 1` throughout, which is why every
-//! `<< (1 - subsamp)` in the reference collapses to a no-op and every
-//! `>> subsamp` collapses to `>> 1` below).
+//! lane-av1422grain: this module USED to be specialised to 4:2:0 -- the
+//! chroma subblock, the chroma grain-block template, the chroma row map, the
+//! `avgLuma` tap, the line/column buffers and the chroma stride were all
+//! written for `subsampling_x == subsampling_y == 1`. It is now per-axis,
+//! matching the C, which threads `chroma_subsamp_y`/`chroma_subsamp_x`
+//! through every one of those sites (`grain_synthesis.c:1018-1035`,
+//! `:1069-1078`, `:1091-1094`, `:1129-1132`, `:554-565`, `:680-691`).
+//!
+//! The MEASUREMENT that makes this a live arm rather than a latent one:
+//! `aomenc` really does emit 4:2:2 film grain (and 4:4:4, profile 1).
+//! `aomenc --profile=2 --film-grain-test=5` over a `yuv422p` source produces
+//! a frame header carrying `subsampling_x = 1, subsampling_y = 0` and a full
+//! point set (read back with `ffprobe -export_side_data +film_grain`).
 //!
 //! Grain is synthesized only into the picture handed back to the caller for
 //! *output* -- the picture stored as a reference for later inter prediction
@@ -36,19 +45,66 @@ const BOTTOM_PAD: i32 = 0;
 const AR_PADDING: i32 = 3;
 
 const LUMA_SUBBLOCK: i32 = 32;
-const CHROMA_SUBBLOCK: i32 = 16; // LUMA_SUBBLOCK >> subsampling (always 1 here)
 
-// 73 x 82, and 38 x 44 for chroma -- the sizes the mission's own recon named.
+/// lane-av1422grain: the frame's `chroma_subsamp_x`/`chroma_subsamp_y`
+/// (spec 5.5.2, parsed by `ec-av1-syntax`, published into `FrameCtx` by
+/// `decode::set_subsampling`), as libaom's `add_film_grain_run` takes them.
+/// Every chroma-side constant and extent in this module is one of the
+/// methods below, which are the C's expressions verbatim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Ss {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Ss {
+    /// The sequence header's pair, read out of `FrameCtx`.
+    pub(crate) fn read(fctx: &crate::decode::FrameCtx) -> Ss {
+        Ss {
+            x: crate::decode::ss_x(fctx) as i32,
+            y: crate::decode::ss_y(fctx) as i32,
+        }
+    }
+
+    /// libaom's `2 >> chroma_subsamp_x` / `2 >> chroma_subsamp_y`.
+    #[inline]
+    fn two_x(self) -> i32 {
+        2 >> self.x
+    }
+    #[inline]
+    fn two_y(self) -> i32 {
+        2 >> self.y
+    }
+    /// `chroma_subblock_size_x` (`grain_synthesis.c:1019`).
+    #[inline]
+    fn csub_x(self) -> i32 {
+        LUMA_SUBBLOCK >> self.x
+    }
+    /// `chroma_subblock_size_y` (`grain_synthesis.c:1018`).
+    #[inline]
+    fn csub_y(self) -> i32 {
+        LUMA_SUBBLOCK >> self.y
+    }
+    /// `chroma_block_size_x` (`grain_synthesis.c:1033-1035`).
+    fn cblock_w(self) -> i32 {
+        LEFT_PAD
+            + self.two_x() * AR_PADDING
+            + self.csub_x() * 2
+            + self.two_x() * AR_PADDING
+            + RIGHT_PAD
+    }
+    /// `chroma_block_size_y` (`grain_synthesis.c:1031-1032`).
+    fn cblock_h(self) -> i32 {
+        TOP_PAD + self.two_y() * AR_PADDING + self.csub_y() * 2 + BOTTOM_PAD
+    }
+}
+
+// 73 x 82 for luma (`grain_synthesis.c:1027-1030`); the chroma template is
+// per-axis and lives in `Ss::cblock_h`/`Ss::cblock_w` (38 x 44 at 4:2:0,
+// 73 x 44 at 4:2:2, 73 x 82 at 4:4:4).
 const LUMA_BLOCK_H: i32 = TOP_PAD + 2 * AR_PADDING + LUMA_SUBBLOCK * 2 + BOTTOM_PAD;
 const LUMA_BLOCK_W: i32 =
     LEFT_PAD + 2 * AR_PADDING + LUMA_SUBBLOCK * 2 + 2 * AR_PADDING + RIGHT_PAD;
-const CHROMA_BLOCK_H: i32 = TOP_PAD + AR_PADDING + CHROMA_SUBBLOCK * 2 + BOTTOM_PAD;
-const CHROMA_BLOCK_W: i32 = LEFT_PAD + AR_PADDING + CHROMA_SUBBLOCK * 2 + AR_PADDING + RIGHT_PAD;
-
-    /// `params->bit_depth` of the picture currently being grained. libaom
-    /// keeps `grain_min`/`grain_max` as file statics set once per
-    /// `av1_add_film_grain_run` (`grain_synthesis.c:1041-1045`); this mirrors
-    /// that rather than threading a parameter through every helper.
 
 /// `params->bit_depth` for the [`apply_grain`] call in progress.
 fn grain_bit_depth(fctx: &crate::decode::FrameCtx) -> u32 {
@@ -134,7 +190,8 @@ fn build_pred_pos(lag: i32, has_luma_avg: bool) -> Vec<(i32, i32, i32)> {
 fn generate_luma_grain_block(
     fg: &FilmGrainParams,
     pred_pos: &[(i32, i32, i32)],
-    rng: &mut Rng, fctx: &crate::decode::FrameCtx,
+    rng: &mut Rng,
+    fctx: &crate::decode::FrameCtx,
 ) -> Vec<i32> {
     let (grain_min, grain_max) = grain_range(fctx);
     let mut block = vec![0i32; (LUMA_BLOCK_H * LUMA_BLOCK_W) as usize];
@@ -166,16 +223,27 @@ fn generate_luma_grain_block(
     block
 }
 
-/// `generate_chroma_grain_blocks` (spec 7.18.3.3), returning `(cb, cr)`.
+/// `generate_chroma_grain_blocks` (spec 7.18.3.3), returning
+/// `(cb, cr, chroma_grain_stride)`.
+/// lane-av1422grain: the template's own size and its `avgLuma` tap are
+/// per-axis, as the C (`grain_synthesis.c:496-589`): the block is
+/// `chroma_block_size_y x chroma_block_size_x` and the luma average covers
+/// the `(chroma_subsamp_y + 1) x (chroma_subsamp_x + 1)` luma samples that
+/// map onto the chroma sample -- a 2x2 quad at 4:2:0, a horizontal PAIR at
+/// 4:2:2, the single sample itself at 4:4:4.
 fn generate_chroma_grain_blocks(
     fg: &FilmGrainParams,
     pred_pos: &[(i32, i32, i32)],
     luma_block: &[i32],
-    seed: u16, fctx: &crate::decode::FrameCtx,
-) -> (Vec<i32>, Vec<i32>) {
+    seed: u16,
+    ss: Ss,
+    fctx: &crate::decode::FrameCtx,
+) -> (Vec<i32>, Vec<i32>, i32) {
     let (grain_min, grain_max) = grain_range(fctx);
-    let mut cb = vec![0i32; (CHROMA_BLOCK_H * CHROMA_BLOCK_W) as usize];
-    let mut cr = vec![0i32; (CHROMA_BLOCK_H * CHROMA_BLOCK_W) as usize];
+    let cbh = ss.cblock_h();
+    let cbw = ss.cblock_w();
+    let mut cb = vec![0i32; (cbh * cbw) as usize];
+    let mut cr = vec![0i32; (cbh * cbw) as usize];
     let gauss_sec_shift = 12 - grain_bit_depth(fctx) as i32 + fg.grain_scale_shift as i32;
     let ar_coeff_shift = fg.ar_coeff_shift_minus_6 as i32 + 6;
     let rounding_offset = 1i32 << (ar_coeff_shift - 1);
@@ -185,12 +253,12 @@ fn generate_chroma_grain_blocks(
 
     if apply_cb {
         let mut rng = Rng::line(7 << 5, seed);
-        for i in 0..CHROMA_BLOCK_H {
-            for j in 0..CHROMA_BLOCK_W {
+        for i in 0..cbh {
+            for j in 0..cbw {
                 let g = GAUSSIAN_SEQUENCE[rng.get(GAUSS_BITS) as usize];
                 set_at(
                     &mut cb,
-                    CHROMA_BLOCK_W,
+                    cbw,
                     i,
                     j,
                     (g + ((1 << gauss_sec_shift) >> 1)) >> gauss_sec_shift,
@@ -200,12 +268,12 @@ fn generate_chroma_grain_blocks(
     }
     if apply_cr {
         let mut rng = Rng::line(11 << 5, seed);
-        for i in 0..CHROMA_BLOCK_H {
-            for j in 0..CHROMA_BLOCK_W {
+        for i in 0..cbh {
+            for j in 0..cbw {
                 let g = GAUSSIAN_SEQUENCE[rng.get(GAUSS_BITS) as usize];
                 set_at(
                     &mut cr,
-                    CHROMA_BLOCK_W,
+                    cbw,
                     i,
                     j,
                     (g + ((1 << gauss_sec_shift) >> 1)) >> gauss_sec_shift,
@@ -214,47 +282,47 @@ fn generate_chroma_grain_blocks(
         }
     }
 
-    for i in TOP_PAD..CHROMA_BLOCK_H - BOTTOM_PAD {
-        for j in LEFT_PAD..CHROMA_BLOCK_W - RIGHT_PAD {
+    for i in TOP_PAD..cbh - BOTTOM_PAD {
+        for j in LEFT_PAD..cbw - RIGHT_PAD {
             let mut wsum_cb = 0i32;
             let mut wsum_cr = 0i32;
             for (idx, &(dy, dx, kind)) in pred_pos.iter().enumerate() {
                 if kind == 0 {
-                    wsum_cb +=
-                        fg.ar_coeffs_cb[idx] as i32 * at(&cb, CHROMA_BLOCK_W, i + dy, j + dx);
-                    wsum_cr +=
-                        fg.ar_coeffs_cr[idx] as i32 * at(&cr, CHROMA_BLOCK_W, i + dy, j + dx);
+                    wsum_cb += fg.ar_coeffs_cb[idx] as i32 * at(&cb, cbw, i + dy, j + dx);
+                    wsum_cr += fg.ar_coeffs_cr[idx] as i32 * at(&cr, cbw, i + dy, j + dx);
                 } else {
-                    // `avgLuma` (spec 7.18.3.3): subsampling_x = subsampling_y = 1
-                    // always here, so the 2x2 luma quad is exactly one 4:2:0 cell.
-                    let luma_y = ((i - TOP_PAD) << 1) + TOP_PAD;
-                    let luma_x = ((j - LEFT_PAD) << 1) + LEFT_PAD;
+                    // `avgLuma` (spec 7.18.3.3; `grain_synthesis.c:554-565`):
+                    // the luma origin is the chroma origin scaled back by each
+                    // axis' subsampling, and the average divides by the
+                    // per-axis sample count with the C's rounding term
+                    // `((1 << (ss_y + ss_x)) >> 1)`.
+                    let luma_y = ((i - TOP_PAD) << ss.y) + TOP_PAD;
+                    let luma_x = ((j - LEFT_PAD) << ss.x) + LEFT_PAD;
                     let mut av = 0i32;
-                    for k in luma_y..luma_y + 2 {
-                        for l in luma_x..luma_x + 2 {
+                    for k in luma_y..luma_y + ss.y + 1 {
+                        for l in luma_x..luma_x + ss.x + 1 {
                             av += at(luma_block, LUMA_BLOCK_W, k, l);
                         }
                     }
-                    av = (av + 2) >> 2;
+                    let shift = ss.y + ss.x;
+                    av = (av + ((1 << shift) >> 1)) >> shift;
                     wsum_cb += fg.ar_coeffs_cb[idx] as i32 * av;
                     wsum_cr += fg.ar_coeffs_cr[idx] as i32 * av;
                 }
             }
             if apply_cb {
-                let v = (at(&cb, CHROMA_BLOCK_W, i, j)
-                    + ((wsum_cb + rounding_offset) >> ar_coeff_shift))
+                let v = (at(&cb, cbw, i, j) + ((wsum_cb + rounding_offset) >> ar_coeff_shift))
                     .clamp(grain_min, grain_max);
-                set_at(&mut cb, CHROMA_BLOCK_W, i, j, v);
+                set_at(&mut cb, cbw, i, j, v);
             }
             if apply_cr {
-                let v = (at(&cr, CHROMA_BLOCK_W, i, j)
-                    + ((wsum_cr + rounding_offset) >> ar_coeff_shift))
+                let v = (at(&cr, cbw, i, j) + ((wsum_cr + rounding_offset) >> ar_coeff_shift))
                     .clamp(grain_min, grain_max);
-                set_at(&mut cr, CHROMA_BLOCK_W, i, j, v);
+                set_at(&mut cr, cbw, i, j, v);
             }
         }
     }
-    (cb, cr)
+    (cb, cr, cbw)
 }
 
 /// `init_scaling_function` (spec 7.18.3.2, piecewise-linear scaling LUT).
@@ -291,8 +359,8 @@ fn scale_lut(lut: &[i32; 256], index: i32, bit_depth: u32) -> i32 {
     if shift == 0 || x == 255 {
         lut[x]
     } else {
-        lut[x] + (((lut[x + 1] - lut[x]) * (index & ((1 << shift) - 1)) + (1 << (shift - 1)))
-            >> shift)
+        lut[x]
+            + (((lut[x + 1] - lut[x]) * (index & ((1 << shift) - 1)) + (1 << (shift - 1))) >> shift)
     }
 }
 
@@ -310,15 +378,21 @@ fn expand_scaling_lut(lut: &[i32; 256], bit_depth: u32) -> Vec<i32> {
         .collect()
 }
 
-/// `add_noise_to_block` (spec 7.18.3.5), 4:2:0 only. `(py0, px0)` is
-/// the luma-plane pixel origin; the matching chroma origin is `(py0/2,
-/// px0/2)`. Grain is read from `(grain, stride, row0, col0)` triples so the
-/// same function serves both the raw 82x73/44x38 templates and the small
-/// blended col/line buffers below.
+/// `add_noise_to_block` (spec 7.18.3.5). `(py0, px0)` is the luma-plane
+/// pixel origin; the matching chroma origin is `(py0 >> ss_y, px0 >>
+/// ss_x)` -- `(py0/2, px0/2)` only at 4:2:0. Grain is read from
+/// `(grain, stride, row0, col0)` triples so the same function serves both
+/// the raw luma/chroma templates and the small blended col/line buffers
+/// below.
+///
+/// lane-av1422grain: the chroma half-extents are per-axis, as the C: the
+/// chroma loops run `half_h << (1 - ss_y)` rows by `half_w << (1 - ss_x)`
+/// columns (`grain_synthesis.c:680-681`).
 #[allow(clippy::too_many_arguments)]
 fn add_noise_to_block(
     fg: &FilmGrainParams,
     mc_identity: bool,
+    ss: Ss,
     scaling_y: &[i32],
     scaling_cb: &[i32],
     scaling_cr: &[i32],
@@ -335,7 +409,8 @@ fn add_noise_to_block(
     cg_row0: i32,
     cg_col0: i32,
     half_h: i32,
-    half_w: i32, fctx: &crate::decode::FrameCtx,
+    half_w: i32,
+    fctx: &crate::decode::FrameCtx,
 ) {
     // spec 7.18.3.5 runs the block's noise loops `for i in 0..h`/`for j in
     // 0..w`, so a block with no rows (or no columns) writes nothing. The
@@ -348,7 +423,7 @@ fn add_noise_to_block(
         return;
     }
     let y_stride = picture.width as i32;
-    let c_stride = (picture.width / 2) as i32;
+    let c_stride = (picture.width >> ss.x) as i32;
     let scaling_shift = fg.grain_scaling_minus_8 as i32 + 8;
     let bit_depth = grain_bit_depth(fctx);
     let bd_shift = bit_depth - 8;
@@ -394,24 +469,51 @@ fn add_noise_to_block(
         (0, index_max, 0, index_max)
     };
 
-    let cy0 = py0 / 2;
-    let cx0 = px0 / 2;
+    // `cb + ((y + i) << (1 - chroma_subsamp_y)) * chroma_stride + ((x + j) <<
+    // (1 - chroma_subsamp_x))` (`grain_synthesis.c:1129-1130`), with
+    // `py0 == (y + i) << 1`: per-axis, and equal to `/ 2` only at 4:2:0.
+    let cy0 = py0 >> ss.y;
+    let cx0 = px0 >> ss.x;
     if apply_cb || apply_cr {
-        // lane-perf4: one row of each operand at a time. The 4:2:0 luma
-        // average (spec 7.18.3.5) reads a horizontally adjacent PAIR of the
-        // block's own luma row, so `chunks_exact(2)` walks exactly the pairs
-        // the per-sample `(ly * y_stride + lx)` form used to re-derive, and
-        // the U/V/grain rows advance in lockstep with it -- same integers,
-        // same rounding, no per-sample index arithmetic or bounds check.
-        let cw = half_w as usize;
+        // lane-perf4: one row of each operand at a time. The luma average
+        // (spec 7.18.3.5) reads a horizontally adjacent PAIR of the block's
+        // own luma row at `ss_x == 1` (4:2:0 and 4:2:2 alike), so
+        // `chunks_exact(2)` walks exactly the pairs the per-sample
+        // `(ly * y_stride + lx)` form used to re-derive, and the U/V/grain rows
+        // advance in lockstep with it -- same integers, same rounding, no
+        // per-sample index arithmetic or bounds check. At `ss_x == 0` (4:4:4)
+        // the C reads the luma sample itself and the kernel takes its scalar
+        // `pair == false` arm.
+        //
+        // The chroma block is `half_h << (1 - ss_y)` rows by
+        // `half_w << (1 - ss_x)` columns, and the luma row a chroma row
+        // averages is `1 << ss_y` luma rows down.
+        let pair = ss.x == 1;
+        let cw = (half_w << (1 - ss.x)) as usize;
+        let ch = (half_h << (1 - ss.y)) as usize;
+        // The luma ROW a chroma row averages is `i << ss_y`
+        // (`grain_synthesis.c:684`), so consecutive chroma rows step
+        // `1 << ss_y` luma rows -- 2 at 4:2:0 and 4:2:2, 1 at 4:4:4.
+        let lrow_step = 1usize << ss.y;
         // U and V are distinct fields, so a disjoint borrow of each is
         // needed alongside the immutable read of Y.
-        let Picture { y: ref luma_plane, u: ref mut u_plane, v: ref mut v_plane, .. } = *picture;
+        let Picture {
+            y: ref luma_plane,
+            u: ref mut u_plane,
+            v: ref mut v_plane,
+            ..
+        } = *picture;
         let lrow0 = (py0 * y_stride + px0) as usize;
         let crow0 = (cy0 * c_stride + cx0) as usize;
         let grow0 = (cg_row0 * cg_stride + cg_col0) as usize;
         let luma = &luma_plane[lrow0..];
-        let params = ChromaNoise { index_max, rounding_offset, scaling_shift, min_chroma, max_chroma };
+        let params = ChromaNoise {
+            index_max,
+            rounding_offset,
+            scaling_shift,
+            min_chroma,
+            max_chroma,
+        };
         // lane-grain: the whole block in one call, so the kernel's AVX2
         // prologue is paid once per block instead of once per 15-sample row.
         if apply_cb {
@@ -419,16 +521,17 @@ fn add_noise_to_block(
                 &mut u_plane[crow0..],
                 c_stride as usize,
                 luma,
-                2 * y_stride as usize,
+                lrow_step * y_stride as usize,
                 &cb_grain[grow0..],
                 cg_stride as usize,
-                half_h as usize,
+                ch,
                 cw,
                 scaling_cb,
                 cb_luma_mult,
                 cb_mult,
                 cb_offset,
                 params,
+                pair,
             );
         }
         if apply_cr {
@@ -436,16 +539,17 @@ fn add_noise_to_block(
                 &mut v_plane[crow0..],
                 c_stride as usize,
                 luma,
-                2 * y_stride as usize,
+                lrow_step * y_stride as usize,
                 &cr_grain[grow0..],
                 cg_stride as usize,
-                half_h as usize,
+                ch,
                 cw,
                 scaling_cr,
                 cr_luma_mult,
                 cr_mult,
                 cr_offset,
                 params,
+                pair,
             );
         }
     }
@@ -489,7 +593,17 @@ fn luma_noise_row(
 ) {
     let n = pixels.len().min(grain.len());
     luma_noise_rows(
-        pixels, n, grain, n, 1, n, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
+        pixels,
+        n,
+        grain,
+        n,
+        1,
+        n,
+        scaling,
+        rounding_offset,
+        scaling_shift,
+        min_luma,
+        max_luma,
     );
 }
 
@@ -524,8 +638,17 @@ fn luma_noise_rows(
         // sliced, and gathers only in-range LUT entries.
         unsafe {
             simd::luma_noise_rows_avx2(
-                pixels, p_stride, grain, g_stride, rows, n, scaling, rounding_offset,
-                scaling_shift, min_luma, max_luma,
+                pixels,
+                p_stride,
+                grain,
+                g_stride,
+                rows,
+                n,
+                scaling,
+                rounding_offset,
+                scaling_shift,
+                min_luma,
+                max_luma,
             )
         };
         return;
@@ -554,9 +677,21 @@ struct ChromaNoise {
     max_chroma: i32,
 }
 
-/// One chroma row of spec 7.18.3.5's `add_noise_to_block`: `luma` is the
-/// block's own luma row pair-averaged 4:2:0 (`luma.len() == 2 *
-/// chroma.len()`), `grain` and `scaling` are the plane's own.
+/// One chroma row of spec 7.18.3.5's `add_noise_to_block`.
+///
+/// lane-av1422grain: the luma operand is per-axis, as the C
+/// (`grain_synthesis.c:680-691`). The chroma loop runs
+/// `half_luma_height << (1 - ss_y)` rows by `half_luma_width << (1 - ss_x)`
+/// columns, and the luma sample a chroma sample averages is:
+///
+/// * `ss_x == 1` -- a horizontal PAIR at luma row `i << ss_y`, columns
+///   `(j << ss_x)` and `(j << ss_x) + 1`, rounded `(a + b + 1) >> 1`. True at
+///   BOTH 4:2:0 and 4:2:2; only the row step differs, and that is `l_stride`.
+/// * `ss_x == 0` (4:4:4) -- the single luma sample itself, no pair and no
+///   `+ 1`. `luma.len() == chroma.len()` and `l_stride` is one luma row per
+///   chroma row.
+///
+/// `pair` selects which; it is `ss_x == 1`.
 ///
 /// lane-perf9: AVX2 does 8 chroma samples at a time, the luma pair sum being
 /// one `vpmaddwd` against ones; every other CPU runs the scalar loop, which
@@ -574,14 +709,31 @@ fn chroma_noise_row(
     offset: i32,
     p: ChromaNoise,
 ) {
-    let n = chroma.len().min(grain.len()).min(luma.len() / 2);
+    // The 4:2:0/4:2:2 shape the existing SIMD kernel is written for: one
+    // horizontal luma pair per chroma sample, one luma row per chroma row.
+    let per = 2usize;
+    let n = chroma.len().min(grain.len()).min(luma.len() / per);
     chroma_noise_rows(
-        chroma, n, luma, 2 * n, grain, n, 1, n, scaling, luma_mult, mult, offset, p,
+        chroma,
+        n,
+        luma,
+        2 * n,
+        grain,
+        n,
+        1,
+        n,
+        scaling,
+        luma_mult,
+        mult,
+        offset,
+        p,
+        true,
     );
 }
 
 /// [`chroma_noise_row`] over `rows` consecutive chroma rows of a block; see
 /// [`luma_noise_rows`] for why the row loop lives inside the kernel.
+/// `pair` is `ss_x == 1`; see [`chroma_noise_row`] for the two luma shapes.
 #[allow(unsafe_code)]
 #[allow(clippy::too_many_arguments)]
 fn chroma_noise_rows(
@@ -598,9 +750,10 @@ fn chroma_noise_rows(
     mult: i32,
     offset: i32,
     p: ChromaNoise,
+    pair: bool,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if n >= 4 && crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
+    if pair && n >= 4 && crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
         // SAFETY: reached only when the CPU reports avx2; the kernel reads
         // `luma`/`grain`/`chroma` only inside the window the caller sliced,
         // and gathers only in-range LUT entries.
@@ -612,16 +765,18 @@ fn chroma_noise_rows(
         };
         return;
     }
+    let lrow = if pair { 2 * n } else { n };
     for r in 0..rows {
         chroma_noise_row_scalar(
             &mut chroma[r * c_stride..r * c_stride + n],
-            &luma[r * l_stride..r * l_stride + 2 * n],
+            &luma[r * l_stride..r * l_stride + lrow],
             &grain[r * g_stride..r * g_stride + n],
             scaling,
             luma_mult,
             mult,
             offset,
             p,
+            pair,
         );
     }
 }
@@ -637,13 +792,26 @@ fn chroma_noise_row_scalar(
     mult: i32,
     offset: i32,
     p: ChromaNoise,
+    pair: bool,
 ) {
-    for ((c, lpair), &g) in chroma.iter_mut().zip(luma.chunks_exact(2)).zip(grain) {
-        let average_luma = (lpair[0] as i32 + lpair[1] as i32 + 1) >> 1;
-        let scaled =
-            (((average_luma * luma_mult + mult * *c as i32) >> 6) + offset).clamp(0, p.index_max);
-        let delta = (scaling[scaled as usize] * g + p.rounding_offset) >> p.scaling_shift;
-        *c = ((*c as i32 + delta).clamp(p.min_chroma, p.max_chroma)) as u16;
+    if pair {
+        for ((c, lpair), &g) in chroma.iter_mut().zip(luma.chunks_exact(2)).zip(grain) {
+            let average_luma = (lpair[0] as i32 + lpair[1] as i32 + 1) >> 1;
+            let scaled = (((average_luma * luma_mult + mult * *c as i32) >> 6) + offset)
+                .clamp(0, p.index_max);
+            let delta = (scaling[scaled as usize] * g + p.rounding_offset) >> p.scaling_shift;
+            *c = ((*c as i32 + delta).clamp(p.min_chroma, p.max_chroma)) as u16;
+        }
+    } else {
+        // 4:4:4: `average_luma = luma[(i << ss_y) * luma_stride + j]` -- the
+        // luma sample itself (`grain_synthesis.c:691`).
+        for ((c, &l), &g) in chroma.iter_mut().zip(luma).zip(grain) {
+            let average_luma = l as i32;
+            let scaled = (((average_luma * luma_mult + mult * *c as i32) >> 6) + offset)
+                .clamp(0, p.index_max);
+            let delta = (scaling[scaled as usize] * g + p.rounding_offset) >> p.scaling_shift;
+            *c = ((*c as i32 + delta).clamp(p.min_chroma, p.max_chroma)) as u16;
+        }
     }
 }
 
@@ -695,7 +863,17 @@ mod simd {
     ) {
         let n = pixels.len().min(grain.len());
         luma_noise_rows_avx2(
-            pixels, n, grain, n, 1, n, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
+            pixels,
+            n,
+            grain,
+            n,
+            1,
+            n,
+            scaling,
+            rounding_offset,
+            scaling_shift,
+            min_luma,
+            max_luma,
         );
     }
 
@@ -800,7 +978,19 @@ mod simd {
     ) {
         let n = chroma.len().min(grain.len()).min(luma.len() / 2);
         chroma_noise_rows_avx2(
-            chroma, n, luma, 2 * n, grain, n, 1, n, scaling, luma_mult, mult, offset, p,
+            chroma,
+            n,
+            luma,
+            2 * n,
+            grain,
+            n,
+            1,
+            n,
+            scaling,
+            luma_mult,
+            mult,
+            offset,
+            p,
         );
     }
 
@@ -886,8 +1076,10 @@ mod simd {
                 let avg = _mm_srai_epi32(_mm_add_epi32(pair_sum, one4), 1);
                 let c16 = _mm_loadl_epi64(cp.add(c).cast());
                 let c32 = _mm_cvtepu16_epi32(c16);
-                let mixed =
-                    _mm_add_epi32(_mm_mullo_epi32(avg, vluma_mult4), _mm_mullo_epi32(c32, vmult4));
+                let mixed = _mm_add_epi32(
+                    _mm_mullo_epi32(avg, vluma_mult4),
+                    _mm_mullo_epi32(c32, vmult4),
+                );
                 let scaled = _mm_add_epi32(_mm_srai_epi32(mixed, 6), voffset4);
                 let clamped = _mm_max_epi32(_mm_min_epi32(scaled, vindex_max4), zero4);
                 let idx = _mm_min_epi32(clamped, last4);
@@ -910,6 +1102,7 @@ mod simd {
                 mult,
                 offset,
                 p,
+                true,
             );
         }
     }
@@ -929,7 +1122,8 @@ fn ver_overlap_inplace(
     right_row0: i32,
     right_col0: i32,
     width: i32,
-    height: i32, fctx: &crate::decode::FrameCtx,
+    height: i32,
+    fctx: &crate::decode::FrameCtx,
 ) {
     let (grain_min, grain_max) = grain_range(fctx);
     for h in 0..height {
@@ -979,7 +1173,8 @@ fn hor_overlap_inplace(
     bot_row0: i32,
     bot_col0: i32,
     width: i32,
-    height: i32, fctx: &crate::decode::FrameCtx,
+    height: i32,
+    fctx: &crate::decode::FrameCtx,
 ) {
     let (grain_min, grain_max) = grain_range(fctx);
     if height == 1 {
@@ -1029,7 +1224,8 @@ fn copy_area(
     src_row0: i32,
     src_col0: i32,
     width: i32,
-    height: i32, fctx: &crate::decode::FrameCtx,
+    height: i32,
+    fctx: &crate::decode::FrameCtx,
 ) {
     let (_grain_min, _grain_max) = grain_range(fctx);
     for h in 0..height {
@@ -1138,17 +1334,33 @@ pub(crate) fn apply_grain(
     picture: &Picture,
     fg: &FilmGrainParams,
     mc_identity: bool,
-    bit_depth: u32, fctx: &crate::decode::FrameCtx,
+    bit_depth: u32,
+    fctx: &crate::decode::FrameCtx,
 ) -> Picture {
     if !fg.apply_grain {
         return picture.clone();
     }
     fctx.grain_bit_depth.with(|c| c.set(bit_depth));
     hit!(GRAIN_HITS);
+    // lane-av1422grain: the chroma geometry is per-axis. `FrameCtx` already
+    // carries the sequence header's pair (`decode::set_subsampling`), and
+    // `apply_grain` runs inside the same frame context, so the chroma
+    // subblock, template, row map and stride all follow the header rather
+    // than a hardcoded 4:2:0.
+    let ss = Ss::read(fctx);
     let width = picture.width as i32;
     let height = picture.height as i32;
     let y_stride = width;
-    let c_stride = width / 2;
+    // `width >> chroma_subsamp_x`: `chroma_stride` is the U/V plane's own
+    // row length (`grain_synthesis.c:1461`).
+    let c_stride = width >> ss.x;
+    let csub_x = ss.csub_x();
+    let csub_y = ss.csub_y();
+    // The chroma plane is `c_stride x (height >> ss_y)` rows tall, so the
+    // number of block ROWS is unchanged by `ss_y` only if the walk is
+    // expressed in luma rows -- which is what the C does: `for (y = 0; y <
+    // height / 2; y += luma_subblock_size_y >> 1)` (`grain_synthesis.c:1069`).
+    // Each such block row covers `csub_y << (1 - ss_y)` chroma rows.
 
     let lag = fg.ar_coeff_lag as i32;
     let pred_luma = build_pred_pos(lag, false);
@@ -1156,8 +1368,8 @@ pub(crate) fn apply_grain(
 
     let mut rng = Rng::raw(fg.grain_seed);
     let luma_template = generate_luma_grain_block(fg, &pred_luma, &mut rng, fctx);
-    let (cb_template, cr_template) =
-        generate_chroma_grain_blocks(fg, &pred_chroma, &luma_template, fg.grain_seed, fctx);
+    let (cb_template, cr_template, cg_stride) =
+        generate_chroma_grain_blocks(fg, &pred_chroma, &luma_template, fg.grain_seed, ss, fctx);
 
     let scaling_y = build_scaling_lut(
         &fg.point_y_value,
@@ -1194,7 +1406,7 @@ pub(crate) fn apply_grain(
     // lane-filt1: 32-pixel block ROWS are the parallel axis. A row's noise
     // offsets come from `Rng::line(y * 2, grain_seed)` -- a function of the
     // row and the frame seed alone -- and a row writes only luma rows
-    // `y*2 .. y*2+31` (chroma `y .. y+15`), so rows are write-disjoint. The
+    // `y*2 >> ss_y .. +csub_y << (1 - ss_y)`), so rows are write-disjoint. The
     // one carry ACROSS rows is `*_line_buf` (the row above's bottom lines,
     // blended into this row's top lines when `overlap_flag`), and its final
     // content is written by that row's own blocks out of the grain templates
@@ -1203,6 +1415,11 @@ pub(crate) fn apply_grain(
     // to rebuild the line buffers, then codes its own rows exactly as the
     // single-threaded walk does.
     let row_step = LUMA_SUBBLOCK >> 1;
+    // lane-av1422grain: one luma block row spans `csub_y << (1 - ss_y)` chroma
+    // rows (16 at 4:2:0, 32 at 4:2:2 and at 4:4:4), and the chroma row a block
+    // row `y` starts at is `y * 2 >> ss_y`. At 4:2:0 both collapse to the old
+    // `row_step` / `y` this walk used.
+    let chroma_row = |y: usize| (2 * y) >> ss.y;
     let nrows = ((height / 2).max(0) as usize).div_ceil(row_step as usize);
     let gbands = crate::par::bands(nrows, crate::par::filter_threads());
     // lane-grain2: the clean picture used to be cloned here, on the frame
@@ -1211,8 +1428,16 @@ pub(crate) fn apply_grain(
     // walk. The bands own a partition of the plane rows, so each band copies
     // its OWN rows out of the clean source and adds noise to them: the copy
     // moves onto the filter pool and the destination never needs zeroing.
-    let y_rows = if y_stride > 0 { picture.y.len() / y_stride as usize } else { 0 };
-    let c_rows = if c_stride > 0 { picture.u.len() / c_stride as usize } else { 0 };
+    let y_rows = if y_stride > 0 {
+        picture.y.len() / y_stride as usize
+    } else {
+        0
+    };
+    let c_rows = if c_stride > 0 {
+        picture.u.len() / c_stride as usize
+    } else {
+        0
+    };
     let banded = !gbands.is_empty() && y_stride > 0 && c_stride > 0;
     let mut out = if banded {
         Picture {
@@ -1240,23 +1465,44 @@ pub(crate) fn apply_grain(
         // the rows the kernels then read back are still in this core's cache.
         let ys = y_stride as usize;
         let cs = c_stride as usize;
-        let c_end = if b_hi == nrows { c_rows } else { (b_hi * row_step as usize).min(c_rows) };
-        let l_end =
-            if b_hi == nrows { y_rows } else { (2 * b_hi * row_step as usize).min(y_rows) };
-        let mut ccur = (b_lo * row_step as usize).min(c_rows);
+        let c_end = if b_hi == nrows {
+            c_rows
+        } else {
+            chroma_row(b_hi * row_step as usize).min(c_rows)
+        };
+        let l_end = if b_hi == nrows {
+            y_rows
+        } else {
+            (2 * b_hi * row_step as usize).min(y_rows)
+        };
+        let mut ccur = chroma_row(b_lo * row_step as usize).min(c_rows);
         let mut lcur = (2 * b_lo * row_step as usize).min(y_rows);
         let y_lo = (b_lo * row_step as usize) as i32;
         let y_hi = ((b_hi * row_step as usize) as i32).min(height / 2);
         let y_first = if b_lo > 0 { y_lo - row_step } else { y_lo };
         let mut y_line_buf = vec![0i32; (y_stride * 2).max(1) as usize];
-        let mut cb_line_buf = vec![0i32; c_stride.max(1) as usize];
-        let mut cr_line_buf = vec![0i32; c_stride.max(1) as usize];
+        // lane-av1422grain: the line and column buffers are per-axis, as the C's
+        // `init_arrays` (`grain_synthesis.c:392-414`): the chroma line buffer
+        // is `chroma_stride * (2 >> ss_y)` samples and the chroma column
+        // buffer is `(chroma_subblock_size_y + (2 >> ss_y)) * (2 >> ss_x)`.
+        let mut cb_line_buf = vec![0i32; (c_stride * ss.two_y()).max(1) as usize];
+        let mut cr_line_buf = vec![0i32; (c_stride * ss.two_y()).max(1) as usize];
         let mut y_col_buf = vec![0i32; ((LUMA_SUBBLOCK + 2) * 2) as usize];
-        let mut cb_col_buf = vec![0i32; (CHROMA_SUBBLOCK + 1) as usize];
-        let mut cr_col_buf = vec![0i32; (CHROMA_SUBBLOCK + 1) as usize];
+        let cb_col_len = ((csub_y + ss.two_y()) * ss.two_x()).max(1) as usize;
+        let mut cb_col_buf = vec![0i32; cb_col_len];
+        let mut cr_col_buf = vec![0i32; cb_col_len];
+        // The assembled chroma block is `half_luma_height << (1 - ss_y)` rows
+        // by `half_luma_width << (1 - ss_x)` columns -- the block the C's
+        // `add_noise_to_block` walks (`grain_synthesis.c:680-681`). Note the
+        // half extents it is given are LUMA ones (`AOMMIN(32 >> 1, ...)`,
+        // `:1254-1255`), so the block size is `16 << (1 - ss)`, NOT
+        // `chroma_subblock_size << (1 - ss)`: the two differ wherever
+        // `chroma_subsamp == 0` (4:2:2 rows, 4:4:4 both axes).
+        let cblk_stride = ((LUMA_SUBBLOCK >> 1) << (1 - ss.x)) as usize;
+        let cblk_rows = ((LUMA_SUBBLOCK >> 1) << (1 - ss.y)) as usize;
         let mut y_blk = vec![0i32; (LUMA_SUBBLOCK * LUMA_SUBBLOCK) as usize];
-        let mut cb_blk = vec![0i32; (CHROMA_SUBBLOCK * CHROMA_SUBBLOCK) as usize];
-        let mut cr_blk = vec![0i32; (CHROMA_SUBBLOCK * CHROMA_SUBBLOCK) as usize];
+        let mut cb_blk = vec![0i32; cblk_stride * cblk_rows];
+        let mut cr_blk = vec![0i32; cblk_stride * cblk_rows];
 
         let mut y = y_first;
         while y < y_hi {
@@ -1269,9 +1515,13 @@ pub(crate) fn apply_grain(
                 &mut lcur,
                 &mut ccur,
                 (2 * (y as usize + row_step as usize)).min(l_end),
-                (y as usize + row_step as usize).min(c_end),
+                chroma_row(y as usize + row_step as usize).min(c_end),
             );
             let mut row_rng = Rng::line(y * 2, fg.grain_seed);
+            // `for (x = 0; x < width / 2; x += luma_subblock_size_x >> 1)`
+            // (`grain_synthesis.c:1075`): the COLUMN walk is in luma units at
+            // every subsampling, so `width / 2` is right as written and the
+            // chroma column follows from it per-axis.
             let mut x = 0;
             while x < width / 2 {
                 let raw = row_rng.get(8);
@@ -1280,8 +1530,11 @@ pub(crate) fn apply_grain(
 
                 let luma_off_y = LEFT_PAD + 2 * AR_PADDING + (offset_y << 1);
                 let luma_off_x = TOP_PAD + 2 * AR_PADDING + (offset_x << 1);
-                let chroma_off_y = TOP_PAD + AR_PADDING + offset_y;
-                let chroma_off_x = LEFT_PAD + AR_PADDING + offset_x;
+                // `chroma_offset_y = top_pad + (2 >> chroma_subsamp_y) *
+                // ar_padding + offset_y * (2 >> chroma_subsamp_y)`
+                // (`grain_synthesis.c:1091-1094`).
+                let chroma_off_y = TOP_PAD + ss.two_y() * AR_PADDING + offset_y * ss.two_y();
+                let chroma_off_x = LEFT_PAD + ss.two_x() * AR_PADDING + offset_x * ss.two_x();
 
                 if overlap && x != 0 {
                     let h_count = (LUMA_SUBBLOCK + 2).min(height - (y << 1));
@@ -1295,34 +1548,40 @@ pub(crate) fn apply_grain(
                         luma_off_y,
                         luma_off_x,
                         2,
-                        h_count, fctx,
+                        h_count,
+                        fctx,
                     );
-                    let hc_count = (CHROMA_SUBBLOCK + 1).min((height - (y << 1)) >> 1);
+                    // `ver_boundary_overlap(cb_col_buf, 2 >> chroma_subsamp_x,
+                    // ..., 2 >> chroma_subsamp_x, AOMMIN(chroma_subblock_size_y
+                    // + (2 >> chroma_subsamp_y), (height - (y << 1)) >>
+                    // chroma_subsamp_y))` (`grain_synthesis.c:1102-1112`).
+                    let hc_count = (csub_y + ss.two_y()).min((height - (y << 1)) >> ss.y);
                     ver_overlap_inplace(
                         &mut cb_col_buf,
-                        1,
+                        ss.two_x(),
                         0,
                         0,
                         &cb_template,
-                        CHROMA_BLOCK_W,
+                        cg_stride,
                         chroma_off_y,
                         chroma_off_x,
-                        1,
-                        hc_count, fctx,
+                        ss.two_x(),
+                        hc_count,
+                        fctx,
                     );
                     ver_overlap_inplace(
                         &mut cr_col_buf,
-                        1,
+                        ss.two_x(),
                         0,
                         0,
                         &cr_template,
-                        CHROMA_BLOCK_W,
+                        cg_stride,
                         chroma_off_y,
                         chroma_off_x,
-                        1,
-                        hc_count, fctx,
+                        ss.two_x(),
+                        hc_count,
+                        fctx,
                     );
-
                 }
 
                 if overlap && y != 0 {
@@ -1337,35 +1596,43 @@ pub(crate) fn apply_grain(
                             0,
                             0,
                             2,
-                            2, fctx,
+                            2,
+                            fctx,
                         );
+                        // `hor_boundary_overlap(cb_line_buf + (x << (1 -
+                        // chroma_subsamp_x)), chroma_stride, cb_col_buf, 2 >>
+                        // chroma_subsamp_x, ..., 2 >> chroma_subsamp_x, 2 >>
+                        // chroma_subsamp_y)` (`grain_synthesis.c:1157-1168`).
+                        let ccol_x = x << (1 - ss.x);
                         hor_overlap_inplace(
                             &mut cb_line_buf,
                             c_stride,
                             0,
-                            x,
+                            ccol_x,
                             &cb_col_buf,
-                            1,
+                            ss.two_x(),
                             0,
                             0,
-                            1,
-                            1, fctx,
+                            ss.two_x(),
+                            ss.two_y(),
+                            fctx,
                         );
                         hor_overlap_inplace(
                             &mut cr_line_buf,
                             c_stride,
                             0,
-                            x,
+                            ccol_x,
                             &cr_col_buf,
-                            1,
+                            ss.two_x(),
                             0,
                             0,
-                            1,
-                            1, fctx,
+                            ss.two_x(),
+                            ss.two_y(),
+                            fctx,
                         );
                     }
                     let lcol0 = if x != 0 { (x + 1) << 1 } else { 0 };
-                    let ccol0 = if x != 0 { x + 1 } else { 0 };
+                    let ccol0 = if x != 0 { (x + 1) << (1 - ss.x) } else { 0 };
                     let lw = (LUMA_SUBBLOCK - (if x != 0 { 2 } else { 0 })).min(width - lcol0);
                     hor_overlap_inplace(
                         &mut y_line_buf,
@@ -1377,20 +1644,31 @@ pub(crate) fn apply_grain(
                         luma_off_y,
                         luma_off_x + if x != 0 { 2 } else { 0 },
                         lw,
-                        2, fctx,
+                        2,
+                        fctx,
                     );
-                    let cw = (CHROMA_SUBBLOCK - (if x != 0 { 1 } else { 0 })).min((width - lcol0) >> 1);
+                    // `hor_boundary_overlap(cb_line_buf + ((x ? x + 1 : 0) << (1
+                    // - chroma_subsamp_x)), chroma_stride, cb_grain_block +
+                    // chroma_offset_y * stride + chroma_offset_x + ((x ? 1 : 0)
+                    // << (1 - chroma_subsamp_x)), chroma_grain_stride, ...,
+                    // AOMMIN(chroma_subblock_size_x - ((x ? 1 : 0) << (1 -
+                    // chroma_subsamp_x)), (width - ((x ? x + 1 : 0) << 1)) >>
+                    // chroma_subsamp_x), 2 >> chroma_subsamp_y)`
+                    // (`grain_synthesis.c:1189-1200`).
+                    let cskip = if x != 0 { ss.two_x() } else { 0 };
+                    let cw = (csub_x - cskip).min((width - lcol0) >> ss.x);
                     hor_overlap_inplace(
                         &mut cb_line_buf,
                         c_stride,
                         0,
                         ccol0,
                         &cb_template,
-                        CHROMA_BLOCK_W,
+                        cg_stride,
                         chroma_off_y,
-                        chroma_off_x + if x != 0 { 1 } else { 0 },
+                        chroma_off_x + cskip,
                         cw,
-                        1, fctx,
+                        ss.two_y(),
+                        fctx,
                     );
                     hor_overlap_inplace(
                         &mut cr_line_buf,
@@ -1398,13 +1676,13 @@ pub(crate) fn apply_grain(
                         0,
                         ccol0,
                         &cr_template,
-                        CHROMA_BLOCK_W,
+                        cg_stride,
                         chroma_off_y,
-                        chroma_off_x + if x != 0 { 1 } else { 0 },
+                        chroma_off_x + cskip,
                         cw,
-                        1, fctx,
+                        ss.two_y(),
+                        fctx,
                     );
-
                 }
 
                 let i = if overlap && y != 0 { 1 } else { 0 };
@@ -1416,6 +1694,7 @@ pub(crate) fn apply_grain(
                         add_noise_to_block(
                             fg,
                             mc_identity,
+                            ss,
                             &scaling_y,
                             &scaling_cb,
                             &scaling_cr,
@@ -1428,11 +1707,12 @@ pub(crate) fn apply_grain(
                             luma_off_x,
                             &cb_template,
                             &cr_template,
-                            CHROMA_BLOCK_W,
+                            cg_stride,
                             chroma_off_y,
                             chroma_off_x,
                             bh,
-                            bw, fctx,
+                            bw,
+                            fctx,
                         );
                     } else {
                         // lane-grainrow: the overlap line and the overlap
@@ -1442,11 +1722,23 @@ pub(crate) fn apply_grain(
                         // AVX2 kernel handed the 3-sample tail of every row
                         // back to the scalar loop. A 4K cut spent 2.19e9 calls
                         // on 4.4e9 such samples. Assembling the three noise
-                        // sources into one 32x32 block (16x16 chroma) first
-                        // makes it one kernel call per block over a width that
-                        // is a multiple of 8, with no scalar remainder. Every
-                        // sample keeps the value its own source gave it, so the
-                        // picture is bit-identical.
+                        // sources into one block first makes it one kernel call
+                        // per block over a width that is a multiple of 8, with
+                        // no scalar remainder. Every sample keeps the value its
+                        // own source gave it, so the picture is bit-identical.
+                        //
+                        // lane-av1422grain: the assembled CHROMA block is
+                        // `bh << (1 - ss_y)` rows by `bw << (1 - ss_x)` columns
+                        // -- the very block `add_noise_to_block` walks
+                        // (`grain_synthesis.c:680-681`) -- with `i << (1 - ss_y)`
+                        // overlap rows and `j << (1 - ss_x)` overlap columns
+                        // taken from the line and column buffers. At 4:2:0 both
+                        // shifts are `<< 0`, so this is the 16x16 it always was.
+                        let cch = (bh << (1 - ss.y)) as usize;
+                        let ccw = (bw << (1 - ss.x)) as usize;
+                        let ctop = (i << (1 - ss.y)) as usize;
+                        let cwide = (j << (1 - ss.x)) as usize;
+                        let ccol_x = (x << (1 - ss.x)) as usize;
                         if apply_y {
                             assemble_block_noise(
                                 &mut y_blk,
@@ -1468,17 +1760,17 @@ pub(crate) fn apply_grain(
                         if apply_cb {
                             assemble_block_noise(
                                 &mut cb_blk,
-                                CHROMA_SUBBLOCK as usize,
-                                bh as usize,
-                                bw as usize,
+                                cblk_stride,
+                                cch,
+                                ccw,
                                 &cb_line_buf,
                                 c_stride as usize,
-                                x as usize,
-                                i as usize,
+                                ccol_x,
+                                ctop,
                                 &cb_col_buf,
-                                j as usize,
+                                cwide,
                                 &cb_template,
-                                CHROMA_BLOCK_W as usize,
+                                cg_stride as usize,
                                 chroma_off_y as usize,
                                 chroma_off_x as usize,
                             );
@@ -1486,17 +1778,17 @@ pub(crate) fn apply_grain(
                         if apply_cr {
                             assemble_block_noise(
                                 &mut cr_blk,
-                                CHROMA_SUBBLOCK as usize,
-                                bh as usize,
-                                bw as usize,
+                                cblk_stride,
+                                cch,
+                                ccw,
                                 &cr_line_buf,
                                 c_stride as usize,
-                                x as usize,
-                                i as usize,
+                                ccol_x,
+                                ctop,
                                 &cr_col_buf,
-                                j as usize,
+                                cwide,
                                 &cr_template,
-                                CHROMA_BLOCK_W as usize,
+                                cg_stride as usize,
                                 chroma_off_y as usize,
                                 chroma_off_x as usize,
                             );
@@ -1504,6 +1796,7 @@ pub(crate) fn apply_grain(
                         add_noise_to_block(
                             fg,
                             mc_identity,
+                            ss,
                             &scaling_y,
                             &scaling_cb,
                             &scaling_cr,
@@ -1516,11 +1809,12 @@ pub(crate) fn apply_grain(
                             0,
                             &cb_blk,
                             &cr_blk,
-                            CHROMA_SUBBLOCK,
+                            cblk_stride as i32,
                             0,
                             0,
                             bh,
-                            bw, fctx,
+                            bw,
+                            fctx,
                         );
                     }
                 }
@@ -1537,37 +1831,56 @@ pub(crate) fn apply_grain(
                             LUMA_SUBBLOCK,
                             0,
                             2,
-                            2, fctx,
+                            2,
+                            fctx,
                         );
+                        // `copy_area(cb_col_buf + (chroma_subblock_size_y << (1
+                        // - chroma_subsamp_x)), 2 >> chroma_subsamp_x,
+                        // cb_line_buf + (x << (1 - chroma_subsamp_x)),
+                        // chroma_stride, 2 >> chroma_subsamp_x, 2 >>
+                        // chroma_subsamp_y)` (`grain_synthesis.c:1289-1296`).
+                        //
+                        // The C's source base is a FLAT element offset into
+                        // `cb_col_buf`, and `copy_area` here addresses
+                        // `src_row0 * src_stride + src_col0`. Since
+                        // `src_stride == 2 >> ss_x` and the flat offset is
+                        // `chroma_subblock_size_y << (1 - ss_x)`, the two agree
+                        // for every `ss_x` -- but only because the flat offset
+                        // was folded back into a ROW index here. Passing the
+                        // flat value as the row index (the obvious reading)
+                        // multiplies it by the stride a second time and reads
+                        // past the buffer.
                         copy_area(
                             &mut cb_line_buf,
                             c_stride,
                             0,
-                            x,
+                            x << (1 - ss.x),
                             &cb_col_buf,
-                            1,
-                            CHROMA_SUBBLOCK,
+                            ss.two_x(),
+                            csub_y,
                             0,
-                            1,
-                            1, fctx,
+                            ss.two_x(),
+                            ss.two_y(),
+                            fctx,
                         );
                         copy_area(
                             &mut cr_line_buf,
                             c_stride,
                             0,
-                            x,
+                            x << (1 - ss.x),
                             &cr_col_buf,
-                            1,
-                            CHROMA_SUBBLOCK,
+                            ss.two_x(),
+                            csub_y,
                             0,
-                            1,
-                            1, fctx,
+                            ss.two_x(),
+                            ss.two_y(),
+                            fctx,
                         );
                     }
                     let lcol0 = if x != 0 { (x + 1) << 1 } else { 0 };
-                    let ccol0 = if x != 0 { x + 1 } else { 0 };
+                    let ccol0 = if x != 0 { (x + 1) << (1 - ss.x) } else { 0 };
                     let lcut = if x != 0 { 2 } else { 0 };
-                    let ccut = if x != 0 { 1 } else { 0 };
+                    let ccut = if x != 0 { ss.two_x() } else { 0 };
                     copy_area(
                         &mut y_line_buf,
                         y_stride,
@@ -1578,19 +1891,30 @@ pub(crate) fn apply_grain(
                         luma_off_y + LUMA_SUBBLOCK,
                         luma_off_x + lcut,
                         LUMA_SUBBLOCK.min(width - (x << 1)) - lcut,
-                        2, fctx,
+                        2,
+                        fctx,
                     );
+                    // `copy_area(cb_grain_block + (chroma_offset_y +
+                    // chroma_subblock_size_y) * chroma_grain_stride +
+                    // chroma_offset_x + (x ? 2 >> chroma_subsamp_x : 0), ...,
+                    // cb_line_buf + ((x ? x + 1 : 0) << (1 -
+                    // chroma_subsamp_x)), chroma_stride, AOMMIN(
+                    // chroma_subblock_size_x, ((width - (x << 1)) >>
+                    // chroma_subsamp_x)) - (x ? 2 >> chroma_subsamp_x : 0), 2
+                    // >> chroma_subsamp_y)` (`grain_synthesis.c:1309-1320`).
+                    let cgw = csub_x.min((width - (x << 1)) >> ss.x) - ccut;
                     copy_area(
                         &mut cb_line_buf,
                         c_stride,
                         0,
                         ccol0,
                         &cb_template,
-                        CHROMA_BLOCK_W,
-                        chroma_off_y + CHROMA_SUBBLOCK,
+                        cg_stride,
+                        chroma_off_y + csub_y,
                         chroma_off_x + ccut,
-                        CHROMA_SUBBLOCK.min((width - (x << 1)) >> 1) - ccut,
-                        1, fctx,
+                        cgw,
+                        ss.two_y(),
+                        fctx,
                     );
                     copy_area(
                         &mut cr_line_buf,
@@ -1598,14 +1922,20 @@ pub(crate) fn apply_grain(
                         0,
                         ccol0,
                         &cr_template,
-                        CHROMA_BLOCK_W,
-                        chroma_off_y + CHROMA_SUBBLOCK,
+                        cg_stride,
+                        chroma_off_y + csub_y,
                         chroma_off_x + ccut,
-                        CHROMA_SUBBLOCK.min((width - (x << 1)) >> 1) - ccut,
-                        1, fctx,
+                        cgw,
+                        ss.two_y(),
+                        fctx,
                     );
 
                     let h_count = (LUMA_SUBBLOCK + 2).min(height - (y << 1));
+                    // The chroma column buffer's row count, per-axis as the C
+                    // (`grain_synthesis.c:1349-1350`): the same
+                    // `AOMMIN(chroma_subblock_size_y + (2 >> ss_y), (height -
+                    // (y << 1)) >> ss_y)` the vertical overlap above used.
+                    let hc_count = (csub_y + ss.two_y()).min((height - (y << 1)) >> ss.y);
                     copy_area(
                         &mut y_col_buf,
                         2,
@@ -1616,32 +1946,41 @@ pub(crate) fn apply_grain(
                         luma_off_y,
                         luma_off_x + LUMA_SUBBLOCK,
                         2,
-                        h_count, fctx,
+                        h_count,
+                        fctx,
                     );
-                    let hc_count = (CHROMA_SUBBLOCK + 1).min((height - (y << 1)) >> 1);
+                    // `copy_area(cb_grain_block + chroma_offset_y *
+                    // chroma_grain_stride + chroma_offset_x +
+                    // chroma_subblock_size_x, chroma_grain_stride, cb_col_buf,
+                    // 2 >> chroma_subsamp_x, 2 >> chroma_subsamp_x, AOMMIN(
+                    // chroma_subblock_size_y + (2 >> chroma_subsamp_y),
+                    // (height - (y << 1)) >> chroma_subsamp_y))`
+                    // (`grain_synthesis.c:1345-1352`).
                     copy_area(
                         &mut cb_col_buf,
-                        1,
+                        ss.two_x(),
                         0,
                         0,
                         &cb_template,
-                        CHROMA_BLOCK_W,
+                        cg_stride,
                         chroma_off_y,
-                        chroma_off_x + CHROMA_SUBBLOCK,
-                        1,
-                        hc_count, fctx,
+                        chroma_off_x + csub_x,
+                        ss.two_x(),
+                        hc_count,
+                        fctx,
                     );
                     copy_area(
                         &mut cr_col_buf,
-                        1,
+                        ss.two_x(),
                         0,
                         0,
                         &cr_template,
-                        CHROMA_BLOCK_W,
+                        cg_stride,
                         chroma_off_y,
-                        chroma_off_x + CHROMA_SUBBLOCK,
-                        1,
-                        hc_count, fctx,
+                        chroma_off_x + csub_x,
+                        ss.two_x(),
+                        hc_count,
+                        fctx,
                     );
                 }
 
@@ -1681,17 +2020,30 @@ mod perf5_tests {
                 let rounding_offset = 1i32 << (scaling_shift - 1);
                 for &(lo, hi) in &[(0i32, sample_max as i32), (16 << bd_shift, 235 << bd_shift)] {
                     for len in [1usize, 4, 7, 8, 9, 16, 31, 32, 64, 128] {
-                        let pixels: Vec<u16> =
-                            (0..len).map(|_| (rng() % (u64::from(sample_max) + 1)) as u16).collect();
+                        let pixels: Vec<u16> = (0..len)
+                            .map(|_| (rng() % (u64::from(sample_max) + 1)) as u16)
+                            .collect();
                         let grain: Vec<i32> =
                             (0..len).map(|_| (rng() % 513) as i32 - 256).collect();
                         let mut want = pixels.clone();
                         super::luma_noise_row_scalar(
-                            &mut want, &grain, &scaling, rounding_offset, scaling_shift, lo, hi,
+                            &mut want,
+                            &grain,
+                            &scaling,
+                            rounding_offset,
+                            scaling_shift,
+                            lo,
+                            hi,
                         );
                         let mut got = pixels.clone();
                         super::luma_noise_row(
-                            &mut got, &grain, &scaling, rounding_offset, scaling_shift, lo, hi,
+                            &mut got,
+                            &grain,
+                            &scaling,
+                            rounding_offset,
+                            scaling_shift,
+                            lo,
+                            hi,
                         );
                         assert_eq!(got, want, "dispatch len={len} shift={scaling_shift}");
                         #[cfg(target_arch = "x86_64")]
@@ -1700,8 +2052,13 @@ mod perf5_tests {
                             #[allow(unsafe_code)]
                             unsafe {
                                 super::simd::luma_noise_row_avx2(
-                                    &mut avx, &grain, &scaling, rounding_offset, scaling_shift,
-                                    lo, hi,
+                                    &mut avx,
+                                    &grain,
+                                    &scaling,
+                                    rounding_offset,
+                                    scaling_shift,
+                                    lo,
+                                    hi,
                                 )
                             };
                             assert_eq!(avx, want, "avx2 len={len} shift={scaling_shift}");
@@ -1740,9 +2097,7 @@ mod perf5_tests {
                     (-128, 127, -(1 << (8 + bd_shift))),
                     (17, -64, 42),
                 ] {
-                    for &(lo, hi) in
-                        &[(0i32, index_max), (16 << bd_shift, 240 << bd_shift)]
-                    {
+                    for &(lo, hi) in &[(0i32, index_max), (16 << bd_shift, 240 << bd_shift)] {
                         for len in [1usize, 5, 8, 9, 16, 17, 32] {
                             let p = super::ChromaNoise {
                                 index_max,
@@ -1762,6 +2117,7 @@ mod perf5_tests {
                             let mut want = chroma.clone();
                             super::chroma_noise_row_scalar(
                                 &mut want, &luma, &grain, &scaling, luma_mult, mult, offset, p,
+                                true,
                             );
                             let mut got = chroma.clone();
                             super::chroma_noise_row(
@@ -1774,8 +2130,8 @@ mod perf5_tests {
                                 #[allow(unsafe_code)]
                                 unsafe {
                                     super::simd::chroma_noise_row_avx2(
-                                        &mut avx, &luma, &grain, &scaling, luma_mult, mult,
-                                        offset, p,
+                                        &mut avx, &luma, &grain, &scaling, luma_mult, mult, offset,
+                                        p,
                                     )
                                 };
                                 assert_eq!(avx, want, "avx2 len={len} mult={mult}");
@@ -1807,8 +2163,12 @@ mod grain2_tests {
             width: w,
             height: h,
             y: (0..w * h).map(|i| ((i * 7 + 3) % 256) as u16).collect(),
-            u: (0..w * h / 4).map(|i| ((i * 11 + 5) % 256) as u16).collect(),
-            v: (0..w * h / 4).map(|i| ((i * 13 + 9) % 256) as u16).collect(),
+            u: (0..w * h / 4)
+                .map(|i| ((i * 11 + 5) % 256) as u16)
+                .collect(),
+            v: (0..w * h / 4)
+                .map(|i| ((i * 13 + 9) % 256) as u16)
+                .collect(),
         };
         let mut fg = FilmGrainParams {
             apply_grain: true,
@@ -1827,7 +2187,10 @@ mod grain2_tests {
         fg.point_cb_scaling[..2].copy_from_slice(&[40, 60]);
         let fctx = crate::decode::FrameCtx::new();
         let out = apply_grain(&src, &fg, false, 8, &fctx);
-        assert_eq!(out.y, src.y, "no luma points: the luma plane is the clean copy");
+        assert_eq!(
+            out.y, src.y,
+            "no luma points: the luma plane is the clean copy"
+        );
         assert_eq!(out.v, src.v, "no cr points: the V plane is the clean copy");
         assert_ne!(out.u, src.u, "cb grain landed on the U plane");
 
@@ -1837,7 +2200,10 @@ mod grain2_tests {
         fg2.point_y_scaling[..2].copy_from_slice(&[50, 70]);
         let out2 = apply_grain(&src, &fg2, false, 8, &fctx);
         assert_ne!(out2.y, src.y, "luma grain landed");
-        assert_eq!(out2.v, src.v, "no cr points: the V plane is still the clean copy");
+        assert_eq!(
+            out2.v, src.v,
+            "no cr points: the V plane is still the clean copy"
+        );
         assert_eq!(out2.y.len(), w * h, "the ragged tail row is present");
     }
 }
@@ -1850,25 +2216,45 @@ mod ragged_grain_tests {
         (x + (1 << (n - 1))) >> n
     }
 
-    /// One 17-row chroma stripe block of spec 7.18.3.4's `add_noise_stripe`.
+    /// One chroma stripe block of spec 7.18.3.4's `add_noise_stripe`, per-axis.
+    ///
+    /// `rows`/`cols` are the block's own extent plus the `2 >> ss` overlap
+    /// rows/columns the NEXT block blends against, and `x` is the block's first
+    /// chroma column. The column blend is `ver_boundary_overlap`
+    /// (`grain_synthesis.c:912-939`), whose two widths are DIFFERENT formulas:
+    /// `width == 1` (`2 >> ss_x == 1`, so 4:2:0 and 4:2:2) is 23/22, while
+    /// `width == 2` (4:4:4) is 27/17 on the first column and 17/27 on the
+    /// second.
+    #[allow(clippy::too_many_arguments)]
     fn chroma_stripe_block(
         st: &mut [i32],
         tpl: &[i32],
+        tp_stride: i32,
         coy: i32,
         cox: i32,
         x: i32,
         cw: i32,
+        rows: i32,
+        cols: i32,
+        skip: i32,
         overlap: bool,
         gmin: i32,
         gmax: i32,
     ) {
-        for i in 0..17 {
-            for j in 0..17 {
+        for i in 0..rows {
+            for j in 0..cols {
                 let col = x + j;
-                let mut g = tpl[((coy + i) * CHROMA_BLOCK_W + cox + j) as usize];
-                if overlap && x > 0 && j < 1 {
+                let mut g = tpl[((coy + i) * tp_stride + cox + j) as usize];
+                if overlap && x > 0 && j < skip {
                     let old = st[(i * cw + col) as usize];
-                    g = round2(old * 23 + g * 22, 5).clamp(gmin, gmax);
+                    g = if skip == 1 {
+                        round2(old * 23 + g * 22, 5)
+                    } else if j == 0 {
+                        round2(old * 27 + g * 17, 5)
+                    } else {
+                        round2(old * 17 + g * 27, 5)
+                    }
+                    .clamp(gmin, gmax);
                 }
                 if col < cw {
                     st[(i * cw + col) as usize] = g;
@@ -1884,10 +2270,22 @@ mod ragged_grain_tests {
     /// pixel kernels (which are not what this test exercises). 8-bit, 4:2:0,
     /// `clip_to_restricted_range == false`.
     fn reference(src: &Picture, fg: &FilmGrainParams, fctx: &crate::decode::FrameCtx) -> Picture {
+        let ss = Ss::read(fctx);
         let w = src.width as i32;
         let h = src.height as i32;
-        let cw = w / 2;
-        let ch = h / 2;
+        // lane-av1422grain: the reference walks LUMA units exactly as the C's
+        // `add_film_grain_run` does (`grain_synthesis.c:1069-1078`) and derives
+        // every chroma extent per-axis, so one transcription serves 4:2:0,
+        // 4:2:2 and 4:4:4.
+        let cw = w >> ss.x;
+        let ch = h >> ss.y;
+        // The chroma block a luma block covers, per-axis. As in the C the
+        // half extents are LUMA ones (`AOMMIN(32 >> 1, ...)`,
+        // `grain_synthesis.c:1254-1255`) scaled by each axis, so this is
+        // `16 << (1 - ss)` -- 16x16 at 4:2:0, 32x16 at 4:2:2, 32x32 at 4:4:4.
+        let cblk_rows = (LUMA_SUBBLOCK >> 1) << (1 - ss.y);
+        let cblk_cols = (LUMA_SUBBLOCK >> 1) << (1 - ss.x);
+        let chroma_row = |y: i32| (y * 2) >> ss.y;
         let (gmin, gmax) = grain_range(fctx);
         let overlap = fg.overlap_flag;
 
@@ -1895,32 +2293,48 @@ mod ragged_grain_tests {
         let pl = build_pred_pos(fg.ar_coeff_lag as i32, false);
         let pc = build_pred_pos(fg.ar_coeff_lag as i32, fg.num_y_points > 0);
         let lt = generate_luma_grain_block(fg, &pl, &mut rng, fctx);
-        let (cbt, crt) = generate_chroma_grain_blocks(fg, &pc, &lt, fg.grain_seed, fctx);
+        let (cbt, crt, cg_stride) =
+            generate_chroma_grain_blocks(fg, &pc, &lt, fg.grain_seed, ss, fctx);
 
         let mut nl = vec![0i32; (w * h) as usize];
         let mut ncb = vec![0i32; (cw * ch) as usize];
         let mut ncr = vec![0i32; (cw * ch) as usize];
         let mut prev: Option<(Vec<i32>, Vec<i32>, Vec<i32>)> = None;
         let mut y = 0;
-        while y < ch {
+        while y < h / 2 {
             let mut row_rng = Rng::line(y * 2, fg.grain_seed);
+            // 34 luma rows (32 + 2 overlap) and, per chroma plane, a stripe of
+            // `cblk_rows + (2 >> ss_y)` rows by `cblk_cols + (2 >> ss_x)`
+            // columns (17 x 17 at 4:2:0, 34 x 17 at 4:2:2, 34 x 34 at 4:4:4).
+            let crows = cblk_rows + (2 >> ss.y);
+            let ccols = cblk_cols + (2 >> ss.x);
             let mut sl = vec![0i32; (34 * w) as usize];
-            let mut scb = vec![0i32; (17 * cw) as usize];
-            let mut scr = vec![0i32; (17 * cw) as usize];
+            let mut scb = vec![0i32; (crows * cw) as usize];
+            let mut scr = vec![0i32; (crows * cw) as usize];
             let mut x = 0;
-            while x < cw {
+            while x < w / 2 {
                 let raw = row_rng.get(8);
                 let ox = (raw >> 4) & 15;
                 let oy = raw & 15;
-                let (loy, lox) = (9 + 2 * oy, 9 + 2 * ox);
-                let (coy, cox) = (6 + oy, 6 + ox);
+                let (loy, lox) = (
+                    LEFT_PAD + 2 * AR_PADDING + (oy << 1),
+                    TOP_PAD + 2 * AR_PADDING + (ox << 1),
+                );
+                let (coy, cox) = (
+                    TOP_PAD + ss.two_y() * AR_PADDING + oy * ss.two_y(),
+                    LEFT_PAD + ss.two_x() * AR_PADDING + ox * ss.two_x(),
+                );
                 for i in 0..34 {
                     for j in 0..34 {
                         let col = x * 2 + j;
                         let mut g = lt[((loy + i) * LUMA_BLOCK_W + lox + j) as usize];
                         if overlap && x > 0 && j < 2 {
                             let old = sl[(i * w + col) as usize];
-                            g = if j == 0 { old * 27 + g * 17 } else { old * 17 + g * 27 };
+                            g = if j == 0 {
+                                old * 27 + g * 17
+                            } else {
+                                old * 17 + g * 27
+                            };
                             g = round2(g, 5).clamp(gmin, gmax);
                         }
                         if col < w {
@@ -1928,11 +2342,44 @@ mod ragged_grain_tests {
                         }
                     }
                 }
-                chroma_stripe_block(&mut scb, &cbt, coy, cox, x, cw, overlap, gmin, gmax);
-                chroma_stripe_block(&mut scr, &crt, coy, cox, x, cw, overlap, gmin, gmax);
-                x += 16;
+                // The stripe block spans `cblk_rows + (2 >> ss_y)` rows -- the
+                // trailing `2 >> ss_y` are the rows the NEXT block row's
+                // vertical overlap reads back out of `prev` -- and starts at
+                // chroma column `x << (1 - ss_x)`. At 4:2:0 that is the 17x17
+                // the transcription always used.
+                chroma_stripe_block(
+                    &mut scb,
+                    &cbt,
+                    cg_stride,
+                    coy,
+                    cox,
+                    x << (1 - ss.x),
+                    cw,
+                    crows,
+                    ccols,
+                    2 >> ss.x,
+                    overlap,
+                    gmin,
+                    gmax,
+                );
+                chroma_stripe_block(
+                    &mut scr,
+                    &crt,
+                    cg_stride,
+                    coy,
+                    cox,
+                    x << (1 - ss.x),
+                    cw,
+                    crows,
+                    ccols,
+                    2 >> ss.x,
+                    overlap,
+                    gmin,
+                    gmax,
+                );
+                x += LUMA_SUBBLOCK >> 1;
             }
-            for i in 0..32 {
+            for i in 0..(LUMA_SUBBLOCK >> 1) * 2 {
                 let row = y * 2 + i;
                 if row >= h {
                     break;
@@ -1942,31 +2389,56 @@ mod ragged_grain_tests {
                     if overlap && i < 2 {
                         if let Some((p, _, _)) = &prev {
                             let old = p[((i + 32) * w + col) as usize];
-                            g = if i == 0 { old * 27 + g * 17 } else { old * 17 + g * 27 };
+                            g = if i == 0 {
+                                old * 27 + g * 17
+                            } else {
+                                old * 17 + g * 27
+                            };
                             g = round2(g, 5).clamp(gmin, gmax);
                         }
                     }
                     nl[(row * w + col) as usize] = g;
                 }
             }
-            for i in 0..16 {
-                let row = y + i;
+            let cy0 = chroma_row(y);
+            for i in 0..cblk_rows {
+                let row = cy0 + i;
                 if row >= ch {
                     break;
                 }
                 for col in 0..cw {
                     for (st, img) in [(&scb, &mut ncb), (&scr, &mut ncr)] {
                         let mut g = st[(i * cw + col) as usize];
-                        if overlap && i < 1 {
+                        if overlap && i < (2 >> ss.y) {
                             let old = match &prev {
                                 Some((_, pb, pr)) => {
-                                    let p = if std::ptr::eq(st.as_ptr(), scb.as_ptr()) { pb } else { pr };
-                                    Some(p[((i + 16) * cw + col) as usize])
+                                    let p = if std::ptr::eq(st.as_ptr(), scb.as_ptr()) {
+                                        pb
+                                    } else {
+                                        pr
+                                    };
+                                    Some(p[((i + cblk_rows) * cw + col) as usize])
                                 }
                                 None => None,
                             };
                             if let Some(old) = old {
-                                g = round2(old * 23 + g * 22, 5).clamp(gmin, gmax);
+                                // `hor_boundary_overlap`'s two heights are
+                                // DIFFERENT formulas: `height == 1` blends
+                                // 23/22 (`grain_synthesis.c:941-956`),
+                                // `height == 2` blends 27/17 on the first row
+                                // and 17/27 on the second (`:957-970`). At
+                                // 4:2:0 `2 >> ss_y == 1` and only the first
+                                // applies; at 4:2:2 and 4:4:4 it is 2 and the
+                                // second row's 17/27 blend is a DIFFERENT
+                                // value.
+                                g = if (2 >> ss.y) == 1 {
+                                    round2(old * 23 + g * 22, 5)
+                                } else if i == 0 {
+                                    round2(old * 27 + g * 17, 5)
+                                } else {
+                                    round2(old * 17 + g * 27, 5)
+                                }
+                                .clamp(gmin, gmax);
                             }
                         }
                         img[(row * cw + col) as usize] = g;
@@ -1974,20 +2446,32 @@ mod ragged_grain_tests {
                 }
             }
             prev = Some((sl, scb, scr));
-            y += 16;
+            y += LUMA_SUBBLOCK >> 1;
         }
 
         let mut out = src.clone();
         let sy = expand_scaling_lut(
-            &build_scaling_lut(&fg.point_y_value, &fg.point_y_scaling, fg.num_y_points as usize),
+            &build_scaling_lut(
+                &fg.point_y_value,
+                &fg.point_y_scaling,
+                fg.num_y_points as usize,
+            ),
             8,
         );
         let s_cb = expand_scaling_lut(
-            &build_scaling_lut(&fg.point_cb_value, &fg.point_cb_scaling, fg.num_cb_points as usize),
+            &build_scaling_lut(
+                &fg.point_cb_value,
+                &fg.point_cb_scaling,
+                fg.num_cb_points as usize,
+            ),
             8,
         );
         let s_cr = expand_scaling_lut(
-            &build_scaling_lut(&fg.point_cr_value, &fg.point_cr_scaling, fg.num_cr_points as usize),
+            &build_scaling_lut(
+                &fg.point_cr_value,
+                &fg.point_cr_scaling,
+                fg.num_cr_points as usize,
+            ),
             8,
         );
         let scaling_shift = fg.grain_scaling_minus_8 as i32 + 8;
@@ -2002,9 +2486,18 @@ mod ragged_grain_tests {
         // Chroma first, and out of the CLEAN luma: `add_noise_to_block` adds
         // the block's chroma noise before its luma noise, so no chroma
         // sample ever sees a noised luma neighbour.
+        // lane-av1422grain: chroma row `r` averages luma row `r << ss_y`, and
+        // the luma operand is a horizontal pair at `ss_x == 1` and the sample
+        // itself at `ss_x == 0` -- `grain_synthesis.c:683-691`.
+        let pair = ss.x == 1;
         for r in 0..ch {
             let (cs, ce) = ((r * cw) as usize, ((r + 1) * cw) as usize);
-            let (ls, le) = ((2 * r * w) as usize, (2 * r * w + w) as usize);
+            let lrow = (r << ss.y) as usize;
+            let lper = if pair { 2 } else { 1 };
+            let (ls, le) = (
+                lrow * w as usize,
+                lrow * w as usize + cw as usize * lper as usize,
+            );
             if fg.num_cb_points > 0 {
                 chroma_noise_row_scalar(
                     &mut out.u[cs..ce],
@@ -2015,6 +2508,7 @@ mod ragged_grain_tests {
                     fg.cb_mult as i32 - 128,
                     fg.cb_offset as i32 - 256,
                     p,
+                    pair,
                 );
             }
             if fg.num_cr_points > 0 {
@@ -2027,13 +2521,22 @@ mod ragged_grain_tests {
                     fg.cr_mult as i32 - 128,
                     fg.cr_offset as i32 - 256,
                     p,
+                    pair,
                 );
             }
         }
         if fg.num_y_points > 0 {
             for r in 0..h {
                 let (ls, le) = ((r * w) as usize, (r * w + w) as usize);
-                luma_noise_row_scalar(&mut out.y[ls..le], &nl[ls..le], &sy, ro, scaling_shift, 0, 255);
+                luma_noise_row_scalar(
+                    &mut out.y[ls..le],
+                    &nl[ls..le],
+                    &sy,
+                    ro,
+                    scaling_shift,
+                    0,
+                    255,
+                );
             }
         }
         out
@@ -2078,20 +2581,40 @@ mod ragged_grain_tests {
         let fctx = crate::decode::FrameCtx::new();
         fctx.grain_bit_depth.with(|c| c.set(8));
         let fg = params();
-        for &(w, h) in &[(64usize, 66usize), (66, 64), (64, 98), (48, 100)] {
-            let src = Picture {
-                width: w,
-                height: h,
-                y: (0..w * h).map(|i| ((i * 7 + 3) % 256) as u16).collect(),
-                u: (0..w / 2 * (h / 2)).map(|i| ((i * 11 + 5) % 256) as u16).collect(),
-                v: (0..w / 2 * (h / 2)).map(|i| ((i * 13 + 9) % 256) as u16).collect(),
-            };
-            let got = apply_grain(&src, &fg, false, 8, &fctx);
-            let want = reference(&src, &fg, &fctx);
-            assert_eq!(got.y, want.y, "{w}x{h} luma");
-            assert_eq!(got.u, want.u, "{w}x{h} cb");
-            assert_eq!(got.v, want.v, "{w}x{h} cr");
-            assert_ne!(got.y, src.y, "{w}x{h} grain actually landed");
+        // lane-av1422grain: the same transcription, driven over every chroma
+        // format the module admits. Before this lane the geometry was 4:2:0
+        // only, so 4:2:2 and 4:4:4 had NO coverage here at all -- and the
+        // defect was silent (a wrong picture, never a panic), which is exactly
+        // why the reference had to become per-axis rather than gain a second
+        // 4:2:0-shaped copy.
+        for (ss_x, ss_y, name) in [(1i32, 1i32, "420"), (1, 0, "422"), (0, 0, "444")] {
+            crate::decode::set_subsampling(ss_x as u8, ss_y as u8, &fctx);
+            for &(w, h) in &[(64usize, 66usize), (66, 64), (64, 98), (48, 100)] {
+                let (cw, ch) = (w >> ss_x as usize, h >> ss_y as usize);
+                let src = Picture {
+                    width: w,
+                    height: h,
+                    y: (0..w * h).map(|i| ((i * 7 + 3) % 256) as u16).collect(),
+                    u: (0..cw * ch).map(|i| ((i * 11 + 5) % 256) as u16).collect(),
+                    v: (0..cw * ch).map(|i| ((i * 13 + 9) % 256) as u16).collect(),
+                };
+                let got = apply_grain(&src, &fg, false, 8, &fctx);
+                let want = reference(&src, &fg, &fctx);
+                let tag = format!("{name} {w}x{h}");
+                assert_eq!(got.y, want.y, "{tag} luma");
+                assert_eq!(got.u, want.u, "{tag} cb");
+                assert_eq!(got.v, want.v, "{tag} cr");
+                assert_ne!(got.y, src.y, "{tag} grain actually landed");
+                // The whole chroma plane must be grained, not just the top
+                // half. This is THE assertion the 4:2:0-shaped geometry
+                // could not make: at 4:2:2 the plane is `height` rows tall and
+                // the old `nrows = height / 2` walk left the bottom half raw.
+                assert_ne!(
+                    &got.u[ch.saturating_sub(1) * cw..],
+                    &src.u[ch.saturating_sub(1) * cw..],
+                    "{tag}: the LAST chroma row came back clean -- the walk did not reach it"
+                );
+            }
         }
     }
 }
