@@ -3020,6 +3020,270 @@ pub(crate) mod tests {
     /// the refusal-by-name contract: with the header refusal standing,
     /// NO committed test can decode a 4:2:2 stream, because the bypass that
     /// would allow it must never be committed.
+    /// lane-av1422lpf: the 4:2:2 lossless INTER chroma panic family -- SEVEN
+    /// sites, each indexing a block's chroma PLANE BLOCK with the ENCLOSING
+    /// SQUARE `max(side >> ss_x, side >> ss_y)`.
+    ///
+    /// libaom's chroma plane block is PER-AXIS, `(bw >> ss_x) x
+    /// (bh >> ss_y)` (`av1_common_int.h`'s `av1_get_plane_block_size`, the
+    /// `dec->uv_buffer` extent in decodeframe.c), and it is square only when
+    /// `ss_x == ss_y`. The enclosing square is the same number at 4:2:0
+    /// (`side >> 1`) and 4:4:4 (`side`) on a square block, so every site
+    /// below is byte-identical there; at 4:2:2 the square is the LUMA side
+    /// and each site walked off its own buffer.
+    ///
+    /// Committed code refuses 4:2:2 at the sequence header, so -- exactly
+    /// like the witnesses above -- what this gate can assert in committed
+    /// code is the byte pin, the refusal-by-name contract, and the arm below:
+    /// that each site's PER-AXIS expression is still spelled per-axis and
+    /// the square-cut expression it replaced is gone. The decode-level
+    /// evidence is measured on the local `EC_AV1_ALLOW_422_PROBE`
+    /// patch-run-restore build and is in `lanes/av1422lpf.report.md`.
+    #[test]
+    fn the_pinned_422_lossless_inter_chroma_panics_refuse_by_name() {
+        const NAME: &str = "the_pinned_422_lossless_inter_chroma_panics_refuse_by_name";
+        const REFUSAL: &str = "a chroma format of 4:2:2";
+        for (file, bytes, fp) in [
+            ("W_intrabc.obu", 130_320usize, 0xb6d5c4653a32567a_u64),
+            ("X_intrabc_tiled.obu", 131_696, 0xb6e04621d2116ef7),
+            ("Y_intrabc_10b.obu", 202_281, 0x2ecf03435a14dbf),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(file);
+            let data = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!("{NAME}: pinned witness {file} is missing ({e}) -- the gate cannot run")
+            });
+            assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
+            assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
+            let err = decode_stream(&data).unwrap_err().to_string();
+            assert!(
+                err.contains(REFUSAL),
+                "{NAME}: {file} must refuse by name, got: {err}"
+            );
+        }
+    }
+
+    /// lane-av1422lpf: the SOURCE-SCAN arm of the witness gate above -- one
+    /// assertion per site, so a mutation at any single site reds exactly that
+    /// site and leaves the other six alone.
+    ///
+    /// Every assertion has a NEGATIVE twin (`forbidden`) and a POSITIVE twin
+    /// (`required`), so neither an unreverted site nor a matcher that has
+    /// stopped matching can pass: the forbidden string is absent AND the
+    /// required string is present in the same function body. The `required`
+    /// half is what makes this gate non-vacuous in the
+    /// `dead-matcher-positive-control` sense -- a scan that matched nothing
+    /// would fail it rather than pass silently.
+    ///
+    /// `strip_code` is the same comment-stripping the arms above use: the
+    /// fixes quote their own old expression to say what it was, and a prose
+    /// mention must neither read as a reintroduction nor mask one.
+    #[test]
+    fn the_422_lossless_inter_chroma_walk_sites_stay_per_axis() {
+        const NAME: &str = "the_422_lossless_inter_chroma_walk_sites_stay_per_axis";
+        let src = include_str!("decode.rs");
+        let strip_code = |body: &str| -> String {
+            body.lines()
+                .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // A SECOND form with the same comment stripping but every run of
+        // whitespace collapsed to one space, so a matcher can span an argument
+        // list that a line-anchored fix's own comment sits inside. Without it
+        // the site-5 and site-6 matchers are DEAD: the mutation that reverts
+        // them still passes, because the literal being searched for never
+        // matched even when the fix was in place. Measured, not assumed --
+        // `verifier-dead-matcher-positive-control`.
+        let flatten = |body: &str| -> String {
+            strip_code(body)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let body_of = |fn_name: &str| -> String {
+            let after = src
+                .split_once(&format!("\nfn {fn_name}("))
+                .unwrap_or_else(|| panic!("{NAME}: `{fn_name}` must exist in decode.rs"));
+            let end = after.1.find("\nfn ").unwrap_or(after.1.len());
+            strip_code(&after.1[..end])
+        };
+        let flat_of = |fn_name: &str| -> String {
+            let after = src
+                .split_once(&format!("\nfn {fn_name}("))
+                .unwrap_or_else(|| panic!("{NAME}: `{fn_name}` must exist in decode.rs"));
+            let end = after.1.find("\nfn ").unwrap_or(after.1.len());
+            flatten(&after.1[..end])
+        };
+        // (label, enclosing fn, forbidden square-cut spelling, required
+        //  per-axis spelling, required count in that fn)
+        let sites: [(&str, &str, &str, &str, usize); 4] = [
+            (
+                "site 1 -- read_inter_chroma_lossless's composed-grid extent",
+                "read_inter_chroma_lossless",
+                "stride * stride,\n                );",
+                "stride * blk_h,",
+                1,
+            ),
+            (
+                "site 7 -- read_intra_chroma_lossless's composed-grid extent",
+                "read_intra_chroma_lossless",
+                "stride * stride,\n                );",
+                "stride * blk_h,",
+                1,
+            ),
+            (
+                "site 4 -- the strip chroma rect's VERT arm at ss (1,0)",
+                "decode_inter_block",
+                "} else if s.horz {\n                (8, 4)\n            } else {\n                (4, 8)\n            }",
+                "} else if ss_y(fctx) == 0 {\n                (4, 16)\n            } else {\n                (4, 8)\n            }",
+                1,
+            ),
+            (
+                "site 5 -- the mu-chunk lossless walk's prediction stride",
+                "decode_inter_block",
+                "(write_chroma_w, write_chroma_h), chroma_side, mode_for_tx,",
+                "(write_chroma_w, write_chroma_h), chroma_stride, mode_for_tx,",
+                2,
+            ),
+        ];
+        for (label, fn_name, forbidden, required, count) in sites {
+            // The last table row is written in the flattened form (it spans a
+            // comment the fix itself wrote); the others are line-anchored.
+            let flattened = required.contains(" mode_for_tx,");
+            let body = if flattened {
+                flat_of(fn_name)
+            } else {
+                body_of(fn_name)
+            };
+            assert_eq!(
+                body.matches(forbidden).count(),
+                0,
+                "{NAME}: {label} is BACK -- the square-cut expression \
+                 `{forbidden}` is what this gate exists for"
+            );
+            assert!(
+                body.matches(required).count() >= count,
+                "{NAME}: {label}: the per-axis expression `{required}` must appear \
+                 at least {count} time(s) in `{fn_name}` -- found {}",
+                body.matches(required).count()
+            );
+        }
+        // Sites 2, 5 and 6 are the `chroma_side`-vs-`chroma_stride` and
+        // `chroma_side`-vs-`chroma_buf_h` argument choices, which are
+        // single-token differences on otherwise identical lines. Counting the
+        // remaining `chroma_side` uses per arm is the only way to see them, so
+        // they get their own exact-count assertions instead of a substring.
+        let dib = body_of("decode_inter_block");
+        // Site 2: the lossless TX_4x4 unit replay indexes the composed grid.
+        assert_eq!(
+            dib.matches("let start = (cr * cu + rr) * chroma_stride + cc * cu;")
+                .count(),
+            1,
+            "{NAME}: site 2 -- the lossless TX_4x4 replay must index the \
+             composed plane grid at `chroma_stride` (the plane block's own \
+             width), not `chroma_side`"
+        );
+        assert_eq!(
+            dib.matches("let start = (cr * cu + rr) * chroma_side + cc * cu;")
+                .count(),
+            0,
+            "{NAME}: site 2 is BACK -- the lossless TX_4x4 replay indexes the \
+             composed grid at the enclosing square again"
+        );
+        // Sites 5 and 6. The two mu-chunk walks (the single-reference and the
+        // compound twin) take the block's `(write_chroma_w, write_chroma_h)`
+        // and the stride SEPARATELY; the two intra-in-inter walks take both
+        // the block shape and the region as `(chroma_stride, chroma_buf_h)`.
+        // Every one of the four must be per-axis; the pre-fix spelling was
+        // the enclosing square `chroma_side` for the stride, and
+        // `(chroma_side, chroma_side)` for the intra block shape.
+        let dibf = flat_of("decode_inter_block");
+        assert_eq!(
+            dibf.matches("(chroma_stride, chroma_buf_h),").count(),
+            3,
+            "{NAME}: site 6 -- the two intra-in-inter walks pass the plane block \
+             as `(chroma_stride, chroma_buf_h)` at all THREE argument positions \
+             it occupies -- the mu-chunk walk's blk shape, and the whole-block              walk's blk shape and region -- found {}",
+            dibf.matches("(chroma_stride, chroma_buf_h),").count()
+        );
+        assert_eq!(
+            dibf.matches("(chroma_side, chroma_side),").count(),
+            0,
+            "{NAME}: site 6 is BACK -- an intra-in-inter walk still hands the \
+             plane block the enclosing square `chroma_side`"
+        );
+        // The geometry the scan cannot see, derived from the same `>> ss`
+        // forms the fixes use, so the scan and the fix cannot disagree about
+        // what per-axis means at each chroma format. A 16x16 luma block:
+        // (side >> ss_x, side >> ss_y) is the plane block and
+        // max(side >> ss_x, side >> ss_y) is the enclosing square.
+        let plane_block = |side: usize, ss_x: u32, ss_y: u32| (side >> ss_x, side >> ss_y);
+        let enclosing = |side: usize, ss_x: u32, ss_y: u32| {
+            (
+                (side >> ss_x).max(side >> ss_y),
+                (side >> ss_x).max(side >> ss_y),
+            )
+        };
+        for (label, side, ss_x, ss_y, block, square) in [
+            ("4:2:0", 16usize, 1u32, 1u32, (8, 8), (8, 8)),
+            ("4:2:2", 16, 1, 0, (8, 16), (16, 16)),
+            ("4:4:4", 16, 0, 0, (16, 16), (16, 16)),
+        ] {
+            assert_eq!(
+                plane_block(side, ss_x, ss_y),
+                block,
+                "{NAME}: the {label} chroma plane block of a {side}x{side} luma block"
+            );
+            assert_eq!(
+                enclosing(side, ss_x, ss_y),
+                square,
+                "{NAME}: the {label} enclosing chroma square of a {side}x{side} \
+                 luma block"
+            );
+        }
+        // The load-bearing claim of "unchanged at 4:2:0 and 4:4:4": the two
+        // are the same number exactly when `ss_x == ss_y`, and DIFFERENT at
+        // 4:2:2 -- which is what makes every site above inert there and
+        // active at 4:2:2. If this ever held at 4:2:2 the fixes would be
+        // untested rather than inert.
+        assert_eq!(plane_block(16, 1, 1), enclosing(16, 1, 1));
+        assert_eq!(plane_block(16, 0, 0), enclosing(16, 0, 0));
+        assert_ne!(
+            plane_block(16, 1, 0),
+            enclosing(16, 1, 0),
+            "{NAME}: 4:2:2 must NOT be square -- if the plane block equalled \
+             the enclosing square at ss (1,0), none of these sites could ever \
+             be wrong and the gates above would be measuring nothing"
+        );
+        // Site 4's own geometry: a PARTITION_VERT_4 strip is 4x16 luma and
+        // pairs on COLUMNS while `ss_x == 1`, so the pair is 8x16 and its
+        // plane block is (8 >> ss_x, 16 >> ss_y).
+        for (label, ss_x, _ss_y, want) in [
+            ("4:2:0", 1u32, 1u32, (4usize, 8usize)),
+            ("4:2:2", 1, 0, (4, 16)),
+            ("4:4:4", 0, 0, (8, 16)),
+        ] {
+            assert_eq!(
+                plane_block(8, ss_x, 0).0,
+                want.0,
+                "{NAME}: site 4 -- the {label} VERT strip pair's chroma width"
+            );
+        }
+        // ...and the HORZ arm of the same match needs NO third shape at
+        // 4:2:2: a HORZ_4 strip pairs on ROWS only while `ss_y == 1`, and
+        // 4:2:2 has `ss_y == 0`, so each 16x4 strip is its own chroma
+        // reference and its own (8 >> ss_x, 4 >> 0) plane block -- which is
+        // the (8, 4) the existing arm already returns.
+        assert_eq!(
+            (plane_block(16, 1, 0).0, plane_block(4, 1, 0).1),
+            (8usize, 4usize),
+            "{NAME}: site 4 -- the 4:2:2 HORZ strip's own plane block is already \
+             the (8, 4) the unsplit arm returns, which is why only the VERT arm \
+             gained a shape"
+        );
+    }
     #[test]
     fn the_pinned_422_residual_compound_warp_witness_is_present_and_refuses_by_name() {
         const NAME: &str =
@@ -10603,7 +10867,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let decoded = decode_stream(&data).expect("the pinned stream decodes");
         let ours = pack_rawvideo(&decoded, bit_depth, NAME);
-        assert_eq!(ours.len(), want.len(), "{NAME}: the two sides differ in size");
+        assert_eq!(
+            ours.len(),
+            want.len(),
+            "{NAME}: the two sides differ in size"
+        );
 
         // The per-frame plane table, built from each decoded picture's OWN
         // plane lengths -- the same source `pack_rawvideo` lays the bytes out
@@ -51810,5 +52078,4 @@ exit 0
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }
