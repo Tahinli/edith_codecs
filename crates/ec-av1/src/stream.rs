@@ -8361,6 +8361,122 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1444altref: the 4:4:4 LOSSLESS + altref chroma residual this
+    /// lane closed -- 317 wrong bytes, Y exact, on
+    /// `fixtures/ll444_c_altref_leaf8_warp.obu` (512220 bytes, sha256
+    /// `999a41d88a092840456d5e9de83590ab819a8a14686a694889e63c2258ff2bb8`;
+    /// the cell is committed here byte for byte, never re-encoded, and its
+    /// `aomenc` recipe is still unrecorded -- see
+    /// `lanes/av1444altref.report.md`).
+    ///
+    /// The defect: `decode_inter_block8`'s COMPOUND arm warped its LUMA
+    /// intermediates (`warp_affine_compound`) and left BOTH CHROMA arms
+    /// translational. libaom warps per PLANE
+    /// (`build_inter_predictors_8x8_and_bigger`,
+    /// reconinter_template.inc:230, runs `av1_init_warp_params` +
+    /// `av1_warp_plane` inside the plane loop with that plane's
+    /// subsampling and origin). A GLOBALMV (affine) 8x8 leaf's MV is the
+    /// affine's local derivative, so a translation agrees with the warp at
+    /// the block's top-left corner and drifts apart toward its bottom-right
+    /// -- the measured signature, a bottom-right-biased +/-1 gradient in a
+    /// few 8x8 chroma cells of hidden altref pictures while luma stayed exact.
+    ///
+    /// The assertion is BYTE-EXACTNESS on all three planes of all 16
+    /// displayed frames against the oracle aomdec, never a route counter. The
+    /// `flip` arm is the oracle-flip control: it rotates ONE byte of the
+    /// oracle's own rawvideo output and requires the same comparator to
+    /// report exactly that one sample, so the zeros above are a live
+    /// comparison and not an empty or short zip (class
+    /// `stale-output-faked-measurement`). `compound_warp_hits_8`'s delta is
+    /// the supplementary reachability witness: it proves the 8x8 compound
+    /// warp-leaf arm -- the body the fix lives in -- actually ran on this
+    /// cell (class `gate-blind-to-feature`).
+    #[test]
+    fn a_lossless_444_altref_leaf8_warp_chroma_is_byte_exact() {
+        const NAME: &str = "a_lossless_444_altref_leaf8_warp_chroma_is_byte_exact";
+        const FIXTURE_LEN: usize = 512_220;
+        const FIXTURE_FNV: u64 = 0xbe0a_569f_3d13_1026;
+        const W: usize = 320;
+        const H: usize = 240;
+        const FRAMES: usize = 16;
+        let stream =
+            std::fs::read(crate_pin("ll444_c_altref_leaf8_warp.obu")).unwrap_or_else(|e| {
+                panic!(
+                    "{NAME}: pinned fixture ll444_c_altref_leaf8_warp.obu is missing ({e}) -- \
+                     the gate cannot run, which is a failure, not a skip"
+                )
+            });
+        assert_eq!(stream.len(), FIXTURE_LEN, "{NAME}: fixture length moved");
+        assert_eq!(fnv1a64(&stream), FIXTURE_FNV, "{NAME}: fixture bytes moved");
+        assert_eq!(
+            stream_bit_depth(&stream, NAME),
+            8,
+            "{NAME}: this cell is 8-bit"
+        );
+
+        let _guard = lock_gate_counters();
+        // The pin is 18 decode-order pictures for 16 displayed frames (two
+        // hidden altrefs); the geometry assert is on the DISPLAYED frames,
+        // which is what aomdec's --rawvideo emits and what the comparator
+        // packs.
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
+        assert_eq!(frames.len(), FRAMES, "{NAME}: displayed frame count");
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: frame {i} dimensions");
+        }
+
+        if !aomdec_available(NAME) {
+            return;
+        }
+        // ---- arm 1: the real oracle, every plane byte-identical ----------
+        let (wy, wu, wv, n, exact) =
+            count_rawvideo_diffs(&stream, NAME, None).unwrap_or_else(|| {
+                panic!(
+                    "{NAME}: the two sides are not the same size -- a zip-truncated compare \
+                     would report zero and hide the whole chroma span"
+                )
+            });
+        assert_eq!(
+            (wy, wu, wv),
+            (0, 0, 0),
+            "{NAME}: {wy} Y / {wu} U / {wv} V samples differ from the oracle \
+             (class altref-444-leaf8-chroma-unwarped)"
+        );
+        assert_eq!(
+            (n, exact),
+            (FRAMES, FRAMES),
+            "{NAME}: every displayed frame must be byte-identical to the oracle's"
+        );
+
+        // ---- arm 2: the ORACLE-FLIP CONTROL -----------------------------
+        // One byte of the oracle's own output (the first U sample of frame 0),
+        // rotated in the comparator. The count MUST move, by exactly one, in
+        // the U plane only: a comparator that ignored the reference, or zipped
+        // a truncated buffer, would still report zero here.
+        let (cy, cu, cv, cn, _) = count_rawvideo_diffs(&stream, NAME, Some(W * H))
+            .unwrap_or_else(|| panic!("{NAME}: the control arm could not compare at all"));
+        assert_eq!(
+            (cy, cu, cv),
+            (0, 1, 0),
+            "{NAME}: the oracle-flip control did not move the count -- this gate's zero is \
+             vacuous, not exact"
+        );
+        assert_eq!(
+            cn, FRAMES,
+            "{NAME}: the control arm must still see every frame"
+        );
+
+        // ---- supplementary reachability witness -------------------------
+        let before8 = crate::decode::compound_warp_hits_8();
+        let _ = decode_stream(&stream).expect("the reachability witness re-decodes the pin");
+        assert!(
+            crate::decode::compound_warp_hits_8() > before8,
+            "{NAME}: no 8x8 compound warp leaf ran on this cell, so the fixed body was never \
+             reached and the byte compare above proved nothing (class gate-blind-to-feature)"
+        );
+    }
+
     /// lane-av1-444sb: the byte-exact pin for the ss-aware 128-rect chroma
     /// unit walk (`decode_block_128rect`). The parent walk hardcoded the
     /// 4:2:0 mu-chunk span -- one 32x32 chroma unit per 64x64 chunk, chunk
@@ -16298,7 +16414,11 @@ exit 0
             "{name}: the committed pin {pin} is {} bytes, this gate names {pin_len}",
             stream.len()
         );
-        assert_eq!(fnv1a64(&stream), pin_fnv, "{name}: the committed pin {pin} moved");
+        assert_eq!(
+            fnv1a64(&stream),
+            pin_fnv,
+            "{name}: the committed pin {pin} moved"
+        );
         if have_aomenc() {
             assert_eq!(
                 live.len(),
@@ -16364,8 +16484,9 @@ exit 0
             let _ = std::fs::remove_dir_all(&dir);
             // The +1 control (part 6): clean is all-zero, one flipped oracle
             // byte is exactly +1 luma byte and one fewer exact frame.
-            let clean = count_rawvideo_diffs(&stream, name, None)
-                .unwrap_or_else(|| panic!("{name}: our packed output and the oracle's rawvideo differ in SIZE"));
+            let clean = count_rawvideo_diffs(&stream, name, None).unwrap_or_else(|| {
+                panic!("{name}: our packed output and the oracle's rawvideo differ in SIZE")
+            });
             assert_eq!(
                 clean,
                 (0, 0, 0, frames, frames),
@@ -16445,8 +16566,7 @@ exit 0
     /// with screen content tools" blocked while decoding exactly.
     #[test]
     fn a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact";
+        const NAME: &str = "a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact";
         const PIN: &str = "screen12_palette.obu";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
@@ -16468,7 +16588,15 @@ exit 0
             Vec::new()
         };
         assert_12bit_screen_content_arm(
-            NAME, PIN, live, PIN_LEN_PALETTE, PIN_FNV_PALETTE, 2, 160, 128, false,
+            NAME,
+            PIN,
+            live,
+            PIN_LEN_PALETTE,
+            PIN_FNV_PALETTE,
+            2,
+            160,
+            128,
+            false,
         );
     }
 
@@ -16514,7 +16642,15 @@ exit 0
             Vec::new()
         };
         assert_12bit_screen_content_arm(
-            NAME, PIN, live, PIN_LEN_INTRABC, PIN_FNV_INTRABC, 1, 256, 192, true,
+            NAME,
+            PIN,
+            live,
+            PIN_LEN_INTRABC,
+            PIN_FNV_INTRABC,
+            1,
+            256,
+            192,
+            true,
         );
     }
 
@@ -16528,8 +16664,7 @@ exit 0
     /// `ec7942c96763593e6d8e4b3fb23c03930bba3bb743102d0cf552fe73ae11c203`).
     #[test]
     fn a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact";
+        const NAME: &str = "a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact";
         const PIN: &str = "screen12_lossless_palette.obu";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
@@ -16552,7 +16687,15 @@ exit 0
             Vec::new()
         };
         assert_12bit_screen_content_arm(
-            NAME, PIN, live, PIN_LEN_LOSSLESS, PIN_FNV_LOSSLESS, 2, 160, 128, false,
+            NAME,
+            PIN,
+            live,
+            PIN_LEN_LOSSLESS,
+            PIN_FNV_LOSSLESS,
+            2,
+            160,
+            128,
+            false,
         );
     }
 

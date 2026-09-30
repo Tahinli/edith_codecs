@@ -4662,7 +4662,7 @@ fn exec_mc(
         1 => &mut *u,
         _ => &mut *v,
     };
-    target.reconstruct_mc_rect(x, oy, stride, w, h, prediction, residual, fctx);
+    target.reconstruct_mc_rect(x, oy, plane, stride, w, h, prediction, residual, fctx);
 }
 
 thread_local! {
@@ -37135,6 +37135,7 @@ impl PlaneBuf<'_> {
         &mut self,
         x: usize,
         y: usize,
+        plane: usize,
         side: usize,
         w: usize,
         h: usize,
@@ -37168,6 +37169,43 @@ impl PlaneBuf<'_> {
                 residual.is_empty(),
                 std::panic::Location::caller()
             );
+        }
+        // lane-av1444altref r2: EC_CPRED, the picture-independent twin of the
+        // oracle's rung of the same name (aomdec's
+        // `dec_build_inter_predictor`).  This is the ONE site every inter
+        // prediction reaches on its way into a plane -- after the compound
+        // blend and after the inter-intra blend, before the residual -- so it
+        // measures exactly the quantity the oracle's rung measures.  Pairing
+        // is by (plane, x, y, w, h): the same chroma geometry recurs in many
+        // pictures, so a rung line alone is ambiguous, but a geometry whose
+        // samples differ by at most 1 is a unique match (any wrong pairing
+        // differs by tens).
+        // Env: EC_CPRED="x:y" (plane-absolute origin; -1 for either = any).
+        if let Ok(spec) = crate::envflags::var("EC_CPRED") {
+            let (fx, fy): (i64, i64) = spec
+                .split_once(':')
+                .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
+                .unwrap_or((-1, -1));
+            let hit = (fx < 0 || fx == x as i64) && (fy < 0 || fy == y as i64);
+            if hit {
+                // `PREFILT_PICTURE_IDX` is bumped once per frame just AFTER
+                // that frame's `flush_recon`, so it still reads this frame's own
+                // decode-order index here -- the same numbering the oracle's
+                // `aom_ec_pict_idx` and the `.fN` prefilter dumps use.
+                let pict = PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst);
+                eprintln!(
+                    "OUR_CPRED pict={pict} plane={plane} x={x} y={y} w={w} h={h} side={side}"
+                );
+                for row in 0..h {
+                    let src = &prediction[row * side..row * side + w];
+                    let mut line = String::with_capacity(w * 4);
+                    for v in src {
+                        line.push(' ');
+                        line.push_str(&v.to_string());
+                    }
+                    eprintln!("OUR_CPROW{row}:{line}");
+                }
+            }
         }
         // lane-recoparse: an all-zero residual (60% of the units) is a plain
         // prediction copy -- the same arithmetic with `r == 0`, without
@@ -49274,6 +49312,46 @@ fn decode_inter_block8(
                         &mut inter0_u,
                         fctx,
                     );
+                    // lane-av1444altref r3: this leaf warped its LUMA
+                    // intermediates (`warp0_c`/`warp1_c` above) but left both
+                    // CHROMA arms translational.  libaom warps per PLANE:
+                    // `build_inter_predictors_8x8_and_bigger`
+                    // (reconinter_template.inc:230) runs the whole
+                    // `av1_init_warp_params` + `av1_warp_plane` pair for every
+                    // plane of the block, chroma included, with
+                    // `pd->subsampling_x/y` and the plane's own origin/extent.
+                    // A global-motion (warp) 8x8 leaf at 4:4:4 therefore had
+                    // its chroma predicted from the block's top-left
+                    // translation instead of the affine map -- the MV is the
+                    // affine's local derivative, so the two agree at the
+                    // block's top-left corner and drift apart toward its
+                    // bottom-right, which is exactly the measured signature
+                    // (a bottom-right-biased +/-1 gradient in 8x8 chroma
+                    // cells of the 4:4:4 altref cell `ll444_c`, luma exact).
+                    // `warp_plane_allowed` mirrors `av1_init_warp_params`'s
+                    // `block_width < 8 || block_height < 8` bail, so a
+                    // subsampled plane's sub-8 chroma block stays
+                    // translational exactly as the 16x16+ arm above does.
+                    if let Some(wp) = &warp0_c {
+                        if warp_plane_allowed(chroma_w, chroma_h) {
+                            crate::warp::warp_affine_compound(
+                                wp,
+                                &pu0.data,
+                                pu0.true_width as i32,
+                                pu0.true_height as i32,
+                                pu0.width as i32,
+                                &mut inter0_u,
+                                cpx as i32,
+                                cpy as i32,
+                                chroma_w as i32,
+                                chroma_h as i32,
+                                chroma_w as i32,
+                                ss_x(fctx) as i32,
+                                ss_y(fctx) as i32,
+                                fctx,
+                            );
+                        }
+                    }
                     let mut inter1_u = vec![0i32; chroma_w * chroma_h];
                     mc::predict_compound_intermediate(
                         &pu1.data,
@@ -49290,6 +49368,26 @@ fn decode_inter_block8(
                         &mut inter1_u,
                         fctx,
                     );
+                    if let Some(wp) = &warp1_c {
+                        if warp_plane_allowed(chroma_w, chroma_h) {
+                            crate::warp::warp_affine_compound(
+                                wp,
+                                &pu1.data,
+                                pu1.true_width as i32,
+                                pu1.true_height as i32,
+                                pu1.width as i32,
+                                &mut inter1_u,
+                                cpx as i32,
+                                cpy as i32,
+                                chroma_w as i32,
+                                chroma_h as i32,
+                                chroma_w as i32,
+                                ss_x(fctx) as i32,
+                                ss_y(fctx) as i32,
+                                fctx,
+                            );
+                        }
+                    }
                     let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_w * chroma_h);
                     if let Some(mask_y) = mask_y {
                         mc::blend_masked_compound(
@@ -49331,6 +49429,28 @@ fn decode_inter_block8(
                         &mut inter0_v,
                         fctx,
                     );
+                    // lane-av1444altref r3: the V arm's missing per-plane warp,
+                    // same defect and same fix as U above.
+                    if let Some(wp) = &warp0_c {
+                        if warp_plane_allowed(chroma_w, chroma_h) {
+                            crate::warp::warp_affine_compound(
+                                wp,
+                                &pv0.data,
+                                pv0.true_width as i32,
+                                pv0.true_height as i32,
+                                pv0.width as i32,
+                                &mut inter0_v,
+                                cpx as i32,
+                                cpy as i32,
+                                chroma_w as i32,
+                                chroma_h as i32,
+                                chroma_w as i32,
+                                ss_x(fctx) as i32,
+                                ss_y(fctx) as i32,
+                                fctx,
+                            );
+                        }
+                    }
                     let mut inter1_v = vec![0i32; chroma_w * chroma_h];
                     mc::predict_compound_intermediate(
                         &pv1.data,
@@ -49347,6 +49467,26 @@ fn decode_inter_block8(
                         &mut inter1_v,
                         fctx,
                     );
+                    if let Some(wp) = &warp1_c {
+                        if warp_plane_allowed(chroma_w, chroma_h) {
+                            crate::warp::warp_affine_compound(
+                                wp,
+                                &pv1.data,
+                                pv1.true_width as i32,
+                                pv1.true_height as i32,
+                                pv1.width as i32,
+                                &mut inter1_v,
+                                cpx as i32,
+                                cpy as i32,
+                                chroma_w as i32,
+                                chroma_h as i32,
+                                chroma_w as i32,
+                                ss_x(fctx) as i32,
+                                ss_y(fctx) as i32,
+                                fctx,
+                            );
+                        }
+                    }
                     let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_w * chroma_h);
                     if let Some(mask_y) = mask_y {
                         mc::blend_masked_compound(
@@ -50230,13 +50370,15 @@ fn decode_inter_block8(
                     0,
                     fctx,
                 );
-                // `av1_init_warp_params`'s per-plane `block_width/height < 8`
-                // bail-out: an 8x8 leaf's chroma plane block is narrower than 8
+                // `av1_init_warp_params`'s per-plane bail-out is on BOTH
+                // extents (`block_height < 8 || block_width < 8`,
+                // reconinter.c:61): an 8x8 leaf's chroma plane block is under 8
                 // at any subsampled format (4:2:0 4x4, 4:2:2 4x8), so it is
                 // predicted translationally even when the luma warps; 4:4:4's
-                // 8x8 chroma warps with the luma.
-                #[allow(clippy::absurd_extreme_comparisons)]
-                if chroma_w >= 8 {
+                // 8x8 chroma warps with the luma, and a rect chroma block 8 wide
+                // but under 8 high (4:2:2 BLOCK_8X4) stays translational too.
+                // lane-av1444altref r3: this arm tested only the width.
+                if warp_plane_allowed(chroma_w, chroma_h) {
                     crate::warp::warp_affine(
                         params,
                         &sref_u.data,
