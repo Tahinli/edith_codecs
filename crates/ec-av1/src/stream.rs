@@ -1777,10 +1777,21 @@ fn decode_frame(
     // name` below (hand-built profile 1/2 headers plus a real aomenc 4:4:4
     // stream).
     // lane-av1-444: 4:4:4 (ss 0,0) is decoded. 4:2:2 (ss_x != ss_y) is not.
+    // lane-av1odd440: the CONDITION is left as `ss_x != ss_y` because that is
+    // what a parsed header can violate, but the STRING now names the only
+    // shape that can: `subsampling_y` is coded ONLY when `subsampling_x` is
+    // 1 (spec 5.5.2's `color_config`; libaom `av1_read_color_config`,
+    // `av1/decoder/decodeframe.c:4171-4175`, and its writer's own
+    // `assert(seq_params->subsampling_y == 0 && "4:4:0 subsampling not
+    // allowed in AV1")`, `av1/encoder/bitstream.c:2467-2468`), so a header can
+    // carry (1,1), (1,0) or (0,0) and never (0,1) -- 4:4:0 is not a cell a
+    // decoder can be handed at all. The gate
+    // `the_440_cell_is_not_a_codable_chroma_shape` proves the whole reachable
+    // set, so this string is not a claim about a shape that cannot arrive.
     if seq.subsampling_x != seq.subsampling_y {
         return Err(Error::unsupported(
             "AV1 decode_stream",
-            "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported",
+            "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported, and 4:4:0 (0,1) is not a codable cell",
         ));
     }
     // lane-av1-qmatrix: `quantization_params.using_qmatrix` + `qm_y`/`qm_u`/
@@ -2303,6 +2314,390 @@ pub(crate) mod tests {
             frames.len(),
             1,
             "{NAME}: the 4:2:0 control decoded no frame"
+        );
+    }
+
+    /// lane-av1odd440, CELL 1 of 2: `4:2:0 with an ODD luma dimension`, the
+    /// cell `lanes/av1formatsweep.report.md` left as declared debt because
+    /// "aomenc rounds a 4:2:0 frame's coded size DOWN to even, so no stream
+    /// this recipe can produce codes an odd luma dimension".
+    ///
+    /// The pin, `420_odd65x65_key.obu` (2305 bytes,
+    /// sha256 `66986019a561f81130f407f426c4379b25e6e80c2cd9ce47d517b3216e9a03cf`),
+    /// is that missing stream, built offline by
+    /// `examples/gen_coverage_cells.rs`: a 96x96 card padded to the block
+    /// grid, coded by `encode::encode_key_frame_at_size` with a 65x65 frame
+    /// header. Provenance: that example, `cargo run -p ec-av1 --example
+    /// gen_coverage_cells -- crates/ec-av1/fixtures`; no encoder, no ffmpeg,
+    /// no lavfi.
+    ///
+    /// WHY THE CELL IS NOT A RUBBER STAMP -- the chroma extent is where a
+    /// floor shows. A 65-wide 4:2:0 frame has
+    /// `ROUND_POWER_OF_TWO(65, 1) = 33` chroma columns (libaom
+    /// `av1_common_plane_width`, `av1/common/av1_common_int.h`), not 32, so
+    /// the decoded frame's own plane sizes, the rawvideo sample count and
+    /// the oracle compare all move if `decode::round_ss` is floored. The
+    /// mutation was run: flooring `round_ss` (`decode.rs:697`) turns the
+    /// `round_ss` assert below red at 32 chroma columns and the oracle arm
+    /// red at a 6273-byte raw against the oracle's 6403. The gate is
+    /// therefore not green on a floored decoder, which is the whole content
+    /// of this cell.
+    ///
+    /// The stream decodes PIXEL-EXACT against the instrumented `aomdec`
+    /// (6403 raw bytes = 65*65 + 2*33*33, byte-identical), so the cell is a
+    /// `y` and not a `–`.
+    #[test]
+    fn an_odd_luma_420_key_frame_decodes_pixel_exact() {
+        const NAME: &str = "an_odd_luma_420_key_frame_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("420_odd65x65_key.obu");
+        let stream = read_pin(&path, 2305, 0xf55645c4b139e8f7, NAME);
+
+        // The stream's OWN header, read from its own bytes: an odd luma size
+        // at 4:2:0, which is the cell. (Taken from the pin, not from the
+        // gate's name -- class `helper-packs-u16-for-an-8-bit-stream`.)
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{NAME}: OBU at byte {pos} does not parse: {e:?}"));
+            pos += obu.total_size;
+        }
+        let seq = probe
+            .sequence_header()
+            .unwrap_or_else(|| panic!("{NAME}: the pin carries no sequence header"));
+        assert_eq!(
+            (seq.max_frame_width, seq.max_frame_height),
+            (65, 65),
+            "{NAME}: the pin must declare an ODD luma size, it declares {}x{}",
+            seq.max_frame_width,
+            seq.max_frame_height
+        );
+        assert_eq!(
+            (
+                seq.color_config.subsampling_x,
+                seq.color_config.subsampling_y
+            ),
+            (1, 1),
+            "{NAME}: this cell is an odd luma SIZE at 4:2:0, not another chroma shape"
+        );
+
+        // The decoded frame's own extents. This arm needs no oracle, and it
+        // is the one a floored `round_ss` turns red.
+        let frames = decode_stream(&stream).expect("the odd-luma 4:2:0 pin must decode");
+        assert_eq!(frames.len(), 1, "{NAME}: frame count");
+        let frame = &frames[0];
+        assert_eq!(
+            (frame.width, frame.height),
+            (65, 65),
+            "{NAME}: decoded luma extent"
+        );
+        assert_eq!(frame.y.len(), 65 * 65, "{NAME}: decoded luma sample count");
+        assert_eq!(
+            (frame.u.len(), frame.v.len()),
+            (33 * 33, 33 * 33),
+            "{NAME}: a 65x65 4:2:0 frame has ROUND_POWER_OF_TWO(65,1) = 33 chroma \
+             columns and rows -- 32 means the extent was floored"
+        );
+
+        if !aomdec_available(NAME) {
+            return;
+        }
+        assert_rawvideo_matches(&path, &stream, NAME, 1, 8);
+    }
+
+    /// lane-av1odd440, CELL 2 of 2: the `4:4:0 (ss 0,1)` row, which the same
+    /// report called "unmeasured and unproducible by recipe". It is neither
+    /// unmeasured nor unproducible: it is NOT A CELL AT ALL.
+    ///
+    /// `subsampling_y` is coded only when `subsampling_x` is 1 (spec 5.5.2
+    /// `color_config`), so a sequence header can carry exactly three chroma
+    /// shapes -- 4:2:0 `(1,1)`, 4:2:2 `(1,0)`, 4:4:4 `(0,0)` -- and never
+    /// `(0,1)`. libaom says so in both directions: the reader leaves
+    /// `subsampling_y = 0` when `subsampling_x` is 0
+    /// (`av1_read_color_config`, `av1/decoder/decodeframe.c:4171-4175`) and
+    /// the writer ASSERTS it -- `assert(seq_params->subsampling_y == 0 &&
+    /// "4:4:0 subsampling not allowed in AV1")`, `av1/encoder/bitstream.c:
+    /// 2463-2465`. So there is no stream to decode, no fixture to pin that
+    /// a decoder could be handed, and no oracle to compare against: a
+    /// 4:4:0 row in a coverage matrix is a matrix bug, not a decoder gap.
+    ///
+    /// What is pinned, then, is the claim itself, in three arms that a
+    /// mutation turns red:
+    ///
+    /// 1. WRITER: every `(profile, bit_depth, mono, colour description,
+    ///    requested subsampling)` combination a `color_config` can carry is
+    ///    written by this crate's own writer and read back by this crate's
+    ///    own reader. The reachable set is asserted to be EXACTLY
+    ///    `{(1,1), (1,0), (0,0)}` -- each legal shape present, `(0,1)`
+    ///    absent -- and, on the BYTES rather than on the round trip, the two
+    ///    requests that differ only in `subsampling_y` must write identical
+    ///    headers whenever `subsampling_x` is 0. A sweep that silently wrote
+    ///    nothing would pass, so the count of combinations actually written
+    ///    and read is asserted too.
+    /// 2. READER: the one byte that carries `subsampling_x` is found by
+    ///    diffing an `(0,0)` header against an `(1,0)` one, and then all 256
+    ///    values of that byte are fed back through the reader. Not one of the
+    ///    headers that parse reads back `(0,1)`, because the reader never
+    ///    reads a `subsampling_y` bit in that position. A reader that always
+    ///    read a second bit would produce `(0,1)` at the one value that sets
+    ///    both bits.
+    /// 3. THE PIN: `440_request_is_422.obu` (2014 bytes, sha256
+    ///    `4afaa5470c4e010d9d970086ef514680adfe801a579e4deeec582f52d13c5e7c`,
+    ///    fnv1a64 `0x98a1378df976253d`) is what this crate's writer produces
+    ///    when it is handed `subsampling (0,1)` at profile 2 -- profile 2
+    ///    below 12 bits is 4:2:2 and codes no subsampling bit at all, so the
+    ///    request lands on `(1,0)`. The pin is asserted to read back `(1,0)`,
+    ///    NOT `(0,1)`, and the decoder is asserted to refuse it by name,
+    ///    which is the honest outcome for the shape a 4:4:0 request actually
+    ///    yields. Its frame OBU is a 4:2:0 key frame's, so the pin is a HEADER
+    ///    witness, not a decodable 4:2:2 stream -- nothing here claims
+    ///    pixels for it. Provenance: `examples/gen_coverage_cells.rs`, `cargo
+    ///    run -p ec-av1 --example gen_coverage_cells -- crates/ec-av1/fixtures`.
+    #[test]
+    fn the_440_cell_is_not_a_codable_chroma_shape() {
+        const NAME: &str = "the_440_cell_is_not_a_codable_chroma_shape";
+        let _gate_lock = lock_gate_counters();
+        let header_obu = |profile: u8, color: ec_av1_syntax::ColorConfig| -> Vec<u8> {
+            let (mut seq, _header) = crate::encode::key_frame_headers_colour(64, 64, 100, color)
+                .expect("the header builders accept a colour config");
+            seq.seq_profile = profile;
+            crate::sequence::sequence_header_obu(&seq).expect("writing the sequence header")
+        };
+        let shape_of = |obu: &[u8]| -> Option<(u8, u8)> {
+            let mut parser = Av1Parser::new();
+            let parsed = parser.parse_obu(obu).ok()?;
+            if !matches!(parsed.kind, ec_av1_syntax::ObuKind::SequenceHeader(_)) {
+                return None;
+            }
+            let seq = parser.sequence_header()?;
+            Some((
+                seq.color_config.subsampling_x,
+                seq.color_config.subsampling_y,
+            ))
+        };
+
+        // ---- arm 1: the writer's whole reachable space --------------------
+        let mut reachable: std::collections::BTreeSet<(u8, u8)> = Default::default();
+        let mut asked = 0usize;
+        for profile in [0u8, 1, 2] {
+            for bit_depth in [8u8, 10, 12] {
+                for mono_chrome in [false, true] {
+                    // Profile 1 is 4:4:4 and codes no mono bit; asking for
+                    // monochrome there is refused by the writer, which is
+                    // not a chroma shape and not this gate's subject.
+                    if mono_chrome && profile == 1 {
+                        continue;
+                    }
+                    for (label, (cp, tc, mc)) in [
+                        ("unspecified", (2u8, 2u8, 2u8)),
+                        ("bt709", (1u8, 1u8, 1u8)),
+                        ("srgb", (1u8, 13u8, 0u8)),
+                    ] {
+                        for sx in [0u8, 1] {
+                            for sy in [0u8, 1] {
+                                let color = ec_av1_syntax::ColorConfig {
+                                    bit_depth,
+                                    mono_chrome,
+                                    num_planes: if mono_chrome { 1 } else { 3 },
+                                    color_primaries: cp,
+                                    transfer_characteristics: tc,
+                                    matrix_coefficients: mc,
+                                    color_range: false,
+                                    subsampling_x: sx,
+                                    subsampling_y: sy,
+                                    chroma_sample_position:
+                                        ec_av1_syntax::ChromaSamplePosition::Unknown,
+                                    separate_uv_delta_q: false,
+                                };
+                                asked += 1;
+                                let obu = header_obu(profile, color);
+                                // The WRITER half of the claim, measured on the
+                                // bytes rather than on a round trip: with
+                                // `subsampling_x == 0` the spec codes no
+                                // `subsampling_y` bit at all, so the two
+                                // requests that differ ONLY in `subsampling_y`
+                                // must produce byte-identical headers. A
+                                // writer that emitted the bit anyway (the
+                                // mutation libaom's own `assert` exists to
+                                // catch, av1/encoder/bitstream.c:2467-2468) fails
+                                // here -- and note it does NOT fail the
+                                // round trip, because the reader then absorbs
+                                // the extra bit as `separate_uv_delta_q`.
+                                if sx == 0 {
+                                    let mut other = color;
+                                    other.subsampling_y = 1;
+                                    assert_eq!(
+                                        obu,
+                                        header_obu(profile, other),
+                                        "{NAME}: a (0,0) and a (0,1) request wrote DIFFERENT \
+                                         bytes at profile {profile}, {bit_depth}-bit, mono \
+                                         {mono_chrome}, {label} -- `subsampling_y` must not be \
+                                         coded at all when `subsampling_x` is 0"
+                                    );
+                                }
+                                if let Some(got) = shape_of(&obu) {
+                                    assert_ne!(
+                                        got,
+                                        (0, 1),
+                                        "{NAME}: a 4:4:0 shape came back out of the writer at \
+                                         profile {profile}, {bit_depth}-bit, mono {mono_chrome}, \
+                                         {label}, asked for ({sx},{sy}) -- libaom forbids this \
+                                         shape outright (av1/encoder/bitstream.c:2467-2468)"
+                                    );
+                                    reachable.insert(got);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            asked >= 100 && reachable.len() == 3,
+            "{NAME}: the sweep asked {asked} combinations and reached {} shapes -- it must reach \
+             all three legal ones, or it is not measuring the space",
+            reachable.len()
+        );
+        assert_eq!(
+            reachable,
+            std::collections::BTreeSet::from([(0u8, 0u8), (1u8, 0u8), (1u8, 1u8)]),
+            "{NAME}: the chroma shapes a `color_config` can code are exactly 4:4:4 (0,0), 4:2:2 \
+             (1,0) and 4:2:0 (1,1)"
+        );
+
+        // ---- arm 2: the reader's bit at that position ----------------------
+        // Profile 2 at 12 bits is the only place BOTH subsampling bits are
+        // coded, so it is where a hand-built header could try to smuggle a
+        // `subsampling_y`. Find the byte that carries `subsampling_x` by
+        // diffing the two shapes, then read back all eight of its values.
+        let at_444 = |sx: u8| {
+            let color = ec_av1_syntax::ColorConfig {
+                bit_depth: 12,
+                subsampling_x: sx,
+                subsampling_y: 0,
+                chroma_sample_position: ec_av1_syntax::ChromaSamplePosition::Unknown,
+                ..ec_av1_syntax::ColorConfig::default()
+            };
+            let (mut seq, _h) =
+                crate::encode::key_frame_headers_colour(64, 64, 100, color).unwrap();
+            seq.seq_profile = 2;
+            let obu = crate::sequence::sequence_header_obu(&seq).unwrap();
+            let mut parser = Av1Parser::new();
+            parser.parse_obu(&obu).expect("the profile-2 header parses");
+            let seq = parser.sequence_header().expect("sequence header");
+            (
+                seq.color_config.subsampling_x,
+                seq.color_config.subsampling_y,
+            )
+        };
+        assert_eq!(at_444(0), (0, 0), "{NAME}: the sx=0 header is 4:4:4");
+        assert_eq!(at_444(1), (1, 0), "{NAME}: the sx=1 header is 4:2:2");
+        let base = {
+            let color = ec_av1_syntax::ColorConfig {
+                bit_depth: 12,
+                subsampling_x: 0,
+                subsampling_y: 0,
+                chroma_sample_position: ec_av1_syntax::ChromaSamplePosition::Unknown,
+                ..ec_av1_syntax::ColorConfig::default()
+            };
+            let (mut seq, _h) =
+                crate::encode::key_frame_headers_colour(64, 64, 100, color).unwrap();
+            seq.seq_profile = 2;
+            crate::sequence::sequence_header_obu(&seq).unwrap()
+        };
+        let other = {
+            let color = ec_av1_syntax::ColorConfig {
+                bit_depth: 12,
+                subsampling_x: 1,
+                subsampling_y: 0,
+                chroma_sample_position: ec_av1_syntax::ChromaSamplePosition::Unknown,
+                ..ec_av1_syntax::ColorConfig::default()
+            };
+            let (mut seq, _h) =
+                crate::encode::key_frame_headers_colour(64, 64, 100, color).unwrap();
+            seq.seq_profile = 2;
+            crate::sequence::sequence_header_obu(&seq).unwrap()
+        };
+        assert_eq!(
+            base.len(),
+            other.len(),
+            "{NAME}: the two headers must differ in place"
+        );
+        let byte_at = base
+            .iter()
+            .zip(&other)
+            .position(|(a, b)| a != b)
+            .expect("the two shapes must differ somewhere");
+        // Every value of that byte is fed back through the reader -- it is the
+        // LAST payload byte, so the bits a smuggled `subsampling_y` would come
+        // from are in it too (spec 5.5.2 always codes `separate_uv_delta_q`
+        // after the subsampling pair, and the payload is padded out to the
+        // byte with `trailing_bits`). A header that stops parsing is not a
+        // 4:4:0 shape and cannot be counted as one; the sweep asserts how
+        // many DID parse, so a sweep that quietly parsed nothing is not
+        // evidence of anything.
+        let mut parsed_headers = 0usize;
+        for value in 0..256u16 {
+            let mut poked = base.clone();
+            poked[byte_at] = value as u8;
+            let mut parser = Av1Parser::new();
+            let Ok(parsed) = parser.parse_obu(&poked) else {
+                continue;
+            };
+            if !matches!(parsed.kind, ec_av1_syntax::ObuKind::SequenceHeader(_)) {
+                continue;
+            }
+            let seq = parser.sequence_header().expect("sequence header");
+            parsed_headers += 1;
+            assert_ne!(
+                (
+                    seq.color_config.subsampling_x,
+                    seq.color_config.subsampling_y
+                ),
+                (0, 1),
+                "{NAME}: payload byte {byte_at} = {value:#04x} read back as 4:4:0 -- the reader \
+                 took a `subsampling_y` bit that spec 5.5.2 does not code when `subsampling_x` \
+                 is 0"
+            );
+        }
+        assert!(
+            parsed_headers > 100,
+            "{NAME}: only {parsed_headers} of the 256 poked headers parsed -- the sweep is not \
+             measuring the reader"
+        );
+
+        // ---- arm 3: the pinned bytes a 4:4:0 request produces --------------
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("440_request_is_422.obu");
+        let pinned = read_pin(&path, 2014, 0x98a1378df976253d, NAME);
+        let mut parser = Av1Parser::new();
+        let obu = parser
+            .parse_obu(&pinned)
+            .unwrap_or_else(|e| panic!("{NAME}: the pin's first OBU does not parse: {e:?}"));
+        assert!(
+            matches!(obu.kind, ec_av1_syntax::ObuKind::SequenceHeader(_)),
+            "{NAME}: the pin must start with its sequence header"
+        );
+        let seq = parser.sequence_header().expect("the pin's sequence header");
+        assert_eq!(
+            (
+                seq.color_config.subsampling_x,
+                seq.color_config.subsampling_y
+            ),
+            (1, 0),
+            "{NAME}: the pin is what a 4:4:0 request at profile 2 produces -- 4:2:2 (1,0). If this \
+             ever reads (0,1), a 4:4:0 cell became codable and this whole gate is wrong about the \
+             format."
+        );
+        let err = decode_stream(&pinned).unwrap_err().to_string();
+        assert!(
+            err.contains("a chroma format of 4:2:2"),
+            "{NAME}: the shape the 4:4:0 request lands on must still refuse by name, got: {err}"
         );
     }
     /// lane-av1-422bigblock: the two witnessed 4:2:2 big-block defects, pinned
