@@ -5797,7 +5797,7 @@ pub(crate) mod tests {
         frames: usize,
     ) -> Vec<Pic> {
         let out = run_with_stdin(
-            Command::new("ffmpeg").args([
+            Command::new(ffmpeg_path()).args([
                 "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
             ]),
             stream,
@@ -5857,7 +5857,7 @@ pub(crate) mod tests {
         frames: usize,
     ) -> Vec<u8> {
         let out = run_with_stdin(
-            Command::new("ffmpeg").args([
+            Command::new(ffmpeg_path()).args([
                 "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "gray", "-",
             ]),
             stream,
@@ -5888,7 +5888,7 @@ pub(crate) mod tests {
         frames: usize,
     ) -> Vec<Pic> {
         let out = run_with_stdin(
-            Command::new("ffmpeg").args([
+            Command::new(ffmpeg_path()).args([
                 "-v",
                 "error",
                 "-f",
@@ -10221,6 +10221,33 @@ pub(crate) mod tests {
         ORACLE_PATH.with(|c| *c.borrow_mut() = path);
     }
 
+    // lane-film10fix: this thread's ffmpeg override, set by
+    // `set_ffmpeg_path` and consulted by `ffmpeg_path` ahead of the bare
+    // name. Same shape and same reason as `ORACLE_PATH` above: the control
+    // test `every_ffmpeg_comparator_reds_on_a_one_sample_wrong_ffmpeg` has
+    // to hand the `ffmpeg_decode_sequence*` helpers a DELIBERATELY WRONG
+    // reference, and a process-global PATH edit would leak that wrong
+    // reference into every sibling test decoding on another thread. The
+    // crate denies `unsafe_code`, so `std::env::set_var` is not available
+    // either; a thread-local confines the tamper to the one thread.
+    thread_local! {
+        static FFMPEG_PATH: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Points this thread's `ffmpeg_decode_sequence*` helpers at `path`.
+    /// `None` restores the real `ffmpeg` on PATH.
+    fn set_ffmpeg_path(path: Option<std::path::PathBuf>) {
+        FFMPEG_PATH.with(|c| *c.borrow_mut() = path);
+    }
+
+    /// The `ffmpeg` every reference helper in this module spawns.
+    fn ffmpeg_path() -> std::path::PathBuf {
+        if let Some(p) = FFMPEG_PATH.with(|c| c.borrow().clone()) {
+            return p;
+        }
+        std::path::PathBuf::from("ffmpeg")
+    }
 
     /// The instrumented `aomdec` beside the `aomenc` oracle
     /// (`scripts/build-aom-oracle.sh` + `scripts/instrument-aom-oracle.sh`).
@@ -10509,9 +10536,8 @@ pub(crate) mod tests {
                 (1, 0),
                 "{NAME}: arm 1 expects one decode-order frame and no hidden frames"
             );
-            let (wy, wu, wv, n, exact) =
-                count_rawvideo_diffs(&stream, "oracle-control-arm1-count")
-                    .expect("arm 1: the two sides must be byte-comparable");
+            let (wy, wu, wv, n, exact) = count_rawvideo_diffs(&stream, "oracle-control-arm1-count")
+                .expect("arm 1: the two sides must be byte-comparable");
             assert_eq!(
                 (wy, wu, wv),
                 (0, 0, 0),
@@ -10545,8 +10571,11 @@ pub(crate) mod tests {
         // The real oracle's path rides in a sibling file rather than inside
         // the script, so a path with a quote or a space cannot mangle it and
         // the script body needs no `format!` escaping at all.
-        std::fs::write(dir.join("real-aomdec"), aomdec_path().as_os_str().as_encoded_bytes())
-            .expect("recording the real oracle's path for the shim");
+        std::fs::write(
+            dir.join("real-aomdec"),
+            aomdec_path().as_os_str().as_encoded_bytes(),
+        )
+        .expect("recording the real oracle's path for the shim");
         // Byte 7 of both the `--rawvideo` output and the `EC_AV1_FINAL_DUMP`
         // frame 0 is inside the Y plane, and its value is rotated by 128 so
         // the write always changes it. Nothing else is touched: the stream,
@@ -10591,9 +10620,8 @@ exit 0
         let reds: [bool; 5];
         {
             set_oracle_path(Some(shim.clone()));
-            let panicked = |f: &dyn Fn()| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
-            };
+            let panicked =
+                |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
             let rawvideo_red = panicked(&|| {
                 let obu = std::env::temp_dir().join(format!("{NAME}-arm2.obu"));
                 std::fs::write(&obu, &stream).expect("writing the pin for arm 2");
@@ -10649,6 +10677,397 @@ exit 0
             blind.len()
         );
         eprintln!("{NAME}: all five oracle comparators red on a one-byte-wrong oracle");
+    }
+
+    /// lane-film10fix: the permanent CONTROL for the ffmpeg half of the class
+    /// `comparator-that-never-reads-the-oracle`.
+    ///
+    /// Its sibling above covers the five `aomdec` comparators. The `ffmpeg`
+    /// half had no such control, and it is the half the two 10-bit FILM gates
+    /// rest on: `a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_...`
+    /// and `a_10bit_film_frames_with_small_side_globalmv_and_rect_warp_...`
+    /// both declare "pixel-exact" purely as
+    /// `assert_eq!(ours.<plane>, ffmpeg_decode_sequence_10bit(...).<plane>)`
+    /// over 15 and 33 shown frames. If `ffmpeg_decode_sequence_10bit` ever
+    /// stopped reading ffmpeg's stdout -- packed our own samples into the
+    /// buffer it returns, say -- both gates would report exact on a decoder
+    /// that could be arbitrarily wrong, and nothing in the crate would go
+    /// red. Reading the helper's source proves it is live TODAY; only a
+    /// deliberately wrong reference proves it can FAIL.
+    ///
+    /// So this is the same two-arm shape, pointed at ffmpeg. The shim runs the
+    /// REAL ffmpeg and then rotates ONE byte of its rawvideo stdout per
+    /// offset in a sibling file, leaving the stream, the geometry, the frame
+    /// count and every other sample a genuine decode. On a pin that IS
+    /// byte-exact against real ffmpeg:
+    ///
+    /// 1. **arm 1, real ffmpeg: every helper is GREEN.** Without this arm,
+    ///    arm 2's red could just be a stream that was never exact.
+    /// 2. **arm 2, one-sample-wrong ffmpeg, PER PLANE: every helper is RED
+    ///    and the red names the plane that was tampered with.** Three arms,
+    ///    one per plane, because a helper that only ever compared luma would
+    ///    pass the Y arm and fail U and V -- and a 10-bit film gate that
+    ///    reported "exact" while ignoring chroma entirely would be exactly
+    ///    the class this controls.
+    ///
+    /// The three helpers are the whole reference surface in this module:
+    /// `ffmpeg_decode_sequence` (4:2:0 8-bit), `ffmpeg_decode_gray_sequence`
+    /// (monochrome, one plane) and `ffmpeg_decode_sequence_10bit` (the
+    /// `yuv420p10le` family both film gates use). Each is driven on a pin it
+    /// is known to be exact against: the 8-bit `420_odd65x65_key.obu` for the
+    /// first, the same stream for the third's shape arithmetic, and the
+    /// monochrome recipe the mono gate already builds for the second. The
+    /// override is thread-local, so a red arm cannot leave a tampered ffmpeg
+    /// behind for a sibling test on another thread.
+    #[test]
+    fn every_ffmpeg_comparator_reds_on_a_one_sample_wrong_ffmpeg() {
+        const NAME: &str = "every_ffmpeg_comparator_reds_on_a_one_sample_wrong_ffmpeg";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        // Same mutex the oracle control takes: this test's shim is
+        // thread-local, but the SCREAM it produces must not interleave with a
+        // sibling's decode in the captured log.
+        let _gate_lock = lock_gate_counters();
+
+        // The 4:2:0 8-bit arm. It BUILDS its stream with the same
+        // `libaom-av1` lavfi recipe the mono gate below uses rather than
+        // pinning one: `ffmpeg_decode_sequence` derives its frame size as
+        // `w*h + 2*(w*h/4)`, which is only right for EVEN dimensions -- on a
+        // 65x65 stream 4:2:0 chroma is ceil(65/2)^2 = 1089, not 4225/4 =
+        // 1056, and the helper's length assert fires (loudly, by design --
+        // see `frame_count_diagnosis`). 320x240 keeps the offsets below
+        // exact: luma 76800 samples, chroma 160x120 = 19200 each.
+        let (w, h) = (320usize, 240usize);
+        let (ys, cs) = (w * h, (w / 2) * (h / 2));
+        assert_eq!(
+            (ys, cs),
+            (76800, 19200),
+            "{NAME}: the byte offsets in this test are computed from this geometry"
+        );
+        let build_8bit = {
+            let out = Command::new(ffmpeg_path())
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=320x240:rate=30:duration=1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:v",
+                    "libaom-av1",
+                    "-cpu-used",
+                    "8",
+                    "-b:v",
+                    "300k",
+                    "-f",
+                    "obu",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to build the 4:2:0 8-bit arm");
+            assert!(
+                out.status.success(),
+                "{NAME}: ffmpeg could not build the 8-bit arm: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        assert_eq!(
+            stream_bit_depth(&build_8bit, NAME),
+            8,
+            "{NAME}: this arm is the 8-bit cell the byte offsets below are computed for"
+        );
+        let our_8bit =
+            decode_stream(&build_8bit).expect("the 8-bit arm must decode -- arm 1 needs it exact");
+        assert!(
+            !our_8bit.is_empty(),
+            "{NAME}: the 8-bit arm decoded nothing"
+        );
+        let frames_8bit = our_8bit.len();
+
+        // The monochrome recipe, byte-identical to the one
+        // `a_real_libaom_monochrome_key_frame_decodes_pixel_exact` builds, so
+        // the gray helper is driven on a stream that gate already proves
+        // exact. A MONOCHROME stream is also this test's 4:2:0 4:2:0-free
+        // arm: `ffmpeg_decode_gray_sequence` returns a flat luma buffer, so
+        // the one flipped offset must be attributed to Y and to nothing else.
+        let gray_stream = {
+            let out = Command::new(ffmpeg_path())
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x64:rate=30:duration=1",
+                    "-pix_fmt",
+                    "gray",
+                    "-c:v",
+                    "libaom-av1",
+                    "-cpu-used",
+                    "8",
+                    "-b:v",
+                    "100k",
+                    "-f",
+                    "obu",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to build the monochrome arm");
+            assert!(
+                out.status.success(),
+                "{NAME}: ffmpeg could not build the monochrome arm: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let our_gray = decode_stream(&gray_stream).expect("the monochrome arm must decode");
+        assert!(
+            !our_gray.is_empty(),
+            "{NAME}: the monochrome arm decoded nothing"
+        );
+        let frames_gray = our_gray.len();
+
+        // ---- the one-sample-wrong ffmpeg shim ---------------------------
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // The real ffmpeg's path rides in a sibling file rather than inside
+        // the script, so a path with a space or a quote cannot mangle it and
+        // the script body needs no `format!` escaping.
+        let real = if let Some(p) = std::env::var_os("EC_AV1_FFMPEG") {
+            std::path::PathBuf::from(p)
+        } else {
+            let found = Command::new("ffmpeg")
+                .arg("-version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(found, "{NAME}: no working ffmpeg on PATH to wrap");
+            // Resolve the bare name through PATH so the shim does not depend
+            // on inheriting whatever PATH the test runner had.
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            std::env::split_paths(&path)
+                .map(|d| d.join("ffmpeg"))
+                .find(|p| p.is_file())
+                .expect("{NAME}: ffmpeg is on PATH but not resolvable to a file")
+        };
+        std::fs::write(dir.join("real-ffmpeg"), real.as_os_str().as_encoded_bytes())
+            .expect("recording the real ffmpeg's path for the shim");
+        // Each line of `offsets` is one byte of the rawvideo stdout to rotate
+        // by 128, so the write always changes it. Everything else -- the
+        // stream, the geometry, the frame count, every other sample -- is a
+        // genuine ffmpeg decode. stdin is inherited so the shim is a drop-in
+        // for the helpers' `run_with_stdin` call.
+        let script = r#"#!/bin/sh
+REAL=$(cat "$(dirname "$0")/real-ffmpeg")
+OUT=$(mktemp)
+"$REAL" "$@" > "$OUT" || exit $?
+while read -r o; do
+  [ -n "$o" ] || continue
+  b=$(od -An -tu1 -j "$o" -N 1 "$OUT" 2>/dev/null | tr -d ' \n')
+  [ -n "$b" ] || continue
+  esc=$(printf '\\%03o' $(( (b + 128) % 256 )))
+  printf "$esc" | dd of="$OUT" bs=1 seek="$o" count=1 conv=notrunc 2>/dev/null
+done < "$(dirname "$0")/offsets"
+cat "$OUT"
+rm -f "$OUT"
+exit 0
+"#;
+        let shim = dir.join("one-sample-wrong-ffmpeg.sh");
+        std::fs::write(&shim, script).expect("writing the ffmpeg shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("the ffmpeg shim must be executable");
+        }
+        let set_offsets = |bytes: &[usize]| {
+            let body: String = bytes
+                .iter()
+                .map(|b| format!("{b}\n"))
+                .collect::<Vec<_>>()
+                .concat();
+            std::fs::write(dir.join("offsets"), body).expect("writing the offsets file");
+        };
+        // A comparator that cannot report a difference is worse than none, so
+        // each arm is scored as a COUNT of differing samples, not as a panic.
+        let count8 = |theirs: &[Pic]| -> [usize; 3] {
+            let mut wrong = [0usize; 3];
+            for (plane, (x, y)) in [
+                (0usize, (&our_8bit[0].y, &theirs[0].y)),
+                (1, (&our_8bit[0].u, &theirs[0].u)),
+                (2, (&our_8bit[0].v, &theirs[0].v)),
+            ] {
+                wrong[plane] = x.iter().zip(y).filter(|(a, b)| a != b).count();
+            }
+            wrong
+        };
+
+        // The 10-bit FILM pin, and the comparator both charter-named film
+        // gates rest on. Driven on the real stream rather than a synthetic
+        // one: `ffmpeg_decode_sequence_10bit` is the only reference helper
+        // with a per-plane split, so it is the one that could silently lose a
+        // plane. 1920x792 at 10 bits: luma 1920*792*2 bytes per frame, chroma
+        // 960*396*2.
+        let film = std::fs::read(crate_pin("troy_sb128_inter_witness.obu")).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: the 10-bit film pin troy_sb128_inter_witness.obu is missing ({e}) -- \
+                 restore the committed copy"
+            )
+        });
+        assert_eq!(
+            stream_bit_depth(&film, NAME),
+            10,
+            "{NAME}: this arm is the 10-bit cell the byte offsets below are computed for"
+        );
+        let our_10bit =
+            decode_stream(&film).expect("the 10-bit film pin must decode -- arm 1 needs it exact");
+        let (fw, fh) = (1920usize, 792usize);
+        let film_frames = our_10bit.len();
+        let (fys, fcs) = (fw * fh * 2, (fw / 2) * (fh / 2) * 2);
+        let count10 = |theirs: &[Pic]| -> [usize; 3] {
+            let mut wrong = [0usize; 3];
+            for (a, b) in our_10bit.iter().zip(theirs) {
+                for (plane, (x, y)) in
+                    [(0usize, (&a.y, &b.y)), (1, (&a.u, &b.u)), (2, (&a.v, &b.v))]
+                {
+                    wrong[plane] += x.iter().zip(y).filter(|(p, q)| p != q).count();
+                }
+            }
+            wrong
+        };
+        let count_gray = |theirs: &[u8]| -> usize {
+            our_gray[0]
+                .y
+                .iter()
+                .zip(theirs)
+                .filter(|(a, b)| **a != u16::from(**b))
+                .count()
+        };
+
+        // ---- arm 1: the real ffmpeg, every comparator GREEN ------------
+        {
+            set_offsets(&[]);
+            set_ffmpeg_path(None);
+            let theirs = ffmpeg_decode_sequence(&build_8bit, w, h, frames_8bit);
+            assert_eq!(
+                count8(&theirs),
+                [0, 0, 0],
+                "{NAME}: arm 1 runs against the REAL ffmpeg, so every plane must be zero -- if \
+                 this is red the stream is not the byte-exact pin this control needs"
+            );
+            let their_gray = ffmpeg_decode_gray_sequence(&gray_stream, 64, 64, frames_gray);
+            assert_eq!(
+                count_gray(&their_gray),
+                0,
+                "{NAME}: arm 1's monochrome plane must be zero against the real ffmpeg"
+            );
+            // arm 1's 10-bit half: the film pin is byte-exact against real
+            // ffmpeg on every plane of every shown frame -- that is exactly
+            // what `a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_...`
+            // asserts -- so this is the cell the two charter-named film gates
+            // claim.
+            let their_10bit = ffmpeg_decode_sequence_10bit(&film, fw, fh, film_frames);
+            assert_eq!(
+                count10(&their_10bit),
+                [0, 0, 0],
+                "{NAME}: arm 1's 10-bit film pin must be zero on every plane against the real \
+                 ffmpeg -- if this is red the control's pin is not the byte-exact stream it needs"
+            );
+        }
+
+        // ---- arm 2: one sample wrong, PER PLANE -------------------------
+        // The shim is thread-local, so the tampered reference is confined to
+        // this thread; it is cleared before anything is asserted, so a red arm
+        // cannot leave this test's own later work reading a wrong ffmpeg.
+        let mut blind: Vec<String> = Vec::new();
+        {
+            set_ffmpeg_path(Some(shim.clone()));
+            for (plane, (_name, base)) in [("Y", 0usize), ("U", ys), ("V", ys + cs)]
+                .into_iter()
+                .enumerate()
+            {
+                // Byte 1000 of the named plane: inside the 4:2:0 8-bit pin's
+                // luma (4225), inside its chroma (1024), or past both.
+                set_offsets(&[base + 1000]);
+                let theirs = ffmpeg_decode_sequence(&build_8bit, w, h, frames_8bit);
+                let got = count8(&theirs);
+                let want = [0usize, 0, 0];
+                let mut expected = want;
+                expected[plane] = 1;
+                if got != expected {
+                    blind.push(format!(
+                        "ffmpeg_decode_sequence {plane} arm: counted {got:?}, expected \
+                         {expected:?} (exactly the one tampered sample)"
+                    ));
+                }
+            }
+            // The 10-bit helper, per plane, on the 10-bit FILM pin. This is the
+            // arm that matters for the charter: both
+            // `a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_...`
+            // and
+            // `a_10bit_film_frames_with_small_side_globalmv_and_rect_warp_...`
+            // declare "pixel-exact on every plane" using nothing but this
+            // helper's output. A helper that dropped U or V would leave both
+            // gates green while chroma went unchecked for 15 and 33 frames.
+            for (plane, (_name, base)) in [("Y", 0usize), ("U", fys), ("V", fys + fcs)]
+                .into_iter()
+                .enumerate()
+            {
+                // Sample 1000 of the named plane, two bytes per sample.
+                set_offsets(&[base + 2000]);
+                let theirs = ffmpeg_decode_sequence_10bit(&film, fw, fh, film_frames);
+                let got = count10(&theirs);
+                let mut expected = [0usize, 0, 0];
+                expected[plane] = 1;
+                if got != expected {
+                    blind.push(format!(
+                        "ffmpeg_decode_sequence_10bit {plane} arm: counted {got:?}, expected \
+                         {expected:?} (exactly the one tampered sample)"
+                    ));
+                }
+            }
+            // The monochrome helper: one plane, so the single flipped offset
+            // must show up as luma and nothing else can absorb it.
+            set_offsets(&[1000]);
+            let their_gray = ffmpeg_decode_gray_sequence(&gray_stream, 64, 64, frames_gray);
+            if count_gray(&their_gray) != 1 {
+                blind.push(format!(
+                    "ffmpeg_decode_gray_sequence arm: counted {} differing luma samples, expected \
+                     exactly 1",
+                    count_gray(&their_gray)
+                ));
+            }
+            set_ffmpeg_path(None);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // One assert, naming EVERY helper that failed to notice: a partial run
+        // would report the first and hide whether the others are covered.
+        assert!(
+            blind.is_empty(),
+            "{NAME}: {} of 7 ffmpeg comparator arms stayed GREEN against an ffmpeg that is wrong \
+             by exactly one sample -- {blind:#?} -- they cannot fail, so their green proves \
+             nothing (class `comparator-that-never-reads-the-oracle`)",
+            blind.len()
+        );
+        eprintln!(
+            "{NAME}: ffmpeg_decode_sequence red on a one-sample-wrong Y, U and V separately; \
+             ffmpeg_decode_gray_sequence red on one wrong luma sample; \
+             ffmpeg_decode_sequence_10bit red on a one-sample-wrong Y, U and V of the 10-bit \
+             film pin"
+        );
     }
 
     /// lane-av1422anom: the odd-frame-HEIGHT 4:2:0 reconstruction defect,
@@ -46435,6 +46854,59 @@ exit 0
              gm_nontrans_small_side={gm} tr_reach_longer_side={tr} \
              uv_mode_grid_override={uvg}"
         );
+    }
+
+    /// lane-film10fix: the DECODE-ORDER half of the two charter-named 10-bit
+    /// film gates, against the instrumented `aomdec` rather than ffmpeg.
+    ///
+    /// `a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_...` (15 shown
+    /// frames) and `a_10bit_film_frames_with_small_side_globalmv_and_rect_warp_...`
+    /// (33 shown) each hold exactly ONE hidden alt-ref frame, and both
+    /// compare through `ffmpeg_decode_sequence_10bit`, which emits SHOWN
+    /// frames only. So one frame in 16 and one in 34 of each stream is
+    /// outside both gates' reach -- class `gate-blind-to-hidden-frames`: a
+    /// defect in a hidden frame surfaces only as drift on some later shown
+    /// frame, if at all. Their doc comments claim the hidden frames were
+    /// compared byte-exact against aomdec, but that measurement lived in a
+    /// lane report, not in a test, so nothing re-ran it.
+    ///
+    /// This gate is that measurement, committed.
+    /// [`decode_all_frames_vs_oracle`] writes `EC_AV1_FINAL_DUMP` on both
+    /// sides (ours in `decode_stream`, the oracle's in rung 12 of
+    /// `scripts/instrument-aom-oracle.sh`) and byte-compares EVERY decode-order
+    /// frame, hidden included. Both fixtures are the same 1920x792 10-bit
+    /// films their own gates pin, at the sha256 those gates record.
+    ///
+    /// The frame counts are asserted, not just reported: 16 = 15 shown + 1
+    /// hidden, 34 = 33 shown + 1. A stream that quietly lost its hidden ARF
+    /// would make this compare fewer frames and would otherwise read as a
+    /// pass.
+    #[test]
+    fn the_two_10bit_film_pins_match_aomdec_on_every_decode_order_frame() {
+        const NAME: &str = "the_two_10bit_film_pins_match_aomdec_on_every_decode_order_frame";
+        let _gate_lock = lock_gate_counters();
+        if !aomdec_available(NAME) {
+            return;
+        }
+        for (pin, frames, shown) in [
+            ("troy_sb128_inter_witness.obu", 16usize, 15usize),
+            ("gm_small_side_witness.obu", 34, 33),
+        ] {
+            let stream = std::fs::read(crate_pin(pin))
+                .unwrap_or_else(|e| panic!("{NAME}: reading {pin}: {e}"));
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert_eq!(
+                (decoded, hidden),
+                (frames, frames - shown),
+                "{NAME}: {pin} must decode to {frames} decode-order frames of which {shown} are \
+                 shown -- a stream that lost its hidden alt-ref would make the byte compare below \
+                 cover less than it claims"
+            );
+            eprintln!(
+                "{NAME}: {pin} {decoded} decode-order frames ({hidden} hidden) byte-exact vs \
+                 aomdec EC_AV1_FINAL_DUMP on every plane"
+            );
+        }
     }
 
     /// lane-t900 r11: the frame-edge MV clamp witness.
