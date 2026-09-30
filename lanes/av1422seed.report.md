@@ -4,7 +4,10 @@
 applied verbatim at ss (1,0) — proved by an unwritten-sample census, not inferred —
 and the write-side half of the fix is not sufficient on its own: moving the chroma
 write alone regresses luma, so the entropy-side half of the same arm must move with
-it. This branch therefore lands NO decoder change.**
+it. The landed fix is `lane/av1422luma` `459e425d` (§3.3): the write, BOTH chroma
+context gathers, AND the mi-map publication have to move together; with all
+three, all six cells of this family are byte-exact vs ffmpeg. This branch
+carries NO decoder change.**
 
 Tip: `main` = `affe70dc`. Worktree `/home/tahinli/.cache/wt/av1422seed`, branch
 `lane/av1422seed`. `crates/ec-av1/src/decode.rs` and `src/stream.rs` are at
@@ -21,8 +24,11 @@ committed and the sequence-header refusal is intact.
    and the per-frame counts.
 3. §4 — the localisation: the exact arm, the exact constants, and a census that
    names the unwritten samples.
-4. §5 — the attempted fix, why it is **not** landed, and what the remaining half is.
-5. §6 — what is NOT measured (stated, not hidden).
+4. §3.3 — the RESOLVED outcome: the landed fix `459e425d`, its exact five-edit
+   shape, and the before/after table for all six cells of this family.
+5. §4 — what this lane attempted and why the write-side half alone was not enough
+   (the two missing halves are now in `459e425d`).
+6. §7 — what is NOT measured (stated, not hidden).
 
 ---
 
@@ -229,7 +235,80 @@ strip family, same two-row-pair displacement, five geometries.
 
 ---
 
-## 4. The attempted fix, and why it is not landed
+## 3.3 RESOLVED — the landed fix is `lane/av1422luma` commit `459e425d`
+
+**Supersedes §4's "not landed" verdict. One owner for this defect:
+`lanes/av1422luma.report.md`, commit `459e425d`.** Two lanes converged on one
+function, which is the strongest signal in this report.
+
+Measured there, ffmpeg 8.1.3, 16 shown frames per cell:
+
+| cell | pre | post |
+|---|---|---|
+| `s422_320x246` | 0/7810/5531 | **0/0/0** |
+| `s422_322x240` | 0/22003/21625 | **0/0/0** |
+| `s422_322x246` | 0/3437/2222 | **0/0/0** |
+| `s422_352x242_10b` | 0/4653/3777 | **0/0/0** |
+| `s422_416x242_10b` | 0/5740/4348 | **0/0/0** |
+| `s422_416x250_10b` | 99011/61486/60106 | **0/0/0** |
+
+25 of 26 swept cells byte-exact; `s422_384x240` unchanged at 0/1780/1871 — a
+DIFFERENT residual (luma-exact on both sides of the change, first bad frame 1),
+so it must not be attributed to the 1:4-strip arm. All 4:2:0 and 4:4:4 controls
+byte-exact before and after.
+
+**The landed shape** (`decode.rs`, `decode_rect4_16_intrabc`). One predicate
+`own422 = ss_x == 1 && ss_y == 0 && horz`, `own_chroma = own444 || own422`
+(`own444` unchanged), five edits:
+
+1. `cw, ch = if own_chroma { (bw >> ss_x(fctx), bh >> ss_y(fctx)) } else { (pw/2, ph/2) }`
+2. `pair_mi = has_chroma ? (own_chroma ? lmi : horz ? (lmi.0-1, lmi.1) : (lmi.0, lmi.1-1)) : lmi`
+3. `cpx, cpy = has_chroma ? (own_chroma ? (px >> ss_x(fctx), py >> ss_y(fctx)) : (pair_mi.1*MI/2, pair_mi.0*MI/2)) : (0, 0)`
+4. **BOTH** chroma gathers (the non-lossless one and the `chroma_stamped_per_unit
+   = false` one; the lossless `read_inter_chroma_lossless` twin takes `pair_mi` /
+   `(cpx, cpy)` as arguments and inherits 1-3 for free):
+
+   ```rust
+   let (gmi, gw, gh) = if own_chroma { (lmi, bw, bh) } else { (pair_mi, pw, ph) };
+   let around = if own422 {
+       neighbours.around_mi_422_chroma(gmi, gw, gh)   // ss (1,0) only
+   } else {
+       neighbours.around_mi_rect(gmi, gw, gh)        // 4:2:0 pair, 4:4:4 own extent
+   };
+   ```
+
+   4:4:4 deliberately keeps `around_mi_rect`: at `ss_x == 0` a chroma column IS a
+   luma mi column, so the every-second-column sampling would halve its own above
+   span.
+5. **the publication the NEXT block's context reads** — the half this lane never
+   named:
+
+   ```rust
+   let (rmi, rw, rh) = if own_chroma { (lmi, bw, bh) } else { (pair_mi, pw, ph) };
+   neighbours.record_uv_mode_mi(rmi.0, rmi.1, rw / MI, rh / MI, DC_PRED);
+   // and the two left/above skip loops over rh/MI and rw/MI at rmi
+   ```
+
+**`has_chroma` is NOT the missing piece** — §4's open candidate 1 is disproved:
+the caller's existing predicate already holds for every HORZ strip in the cell
+(56 of them in frame 0; the U and V units at mi (51, 84) are read, so the oracle
+reads chroma for an even-row strip too).
+
+**Why every half was needed — it is one constant read from three places.** The
+entropy-side half is `around_mi_rect(pair_mi, pw, ph)`: at 4:2:2 the U/V
+`txb_skip` read of the intra-BC 16x4 strip at mi (51, 84) took its **LEFT** flag
+one mi row high (ours ctx 2, oracle ctx 8), so `all_zero` decoded 1 instead of 0
+and the frame desynced, luma included. That is exactly why this lane's
+write-side-only attempt regressed luma 0 -> 5958: the write had moved to the
+strip's own origin while the gather and the publication stayed on the 4:2:0 pair,
+so the three halves disagreed about which block the chroma TU belonged to.
+
+This lane's branch carries **no decoder change** (`33cb2d0b` is the report plus
+the comparator scripts); every hunk is Serkan-4's to carry, agreed by IRC message.
+§4 is kept as the record of what was tried here and why the write-side half alone
+was insufficient.
+
+## 4. The attempted fix, and why it was not sufficient on its own
 
 The write-side half of the fix, applied and measured (this is the change that is
 **not** in the tree):
@@ -311,7 +390,8 @@ Per-frame U counts, `s422_320x246` (display order, 16 frames):
 **every** frame, growing with the altref's reference use, which is what a
 frame-0 seed that later frames predict from looks like.
 
-Post-fix: **none** — the change is not landed.
+Post-fix (`459e425d`, measured by Serkan-4): **0/0/0 on all five**, plus `0/0/0`
+on `s422_416x250_10b` — see §3.3.
 
 **4:2:0 and 4:4:4 controls after the change attempt:** unchanged, `0/0/0` on all
 five control cells (§1.1 re-run with the change in the tree: 5/5 BYTE-EXACT). The
@@ -335,15 +415,15 @@ Run against `main` instead, the five slice cells read the §2 numbers and
 `s422_416x250_10b` reads the census's luma-wrong row. The sweep is here so the
 next lane does not have to re-derive it: **`s422_384x240` is not this defect**
 (its first bad frame is 1, and its region is not the 16-columns-from-the-right
-band), so closing this arm should leave exactly one 4:2:2 cell diverging in the
-sweep.
+band), so with `459e425d` landed that is exactly what happens: 25 of 26 swept cells are
+byte-exact and `s422_384x240` is the one that remains, on its own residual.
 
 ## 7. What is NOT measured
 
 * **The flip control was not run.** §1.1's controls are the five byte-exact cells,
   not the sample-flip arms. Nothing here should be read as "the comparator was
   proven to bite by a flip".
-* **No permanent gate was added.** The brief asked for a gate in the crate's test
+* **No permanent gate was added by this lane.** The brief asked for a gate in the crate's test
   binary naming a cell; with the fix unlanded a gate would have to assert a
   *failure*, and a gate that asserts a known defect is not a gate. The
   `INTRABC_RECT4_OWN_CHROMA422_HITS` counter is the hook such a gate will need;
@@ -354,8 +434,8 @@ sweep.
 * The 4:2:2 sequence-header refusal is **untouched** — `stream.rs:1803` reads
   `if seq.subsampling_x != seq.subsampling_y` on this branch, verified by
   `git status` clean for that file.
-* `s422_416x250_10b`'s luma desync is Serkan-4's slice; this report only records
-  that it is in the same function.
+* `s422_416x250_10b`'s luma desync was Serkan-4's slice and is closed by the same
+  commit (§3.3).
 
 ## 8. Reproducing this lane's numbers
 
