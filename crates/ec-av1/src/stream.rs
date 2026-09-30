@@ -2974,93 +2974,41 @@ pub(crate) mod tests {
             );
         }
     }
-    /// lane-av1422warp: the SECOND 4:2:2 coverage witness -- the one
-    /// `422_sb128_3f.obu` could not be, because that stream's inter content
-    /// is skip-heavy (see `lanes/av1422stripwrite.report.md`, which named a
-    /// second fixture with real residuals, compound and warped motion above
-    /// the vertical midpoint as the thing that would justify lifting the
-    /// refusal). This is that fixture.
+    /// lane-av1422lpf: the three 4:2:2 LOSSLESS INTER witness fixtures,
+    /// PINNED, and asserted to refuse at the SEQUENCE HEADER.
     ///
-    /// `422_residual_compound_warp_16f.obu` (38845 bytes), sha256
-    /// `d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95`:
+    /// W/X/Y (`W_intrabc.obu`, `X_intrabc_tiled.obu`, `Y_intrabc_10b.obu`) are
+    /// the streams on which lane-av1422lpf found the seven-site chroma-extent
+    /// PANIC family -- each site indexed a block's chroma PLANE BLOCK with
+    /// the ENCLOSING SQUARE `max(side >> ss_x, side >> ss_y)` instead of the
+    /// PER-AXIS `(bw >> ss_x, bh >> ss_y)` -- so the pins keep the bytes that
+    /// witnessed it from silently changing under the gate.
     ///
-    /// ```text
-    /// ffmpeg -f lavfi -i "mandelbrot=size=256x288:rate=24:maxiter=220:start_scale=3:end_scale=0.35:end_pts=300,rotate=a=0.10*t:c=none:ow=256:oh=288" \
-    ///        -frames:v 24 -pix_fmt yuv422p -f yuv4mpegpipe src422.y4m
-    /// aomenc --codec=av1 --profile=2 --input-bit-depth=8 --limit=16
-    ///        --width=256 --height=288 --lag-in-frames=25 --auto-alt-ref=1
-    ///        --enable-global-motion=1 --pass=1
-    ///        --cq-level=24 --cpu-used=0
-    ///        --threads=4 --kf-min-dist=0 --kf-max-dist=999999 \
-    ///        src422.y4m -o a1.webm
-    /// ffmpeg -i a1.webm -c copy -f obu -y a1.obu
-    /// ```
+    /// WHAT THIS GATE DOES NOT COVER, measured rather than argued: the
+    /// refusal it asserts is the HEADER refusal, which fires BEFORE any of
+    /// the seven sites is reachable, and it fires IDENTICALLY on the pre-fix
+    /// tree (commit `aef4fa67` prints the same string, built and run for
+    /// this correction). This gate is therefore VACUOUS with respect to the
+    /// seven-site fix -- it passes before and after the fix. Its only real
+    /// content is the three pins.
     ///
-    /// CORRECTED by lane-av1422lrless (reviewer P2). This doc previously
-    /// carried a different ffmpeg filter (`rotate=a=0.10`, no `*t`, no
-    /// `:c=none:ow/oh`) and a `-n ffp --pass=2 --fpf=...` two-pass line.
-    /// **Neither produced these bytes.** Re-encoding from the recorded
-    /// source `src422.y4m` (sha256
-    /// `4d35eaf65d1a5541b3177e1183644c163b3868d8f141bed0ce9fdf833280ba9f`)
-    /// was measured three ways: the two-pass form gives 38774 bytes
-    /// (`e93c4ed7...`), and only adding `--pass=1` reproduces these 38845
-    /// bytes byte for byte (`d78e2afb...`). `aomenc` DEFAULTS to two-pass,
-    /// so the flag has to be stated to get back the pinned stream. The
-    /// recipe above is the one that was actually run.
+    /// Nor can any committed gate witness that fix's DECODE behaviour: with
+    /// the header refusal standing, no committed test reaches a 4:2:2 decode,
+    /// because the `EC_AV1_ALLOW_422_PROBE` bypass is a patch-run-restore
+    /// hack that must never be committed. The panic fix's evidence is the
+    /// BYPASSED manual measurement in `lanes/av1422lpf.report.md`; what is
+    /// committed for the fix is the source-scan arm
+    /// `the_422_lossless_inter_chroma_walk_sites_stay_per_axis`, which
+    /// proves the per-axis SPELLING and nothing about pixels.
     ///
-    /// Measured on a patch-run-restore build (the `EC_AV1_ALLOW_422_PROBE`
-    /// bypass applied for the run, reverted after -- it is deliberately NOT
-    /// committed, and the refusal below is what the committed tree asserts):
-    ///
-    /// - all 16 frames pixel-exact against `aomdec --rawvideo`, 2359296
-    ///   bytes each, sha256 `4bfc2395e5ca6ea178f606e6b1ced773e26fc2d85b
-    ///   c3a6cdb63a402939aeb203` on both sides;
-    /// - the entropy stream pairs bit-for-bit against the instrumented
-    ///   oracle -- 246735 symbol reads each, no divergence anywhere in the
-    ///   stream, not merely at the window this lane spent nine rounds
-    ///   narrowing;
-    /// - the arms this fixture exists to cover really fire ABOVE the
-    ///   vertical midpoint: 3 upper-half blocks on a non-`TRANSLATION`
-    ///   global-motion model (`top_half_warp_hits`, gated on libaom's
-    ///   `is_global_mv_block` per slot) and 3 upper-half
-    ///   `GLOBAL_GLOBALMV` compound blocks (`top_half_compound_hits`),
-    ///   alongside 25 compound-warp, 18 compound-warp-8x8-leaf, 84
-    ///   rotzoom global-warp, 22 Wiener and 10 SGRPROJ loop-restoration
-    ///   units frame-globally.
-    ///
-    /// The loop-restoration numbers are load-bearing twice over: decoding
-    /// this stream is what exposed the per-axis `read_lr` corner bug
-    /// (`restoration.rs`, `av1_loop_restoration_corners_in_sb`), whose fix
-    /// is what made the whole sequence pair. 4:2:0 and 4:4:4 are unchanged
-    /// by it -- byte-identical to their pre-lane decodes, with the LR gate
-    /// family green.
-    ///
-    /// Like its two siblings, the committed assertion is the byte pin plus
-    /// the refusal-by-name contract: with the header refusal standing,
-    /// NO committed test can decode a 4:2:2 stream, because the bypass that
-    /// would allow it must never be committed.
-    /// lane-av1422lpf: the 4:2:2 lossless INTER chroma panic family -- SEVEN
-    /// sites, each indexing a block's chroma PLANE BLOCK with the ENCLOSING
-    /// SQUARE `max(side >> ss_x, side >> ss_y)`.
-    ///
-    /// libaom's chroma plane block is PER-AXIS, `(bw >> ss_x) x
-    /// (bh >> ss_y)` (`av1_common_int.h`'s `av1_get_plane_block_size`, the
-    /// `dec->uv_buffer` extent in decodeframe.c), and it is square only when
-    /// `ss_x == ss_y`. The enclosing square is the same number at 4:2:0
-    /// (`side >> 1`) and 4:4:4 (`side`) on a square block, so every site
-    /// below is byte-identical there; at 4:2:2 the square is the LUMA side
-    /// and each site walked off its own buffer.
-    ///
-    /// Committed code refuses 4:2:2 at the sequence header, so -- exactly
-    /// like the witnesses above -- what this gate can assert in committed
-    /// code is the byte pin, the refusal-by-name contract, and the arm below:
-    /// that each site's PER-AXIS expression is still spelled per-axis and
-    /// the square-cut expression it replaced is gone. The decode-level
-    /// evidence is measured on the local `EC_AV1_ALLOW_422_PROBE`
-    /// patch-run-restore build and is in `lanes/av1422lpf.report.md`.
+    /// CORRECTED by lane-av1422llintra: the name said `..._panics_refuse_
+    /// by_name`, and lane-av1422lpf's report claimed W and X now REFUSE with
+    /// `a Golomb tail longer than this decoder reads` at frame 2. That
+    /// refusal DOES NOT REPRODUCE on this tip: with the bypass applied, all
+    /// three cells DECODE 16/16 -- no panic and no second refusal.
     #[test]
-    fn the_pinned_422_lossless_inter_chroma_panics_refuse_by_name() {
-        const NAME: &str = "the_pinned_422_lossless_inter_chroma_panics_refuse_by_name";
+    fn the_pinned_422_lossless_inter_witnesses_are_present_and_refuse_by_name() {
+        const NAME: &str = "the_pinned_422_lossless_inter_witnesses_are_present_and_refuse_by_name";
         const REFUSAL: &str = "a chroma format of 4:2:2";
         for (file, bytes, fp) in [
             ("W_intrabc.obu", 130_320usize, 0xb6d5c4653a32567a_u64),
@@ -3094,6 +3042,12 @@ pub(crate) mod tests {
     /// half is what makes this gate non-vacuous in the
     /// `dead-matcher-positive-control` sense -- a scan that matched nothing
     /// would fail it rather than pass silently.
+    ///
+    /// WHAT IT DOES NOT COVER: this arm is a SPELLING scan. It cannot observe
+    /// a decode, so it cannot prove any cell decodes and cannot prove any
+    /// pixel -- the same limit as the witness gate above it, and stated here
+    /// because "one assertion per site, each with a mutation proof" reads
+    /// like more coverage than it is.
     ///
     /// `strip_code` is the same comment-stripping the arms above use: the
     /// fixes quote their own old expression to say what it was, and a prose
@@ -3303,6 +3257,71 @@ pub(crate) mod tests {
              gained a shape"
         );
     }
+    /// lane-av1422warp: the SECOND 4:2:2 coverage witness -- the one
+    /// `422_sb128_3f.obu` could not be, because that stream's inter content
+    /// is skip-heavy (see `lanes/av1422stripwrite.report.md`, which named a
+    /// second fixture with real residuals, compound and warped motion above
+    /// the vertical midpoint as the thing that would justify lifting the
+    /// refusal). This is that fixture.
+    ///
+    /// `422_residual_compound_warp_16f.obu` (38845 bytes), sha256
+    /// `d78e2afb43ce311d3d82335a945c6f80f62db4537966d881c1349a68b3aecb95`:
+    ///
+    /// ```text
+    /// ffmpeg -f lavfi -i "mandelbrot=size=256x288:rate=24:maxiter=220:start_scale=3:end_scale=0.35:end_pts=300,rotate=a=0.10*t:c=none:ow=256:oh=288" \
+    ///        -frames:v 24 -pix_fmt yuv422p -f yuv4mpegpipe src422.y4m
+    /// aomenc --codec=av1 --profile=2 --input-bit-depth=8 --limit=16
+    ///        --width=256 --height=288 --lag-in-frames=25 --auto-alt-ref=1
+    ///        --enable-global-motion=1 --pass=1
+    ///        --cq-level=24 --cpu-used=0
+    ///        --threads=4 --kf-min-dist=0 --kf-max-dist=999999 \
+    ///        src422.y4m -o a1.webm
+    /// ffmpeg -i a1.webm -c copy -f obu -y a1.obu
+    /// ```
+    ///
+    /// CORRECTED by lane-av1422lrless (reviewer P2). This doc previously
+    /// carried a different ffmpeg filter (`rotate=a=0.10`, no `*t`, no
+    /// `:c=none:ow/oh`) and a `-n ffp --pass=2 --fpf=...` two-pass line.
+    /// **Neither produced these bytes.** Re-encoding from the recorded
+    /// source `src422.y4m` (sha256
+    /// `4d35eaf65d1a5541b3177e1183644c163b3868d8f141bed0ce9fdf833280ba9f`)
+    /// was measured three ways: the two-pass form gives 38774 bytes
+    /// (`e93c4ed7...`), and only adding `--pass=1` reproduces these 38845
+    /// bytes byte for byte (`d78e2afb...`). `aomenc` DEFAULTS to two-pass,
+    /// so the flag has to be stated to get back the pinned stream. The
+    /// recipe above is the one that was actually run.
+    ///
+    /// Measured on a patch-run-restore build (the `EC_AV1_ALLOW_422_PROBE`
+    /// bypass applied for the run, reverted after -- it is deliberately NOT
+    /// committed, and the refusal below is what the committed tree asserts):
+    ///
+    /// - all 16 frames pixel-exact against `aomdec --rawvideo`, 2359296
+    ///   bytes each, sha256 `4bfc2395e5ca6ea178f606e6b1ced773e26fc2d85b
+    ///   c3a6cdb63a402939aeb203` on both sides;
+    /// - the entropy stream pairs bit-for-bit against the instrumented
+    ///   oracle -- 246735 symbol reads each, no divergence anywhere in the
+    ///   stream, not merely at the window this lane spent nine rounds
+    ///   narrowing;
+    /// - the arms this fixture exists to cover really fire ABOVE the
+    ///   vertical midpoint: 3 upper-half blocks on a non-`TRANSLATION`
+    ///   global-motion model (`top_half_warp_hits`, gated on libaom's
+    ///   `is_global_mv_block` per slot) and 3 upper-half
+    ///   `GLOBAL_GLOBALMV` compound blocks (`top_half_compound_hits`),
+    ///   alongside 25 compound-warp, 18 compound-warp-8x8-leaf, 84
+    ///   rotzoom global-warp, 22 Wiener and 10 SGRPROJ loop-restoration
+    ///   units frame-globally.
+    ///
+    /// The loop-restoration numbers are load-bearing twice over: decoding
+    /// this stream is what exposed the per-axis `read_lr` corner bug
+    /// (`restoration.rs`, `av1_loop_restoration_corners_in_sb`), whose fix
+    /// is what made the whole sequence pair. 4:2:0 and 4:4:4 are unchanged
+    /// by it -- byte-identical to their pre-lane decodes, with the LR gate
+    /// family green.
+    ///
+    /// Like its two siblings, the committed assertion is the byte pin plus
+    /// the refusal-by-name contract: with the header refusal standing,
+    /// NO committed test can decode a 4:2:2 stream, because the bypass that
+    /// would allow it must never be committed.
     #[test]
     fn the_pinned_422_residual_compound_warp_witness_is_present_and_refuses_by_name() {
         const NAME: &str =
@@ -16298,7 +16317,11 @@ exit 0
             "{name}: the committed pin {pin} is {} bytes, this gate names {pin_len}",
             stream.len()
         );
-        assert_eq!(fnv1a64(&stream), pin_fnv, "{name}: the committed pin {pin} moved");
+        assert_eq!(
+            fnv1a64(&stream),
+            pin_fnv,
+            "{name}: the committed pin {pin} moved"
+        );
         if have_aomenc() {
             assert_eq!(
                 live.len(),
@@ -16364,8 +16387,9 @@ exit 0
             let _ = std::fs::remove_dir_all(&dir);
             // The +1 control (part 6): clean is all-zero, one flipped oracle
             // byte is exactly +1 luma byte and one fewer exact frame.
-            let clean = count_rawvideo_diffs(&stream, name, None)
-                .unwrap_or_else(|| panic!("{name}: our packed output and the oracle's rawvideo differ in SIZE"));
+            let clean = count_rawvideo_diffs(&stream, name, None).unwrap_or_else(|| {
+                panic!("{name}: our packed output and the oracle's rawvideo differ in SIZE")
+            });
             assert_eq!(
                 clean,
                 (0, 0, 0, frames, frames),
@@ -16445,8 +16469,7 @@ exit 0
     /// with screen content tools" blocked while decoding exactly.
     #[test]
     fn a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact";
+        const NAME: &str = "a_real_aomenc_12bit_screen_content_palette_stream_decodes_pixel_exact";
         const PIN: &str = "screen12_palette.obu";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
@@ -16468,7 +16491,15 @@ exit 0
             Vec::new()
         };
         assert_12bit_screen_content_arm(
-            NAME, PIN, live, PIN_LEN_PALETTE, PIN_FNV_PALETTE, 2, 160, 128, false,
+            NAME,
+            PIN,
+            live,
+            PIN_LEN_PALETTE,
+            PIN_FNV_PALETTE,
+            2,
+            160,
+            128,
+            false,
         );
     }
 
@@ -16514,7 +16545,15 @@ exit 0
             Vec::new()
         };
         assert_12bit_screen_content_arm(
-            NAME, PIN, live, PIN_LEN_INTRABC, PIN_FNV_INTRABC, 1, 256, 192, true,
+            NAME,
+            PIN,
+            live,
+            PIN_LEN_INTRABC,
+            PIN_FNV_INTRABC,
+            1,
+            256,
+            192,
+            true,
         );
     }
 
@@ -16528,8 +16567,7 @@ exit 0
     /// `ec7942c96763593e6d8e4b3fb23c03930bba3bb743102d0cf552fe73ae11c203`).
     #[test]
     fn a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact() {
-        const NAME: &str =
-            "a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact";
+        const NAME: &str = "a_real_aomenc_12bit_lossless_screen_content_stream_decodes_pixel_exact";
         const PIN: &str = "screen12_lossless_palette.obu";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
@@ -16552,7 +16590,15 @@ exit 0
             Vec::new()
         };
         assert_12bit_screen_content_arm(
-            NAME, PIN, live, PIN_LEN_LOSSLESS, PIN_FNV_LOSSLESS, 2, 160, 128, false,
+            NAME,
+            PIN,
+            live,
+            PIN_LEN_LOSSLESS,
+            PIN_FNV_LOSSLESS,
+            2,
+            160,
+            128,
+            false,
         );
     }
 
