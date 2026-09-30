@@ -2751,6 +2751,15 @@ thread_local! {
     /// measured value is unchanged at 4 (one block with nw = 1, nh = 2 x two
     /// planes x two unit rows); a stream whose palette chroma blocks are all
     /// single-unit now leaves it at zero.
+    ///
+    /// FURTHER CORRECTED the same day by the palette lane's refutation
+    /// (`lanes/av1444palw.report.md` + the arm-isolated mutation): the guard is
+    /// about TILING, not about `nw > 1` specifically. Isolating the two window
+    /// sites shows the RECT-unit arm alone reds the 10-bit cell, and the
+    /// SQUARE-unit arm alone reds the 12-bit cell *and* the 10-bit one -- so
+    /// windowing is load-bearing for every tiled block, and `nw > 1` is merely
+    /// the case the corpus could not reach. Do not read this counter as
+    /// evidence that only the horizontal term matters.
     static CHROMA_PALETTE_WINDOW_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -20165,7 +20174,7 @@ fn decode_block_rect64(
             eprintln!(
                 "EC_PALWALK mi={r},{c} px={px} py={py} bw={bw} bh={bh} cw={chroma_w} \
                  ch={chroma_h} uw={uw} uh={uh} nw={nw} nh={nh} ast={allow_screen_content_tools} \
-                 puv={} py={}",
+                 puv={} py_pal={}",
                 palette_uv.is_some() as i32,
                 palette_y.is_some() as i32
             );
