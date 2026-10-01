@@ -56619,10 +56619,15 @@ mod tests {
     /// a symbol's RESOLUTION and every dispatch of it.
     ///
     /// So the invariant is stated over the dispatch structure, not over a list.
-    /// Today the file has **10 partition-symbol resolutions** and **13
-    /// `refuse_invalid_subsize((` call sites**, of which 9 are guards at 9
-    /// resolutions (the extra 4 are the definition, the doc comment and the test's
-    /// own example strings). What is asserted, exactly:
+    /// Counts in the tree this was written against, re-derived per line rather
+    /// than grepped: `refuse_invalid_subsize((` occurs **18 times** in this file —
+    /// **11 guard call sites** in the decode body (35588, 36278, 36406, 36472,
+    /// 36882, 37132, 53985, 54222, 54606, 54752, 55164), **5** in this test's own
+    /// string literals and comparisons, **2** in doc comments; the definition's
+    /// signature line does not match `((` at all. The scan finds **10 resolutions**:
+    /// the eleventh guard is the inter-frame 128 one, whose resolution lives in
+    /// the shared `read_sb128_root`, so a guard has no resolution of its own here.
+    /// What is asserted, exactly:
     ///
     /// * every `partition_w<N>[` level in the file appears among the resolutions
     ///   this scan finds -- a new level cannot be added without a guard check;
@@ -56635,8 +56640,12 @@ mod tests {
     /// * no guard sits inside a `PARTITION_HORZ_A..=PARTITION_VERT_B` arm.
     ///
     /// It does NOT prove a guard is at the exact dispatch point: the window is a
-    /// window. That limit is why the AB-arm invariant exists separately, and why
-    /// `EC_AV1_SUBSIZE_GUARD_TRACE` records what each site really sees.
+    /// window. And the two cross-checks are weaker than they look — cross-check 1
+    /// is level PRESENCE only, cross-check 2 is `>=` — so a SECOND unguarded site
+    /// at an already-covered level is caught ONLY by the per-site 220-line window,
+    /// which is a window and not a dispatch bound. That limit is why the AB-arm
+    /// invariant exists separately, and why `EC_AV1_SUBSIZE_GUARD_TRACE` records
+    /// what each site really sees over the corpus.
     #[test]
     fn every_partition_symbol_resolution_is_guarded_before_it_dispatches() {
         let src = include_str!("decode.rs");
@@ -56700,14 +56709,34 @@ mod tests {
             let level: usize = digits.parse().expect("digits");
             // The bound variable is the token after `let `, looked for in the two
             // lines the binding can occupy (r9: it may be the line above).
+            // r10: scan BACKWARDS from the closest line and take the nearest `let`
+            // whose binding is the one followed by this symbol read -- taking the
+            // first `let` upward named an unrelated binding above it.
             let mut var = None;
-            for cand in [lo, n] {
+            for cand in (lo..=n).rev() {
                 let ct = lines[cand].trim_start();
-                if let Some(v) = ct.strip_prefix("let ") {
-                    var = v
-                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                        .next()
-                        .map(str::to_string);
+                if ct.starts_with("//") {
+                    continue;
+                }
+                let Some(v) = ct.strip_prefix("let ") else {
+                    continue;
+                };
+                let name = v
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                // This binding is followed by the symbol read if the SAME line
+                // completes `let <name> = dec.symbol(`, or if the next line starts
+                // the call. That is what separates `let part8 =` from an unrelated
+                // `let ec_dbg_pre =` two lines above it.
+                let next = lines.get(cand + 1).copied().unwrap_or("");
+                let binds_here = ct.contains("= dec.symbol") || next.contains("dec.symbol(");
+                if binds_here || cand == n {
+                    var = Some(name);
                     break;
                 }
             }
@@ -56823,6 +56852,12 @@ mod tests {
             // been inside it.
             if line.contains("PARTITION_HORZ_A..=PARTITION_VERT_B") {
                 ab_arm = Some((ind + 4, false));
+            } else if t == "{" {
+                // r10: the arm's own brace carries the OPENER's indent, not the
+                // body's, so treating it as "backed out" cleared the arm before a
+                // single body statement was seen -- which is why the mutation that
+                // moves a guard INSIDE an arm stayed GREEN at r8 AND r9. A lone `{`
+                // never changes the state.
             } else if let Some((body, entered)) = ab_arm {
                 if !entered {
                     if ind >= body {

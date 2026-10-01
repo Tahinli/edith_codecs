@@ -619,7 +619,11 @@ reachable at ss (1,0) today. Guarded anyway.
    adds the exact guard-vs-resolution count.
 3. **`sites.len() >= 9` was a floor the tree already satisfied with 10.** Replaced
    with a count derived from the scan: the decode body has **11 guard sites** and
-   the scan finds **11 resolutions**.
+   the scan finds **10 resolutions** — the eleventh guard is the inter-frame 128
+   one at `53985`, whose resolution lives in the shared `read_sb128_root` and so
+   has no resolution of its own here. That is exactly the redundancy the `>=`
+   exists to allow, so the counts are reported as 11 guards against 10
+   resolutions and the reason is named.
 
 Plus the one the refutation demonstrated green: the AB-arm tracker **self-cleared
 on the `{` line**, because that line carries the same indent as the `if` — moving
@@ -635,19 +639,59 @@ refuse_invalid_subsize((32, 32)) within 220 lines after it
 
 ### 11.3 The occurrence count, re-derived per line
 
-`refuse_invalid_subsize((` appears **18 times in `decode.rs`**: **11** guard call
-sites in the decode body (one per resolution), **4** in this test's own string
-literals and comparisons, **2** in doc comments, and **1** — the definition's own
-signer line does not match `((` at all. Main's line-grep count of 13 was taken at
-r7, before the two r9 guards; the refutation's 15 was likewise pre-r9. Eleven is
-what the tree carries now, counted by call shape (`l.trim_start().starts_with(…)`)
-so a multi-line assert string mentioning the function is not counted.
+`refuse_invalid_subsize((` appears **18 times in `decode.rs`**, and the breakdown
+that sums is **11 + 5 + 2**:
+
+* **11 guard call sites** in the decode body — 35588, 36278, 36406, 36472, 36882,
+  37132, 53985, 54222, 54606, 54752, 55164;
+* **5** in this test's own string literals and comparisons — the four named in the
+  assertions plus the multi-line assert string at 56835;
+* **2** in doc comments.
+
+The definition's own signature line does not match `((` at all. Main's line-grep
+count of 13 was taken at r7 and the refutation's 15 at r9, both before the r9 kf-w8
+guards; 18 is what the tree carries now, counted by call shape
+(`l.trim_start().starts_with(…)`) so a multi-line assert string mentioning the
+function is not counted. The scan finds **10** resolutions against those **11**
+guards — the inter-128 guard at 53985 has no resolution of its own because
+`read_sb128_root` is shared.
 
 ### 11.4 What is still not claimed
 
-The guard-vs-resolution cross-check is `>=`, not `==`: the scan sees 11 and 11
-today, but a hard equality between two numbers the scan itself computes is a claim
-about the scanner, not about coverage. What reds is a resolution with no guard —
-on its own line, naming the variable — and a guard sitting inside an AB arm. A
-redundant guard with no resolution behind it is harmless and is not treated as a
-defect.
+The guard-vs-resolution cross-check is `>=`, not `==`: the scan sees 10 resolutions
+against 11 guards today, and a hard equality between two numbers the scan itself
+computes is a claim about the scanner, not about coverage. What reds is a
+resolution with no guard — on its own line, naming the variable — and a guard
+sitting inside an AB arm. A redundant guard with no resolution behind it is
+harmless and is not treated as a defect.
+
+**And the two cross-checks are weaker than they look.** Cross-check 1 is level
+PRESENCE only. Cross-check 2 is `>=`. So a **second unguarded site at an
+already-covered level is caught only by the per-site 220-line window** — which is
+a window, not a dispatch bound. Stated rather than left for a reader to infer.
+
+### 11.5 r10: the AB-arm tracker, again
+
+r9's tracker was open for exactly one line: armed at the condition (indent 44,
+body 48), the wrapped `.contains(&part16)` at indent 48 set `entered = true`, and
+then the arm's own `{` — at the **opener's** indent 44, not the body's — hit
+`ind < body` and cleared it. Every statement in the arm body was invisible, and
+the mutation that moves a guard INSIDE an arm stayed GREEN at r8 *and* r9. r10
+skips a line whose trimmed text is exactly `{` when deciding to enter or clear.
+The mutation now reds with the r5 diagnostic:
+
+```
+$ # move the kf-16 guard inside a PARTITION_HORZ_A..=PARTITION_VERT_B arm
+decode.rs:36539 puts a refuse_invalid_subsize inside a
+PARTITION_HORZ_A..=PARTITION_VERT_B arm (values 4..=7 only); the offending
+values are PARTITION_VERT (2) and PARTITION_VERT_4 (9), which that arm can
+never observe -- r5's defect
+```
+
+Also in r10: the bound-variable lookup scans **backwards** and takes the nearest
+`let` whose binding is the one followed by the symbol read. It used to take the
+first `let` upward, which could name an unrelated binding (`ec_dbg_pre`) instead
+of the partition symbol.
+
+**No decode-path change in r10** — the four passes found no defect in it.
+
