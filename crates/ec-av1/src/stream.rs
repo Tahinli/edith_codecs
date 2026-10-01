@@ -2791,6 +2791,100 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1422tailskip: the WITNESS cell for the 4:2:2 intra-in-inter
+    /// PALETTE chroma per-unit window, and its byte pin.
+    ///
+    /// `422_palette_intra_in_inter_384x240_17f.obu` (19344 B, sha256
+    /// `bf1c658e9bfdc13ec1ed51e59049d2b81201941b6ef4571f8382f356ea4b815b`) is
+    /// the one 4:2:2 cell of the 384x240 census sweep: 384x240, ss (1,0),
+    /// 8-bit, **17 decode frames, 16 shown** (decode 1 is the hidden altref).
+    /// Its decode-frame-1 block at mi(32,0) is a 64x64 INTRA block with a
+    /// PALETTE -- `aomdec`'s `EC_PIB` prints `use_palette=1` there, and the
+    /// oracle's own prediction rungs print nothing for the block because
+    /// `av1_predict_intra_block` returns at its palette branch before them
+    /// (`reconintra.c:1735`).
+    ///
+    /// At 4:2:2 that block's chroma plane block is 32x64, but
+    /// `av1_get_max_uv_txsize` adjusts `max_tx_size_rect_lookup[BLOCK_32X64]`
+    /// down to TX_32X32, so it codes TWO STACKED SQUARE units per plane.
+    /// `decode_inter_block`'s `side == 64` walk armed the ONE block-sized
+    /// 2048-entry chroma palette prediction before the loop: the first unit
+    /// consumed all of it and the second found none pending, so it silently
+    /// fell back to the edge DC prediction -- a flat 90/240 box where the
+    /// oracle carries its palette (U/V rows 170..189, cols 23..31, 180 wrong
+    /// samples per plane at the pre-filter stage). Each unit now takes its own
+    /// `palette_window` of that buffer (`decode.rs`) -- the same helper the
+    /// split-transform chroma paths already used.
+    ///
+    /// **The committed assertion follows the family's standing rule** (same
+    /// shape as
+    /// [`the_pinned_422_bigblock_witnesses_are_present_and_refuse_by_name`]):
+    /// the byte pin plus this decoder's disposition of those bytes. While
+    /// `decode_stream` still refuses 4:2:2 at the sequence header
+    /// (`decode_frame`, `subsampling_x != subsampling_y`) that is the refusal
+    /// BY NAME, and the gate additionally asserts the arm's counter reads 0 --
+    /// the pin alone must never be able to fake a green. When the header lift
+    /// lands the same test becomes the full gate: 17 decode-order frames
+    /// byte-exact against aomdec with `palette_422_unit_window_hits()` fired,
+    /// which is what it asserts then. Both branches are loud.
+    #[test]
+    fn the_pinned_422_palette_intra_in_inter_cell_window_is_byte_exact() {
+        const NAME: &str = "the_pinned_422_palette_intra_in_inter_cell_window_is_byte_exact";
+        const FILE: &str = "422_palette_intra_in_inter_384x240_17f.obu";
+        const BYTES: usize = 19344;
+        const FP: u64 = 0x923ccabfcb933e90;
+        const REFUSAL: &str = "a chroma format of 4:2:2";
+        let _gate_lock = lock_gate_counters();
+        let data = std::fs::read(crate_pin(FILE)).unwrap_or_else(|e| {
+            panic!("{NAME}: the committed pin {FILE} is missing ({e}) -- a failure, not a skip")
+        });
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FP, "{NAME}: {FILE} bytes drifted");
+        let before = crate::decode::palette_422_unit_window_hits();
+        match decode_stream(&data) {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains(REFUSAL),
+                    "{NAME}: {FILE} neither refused by name nor decoded to the 17 \
+                     decode-order frames this gate claims -- if 4:2:2 has been lifted the \
+                     ERROR arm is stale, got: {err}"
+                );
+                assert_eq!(
+                    crate::decode::palette_422_unit_window_hits(),
+                    before,
+                    "{NAME}: a refusal cannot reach the palette arm, so its counter moved \
+                     from {before} -- this is not the refusal this gate models"
+                );
+                eprintln!(
+                    "{NAME}: {FILE} refuses 4:2:2 at the sequence header (the standing \
+                     family rule), so the per-unit palette window could not be exercised \
+                     here; the exactness and fired-counter claims are measured on a local \
+                     patch-run-restore build -- see lanes/av1422tailskip.report.md"
+                );
+            }
+            Ok(_) => {
+                let windows = crate::decode::palette_422_unit_window_hits() - before;
+                assert!(
+                    windows > 0,
+                    "{NAME}: {FILE} decoded, but no 4:2:2 intra-in-inter chroma unit took \
+                     the per-unit palette window ({windows} did) -- this cell does not \
+                     exercise the arm at all (class gate-blind-to-feature)"
+                );
+                let (decoded, hidden) = decode_all_frames_vs_oracle(&data, FILE);
+                assert_eq!(
+                    decoded, 17,
+                    "{NAME}: the oracle decoded {decoded} frames in DECODE order, not 17"
+                );
+                assert_eq!(hidden, 1, "{NAME}: expected exactly the one hidden altref");
+                eprintln!(
+                    "{NAME}: {decoded} decode-order frame(s) byte-exact against aomdec \
+                     ({hidden} hidden), {windows} chroma palette unit window(s)"
+                );
+            }
+        }
+    }
+
     /// lane-av1-ibc128chunk: the WITNESS for the 128-root intrabc strip's
     /// de-square-cut mu-chunk chroma walk, and the byte pin for it.
     ///
