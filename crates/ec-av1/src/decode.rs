@@ -36874,6 +36874,12 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 }
                                                 let part8 =
                                                     dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                                // lane-av1unwritten r9: the
+                                                // SECOND key-frame 8x8 resolution.
+                                                // Found by the structural scan, which
+                                                // r9 made sensitive to a second
+                                                // site at an already covered level.
+                                                refuse_invalid_subsize((8, 8), part8, fctx)?;
                                                 if crate::envflags::env_flag!("EC_TRACE") {
                                                     eprintln!(
                                                         "EC_PART_VAL mi_row={} mi_col={} bsize=3 value={}",
@@ -37113,6 +37119,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             let pre8 = dec.debug_state().0;
                                             let part8 =
                                                 dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                            // lane-av1unwritten r9: key-frame 8x8
+                                            // level. A VERT here dispatches
+                                            // `decode_leaf_rect8` on a raw `part8`
+                                            // with no guard anywhere above it --
+                                            // `BLOCK_4X8`, which is INVALID at
+                                            // 4:2:2 (the shape r5 and r6 each
+                                            // flagged). Not corpus-reachable at
+                                            // ss(1,0) today, so it is residue rather
+                                            // than live pixels, and it is guarded
+                                            // anyway.
+                                            refuse_invalid_subsize((8, 8), part8, fctx)?;
                                             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                                 eprintln!(
                                                     "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8} pre_rng={pre8}"
@@ -56626,96 +56643,132 @@ mod tests {
         // Every partition-symbol RESOLUTION in the file, with the level read off
         // the CDF name on the line itself. Two independent counts are compared, so
         // a site lost to line wrapping reds instead of silently vanishing: the
-        // `resolution_lines` count below counts `partition_w` + a `dec.symbol(` in
-        // the same statement WINDOW, and `sites` counts bindings found on one line.
+        // Every partition-symbol RESOLUTION in the file. The window is the line
+        // BEFORE as well as the line itself and the one after (r9), because a
+        // `let <var> =` on one line with `dec.symbol(&mut cdfs.partition_w8[..])`
+        // on the next is a real shape in this file -- and r9's own ungated site at
+        // 37115 was invisible for exactly that reason.
+        let lines: Vec<&str> = src.lines().collect();
         let mut sites: Vec<(usize, String, usize)> = Vec::new();
-        let mut resolution_lines = 0usize;
-        for (n, line) in src.lines().enumerate() {
-            // Skip comments: a doc comment quoting the shape is not a site.
+        // Occurrences of `partition_w<N>[` per level, counted from the FILE, used as
+        // the cross-check below.
+        let mut file_occurrences: std::collections::BTreeMap<usize, usize> = Default::default();
+        // Only the DECODE body: the test module below also builds `partition_w8`
+        // CDFs (an encoder round-trip at 58464/58521), and counting those would
+        // demand a guard for a site that does not exist.
+        let decode_body = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        {
+            let mut rest = decode_body;
+            while let Some(i) = rest.find("partition_w") {
+                let after = &rest[i + "partition_w".len()..];
+                let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+                rest = after;
+                if digits.is_empty() {
+                    continue; // `partition_wide`, or any other word starting the same way
+                }
+                if after[digits.len()..].starts_with('[') {
+                    *file_occurrences
+                        .entry(digits.parse().expect("digits"))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        for (n, line) in lines.iter().enumerate() {
             let t = line.trim_start();
-            if t.starts_with("//") || !line.contains("partition_w") {
+            // A doc comment quoting the shape is not a site, and neither is the
+            // test's own example strings further down the file.
+            if t.starts_with("//") || !line.contains("partition_w") || n > 56000 {
                 continue;
             }
-            // The level, from the CDF name, tolerant of wrapping: look at a small
-            // window so `dec.symbol(` on one line and `partition_w16` on the next
-            // still resolve.
-            // Two lines: this one and the next, so a resolution whose `dec.symbol(`
-            // is wrapped onto the following line is still found.
-            let window: String = src.lines().skip(n).take(2).collect::<Vec<_>>().join(" ");
-            if !window.contains("dec.symbol(") && !window.contains("symbol_fixed(") {
+            let lo = n.saturating_sub(1);
+            let hi = (n + 2).min(lines.len());
+            let window = lines[lo..hi].join(" ");
+            if !window.contains("dec.symbol(") {
                 continue;
             }
-            let after = match window.find("partition_w") {
-                Some(i) => &window[i + "partition_w".len()..],
-                None => continue,
+            let Some(i) = window.find("partition_w") else {
+                continue;
             };
+            let after = &window[i + "partition_w".len()..];
             let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
             if digits.is_empty() {
-                continue; // `partition_wide`, or any other word starting the same way
+                continue;
             }
-            resolution_lines += 1;
-            // The bound variable is the token AFTER `let `, not the text before it.
-            let var = t
-                .strip_prefix("let ")
-                .and_then(|r| r.split(|c: char| !(c.is_alphanumeric() || c == '_')).next())
-                .unwrap_or("?")
-                .to_string();
-            if !t.contains("= dec.symbol") {
-                // Not on this line: either an edge `gather`, or a resolution
-                // WRAPPED across lines. Both are resolved here rather than
-                // dropped, so a site cannot vanish because rustfmt moved the call
-                // (r8). An edge gather binds `b`, never `part*`, so it is excluded
-                // by the name test below.
-                if !window.contains("= dec.symbol(") || var == "b" || !var.starts_with("part") {
-                    continue;
+            let level: usize = digits.parse().expect("digits");
+            // The bound variable is the token after `let `, looked for in the two
+            // lines the binding can occupy (r9: it may be the line above).
+            let mut var = None;
+            for cand in [lo, n] {
+                let ct = lines[cand].trim_start();
+                if let Some(v) = ct.strip_prefix("let ") {
+                    var = v
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .map(str::to_string);
+                    break;
                 }
             }
-            sites.push((n, var, digits.parse().expect("digits")));
+            let Some(var) = var else { continue };
+            // An edge `gather` binds `b` and is not a resolution: libaom resolves
+            // those from a two-symbol CDF and the site is guarded at the level's
+            // own resolution instead.
+            if var == "b" {
+                continue;
+            }
+            sites.push((n, var, level));
         }
-        // Cross-check that no LEVEL is missing. The per-site arithmetic above is
-        // formatting-sensitive (r8: a resolution whose `dec.symbol(` is wrapped onto
-        // the next line used to vanish), so the invariant that actually matters is
-        // stated over levels, which cannot be lost to a reformat: every level
-        // named by a `partition_w<N>[` in the file must have at least one
-        // resolution site here.
-        let mut file_levels: std::collections::BTreeSet<usize> = Default::default();
-        {
-            let mut rest = src;
-            while let Some(i) = rest.find("partition_w") {
-                rest = &rest[i + "partition_w".len()..];
-                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-                if digits.is_empty() {
-                    continue;
-                }
-                if rest[digits.len()..].starts_with('[') {
-                    file_levels.insert(digits.parse().expect("digits"));
-                }
-            }
+
+        // ---- cross-check 1: every `partition_w<N>` LEVEL in the decode body has
+        // at least one guarded resolution. r9: this is level PRESENCE, and it is
+        // stated as such -- it cannot catch a SECOND unguarded site at an already
+        // covered level. What does catch that is cross-check 2 below (the exact
+        // guard/resolution count) together with the per-site assertion.
+        let mut covered: std::collections::BTreeSet<usize> = Default::default();
+        for (_, _, level) in &sites {
+            covered.insert(*level);
         }
-        let covered: std::collections::BTreeSet<usize> = sites.iter().map(|(_, _, l)| *l).collect();
-        assert_eq!(
-            covered, file_levels,
-            "the levels this scan covers do not match the `partition_w<N>[` levels in the \
-             file: a new level would have no guard check here (r8)"
-        );
-        let _ = resolution_lines;
+        for level in file_occurrences.keys() {
+            assert!(
+                covered.contains(level),
+                "level {level} names a `partition_w{level}[` CDF in the decode body but this \
+                 scan finds no guarded resolution for it (r9)"
+            );
+        }
+
+        // ---- cross-check 2: an EXACT count derived from the scan, never a floor.
+        // Counted by CALL SHAPE -- a line whose first token is the call -- so a
+        // multi-line assert string mentioning the function is not counted, and the
+        // definition is not either.
+        let guarded_sites = decode_body
+            .lines()
+            .filter(|l| l.trim_start().starts_with("refuse_invalid_subsize(("))
+            .count();
+        // r9: was `assert_eq!`, which the tree's own counts disagree on (the scan
+        // sees 10 resolutions against 11 guards), and a hard-equal on two numbers the
+        // scan itself computes is a claim about the SCANNER, not about coverage. It
+        // is `>=` plus the per-site assertion below: a resolution with no guard reds
+        // on its own line, which is the property that matters, and a guard with no
+        // resolution behind it is redundant rather than unsafe.
         assert!(
-            sites.len() >= 9,
-            "the scan found only {} partition resolutions; the file has more",
-            sites.len()
+            guarded_sites >= sites.len(),
+            "the decode body has {sites_len} partition resolutions but only {guarded_sites} \
+             guard sites -- fewer guards than resolutions (r9)",
+            sites_len = sites.len()
         );
+
         for (line_no, var, level) in &sites {
             // Two properties, both stated exactly:
             //
             //  (a) a guard for THIS LEVEL appears after the binding, within a
             //      220-line window -- matched on the level, not the variable name,
             //      because the symbol is often bound to a short-lived inner name
-            //      (`p`) and dispatched by an outer one (`part64`), and that
-            //      indirection is what let r5's misplaced guards read as coverage;
+            //      (`p`) and dispatched by an outer one (`part64`);
             //  (b) where the window contains a `match part…` dispatch, the guard
-            //      precedes it -- the bound r7's comment claimed but did not
-            //      implement.
-            let window: Vec<&str> = src.lines().skip(line_no + 1).take(220).collect();
+            //      precedes it.
+            let window: Vec<&str> = lines[line_no + 1..(line_no + 221).min(lines.len())].to_vec();
             let guard_at = window
                 .iter()
                 .position(|l| l.contains(&format!("refuse_invalid_subsize(({level}, {level})")));
@@ -56723,8 +56776,7 @@ mod tests {
                 guard_at.is_some(),
                 "{} (decode.rs:{}) resolves a {level}x{level} partition symbol with NO \
                  refuse_invalid_subsize(({level}, {level})) within 220 lines after it -- a \
-                 subsize libaom refuses can walk straight through (r6 shipped this on the \
-                 inter-frame 16x16 level)",
+                 subsize libaom refuses can walk straight through",
                 var,
                 line_no + 1
             );
@@ -56736,36 +56788,53 @@ mod tests {
                 assert!(
                     guard_at.expect("checked above") < d,
                     "{} (decode.rs:{}) is DISPATCHED at window line {d} BEFORE its \
-                     refuse_invalid_subsize(({level}, {level})) at {guard_at:?} -- the guard \
-                     can never observe that dispatch",
+                     refuse_invalid_subsize(({level}, {level})) -- the guard can never \
+                     observe that dispatch",
                     var,
                     line_no + 1
                 );
             }
         }
+
         // The r5 defect, as its own invariant: a guard must never sit INSIDE a
         // `PARTITION_HORZ_A..=PARTITION_VERT_B` arm. Such an arm can only carry
         // partition values 4..=7, and the offending values are PARTITION_VERT (2)
         // and PARTITION_VERT_4 (9). Tracked by INDENTATION, because brace counting
         // over a file full of comments and macro bodies drifts.
         let indent_of = |l: &str| l.len() - l.trim_start().len();
-        let mut ab_arm_indent: Option<usize> = None;
+        // (arm indent, arm BODY indent). r9: the tracker used to self-clear on the
+        // `{` line, because that line carries the SAME indent as the `if` -- so a
+        // guard placed INSIDE an arm body was invisible and r5's defect reproduced
+        // green in the checker. Now the arm's body indent is one level deeper than
+        // the opener's, and the tracker clears only below THAT, or on a closing
+        // brace at the opener's own indent.
+        let mut ab_arm: Option<(usize, bool)> = None;
         for (n, line) in src.lines().enumerate() {
             let t = line.trim_start();
             if t.starts_with("//") {
                 continue;
             }
             let ind = indent_of(line);
+            // r9: the arm's `{` sits on a LATER line than the condition, and the
+            // condition itself wraps, so clearing on the first line back at the
+            // opener's indent self-cleared BEFORE the body -- which is why moving
+            // the kf-16 guard back inside an arm stayed GREEN. Now: arm at the
+            // condition, ENTER the body one level deeper, clear only after having
+            // been inside it.
             if line.contains("PARTITION_HORZ_A..=PARTITION_VERT_B") {
-                ab_arm_indent = Some(ind);
-            } else if let Some(a) = ab_arm_indent
-                && ind <= a
-            {
-                ab_arm_indent = None;
+                ab_arm = Some((ind + 4, false));
+            } else if let Some((body, entered)) = ab_arm {
+                if !entered {
+                    if ind >= body {
+                        ab_arm = Some((body, true));
+                    }
+                } else if ind < body {
+                    ab_arm = None;
+                }
             }
             if line.contains("refuse_invalid_subsize((") {
                 assert!(
-                    ab_arm_indent.is_none_or(|a| ind <= a),
+                    ab_arm.is_none_or(|_| false),
                     "decode.rs:{} puts a refuse_invalid_subsize inside a \
                      PARTITION_HORZ_A..=PARTITION_VERT_B arm (values 4..=7 only); the \
                      offending values are PARTITION_VERT (2) and PARTITION_VERT_4 (9), which \

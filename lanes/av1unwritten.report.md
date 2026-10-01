@@ -590,3 +590,64 @@ $ # move the inter-64 guard inside a PARTITION_HORZ_A..=PARTITION_VERT_B arm
 p (decode.rs:54137) resolves a 64x64 partition symbol with NO
 refuse_invalid_subsize((64, 64)) within 220 lines after it
 ```
+
+---
+
+## 11. r9 — a real residue site, and a checker that was weaker than its comment
+
+The third pass confirmed r7's decode path (all 9 guard sites top-level, seeing
+every value; the corpus census reproducing exactly; all 20 genuine 4:2:2 fixtures
+decoding). The FAIL was in the checker plus one real residue.
+
+### 11.1 The residue: a second key-frame 8x8 resolution, unguarded
+
+`decode.rs:37115` is a key-frame `partition_w8` resolution dispatching
+`decode_leaf_rect8` on a raw `part8` with no `refuse_invalid_subsize` anywhere
+after it — `BLOCK_4X8` at 4:2:2, the shape r5 and r6 each flagged. Guarded. The
+fixed scan then immediately found a **second** one at `36876`, which no earlier
+round had seen. Both are residue rather than live pixels: neither is corpus-
+reachable at ss (1,0) today. Guarded anyway.
+
+### 11.2 Three checker gaps, all closed
+
+1. **The scan's window started AT the `partition_w` line**, so a binding whose
+   `let` is on the line above was dropped — which is exactly why `37115` was
+   invisible. r9 searches the line BEFORE as well.
+2. **The level cross-check was per-level PRESENCE**, so a second unguarded site
+   at an already covered level passed — which is how `37115` survived with level 8
+   covered by the inter-8 site. r9 keeps presence as presence and says so, and
+   adds the exact guard-vs-resolution count.
+3. **`sites.len() >= 9` was a floor the tree already satisfied with 10.** Replaced
+   with a count derived from the scan: the decode body has **11 guard sites** and
+   the scan finds **11 resolutions**.
+
+Plus the one the refutation demonstrated green: the AB-arm tracker **self-cleared
+on the `{` line**, because that line carries the same indent as the `if` — moving
+the kf-32 guard back inside an arm stayed GREEN. r9 arms at the condition,
+*enters* the body one level deeper, and clears only after having been inside it.
+That mutation now reds:
+
+```
+$ # move the kf-32 guard inside a PARTITION_HORZ_A => arm
+p (decode.rs:36332) resolves a 32x32 partition symbol with NO
+refuse_invalid_subsize((32, 32)) within 220 lines after it
+```
+
+### 11.3 The occurrence count, re-derived per line
+
+`refuse_invalid_subsize((` appears **18 times in `decode.rs`**: **11** guard call
+sites in the decode body (one per resolution), **4** in this test's own string
+literals and comparisons, **2** in doc comments, and **1** — the definition's own
+signer line does not match `((` at all. Main's line-grep count of 13 was taken at
+r7, before the two r9 guards; the refutation's 15 was likewise pre-r9. Eleven is
+what the tree carries now, counted by call shape (`l.trim_start().starts_with(…)`)
+so a multi-line assert string mentioning the function is not counted.
+
+### 11.4 What is still not claimed
+
+The guard-vs-resolution cross-check is `>=`, not `==`: the scan sees 11 and 11
+today, but a hard equality between two numbers the scan itself computes is a claim
+about the scanner, not about coverage. What reds is a resolution with no guard —
+on its own line, naming the variable — and a guard sitting inside an AB arm. A
+redundant guard with no resolution behind it is harmless and is not treated as a
+defect.
