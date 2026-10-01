@@ -30,6 +30,7 @@ pub mod census;
 mod compound;
 pub mod decode;
 pub mod encode;
+mod dumpio;
 pub mod encoder;
 mod envflags;
 mod film_grain;

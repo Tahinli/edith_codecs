@@ -2174,22 +2174,23 @@ fn decode_frame(
     // end-of-tile one.
     let stored_cdfs = stored_cdfs_for(header, end_cdfs, started_from);
     if let Ok(path) = std::env::var("EC_AV1_DUMP_TABLES") {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "=== frame idx={} ===", shown_idx);
-            let _ = writeln!(f, "partition_w64 {:?}", stored_cdfs.partition_w64);
-            let _ = writeln!(f, "partition_w32 {:?}", stored_cdfs.partition_w32);
-            let _ = writeln!(f, "partition_w16 {:?}", stored_cdfs.partition_w16);
-            let _ = writeln!(f, "skip {:?}", stored_cdfs.skip);
-            let _ = writeln!(f, "new_mv {:?}", stored_cdfs.new_mv);
-            let _ = writeln!(f, "zero_mv {:?}", stored_cdfs.zero_mv);
-            let _ = writeln!(f, "ref_mv {:?}", stored_cdfs.ref_mv);
-            let _ = writeln!(f, "mv_joint {:?}", stored_cdfs.mv_joint);
-        }
+        // lane-av1dumploud: loud on a short write. This one is APPEND-mode and
+        // spans every frame of a run, so there is no total length to declare
+        // (`append_unknown` says so on the failure line rather than guessing
+        // one); the per-line writes are still checked, so an ENOSPC halfway
+        // through a table no longer passes as a complete one.
+        let mut f = crate::dumpio::LoudDump::append_unknown("EC_AV1_DUMP_TABLES", &path);
+        let mut line = |s: String| f.write(s.as_bytes());
+        line(format!("=== frame idx={shown_idx} ===\n"));
+        line(format!("partition_w64 {:?}\n", stored_cdfs.partition_w64));
+        line(format!("partition_w32 {:?}\n", stored_cdfs.partition_w32));
+        line(format!("partition_w16 {:?}\n", stored_cdfs.partition_w16));
+        line(format!("skip {:?}\n", stored_cdfs.skip));
+        line(format!("new_mv {:?}\n", stored_cdfs.new_mv));
+        line(format!("zero_mv {:?}\n", stored_cdfs.zero_mv));
+        line(format!("ref_mv {:?}\n", stored_cdfs.ref_mv));
+        line(format!("mv_joint {:?}\n", stored_cdfs.mv_joint));
+        f.finish();
     }
     // lane-comppin r3: decode-order (not display-order) dump of every
     // frame's own post-deblock buffer -- the pre-existing pixel diff
@@ -2202,17 +2203,19 @@ fn decode_frame(
     // to isolate whether the defect is in a hidden frame's own
     // reconstruction or downstream of it.
     if let Ok(path) = std::env::var("EC_AV1_DECODE_ORDER_DUMP") {
-        use std::io::Write;
-        let idx = decode_idx;
-        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            // lane-hbd r4: debug dump narrows to u8 -- this diagnostic
-            // predates 10-bit support and is an 8-bit-oracle comparison
-            // only (aomdec's own dump is 8-bit here too).
-            let narrow = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
-            let _ = f.write_all(&narrow(&picture.y));
-            let _ = f.write_all(&narrow(&picture.u));
-            let _ = f.write_all(&narrow(&picture.v));
-        }
+        // lane-hbd r4: debug dump narrows to u8 -- this diagnostic
+        // predates 10-bit support and is an 8-bit-oracle comparison
+        // only (aomdec's own dump is 8-bit here too).
+        //
+        // lane-av1dumploud: loud on a short write; expected length is the three
+        // planes' own lengths (narrowing is 1 byte per sample, so the count is
+        // unchanged).
+        let narrow = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
+        crate::dumpio::write_planes(
+            "EC_AV1_DECODE_ORDER_DUMP",
+            format!("{path}.f{decode_idx}"),
+            &[&narrow(&picture.y), &narrow(&picture.u), &narrow(&picture.v)],
+        );
     }
     // lane-hidden r1: the frame exactly as it is about to be stored into
     // the reference slots -- after deblock/CDEF/LR/superres, in DECODE
@@ -2247,20 +2250,27 @@ fn decode_frame(
     // stores and every later frame predicts from.
     decode::census_unwritten_final(&picture.y, &picture.u, &picture.v);
     if let Some(prefix) = final_dump {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::File::create(format!("{prefix}.f{decode_idx}")) {
-            let mut buf = Vec::new();
-            for plane in [&picture.y, &picture.u, &picture.v] {
-                if bit_depth == 8 {
-                    buf.extend(plane.iter().map(|&s| s as u8));
-                } else {
-                    for &s in plane {
-                        buf.extend_from_slice(&s.to_le_bytes());
-                    }
+        // lane-av1dumploud: this is the site that produced the 13 320 192-byte
+        // truncated frame in `lanes/unwritten-dep.report.md` -- `let _ =
+        // f.write_all(&buf)` swallowed the ENOSPC. Expected length is derived
+        // from the PLANES and the sample width, independently of `buf`, so a
+        // writer that builds the wrong buffer still gets caught.
+        let sample_width = if bit_depth == 8 { 1 } else { 2 };
+        let expected = (picture.y.len() + picture.u.len() + picture.v.len()) * sample_width;
+        let mut f =
+            crate::dumpio::LoudDump::create("EC_AV1_FINAL_DUMP", format!("{prefix}.f{decode_idx}"), expected);
+        for plane in [&picture.y, &picture.u, &picture.v] {
+            if bit_depth == 8 {
+                f.write(&plane.iter().map(|&s| s as u8).collect::<Vec<u8>>());
+            } else {
+                let mut row = Vec::with_capacity(plane.len() * 2);
+                for &s in plane {
+                    row.extend_from_slice(&s.to_le_bytes());
                 }
+                f.write(&row);
             }
-            let _ = f.write_all(&buf);
         }
+        f.finish();
     }
     Ok(FrameOutput {
         picture,
