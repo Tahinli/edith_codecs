@@ -84,9 +84,9 @@ const REFUSALS: &[&str] = &[
     // pixel-exact vs ffmpeg).
     // lane-av1txr: `a sub-8x8 leaf that uses intrabc (…)` is GONE -- the
     // capability landed in this lane (4x4 / 4x8 / 8x4 intrabc leaves read the
-    // DV and reconstruct a frame copy + the INTER residual; gates
-    // `a_non_420_subsampled_sequence_header_is_refused_by_name`'s sibling
-    // witnesses and the `warped.obu`/`allintra.obu` traces). Its census gate
+    // DV and reconstruct a frame copy + the INTER residual; the sub-8x8
+    // intrabc leaf witnesses in `stream.rs` and the `warped.obu` /
+    // `allintra.obu` traces). Its census gate
     // (`a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal`)
     // still runs: it now reports `reached = 0` with the same non-vacuous
     // premise (allow_intrabc frames + decoded sub-8 leaves).
@@ -134,20 +134,6 @@ const REFUSALS: &[&str] = &[
     // (`encoder.c:2404`), so an untiled `smptebars=size=128x96` source gives
     // `allow_intrabc = 0` with AND without `--tune-content=screen`, while the
     // 256x192 `-vf tile=2x2` source gives `= 1` at 8, 10 and 12 bits.
-    // lane-av1txr: the silent-garbage guard. A 4:4:4/4:2:2 stream used to
-    // decode with no refusal and wrong pixels (every chroma extent is
-    // hardcoded 4:2:0, the probe emits 4:2:0 planes only); it is now refused
-    // at the sequence header. Gate:
-    // `a_non_420_subsampled_sequence_header_is_refused_by_name`.
-    // lane-av1odd440: the string gained its 4:4:0 clause. `subsampling_y` is
-    // coded only when `subsampling_x` is 1 (spec 5.5.2; libaom
-    // `av1_read_color_config`, `av1/decoder/decodeframe.c:4171-4175`, and its
-    // writer's own `assert(..., "4:4:0 subsampling not allowed in AV1")` at
-    // `av1/encoder/bitstream.c:2467-2468`), so (0,1) cannot reach this check --
-    // the reachable set is 4:2:0, 4:2:2 and 4:4:4, and only 4:2:2 lands here.
-    // Gate: `the_440_cell_is_not_a_codable_chroma_shape`, which enumerates
-    // the whole reachable set through this crate's own writer AND reader.
-    "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported, and 4:4:0 (0,1) is not a codable cell",
     // lane-av1txr-r2 added, lane-av1-qmatrix RETIRED: the third member of the
     // silent-garbage family (`using_qmatrix`/`qm_y`/`qm_u`/`qm_v`, refused by
     // name at the frame header) now DEQUANTISES through libaom's
@@ -520,17 +506,16 @@ const PROVEN: &[(&str, &str, Proof)] = &[
     // that refused pre-lift) and the compound-warp arm witnesses through
     // `a_real_compound_global_warp_12bit_stream_decodes_pixel_exact`
     // (hard `compound_warp_hits > 0`).
-    // lane-av1txr: the guard's own gate builds a profile-1 and a profile-2
-    // sequence header by hand and asserts each refuses by name while the
-    // profile-0 CONTROL still decodes -- the refusal is exercised, not merely
-    // present. lane-av1odd440 adds the second gate named here, which
-    // enumerates every chroma shape a `color_config` can code and pins the
-    // bytes a 4:4:0 request actually produces (`440_request_is_422.obu`).
-    (
-        "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported, and 4:4:0 (0,1) is not a codable cell",
-        "a_non_420_subsampled_sequence_header_is_refused_by_name",
-        Proof::NegativeGate,
-    ),
+    // lane-av1422lift: the 4:2:2 sequence-header refusal is GONE and so is
+    // this pairing. The tuple named `a_non_420_subsampled_sequence_header_is_
+    // refused_by_name` as the gate that refused (1,0); that gate asserted a
+    // REFUSAL STRING, so it could not fail on a tree where 4:2:2 decode was
+    // completely broken -- it passed unchanged on the broken tree and would
+    // have kept passing if the port had been reverted. Its replacement
+    // `a_real_422_key_frame_and_inter_sequence_decode_pixel_exact` (and the
+    // corpus battery `the_pinned_422_corpus_cells_decode_pixel_exact`) assert
+    // BYTE-EXACT planes against ffmpeg on real 4:2:2 streams, with the
+    // per-plane coefficient-unit census as the non-vacuity arm.
     // lane-av1txr-r2 paired, lane-av1-qmatrix RETIRED with its gate: the
     // refusal's witness is now
     // `a_real_aomenc_quantisation_matrix_stream_decodes_pixel_exact`, which
@@ -1731,10 +1716,13 @@ mod tests {
     /// The subsampling domain is `{(0,0), (1,0), (1,1)}` and excludes
     /// `(0,1)`: `ec-av1-syntax`'s `color_config` only ever READS
     /// `subsampling_y` when `subsampling_x == 1` (sequence.rs:481), so
-    /// `(0,1)` is uncodable. `(1,0)` is 4:2:2, refused at the sequence
-    /// header by `a_non_420_subsampled_sequence_header_is_refused_by_name`
-    /// -- it is walked anyway, so the proof does not depend on that guard
-    /// staying in place.
+    /// `(0,1)` is uncodable. `(1,0)` is 4:2:2. It is walked because that is
+    /// the codable domain, NOT because a guard stands in the way: as of
+    /// lane-av1422lift the sequence header no longer refuses 4:2:2 at all, so
+    /// the sentence this replaces ("refused at the sequence header by
+    /// `a_non_420_subsampled_sequence_header_is_refused_by_name`") names a
+    /// gate that no longer exists. The walk was already right; its stated
+    /// reason was not.
     #[test]
     fn every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table() {
         let src = include_str!("decode.rs");
@@ -2023,7 +2011,10 @@ mod tests {
     /// this half was wrong: "the header refuses it" is a statement about
     /// today's tree, not about the strip domain, and a domain that shrinks
     /// silently when a guard moves is not an enumeration. `(1,0)` is walked
-    /// here anyway, so this proof does not depend on the guard staying.
+    /// here anyway, so this proof does not depend on the guard staying -- and
+    /// as of lane-av1422lift it does not depend on the guard EXISTING: 4:2:2
+    /// decodes, and this enumeration is what says the decode has a
+    /// coefficient table for every chroma unit it can present.
     ///
     /// The 32-per-axis cap is what keeps 4:2:2 covered without new table
     /// arms: a 4:2:0 32x64 strip is a 16x32 chroma unit and its 4:2:2

@@ -2875,9 +2875,16 @@ thread_local! {
     /// Chroma units of the same walk whose grid is exactly 1x2 (4:4:4 32x64,
     /// or 16x64 as two 16x32s).
     static RECT_TILED_CHROMA_1X2_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Chroma units of the same walk in any other multi-unit grid (2x2 and up
-    /// -- only reachable at 4:2:2, which is refused, so this stays 0 on
-    /// every admitted stream; kept so the match above is exhaustive).
+    /// Chroma units of the same walk in any other multi-unit grid (2x2 and
+    /// up). lane-av1422lift: this used to say "only reachable at 4:2:2, which
+    /// is refused, so this stays 0 on every admitted stream", and that was
+    /// true. 4:2:2 is decoded now, so the "cannot happen" is gone -- but the
+    /// arm is still UNWITNESSED: measured on this branch's tip over all 21
+    /// committed 4:2:2 cells and over the 4:2:0 / 4:4:4 cells probed, it
+    /// reads 0 on every one of them. No committed gate reads it either (the
+    /// only readers of `rect_tiled_chroma_grid_hits()` are two 4:4:4 strip
+    /// gates, where `nxn` is interpolated into a failure message and never
+    /// asserted). Kept so the match above is exhaustive.
     static RECT_TILED_CHROMA_NXN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -6155,9 +6162,17 @@ thread_local! {
 
 // lane-av1422luma: the ss (1,0) twin of `INTRABC_RECT4_OWN_CHROMA444_HITS`
 // -- how many intra-BC 1:4 strips at 4:2:2 took the own-chroma (no pair)
-// route. Same caveat as the 4:4:4 counter: it proves REACH and nothing else,
-// and 4:2:2 is refused at the sequence header, so no committed test can read
-// it (the count in `lanes/av1422luma.report.md` is from a bypassed probe build).
+// route. Same caveat as the 4:4:4 counter: it proves REACH and nothing else.
+// lane-av1422lift: 4:2:2 is DECODED, so this counter is no longer pinned
+// behind a header refusal -- and it DOES fire: measured on this branch's tip,
+// the six committed corpus cells each read 1 more than the cell before
+// (`s422_320x246` 1, `s422_322x240` 2, `s422_322x246` 3, `s422_352x242_10b`
+// 4, `s422_416x242_10b` 5, `s422_416x250_10b` 6), and every other committed
+// 4:2:2 cell leaves it at 6. **No committed gate reads it**: the accessor
+// below has no callers in the crate (the 4:4:4 twin is read at two
+// `stream.rs` sites, this one nowhere). The honest sentence is therefore
+// "no committed test reads this counter", which is what the 4:4:4 twin's
+// doc says about itself -- it does NOT become "the corpus gate reads it".
 thread_local! {
     static INTRABC_RECT4_OWN_CHROMA422_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -17024,9 +17039,14 @@ fn decode_block_rect4(
     // 4:2:0 codes 16x4/4x16 (`TxbSet::Chroma8`); 4:4:4 codes the strip
     // itself, 32x8/8x32 (`get_txsize_entropy_ctx(TX_32X8)` =
     // `(wide_log2 + high_log2 + 1) >> 1` = the 16x16 set,
-    // `TxbSet::Chroma16`). The caller set is closed -- this reader only
-    // ever sees 32x8 / 8x32 luma and the sequence header admits ss 0/0
-    // and 1/1 only -- so the table is exhaustive.
+    // `TxbSet::Chroma16`). The caller set is closed -- this reader only ever
+    // sees 32x8 / 8x32 luma. lane-av1422lift: this sentence used to end "and
+    // the sequence header admits ss 0/0 and 1/1 only -- so the table is
+    // exhaustive", which was a claim about a guard rather than about this
+    // reader. The header admits ss (1,1), (1,0) and (0,0), and the (1,0)
+    // 4:2:2 arm is dispatched a few lines below (`chroma422_rect32`), so the
+    // table's exhaustiveness comes from the reader's own luma shape -- which
+    // is what the sentence now claims.
     let chroma422_rect32 = (chroma_w, chroma_h) == (4, 32) && ss_x(fctx) == 1 && ss_y(fctx) == 0;
     let (chroma_set, chroma_scan): (TxbSet, &[u16]) = match (chroma_w, chroma_h) {
         (16, 4) => (TxbSet::Chroma8, &SCAN_16X4[..]),
@@ -23425,13 +23445,27 @@ thread_local! {
     /// ... and the number of non-skip 128-root rect BLOCKS whose replay
     /// height differs from the unit's own LUMA-MI height -- the signature of the
     /// width passed to both axes (`luma_span` where the in-loop stamp used
-    /// `luma_span_h`). Zero on every stream this decoder admits: both
-    /// supported chroma formats have `ss_x == ss_y` (4:2:0 and 4:4:4), and
-    /// 4:2:2 -- the one format whose two spans differ -- is refused by name
-    /// at the sequence header (`stream::decode_frame`), so the arm is
-    /// defensive until that format is ported. The counter turns a future
-    /// 4:2:2 admission (or any hardcoded span) into a named red gate instead
-    /// of silent mi-state corruption.
+    /// `luma_span_h`). lane-av1422lift: the doc here used to read "Zero on
+    /// every stream this decoder admits ... 4:2:2 ... is refused by name at
+    /// the sequence header", and that was TRUE. Admitting 4:2:2 genuinely made
+    /// this counter able to fire, and it does fire: measured on this branch's
+    /// tip over all 21 committed 4:2:2 cells, `422_intrabc_sb128_strip.obu`
+    /// and `422_intrabc_sb128_strip_notxsearch.obu` each read
+    /// `replay = 72, mismatch = 9`; the other 19 read 0.
+    ///
+    /// **Those two pins are byte-exact against ffmpeg**
+    /// (`the_pinned_422_intrabc_sb128_strip_witnesses_decode_pixel_exact`, all
+    /// five frames, every plane), so a non-zero mismatch is NOT a defect
+    /// signature at 4:2:2 -- it is the arm counting its own designed case.
+    /// Nothing here asserts zero, and nothing should: adding a zero assert
+    /// would red a gate on a cell that is provably correct.
+    ///
+    /// The only readers of the pair are
+    /// [`sb128rect_chroma_replay_hits`]'s two gates, both on 4:4:4 and 4:2:0
+    /// streams, where the unit's luma width and height are equal so the
+    /// mismatch half is structurally zero. That is the zero this counter is
+    /// currently a tripwire FOR, and it is a statement about those two
+    /// streams, not about the format.
     pub(crate) static SB128RECT_REPLAY_SPAN_MISMATCH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
