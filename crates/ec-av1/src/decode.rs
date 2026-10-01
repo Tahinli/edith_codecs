@@ -21635,26 +21635,44 @@ fn refuse_invalid_plane_block(_bw: usize, _bh: usize, _fctx: &crate::decode::Fra
 /// the output does not depend on the plane buffer's initial content.
 const PLANE_SENTINEL: u16 = 0xDEAD;
 
-/// lane-unwritten-dep: the census count at the LAST point of the pipeline, after
-/// deblock/CDEF/LR -- i.e. on the exact bytes `EC_AV1_FINAL_DUMP` writes.
+/// lane-unwritten-dep: the census count at the LAST point of the pipeline, on the
+/// exact bytes `EC_AV1_FINAL_DUMP` writes.
 ///
-/// WHY A SECOND COUNT (the pre-deblock one is not enough, and this is the
-/// measured reason, not a guess): on `440_request_is_422` the pre-deblock plane
-/// is BYTE-IDENTICAL between an uninitialised and a `PLANE_SENTINEL`-filled run
-/// (0 sentinel samples in both) while the final output differs by 1986 bytes,
-/// all of it in the U/V planes' rows 30..63. The deblock pass is where the
-/// dependence is CREATED: `EC_AV1_POSTDEBLOCK_DUMP16` is identical pre-deblock
-/// and differs by 26 bytes post-deblock, and `EC_AV1_DEBUG_SKIP_DEBLOCK=1` does
-/// not remove the difference. So a pre-deblock scan cannot see a hole the loop
-/// filter then READS: deblock reads a neighbour to decide an edge, so an
-/// unwritten sample changes its neighbour's filtered value even when the
-/// unwritten sample itself is overwritten afterwards.
+/// WHY A SECOND COUNT, and what it is actually for -- the justification this
+/// comment originally carried was WRONG and is corrected here, because a reader
+/// would otherwise re-derive the wrong conclusion. An earlier revision of this
+/// lane claimed the pre-deblock plane was byte-identical plain-vs-sentinel and
+/// that "deblock creates the dependence". That reading came from
+/// [`dump_stage16`], which cropped chroma as `(fw/2, fh/2)` -- a 4:2:0
+/// assumption. On a 64x64 4:2:2 frame (ss_x=1, ss_y=0) that wrote 32x32 chroma
+/// where the frame carries 32x64, so 2048 chroma samples appeared in NO stage
+/// dump, and they are exactly the region where the difference lives.
 ///
-/// This count is the same measurement taken where the output is taken, so it is
-/// what a gate can assert: "no sample the tile walk never wrote survives into the
-/// frame the caller receives". Zero here AND zero pre-deblock = no dependence;
-/// non-zero here with zero pre-deblock = a loop-filter read, named.
+/// With per-axis extents the corrected measurement on `440_request_is_422` is:
+/// the PRE-DEBLOCK dump already DIFFERS by 2158 bytes plain-vs-sentinel, and an
+/// exact u16 whole-plane census finds 224 unwritten samples (U 112, V 112,
+/// rows 36..63, whole 4x4 groups) -- the same number
+/// `lanes/av1unwritten.report.md` reports. **The hole is present before any
+/// filter runs, and the pre-deblock census sees it.** This comment previously
+/// said the opposite; that was the instrument's blind spot read as a property of
+/// the pipeline.
+///
+/// So what this second count is FOR, stated honestly: it is not there because the
+/// pre-deblock census misses holes. It is there because it is the measurement
+/// taken where the OUTPUT is taken -- the bytes stored into the reference slots
+/// and handed to the caller. A hole can be created after reconstruction (a
+/// filter stage, a superres step, a second pass) and be invisible to a scan taken
+/// before it; this one cannot. It is a check on the whole span from the tile walk
+/// to the caller's frame, not a claim that the pre-deblock scan is insufficient.
 static FINAL_UNWRITTEN_SAMPLES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Samples [`census_unwritten_final`] has looked at since the last
+/// [`take_final_census_scanned`]. A gate that only asserts
+/// [`take_final_unwritten_samples`] == 0 passes on a build whose census call was
+/// deleted, so it reads THIS too -- the same pairing
+/// [`CENSUS_SCANNED`] documents for the pre-deblock census.
+static FINAL_CENSUS_SCANNED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// lane-unwritten-dep: reads and clears [`FINAL_UNWRITTEN_SAMPLES`] -- unwritten
@@ -21666,26 +21684,35 @@ pub fn take_final_unwritten_samples() -> usize {
     FINAL_UNWRITTEN_SAMPLES.swap(0, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Reads and clears [`FINAL_CENSUS_SCANNED`]; the pairing is the reason it
+/// exists, exactly as for [`take_census_scanned`].
+pub fn take_final_census_scanned() -> usize {
+    FINAL_CENSUS_SCANNED.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// lane-unwritten-dep: the census at the pipeline's last point. Counts, over each
-/// plane's true extent, how many samples still hold [`PLANE_SENTINEL`] once every
-/// filter has run. Env-gated on the same flag as [`fresh_plane`] (there is no
-/// separate one: the fill and the census must agree on when they are live).
+/// plane, how many samples still hold [`PLANE_SENTINEL`] once every filter has
+/// run, and records how many samples it LOOKED at in [`FINAL_CENSUS_SCANNED`].
 ///
-/// Scans IN PLACE at the point the picture is finished, which is what
-/// distinguishes it from the pre-deblock census: this one sees what the caller
-/// receives.
+/// Gated on [`plane_sentinel_on`] -- the SAME predicate as [`fresh_plane`] and as
+/// the pre-deblock [`census_unwritten`]: the env flag OR the thread-local
+/// [`set_plane_sentinel`] override. An earlier revision gated this on the raw env
+/// var alone, which made the census silently inert for any in-process test using
+/// the thread-local switch that the rest of the crate honours. The fill and both
+/// censuses must agree on when they are live, or a "0" means nothing.
 pub(crate) fn census_unwritten_final(y: &[u16], u: &[u16], v: &[u16]) {
-    if !crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL") {
+    if !plane_sentinel_on() {
         return;
     }
     // The caller passes the frame's planes exactly as they are about to be
     // stored into the reference slots, which are already cropped to the true
     // extent (no padding past it reaches this point), so a flat count over
     // each plane IS the true-extent count.
-    let total: usize = [y, u, v]
+    let (scanned, total): (usize, usize) = [y, u, v]
         .iter()
-        .map(|p| p.iter().filter(|&&s| s == PLANE_SENTINEL).count())
-        .sum();
+        .map(|p| (p.len(), p.iter().filter(|&&s| s == PLANE_SENTINEL).count()))
+        .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
+    FINAL_CENSUS_SCANNED.fetch_add(scanned, std::sync::atomic::Ordering::SeqCst);
     FINAL_UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
 }
 
