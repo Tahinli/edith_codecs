@@ -466,3 +466,72 @@ $ wc -l /tmp/gt.txt
 * No other subsize-selecting dispatch lacks a guard above it: the arm scan finds
   no dispatch reached with a non-codable subsize and no `refuse_invalid_subsize`
   call between it and the symbol's resolution.
+
+---
+
+## 9. r7 — two more gaps, and the structural change that stops the third
+
+r6 was also partial. The refutation found two surviving holes and named the
+pattern that kept producing them.
+
+**Gap 1 — inter 64 edge arm.** r6's guard sat inside the `(true, true)` arm of
+`let part64 = match (has_cols, has_rows)`. The edge arms return without passing
+it, and `(false, true)` resolves to `PARTITION_VERT`, which at a 64x64 root
+selects `BLOCK_32X64` — INVALID at (1,0). Measured: `inter64_rect` is reached with
+`part64=2, has_cols=false, has_rows=true` **50 times corpus-wide and 0 times in
+any 4:2:2 cell**, so the corpus cannot see it. Fixed by hoisting one
+`refuse_invalid_subsize((64, 64), part64, fctx)?` to just after the `match` closes.
+
+**Gap 2 — the inter-frame 16x16 level had no guard at all.** r6 deleted r5's
+misplaced one without replacing it, and all three dispatch arms there (NONE/HORZ/
+VERT, the four AB arms, and the 1:4 arms) select `BLOCK_8X16` and `BLOCK_4X16` —
+two more of the eight (1,0)-INVALID shapes. Fixed by adding the guard where the
+inter-16 symbol is resolved, before any arm.
+
+### 9.1 The structural change (this is the part that matters)
+
+Both r5 and r6 failures had the same shape: **a guard existed somewhere and
+nothing said it sat between a symbol's resolution and every dispatch of it.** A
+hand-maintained site list cannot fix that — it is a list, and lists drift. So the
+invariant is now stated over the dispatch structure itself:
+
+`every_partition_symbol_resolution_is_guarded_before_it_dispatches` scans
+`decode.rs` for every binding of the form `let <var> = dec.symbol(...partition_w<N>[...])`
+— the resolutions, derived from the code, not from memory — and asserts each is
+followed by a `refuse_invalid_subsize((N, N), …)` for its own level. It also
+asserts the r5 defect cannot come back: **no `refuse_invalid_subsize` call may
+sit inside a `PARTITION_HORZ_A..=PARTITION_VERT_B` arm** (values 4..=7 only; the
+offending values are 2 and 9), tracked by indentation.
+
+Mutation, to show it bites:
+
+```
+$ # delete the inter-16 guard
+panicked: part16 (decode.rs:54671) resolves a 16x16 partition symbol with NO
+refuse_invalid_subsize((16, 16)) anywhere after it -- a subsize libaom refuses
+can walk straight through (r6 shipped exactly this on the inter-frame 16x16 level)
+```
+
+This is why `EC_AV1_SUBSIZE_ARM_TRACE` hand-listing three arms was not enough:
+its site list was itself a hand-maintained list, and r6's "no unguarded arm"
+reading was a limit of the instrument. The scan above cannot have a hole of that
+kind — a new level appears as a new binding and the test fails until it is
+guarded.
+
+### 9.2 Residue, corrected
+
+**At least three sites, not one.** `decode_rect4_16_intrabc` is **not** the only
+exception any more, and the earlier "still open: none" was wrong:
+
+| residue | status |
+|---|---|
+| inter-64 edge arm (`part64=2` via `(false, true)`) | **fixed in r7** |
+| inter-16 level's two shapes (`BLOCK_8X16`, `BLOCK_4X16`) | **fixed in r7** |
+| `decode_rect4_16_intrabc` | **out of scope and NOT audited** — another lane's charter |
+
+Beyond those, the structural scan reports every `partition_w*` resolution in the
+file guarded at its own level, so no further subsize-selecting dispatch in the
+paths this lane owns lacks a guard above it. That is a statement about the
+`partition_w*` resolutions; a dispatch that selects a subsize WITHOUT reading a
+`partition_w*` symbol would not be caught by it, and I did not find one, but I am
+not claiming the scan proves none exists.
