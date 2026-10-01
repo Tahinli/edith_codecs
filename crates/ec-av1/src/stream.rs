@@ -48557,6 +48557,239 @@ exit 0
         println!("UWDEP_CENSUS {n} frames={} scanned={scanned}", frames.len());
     }
 
+    /// lane-av1uballoc: the frame the caller receives does not depend on what
+    /// the plane buffer held before the decode wrote it.
+    ///
+    /// Four runs of the same fixtures, each in its own process (the fill and
+    /// the alloc closure are both process-constant env reads -- see
+    /// [`crate::envflags`] -- and this crate forbids `set_var`), must agree on
+    /// one hash per fixture:
+    ///
+    /// * `EC_AV1_PLANE_SENTINEL=0xDEAD` and `=0xBEEF` -- two DIFFERENT
+    ///   impossible values for the same buffer. This is the arm that can
+    ///   actually FAIL: if any reader's value reaches the picture, changing the
+    ///   poison changes the output. Equal hashes are a statement about a READ,
+    ///   which is what the `unsafe` in [`decode::fresh_plane`] needs and what no
+    ///   census in the crate measures.
+    /// * the sentinel OFF with `EC_AV1_PLANE_ALLOC=uninit` and `=zeroed` -- the
+    ///   status quo and the shipped closure, which must agree with each other
+    ///   and with the poisoned runs. This is the "same with the sentinel off"
+    ///   arm; on its own it is weak (the allocator may hand out the same
+    ///   ambient bytes twice) and is here as the join between the two worlds.
+    ///
+    /// NON-VACUITY, first and synthetic: [`allocdet_synthetic`] hashes two
+    /// pictures that differ in ONE sample and asserts the hashes DIFFER. A hash
+    /// that cannot see a one-sample difference would make every equality below
+    /// vacuous, and it is the failure mode a "0 errors" style result has.
+    /// Second: every arm must report `frames>0`, so a child that decoded
+    /// nothing cannot agree with another child that decoded nothing.
+    #[test]
+    fn the_frame_does_not_depend_on_the_plane_buffers_initial_content() {
+        const NAME: &str = "the_frame_does_not_depend_on_the_plane_buffers_initial_content";
+        let _gate_lock = lock_gate_counters();
+        // Kept SMALL on purpose: the whole gate is 4 child processes x this
+        // list, and the suite runs it in a DEBUG build. A first revision used
+        // the 1920x792 film fixtures here and took 252 s, which is not a gate
+        // anyone keeps. These ten cover every shape the region list names --
+        // 4:2:2 (12-bit key, inter, sb128 intrabc, 17-frame odd-size), 4:4:4
+        // (lossless sb64, intrabc rect4, 128-root mu), a padded odd size, an
+        // off-tile chroma walk, and superres+CDEF+LR -- for ~1.3 s per arm.
+        const FIXTURES: &[&str] = &[
+            "s422_12bit_160x128",
+            "422_inter_160x128_3f",
+            "422_intrabc_sb128_strip",
+            "s422_352x242_10b",
+            "ll444_sb64_1to4_lossless",
+            "444_intrabc_rect4_witness",
+            "444_intra_in_inter_128root_mu_chroma",
+            "svt1-split-tx-pin",
+            "mix176_offtile_chroma_clip",
+            "superres_kf_cdef_lr_64x64",
+        ];
+
+        let (a, b) = allocdet_synthetic();
+        assert_ne!(
+            a, b,
+            "{NAME}: the content hash returned the same value for two pictures differing in one \
+             sample, so every equality below is vacuous -- this gate would pass on any decoder, \
+             including one that returns garbage (class: hash-cannot-see-content)"
+        );
+
+        let arms: [(&str, Option<&str>, &str); 4] = [
+            ("poison-dead", Some("0xDEAD"), "uninit"),
+            ("poison-beef", Some("0xBEEF"), "uninit"),
+            ("sentinel-off-uninit", None, "uninit"),
+            ("alloc-zeroed", None, "zeroed"),
+        ];
+        let mut baseline: Option<Vec<(String, usize, u64)>> = None;
+        for (label, poison, alloc) in arms {
+            let rows = allocdet_child(FIXTURES, poison, alloc);
+            assert_eq!(
+                rows.len(),
+                FIXTURES.len(),
+                "{NAME}: the {label} arm reported {} of {} fixtures -- a run that decoded \
+                 nothing can agree with another run that decoded nothing",
+                rows.len(),
+                FIXTURES.len()
+            );
+            for (f, frames, _) in &rows {
+                assert!(
+                    *frames > 0,
+                    "{NAME}: the {label} arm decoded 0 frames of {f}; the hashes it compared are \
+                     over nothing"
+                );
+            }
+            match &baseline {
+                None => baseline = Some(rows),
+                Some(first) => {
+                    for (i, (f, frames, h)) in rows.iter().enumerate() {
+                        let (bf, bframes, bh) = &first[i];
+                        assert_eq!(
+                            bf, f,
+                            "{NAME}: arm {label} reported fixture {f} where the \
+                             baseline reported {bf} -- the arms are not comparable"
+                        );
+                        assert_eq!(
+                            bframes, frames,
+                            "{NAME}: {f} decoded {frames} frames under \
+                             {label} and {bframes} under the baseline arm"
+                        );
+                        assert_eq!(
+                            bh, h,
+                            "{NAME}: {f} decoded to a DIFFERENT picture depending on what the \
+                             plane buffer held before the decode wrote it -- {label} gave {h:016x}, \
+                             the baseline arm gave {bh:016x}. A read of uninitialised memory \
+                             reaches the caller's frame (see the SAFETY comment on \
+                             decode::fresh_plane)."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs [`allocdet_child_decode`] in a fresh process and parses its
+    /// `ALLOCDET <fixture> frames=<n> hash=<hex>` lines into
+    /// `(fixture, frames, hash)` in FIXTURES order.
+    fn allocdet_child(
+        fixtures: &[&str],
+        poison: Option<&str>,
+        alloc: &str,
+    ) -> Vec<(String, usize, u64)> {
+        const NAME: &str = "the_frame_does_not_depend_on_the_plane_buffers_initial_content";
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "stream::tests::allocdet_child_decode",
+            "--nocapture",
+        ])
+        .env("ALLOCDET_FIXTURES", fixtures.join(","))
+        .env("EC_AV1_PLANE_ALLOC", alloc)
+        .env_remove("ALLOCDET_SYNTHETIC");
+        match poison {
+            Some(p) => cmd.env("EC_AV1_PLANE_SENTINEL", p),
+            None => cmd.env_remove("EC_AV1_PLANE_SENTINEL"),
+        };
+        let out = cmd.output().expect("running the allocdet child");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let mut rows = Vec::new();
+        for f in fixtures {
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&format!("ALLOCDET {f} ")))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{NAME}: the child reported nothing for {f} (child said: {:?})",
+                        text.trim()
+                    )
+                });
+            let mut parts = line.split_whitespace();
+            assert_eq!(parts.next(), Some("ALLOCDET"));
+            assert_eq!(parts.next(), Some(*f));
+            let frames = parts
+                .find_map(|p| p.strip_prefix("frames="))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{NAME}: no frame count in {line:?}"));
+            let hash = parts
+                .find_map(|p| p.strip_prefix("hash="))
+                .and_then(|v| u64::from_str_radix(v, 16).ok())
+                .unwrap_or_else(|| panic!("{NAME}: no hash in {line:?}"));
+            rows.push(((*f).to_string(), frames, hash));
+        }
+        rows
+    }
+
+    /// The child half of
+    /// [`the_frame_does_not_depend_on_the_plane_buffers_initial_content`]:
+    /// decodes every fixture named in `ALLOCDET_FIXTURES` and prints one
+    /// `ALLOCDET` line each.
+    ///
+    /// With `ALLOCDET_SYNTHETIC` set it instead prints the two hashes the
+    /// non-vacuity control compares -- two pictures differing in ONE sample --
+    /// and decodes nothing.
+    #[test]
+    fn allocdet_child_decode() {
+        if std::env::var_os("ALLOCDET_SYNTHETIC").is_some() {
+            let (a, b) = allocdet_synthetic();
+            println!("ALLOCDET_SYNTHETIC {a:016x} {b:016x}");
+            return;
+        }
+        let list = std::env::var("ALLOCDET_FIXTURES").expect("ALLOCDET_FIXTURES");
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for fixture in list.split(',').filter(|s| !s.is_empty()) {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("fixtures/{fixture}.obu"));
+            let stream =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            let mut frames = 0usize;
+            decode_stream_with(&stream, |pic, _idx, shown| {
+                if !shown {
+                    return Ok(());
+                }
+                frames += 1;
+                for p in [&pic.y, &pic.u, &pic.v] {
+                    for &s in p.iter() {
+                        for b in s.to_le_bytes() {
+                            hash ^= u64::from(b);
+                            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("{fixture} refused: {e}"));
+            println!("ALLOCDET {fixture} frames={frames} hash={hash:016x}");
+        }
+    }
+
+    /// Two pictures identical except for ONE sample of ONE plane, hashed by the
+    /// same FNV-1a the child uses. Equal values here would make the gate's
+    /// equalities vacuous, so it is asserted to differ.
+    fn allocdet_synthetic() -> (u64, u64) {
+        const P: u64 = 0x0000_0100_0000_01b3;
+        let hash = |mut h: u64, samples: &[u16]| {
+            for &s in samples {
+                for b in s.to_le_bytes() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(P);
+                }
+            }
+            h
+        };
+        let a = vec![128u16; 4096];
+        let mut b = a.clone();
+        b[2048] = 129;
+        (
+            hash(0xcbf2_9ce4_8422_2325, &a),
+            hash(0xcbf2_9ce4_8422_2325, &b),
+        )
+    }
+
     /// lane-t900 r6: the 128-superblock INTER witness.
     /// `crates/ec-av1/fixtures/troy_sb128_inter_witness.obu`, 177773 bytes,
     /// sha256 `09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc`:
