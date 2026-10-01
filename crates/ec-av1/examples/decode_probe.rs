@@ -80,6 +80,10 @@ fn main() {
         let (pal_y, pal_uv) = ec_av1::stream::intra_in_inter_palette_hits();
         println!("intra_in_inter_palette: y={pal_y} uv={pal_uv}");
         println!(
+            "palette_422_unit_window: {}",
+            ec_av1::decode::palette_422_unit_window_hits()
+        );
+        println!(
             "rect64_corner_tu: 64x32={} 32x64={}",
             ec_av1::stream::rect64_corner_tu_hits(0),
             ec_av1::stream::rect64_corner_tu_hits(1)
