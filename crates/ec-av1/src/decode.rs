@@ -21490,8 +21490,11 @@ const PLANE_BLOCK_INVALID_440: &[(usize, usize)] = &[
 
 /// Whether `av1_ss_size_lookup[(bw, bh)][sx][sy]` is not `BLOCK_INVALID` -- i.e.
 /// whether libaom lets a subsize of this luma shape have a chroma plane block
-/// at this subsampling at all.
-fn chroma_plane_block_codable(bw: usize, bh: usize, sx: usize, sy: usize) -> bool {
+/// at this subsampling at all. `pub(crate)` so a fixture gate in `stream.rs`
+/// can assert WHICH shape its pin carries, rather than only that the decode
+/// refused -- a refusal gate that cannot name the shape is one decode-site
+/// change away from measuring the wrong thing.
+pub(crate) fn chroma_plane_block_codable(bw: usize, bh: usize, sx: usize, sy: usize) -> bool {
     match (sx, sy) {
         (1, 0) => !PLANE_BLOCK_INVALID_422.contains(&(bw, bh)),
         (0, 1) => !PLANE_BLOCK_INVALID_440.contains(&(bw, bh)),
@@ -37234,6 +37237,55 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 // the user's 3840x1608 film.
                                                 hit!(HORZ_VERT_INTRA_HITS);
                                                 hit!(EDGE_RECT_STRIP_HITS);
+                                                // lane-av1subsizesweep: this arm is the ONE
+                                                // frame-edge partition read in the file that
+                                                // dispatches on its own symbol instead of
+                                                // resolving it into a `partN` the level's guard
+                                                // covers. The 128-root edge arms
+                                                // (decode.rs:35559/35567), the 64-level ones
+                                                // (36247/36264) and the 32-level ones
+                                                // (36371/36391) all end in `PARTITION_HORZ` /
+                                                // `PARTITION_VERT` / `PARTITION_SPLIT`, which
+                                                // the guard after their `match` sees -- the
+                                                // inter-frame 16-level edge arms (54777/54790)
+                                                // resolve into `part16` for the same reason.
+                                                // Here `edge_split` goes straight into
+                                                // `decode_leaf_rect`, and the shape it carries is
+                                                // `BLOCK_8X16` when the COLUMN is short --
+                                                // whose (1,0) chroma plane block is
+                                                // BLOCK_INVALID (`av1_ss_size_lookup`,
+                                                // common_data.c:20), so at 4:2:2 this walks a
+                                                // subsize libaom refuses at decodeframe.c:1456.
+                                                //
+                                                // The check names the LEVEL, not a hand-picked
+                                                // shape: the gathered bit resolves to
+                                                // PARTITION_HORZ when the columns are full and
+                                                // PARTITION_VERT when they are not, and
+                                                // `refuse_invalid_subsize` reduces that through
+                                                // the same `partition_subsize_dims` every other
+                                                // site uses. So the 16x8 strip -- BLOCK_8X16's
+                                                // mirror, whose (1,0) cell is BLOCK_8X8 and MUST
+                                                // keep decoding -- is untouched, and the guard
+                                                // reds on the cell list, not a shape list.
+                                                let edge_part = if has_cols16 {
+                                                    PARTITION_HORZ
+                                                } else {
+                                                    PARTITION_VERT
+                                                };
+                                                refuse_invalid_subsize((16, 16), edge_part, fctx)?;
+                                                // lane-av1unwritten r6: arm census -- which
+                                                // partition value reaches here.
+                                                note_subsize_arm(
+                                                    edge_part,
+                                                    chroma_plane_block_codable(
+                                                        partition_subsize_dims((16, 16), edge_part)
+                                                            .0,
+                                                        partition_subsize_dims((16, 16), edge_part)
+                                                            .1,
+                                                        ss_x(fctx),
+                                                        ss_y(fctx),
+                                                    ),
+                                                );
                                                 let (mi_row0, mi_col0) =
                                                     (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
                                                 let (bw, bh) =
@@ -56871,6 +56923,57 @@ mod tests {
                 }
             }
         }
+        // r11 (lane-av1subsizesweep): a partition-symbol READ is a `dec.<name>(..)`
+        // call whose OWN ARGUMENT LIST names a `partition_w<N>[` CDF. That is the
+        // whole definition, and it is why the read spellings need no hand-list:
+        // `dec.symbol(..partition_w..)` qualifies, the frame-edge gather's
+        // `dec.symbol_fixed(&gather(..partition_w..))` qualifies, and
+        // `dec.debug_state()` does not -- it never names a partition CDF. A third
+        // spelling is covered the day somebody writes it.
+        //
+        // r11's hole was a SPELLING gap, not a shape gap: the old matcher named
+        // `dec.symbol(` literally, and `dec.symbol(` is not a substring of
+        // `dec.symbol_fixed(`. So the key-frame 16-level frame-edge arm -- which
+        // dispatches `decode_leaf_rect` straight off a gathered `edge_split` onto
+        // a BLOCK_8X16 chroma walk -- was never a site at all.
+        let is_partition_read = |window: &str| -> bool {
+            let mut at = 0usize;
+            while let Some(rel) = window[at..].find("dec.") {
+                let call = at + rel + "dec.".len();
+                at = call;
+                let name: String = window[call..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() {
+                    continue;
+                }
+                let Some(open) = window[call + name.len()..].find('(') else {
+                    continue;
+                };
+                let arg_from = call + name.len() + open + 1;
+                let mut depth = 1usize;
+                let mut stop = None;
+                for (i, c) in window[arg_from..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                stop = Some(arg_from + i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(stop) = stop else { continue };
+                if window[arg_from..stop].contains("partition_w") {
+                    return true;
+                }
+            }
+            false
+        };
         for (n, line) in lines.iter().enumerate() {
             let t = line.trim_start();
             // A doc comment quoting the shape is not a site, and neither is the
@@ -56881,7 +56984,9 @@ mod tests {
             let lo = n.saturating_sub(1);
             let hi = (n + 2).min(lines.len());
             let window = lines[lo..hi].join(" ");
-            if !window.contains("dec.symbol(") {
+            // r11: the read test is the DERIVED predicate above, not a spelling
+            // literal. Naming `dec.symbol(` here is what hid the frame-edge arm.
+            if !is_partition_read(&window) {
                 continue;
             }
             let Some(i) = window.find("partition_w") else {
@@ -56916,23 +57021,25 @@ mod tests {
                     continue;
                 }
                 // This binding is followed by the symbol read if the SAME line
-                // completes `let <name> = dec.symbol(`, or if the next line starts
-                // the call. That is what separates `let part8 =` from an unrelated
-                // `let ec_dbg_pre =` two lines above it.
+                // completes `let <name> = dec.<spelling>(`, or if the next line
+                // starts the call. That is what separates `let part8 =` from an
+                // unrelated `let ec_dbg_pre =` two lines above it.
                 let next = lines.get(cand + 1).copied().unwrap_or("");
-                let binds_here = ct.contains("= dec.symbol") || next.contains("dec.symbol(");
+                let binds_here = ct.contains("= dec.") || next.contains("dec.");
                 if binds_here || cand == n {
                     var = Some(name);
                     break;
                 }
             }
             let Some(var) = var else { continue };
-            // An edge `gather` binds `b` and is not a resolution: libaom resolves
-            // those from a two-symbol CDF and the site is guarded at the level's
-            // own resolution instead.
-            if var == "b" {
-                continue;
-            }
+            // r11: the edge `gather` reads are SITES now, not skips. r10 skipped
+            // them on the reasoning that "the site is guarded at the level's own
+            // resolution instead" -- true for every arm that resolves into a
+            // `partN`, and FALSE for the one that does not: the key-frame 16-level
+            // frame-edge arm dispatches `decode_leaf_rect` straight off `edge_split`,
+            // and `BLOCK_8X16` is BLOCK_INVALID at 4:2:2. Every site therefore has
+            // to carry a guard for its OWN level between the read and the first
+            // chroma-walking dispatch after it -- see the per-site check below.
             sites.push((n, var, level));
         }
 
@@ -57195,6 +57302,584 @@ mod tests {
             "32x8 at 4:4:0 is BLOCK_INVALID"
         );
     }
+
+    /// lane-av1subsizesweep: the CENSUS, as an invariant.
+    ///
+    /// The merged `lane/av1unwritten` lane covers partition SYMBOLS: every
+    /// `dec.symbol(&mut cdfs.partition_w<N>[..])` gets a
+    /// [`refuse_invalid_subsize`] within 220 lines, and
+    /// [`every_partition_symbol_resolution_is_guarded_before_it_dispatches`]
+    /// holds that shape against the source. Its own stated limit is exactly
+    /// the hole this lane found: the scan matches on `dec.symbol(`, so the
+    /// frame-edge GATHER reads (`dec.symbol_fixed(&gather(..))`) are invisible
+    /// to it, and its site list names RESOLUTIONS, not the chroma-plane WALKS
+    /// those resolutions descend into.
+    ///
+    /// So this test states the other half, over the WALK sites instead of the
+    /// symbol sites:
+    ///
+    /// * every `decode_*` call that walks a chroma plane is enumerated, with
+    ///   the luma shape(s) it can be handed -- derived from the enclosing
+    ///   dispatch, not typed in by hand;
+    /// * for each shape that libaom marks BLOCK_INVALID at some subsampling
+    ///   mode, the walk must have a [`refuse_invalid_subsize`] for its OWN
+    ///   level on its path -- either at the level that dispatched it
+    ///   (`PARTITION_*` arms resolve into a `partN`) or at the dispatch site
+    ///   itself;
+    /// * a walk reachable ONLY through a level whose guard already refuses the
+    ///   offending subsize is CLOSED, and the reason is the level's own guard
+    ///   line -- asserted, not commented.
+    ///
+    /// The residue the merged lane named, [`decode_rect4_16_intrabc`], is the
+    /// second case: it is reachable only from the 16x16-level 1:4 arms, and
+    /// `partition_subsize_dims((16,16), PARTITION_VERT_4) == (4,16)`, which is
+    /// in `PLANE_BLOCK_INVALID_422`. Both of its callers' guards refuse that
+    /// before the call, so it is CLOSED rather than guarded a third time --
+    /// and this test is what makes that a checked claim instead of a comment.
+    #[test]
+    fn every_chroma_walking_leaf_dispatch_is_guarded_or_closed_with_a_reason() {
+        let src = include_str!("decode.rs");
+        // r2: `decode_body` is hoisted to the top of the test because the per-row
+        // guard check below needs it BEFORE the walk census it sits under, and a
+        // reader who has to hunt for a binding is a reader who will not notice
+        // when it is scoped to the wrong thing.
+        let decode_body = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        // (a) The shapes libaom cannot code, transcribed from the same
+        // `av1_ss_size_lookup` cells `PLANE_BLOCK_INVALID_422` carries. A walk
+        // handed one of these at the matching subsampling mode is the defect.
+        let invalid_at = |bw: usize, bh: usize, sx: usize, sy: usize| {
+            !chroma_plane_block_codable(bw, bh, sx, sy)
+        };
+
+        // (b) The CENSUS: every chroma-plane walk in the decode body, with the
+        // luma footprint(s) each dispatch can hand it. `guarded_by` names the
+        // mechanism, which is what a reader has to be able to check:
+        //
+        //   * `refuse_invalid_subsize` at the DISPATCH -- the guard sits on
+        //     the walk's own path (the hole this lane fixed, and the 8x8 /
+        //     16-level sites);
+        //   * `refuse_invalid_subsize` at the RESOLUTION -- the dispatch is a
+        //     `PARTITION_*` arm, so the level's guard saw the symbol that
+        //     selected this shape before the call;
+        //   * `unreachable` -- proven-uncodable at every subsampling mode a
+        //     `color_config` can select, closed with an assertion instead of
+        //     a guard.
+        //
+        // Each row is (walk, shapes, mechanism).
+        //
+        // r2 (Main's review, and it was right): `AtResolution` used to assert
+        // only that SOME shape the walk handles is BLOCK_INVALID, which
+        // restates the libaom table and never mentions a guard -- deleting the
+        // inter 32-level guard left it green. So a resolution row now CARRIES
+        // the guard it depends on: `(walk, fn-scope, level)`, and the check
+        // below looks for `refuse_invalid_subsize((level, level))` inside that
+        // function and before the walk's first call site in it. A row that
+        // cannot be checked that way says so with `Prose` instead.
+        enum Mech {
+            AtDispatch,
+            /// Protected by `refuse_invalid_subsize((L, L))` in the named
+            /// function, above the walk's first call site there.
+            AtResolution(&'static str, usize),
+            /// The walk is reached INDIRECTLY -- this row's guard is asserted to
+            /// exist in `fscope`, and the ordering is asserted by the per-route
+            /// loop further down (which scopes to the enclosing function and
+            /// names this walk's real caller chain). Used only where the walk's
+            /// call site is not in the guard's own function.
+            AtResolutionVia(&'static str, usize),
+            Unreachable(&'static str),
+        }
+        // The key-frame tile decoder and the inter tile decoder. Every
+        // resolution guard lives in one of the two, which is what makes "the
+        // guard for THIS row" a scoped lookup rather than a global one.
+        const KF: &str = "decode_key_frame_tile_with_cdfs";
+        const INTER: &str = "decode_inter_frame_tile_with_cdfs";
+        let census: &[(&str, &[(usize, usize)], Mech)] = &[
+            // ---- the residue the merged lane named -------------------
+            //
+            // `decode_rect4_16_intrabc` reconstructs one 16x4 or 4x16 strip.
+            // It has exactly ONE caller (`decode_rect4_16_strip`, decode.rs
+            // 18934), which has exactly two (17595 from `decode_rect4_16`,
+            // 13810 from `decode_intra_rect_in_inter`), which have one each
+            // (36793 key frame, 45447 inter). BOTH are 16x16-level 1:4 arms, so
+            // both sit under a `refuse_invalid_subsize((16, 16), part16)`.
+            //
+            // The offending subsize is the VERT_4 one and ONLY that one:
+            // `partition_subsize_dims((16,16), PARTITION_VERT_4) == (4,16)`,
+            // and (4,16) is in `PLANE_BLOCK_INVALID_422`, while HORZ_4 gives
+            // (16,4) whose (1,0) cell is BLOCK_8X4 and is legal. So the
+            // 16x16-level guard refuses exactly the shape that would be
+            // BLOCK_INVALID, and the strip that survives -- 16x4 -- is the one
+            // this decoder's `own422` arm is written for. Part (d) below
+            // re-derives that split and part (f) pins the caller count, so the
+            // closure is checked rather than asserted in prose.
+            (
+                "decode_rect4_16_intrabc",
+                &[(16, 4), (4, 16)],
+                Mech::AtResolutionVia(KF, 16),
+            ),
+            // ---- 1:4 and 2:1 rect walks, all resolved-symbol guarded --
+            (
+                "decode_rect4_16",
+                &[(16, 4), (4, 16)],
+                Mech::AtResolution(KF, 16),
+            ),
+            (
+                "decode_rect4_16_strip",
+                &[(16, 4), (4, 16)],
+                Mech::AtResolutionVia(KF, 16),
+            ),
+            (
+                "decode_block_rect",
+                &[(32, 16), (16, 32)],
+                Mech::AtResolution(KF, 32),
+            ),
+            (
+                "decode_block_rect4",
+                &[(32, 8), (8, 32)],
+                Mech::AtResolution(KF, 32),
+            ),
+            (
+                "decode_block_rect64",
+                &[(64, 16), (16, 64)],
+                Mech::AtResolution(KF, 64),
+            ),
+            // The 128-root guard lives in `read_sb128_root`, the shared
+            // resolver both tile decoders call -- not in the walker's own
+            // function.
+            (
+                "decode_block_128rect",
+                &[(128, 64), (64, 128)],
+                Mech::AtResolutionVia("read_sb128_root", 128),
+            ),
+            // `decode_rect_split` is called from inside decode_block_rect /
+            // decode_leaf_rect / decode_block_rect4 / decode_block_rect64, none of
+            // which is the tile decoder -- so the guard it inherits is checked on
+            // its own callers' rows, not here.
+            (
+                "decode_rect_split",
+                &[(64, 16), (16, 64), (32, 16), (16, 32)],
+                Mech::AtResolutionVia(KF, 32),
+            ),
+            (
+                "decode_leaf_rect",
+                &[(16, 8), (8, 16)],
+                Mech::AtResolution(KF, 16),
+            ),
+            // ---- the INTER-side rect walks -----------------------------
+            //
+            // r2: without these three rows the inter 32- and 64-level guards
+            // were claimed by NOTHING, and deleting either left the census
+            // green. They are load-bearing -- `decode_intra_rect_in_inter`
+            // dispatches `decode_block_rect4` on 32x8/8x32 (8x32 is
+            // BLOCK_INVALID at 4:2:2) and `decode_block_rect64` on
+            // 64x16/16x64 (16x64 likewise) -- so each gets its own row naming
+            // the guard that stands in front of it.
+            //
+            // These are `AtResolutionVia`, not `AtResolution`: the walk is
+            // dispatched from `decode_intra_rect_in_inter`, a helper, not from
+            // the tile decoder the guard lives in. The check is therefore guard
+            // EXISTENCE in that decoder -- which is what reds when the guard
+            // is deleted -- and the linkage is stated here rather than derived.
+            (
+                "decode_block_rect4[inter]",
+                &[(32, 8), (8, 32)],
+                Mech::AtResolutionVia(INTER, 32),
+            ),
+            (
+                "decode_block_rect64[inter]",
+                &[(64, 16), (16, 64)],
+                Mech::AtResolutionVia(INTER, 64),
+            ),
+            (
+                "decode_intra_rect_in_inter",
+                &[(16, 8), (8, 16), (16, 4), (4, 16)],
+                Mech::AtResolutionVia(INTER, 16),
+            ),
+            // ---- sub-8 walks ------------------------------------------
+            // (8,4) is legal at 4:2:2 (`av1_ss_size_lookup[8x4][1][0]` is
+            // BLOCK_4X4); (4,8) is BLOCK_INVALID there. Both come off a raw
+            // `part8`, and both 8x8 resolution sites carry the guard -- plus
+            // the redundant inline `chroma_plane_block_codable` check the
+            // merged lane left at 36904.
+            (
+                "decode_leaf_rect8",
+                &[(8, 4), (4, 8)],
+                Mech::AtResolution(KF, 8),
+            ),
+            (
+                "decode_inter_sub8_rect2",
+                &[(8, 4), (4, 8)],
+                Mech::AtResolution(INTER, 8),
+            ),
+            (
+                "decode_leaf_split4",
+                &[(4, 4)],
+                Mech::Unreachable("4x4's plane block is 4x4 at EVERY subsampling cell"),
+            ),
+            (
+                "decode_inter_sub8_split4",
+                &[(4, 4)],
+                Mech::Unreachable("4x4's plane block is 4x4 at EVERY subsampling cell"),
+            ),
+            (
+                "decode_leaf8",
+                &[(8, 8)],
+                Mech::Unreachable("8x8's plane block is 8x8 / 4x8 / 4x4, never BLOCK_INVALID"),
+            ),
+            // The square walks take only square footprints, and every square
+            // in `BLOCK_SIZES_ALL` has a valid plane block at EVERY selectable
+            // mode (the whole BLOCK_INVALID column is 4x8 / 8x4 / 4x16 / 8x16
+            // / ... -- all rect). So no guard is needed for them, and the
+            // level guards that exist protect the SYMBOL that would have to
+            // select one of those rect shapes, not the square decode itself.
+            (
+                "decode_block",
+                &[(128, 128), (64, 64), (32, 32), (16, 16), (8, 8)],
+                Mech::Unreachable(
+                    "every SQUARE footprint's plane block is valid at every selectable \
+                     subsampling mode; the whole BLOCK_INVALID column is rect",
+                ),
+            ),
+            (
+                "decode_inter_block",
+                &[(128, 128), (64, 64), (32, 32), (16, 16), (8, 8)],
+                Mech::Unreachable(
+                    "every SQUARE footprint's plane block is valid at every selectable \
+                     subsampling mode; the whole BLOCK_INVALID column is rect",
+                ),
+            ),
+            (
+                "decode_inter_block8",
+                &[(8, 8)],
+                Mech::Unreachable("8x8's plane block is 8x8 / 4x8 / 4x4, never BLOCK_INVALID"),
+            ),
+            // ---- THE HOLE THIS LANE FIXED ---------------------------
+            //
+            // `decode_leaf_rect`'s key-frame FRAME-EDGE caller (the one
+            // `decode_leaf_rect`'s row above does not cover, because that arm
+            // dispatches on a gathered `edge_split` instead of resolving into
+            // `part16`). It is 8x16 when the COLUMN is short -- BLOCK_INVALID
+            // at 4:2:2 -- and 16x8 when the ROW is, which is legal and must
+            // keep decoding. Before this lane nothing sat on that path.
+            (
+                "decode_leaf_rect[16-edge]",
+                &[(16, 8), (8, 16)],
+                Mech::AtDispatch,
+            ),
+        ];
+
+        // (c) Every row's mechanism must be a REAL one. This is what stops
+        // the census from being a list of good intentions: each claim is
+        // re-derived here, and the file is checked for the site it names.
+        for (walk, shapes, mech) in census {
+            let name = walk.split('[').next().expect("walk name");
+            assert!(
+                src.contains(&format!("fn {name}(")),
+                "the census names `{name}`, which is not a function in this file -- the \
+                 walk was renamed or removed and this row is stale"
+            );
+            // Only subsampling modes a `color_config` can actually SELECT
+            // count. `(0, 1)` 4:4:0 is excluded on libaom's own authority --
+            // it asserts `subsampling_y == 0` whenever `subsampling_x == 0`
+            // (`color_config`, av1_decoder.c), so no frame in existence is
+            // 4:4:0 and `PLANE_BLOCK_INVALID_440` is transcribed only to keep
+            // the cell table whole. Counting it here would make `16x4` look
+            // like a shape that needs a guard at a mode no stream can carry
+            // -- the same class as the merged lane's r2, which refused a legal
+            // 4:2:2 shape by testing a cell no `color_config` can request.
+            let offending: Vec<(usize, usize, usize, usize)> = shapes
+                .iter()
+                .flat_map(|&(bw, bh)| {
+                    [(1, 0), (1, 1), (0, 0)]
+                        .into_iter()
+                        .filter_map(move |(sx, sy)| {
+                            invalid_at(bw, bh, sx, sy).then_some((bw, bh, sx, sy))
+                        })
+                })
+                .collect();
+            match mech {
+                // A dispatch-time guard has to reduce to the SAME shape the
+                // dispatch hands the walk -- this is the claim that made the
+                // hole a hole, stated as an assertion.
+                Mech::AtDispatch => {
+                    assert!(
+                        !offending.is_empty(),
+                        "{walk} is listed AtDispatch but libaom codes every shape it \
+                         walks at every subsampling mode -- then it needs no guard"
+                    );
+                    for &(bw, bh, sx, sy) in &offending {
+                        assert!(
+                            invalid_at(bw, bh, sx, sy),
+                            "{walk} is not actually handed {bw}x{bh} at ({sx},{sy})"
+                        );
+                    }
+                }
+                // r2: the guard THIS row depends on, scoped to the function it
+                // lives in and ordered before the walk's first call there.
+                // Deleting that one guard -- and only that one -- reds this row,
+                // which is what r2's review showed the previous version could
+                // not do.
+                Mech::AtResolution(fscope, level) => {
+                    assert!(
+                        !offending.is_empty(),
+                        "{walk} is listed AtResolution but no shape it walks is BLOCK_INVALID \
+                         -- then the level's guard is not what protects it"
+                    );
+                    let fstart = decode_body
+                        .find(&format!("\nfn {fscope}("))
+                        .or_else(|| decode_body.find(&format!("\npub(crate) fn {fscope}(")))
+                        .or_else(|| decode_body.find(&format!("\npub fn {fscope}(")))
+                        .unwrap_or_else(|| {
+                            panic!("the census names `{fscope}`, which is not a function here")
+                        });
+                    let fend = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                        .iter()
+                        .filter_map(|pat| {
+                            decode_body[fstart + 1..].find(pat).map(|i| fstart + 1 + i)
+                        })
+                        .min()
+                        .unwrap_or(decode_body.len());
+                    let body = &decode_body[fstart..fend];
+                    let guard = format!("refuse_invalid_subsize(({level}, {level})");
+                    let gpos = body.find(&guard).unwrap_or_else(|| {
+                        panic!(
+                            "{walk} claims refuse_invalid_subsize(({level}, {level})) guards it, \
+                             but there is NO such guard in `{fscope}` -- the row's mechanism is \
+                             prose, not a check; re-derive it or mark the row Prose"
+                        )
+                    });
+                    let call = body.find(&format!("{name}(")).unwrap_or_else(|| {
+                        panic!(
+                            "{walk} has no call site inside `{fscope}` to order the guard against"
+                        )
+                    });
+                    assert!(
+                        gpos < call,
+                        "{walk}: in `{fscope}` the ({level}, {level}) guard is at {gpos} and the \
+                         walk is dispatched at {call} -- a guard BELOW the dispatch can never \
+                         observe it"
+                    );
+                }
+                Mech::AtResolutionVia(fscope, level) => {
+                    assert!(
+                        !offending.is_empty(),
+                        "{walk} is listed AtResolutionVia but no shape it walks is \
+                         BLOCK_INVALID"
+                    );
+                    let fstart = decode_body
+                        .find(&format!("\nfn {fscope}("))
+                        .or_else(|| decode_body.find(&format!("\npub(crate) fn {fscope}(")))
+                        .or_else(|| decode_body.find(&format!("\npub fn {fscope}(")))
+                        .unwrap_or_else(|| {
+                            panic!("the census names `{fscope}`, which is not a function here")
+                        });
+                    let fend = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                        .iter()
+                        .filter_map(|pat| {
+                            decode_body[fstart + 1..].find(pat).map(|i| fstart + 1 + i)
+                        })
+                        .min()
+                        .unwrap_or(decode_body.len());
+                    assert!(
+                        decode_body[fstart..fend]
+                            .contains(&format!("refuse_invalid_subsize(({level}, {level})")),
+                        "{walk} claims refuse_invalid_subsize(({level}, {level})) in `{fscope}` \
+                         guards it, but there is NO such guard there"
+                    );
+                }
+                Mech::Unreachable(reason) => {
+                    assert!(
+                        offending.is_empty(),
+                        "{walk} claims it is unreachable, but libaom marks {} \
+                         BLOCK_INVALID -- the claim is stale",
+                        offending
+                            .iter()
+                            .map(|(bw, bh, sx, sy)| format!("{bw}x{bh}@({sx},{sy})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    assert!(
+                        reason.len() > 40,
+                        "{walk}'s Unreachable reason is too short to name the symbol \
+                         or caller that makes it unreachable"
+                    );
+                }
+            }
+        }
+
+        // (d) The residue's closure, derived rather than asserted in prose:
+        // the ONLY subsize its callers can hand it that libaom refuses at
+        // 4:2:2 is the 16x16-level VERT_4 one, and the level's own guard
+        // refuses exactly that. If either half stops holding -- a new caller
+        // at another level, or a change to `partition_subsize_dims` -- this
+        // reds instead of the comment going stale.
+        for &(part, want) in &[
+            (PARTITION_HORZ_4, (16usize, 4usize)),
+            (PARTITION_VERT_4, (4, 16)),
+        ] {
+            let (bw, bh) = partition_subsize_dims((16, 16), part);
+            assert_eq!(
+                (bw, bh),
+                want,
+                "get_partition_subsize(BLOCK_16X16, {part}) moved"
+            );
+            assert_eq!(
+                chroma_plane_block_codable(bw, bh, 1, 0),
+                part == PARTITION_HORZ_4,
+                "the 16x16 1:4 pair's (1,0) cells moved: HORZ_4 -> {bw}x{bh}, \
+                 VERT_4 -> {bw}x{bh}. decode_rect4_16_intrabc's Unreachable row \
+                 is written against exactly this split"
+            );
+        }
+        // (e) The AtDispatch row, checked where it actually bites. This is
+        // the hole the merged lane's scan cannot see: its 220-line window is
+        // keyed on `dec.symbol(`, and the frame-edge arm reads
+        // `dec.symbol_fixed(&gather(..))` into `edge_split` and dispatches on
+        // THAT. The claim to check is ordering -- the guard has to sit between
+        // the read and the `decode_leaf_rect` it protects, which is r5's
+        // defect in a new place if it ever moves below.
+        let edge_read = src
+            .find("let edge_split = if has_cols16")
+            .expect("the key-frame 16-level frame-edge arm reads a gathered bit");
+        let guard_at = src[edge_read..]
+            .find("refuse_invalid_subsize((16, 16)")
+            .map(|i| edge_read + i)
+            .expect(
+                "the key-frame 16-level frame-edge arm dispatches decode_leaf_rect on an \
+                 8x16 strip (BLOCK_INVALID at 4:2:2) with NO refuse_invalid_subsize on its \
+                 path -- every sibling edge arm resolves into a guarded partN, this one does not",
+            );
+        let walk_at = src[edge_read..]
+            .find("decode_leaf_rect(")
+            .map(|i| edge_read + i)
+            .expect("the frame-edge arm's decode_leaf_rect call");
+        assert!(
+            guard_at < walk_at,
+            "the 16-level frame-edge guard (offset {guard_at}) sits AFTER the \
+             decode_leaf_rect it protects (offset {walk_at}) -- it can never observe it"
+        );
+
+        // (f) The residue's closure, by CALLER COUNT rather than by prose: a
+        // third caller at another level is what would make the residue row
+        // stale, and a count reds on that where a comment cannot. Counted over
+        // the DECODE BODY only -- this test's own string literals name the same
+        // functions, and the merged lane's own scan hit exactly that (five of
+        // its eighteen `refuse_invalid_subsize((` matches are its own).
+        for (name, calls) in [
+            ("decode_rect4_16_intrabc", 1usize),
+            ("decode_rect4_16_strip", 2),
+            ("decode_rect4_16", 1),
+            ("decode_intra_rect_in_inter", 1),
+        ] {
+            let needle = format!("{name}(");
+            let decl = format!("fn {name}(");
+            // A doc-comment mention (`[`name`](..)`) is prose, not a call, so
+            // comment lines are dropped before counting.
+            let body: String = decode_body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let found = body.matches(&needle).count() - usize::from(body.contains(&decl));
+            assert_eq!(
+                found, calls,
+                "{name} has {found} call site(s) in the decode body, the census expects \
+                 {calls}. A new caller is not automatically wrong, but it is not \
+                 automatically covered either: re-derive which level's guard it sits \
+                 under before this row stays green"
+            );
+        }
+        // Both callers reach the 1:4 strips by a DIFFERENT route, so the
+        // closure is checked per route -- and per route it is the same shape:
+        // the 16x16-level guard must sit ABOVE the test that names VERT_4.
+        //
+        //   key frame: `decode_rect4_16(...)` at 36793, inside an arm testing
+        //   `part16 == PARTITION_HORZ_4 || part16 == PARTITION_VERT_4`.
+        //   inter:     the 1:4 strips reach `decode_intra_rect_in_inter`
+        //   through `fctx.inter_strip_chroma`, whose ONLY writer is the inter
+        //   16-level 1:4 arm (55068) -- `strip16` is `None` without it.
+        //
+        // Ordering is the property (a guard BELOW the 1:4 test cannot observe
+        // it), which is why each pair is compared rather than merely counted.
+        for (what, test, call) in [
+            (
+                "the key-frame decode_rect4_16 caller",
+                "if part16 == PARTITION_HORZ_4",
+                "decode_rect4_16(",
+            ),
+            (
+                "the inter-frame inter_strip_chroma writer",
+                "let horz = part16 == PARTITION_HORZ_4;",
+                "c.set(Some(InterStripChroma {",
+            ),
+        ] {
+            let test_at = decode_body
+                .find(test)
+                .unwrap_or_else(|| panic!("the 1:4 arm test {test:?} for {what} is gone"));
+            // `decode_rect4_16(` also matches the DEFINITION, which is the
+            // first occurrence -- the call is the last one.
+            let call_at = decode_body
+                .rfind(call)
+                .unwrap_or_else(|| panic!("{what} is gone -- re-derive the residue's closure"));
+            // r2 (Main's review, and it was right): the guard search is SCOPED
+            // to the anchor's own enclosing function. `find()` over the whole
+            // decode body returns the FIRST `refuse_invalid_subsize((16, 16)` --
+            // the KEY-FRAME one -- so the inter pair's comparison was satisfied
+            // by a guard three quarters of the file away, and deleting the inter
+            // 16-level guard left this test green. Both routes live in
+            // different `fn` bodies (`decode_key_frame_tile_with_cdfs` and the
+            // inter tile decoder), so the enclosing function is the scope that
+            // tells the two apart.
+            let fn_scope = |at: usize| -> std::ops::Range<usize> {
+                let head = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                    .iter()
+                    .filter_map(|pat| decode_body[..at].rfind(pat))
+                    .max()
+                    .unwrap_or(0);
+                let tail = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                    .iter()
+                    .filter_map(|pat| decode_body[at..].find(pat).map(|i| at + i))
+                    .min()
+                    .unwrap_or(decode_body.len());
+                head..tail
+            };
+            let scope = fn_scope(test_at);
+            let guard_at = decode_body[scope.clone()]
+                .find("refuse_invalid_subsize((16, 16)")
+                .map(|i| scope.start + i)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{what}: there is NO refuse_invalid_subsize((16, 16)) in the function \
+                         enclosing the 1:4 arm test -- so nothing refuses the VERT_4 symbol \
+                         this arm dispatches on, and decode_rect4_16_intrabc's closure is gone"
+                    )
+                });
+            assert!(
+                guard_at < test_at && test_at < call_at,
+                "{what}: guard at {guard_at} (function scope {scope:?}), 1:4 arm test at \
+                 {test_at}, dispatch at {call_at}. The guard has to sit ABOVE the 1:4 arm \
+                 test INSIDE THE SAME FUNCTION, or the VERT_4 symbol it refuses has already \
+                 been dispatched on"
+            );
+            assert!(
+                scope.contains(&guard_at) && scope.contains(&test_at) && scope.contains(&call_at),
+                "{what}: guard, 1:4 test and dispatch must share one enclosing function"
+            );
+        }
+        // And the inter route really is the only one: `strip16` is built from
+        // `strip_chroma`, which is `inter_strip_chroma.take()`, so a missing
+        // writer would silently drop the arm rather than expose it.
+        assert_eq!(
+            decode_body.matches("inter_strip_chroma.with(|c| {").count(),
+            1,
+            "inter_strip_chroma gained a second writer -- the inter 1:4 strips can now \
+             come from a level whose guard this census has not checked"
+        );
+    }
+
     /// lane-av1chrtx: [`covering_leaf_tx_type`] resolves a chroma unit's
     /// `tx_type` from the luma leaf covering the unit's OWN quadrant, and
     /// reports "no leaf there" as `None` so the caller can fall back to the
