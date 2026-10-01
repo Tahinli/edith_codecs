@@ -215,8 +215,9 @@ fn failure_line(site: &str, path: &Path, got: usize, expected: Option<usize>, wh
     )
 }
 
-/// Write `bytes` to `path` as a FATAL pin, loud on any shortfall -- [`pin`]'s
-/// counterpart to [`write_planes`], for the single-blob case.
+/// Write `bytes` to `path` as a FATAL pin: [`pin`] IS a wrapper -- three
+/// [`LoudDump`] calls (`create`/`write`/`finish`), so it inherits the flush and
+/// the flush-then-stat ordering for free.
 ///
 /// lane-av1pinloud: the test-pin sites in `stream.rs` wrote with
 /// `let _ = std::fs::write(..)` and then named the path in the panic that
@@ -230,11 +231,20 @@ pub fn pin(site: &str, path: impl AsRef<Path>, bytes: &[u8]) {
     d.finish();
 }
 
-/// [`pin`] for a site that must NOT die on a failed pin -- a gate whose real
-/// failure is the assert that comes after the pin attempt, and whose comment
-/// says so. Non-fatal, but not silent: a shortfall comes back as the very same
-/// failure line [`pin`] would have panicked with, expected-vs-on-disk counts
-/// included, for the caller to print as a warning.
+/// [`pin`]'s NON-FATAL twin, for a site that must not die on a failed pin -- a
+/// gate whose real failure is the assert that comes after the pin attempt, and
+/// whose comment says so.
+///
+/// This one RE-IMPLEMENTS the check rather than wrapping [`LoudDump`], whose
+/// failure channel is `panic!`: it cannot report instead of dying. So it does
+/// `fs::write` + `metadata` itself. Only the failure LINE is shared, via
+/// [`failure_line`] -- the ordering (flush-then-stat) and the
+/// write-error-handling are not shared with [`LoudDump`], and a reader must not
+/// assume they are.
+///
+/// Non-fatal, but not silent: a shortfall comes back as the very same failure
+/// line [`pin`] would have panicked with, expected-vs-on-disk counts included,
+/// for the caller to print as a warning.
 pub fn pin_reporting(site: &str, path: impl AsRef<Path>, bytes: &[u8]) -> Result<(), String> {
     let path = path.as_ref();
     let expected = bytes.len();
@@ -467,7 +477,7 @@ mod tests {
     #[test]
     fn pin_success_path_is_byte_identical() {
         let p = scratch("pin-ok");
-        pin("EC_AV1_PIN", &p, b"stream bytes");
+        pin("TEST_PIN", &p, b"stream bytes");
         assert_eq!(std::fs::read(&p).unwrap(), b"stream bytes");
         let _ = std::fs::remove_file(&p);
     }
@@ -475,9 +485,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn pin_to_a_full_device_is_loud() {
-        let msg = caught(|| pin("EC_AV1_PIN", "/dev/full", b"stream bytes"));
+        let msg = caught(|| pin("TEST_PIN", "/dev/full", b"stream bytes"));
         assert!(
-            msg.starts_with("ec-av1 dump FAILED [EC_AV1_PIN] /dev/full: wrote "),
+            msg.starts_with("ec-av1 dump FAILED [TEST_PIN] /dev/full: wrote "),
             "{msg}"
         );
         assert!(msg.contains("No space left on device"), "{msg}");
@@ -490,14 +500,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn pin_reporting_is_loud_but_not_fatal() {
-        let line = pin_reporting("EC_AV1_PIN", "/dev/full", b"stream bytes").unwrap_err();
+        let line = pin_reporting("TEST_PIN", "/dev/full", b"stream bytes").unwrap_err();
         assert!(
-            line.contains("ec-av1 dump FAILED [EC_AV1_PIN] /dev/full"),
+            line.contains("ec-av1 dump FAILED [TEST_PIN] /dev/full"),
             "{line}"
         );
         assert!(line.contains(" of 12 bytes"), "{line}");
         let p = scratch("pin-reporting-ok");
-        pin_reporting("EC_AV1_PIN", &p, b"stream bytes").expect("a healthy pin reports nothing");
+        pin_reporting("TEST_PIN", &p, b"stream bytes").expect("a healthy pin reports nothing");
         assert_eq!(std::fs::read(&p).unwrap(), b"stream bytes");
         let _ = std::fs::remove_file(&p);
     }
@@ -525,10 +535,7 @@ mod tests {
             .expect("spawning the capped child");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "a short pin must fail\n{stderr}");
-        assert!(
-            stderr.contains("ec-av1 dump FAILED [EC_AV1_PIN]"),
-            "{stderr}"
-        );
+        assert!(stderr.contains("ec-av1 dump FAILED [TEST_PIN]"), "{stderr}");
         assert!(stderr.contains("File too large"), "{stderr}");
         let frag = std::fs::metadata(dir.join("cap-pinned.obu")).unwrap().len();
         assert!(
@@ -552,7 +559,7 @@ mod tests {
         // `ulimit -f 8` is 8 KiB, so 4x that is guaranteed to run PAST the cap
         // (a write of exactly the cap size succeeds) and land a fragment.
         pin(
-            "EC_AV1_PIN",
+            "TEST_PIN",
             Path::new(&dir).join("cap-pinned.obu"),
             &[7u8; 32768],
         );
