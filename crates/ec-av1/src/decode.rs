@@ -21117,8 +21117,25 @@ pub(crate) fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// lane-tiny r4: raw padded-plane dump for filter-stage bisection, written
 /// only when `var` names a path. Same byte shape as `EC_AV1_PREFILT_DUMP`.
 /// lane-hgkf r2: 16-bit cropped stage dump, the high-bitdepth twin of
-/// [`dump_stage`] (whose `as u8` truncation hides |delta| <= 2 defects) --
-/// matches aomdec's own `ec_dump16` rung byte for byte (crop dims, u16 LE).
+/// [`dump_stage`] (whose `as u8` truncation hides |delta| <= 2 defects).
+/// lane-unwritten-dep: this doc previously said the dump "matches aomdec's own
+/// `ec_dump16` rung byte for byte (crop dims, u16 LE)", which was true only of
+/// the 4:2:0 crop it then used. The crop is now PER-AXIS, which is what the
+/// oracle's rung 1 actually does -- it writes `y_crop_width` x `y_crop_height`,
+/// `uv_crop_width` x `uv_crop_height`, `uv_crop_width` x `uv_crop_height` (the
+/// libaom `YV12_BUFFER_CONFIG` fields, each already per-axis). Byte shape per
+/// subsampling, `fw x fh` luma then both chroma planes, u16 LE, so:
+///
+/// ```text
+/// ss_x ss_y  format   luma        chroma (each)
+///   0    0   4:4:4    fw x fh     fw   x fh      fw*fh*3 samples
+///   1    1   4:2:0    fw x fh     fw/2 x fh/2    fw*fh*3/2 samples
+///   1    0   4:2:2    fw x fh     fw/2 x fh      fw*fh*2 samples
+///   0    1   4:4:0    fw x fh     fw   x fh/2    fw*fh*3/2 samples
+/// ```
+///
+/// (`round_ss` is the rounding the decoder's own plane extents use; at ss = 1 it
+/// is `div_ceil(2)`, so every 4:2:0 dump is byte-for-byte unchanged by this.)
 /// lane-mc64 r1: the decode-order index the stage dumps below key their file
 /// name on. `PREFILT_PICTURE_IDX` is bumped once per frame just BEFORE the
 /// deblock/CDEF stages run, so the frame being dumped here is `idx - 1` --
@@ -21138,19 +21155,38 @@ fn dump_stage16(
     v: &PlaneBuf<'_>,
     fw: usize,
     fh: usize,
+    ss_x: usize,
+    ss_y: usize,
 ) {
     use std::io::Write;
     // lane-sbrect10 r2 / lane-cdef r1 (one shared helper): index the dump by
     // decode-order picture like EC_AV1_PREFILT_DUMP already does -- a fixed
     // `.f0` name kept only the LAST frame, so a mid-sequence divergence could
-    // not be read out at all.
+    // not be read at all.
+    //
+    // lane-unwritten-dep: the chroma extent is PER-AXIS subsampling, not
+    // `div_ceil(2)` on both. The hardcoded pair was a 4:2:0 assumption and it
+    // was load-bearing: on a 64x64 4:2:2 frame (ss_x = 1, ss_y = 0) it wrote
+    // 32x32 chroma per plane where the frame carries 32x64, so HALF of each
+    // chroma plane appeared in NO stage dump at all. A stage bisect that reads
+    // "identical pre-deblock, differs post-deblock" off these dumps is then
+    // measuring the dump's blind spot, not the pipeline's: the samples it could
+    // not see are exactly the region where the 4:2:2 witness's output diverges
+    // (chroma rows 32..63 -- the old `fh.div_ceil(2)` crop wrote 32 of 64 rows,
+    // so everything from row 32 up was invisible; 2048 samples). `round_ss` is
+    // the same rounding the
+    // decoder's own plane extents use, and it matches the oracle's
+    // `uv_crop_width` / `uv_crop_height` per axis.
+    // ONE file per frame: `dump_stage_idx` advances on every call, so creating
+    // the file inside the plane loop would write three files per frame and
+    // shift every later frame's index.
     if let Ok(path) = crate::envflags::var(var)
         && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for (p, w, h) in [
             (y, fw, fh),
-            (u, fw.div_ceil(2), fh.div_ceil(2)),
-            (v, fw.div_ceil(2), fh.div_ceil(2)),
+            (u, round_ss(fw, ss_x), round_ss(fh, ss_y)),
+            (v, round_ss(fw, ss_x), round_ss(fh, ss_y)),
         ] {
             for row in 0..h {
                 let mut bytes = Vec::with_capacity(w * 2);
@@ -21618,25 +21654,163 @@ fn refuse_invalid_plane_block(_bw: usize, _bh: usize, _fctx: &crate::decode::Fra
 /// the output does not depend on the plane buffer's initial content.
 const PLANE_SENTINEL: u16 = 0xDEAD;
 
+/// lane-unwritten-dep: the census count at the LAST point of the pipeline, on the
+/// exact bytes `EC_AV1_FINAL_DUMP` writes.
+///
+/// WHY A SECOND COUNT, and what it is actually for -- the justification this
+/// comment originally carried was WRONG and is corrected here, because a reader
+/// would otherwise re-derive the wrong conclusion. An earlier revision of this
+/// lane claimed the pre-deblock plane was byte-identical plain-vs-sentinel and
+/// that "deblock creates the dependence". That reading came from
+/// [`dump_stage16`], which cropped chroma as `(fw/2, fh/2)` -- a 4:2:0
+/// assumption. On a 64x64 4:2:2 frame (ss_x=1, ss_y=0) that wrote 32x32 chroma
+/// where the frame carries 32x64, so 2048 chroma samples appeared in NO stage
+/// dump, and they are exactly the region where the difference lives.
+///
+/// With per-axis extents the corrected measurement on `440_request_is_422` is:
+/// the PRE-DEBLOCK dump already DIFFERS by 2158 bytes plain-vs-sentinel, and an
+/// exact u16 whole-plane census finds 224 unwritten samples (U 112, V 112,
+/// rows 36..63, whole 4x4 groups) -- the same number
+/// `lanes/av1unwritten.report.md` reports. **The hole is present before any
+/// filter runs, and the pre-deblock census sees it.** This comment previously
+/// said the opposite; that was the instrument's blind spot read as a property of
+/// the pipeline.
+///
+/// So what this second count is FOR, stated honestly: it is not there because the
+/// pre-deblock census misses holes. It is there because it is the measurement
+/// taken where the OUTPUT is taken -- the bytes stored into the reference slots
+/// and handed to the caller. A hole can be created after reconstruction (a
+/// filter stage, a superres step, a second pass) and be invisible to a scan taken
+/// before it; this one cannot. It is a check on the whole span from the tile walk
+/// to the caller's frame, not a claim that the pre-deblock scan is insufficient.
+static FINAL_UNWRITTEN_SAMPLES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Samples [`census_unwritten_final`] has looked at since the last
+/// [`take_final_census_scanned`]. A gate that only asserts
+/// [`take_final_unwritten_samples`] == 0 passes on a build whose census call was
+/// deleted, so it reads THIS too -- the same pairing
+/// [`CENSUS_SCANNED`] documents for the pre-deblock census.
+static FINAL_CENSUS_SCANNED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// lane-unwritten-dep: reads and clears [`FINAL_UNWRITTEN_SAMPLES`] -- unwritten
+/// samples still present in the frame as handed to the caller, summed over every
+/// frame and plane. Process-global, like the pre-deblock census's counter, so a
+/// gate can read it after the decode from a different thread than the one that
+/// scanned.
+pub fn take_final_unwritten_samples() -> usize {
+    FINAL_UNWRITTEN_SAMPLES.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Reads and clears [`FINAL_CENSUS_SCANNED`]; the pairing is the reason it
+/// exists, exactly as for [`take_census_scanned`].
+pub fn take_final_census_scanned() -> usize {
+    FINAL_CENSUS_SCANNED.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// lane-unwritten-dep: the census at the pipeline's last point. Counts, over each
+/// plane, how many samples still hold [`PLANE_SENTINEL`] once every filter has
+/// run, and records how many samples it LOOKED at in [`FINAL_CENSUS_SCANNED`].
+///
+/// Gated on [`plane_sentinel_on`] -- the SAME predicate as [`fresh_plane`] and as
+/// the pre-deblock [`census_unwritten`]: the env flag OR the thread-local
+/// [`set_plane_sentinel`] override. An earlier revision gated this on the raw env
+/// var alone, which made the census silently inert for any in-process test using
+/// the thread-local switch that the rest of the crate honours. The fill and both
+/// censuses must agree on when they are live, or a "0" means nothing.
+pub(crate) fn census_unwritten_final(y: &[u16], u: &[u16], v: &[u16]) {
+    if !plane_sentinel_on() {
+        return;
+    }
+    // The caller passes the frame's planes exactly as they are about to be
+    // stored into the reference slots, which are already cropped to the true
+    // extent (no padding past it reaches this point), so a flat count over
+    // each plane IS the true-extent count.
+    let (scanned, total): (usize, usize) = [y, u, v]
+        .iter()
+        .map(|p| (p.len(), p.iter().filter(|&&s| s == PLANE_SENTINEL).count()))
+        .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
+    FINAL_CENSUS_SCANNED.fetch_add(scanned, std::sync::atomic::Ordering::SeqCst);
+    FINAL_UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// A frame plane's own backing store, `n` samples, UNINITIALISED.
 ///
-/// (lane-picalloc) The SB-padded coding surface is written sample-for-sample
-/// by the tile walk's reconstruction before anything reads it, so the
-/// `vec![0u16; n]` this replaces spent ~3% of the frame thread's cycles
-/// zeroing 25 MB (at 4K) that the very next pass overwrites -- serially, at
-/// the frame's head, on the critical path. `EC_AV1_PLANE_SENTINEL=1` swaps the
-/// uninitialised buffer for a [`PLANE_SENTINEL`] fill; the gate hashes both
-/// ways (see the lane report) and the two agree, which is the proof that no
-/// unwritten sample reaches the output.
+/// (lane-picalloc) Replaced a `vec![0u16; n]` that zeroed the whole plane
+/// buffer: ~3% of the frame thread's cycles at 4K, serially at the frame's head,
+/// to initialise 25 MB the next pass overwrites.
+///
+/// # THE `unsafe` BELOW IS NOT FULLY JUSTIFIED -- read this before approving it
+///
+/// This comment previously claimed the SB-padded surface "is written
+/// sample-for-sample by the tile walk's reconstruction before anything reads
+/// it", and cited the sentinel gate as proof. **That claim is RETRACTED by
+/// measurement.** The basis for the retraction is THIS LANE's own, not
+/// second-hand: on `440_request_is_422` an exact u16 whole-plane census at the
+/// pre-deblock point finds **112 unwritten samples per chroma plane, 224 total**
+/// (U and V, 28 whole 4x4 groups each, rows 36..63) in a frame that is SHOWN
+/// (`Key show=true`) and whose samples the caller receives. Uninitialised memory
+/// that reaches the caller was read, or the read that produced it was. That is
+/// the UB, and it needs no hash-variation claim to stand.
+///
+/// A hash-variation observation also exists -- five plain runs of the same
+/// witness giving two different output hashes (`lanes/av1unwritten.report.md`),
+/// which would point the same way -- but it is SECOND-HAND and was NOT
+/// reproduced here: five plain runs on `8d6998d7` gave one hash
+/// (`a761118c8dd5c8d0`, `lanes/unwritten-dep.report.md` §10). It is not relied
+/// on, and the ambient content a run happens to receive is machine-dependent,
+/// so a stable value on one host and a varying one on another would be the same
+/// defect either way. The 224-sample census is the basis; the hashes are aside.
+///
+/// WHAT IS ACTUALLY ESTABLISHED, and it is weaker:
+///
+/// * The sentinel gate ([`census_unwritten_final`],
+///   `the_frame_the_caller_receives_carries_no_unwritten_plane_sample`) proves
+///   that no sample the tile walk never wrote SURVIVES into the frame the caller
+///   receives, on the corpus measured. **It counts at the OUTPUT POINT ONLY --
+///   one census, one scan.** The pre-deblock census ([`census_unwritten`],
+///   `take_unwritten_samples` / `take_census_scanned`) is a DIFFERENT instrument
+///   and has NO committed reader anywhere in the crate on `main`, so it backs
+///   nothing here; an earlier revision of this comment credited the gate with
+///   both, which would have told a reviewer the premise is covered by two scans
+///   when only one exists. It is measured SURVIVAL, not reads.
+/// * It does NOT prove "every sample is written before it is read". A sample read
+///   as a prediction or filter neighbour and overwritten a moment later is
+///   invisible to that count. **No such read has been observed, and no
+///   instrument here measures for one.**
+/// * On `main` = `e45cc748` the one path where a read was demonstrated is
+///   UNREACHABLE: lane/av1unwritten refuses the subsize before descending.
+///
+/// Honest status: a read-before-write is DEMONSTRATED on a path that is now
+/// refused, UNMEASURED on every other path, and this `unsafe` is sound only under
+/// the unproven "written before read" premise. Filed as an open UB-class item
+/// (`lanes/unwritten-dep.report.md` §12) with two closures: (a) zero the
+/// allocation -- the safe default, at the ~3% this removed; or (b) an instrument
+/// counting reads-before-write per sample, so the premise can be proved rather
+/// than assumed.
 fn fresh_plane(n: usize) -> Vec<u16> {
     if plane_sentinel_on() {
         return vec![PLANE_SENTINEL; n];
     }
     let mut v: Vec<u16> = Vec::with_capacity(n);
-    // SAFETY: `u16` has no invalid bit patterns and no `Drop`, and the
-    // capacity was just reserved, so the vector owns `n` initialised-or-not
-    // `u16` slots. Every one is written by reconstruction before it is read
-    // (proven by the sentinel gate above).
+    // SAFETY, PARTIAL -- the premise is NOT established; see the block comment
+    // above ("THE `unsafe` BELOW IS NOT FULLY JUSTIFIED").
+    //
+    // What IS sound: `u16` has no invalid bit patterns and no `Drop`, and the
+    // capacity was just reserved, so the vector owns `n` slots that are valid to
+    // OWN. Creating a `Vec` over uninitialised memory is not itself UB.
+    //
+    // What is NOT sound, and is the reason this is a filed item rather than a
+    // settled one: reading an uninitialised `u16` IS UB, and the only thing that
+    // makes the reads sound is the premise that reconstruction writes every
+    // sample before any read. That premise was RETRACTED by measurement (224
+    // unwritten samples, output varying with initial content) on a path that is
+    // now refused, and is UNMEASURED everywhere else. The sentinel gate measures
+    // survival at the output point, not reads. The pre-deblock census is a
+    // separate instrument with no committed reader on main, so it adds nothing
+    // here. So this `unsafe` is sound under a premise no current instrument
+    // proves.
     #[allow(unsafe_code)]
     unsafe {
         v.set_len(n);
@@ -37959,6 +38133,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     census_unwritten(&y, &u, &v);
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
@@ -38042,6 +38218,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     apply_cdef(
         &mut y,
@@ -38062,6 +38240,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     capture_stages(&y, &u, &v, deblocked.as_ref(), fctx);
     // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
@@ -56321,6 +56501,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     census_unwritten(&y, &u, &v);
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
@@ -56424,6 +56606,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     if !pipelined {
         apply_cdef(
@@ -56446,6 +56630,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     capture_stages(&y, &u, &v, deblocked.as_ref(), fctx);
     // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
