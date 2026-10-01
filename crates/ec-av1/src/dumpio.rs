@@ -155,7 +155,9 @@ impl LoudDump {
     /// filesystem-level reservation failure all land here rather than in
     /// `write`.
     pub fn finish(mut self) {
-        let Some(mut file) = self.file.take() else { return };
+        let Some(mut file) = self.file.take() else {
+            return;
+        };
         if let Err(e) = file.flush() {
             abort(
                 &self.site,
@@ -193,18 +195,83 @@ impl LoudDump {
 /// The single failure line every short dump now ends on. `site`, the path, the
 /// bytes on disk vs the bytes owed, and the reason.
 fn abort(site: &str, path: &Path, got: usize, expected: Option<usize>, why: &str) -> ! {
+    panic!("{}", failure_line(site, path, got, expected, why));
+}
+
+/// The failure line itself, so the fatal and the reporting shapes cannot
+/// drift apart.
+fn failure_line(site: &str, path: &Path, got: usize, expected: Option<usize>, why: &str) -> String {
     let owed = match expected {
         Some(e) => format!("{e}"),
         None => "an unknown number of".to_string(),
     };
-    panic!(
+    format!(
         "ec-av1 dump FAILED [{}] {}: wrote {} of {} bytes: {}",
         site,
         path.display(),
         got,
         owed,
         why
-    );
+    )
+}
+
+/// Write `bytes` to `path` as a FATAL pin, loud on any shortfall -- [`pin`]'s
+/// counterpart to [`write_planes`], for the single-blob case.
+///
+/// lane-av1pinloud: the test-pin sites in `stream.rs` wrote with
+/// `let _ = std::fs::write(..)` and then named the path in the panic that
+/// followed ("stream pinned at {}"), so an `ENOSPC`/`EFBIG` left a TRUNCATED
+/// stream at exactly the path the reader was told to replay -- the same
+/// silent-truncation class as the dump path, one hop later. Success path is
+/// byte-identical: same bytes, same path, truncate-then-write.
+pub fn pin(site: &str, path: impl AsRef<Path>, bytes: &[u8]) {
+    let mut d = LoudDump::create(site, path, bytes.len());
+    d.write(bytes);
+    d.finish();
+}
+
+/// [`pin`] for a site that must NOT die on a failed pin -- a gate whose real
+/// failure is the assert that comes after the pin attempt, and whose comment
+/// says so. Non-fatal, but not silent: a shortfall comes back as the very same
+/// failure line [`pin`] would have panicked with, expected-vs-on-disk counts
+/// included, for the caller to print as a warning.
+pub fn pin_reporting(site: &str, path: impl AsRef<Path>, bytes: &[u8]) -> Result<(), String> {
+    let path = path.as_ref();
+    let expected = bytes.len();
+    if let Err(e) = std::fs::write(path, bytes) {
+        let on_disk = std::fs::metadata(path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        return Err(failure_line(
+            site,
+            path,
+            on_disk,
+            Some(expected),
+            &format!("could not write the pin: {e}"),
+        ));
+    }
+    let on_disk = match std::fs::metadata(path) {
+        Ok(m) => m.len() as usize,
+        Err(e) => {
+            return Err(failure_line(
+                site,
+                path,
+                expected,
+                Some(expected),
+                &format!("could not stat the written pin: {e}"),
+            ));
+        }
+    };
+    if on_disk != expected {
+        return Err(failure_line(
+            site,
+            path,
+            on_disk,
+            Some(expected),
+            "the pinned file on disk is not the length of the stream",
+        ));
+    }
+    Ok(())
 }
 
 /// Write `planes` (already narrowed to their dump's sample width) as ONE dump
@@ -391,9 +458,103 @@ mod tests {
         if std::env::var("EC_AV1_DUMPLOUD_CHILD").is_err() {
             return;
         }
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/420_mixll_256x128_6f.obu");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/420_mixll_256x128_6f.obu");
         let bytes = std::fs::read(&path).expect("the pinned fixture");
         let _ = crate::stream::decode_stream(&bytes);
+    }
+
+    #[test]
+    fn pin_success_path_is_byte_identical() {
+        let p = scratch("pin-ok");
+        pin("EC_AV1_PIN", &p, b"stream bytes");
+        assert_eq!(std::fs::read(&p).unwrap(), b"stream bytes");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pin_to_a_full_device_is_loud() {
+        let msg = caught(|| pin("EC_AV1_PIN", "/dev/full", b"stream bytes"));
+        assert!(
+            msg.starts_with("ec-av1 dump FAILED [EC_AV1_PIN] /dev/full: wrote "),
+            "{msg}"
+        );
+        assert!(msg.contains("No space left on device"), "{msg}");
+        assert!(msg.contains(" of 12 bytes"), "{msg}");
+    }
+
+    /// The reporting shape: same failure line, returned instead of panicked,
+    /// so a gate whose real failure is the assert after the pin keeps that
+    /// assert -- but the reader still learns the pin is short.
+    #[test]
+    #[cfg(unix)]
+    fn pin_reporting_is_loud_but_not_fatal() {
+        let line = pin_reporting("EC_AV1_PIN", "/dev/full", b"stream bytes").unwrap_err();
+        assert!(
+            line.contains("ec-av1 dump FAILED [EC_AV1_PIN] /dev/full"),
+            "{line}"
+        );
+        assert!(line.contains(" of 12 bytes"), "{line}");
+        let p = scratch("pin-reporting-ok");
+        pin_reporting("EC_AV1_PIN", &p, b"stream bytes").expect("a healthy pin reports nothing");
+        assert_eq!(std::fs::read(&p).unwrap(), b"stream bytes");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The pin path's own reproduction: a real `RLIMIT_FSIZE` leaves a real
+    /// truncated stream at the path the panic names. Without the check the
+    /// reader replays the fragment and blames the decoder.
+    #[test]
+    #[cfg(unix)]
+    fn a_pin_under_a_file_size_cap_fails_loudly() {
+        let dir = std::env::temp_dir().join(format!("ec-av1-pin-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = Command::new("bash")
+            .args([
+                "-c",
+                "ulimit -f 8; trap \"\" XFSZ; exec \"$0\" \"$@\"",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                "--exact",
+                "dumpio::tests::pin_child_under_cap",
+                "--nocapture",
+            ])
+            .env("EC_AV1_PINLOUD_CHILD", &dir)
+            .output()
+            .expect("spawning the capped child");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "a short pin must fail\n{stderr}");
+        assert!(
+            stderr.contains("ec-av1 dump FAILED [EC_AV1_PIN]"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("File too large"), "{stderr}");
+        let frag = std::fs::metadata(dir.join("cap-pinned.obu")).unwrap().len();
+        assert!(
+            frag < 32768,
+            "the capped child left {frag} bytes where 32768 B was owed"
+        );
+        assert!(
+            stderr.contains(&format!("wrote {frag} of 32768 bytes")),
+            "{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Child half of [`a_pin_under_a_file_size_cap_fails_loudly`]. Not a gate:
+    /// with no `EC_AV1_PINLOUD_CHILD` set it writes nothing and asserts nothing.
+    #[test]
+    fn pin_child_under_cap() {
+        let Ok(dir) = std::env::var("EC_AV1_PINLOUD_CHILD") else {
+            return;
+        };
+        // `ulimit -f 8` is 8 KiB, so 4x that is guaranteed to run PAST the cap
+        // (a write of exactly the cap size succeeds) and land a fragment.
+        pin(
+            "EC_AV1_PIN",
+            Path::new(&dir).join("cap-pinned.obu"),
+            &[7u8; 32768],
+        );
     }
 }

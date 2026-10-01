@@ -2214,7 +2214,11 @@ fn decode_frame(
         crate::dumpio::write_planes(
             "EC_AV1_DECODE_ORDER_DUMP",
             format!("{path}.f{decode_idx}"),
-            &[&narrow(&picture.y), &narrow(&picture.u), &narrow(&picture.v)],
+            &[
+                &narrow(&picture.y),
+                &narrow(&picture.u),
+                &narrow(&picture.v),
+            ],
         );
     }
     // lane-hidden r1: the frame exactly as it is about to be stored into
@@ -2257,8 +2261,11 @@ fn decode_frame(
         // writer that builds the wrong buffer still gets caught.
         let sample_width = if bit_depth == 8 { 1 } else { 2 };
         let expected = (picture.y.len() + picture.u.len() + picture.v.len()) * sample_width;
-        let mut f =
-            crate::dumpio::LoudDump::create("EC_AV1_FINAL_DUMP", format!("{prefix}.f{decode_idx}"), expected);
+        let mut f = crate::dumpio::LoudDump::create(
+            "EC_AV1_FINAL_DUMP",
+            format!("{prefix}.f{decode_idx}"),
+            expected,
+        );
         for plane in [&picture.y, &picture.u, &picture.v] {
             if bit_depth == 8 {
                 f.write(&plane.iter().map(|&s| s as u8).collect::<Vec<u8>>());
@@ -14188,7 +14195,7 @@ exit 0
                 assert_eq!(a.len(), b.len(), "{name}: frame {i} {plane} plane length");
                 if a != b {
                     let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
-                    let _ = std::fs::write(&pin, &stream);
+                    crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                     let at = a
                         .iter()
                         .zip(b.iter())
@@ -18198,7 +18205,7 @@ exit 0
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             if got.y != want.y || got.u != want.u || got.v != want.v {
                 let pin = std::env::temp_dir().join("ec-av1-10bit-inter-gate-fail.obu");
-                let _ = std::fs::write(&pin, &stream);
+                crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                 let first = |a: &Vec<u16>, b: &Vec<u16>| {
                     a.iter()
                         .zip(b)
@@ -23167,7 +23174,7 @@ exit 0
             Ok(frames) => frames,
             Err(e) => {
                 let pin = std::env::temp_dir().join(format!("{name}-refused.obu"));
-                let _ = std::fs::write(&pin, &stream);
+                crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                 panic!(
                     "{name}: decode_stream refused a real aomenc stream: {e} (pinned at {})",
                     pin.display()
@@ -23187,7 +23194,7 @@ exit 0
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             if got.y != want.y || got.u != want.u || got.v != want.v {
                 let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
-                let _ = std::fs::write(&pin, &stream);
+                crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                 panic!(
                     "{name}: frame {i} mismatch vs ffmpeg -- stream pinned at {}",
                     pin.display()
@@ -23586,7 +23593,7 @@ exit 0
                 }
                 Err(e) => {
                     let pin = std::env::temp_dir().join(format!("{name}-refused.obu"));
-                    let _ = std::fs::write(&pin, &stream);
+                    crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                     panic!(
                         "{name}: decode_stream failed on a real aomenc stream (cq={cq} period={period}): {e} (pinned at {})",
                         pin.display()
@@ -23608,7 +23615,7 @@ exit 0
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 if got.y != want.y || got.u != want.u || got.v != want.v {
                     let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
-                    let _ = std::fs::write(&pin, &stream);
+                    crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                     panic!(
                         "{name}: frame {i} mismatch vs ffmpeg (cq={cq} period={period}) -- stream pinned at {}",
                         pin.display()
@@ -27901,7 +27908,7 @@ exit 0
                             "ec-av1-deblocking-gate-fail-s{}-cq{cq}.obu",
                             42 + round
                         ));
-                        let _ = std::fs::write(&pin, &stream);
+                        crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                         panic!(
                             "frame {i} mismatch vs ffmpeg (seed {} cq {cq}, deblock fired: \
                              {counted}) -- stream pinned at {}",
@@ -28134,14 +28141,18 @@ exit 0
                 // The pin goes to `fixtures/`, which outlives the session: an
                 // earlier version wrote to a session scratchpad, so once tmpfs
                 // reaped it a real mismatch aborted on the write instead of
-                // reporting itself. A failed write must not mask the assert
-                // below either, so it warns rather than panicking.
+                // reporting itself. A failed write must not mask the asserts
+                // below either, so it warns rather than panicking -- lane-av1pinloud
+                // routed it through `pin_reporting` rather than bare `fs::write`,
+                // so the warning now carries on-disk-vs-owed byte counts: a
+                // truncated pin was as silent here as anywhere else, and this
+                // is the one site where dying on the write is wrong.
                 let sp = pin_dir();
                 let stream_pin = sp.join(format!("cdfflake-stream-seed{seed}.bin"));
                 let ref_pin = sp.join(format!("cdfflake-ffmpeg-raw-seed{seed}.bin"));
                 for (path, bytes) in [(&stream_pin, &stream), (&ref_pin, &ffmpeg_raw)] {
-                    if let Err(e) = std::fs::write(path, bytes) {
-                        eprintln!("cdfflake: could not pin to {}: {e}", path.display());
+                    if let Err(line) = crate::dumpio::pin_reporting("EC_AV1_PIN", path, bytes) {
+                        eprintln!("cdfflake: {line}");
                     }
                 }
                 eprintln!(
@@ -28893,9 +28904,9 @@ exit 0
                     if mismatched {
                         let pin =
                             std::env::temp_dir().join("ec-av1-reference-select-gate-fail.obu");
-                        let _ = std::fs::write(&pin, &stream);
+                        crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                         if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
-                            std::fs::write(&path, &stream).expect("writing pinned stream");
+                            crate::dumpio::pin("EC_AV1_GATE_DUMP", &path, &stream);
                             eprintln!(
                                 "EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}"
                             );
@@ -29103,9 +29114,9 @@ exit 0
                 .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
             if mismatched {
                 let pin = std::env::temp_dir().join("ec-av1-compound-refs-gate-fail.obu");
-                let _ = std::fs::write(&pin, &stream);
+                crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
                 if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
-                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    crate::dumpio::pin("EC_AV1_GATE_DUMP", &path, &stream);
                     eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
