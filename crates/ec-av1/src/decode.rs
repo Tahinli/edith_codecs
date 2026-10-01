@@ -21235,9 +21235,10 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     }
 }
 
-/// `EC_AV1_SENTINEL_CENSUS=1`: at each frame's pre-deblock point, print an
+/// Enabled by `EC_AV1_PLANE_SENTINEL` (there is no separate flag for it): at
+/// each frame's pre-deblock point, print an
 /// EXACT census of the samples the tile walk never wrote -- with
-/// `EC_AV1_PLANE_SENTINEL=1` every plane still holding [`PLANE_SENTINEL`] at
+/// it, every plane still holding [`PLANE_SENTINEL`] at
 /// this point is a sample no block reconstructed, and no legal sample can
 /// equal `0xDEAD` (reconstruction clamps to `(1 << bit_depth) - 1`).
 ///
@@ -21340,6 +21341,54 @@ thread_local! {
 fn plane_sentinel_on() -> bool {
     crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL")
         || PLANE_SENTINEL_ON.with(std::cell::Cell::get)
+}
+
+/// lane-av1unwritten: whether a subsize has a chroma PLANE BLOCK at this
+/// frame's subsampling -- libaom `av1_ss_size_lookup[bsize][ss_x][ss_y] !=
+/// BLOCK_INVALID` (`common_data.c`), which `decode_partition` checks on every
+/// subsize before descending into it:
+///
+/// ```c
+///   if (get_plane_block_size(subsize, pd_u->subsampling_x, pd_u->subsampling_y) ==
+///       BLOCK_INVALID)
+///     aom_internal_error(xd->error_info, AOM_CODEC_CORRUPT_FRAME,
+///                        "Block size %dx%d invalid with this subsampling mode", ...);
+/// ```
+/// (`decodeframe.c:1449-1458`). Only the four cells that are ever BLOCK_INVALID
+/// are listed, from that table's rows:
+/// BLOCK_4X8 `{BLOCK_4X8, BLOCK_4X4 | BLOCK_INVALID, BLOCK_4X4}`,
+/// BLOCK_8X4 `{BLOCK_8X4, BLOCK_INVALID | BLOCK_4X4, BLOCK_4X4}`,
+/// BLOCK_8X16 `{BLOCK_8X16, BLOCK_8X8 | BLOCK_INVALID, BLOCK_4X8}`,
+/// BLOCK_16X4 `{BLOCK_16X4, BLOCK_INVALID | BLOCK_8X8, BLOCK_4X4}`.
+///
+/// So at 4:2:2 a 4x8, 8x16 or 16x4 subsize is NOT DECODABLE: libaom rejects
+/// the frame outright and never reaches a transform size for it. This decoder
+/// walked those subsizes anyway, and the chroma plane block it then covered was
+/// a different shape than the luma one -- on the pinned
+/// `440_request_is_422.obu` (a 4:2:2 sequence header over a 4:2:0 key frame's
+/// tile) that left whole 4x4 chroma blocks unwritten and the output hash
+/// CHANGED RUN TO RUN. `aomdec` on the same file:
+/// `Failed to decode frame 1: Corrupt frame detected` / `Block size 8x16
+/// invalid with this subsampling mode`.
+fn chroma_plane_block_codable(bw: usize, bh: usize, sx: usize, sy: usize) -> bool {
+    match (bw, bh) {
+        (4, 8) => (sx, sy) != (1, 0),
+        (8, 4) => (sx, sy) != (0, 1),
+        (8, 16) => (sx, sy) != (1, 0),
+        (16, 4) => (sx, sy) != (1, 0),
+        _ => true,
+    }
+}
+
+/// [`chroma_plane_block_codable`] as libaom's refusal: a returned error naming
+/// the shape and the subsampling mode, never an `assert!` -- a partition symbol
+/// is stream data, so a hostile file can reach it.
+fn refuse_invalid_plane_block(_bw: usize, _bh: usize, _fctx: &crate::decode::FrameCtx) -> Error {
+    unsupported(
+        "a block size 4x8, 8x16 or 16x4 (or 8x4 at 4:4:0) has no chroma plane block at this \
+         frame's subsampling mode (libaom: \"Block size %dx%d invalid with this subsampling \
+         mode\", av1/decoder/decodeframe.c:1456, refusing by the same rule)",
+    )
 }
 
 /// The value [`fresh_plane`] fills with under `EC_AV1_PLANE_SENTINEL`: no
@@ -26454,9 +26503,8 @@ fn sub8_leaf_chroma422(
     // units -- which is exactly what the two chroma-reference leaves of the
     // `decode_leaf_split4` route below already emit, so the square arms stay
     // for lossless.
-    let rect48 = leaf_shape == (4, 8) && !lossless(fctx);
     let tx_w = 4 << ss_x(fctx);
-    let tx_h = (if rect48 { 8 } else { 4 }) << ss_y(fctx);
+    let tx_h = 4 << ss_y(fctx);
     let reach = Reach::of_tu_chroma(
         mi_bw,
         mi_bh,
@@ -26472,95 +26520,15 @@ fn sub8_leaf_chroma422(
         py > 0 && px + (tx_w << ss_x(fctx)) < y.width,
         px > 0 && py + (tx_h << ss_y(fctx)) < y.height,
     );
-    let chroma_around = neighbours.around_mi_422_chroma(ctx_mi, 8, if rect48 { 8 } else { 4 });
+    let chroma_around = neighbours.around_mi_422_chroma(ctx_mi, 8, 4);
     // lane-av1422sub8pix: the CfL AC signal spans the UNIT's luma footprint,
     // anchored at the same FLOORED luma x the write/prediction anchor below
     // uses -- `px` (the odd leaf's own luma x) steps half the span into the
     // RIGHT neighbour group (t422 frame-1 leaf (1,23): the unit reconstructs
     // chroma px 44..47 from luma 88..95, while a `px`-anchored source
     // averaged luma 92..99 and every CFL unit of the group mismatched).
-    let ac = alpha.map(|_| cfl_src_rect((lmi.1 & !1) * MI, py, 8, if rect48 { 8 } else { 4 }));
-    let grids: (Grid, Grid) = if rect48 {
-        // The 4:2:2 vert pair's ONE chroma reference codes the PAIR's whole
-        // 4x8 chroma plane block. libaom reaches the same unit through
-        // `decode_token_recon_block`'s plane/row/col loop with
-        // `tx_size = av1_get_tx_size(1, xd)` == TX_4X8 (stepr/stepc = 2/1 over
-        // `unit_height = ROUND_POWER_OF_TWO(min(mu_blocks_high + row,
-        // max_blocks_high), ss_y)` = 2 and `unit_width` = 1, i.e. one
-        // iteration), so [`leaf8_chroma422_unit`] -- the port of that walk for
-        // a BLOCK_8X8 leaf -- is the unit, unchanged. The DV arms supply the
-        // frame copy through `pred_override`, which is how the BLOCK_8X8 leaf
-        // hands the same two intrabc shapes over.
-        let (ub, vb) = match intrabc_dv {
-            Some(dv) => {
-                let mut ub = vec![0u16; 4 * 8];
-                mc::predict_with_filter(
-                    &u.data,
-                    u.width,
-                    u.true_width,
-                    u.true_height,
-                    mv_to_q4(cpx, dv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, dv.0, ss_y(fctx)),
-                    4,
-                    8,
-                    mc::InterpFilterKind::Bilinear,
-                    &mut ub,
-                    fctx,
-                );
-                let mut vb = vec![0u16; 4 * 8];
-                mc::predict_with_filter(
-                    &v.data,
-                    v.width,
-                    v.true_width,
-                    v.true_height,
-                    mv_to_q4(cpx, dv.1, ss_x(fctx)),
-                    mv_to_q4(cpy, dv.0, ss_y(fctx)),
-                    4,
-                    8,
-                    mc::InterpFilterKind::Bilinear,
-                    &mut vb,
-                    fctx,
-                );
-                (Some(ub), Some(vb))
-            }
-            None => (None, None),
-        };
-        let u_grid = leaf8_chroma422_unit(
-            dec,
-            cdfs,
-            chroma_around[1],
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            1,
-            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
-            skip,
-            ub,
-            u,
-            cpx,
-            cpy,
-            smooth_neighbor_uv,
-            fctx,
-        )?;
-        let v_grid = leaf8_chroma422_unit(
-            dec,
-            cdfs,
-            chroma_around[2],
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            2,
-            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
-            skip,
-            vb,
-            v,
-            cpx,
-            cpy,
-            smooth_neighbor_uv,
-            fctx,
-        )?;
-        (u_grid, v_grid)
-    } else if let Some(dv) = intrabc_dv.filter(|_| skip) {
+    let ac = alpha.map(|_| cfl_src_rect((lmi.1 & !1) * MI, py, 8, 4));
+    let grids: (Grid, Grid) = if let Some(dv) = intrabc_dv.filter(|_| skip) {
         // lane-av1422ctattr: a SKIPPED intrabc chroma leaf still predicts the
         // frame copy at its DV. libaom's `decode_token_recon_block` takes the
         // INTER arm for an intrabc block (`is_inter_block` counts it,
@@ -36269,6 +36237,24 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     sc * SUB_MI as usize
                                                 );
                                             }
+                                            if part16 == PARTITION_HORZ || part16 == PARTITION_VERT
+                                            {
+                                                let (bw, bh) = if part16 == PARTITION_HORZ {
+                                                    (16, 8)
+                                                } else {
+                                                    (8, 16)
+                                                };
+                                                if !chroma_plane_block_codable(
+                                                    bw,
+                                                    bh,
+                                                    ss_x(fctx),
+                                                    ss_y(fctx),
+                                                ) {
+                                                    return Err(refuse_invalid_plane_block(
+                                                        bw, bh, fctx,
+                                                    ));
+                                                }
+                                            }
                                             if part16 == PARTITION_NONE {
                                                 decode_block(
                                                     &mut dec,
@@ -36638,6 +36624,27 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     eprintln!(
                                                         "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
                                                     );
+                                                }
+                                                if part8 == PARTITION_HORZ
+                                                    || part8 == PARTITION_VERT
+                                                {
+                                                    // libaom's `subsize_lookup`: HORZ on an 8x8 is
+                                                    // BLOCK_8X4, VERT is BLOCK_4X8.
+                                                    let (bw, bh) = if part8 == PARTITION_HORZ {
+                                                        (8, 4)
+                                                    } else {
+                                                        (4, 8)
+                                                    };
+                                                    if !chroma_plane_block_codable(
+                                                        bw,
+                                                        bh,
+                                                        ss_x(fctx),
+                                                        ss_y(fctx),
+                                                    ) {
+                                                        return Err(refuse_invalid_plane_block(
+                                                            bw, bh, fctx,
+                                                        ));
+                                                    }
                                                 }
                                                 let leaf_mode = if part8 == PARTITION_NONE {
                                                     decode_leaf8(
