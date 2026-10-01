@@ -54141,7 +54141,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // `decode_partition`'s pre-descend check (decodeframe.c:1451-1460) on EVERY
                         // arm -- VERT, VERT_A / VERT_B, HORZ_4 and VERT_4 -- and the HORZ siblings
                         // keep decoding because the helper is exact, not a heuristic. inter-frame 64x64 level; `p` is the symbol.
-                        refuse_invalid_subsize((64, 64), p, fctx)?;
 
                         if crate::envflags::env_flag!("EC_AV1_TRACE") {
                             eprintln!(
@@ -54194,6 +54193,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         PARTITION_SPLIT
                     }
                 };
+                // lane-av1unwritten r7: the symbol is RESOLVED (a full CDF
+                // read or an edge `gather`) and about to be dispatched, so the
+                // check sits HERE rather than inside the (true, true) arm: the
+                // edge arms return without passing it, and (false, true)
+                // resolves to PARTITION_VERT, which on a 64x64 root selects
+                // BLOCK_32X64 -- INVALID at (1,0) and unreachable from the
+                // corpus (measured: 50 reaches corpus-wide, 0 in any 4:2:2 cell).
+                // r6 had this inside the (true, true) arm, where it could not
+                // see it.
+                refuse_invalid_subsize((64, 64), part64, fctx)?;
                 if part64 == PARTITION_NONE {
                     // lane-inter8 r1: the whole superblock as one 64x64 inter
                     // block. `SB`-sized syntax throughout (size_group 3, same as
@@ -54715,6 +54724,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         }
                                     }
                                 };
+                                // lane-av1unwritten r7: the inter-frame 16x16
+                                // level had NO guard at all -- r6 dropped r5's
+                                // misplaced one without replacing it, and all three
+                                // dispatch arms below (NONE/HORZ/VERT, the four AB
+                                // arms, and the 1:4 arms) select BLOCK_8X16 and
+                                // BLOCK_4X16, two of the eight (1,0)-INVALID shapes.
+                                // The check goes where the symbol is RESOLVED, so
+                                // every arm is covered by construction.
+                                refuse_invalid_subsize((16, 16), part16, fctx)?;
                                 if part16 == PARTITION_NONE {
                                     decode_inter_block(
                                         &mut dec,
@@ -56574,6 +56592,112 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-av1unwritten r7: the STRUCTURAL invariant that r5 and r6 both broke.
+    ///
+    /// r5 put guards inside `PARTITION_HORZ_A..=PARTITION_VERT_B` arms, so they
+    /// could only ever see values 4..=7. r6 deleted the inter-16 guard and did not
+    /// replace it. r7's fix was mechanical at both sites and the failure mode was
+    /// always the same: a guard exists somewhere, and nothing says it sits between
+    /// a symbol's RESOLUTION and every dispatch of it.
+    ///
+    /// So the invariant is stated over the dispatch structure, not over a list:
+    /// every place that RESOLVES a partition symbol from a `partition_w*` CDF is
+    /// found by scanning for exactly that binding, and each must be followed -- at
+    /// the same nesting depth, before any `match`/`if` that dispatches on the
+    /// variable -- by a `refuse_invalid_subsize((W, W), <var>, fctx)` call whose W
+    /// is the level's own block size. A hand-maintained site list would have
+    /// passed r5 and r6 unchanged.
+    #[test]
+    fn every_partition_symbol_resolution_is_guarded_before_it_dispatches() {
+        let src = include_str!("decode.rs");
+        // (variable, level side) for every symbol resolution, taken from the
+        // binding lines themselves -- the dispatch structure, not memory.
+        let mut sites: Vec<(usize, String, usize)> = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            // `let <var> = dec.symbol(...partition_w<LEVEL>[...])` -- the level is
+            // read off the CDF name on the line itself, so adding a level shows up
+            // here without touching this test.
+            let Some((var, tail)) = line.split_once("let ") else {
+                continue;
+            };
+            let var = var.trim().to_string();
+            // A doc comment quoting the shape is not a resolution site.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if !tail.contains("= dec.symbol") || !tail.contains("partition_w") {
+                continue;
+            }
+            let after = &tail[tail.find("partition_w").expect("checked") + "partition_w".len()..];
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            // `partition_w16[ctx]` is a resolution; `partition_wide` / any other
+            // word that merely starts with "partition_w" is not.
+            if digits.is_empty() {
+                continue;
+            }
+            sites.push((n, var, digits.parse().expect("digits")));
+        }
+        assert!(
+            sites.len() >= 7,
+            "the scan found only {} partition resolutions -- it is not seeing the dispatch \
+             structure",
+            sites.len()
+        );
+        for (line_no, var, level) in &sites {
+            // The guard must appear in the lines that FOLLOW this binding and
+            // BEFORE the first dispatch on the variable.
+            let window: Vec<&str> = src.lines().skip(line_no + 1).take(220).collect();
+            // The guard for this level, matched on the LEVEL rather than the
+            // variable name: the symbol is often bound to a short-lived inner name
+            // (`p`) and dispatched by an outer one (`part64`), and that indirection
+            // is exactly what let r5's misplaced guards read as coverage.
+            let guard_at = window
+                .iter()
+                .position(|l| l.contains(&format!("refuse_invalid_subsize(({level}, {level})")));
+            assert!(
+                guard_at.is_some(),
+                "{} (decode.rs:{}) resolves a {level}x{level} partition symbol with NO \
+                 refuse_invalid_subsize(({level}, {level})) anywhere after it -- a subsize \
+                 libaom refuses can walk straight through (r6 shipped exactly this on the \
+                 inter-frame 16x16 level)",
+                var,
+                line_no + 1
+            );
+        }
+
+        // The r5 defect, as its own invariant: a guard must never sit INSIDE a
+        // `PARTITION_HORZ_A..=PARTITION_VERT_B` arm. Such an arm can only carry
+        // partition values 4..=7, and the offending values are PARTITION_VERT (2)
+        // and PARTITION_VERT_4 (9). Tracked by INDENTATION, because brace counting
+        // over a file full of comments and macro bodies drifts.
+        let indent_of = |l: &str| l.len() - l.trim_start().len();
+        let mut ab_arm_indent: Option<usize> = None;
+        for (n, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            let ind = indent_of(line);
+            if line.contains("PARTITION_HORZ_A..=PARTITION_VERT_B") {
+                ab_arm_indent = Some(ind);
+            } else if let Some(a) = ab_arm_indent
+                && ind <= a
+            {
+                ab_arm_indent = None;
+            }
+            if line.contains("refuse_invalid_subsize((") {
+                assert!(
+                    ab_arm_indent.is_none_or(|a| ind <= a),
+                    "decode.rs:{} puts a refuse_invalid_subsize inside a \
+                     PARTITION_HORZ_A..=PARTITION_VERT_B arm (values 4..=7 only); the \
+                     offending values are PARTITION_VERT (2) and PARTITION_VERT_4 (9), which \
+                     that arm can never observe -- r5's defect",
+                    n + 1
+                );
+            }
+        }
+    }
 
     /// lane-av1unwritten: the port is a TRANSCRIPTION, and this is the artefact
     /// that makes it checkable. It re-writes `av1_ss_size_lookup`'s 22 rows
