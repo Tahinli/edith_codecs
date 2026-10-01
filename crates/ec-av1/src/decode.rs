@@ -35464,9 +35464,7 @@ fn read_sb128_root(
     // whose 4:2:2 plane block is BLOCK_INVALID; the AB arms select 64x64
     // quadrants (valid), so PARTITION_HORZ / PARTITION_NONE / SPLIT keep
     // decoding untouched.
-    if matches!(part128, PARTITION_VERT) {
-        refuse_invalid_subsize((128, 128), part128, fctx)?;
-    }
+    refuse_invalid_subsize((128, 128), part128, fctx)?;
     match part128 {
         PARTITION_SPLIT => hit!(PART128_SPLIT_HITS),
         PARTITION_NONE => hit!(PART128_NONE_HITS),
@@ -36149,6 +36147,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         }
                     }
                 };
+                // lane-av1unwritten r5: the partition symbol is RESOLVED (a full CDF read or
+                // an edge `gather`) and about to be dispatched. `partition_subsize_dims` is
+                // libaom's `get_partition_subsize` (common_data.h:71-90) reduced to
+                // dimensions, so this is `decode_partition`'s pre-descend check
+                // (decodeframe.c:1449-1458) applied to EVERY arm at once -- VERT,
+                // VERT_A / VERT_B, HORZ_4 and VERT_4 included. The HORZ siblings keep
+                // decoding because the helper is exact, not a heuristic. the 64x64 level binds its symbol to `part`.
+                refuse_invalid_subsize((64, 64), part, fctx)?;
                 match part {
                     PARTITION_NONE => {
                         decode_block(
@@ -36276,9 +36282,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                             // block selects BLOCK_32X16, whose (1,0) cell is
                             // BLOCK_16X16 (valid) and MUST keep decoding, so the
                             // check is on the symbol's subsize, not the parent's.
-                            if matches!(part32, PARTITION_VERT) {
-                                refuse_invalid_subsize((32, 32), part32, fctx)?;
-                            }
+                            refuse_invalid_subsize((32, 32), part32, fctx)?;
                             match part32 {
                                 PARTITION_NONE => {
                                     decode_block(
@@ -36497,9 +36501,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 // selects BLOCK_16X4, whose (1,0)
                                                 // cell is BLOCK_8X4 (valid, the
                                                 // shape r2 wrongly refused).
-                                                if matches!(part16, PARTITION_VERT_4) {
-                                                    refuse_invalid_subsize((16, 16), part16, fctx)?;
-                                                }
+                                                refuse_invalid_subsize((16, 16), part16, fctx)?;
                                                 match part16 {
                                                     PARTITION_HORZ_A => {
                                                         let m_tl =
@@ -53824,6 +53826,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             cdef_copy($src, $dst);
                         }};
                     }
+                    // lane-av1unwritten r5: the partition symbol is RESOLVED (a full CDF read or
+                    // an edge `gather`) and about to be dispatched. `partition_subsize_dims` is
+                    // libaom's `get_partition_subsize` (common_data.h:71-90) reduced to
+                    // dimensions, so this is `decode_partition`'s pre-descend check
+                    // (decodeframe.c:1449-1458) applied to EVERY arm at once -- VERT,
+                    // VERT_A / VERT_B, HORZ_4 and VERT_4 included. The HORZ siblings keep
+                    // decoding because the helper is exact, not a heuristic. (inter-frame duplicate)
+                    refuse_invalid_subsize((128, 128), part128, fctx)?;
                     match part128 {
                         PARTITION_HORZ_A => {
                             square64_inter!(base_mi);
@@ -54283,9 +54293,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     // BLOCK_32X64 -- INVALID at 4:2:2. HORZ on the same block
                     // selects BLOCK_64X32, whose (1,0) cell is BLOCK_32X32
                     // (valid) and MUST keep decoding.
-                    if matches!(part64, PARTITION_VERT) {
-                        refuse_invalid_subsize((64, 64), part64, fctx)?;
-                    }
+                    refuse_invalid_subsize((64, 64), part64, fctx)?;
                     match part64 {
                         PARTITION_HORZ_A => {
                             ab_square32!(tl);
@@ -54417,6 +54425,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             }
                         }
                     };
+                    // lane-av1unwritten r5: the partition symbol is RESOLVED (a full CDF read or
+                    // an edge `gather`) and about to be dispatched. `partition_subsize_dims` is
+                    // libaom's `get_partition_subsize` (common_data.h:71-90) reduced to
+                    // dimensions, so this is `decode_partition`'s pre-descend check
+                    // (decodeframe.c:1449-1458) applied to EVERY arm at once -- VERT,
+                    // VERT_A / VERT_B, HORZ_4 and VERT_4 included. The HORZ siblings keep
+                    // decoding because the helper is exact, not a heuristic. (inter-frame duplicate)
+                    refuse_invalid_subsize((32, 32), part32, fctx)?;
                     match part32 {
                         PARTITION_NONE => {
                             decode_inter_block(
@@ -54765,6 +54781,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             )
                                         };
                                     }
+                                    // lane-av1unwritten r5: the partition symbol is RESOLVED (a full CDF read or
+                                    // an edge `gather`) and about to be dispatched. `partition_subsize_dims` is
+                                    // libaom's `get_partition_subsize` (common_data.h:71-90) reduced to
+                                    // dimensions, so this is `decode_partition`'s pre-descend check
+                                    // (decodeframe.c:1449-1458) applied to EVERY arm at once -- VERT,
+                                    // VERT_A / VERT_B, HORZ_4 and VERT_4 included. The HORZ siblings keep
+                                    // decoding because the helper is exact, not a heuristic. (inter-frame duplicate)
+                                    refuse_invalid_subsize((16, 16), part16, fctx)?;
                                     match part16 {
                                         PARTITION_HORZ_A => {
                                             inter_leaf8!(at16, tl);
