@@ -21373,10 +21373,20 @@ fn plane_sentinel_on() -> bool {
 ///    4:2:2 stream can contain the shape and the refusal cannot reject legal
 ///    content.
 ///
-/// What led here was this lane's own pre-deblock census
-/// ([`census_unwritten`]), which reported unwritten chroma samples on THIS
-/// lane's tree at r1. That is a lane-tree measurement with a lane-only
-/// instrument and is cited as such; the refusal stands on (1) and (2).
+/// What led here was the observation that this decoder's output for such a
+/// witness DEPENDS ON UNWRITTEN PLANE CONTENT. Measured on `8d6998d7` by two
+/// independent builds (`EC_AV1_FINAL_DUMP=<dir>/x`, the directory created
+/// FIRST -- the dump writes nothing if it does not exist): five runs with
+/// uninitialised planes give TWO different output hashes, five runs with
+/// `EC_AV1_PLANE_SENTINEL=1` give ONE hash, and the sentinel output differs
+/// from the plain one. At 8-bit the sentinel survives in the dump as the single
+/// byte `0xAD`, not the pair `DE AD` -- `PLANE_SENTINEL`'s u16 narrows in
+/// [`crate::stream`]'s u8 write path, so counting a two-byte `0xDEAD` in an
+/// 8-bit dump cannot find it. The lane's own pre-deblock census
+/// ([`census_unwritten`]) then localised the unwritten samples on THIS lane's
+/// tree: 112 per chroma plane on the witness, 224 total. That census number is a
+/// lane-tree measurement with a lane-only instrument and is cited as such;
+/// (1) and (2) are what make the refusal correct.
 ///
 /// `av1_ss_size_lookup`'s `BLOCK_INVALID` cells, transcribed verbatim:
 /// `(common_data.c:17-41`, rows in `BLOCK_SIZES_ALL` order, indexed
