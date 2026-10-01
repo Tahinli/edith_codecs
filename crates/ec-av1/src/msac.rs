@@ -1133,16 +1133,16 @@ pub(crate) mod symtrace {
             let (buf, n) = &mut *b.borrow_mut();
             if !buf.is_empty() {
                 // lane-av1dumploud: loud on a short write. `std::fs::write`
-                // returns a `Result` that this used to discard; the expected
-                // length is exactly the buffer's own.
+                // returned a `Result` this used to discard, and the check was
+                // hand-rolled against the buffer length only; lane-av1pinloud
+                // folded it into the shared writer so this site also gets the
+                // on-disk length check the dump path already had.
                 let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let (bytes, at) = (buf.as_bytes(), format!("{dir}/{side}-{seq:05}.txt"));
-                if let Err(e) = std::fs::write(&at, bytes) {
-                    panic!(
-                        "ec-av1 dump FAILED [EC_AV1_SYMTRACE] {at}: wrote 0 of {} bytes: {e}",
-                        bytes.len()
-                    );
-                }
+                crate::dumpio::pin(
+                    "EC_AV1_SYMTRACE",
+                    format!("{dir}/{side}-{seq:05}.txt"),
+                    buf.as_bytes(),
+                );
             }
             buf.clear();
             *n = 0;
