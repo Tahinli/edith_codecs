@@ -21252,6 +21252,383 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     }
 }
 
+/// Enabled by `EC_AV1_PLANE_SENTINEL` (there is no separate flag for it): at
+/// each frame's pre-deblock point, print an
+/// EXACT census of the samples the tile walk never wrote -- with
+/// it, every plane still holding [`PLANE_SENTINEL`] at
+/// this point is a sample no block reconstructed, and no legal sample can
+/// equal `0xDEAD` (reconstruction clamps to `(1 << bit_depth) - 1`).
+///
+/// This is the shipped form of the four-line temporary scan the
+/// `lane/av1422seed` census used: it replaces a wrong-sample diff (which says
+/// where the OUTPUT is wrong, not whether the block was written at all) with a
+/// direct count plus the coordinates of every hole, grouped into per-row
+/// spans so a large hole stays readable. Scans each plane over its own
+/// `true_width` x `true_height` extent: past that is the padded coding
+/// surface's invented tail, which no decoder ever reads.
+fn census_unwritten(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
+    if !plane_sentinel_on() {
+        return;
+    }
+    let idx = PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst);
+    for (name, p) in [("Y", y), ("U", u), ("V", v)] {
+        let (w, h) = (p.true_width.min(p.width), p.true_height);
+        let mut total = 0usize;
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for row in 0..h {
+            let mut run: Option<(usize, usize)> = None;
+            for col in 0..w {
+                if p.data[row * p.width + col] == PLANE_SENTINEL {
+                    total += 1;
+                    run = Some(match run {
+                        None => (col, col),
+                        Some((a, _)) => (a, col),
+                    });
+                }
+                if run.is_some()
+                    && (col + 1 == w || p.data[row * p.width + col + 1] != PLANE_SENTINEL)
+                {
+                    let (a, b) = run.take().expect("a run is open here");
+                    spans.push((row, a, b));
+                }
+            }
+        }
+        UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
+        CENSUS_SCANNED.fetch_add(w * h, std::sync::atomic::Ordering::SeqCst);
+        if total == 0 {
+            eprintln!("SENTINEL_CENSUS idx={idx} plane={name} extent={w}x{h} unwritten=0");
+            continue;
+        }
+        let body: Vec<String> = spans
+            .iter()
+            .map(|&(r, a, b)| format!("y{r} x{a}..={b}"))
+            .collect();
+        eprintln!(
+            "SENTINEL_CENSUS idx={idx} plane={name} extent={w}x{h} unwritten={total} \
+             spans={}: {}",
+            spans.len(),
+            body.join(" ")
+        );
+    }
+}
+
+/// Unwritten samples [`census_unwritten`] has counted since the last
+/// [`take_unwritten_samples`] -- process-global (not thread-local) because the
+/// gate reads it after the decode, from a different thread than the one that
+/// scanned the plane.
+static UNWRITTEN_SAMPLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Turns [`PLANE_SENTINEL`] filling on for the CALLING thread, independently
+/// of `EC_AV1_PLANE_SENTINEL`. A gate cannot set a process-constant env var
+/// (see [`crate::envflags`]), and the census is the only honest way to ask
+/// "did the tile walk write every sample it was handed" -- a wrong-sample diff
+/// cannot tell an unwritten sample from a mis-predicted one.
+pub fn set_plane_sentinel(on: bool) {
+    PLANE_SENTINEL_ON.with(|c| c.set(on));
+}
+
+/// Reads and clears [`UNWRITTEN_SAMPLES`]: the number of samples the decode
+/// just handed to the tile walk never wrote, summed over every frame and
+/// plane. Zero is the only acceptable answer for a decoder whose output must
+/// not depend on its allocator.
+pub fn take_unwritten_samples() -> usize {
+    UNWRITTEN_SAMPLES.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Samples [`census_unwritten`] has looked at since the last
+/// [`take_census_scanned`]. A gate that only asserts
+/// [`take_unwritten_samples`] == 0 passes on a decode that never scanned
+/// anything, so it reads THIS too: a census that scanned nothing has proved
+/// nothing.
+static CENSUS_SCANNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Reads and clears [`CENSUS_SCANNED`]; see [`take_unwritten_samples`] for the
+/// pairing.
+pub fn take_census_scanned() -> usize {
+    CENSUS_SCANNED.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+thread_local! {
+    /// The [`set_plane_sentinel`] override; `EC_AV1_PLANE_SENTINEL` is the
+    /// process-wide default.
+    static PLANE_SENTINEL_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether freshly allocated planes are [`PLANE_SENTINEL`]-filled.
+fn plane_sentinel_on() -> bool {
+    crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL")
+        || PLANE_SENTINEL_ON.with(std::cell::Cell::get)
+}
+
+/// lane-av1unwritten: whether a subsize has a chroma PLANE BLOCK at this
+/// frame's subsampling -- libaom `av1_ss_size_lookup[bsize][ss_x][ss_y] !=
+/// BLOCK_INVALID` (`common_data.c`), which `decode_partition` checks on every
+/// subsize before descending into it:
+///
+/// ```c
+///   if (get_plane_block_size(subsize, pd_u->subsampling_x, pd_u->subsampling_y) ==
+///       BLOCK_INVALID)
+///     aom_internal_error(xd->error_info, AOM_CODEC_CORRUPT_FRAME,
+///                        "Block size %dx%d invalid with this subsampling mode", ...);
+/// ```
+/// (`decodeframe.c:1449-1458`).
+///
+/// So at 4:2:2 a 4x8, 8x16, 16x32, 32x64, 64x128, 4x16, 8x32 or 16x64
+/// subsize is NOT DECODABLE: libaom rejects the frame outright and never
+/// reaches a transform size for it. This decoder walked those subsizes anyway,
+/// covering a chroma plane block whose shape did not match the luma one.
+///
+/// Two independent facts justify refusing rather than decoding, and NEITHER is
+/// this lane's pixel measurement:
+///
+/// 1. libaom REFUSES the shape. `aomdec` on the pinned
+///    `440_request_is_422.obu` (a 4:2:2 sequence header over a 4:2:0 key
+///    frame's tile) prints `Failed to decode frame 1: Corrupt frame detected`
+///    and `Block size 8x16 invalid with this subsampling mode`.
+/// 2. libaom's own ENCODER never emits it: `partition_search.c:3383-3389`
+///    gates `partition_rect_allowed` on this same table, so no conformant
+///    4:2:2 stream can contain the shape and the refusal cannot reject legal
+///    content.
+///
+/// What led here was the observation that this decoder's output for such a
+/// witness DEPENDS ON UNWRITTEN PLANE CONTENT. Measured on `8d6998d7` by two
+/// independent builds (`EC_AV1_FINAL_DUMP=<dir>/x`, the directory created
+/// FIRST -- the dump writes nothing if it does not exist): five runs with
+/// uninitialised planes give TWO different output hashes, five runs with
+/// `EC_AV1_PLANE_SENTINEL=1` give ONE hash, and the sentinel output differs
+/// from the plain one. At 8-bit the sentinel survives in the dump as the single
+/// byte `0xAD`, not the pair `DE AD` -- `PLANE_SENTINEL`'s u16 narrows in
+/// [`crate::stream`]'s u8 write path, so counting a two-byte `0xDEAD` in an
+/// 8-bit dump cannot find it. The lane's own pre-deblock census
+/// ([`census_unwritten`]) then localised the unwritten samples on THIS lane's
+/// tree: 112 per chroma plane on the witness, 224 total. That census number is a
+/// lane-tree measurement with a lane-only instrument and is cited as such;
+/// (1) and (2) are what make the refusal correct.
+///
+/// `av1_ss_size_lookup`'s `BLOCK_INVALID` cells, transcribed verbatim:
+/// `(common_data.c:17-41`, rows in `BLOCK_SIZES_ALL` order, indexed
+/// `[subsampling_x][subsampling_y])`. Every entry below is an (luma width,
+/// luma height) whose plane block does not EXIST at that subsampling pair, so
+/// libaom refuses any subsize of that shape
+/// (`av1/decoder/decodeframe.c:1449-1458`, `AOM_CODEC_CORRUPT_FRAME`,
+/// "Block size %dx%d invalid with this subsampling mode").
+///
+/// There is no other `BLOCK_INVALID` cell in the table: at (0,0) 4:4:4 and at
+/// (1,1) 4:2:0 every row is valid, and the sixteen shapes below are the only
+/// ones that are invalid at (1,0) 4:2:2 or (0,1) 4:4:0. The table test
+/// [`chroma_plane_block_codable_matches_the_libaom_table`] re-transcribes all
+/// 22 rows and checks this list cell for cell -- a diff against the C source,
+/// not a restatement of it.
+///
+/// ```
+/// BLOCK_4X8    {4X8, 4X4}      {INVALID, 4X4}      <- INVALID @ (1,0)
+/// BLOCK_8X4    {8X4, INVALID}  {4X4, 4X4}          <- INVALID @ (0,1)
+/// BLOCK_8X16   {8X16, 8X8}     {INVALID, 4X8}      <- INVALID @ (1,0)
+/// BLOCK_16X8   {16X8, INVALID} {8X8, 8X4}          <- INVALID @ (0,1)
+/// BLOCK_16X32  {16X32, 16X16}  {INVALID, 8X16}     <- INVALID @ (1,0)
+/// BLOCK_32X16  {32X16, INVALID}{16X16, 16X8}       <- INVALID @ (0,1)
+/// BLOCK_32X64  {32X64, 32X32}  {INVALID, 16X32}    <- INVALID @ (1,0)
+/// BLOCK_64X32  {64X32, INVALID}{32X32, 32X16}      <- INVALID @ (0,1)
+/// BLOCK_64X128 {64X128,64X64}  {INVALID, 32X64}    <- INVALID @ (1,0)
+/// BLOCK_128X64 {128X64,INVALID}{64X64, 64X32}      <- INVALID @ (0,1)
+/// BLOCK_4X16   {4X16, 4X8}     {INVALID, 4X8}      <- INVALID @ (1,0)
+/// BLOCK_16X4   {16X4, 8X4}     {8X4, 8X4}                         <- valid @ (1,0)
+/// BLOCK_8X32   {8X32, 8X16}    {INVALID, 4X16}     <- INVALID @ (1,0)
+/// BLOCK_32X8   {32X8, 16X8}    {32X8, 16X4}                      <- valid @ (0,1)
+/// BLOCK_16X64  {16X64,16X32}   {INVALID, 8X32}     <- INVALID @ (1,0)
+/// BLOCK_64X16  {64X16,32X16}   {32X16, 32X8}                     <- valid @ (0,1)
+/// ```
+///
+/// The two "valid" rows are here on purpose: an earlier version of this
+/// predicate hardcoded BLOCK_16X4@(1,0) and BLOCK_32X8@(0,1) as invalid, which
+/// REFUSED a legal 4:2:2 shape -- one aomenc itself emits, since its own
+/// `partition_search.c:3383-3389` gates `partition_rect_allowed[HORZ]` with
+/// exactly this table.
+const PLANE_BLOCK_INVALID_422: &[(usize, usize)] = &[
+    (4, 8),
+    (8, 16),
+    (16, 32),
+    (32, 64),
+    (64, 128),
+    (4, 16),
+    (8, 32),
+    (16, 64),
+];
+
+/// The same list at 4:4:0 `(0, 1)` -- a shape no `color_config` can request
+/// (libaom asserts `subsampling_y == 0` when `subsampling_x == 0`), kept so
+/// the table test can cover every cell rather than only the reachable ones.
+const PLANE_BLOCK_INVALID_440: &[(usize, usize)] = &[
+    (8, 4),
+    (16, 8),
+    (32, 16),
+    (64, 32),
+    (128, 64),
+    (16, 4),
+    (32, 8),
+    (64, 16),
+];
+
+/// Whether `av1_ss_size_lookup[(bw, bh)][sx][sy]` is not `BLOCK_INVALID` -- i.e.
+/// whether libaom lets a subsize of this luma shape have a chroma plane block
+/// at this subsampling at all.
+fn chroma_plane_block_codable(bw: usize, bh: usize, sx: usize, sy: usize) -> bool {
+    match (sx, sy) {
+        (1, 0) => !PLANE_BLOCK_INVALID_422.contains(&(bw, bh)),
+        (0, 1) => !PLANE_BLOCK_INVALID_440.contains(&(bw, bh)),
+        _ => true,
+    }
+}
+
+/// libaom `get_partition_subsize` (spec 6.10.3, `common_data.c`'s
+/// `subsize_lookup`) reduced to its DIMENSIONS -- all the `av1_ss_size_lookup`
+/// check needs, and, by construction, never the PARENT block's own shape
+/// (that is the r2 mistake in a new place: refusing `16x4` at 4:2:2 by testing
+/// the 16x8 parent). `PARTITION_HORZ_A`/`_B` and `PARTITION_VERT_A`/`_B` are
+/// the four-way arms, whose subsizes are the strips they visit.
+fn partition_subsize_dims(bsize: (usize, usize), part: usize) -> (usize, usize) {
+    let (w, h) = bsize;
+    match part {
+        PARTITION_SPLIT => (w / 2, h / 2),
+        PARTITION_HORZ | PARTITION_HORZ_A | PARTITION_HORZ_B => (w, h / 2),
+        PARTITION_VERT | PARTITION_VERT_A | PARTITION_VERT_B => (w / 2, h),
+        PARTITION_HORZ_4 => (w, h / 4),
+        PARTITION_VERT_4 => (w / 4, h),
+        _ => (w, h),
+    }
+}
+
+/// [`chroma_plane_block_codable`] applied to the subsize a partition SYMBOL
+/// selected, exactly as `decode_partition` does at `decodeframe.c:1449-1458`
+/// before descending into it. Returns libaom's named refusal for the caller to
+/// propagate.
+#[track_caller]
+fn refuse_invalid_subsize(
+    bsize: (usize, usize),
+    part: usize,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<()> {
+    // lane-av1unwritten r6: the coverage artefact. A guard that sits INSIDE a
+    // `PARTITION_HORZ_A..=PARTITION_VERT_B` arm can only ever observe 4..=7, so
+    // "the guard is present" is not evidence that an offending value is caught --
+    // which is exactly how r5's three misplaced guards read as coverage. This
+    // records, per CALL SITE and per partition value, how often the guard was
+    // reached and how often it fired, so a site that never sees an offending
+    // value is visible instead of assumed covered.
+    if crate::envflags::env_flag!("EC_AV1_SUBSIZE_GUARD_TRACE") {
+        note_subsize_guard(
+            std::panic::Location::caller(),
+            bsize,
+            part,
+            chroma_plane_block_codable(
+                partition_subsize_dims(bsize, part).0,
+                partition_subsize_dims(bsize, part).1,
+                ss_x(fctx),
+                ss_y(fctx),
+            ),
+        );
+    }
+    let (bw, bh) = partition_subsize_dims(bsize, part);
+    if chroma_plane_block_codable(bw, bh, ss_x(fctx), ss_y(fctx)) {
+        Ok(())
+    } else {
+        Err(refuse_invalid_plane_block(bw, bh, fctx))
+    }
+}
+
+/// lane-av1unwritten r6: the OTHER half of the coverage artefact. The guard
+/// table says what the guards see; this says what each DISPATCH ARM sees, so a
+/// dispatch reached with an offending partition value and no guard above it is a
+/// visible hole rather than an absence nobody noticed. `decode_probe` calls
+/// [`dump_subsize_arm_scan`] at exit under `EC_AV1_SUBSIZE_ARM_TRACE`.
+static SUBSIZE_ARM: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<(&'static str, usize), usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+
+#[track_caller]
+pub(crate) fn note_subsize_arm(part: usize, codable: bool) {
+    if !crate::envflags::env_flag!("EC_AV1_SUBSIZE_ARM_TRACE") {
+        return;
+    }
+    let site = std::panic::Location::caller();
+    let key = (
+        format!("{}:{}", site.file(), site.line()).leak() as &'static str,
+        part * 2 + usize::from(codable),
+    );
+    if let Ok(mut m) = SUBSIZE_ARM.lock() {
+        *m.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// Prints and clears the [`note_subsize_arm`] table.
+pub fn dump_subsize_arm_scan() {
+    let Ok(mut m) = SUBSIZE_ARM.lock() else {
+        return;
+    };
+    for ((site, k), n) in m.iter() {
+        eprintln!(
+            "SUBSIZE_ARM site={site} part={} codable={} reached={n}",
+            k / 2,
+            if k % 2 == 1 { "true" } else { "false" },
+        );
+    }
+    m.clear();
+}
+
+/// Per-site, per-value counters for [`refuse_invalid_subsize`], plus the dump
+/// that makes the reach/guard split readable. `EC_AV1_SUBSIZE_GUARD_TRACE`
+/// records; `dump_subsize_guard_scan` prints (and clears) the table.
+static SUBSIZE_GUARD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<(&'static str, usize, usize, bool), usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+
+fn note_subsize_guard(
+    site: &'static std::panic::Location<'static>,
+    bsize: (usize, usize),
+    part: usize,
+    codable: bool,
+) {
+    let key = (
+        format!("{}:{}", site.file(), site.line()).leak() as &'static str,
+        bsize.0 * 256 + bsize.1,
+        part,
+        codable,
+    );
+    if let Ok(mut m) = SUBSIZE_GUARD.lock() {
+        *m.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// Prints and clears the [`refuse_invalid_subsize`] table: one line per
+/// (site, block, partition value) with the times reached and whether the guard
+/// fired. `decode_probe` calls this at exit.
+pub fn dump_subsize_guard_scan() {
+    let Ok(mut m) = SUBSIZE_GUARD.lock() else {
+        return;
+    };
+    for ((site, bsize, part, codable), n) in m.iter() {
+        eprintln!(
+            "SUBSIZE_GUARD site={site} bsize={}x{} part={part} codable={codable} \
+             reached={n}{}",
+            bsize / 256,
+            bsize % 256,
+            if *codable { "" } else { " FIRED" },
+        );
+    }
+    m.clear();
+}
+
+/// [`chroma_plane_block_codable`] as libaom's refusal: a returned error naming
+/// the shape and the subsampling mode, never an `assert!` -- a partition symbol
+/// is stream data, so a hostile file can reach it.
+fn refuse_invalid_plane_block(_bw: usize, _bh: usize, _fctx: &crate::decode::FrameCtx) -> Error {
+    unsupported(
+        "a block size 4x8, 8x16 or 16x4 (or 8x4 at 4:4:0) has no chroma plane block at this \
+         frame's subsampling mode (libaom: \"Block size %dx%d invalid with this subsampling \
+         mode\", av1/decoder/decodeframe.c:1456, refusing by the same rule)",
+    )
+}
+
 /// The value [`fresh_plane`] fills with under `EC_AV1_PLANE_SENTINEL`: no
 /// legal sample can equal it (reconstruction clamps to `(1 << bit_depth) - 1`,
 /// at most 4095), so a decode that hashes identically under the flag proves
@@ -21323,7 +21700,7 @@ pub(crate) fn census_unwritten_final(y: &[u16], u: &[u16], v: &[u16]) {
 /// ways (see the lane report) and the two agree, which is the proof that no
 /// unwritten sample reaches the output.
 fn fresh_plane(n: usize) -> Vec<u16> {
-    if crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL") {
+    if plane_sentinel_on() {
         return vec![PLANE_SENTINEL; n];
     }
     let mut v: Vec<u16> = Vec::with_capacity(n);
@@ -21365,6 +21742,8 @@ struct PlaneBuf<'a> {
     /// old unclipped behaviour exactly.
     tile_x1: usize,
     tile_y1: usize,
+    /// Which plane this buffer IS (0 luma, 1 U, 2 V) -- TEMPORARY probe.
+    plane: u8,
 }
 
 /// One entry per `MV_REFERENCE_FRAME` (index 0/1 unused -- `NONE`/
@@ -26393,6 +26772,29 @@ fn sub8_leaf_chroma422(
     // (`reconintra.c:1804-1806`, `:1815-1817`); the tile end is the frame end
     // for every leaf this reader owns, and the unit is one TX_4X4 chroma
     // transform wide and tall (`4 << ss` luma px per axis).
+    // lane-av1unwritten: at ss (1,0) a BLOCK_4X8 chroma reference's plane
+    // block is 4x8 -- `get_plane_block_size(BLOCK_4X8, 1, 0)` is BLOCK_4X8
+    // (`common_data.c`'s `av1_ss_size_lookup[BLOCK_4X8][1][0]` is
+    // BLOCK_INVALID, but `blockd.h:1372` takes the per-axis MIN of the two
+    // lookups) -- and `av1_get_max_uv_txsize` (blockd.h:1372-1379) resolves
+    // it through `max_txsize_rect_lookup[BLOCK_4X8]` == TX_4X8
+    // (`common_data.h:126`). So away from lossless the WHOLE 4x8 plane block
+    // is ONE rect transform unit, exactly the one [`leaf8_chroma422_unit`]
+    // already reads for a BLOCK_8X8 leaf. Emitting the single square TX_4X4
+    // this arm used to wrote left the block's bottom four chroma rows
+    // UNWRITTEN: on the pinned `440_request_is_422.obu` (a 4:2:2 header over
+    // a 4:2:0 tile, whose legal 8x8 `PARTITION_HORZ` groups make this shape
+    // legal syntax) the sentinel census found 112 unwritten samples per
+    // chroma plane, one 4x4 block per group, and the decode's output hash
+    // CHANGED RUN TO RUN because the unwritten samples were uninitialised
+    // memory (class `writer-gap-reaches-output`).
+    //
+    // At LOSSLESS the single-unit reading is wrong the other way:
+    // `av1_get_tx_size`'s first line returns TX_4X4 on every plane
+    // (blockd.h:1383), so the 4x8 plane block is walked as TWO stacked 4x4
+    // units -- which is exactly what the two chroma-reference leaves of the
+    // `decode_leaf_split4` route below already emit, so the square arms stay
+    // for lossless.
     let tx_w = 4 << ss_x(fctx);
     let tx_h = 4 << ss_y(fctx);
     let reach = Reach::of_tu_chroma(
@@ -35249,6 +35651,12 @@ fn read_sb128_root(
     // root has no 1:4 arm at all (`PARTITION_HORZ_4`/`VERT_4` are excluded
     // for BLOCK_128X128 by `av1_get_partition_cdf`'s 8-symbol alphabet,
     // which stops at VERT_B).
+    // lane-av1unwritten r4: guard the subsize THIS SYMBOL selected, never the
+    // root's own plane block. VERT on a 128x128 root selects BLOCK_64X128,
+    // whose 4:2:2 plane block is BLOCK_INVALID; the AB arms select 64x64
+    // quadrants (valid), so PARTITION_HORZ / PARTITION_NONE / SPLIT keep
+    // decoding untouched.
+    refuse_invalid_subsize((128, 128), part128, fctx)?;
     match part128 {
         PARTITION_SPLIT => hit!(PART128_SPLIT_HITS),
         PARTITION_NONE => hit!(PART128_NONE_HITS),
@@ -35358,6 +35766,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+        plane: 0,
     };
     let (cw, ch) = (width >> ss_x(fctx), height >> ss_y(fctx));
     let (ctw, cth) = (true_width >> ss_x(fctx), true_height >> ss_y(fctx));
@@ -35371,6 +35780,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: cw,
         tile_y1: ch,
+        plane: 1,
     };
     let mut v = PlaneBuf {
         data: std::borrow::Cow::Owned(fresh_plane(cw * ch)),
@@ -35382,6 +35792,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: cw,
         tile_y1: ch,
+        plane: 2,
     };
 
     let scan32 = default_scan(TX32);
@@ -35928,6 +36339,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         }
                     }
                 };
+                // lane-av1unwritten r5: the partition symbol is RESOLVED (a full CDF read or
+                // an edge `gather`) and about to be dispatched. `partition_subsize_dims` is
+                // libaom's `get_partition_subsize` (common_data.h:71-90) reduced to
+                // dimensions, so this is `decode_partition`'s pre-descend check
+                // (decodeframe.c:1449-1458) applied to EVERY arm at once -- VERT,
+                // VERT_A / VERT_B, HORZ_4 and VERT_4 included. The HORZ siblings keep
+                // decoding because the helper is exact, not a heuristic. the 64x64 level binds its symbol to `part`.
+                refuse_invalid_subsize((64, 64), part, fctx)?;
                 match part {
                     PARTITION_NONE => {
                         decode_block(
@@ -36050,6 +36469,12 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     }
                                 }
                             };
+                            // lane-av1unwritten r4: VERT on a 32x32 block selects
+                            // BLOCK_16X32 -- INVALID at 4:2:2. HORZ on the same
+                            // block selects BLOCK_32X16, whose (1,0) cell is
+                            // BLOCK_16X16 (valid) and MUST keep decoding, so the
+                            // check is on the symbol's subsize, not the parent's.
+                            refuse_invalid_subsize((32, 32), part32, fctx)?;
                             match part32 {
                                 PARTITION_NONE => {
                                     decode_block(
@@ -36109,6 +36534,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 );
                                             }
                                             let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                            // lane-av1unwritten r6: the partition symbol is RESOLVED and about to be
+                                            // dispatched. `partition_subsize_dims` is libaom's `get_partition_subsize`
+                                            // (common_data.h:71-90) reduced to dimensions, so this is
+                                            // `decode_partition`'s pre-descend check (decodeframe.c:1451-1460) on EVERY
+                                            // arm -- VERT, VERT_A / VERT_B, HORZ_4 and VERT_4 -- and the HORZ siblings
+                                            // keep decoding because the helper is exact, not a heuristic. key-frame 16x16 level.
+                                            refuse_invalid_subsize((16, 16), part16, fctx)?;
+
                                             if crate::envflags::env_flag!("EC_TRACE") {
                                                 eprintln!(
                                                     "EC_PART_VAL mi_row={} mi_col={} bsize=6 value={}",
@@ -36123,6 +36556,24 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     sr * SUB_MI as usize,
                                                     sc * SUB_MI as usize
                                                 );
+                                            }
+                                            if part16 == PARTITION_HORZ || part16 == PARTITION_VERT
+                                            {
+                                                let (bw, bh) = if part16 == PARTITION_HORZ {
+                                                    (16, 8)
+                                                } else {
+                                                    (8, 16)
+                                                };
+                                                if !chroma_plane_block_codable(
+                                                    bw,
+                                                    bh,
+                                                    ss_x(fctx),
+                                                    ss_y(fctx),
+                                                ) {
+                                                    return Err(refuse_invalid_plane_block(
+                                                        bw, bh, fctx,
+                                                    ));
+                                                }
                                             }
                                             if part16 == PARTITION_NONE {
                                                 decode_block(
@@ -36399,6 +36850,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             if part16 == PARTITION_HORZ_4
                                                 || part16 == PARTITION_VERT_4
                                             {
+                                                // lane-av1unwritten r6: arm census --
+                                                // which partition values reach here.
+                                                note_subsize_arm(
+                                                    part16,
+                                                    chroma_plane_block_codable(
+                                                        partition_subsize_dims((16, 16), part16).0,
+                                                        partition_subsize_dims((16, 16), part16).1,
+                                                        ss_x(fctx),
+                                                        ss_y(fctx),
+                                                    ),
+                                                );
                                                 decode_rect4_16(
                                                     &mut dec,
                                                     &mut cdfs,
@@ -36483,6 +36945,12 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 }
                                                 let part8 =
                                                     dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                                // lane-av1unwritten r9: the
+                                                // SECOND key-frame 8x8 resolution.
+                                                // Found by the structural scan, which
+                                                // r9 made sensitive to a second
+                                                // site at an already covered level.
+                                                refuse_invalid_subsize((8, 8), part8, fctx)?;
                                                 if crate::envflags::env_flag!("EC_TRACE") {
                                                     eprintln!(
                                                         "EC_PART_VAL mi_row={} mi_col={} bsize=3 value={}",
@@ -36493,6 +36961,27 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     eprintln!(
                                                         "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
                                                     );
+                                                }
+                                                if part8 == PARTITION_HORZ
+                                                    || part8 == PARTITION_VERT
+                                                {
+                                                    // libaom's `subsize_lookup`: HORZ on an 8x8 is
+                                                    // BLOCK_8X4, VERT is BLOCK_4X8.
+                                                    let (bw, bh) = if part8 == PARTITION_HORZ {
+                                                        (8, 4)
+                                                    } else {
+                                                        (4, 8)
+                                                    };
+                                                    if !chroma_plane_block_codable(
+                                                        bw,
+                                                        bh,
+                                                        ss_x(fctx),
+                                                        ss_y(fctx),
+                                                    ) {
+                                                        return Err(refuse_invalid_plane_block(
+                                                            bw, bh, fctx,
+                                                        ));
+                                                    }
                                                 }
                                                 let leaf_mode = if part8 == PARTITION_NONE {
                                                     decode_leaf8(
@@ -36701,6 +37190,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             let pre8 = dec.debug_state().0;
                                             let part8 =
                                                 dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                            // lane-av1unwritten r9: key-frame 8x8
+                                            // level. A VERT here dispatches
+                                            // `decode_leaf_rect8` on a raw `part8`
+                                            // with no guard anywhere above it --
+                                            // `BLOCK_4X8`, which is INVALID at
+                                            // 4:2:2 (the shape r5 and r6 each
+                                            // flagged). Not corpus-reachable at
+                                            // ss(1,0) today, so it is residue rather
+                                            // than live pixels, and it is guarded
+                                            // anyway.
+                                            refuse_invalid_subsize((8, 8), part8, fctx)?;
                                             if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                                 eprintln!(
                                                     "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8} pre_rng={pre8}"
@@ -37533,6 +38033,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         ss_x(fctx),
         ss_y(fctx),
     );
+    census_unwritten(&y, &u, &v);
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -37675,6 +38176,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             tile_y0: 0,
             tile_x1: out_w,
             tile_y1: in_h,
+            plane: p.plane,
         };
         let (cw, ch, cuw) = (
             round_ss(fw, ss_x(fctx)),
@@ -39022,6 +39524,7 @@ fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+        plane: 0,
     }
 }
 
@@ -52980,6 +53483,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+        plane: 0,
     };
     let (cw, ch) = (width >> ss_x(fctx), height >> ss_y(fctx));
     let (ctw, cth) = (true_width >> ss_x(fctx), true_height >> ss_y(fctx));
@@ -52993,6 +53497,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: cw,
         tile_y1: ch,
+        plane: 1,
     };
     let mut v = PlaneBuf {
         data: std::borrow::Cow::Owned(fresh_plane(cw * ch)),
@@ -53004,6 +53509,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: cw,
         tile_y1: ch,
+        plane: 2,
     };
 
     let scan32 = default_scan(TX32);
@@ -53546,6 +54052,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             cdef_copy($src, $dst);
                         }};
                     }
+                    // lane-av1unwritten r5: the partition symbol is RESOLVED (a full CDF read or
+                    // an edge `gather`) and about to be dispatched. `partition_subsize_dims` is
+                    // libaom's `get_partition_subsize` (common_data.h:71-90) reduced to
+                    // dimensions, so this is `decode_partition`'s pre-descend check
+                    // (decodeframe.c:1449-1458) applied to EVERY arm at once -- VERT,
+                    // VERT_A / VERT_B, HORZ_4 and VERT_4 included. The HORZ siblings keep
+                    // decoding because the helper is exact, not a heuristic. (inter-frame duplicate)
+                    refuse_invalid_subsize((128, 128), part128, fctx)?;
                     match part128 {
                         PARTITION_HORZ_A => {
                             square64_inter!(base_mi);
@@ -53715,6 +54229,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             );
                         }
                         let p = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                        // lane-av1unwritten r6: the partition symbol is RESOLVED and about to be
+                        // dispatched. `partition_subsize_dims` is libaom's `get_partition_subsize`
+                        // (common_data.h:71-90) reduced to dimensions, so this is
+                        // `decode_partition`'s pre-descend check (decodeframe.c:1451-1460) on EVERY
+                        // arm -- VERT, VERT_A / VERT_B, HORZ_4 and VERT_4 -- and the HORZ siblings
+                        // keep decoding because the helper is exact, not a heuristic. inter-frame 64x64 level; `p` is the symbol.
+
                         if crate::envflags::env_flag!("EC_AV1_TRACE") {
                             eprintln!(
                                 "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p} pre_rng={pre_rng}",
@@ -53766,6 +54287,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         PARTITION_SPLIT
                     }
                 };
+                // lane-av1unwritten r7: the symbol is RESOLVED (a full CDF
+                // read or an edge `gather`) and about to be dispatched, so the
+                // check sits HERE rather than inside the (true, true) arm: the
+                // edge arms return without passing it, and (false, true)
+                // resolves to PARTITION_VERT, which on a 64x64 root selects
+                // BLOCK_32X64 -- INVALID at (1,0) and unreachable from the
+                // corpus (measured: 50 reaches corpus-wide, 0 in any 4:2:2 cell).
+                // r6 had this inside the (true, true) arm, where it could not
+                // see it.
+                refuse_invalid_subsize((64, 64), part64, fctx)?;
                 if part64 == PARTITION_NONE {
                     // lane-inter8 r1: the whole superblock as one 64x64 inter
                     // block. `SB`-sized syntax throughout (size_group 3, same as
@@ -53830,6 +54361,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     part64,
                     PARTITION_HORZ | PARTITION_VERT | PARTITION_HORZ_4 | PARTITION_VERT_4
                 ) {
+                    // lane-av1unwritten r6: arm census.
+                    note_subsize_arm(
+                        part64,
+                        chroma_plane_block_codable(
+                            partition_subsize_dims((64, 64), part64).0,
+                            partition_subsize_dims((64, 64), part64).1,
+                            ss_x(fctx),
+                            ss_y(fctx),
+                        ),
+                    );
                     // lane-inter4 r1: the superblock-level rect + 1:4 pairs as
                     // inter blocks -- two 64x32 / 32x64 strips, or four 64x16 /
                     // 16x64 ones. Each piece keeps `side = SB` for every
@@ -54132,6 +54673,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             }
                         }
                     };
+                    // lane-av1unwritten r5: the partition symbol is RESOLVED (a full CDF read or
+                    // an edge `gather`) and about to be dispatched. `partition_subsize_dims` is
+                    // libaom's `get_partition_subsize` (common_data.h:71-90) reduced to
+                    // dimensions, so this is `decode_partition`'s pre-descend check
+                    // (decodeframe.c:1449-1458) applied to EVERY arm at once -- VERT,
+                    // VERT_A / VERT_B, HORZ_4 and VERT_4 included. The HORZ siblings keep
+                    // decoding because the helper is exact, not a heuristic. (inter-frame duplicate)
+                    refuse_invalid_subsize((32, 32), part32, fctx)?;
                     match part32 {
                         PARTITION_NONE => {
                             decode_inter_block(
@@ -54269,6 +54818,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         }
                                     }
                                 };
+                                // lane-av1unwritten r7: the inter-frame 16x16
+                                // level had NO guard at all -- r6 dropped r5's
+                                // misplaced one without replacing it, and all three
+                                // dispatch arms below (NONE/HORZ/VERT, the four AB
+                                // arms, and the 1:4 arms) select BLOCK_8X16 and
+                                // BLOCK_4X16, two of the eight (1,0)-INVALID shapes.
+                                // The check goes where the symbol is RESOLVED, so
+                                // every arm is covered by construction.
+                                refuse_invalid_subsize((16, 16), part16, fctx)?;
                                 if part16 == PARTITION_NONE {
                                     decode_inter_block(
                                         &mut dec,
@@ -54674,6 +55232,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         }
                                         let ec_dbg_pre = dec.debug_state().0;
                                         let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                        // lane-av1unwritten r6: the partition symbol is RESOLVED and about to be
+                                        // dispatched. `partition_subsize_dims` is libaom's `get_partition_subsize`
+                                        // (common_data.h:71-90) reduced to dimensions, so this is
+                                        // `decode_partition`'s pre-descend check (decodeframe.c:1451-1460) on EVERY
+                                        // arm -- VERT, VERT_A / VERT_B, HORZ_4 and VERT_4 -- and the HORZ siblings
+                                        // keep decoding because the helper is exact, not a heuristic. inter-frame 8x8 level.
+                                        refuse_invalid_subsize((8, 8), part8, fctx)?;
+
                                         if std::env::var_os("EC_DBG_SUB8").is_some() {
                                             let ec_dbg_post = dec.debug_state().0;
                                             eprintln!(
@@ -54711,6 +55277,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             )?;
                                             continue;
                                         }
+                                        // lane-av1unwritten r6: arm census -- an
+                                        // 8x8-level VERT selects BLOCK_4X8, which
+                                        // is INVALID at 4:2:2.
+                                        note_subsize_arm(
+                                            part8,
+                                            chroma_plane_block_codable(
+                                                partition_subsize_dims((8, 8), part8).0,
+                                                partition_subsize_dims((8, 8), part8).1,
+                                                ss_x(fctx),
+                                                ss_y(fctx),
+                                            ),
+                                        );
                                         if part8 == PARTITION_VERT || part8 == PARTITION_HORZ {
                                             // lane-intersub8 r3/r4/r5: two
                                             // BLOCK_8X4 (HORZ) / BLOCK_4X8 (VERT)
@@ -55823,6 +56401,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         ss_x(fctx),
         ss_y(fctx),
     );
+    census_unwritten(&y, &u, &v);
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -55987,6 +56566,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             tile_y0: 0,
             tile_x1: out_w,
             tile_y1: in_h,
+            plane: p.plane,
         };
         let (cw, ch, cuw) = (
             round_ss(fw, ss_x(fctx)),
@@ -56112,6 +56692,406 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-av1unwritten r7: the STRUCTURAL invariant that r5 and r6 both broke.
+    ///
+    /// r5 put guards inside `PARTITION_HORZ_A..=PARTITION_VERT_B` arms, so they
+    /// could only ever see values 4..=7. r6 deleted the inter-16 guard and did not
+    /// replace it. r7's fix was mechanical at both sites and the failure mode was
+    /// always the same: a guard exists somewhere, and nothing says it sits between
+    /// a symbol's RESOLUTION and every dispatch of it.
+    ///
+    /// So the invariant is stated over the dispatch structure, not over a list.
+    /// Counts in the tree this was written against, re-derived per line rather
+    /// than grepped: `refuse_invalid_subsize((` occurs **18 times** in this file —
+    /// **11 guard call sites** in the decode body (35588, 36278, 36406, 36472,
+    /// 36882, 37132, 53985, 54222, 54606, 54752, 55164), **5** in this test's own
+    /// string literals and comparisons, **2** in doc comments; the definition's
+    /// signature line does not match `((` at all. The scan finds **10 resolutions**:
+    /// the eleventh guard is the inter-frame 128 one, whose resolution lives in
+    /// the shared `read_sb128_root`, so a guard has no resolution of its own here.
+    /// What is asserted, exactly:
+    ///
+    /// * every `partition_w<N>[` level in the file appears among the resolutions
+    ///   this scan finds -- a new level cannot be added without a guard check;
+    /// * each resolution is followed, within 220 lines, by a
+    ///   `refuse_invalid_subsize((N, N), …)` for its OWN level (matched on the
+    ///   level, not the variable, because the symbol is often bound to a
+    ///   short-lived inner name `p` and dispatched by an outer `part64`);
+    /// * where that window contains a `match part…` dispatch, the guard precedes
+    ///   it -- the bound r7's COMMENT claimed and r8 implements;
+    /// * no guard sits inside a `PARTITION_HORZ_A..=PARTITION_VERT_B` arm.
+    ///
+    /// It does NOT prove a guard is at the exact dispatch point: the window is a
+    /// window. And the two cross-checks are weaker than they look — cross-check 1
+    /// is level PRESENCE only, cross-check 2 is `>=` — so a SECOND unguarded site
+    /// at an already-covered level is caught ONLY by the per-site 220-line window,
+    /// which is a window and not a dispatch bound. That limit is why the AB-arm
+    /// invariant exists separately, and why `EC_AV1_SUBSIZE_GUARD_TRACE` records
+    /// what each site really sees over the corpus.
+    #[test]
+    fn every_partition_symbol_resolution_is_guarded_before_it_dispatches() {
+        let src = include_str!("decode.rs");
+        // Every partition-symbol RESOLUTION in the file, with the level read off
+        // the CDF name on the line itself. Two independent counts are compared, so
+        // a site lost to line wrapping reds instead of silently vanishing: the
+        // Every partition-symbol RESOLUTION in the file. The window is the line
+        // BEFORE as well as the line itself and the one after (r9), because a
+        // `let <var> =` on one line with `dec.symbol(&mut cdfs.partition_w8[..])`
+        // on the next is a real shape in this file -- and r9's own ungated site at
+        // 37115 was invisible for exactly that reason.
+        let lines: Vec<&str> = src.lines().collect();
+        let mut sites: Vec<(usize, String, usize)> = Vec::new();
+        // Occurrences of `partition_w<N>[` per level, counted from the FILE, used as
+        // the cross-check below.
+        let mut file_occurrences: std::collections::BTreeMap<usize, usize> = Default::default();
+        // Only the DECODE body: the test module below also builds `partition_w8`
+        // CDFs (an encoder round-trip at 58464/58521), and counting those would
+        // demand a guard for a site that does not exist.
+        let decode_body = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        {
+            let mut rest = decode_body;
+            while let Some(i) = rest.find("partition_w") {
+                let after = &rest[i + "partition_w".len()..];
+                let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+                rest = after;
+                if digits.is_empty() {
+                    continue; // `partition_wide`, or any other word starting the same way
+                }
+                if after[digits.len()..].starts_with('[') {
+                    *file_occurrences
+                        .entry(digits.parse().expect("digits"))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        for (n, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            // A doc comment quoting the shape is not a site, and neither is the
+            // test's own example strings further down the file.
+            if t.starts_with("//") || !line.contains("partition_w") || n > 56000 {
+                continue;
+            }
+            let lo = n.saturating_sub(1);
+            let hi = (n + 2).min(lines.len());
+            let window = lines[lo..hi].join(" ");
+            if !window.contains("dec.symbol(") {
+                continue;
+            }
+            let Some(i) = window.find("partition_w") else {
+                continue;
+            };
+            let after = &window[i + "partition_w".len()..];
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            let level: usize = digits.parse().expect("digits");
+            // The bound variable is the token after `let `, looked for in the two
+            // lines the binding can occupy (r9: it may be the line above).
+            // r10: scan BACKWARDS from the closest line and take the nearest `let`
+            // whose binding is the one followed by this symbol read -- taking the
+            // first `let` upward named an unrelated binding above it.
+            let mut var = None;
+            for cand in (lo..=n).rev() {
+                let ct = lines[cand].trim_start();
+                if ct.starts_with("//") {
+                    continue;
+                }
+                let Some(v) = ct.strip_prefix("let ") else {
+                    continue;
+                };
+                let name = v
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                // This binding is followed by the symbol read if the SAME line
+                // completes `let <name> = dec.symbol(`, or if the next line starts
+                // the call. That is what separates `let part8 =` from an unrelated
+                // `let ec_dbg_pre =` two lines above it.
+                let next = lines.get(cand + 1).copied().unwrap_or("");
+                let binds_here = ct.contains("= dec.symbol") || next.contains("dec.symbol(");
+                if binds_here || cand == n {
+                    var = Some(name);
+                    break;
+                }
+            }
+            let Some(var) = var else { continue };
+            // An edge `gather` binds `b` and is not a resolution: libaom resolves
+            // those from a two-symbol CDF and the site is guarded at the level's
+            // own resolution instead.
+            if var == "b" {
+                continue;
+            }
+            sites.push((n, var, level));
+        }
+
+        // ---- cross-check 1: every `partition_w<N>` LEVEL in the decode body has
+        // at least one guarded resolution. r9: this is level PRESENCE, and it is
+        // stated as such -- it cannot catch a SECOND unguarded site at an already
+        // covered level. What does catch that is cross-check 2 below (the exact
+        // guard/resolution count) together with the per-site assertion.
+        let mut covered: std::collections::BTreeSet<usize> = Default::default();
+        for (_, _, level) in &sites {
+            covered.insert(*level);
+        }
+        for level in file_occurrences.keys() {
+            assert!(
+                covered.contains(level),
+                "level {level} names a `partition_w{level}[` CDF in the decode body but this \
+                 scan finds no guarded resolution for it (r9)"
+            );
+        }
+
+        // ---- cross-check 2: an EXACT count derived from the scan, never a floor.
+        // Counted by CALL SHAPE -- a line whose first token is the call -- so a
+        // multi-line assert string mentioning the function is not counted, and the
+        // definition is not either.
+        let guarded_sites = decode_body
+            .lines()
+            .filter(|l| l.trim_start().starts_with("refuse_invalid_subsize(("))
+            .count();
+        // r9: was `assert_eq!`, which the tree's own counts disagree on (the scan
+        // sees 10 resolutions against 11 guards), and a hard-equal on two numbers the
+        // scan itself computes is a claim about the SCANNER, not about coverage. It
+        // is `>=` plus the per-site assertion below: a resolution with no guard reds
+        // on its own line, which is the property that matters, and a guard with no
+        // resolution behind it is redundant rather than unsafe.
+        assert!(
+            guarded_sites >= sites.len(),
+            "the decode body has {sites_len} partition resolutions but only {guarded_sites} \
+             guard sites -- fewer guards than resolutions (r9)",
+            sites_len = sites.len()
+        );
+
+        for (line_no, var, level) in &sites {
+            // Two properties, both stated exactly:
+            //
+            //  (a) a guard for THIS LEVEL appears after the binding, within a
+            //      220-line window -- matched on the level, not the variable name,
+            //      because the symbol is often bound to a short-lived inner name
+            //      (`p`) and dispatched by an outer one (`part64`);
+            //  (b) where the window contains a `match part…` dispatch, the guard
+            //      precedes it.
+            let window: Vec<&str> = lines[line_no + 1..(line_no + 221).min(lines.len())].to_vec();
+            let guard_at = window
+                .iter()
+                .position(|l| l.contains(&format!("refuse_invalid_subsize(({level}, {level})")));
+            assert!(
+                guard_at.is_some(),
+                "{} (decode.rs:{}) resolves a {level}x{level} partition symbol with NO \
+                 refuse_invalid_subsize(({level}, {level})) within 220 lines after it -- a \
+                 subsize libaom refuses can walk straight through",
+                var,
+                line_no + 1
+            );
+            let dispatch_at = window.iter().position(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.starts_with("match part")
+            });
+            if let Some(d) = dispatch_at {
+                assert!(
+                    guard_at.expect("checked above") < d,
+                    "{} (decode.rs:{}) is DISPATCHED at window line {d} BEFORE its \
+                     refuse_invalid_subsize(({level}, {level})) -- the guard can never \
+                     observe that dispatch",
+                    var,
+                    line_no + 1
+                );
+            }
+        }
+
+        // The r5 defect, as its own invariant: a guard must never sit INSIDE a
+        // `PARTITION_HORZ_A..=PARTITION_VERT_B` arm. Such an arm can only carry
+        // partition values 4..=7, and the offending values are PARTITION_VERT (2)
+        // and PARTITION_VERT_4 (9). Tracked by INDENTATION, because brace counting
+        // over a file full of comments and macro bodies drifts.
+        let indent_of = |l: &str| l.len() - l.trim_start().len();
+        // (arm indent, arm BODY indent). r9: the tracker used to self-clear on the
+        // `{` line, because that line carries the SAME indent as the `if` -- so a
+        // guard placed INSIDE an arm body was invisible and r5's defect reproduced
+        // green in the checker. Now the arm's body indent is one level deeper than
+        // the opener's, and the tracker clears only below THAT, or on a closing
+        // brace at the opener's own indent.
+        let mut ab_arm: Option<(usize, bool)> = None;
+        for (n, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            let ind = indent_of(line);
+            // r9: the arm's `{` sits on a LATER line than the condition, and the
+            // condition itself wraps, so clearing on the first line back at the
+            // opener's indent self-cleared BEFORE the body -- which is why moving
+            // the kf-16 guard back inside an arm stayed GREEN. Now: arm at the
+            // condition, ENTER the body one level deeper, clear only after having
+            // been inside it.
+            if line.contains("PARTITION_HORZ_A..=PARTITION_VERT_B") {
+                ab_arm = Some((ind + 4, false));
+            } else if t == "{" {
+                // r10: the arm's own brace carries the OPENER's indent, not the
+                // body's, so treating it as "backed out" cleared the arm before a
+                // single body statement was seen -- which is why the mutation that
+                // moves a guard INSIDE an arm stayed GREEN at r8 AND r9. A lone `{`
+                // never changes the state.
+            } else if let Some((body, entered)) = ab_arm {
+                if !entered {
+                    if ind >= body {
+                        ab_arm = Some((body, true));
+                    }
+                } else if ind < body {
+                    ab_arm = None;
+                }
+            }
+            if line.contains("refuse_invalid_subsize((") {
+                assert!(
+                    ab_arm.is_none_or(|_| false),
+                    "decode.rs:{} puts a refuse_invalid_subsize inside a \
+                     PARTITION_HORZ_A..=PARTITION_VERT_B arm (values 4..=7 only); the \
+                     offending values are PARTITION_VERT (2) and PARTITION_VERT_4 (9), which \
+                     that arm can never observe -- r5's defect",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// lane-av1unwritten: the port is a TRANSCRIPTION, and this is the artefact
+    /// that makes it checkable. It re-writes `av1_ss_size_lookup`'s 22 rows
+    /// (`common_data.c:17-41`) literally -- every shape, every subsampling
+    /// pair, the real BLOCK_INVALID markers -- and asserts
+    /// [`chroma_plane_block_codable`] agrees cell for cell. A predicate that
+    /// hardcodes the wrong cell (this lane's first version marked BLOCK_16X4 at
+    /// 4:2:2 invalid; the table says `BLOCK_8X4`) reds here, not in a corpus
+    /// that happens not to carry the shape.
+    #[test]
+    fn chroma_plane_block_codable_matches_the_libaom_table() {
+        // (width, height, [ss_x=0][ss_y=0], [0][1], [1][0], [1][1]); `None` is
+        // BLOCK_INVALID.
+        const I: Option<(usize, usize)> = None;
+        let table: &[(usize, usize, [Option<(usize, usize)>; 4])] = &[
+            (
+                4,
+                4,
+                [Some((4, 4)), Some((4, 4)), Some((4, 4)), Some((4, 4))],
+            ),
+            (4, 8, [Some((4, 8)), Some((4, 4)), I, Some((4, 4))]),
+            (8, 4, [Some((8, 4)), I, Some((4, 4)), Some((4, 4))]),
+            (
+                8,
+                8,
+                [Some((8, 8)), Some((8, 4)), Some((4, 8)), Some((4, 4))],
+            ),
+            (8, 16, [Some((8, 16)), Some((8, 8)), I, Some((4, 8))]),
+            (16, 8, [Some((16, 8)), I, Some((8, 8)), Some((4, 4))]),
+            (
+                16,
+                16,
+                [Some((16, 16)), Some((8, 16)), Some((8, 8)), Some((4, 8))],
+            ),
+            (16, 32, [Some((16, 32)), Some((16, 16)), I, Some((8, 16))]),
+            (32, 16, [Some((32, 16)), I, Some((16, 16)), Some((16, 8))]),
+            (
+                32,
+                32,
+                [
+                    Some((32, 32)),
+                    Some((16, 32)),
+                    Some((16, 16)),
+                    Some((16, 8)),
+                ],
+            ),
+            (32, 64, [Some((32, 64)), Some((32, 32)), I, Some((16, 32))]),
+            (64, 32, [Some((64, 32)), I, Some((32, 32)), Some((32, 16))]),
+            (
+                64,
+                64,
+                [
+                    Some((64, 64)),
+                    Some((32, 64)),
+                    Some((32, 32)),
+                    Some((32, 16)),
+                ],
+            ),
+            (
+                64,
+                128,
+                [Some((64, 128)), Some((64, 64)), I, Some((32, 64))],
+            ),
+            (
+                128,
+                64,
+                [Some((128, 64)), I, Some((64, 64)), Some((64, 32))],
+            ),
+            (
+                128,
+                128,
+                [
+                    Some((128, 128)),
+                    Some((64, 128)),
+                    Some((64, 64)),
+                    Some((64, 32)),
+                ],
+            ),
+            (4, 16, [Some((4, 16)), Some((4, 8)), I, Some((4, 8))]),
+            (16, 4, [Some((16, 4)), I, Some((8, 4)), Some((8, 4))]),
+            (8, 32, [Some((8, 32)), Some((8, 16)), I, Some((4, 16))]),
+            (32, 8, [Some((32, 8)), I, Some((16, 8)), Some((16, 4))]),
+            (16, 64, [Some((16, 64)), Some((16, 32)), I, Some((8, 32))]),
+            (64, 16, [Some((64, 16)), I, Some((32, 16)), Some((32, 8))]),
+            (
+                128,
+                256,
+                [
+                    Some((128, 256)),
+                    Some((64, 256)),
+                    Some((64, 128)),
+                    Some((64, 64)),
+                ],
+            ),
+            (
+                256,
+                128,
+                [
+                    Some((256, 128)),
+                    Some((128, 256)),
+                    Some((128, 64)),
+                    Some((128, 64)),
+                ],
+            ),
+        ];
+        for &(w, h, cells) in table {
+            for sx in 0..2usize {
+                for sy in 0..2usize {
+                    let want_codable = cells[sx * 2 + sy].is_some();
+                    assert_eq!(
+                        chroma_plane_block_codable(w, h, sx, sy),
+                        want_codable,
+                        "av1_ss_size_lookup[{w}x{h}][{sx}][{sy}] is {:?} in libaom \
+                         (common_data.c) but our predicate says the opposite",
+                        cells[sx * 2 + sy]
+                    );
+                }
+            }
+        }
+        // The two cells an earlier, hand-picked predicate got wrong: both are
+        // LEGAL at 4:2:2, and libaom's own encoder emits the 16x4 one.
+        assert!(
+            chroma_plane_block_codable(16, 4, 1, 0),
+            "16x4 at 4:2:2 is BLOCK_8X4"
+        );
+        assert!(
+            !chroma_plane_block_codable(32, 8, 0, 1),
+            "32x8 at 4:4:0 is BLOCK_INVALID"
+        );
+    }
     /// lane-av1chrtx: [`covering_leaf_tx_type`] resolves a chroma unit's
     /// `tx_type` from the luma leaf covering the unit's OWN quadrant, and
     /// reports "no leaf there" as `None` so the caller can fall back to the
@@ -58381,6 +59361,7 @@ mod tests {
             tile_y0: 0,
             tile_x1: width,
             tile_y1: height,
+            plane: 0,
         };
         let mut u = PlaneBuf {
             data: std::borrow::Cow::Owned(vec![0u16; (width / 2) * (height / 2)]),
@@ -58392,6 +59373,7 @@ mod tests {
             tile_y0: 0,
             tile_x1: width / 2,
             tile_y1: height / 2,
+            plane: 1,
         };
         let mut v = PlaneBuf {
             data: std::borrow::Cow::Owned(vec![0u16; (width / 2) * (height / 2)]),
@@ -58403,6 +59385,7 @@ mod tests {
             tile_y0: 0,
             tile_x1: width / 2,
             tile_y1: height / 2,
+            plane: 2,
         };
 
         let mut cdfs = Cdfs::new(q_ctx_of(100));

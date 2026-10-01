@@ -29,6 +29,11 @@ fn main() {
         }
     };
     let report = || {
+        // lane-av1unwritten r6: the subsize-guard coverage table (per call
+        // site, per partition value, reached vs fired). Env-gated
+        // (`EC_AV1_SUBSIZE_GUARD_TRACE`), so it is empty unless asked for.
+        ec_av1::decode::dump_subsize_guard_scan();
+        ec_av1::decode::dump_subsize_arm_scan();
         // The census below reads ec-av1's gate counters; without the crate's
         // `gate-counters` feature every one of them is compiled out and reads 0.
         if !cfg!(feature = "gate-counters") {
