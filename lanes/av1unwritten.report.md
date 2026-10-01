@@ -297,9 +297,18 @@ instrument is what would show it if one ever did.
   unnoticed. That direction is covered by
   `chroma_plane_block_codable_matches_the_libaom_table`, not by the sweep.
 * **Sentinel sweep** (127 fixtures, `EC_AV1_PLANE_SENTINEL=1`): pre-fix exactly
-  one fixture had a non-empty census (the witness, 112+112); post-fix the corpus
-  has no unwritten sample anywhere — the witness decodes nothing at all now, and
-  the other 126 are unchanged.
+  one fixture had a non-empty census (the witness, 112+112); post-fix the census
+  is empty on all 127 — the witness decodes nothing at all now, and the other 126
+  are unchanged. **This is NOT a corpus-wide claim that no fixture's output
+  depends on unwritten plane memory.** The census is a PRE-DEBLOCK scan of the
+  three planes, so it cannot see a dependence produced at a later stage or in a
+  region it does not cover. Measured on `8d6998d7` with a provenance-verified
+  probe (Main, after r5), a sentinel-vs-plain output diff finds at least two
+  further fixtures whose output DOES depend on unwritten content —
+  `hg_rect64_intra16x4_witness.obu` (34 frames) and `hg_arf_witness.obu` (40
+  frames) — both of which this census calls clean. One of the two instruments has
+  a blind spot; `Kerem-9` owns finding which (`lane/unwritten-dep`). Every number
+  above is this lane's own tree and instrument.
 * **Scoped tests.** `cargo test -p ec-av1 --features gate-counters --lib -- 422
   440 chroma422` → 15 passed (including six real-4:2:2 byte-exact gates:
   `a_real_422_key_frame_and_inter_sequence_decode_pixel_exact`,
@@ -360,3 +369,21 @@ control at the witness reds the third.
   stream and `aomdec` says so.
 * `film_grain.rs`, the reserved 4:2:0 group-tail chroma SKIP arm and
   `decode_rect4_16_intrabc` untouched — the cause is not in them.
+
+---
+
+## 7. Traps this lane paid for
+
+* **`EC_AV1_FINAL_DUMP` writes NOTHING when the prefix's directory does not
+  exist** — silence, not an error, so a run that "produced no dump" reads as a
+  decode that produced no frame. Create the directory first. This cost a
+  measurement round here and one for Main.
+* **At 8-bit the dump is u8, so `PLANE_SENTINEL = 0xDEAD` survives only as the
+  single byte `0xAD`.** Counting a two-byte `0xDEAD` in an 8-bit dump cannot find
+  it (65 such bytes against a 33 baseline is what a sentinel dump actually
+  carries here). Use a 0xAD count at 8-bit, or a 10-bit fixture where the dump is
+  u16 LE.
+* **A binary's provenance comes from its own embedded source paths**, not from
+  what `cargo build` last reported. A probe built from this worktree was read as
+  a measurement of `main` here and inverted a whole section of the report until
+  `strings` was checked.
