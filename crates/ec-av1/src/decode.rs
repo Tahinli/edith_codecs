@@ -21117,8 +21117,25 @@ pub(crate) fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// lane-tiny r4: raw padded-plane dump for filter-stage bisection, written
 /// only when `var` names a path. Same byte shape as `EC_AV1_PREFILT_DUMP`.
 /// lane-hgkf r2: 16-bit cropped stage dump, the high-bitdepth twin of
-/// [`dump_stage`] (whose `as u8` truncation hides |delta| <= 2 defects) --
-/// matches aomdec's own `ec_dump16` rung byte for byte (crop dims, u16 LE).
+/// [`dump_stage`] (whose `as u8` truncation hides |delta| <= 2 defects).
+/// lane-unwritten-dep: this doc previously said the dump "matches aomdec's own
+/// `ec_dump16` rung byte for byte (crop dims, u16 LE)", which was true only of
+/// the 4:2:0 crop it then used. The crop is now PER-AXIS, which is what the
+/// oracle's rung 1 actually does -- it writes `y_crop_width` x `y_crop_height`,
+/// `uv_crop_width` x `uv_crop_height`, `uv_crop_width` x `uv_crop_height` (the
+/// libaom `YV12_BUFFER_CONFIG` fields, each already per-axis). Byte shape per
+/// subsampling, `fw x fh` luma then both chroma planes, u16 LE, so:
+///
+/// ```text
+/// ss_x ss_y  format   luma        chroma (each)
+///   0    0   4:4:4    fw x fh     fw   x fh      fw*fh*3 samples
+///   1    1   4:2:0    fw x fh     fw/2 x fh/2    fw*fh*3/2 samples
+///   1    0   4:2:2    fw x fh     fw/2 x fh      fw*fh*2 samples
+///   0    1   4:4:0    fw x fh     fw   x fh/2    fw*fh*3/2 samples
+/// ```
+///
+/// (`round_ss` is the rounding the decoder's own plane extents use; at ss = 1 it
+/// is `div_ceil(2)`, so every 4:2:0 dump is byte-for-byte unchanged by this.)
 /// lane-mc64 r1: the decode-order index the stage dumps below key their file
 /// name on. `PREFILT_PICTURE_IDX` is bumped once per frame just BEFORE the
 /// deblock/CDEF stages run, so the frame being dumped here is `idx - 1` --
@@ -21718,23 +21735,65 @@ pub(crate) fn census_unwritten_final(y: &[u16], u: &[u16], v: &[u16]) {
 
 /// A frame plane's own backing store, `n` samples, UNINITIALISED.
 ///
-/// (lane-picalloc) The SB-padded coding surface is written sample-for-sample
-/// by the tile walk's reconstruction before anything reads it, so the
-/// `vec![0u16; n]` this replaces spent ~3% of the frame thread's cycles
-/// zeroing 25 MB (at 4K) that the very next pass overwrites -- serially, at
-/// the frame's head, on the critical path. `EC_AV1_PLANE_SENTINEL=1` swaps the
-/// uninitialised buffer for a [`PLANE_SENTINEL`] fill; the gate hashes both
-/// ways (see the lane report) and the two agree, which is the proof that no
-/// unwritten sample reaches the output.
+/// (lane-picalloc) Replaced a `vec![0u16; n]` that zeroed the whole plane
+/// buffer: ~3% of the frame thread's cycles at 4K, serially at the frame's head,
+/// to initialise 25 MB the next pass overwrites.
+///
+/// # THE `unsafe` BELOW IS NOT FULLY JUSTIFIED -- read this before approving it
+///
+/// This comment previously claimed the SB-padded surface "is written
+/// sample-for-sample by the tile walk's reconstruction before anything reads
+/// it", and cited the sentinel gate as proof. **That claim is RETRACTED by
+/// measurement, in this same file**: on `440_request_is_422` the decode produced
+/// TWO different output hashes across five runs with uninitialised planes, one
+/// hash under `EC_AV1_PLANE_SENTINEL=1`, and a pre-deblock census of 112
+/// unwritten samples per chroma plane (224 total) -- see
+/// `chroma_plane_block_codable`'s "What led here" paragraph and
+/// `lanes/av1unwritten.report.md`. Output that varies with the buffer's initial
+/// content means an uninitialised sample was READ. A reviewer approving this
+/// `unsafe` on the old text was approving it on a withdrawn proof.
+///
+/// WHAT IS ACTUALLY ESTABLISHED, and it is weaker:
+///
+/// * The sentinel gate ([`census_unwritten_final`],
+///   `the_frame_the_caller_receives_carries_no_unwritten_plane_sample`) proves
+///   that no sample the tile walk never wrote SURVIVES into the frame the caller
+///   receives, on the corpus measured. It counts at two points -- pre-deblock and
+///   the output point -- so it measures SURVIVAL, not reads.
+/// * It does NOT prove "every sample is written before it is read". A sample read
+///   as a prediction or filter neighbour and overwritten a moment later is
+///   invisible to both counts. **No such read has been observed, and no
+///   instrument here measures for one.**
+/// * On `main` = `e45cc748` the one path where a read was demonstrated is
+///   UNREACHABLE: lane/av1unwritten refuses the subsize before descending.
+///
+/// Honest status: a read-before-write is DEMONSTRATED on a path that is now
+/// refused, UNMEASURED on every other path, and this `unsafe` is sound only under
+/// the unproven "written before read" premise. Filed as an open UB-class item
+/// (`lanes/unwritten-dep.report.md` §12) with two closures: (a) zero the
+/// allocation -- the safe default, at the ~3% this removed; or (b) an instrument
+/// counting reads-before-write per sample, so the premise can be proved rather
+/// than assumed.
 fn fresh_plane(n: usize) -> Vec<u16> {
     if plane_sentinel_on() {
         return vec![PLANE_SENTINEL; n];
     }
     let mut v: Vec<u16> = Vec::with_capacity(n);
-    // SAFETY: `u16` has no invalid bit patterns and no `Drop`, and the
-    // capacity was just reserved, so the vector owns `n` initialised-or-not
-    // `u16` slots. Every one is written by reconstruction before it is read
-    // (proven by the sentinel gate above).
+    // SAFETY, PARTIAL -- the premise is NOT established; see the block comment
+    // above ("THE `unsafe` BELOW IS NOT FULLY JUSTIFIED").
+    //
+    // What IS sound: `u16` has no invalid bit patterns and no `Drop`, and the
+    // capacity was just reserved, so the vector owns `n` slots that are valid to
+    // OWN. Creating a `Vec` over uninitialised memory is not itself UB.
+    //
+    // What is NOT sound, and is the reason this is a filed item rather than a
+    // settled one: reading an uninitialised `u16` IS UB, and the only thing that
+    // makes the reads sound is the premise that reconstruction writes every
+    // sample before any read. That premise was RETRACTED by measurement (224
+    // unwritten samples, output varying with initial content) on a path that is
+    // now refused, and is UNMEASURED everywhere else. The sentinel gate measures
+    // survival at two points, not reads. So this `unsafe` is sound under a
+    // premise no current instrument proves.
     #[allow(unsafe_code)]
     unsafe {
         v.set_len(n);
