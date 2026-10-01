@@ -2196,8 +2196,10 @@ fn decode_frame(
     // (`scratch_isolate_pinned_mismatch`) only ever compares *shown*
     // frames, so a hidden reference (altref/bwdref) that DPB-corrupts a
     // later shown frame is otherwise invisible; diff this byte-for-byte
-    // against `EC_AV1_POSTFILT_DUMP.fN` from the instrumented aomdec
-    // build to isolate whether the defect is in a hidden frame's own
+    // against `EC_AV1_POSTDEBLOCK_DUMP.fN` from the instrumented aomdec build
+    // (rung 6, `scripts/instrument-aom-oracle.sh`; 1 byte per sample, so it is
+    // byte-comparable only at 8-bit -- for HBD use rung 12 `EC_AV1_FINAL_DUMP`)
+    // to isolate whether the defect is in a hidden frame's own
     // reconstruction or downstream of it.
     if let Ok(path) = std::env::var("EC_AV1_DECODE_ORDER_DUMP") {
         use std::io::Write;
