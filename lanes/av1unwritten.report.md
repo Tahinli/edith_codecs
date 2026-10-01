@@ -124,8 +124,14 @@ ba2957e1709507b8336e53cd908b7dfe2a59dc2064b1f5eb4bea9b3149a4653d
 ```
 
 Two distinct output hashes from one file with uninitialised planes; and with
-`EC_AV1_PLANE_SENTINEL=1` five runs give ONE hash, which differs from the plain
-one (1984 bytes). Reproduced independently on a fresh `8d6998d7` worktree with
+`EC_AV1_PLANE_SENTINEL=1` five runs give ONE hash, and that hash differs from the
+plain one -- both dumps are 8192 bytes, and the sentinel dump carries 65 bytes
+equal to `0xAD` against a 33-byte baseline in the plain dump. (An earlier draft of
+this line said "differs by 1984 bytes"; that byte count does not reproduce, and the
+`0xAD` counts are the correct form. A per-byte diff of the two dumps is not
+stable, because one sentinel sample propagates through the loop filters into its
+neighbours -- which is itself the reason the dependence matters.) Reproduced
+independently on a fresh `8d6998d7` worktree with
 its own target dir (Main: `d35d59cce59cfa2b` / `5b38d5079a6578a8` plain,
 `3a2ae6dbec390f26` sentinel x5).
 
@@ -289,7 +295,7 @@ instrument is what would show it if one ever did.
 * **Corpus, both trees.** Every fixture decoded with `EC_AV1_FINAL_DUMP`, every
   `.f*` hashed. Pre-fix vs post-fix the **126 valid fixtures are byte-identical**
   and **none newly refuses**; the witness is the only difference and it now
-  refuses. Re-run on the r5 predicate: `differing:
+  refuses. Re-run on the r6 predicate (guards relocated): `differing:
   ['440_request_is_422']`, 126 fixtures emitting dumps, and exactly one fixture
   whose output contains `REFUSED` — the witness. **The sweep cannot see the
   (16,4)-at-4:2:2 false positive**: no committed fixture carries a 16x8 block
@@ -352,8 +358,9 @@ under the sentinel); it is reported, not gated, because the gate's job is the
 contract and the contract is the refusal. The determinism is then a consequence
 of the refusal, not a second assertion.
 
-**Mutation.** Deleting the two `chroma_plane_block_codable` call sites puts the
-witness back to `OK: 1 frames decoded` and the gate's `unwrap_or_else` panics
+**Mutation.** Deleting any one `refuse_invalid_subsize` call the witness passes
+through (the 128 root's, the key 64's, ...) puts the witness back to
+`OK: 1 frames decoded` and the gate's `unwrap_or_else` panics
 with "the pin must be REFUSED, not decoded"; replacing the message text so it no
 longer contains libaom's wording reds the second assertion; pointing the positive
 control at the witness reds the third.
@@ -387,3 +394,75 @@ control at the witness reds the third.
   what `cargo build` last reported. A probe built from this worktree was read as
   a measurement of `main` here and inverted a whole section of the report until
   `strings` was checked.
+
+---
+
+## 8. r6 — the guards were not where the values are decided
+
+**r5 claimed complete coverage and did not have it.** The refutation pass
+(Yavuz-5) showed that three of the eight `refuse_invalid_subsize` calls sat
+**inside `PARTITION_HORZ_A..=PARTITION_VERT_B` arms**, so they could only ever
+observe partition values 4..=7 — and the arms that DO see the offending values
+had no guard above them:
+
+| unguarded arm | value | subsize | corpus hits |
+|---|---|---|---|
+| kf 16-level `decode_rect4_16` | `part16 = 9` (VERT_4) | `BLOCK_4X16` | 538 |
+| inter 64-level rect / 1:4 arm | `part64 = 2` (VERT) | `BLOCK_32X64` | 887 |
+| inter 64-level rect / 1:4 arm | `part64 = 9` (VERT_4) | `BLOCK_16X64` | 280 |
+| inter `w8` arm | `part8 = 2` (VERT) | `BLOCK_4X8` | 3476 |
+
+All four are `BLOCK_INVALID` at `av1_ss_size_lookup[..][1][0]` — exactly what
+libaom refuses at `decodeframe.c:1451-1460`.
+
+### 8.1 The fix
+
+Every guard now sits where the partition symbol is **RESOLVED**, before any
+dispatch arm — one guard per level per path, so it can see every value that level
+produces:
+
+| site | level | values seen (corpus scan) |
+|---|---|---|
+| `decode.rs:35584` kf 128 root | 128x128 | 0,1,2,3 |
+| `decode.rs:36274` kf 64 | 64x64 | 0,1,2,3,4,5,6,7,8,9 |
+| `decode.rs:36402` kf 32 | 32x32 | 0,1,2,3,4,5,6,7,8,9 |
+| `decode.rs:36468` kf 16 | 16x16 | 0,1,2,3,4,5,6,7,8,9 — **part=7 FIRED 68x** |
+| `decode.rs:54140` inter 64 | 64x64 | 0,1,2,3,4,5,7,8,9 |
+| `decode.rs:54576` inter 32 | 32x32 | 0,1,2,3,4,5,6,7,8,9 |
+| `decode.rs:55125` inter 8 | 8x8 | 0,1,2,3 |
+
+The only guard that fires over the corpus is the key-frame 16-level one, on
+`PARTITION_VERT_B` (subsize `BLOCK_8X16`, INVALID at 4:2:2) — 68 times, in
+`hg_*`-class streams. Every other corpus stream is 4:2:0 / 4:4:4, where the same
+values are legal, so "passed" is the correct reading and **the sweep is what
+proves the legal siblings still decode**.
+
+### 8.2 The coverage artefact (this is what made the failure visible)
+
+Two env-gated scans, both printed by `decode_probe` and both committed, because
+prose about coverage is not evidence of coverage:
+
+* `EC_AV1_SUBSIZE_GUARD_TRACE=1` — per **guard call site**, per partition value:
+  times reached and whether the guard fired. A site that never sees an offending
+  value is then visible instead of assumed covered. That is exactly the defect
+  r5 shipped: three sites whose reachable value set was 4..=7 only.
+* `EC_AV1_SUBSIZE_ARM_TRACE=1` — per **unguarded dispatch arm**, which partition
+  values actually reach it and whether their subsize is codable at this frame's
+  subsampling.
+
+Both are off by default and cost nothing when unset.
+
+```
+$ for f in crates/ec-av1/fixtures/*.obu; do EC_AV1_SUBSIZE_GUARD_TRACE=1     EC_AV1_SUBSIZE_ARM_TRACE=1     ./target/debug/examples/decode_probe "$f" 2>&1 >/dev/null     | grep -E '^SUBSIZE_(GUARD|ARM)'; done > /tmp/gt.txt
+$ wc -l /tmp/gt.txt
+2346 /tmp/gt.txt
+```
+
+### 8.3 Residue
+
+* **`decode_rect4_16_intrabc` is the declared exception and was NOT audited.** It
+  is another lane's charter. Everything above covers the intra and inter paths
+  this lane owns.
+* No other subsize-selecting dispatch lacks a guard above it: the arm scan finds
+  no dispatch reached with a non-codable subsize and no `refuse_invalid_subsize`
+  call between it and the symbol's resolution.

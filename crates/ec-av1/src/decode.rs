@@ -21485,17 +21485,120 @@ fn partition_subsize_dims(bsize: (usize, usize), part: usize) -> (usize, usize) 
 /// selected, exactly as `decode_partition` does at `decodeframe.c:1449-1458`
 /// before descending into it. Returns libaom's named refusal for the caller to
 /// propagate.
+#[track_caller]
 fn refuse_invalid_subsize(
     bsize: (usize, usize),
     part: usize,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
+    // lane-av1unwritten r6: the coverage artefact. A guard that sits INSIDE a
+    // `PARTITION_HORZ_A..=PARTITION_VERT_B` arm can only ever observe 4..=7, so
+    // "the guard is present" is not evidence that an offending value is caught --
+    // which is exactly how r5's three misplaced guards read as coverage. This
+    // records, per CALL SITE and per partition value, how often the guard was
+    // reached and how often it fired, so a site that never sees an offending
+    // value is visible instead of assumed covered.
+    if crate::envflags::env_flag!("EC_AV1_SUBSIZE_GUARD_TRACE") {
+        note_subsize_guard(
+            std::panic::Location::caller(),
+            bsize,
+            part,
+            chroma_plane_block_codable(
+                partition_subsize_dims(bsize, part).0,
+                partition_subsize_dims(bsize, part).1,
+                ss_x(fctx),
+                ss_y(fctx),
+            ),
+        );
+    }
     let (bw, bh) = partition_subsize_dims(bsize, part);
     if chroma_plane_block_codable(bw, bh, ss_x(fctx), ss_y(fctx)) {
         Ok(())
     } else {
         Err(refuse_invalid_plane_block(bw, bh, fctx))
     }
+}
+
+/// lane-av1unwritten r6: the OTHER half of the coverage artefact. The guard
+/// table says what the guards see; this says what each DISPATCH ARM sees, so a
+/// dispatch reached with an offending partition value and no guard above it is a
+/// visible hole rather than an absence nobody noticed. `decode_probe` calls
+/// [`dump_subsize_arm_scan`] at exit under `EC_AV1_SUBSIZE_ARM_TRACE`.
+static SUBSIZE_ARM: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<(&'static str, usize), usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+
+#[track_caller]
+pub(crate) fn note_subsize_arm(part: usize, codable: bool) {
+    if !crate::envflags::env_flag!("EC_AV1_SUBSIZE_ARM_TRACE") {
+        return;
+    }
+    let site = std::panic::Location::caller();
+    let key = (
+        format!("{}:{}", site.file(), site.line()).leak() as &'static str,
+        part * 2 + usize::from(codable),
+    );
+    if let Ok(mut m) = SUBSIZE_ARM.lock() {
+        *m.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// Prints and clears the [`note_subsize_arm`] table.
+pub fn dump_subsize_arm_scan() {
+    let Ok(mut m) = SUBSIZE_ARM.lock() else {
+        return;
+    };
+    for ((site, k), n) in m.iter() {
+        eprintln!(
+            "SUBSIZE_ARM site={site} part={} codable={} reached={n}",
+            k / 2,
+            if k % 2 == 1 { "true" } else { "false" },
+        );
+    }
+    m.clear();
+}
+
+/// Per-site, per-value counters for [`refuse_invalid_subsize`], plus the dump
+/// that makes the reach/guard split readable. `EC_AV1_SUBSIZE_GUARD_TRACE`
+/// records; `dump_subsize_guard_scan` prints (and clears) the table.
+static SUBSIZE_GUARD: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<(&'static str, usize, usize, bool), usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+
+fn note_subsize_guard(
+    site: &'static std::panic::Location<'static>,
+    bsize: (usize, usize),
+    part: usize,
+    codable: bool,
+) {
+    let key = (
+        format!("{}:{}", site.file(), site.line()).leak() as &'static str,
+        bsize.0 * 256 + bsize.1,
+        part,
+        codable,
+    );
+    if let Ok(mut m) = SUBSIZE_GUARD.lock() {
+        *m.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// Prints and clears the [`refuse_invalid_subsize`] table: one line per
+/// (site, block, partition value) with the times reached and whether the guard
+/// fired. `decode_probe` calls this at exit.
+pub fn dump_subsize_guard_scan() {
+    let Ok(mut m) = SUBSIZE_GUARD.lock() else {
+        return;
+    };
+    for ((site, bsize, part, codable), n) in m.iter() {
+        eprintln!(
+            "SUBSIZE_GUARD site={site} bsize={}x{} part={part} codable={codable} \
+             reached={n}{}",
+            bsize / 256,
+            bsize % 256,
+            if *codable { "" } else { " FIRED" },
+        );
+    }
+    m.clear();
 }
 
 /// [`chroma_plane_block_codable`] as libaom's refusal: a returned error naming
@@ -36360,6 +36463,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 );
                                             }
                                             let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                            // lane-av1unwritten r6: the partition symbol is RESOLVED and about to be
+                                            // dispatched. `partition_subsize_dims` is libaom's `get_partition_subsize`
+                                            // (common_data.h:71-90) reduced to dimensions, so this is
+                                            // `decode_partition`'s pre-descend check (decodeframe.c:1451-1460) on EVERY
+                                            // arm -- VERT, VERT_A / VERT_B, HORZ_4 and VERT_4 -- and the HORZ siblings
+                                            // keep decoding because the helper is exact, not a heuristic. key-frame 16x16 level.
+                                            refuse_invalid_subsize((16, 16), part16, fctx)?;
+
                                             if crate::envflags::env_flag!("EC_TRACE") {
                                                 eprintln!(
                                                     "EC_PART_VAL mi_row={} mi_col={} bsize=6 value={}",
@@ -36512,14 +36623,6 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 let br = (mi_row0 + 2, mi_col0 + 2);
                                                 let mut done: Vec<((usize, usize), usize)> =
                                                     Vec::new();
-                                                // lane-av1unwritten r4: the
-                                                // 16x16-level 1:4 split --
-                                                // VERT_4 selects BLOCK_4X16,
-                                                // INVALID at 4:2:2; HORZ_4
-                                                // selects BLOCK_16X4, whose (1,0)
-                                                // cell is BLOCK_8X4 (valid, the
-                                                // shape r2 wrongly refused).
-                                                refuse_invalid_subsize((16, 16), part16, fctx)?;
                                                 match part16 {
                                                     PARTITION_HORZ_A => {
                                                         let m_tl =
@@ -36676,6 +36779,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             if part16 == PARTITION_HORZ_4
                                                 || part16 == PARTITION_VERT_4
                                             {
+                                                // lane-av1unwritten r6: arm census --
+                                                // which partition values reach here.
+                                                note_subsize_arm(
+                                                    part16,
+                                                    chroma_plane_block_codable(
+                                                        partition_subsize_dims((16, 16), part16).0,
+                                                        partition_subsize_dims((16, 16), part16).1,
+                                                        ss_x(fctx),
+                                                        ss_y(fctx),
+                                                    ),
+                                                );
                                                 decode_rect4_16(
                                                     &mut dec,
                                                     &mut cdfs,
@@ -54021,6 +54135,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             );
                         }
                         let p = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                        // lane-av1unwritten r6: the partition symbol is RESOLVED and about to be
+                        // dispatched. `partition_subsize_dims` is libaom's `get_partition_subsize`
+                        // (common_data.h:71-90) reduced to dimensions, so this is
+                        // `decode_partition`'s pre-descend check (decodeframe.c:1451-1460) on EVERY
+                        // arm -- VERT, VERT_A / VERT_B, HORZ_4 and VERT_4 -- and the HORZ siblings
+                        // keep decoding because the helper is exact, not a heuristic. inter-frame 64x64 level; `p` is the symbol.
+                        refuse_invalid_subsize((64, 64), p, fctx)?;
+
                         if crate::envflags::env_flag!("EC_AV1_TRACE") {
                             eprintln!(
                                 "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p} pre_rng={pre_rng}",
@@ -54136,6 +54258,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     part64,
                     PARTITION_HORZ | PARTITION_VERT | PARTITION_HORZ_4 | PARTITION_VERT_4
                 ) {
+                    // lane-av1unwritten r6: arm census.
+                    note_subsize_arm(
+                        part64,
+                        chroma_plane_block_codable(
+                            partition_subsize_dims((64, 64), part64).0,
+                            partition_subsize_dims((64, 64), part64).1,
+                            ss_x(fctx),
+                            ss_y(fctx),
+                        ),
+                    );
                     // lane-inter4 r1: the superblock-level rect + 1:4 pairs as
                     // inter blocks -- two 64x32 / 32x64 strips, or four 64x16 /
                     // 16x64 ones. Each piece keeps `side = SB` for every
@@ -54307,11 +54439,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             )?
                         };
                     }
-                    // lane-av1unwritten r4: VERT on a 64x64 block selects
-                    // BLOCK_32X64 -- INVALID at 4:2:2. HORZ on the same block
-                    // selects BLOCK_64X32, whose (1,0) cell is BLOCK_32X32
-                    // (valid) and MUST keep decoding.
-                    refuse_invalid_subsize((64, 64), part64, fctx)?;
                     match part64 {
                         PARTITION_HORZ_A => {
                             ab_square32!(tl);
@@ -54799,14 +54926,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             )
                                         };
                                     }
-                                    // lane-av1unwritten r5: the partition symbol is RESOLVED (a full CDF read or
-                                    // an edge `gather`) and about to be dispatched. `partition_subsize_dims` is
-                                    // libaom's `get_partition_subsize` (common_data.h:71-90) reduced to
-                                    // dimensions, so this is `decode_partition`'s pre-descend check
-                                    // (decodeframe.c:1449-1458) applied to EVERY arm at once -- VERT,
-                                    // VERT_A / VERT_B, HORZ_4 and VERT_4 included. The HORZ siblings keep
-                                    // decoding because the helper is exact, not a heuristic. (inter-frame duplicate)
-                                    refuse_invalid_subsize((16, 16), part16, fctx)?;
                                     match part16 {
                                         PARTITION_HORZ_A => {
                                             inter_leaf8!(at16, tl);
@@ -55001,6 +55120,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         }
                                         let ec_dbg_pre = dec.debug_state().0;
                                         let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                        // lane-av1unwritten r6: the partition symbol is RESOLVED and about to be
+                                        // dispatched. `partition_subsize_dims` is libaom's `get_partition_subsize`
+                                        // (common_data.h:71-90) reduced to dimensions, so this is
+                                        // `decode_partition`'s pre-descend check (decodeframe.c:1451-1460) on EVERY
+                                        // arm -- VERT, VERT_A / VERT_B, HORZ_4 and VERT_4 -- and the HORZ siblings
+                                        // keep decoding because the helper is exact, not a heuristic. inter-frame 8x8 level.
+                                        refuse_invalid_subsize((8, 8), part8, fctx)?;
+
                                         if std::env::var_os("EC_DBG_SUB8").is_some() {
                                             let ec_dbg_post = dec.debug_state().0;
                                             eprintln!(
@@ -55038,6 +55165,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             )?;
                                             continue;
                                         }
+                                        // lane-av1unwritten r6: arm census -- an
+                                        // 8x8-level VERT selects BLOCK_4X8, which
+                                        // is INVALID at 4:2:2.
+                                        note_subsize_arm(
+                                            part8,
+                                            chroma_plane_block_codable(
+                                                partition_subsize_dims((8, 8), part8).0,
+                                                partition_subsize_dims((8, 8), part8).1,
+                                                ss_x(fctx),
+                                                ss_y(fctx),
+                                            ),
+                                        );
                                         if part8 == PARTITION_VERT || part8 == PARTITION_HORZ {
                                             // lane-intersub8 r3/r4/r5: two
                                             // BLOCK_8X4 (HORZ) / BLOCK_4X8 (VERT)
