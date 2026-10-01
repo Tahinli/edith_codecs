@@ -5,8 +5,9 @@
 chroma plane block at ss (1,0) — libaom calls that `AOM_CODEC_CORRUPT_FRAME`
 ("Block size 8x16 invalid with this subsampling mode") and `aomdec` refuses the
 file outright, and libaom's own encoder never emits such a shape; we walked those
-subsizes anyway. The fix mirrors libaom's check and returns a named refusal; the
-sentinel census that led here is kept as the instrument.**
+subsizes anyway, and our output for that witness depends on unwritten plane
+content. The fix mirrors libaom's check and returns a named refusal; the sentinel
+census that led here is kept as the instrument.**
 
 Branch `lane/av1unwritten`, base `main` = `8d6998d7`. No push.
 
@@ -109,28 +110,61 @@ exactly one of the four libaom refuses.
 
 ## 2. What led here, and what it is worth
 
-The refusal rests on two facts about libaom, both verified first-hand:
+### 2.1 The observation (on `8d6998d7`, by two independent builds)
 
-1. **libaom refuses the shape.** `aomdec --rawvideo` on
-   `440_request_is_422.obu` prints `Failed to decode frame 1: Corrupt frame
-   detected` / `Block size 8x16 invalid with this subsampling mode`
-   (`decodeframe.c:1449-1458`).
+```
+$ mkdir -p /tmp/wt_aw/same          # the dump writes NOTHING if the directory
+                                    # does not exist -- create it first
+$ for i in 1 2 3 4 5; do EC_AV1_FINAL_DUMP=/tmp/wt_aw/same/x \
+    ./target/debug/examples/decode_probe crates/ec-av1/fixtures/440_request_is_422.obu \
+    >/dev/null 2>&1; sha256sum /tmp/wt_aw/same/x.f0; done
+727ea647b2362b22520de232c2f6a0ce541dbfa90f02495f572af4aa2297116d
+ba2957e1709507b8336e53cd908b7dfe2a59dc2064b1f5eb4bea9b3149a4653d
+2e245bcc6abb2ef81e80254711fe042cadd3409c622faa46b9ee393dd14ffa96
+```
+
+Two distinct output hashes from one file with uninitialised planes; and with
+`EC_AV1_PLANE_SENTINEL=1` five runs give ONE hash, which differs from the plain
+one (1984 bytes). Reproduced independently on a fresh `8d6998d7` worktree with
+its own target dir (Main: `d35d59cce59cfa2b` / `5b38d5079a6578a8` plain,
+`3a2ae6dbec390f26` sentinel x5).
+
+**Provenance note, because it nearly inverted this section.** The first
+counter-measurement said main was deterministic; that reading came from a binary
+whose embedded source paths pointed at THIS worktree, not at main -- the
+stale-binary class. Provenance has to come from the binary's own strings, not
+from what `cargo build` last reported. With a path-verified build the
+nondeterminism is real, and this is the observation that started the lane.
+
+**Byte width matters for the census.** `EC_AV1_FINAL_DUMP` writes **u8** for an
+8-bit stream, so `PLANE_SENTINEL = 0xDEAD` narrows to the single byte `0xAD`:
+65 such bytes in a sentinel dump against a 33 baseline in a plain one. Counting
+a two-byte `0xDEAD` in an 8-bit dump cannot find it.
+
+### 2.2 The census, on this lane's tree
+
+`census_unwritten` at each frame's pre-deblock point, on the lane tree at r1:
+**112 unwritten samples per chroma plane, 224 total**, in whole 4x4 chroma
+blocks, each the lower half of a plane block whose luma subsize is one §1 says
+is not decodable. That number is a lane-tree measurement with a lane-only
+instrument and is cited as such; the fix does not rest on it.
+
+### 2.3 Why refusing is the right contract
+
+Neither of these is this lane's pixel measurement:
+
+1. **libaom refuses the shape.** `aomdec --rawvideo` on the pin prints
+   `Failed to decode frame 1: Corrupt frame detected` / `Block size 8x16 invalid
+   with this subsampling mode` (`decodeframe.c:1449-1458`).
 2. **libaom's encoder never emits it.** `partition_search.c:3383-3389` gates
    `partition_rect_allowed` on this same table, so no conformant 4:2:2 stream
    can contain the shape and the refusal cannot reject legal content.
 
-Neither of those is this lane's pixel measurement. What led here was the lane's
-own pre-deblock census (`census_unwritten`, §5), which on THIS LANE'S TREE at
-r1 reported 112 unwritten chroma samples per plane (224 total) on the witness —
-a lane-tree measurement made with a lane-only instrument, cited as such and not
-as a property of `main`. An earlier version of this report asserted more
-strongly that the witness's output hash "changed run to run"; that sentence has
-been removed as not established on `main` (Main re-measured on `main`
-`8d6998d7` with a provenance-checked probe and did not reproduce it).
+§2.1 explains why anyone looked; §2.3 is why the fix is right.
 
-The instrument is **kept** regardless: it is env-gated, off by default, and it
-is the only way to ask "did the tile walk write every sample it was handed" (a
-wrong-sample diff cannot tell an unwritten sample from a mis-predicted one).
+The instrument is **kept**: env-gated, off by default, and the only way to ask
+"did the tile walk write every sample it was handed" (a wrong-sample diff cannot
+tell an unwritten sample from a mis-predicted one).
 
 ## 3. The fix
 
@@ -302,14 +336,12 @@ test stream::tests::a_422_header_over_a_420_tile_refuses_the_subsize_libaom_call
 test result: ok. 1 passed; 0 failed; ...
 ```
 
-**No pixel property is pinned, because there is none to pin.** The witness no
-longer produces output at all — it refuses, which is the contract. An earlier
-version of this report pinned "the output hash must not change run to run" and
-justified it with five differing hashes on the lane tree; that measurement is not
-established on `main` (Main re-measured on `8d6998d7` with a
-provenance-checked probe and did not reproduce it), so the sentence and the
-assertion are both gone. The gate asserts the refusal and a positive control,
-which is what libaom actually does.
+**The pin.** The witness no longer produces output at all — it refuses, which is
+the contract libaom has (§2.3). §2.1 records the observation that made the
+stream worth looking at (varying output with uninitialised planes, one hash
+under the sentinel); it is reported, not gated, because the gate's job is the
+contract and the contract is the refusal. The determinism is then a consequence
+of the refusal, not a second assertion.
 
 **Mutation.** Deleting the two `chroma_plane_block_codable` call sites puts the
 witness back to `OK: 1 frames decoded` and the gate's `unwrap_or_else` panics
