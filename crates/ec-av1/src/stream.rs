@@ -14195,7 +14195,7 @@ exit 0
                 assert_eq!(a.len(), b.len(), "{name}: frame {i} {plane} plane length");
                 if a != b {
                     let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
-                    crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                    crate::dumpio::pin("TEST_PIN", &pin, &stream);
                     let at = a
                         .iter()
                         .zip(b.iter())
@@ -18205,7 +18205,7 @@ exit 0
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             if got.y != want.y || got.u != want.u || got.v != want.v {
                 let pin = std::env::temp_dir().join("ec-av1-10bit-inter-gate-fail.obu");
-                crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                crate::dumpio::pin("TEST_PIN", &pin, &stream);
                 let first = |a: &Vec<u16>, b: &Vec<u16>| {
                     a.iter()
                         .zip(b)
@@ -23174,7 +23174,7 @@ exit 0
             Ok(frames) => frames,
             Err(e) => {
                 let pin = std::env::temp_dir().join(format!("{name}-refused.obu"));
-                crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                crate::dumpio::pin("TEST_PIN", &pin, &stream);
                 panic!(
                     "{name}: decode_stream refused a real aomenc stream: {e} (pinned at {})",
                     pin.display()
@@ -23194,7 +23194,7 @@ exit 0
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             if got.y != want.y || got.u != want.u || got.v != want.v {
                 let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
-                crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                crate::dumpio::pin("TEST_PIN", &pin, &stream);
                 panic!(
                     "{name}: frame {i} mismatch vs ffmpeg -- stream pinned at {}",
                     pin.display()
@@ -23593,7 +23593,7 @@ exit 0
                 }
                 Err(e) => {
                     let pin = std::env::temp_dir().join(format!("{name}-refused.obu"));
-                    crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                    crate::dumpio::pin("TEST_PIN", &pin, &stream);
                     panic!(
                         "{name}: decode_stream failed on a real aomenc stream (cq={cq} period={period}): {e} (pinned at {})",
                         pin.display()
@@ -23615,7 +23615,7 @@ exit 0
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 if got.y != want.y || got.u != want.u || got.v != want.v {
                     let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
-                    crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                    crate::dumpio::pin("TEST_PIN", &pin, &stream);
                     panic!(
                         "{name}: frame {i} mismatch vs ffmpeg (cq={cq} period={period}) -- stream pinned at {}",
                         pin.display()
@@ -27908,7 +27908,7 @@ exit 0
                             "ec-av1-deblocking-gate-fail-s{}-cq{cq}.obu",
                             42 + round
                         ));
-                        crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                        crate::dumpio::pin("TEST_PIN", &pin, &stream);
                         panic!(
                             "frame {i} mismatch vs ffmpeg (seed {} cq {cq}, deblock fired: \
                              {counted}) -- stream pinned at {}",
@@ -28151,7 +28151,7 @@ exit 0
                 let stream_pin = sp.join(format!("cdfflake-stream-seed{seed}.bin"));
                 let ref_pin = sp.join(format!("cdfflake-ffmpeg-raw-seed{seed}.bin"));
                 for (path, bytes) in [(&stream_pin, &stream), (&ref_pin, &ffmpeg_raw)] {
-                    if let Err(line) = crate::dumpio::pin_reporting("EC_AV1_PIN", path, bytes) {
+                    if let Err(line) = crate::dumpio::pin_reporting("TEST_PIN", path, bytes) {
                         eprintln!("cdfflake: {line}");
                     }
                 }
@@ -28904,7 +28904,7 @@ exit 0
                     if mismatched {
                         let pin =
                             std::env::temp_dir().join("ec-av1-reference-select-gate-fail.obu");
-                        crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                        crate::dumpio::pin("TEST_PIN", &pin, &stream);
                         if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
                             crate::dumpio::pin("EC_AV1_GATE_DUMP", &path, &stream);
                             eprintln!(
@@ -29114,7 +29114,7 @@ exit 0
                 .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
             if mismatched {
                 let pin = std::env::temp_dir().join("ec-av1-compound-refs-gate-fail.obu");
-                crate::dumpio::pin("EC_AV1_PIN", &pin, &stream);
+                crate::dumpio::pin("TEST_PIN", &pin, &stream);
                 if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
                     crate::dumpio::pin("EC_AV1_GATE_DUMP", &path, &stream);
                     eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
