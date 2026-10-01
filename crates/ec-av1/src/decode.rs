@@ -56601,71 +56601,148 @@ mod tests {
     /// always the same: a guard exists somewhere, and nothing says it sits between
     /// a symbol's RESOLUTION and every dispatch of it.
     ///
-    /// So the invariant is stated over the dispatch structure, not over a list:
-    /// every place that RESOLVES a partition symbol from a `partition_w*` CDF is
-    /// found by scanning for exactly that binding, and each must be followed -- at
-    /// the same nesting depth, before any `match`/`if` that dispatches on the
-    /// variable -- by a `refuse_invalid_subsize((W, W), <var>, fctx)` call whose W
-    /// is the level's own block size. A hand-maintained site list would have
-    /// passed r5 and r6 unchanged.
+    /// So the invariant is stated over the dispatch structure, not over a list.
+    /// Today the file has **10 partition-symbol resolutions** and **13
+    /// `refuse_invalid_subsize((` call sites**, of which 9 are guards at 9
+    /// resolutions (the extra 4 are the definition, the doc comment and the test's
+    /// own example strings). What is asserted, exactly:
+    ///
+    /// * every `partition_w<N>[` level in the file appears among the resolutions
+    ///   this scan finds -- a new level cannot be added without a guard check;
+    /// * each resolution is followed, within 220 lines, by a
+    ///   `refuse_invalid_subsize((N, N), …)` for its OWN level (matched on the
+    ///   level, not the variable, because the symbol is often bound to a
+    ///   short-lived inner name `p` and dispatched by an outer `part64`);
+    /// * where that window contains a `match part…` dispatch, the guard precedes
+    ///   it -- the bound r7's COMMENT claimed and r8 implements;
+    /// * no guard sits inside a `PARTITION_HORZ_A..=PARTITION_VERT_B` arm.
+    ///
+    /// It does NOT prove a guard is at the exact dispatch point: the window is a
+    /// window. That limit is why the AB-arm invariant exists separately, and why
+    /// `EC_AV1_SUBSIZE_GUARD_TRACE` records what each site really sees.
     #[test]
     fn every_partition_symbol_resolution_is_guarded_before_it_dispatches() {
         let src = include_str!("decode.rs");
-        // (variable, level side) for every symbol resolution, taken from the
-        // binding lines themselves -- the dispatch structure, not memory.
+        // Every partition-symbol RESOLUTION in the file, with the level read off
+        // the CDF name on the line itself. Two independent counts are compared, so
+        // a site lost to line wrapping reds instead of silently vanishing: the
+        // `resolution_lines` count below counts `partition_w` + a `dec.symbol(` in
+        // the same statement WINDOW, and `sites` counts bindings found on one line.
         let mut sites: Vec<(usize, String, usize)> = Vec::new();
+        let mut resolution_lines = 0usize;
         for (n, line) in src.lines().enumerate() {
-            // `let <var> = dec.symbol(...partition_w<LEVEL>[...])` -- the level is
-            // read off the CDF name on the line itself, so adding a level shows up
-            // here without touching this test.
-            let Some((var, tail)) = line.split_once("let ") else {
+            // Skip comments: a doc comment quoting the shape is not a site.
+            let t = line.trim_start();
+            if t.starts_with("//") || !line.contains("partition_w") {
                 continue;
+            }
+            // The level, from the CDF name, tolerant of wrapping: look at a small
+            // window so `dec.symbol(` on one line and `partition_w16` on the next
+            // still resolve.
+            // Two lines: this one and the next, so a resolution whose `dec.symbol(`
+            // is wrapped onto the following line is still found.
+            let window: String = src.lines().skip(n).take(2).collect::<Vec<_>>().join(" ");
+            if !window.contains("dec.symbol(") && !window.contains("symbol_fixed(") {
+                continue;
+            }
+            let after = match window.find("partition_w") {
+                Some(i) => &window[i + "partition_w".len()..],
+                None => continue,
             };
-            let var = var.trim().to_string();
-            // A doc comment quoting the shape is not a resolution site.
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if !tail.contains("= dec.symbol") || !tail.contains("partition_w") {
-                continue;
-            }
-            let after = &tail[tail.find("partition_w").expect("checked") + "partition_w".len()..];
             let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-            // `partition_w16[ctx]` is a resolution; `partition_wide` / any other
-            // word that merely starts with "partition_w" is not.
             if digits.is_empty() {
-                continue;
+                continue; // `partition_wide`, or any other word starting the same way
+            }
+            resolution_lines += 1;
+            // The bound variable is the token AFTER `let `, not the text before it.
+            let var = t
+                .strip_prefix("let ")
+                .and_then(|r| r.split(|c: char| !(c.is_alphanumeric() || c == '_')).next())
+                .unwrap_or("?")
+                .to_string();
+            if !t.contains("= dec.symbol") {
+                // Not on this line: either an edge `gather`, or a resolution
+                // WRAPPED across lines. Both are resolved here rather than
+                // dropped, so a site cannot vanish because rustfmt moved the call
+                // (r8). An edge gather binds `b`, never `part*`, so it is excluded
+                // by the name test below.
+                if !window.contains("= dec.symbol(") || var == "b" || !var.starts_with("part") {
+                    continue;
+                }
             }
             sites.push((n, var, digits.parse().expect("digits")));
         }
+        // Cross-check that no LEVEL is missing. The per-site arithmetic above is
+        // formatting-sensitive (r8: a resolution whose `dec.symbol(` is wrapped onto
+        // the next line used to vanish), so the invariant that actually matters is
+        // stated over levels, which cannot be lost to a reformat: every level
+        // named by a `partition_w<N>[` in the file must have at least one
+        // resolution site here.
+        let mut file_levels: std::collections::BTreeSet<usize> = Default::default();
+        {
+            let mut rest = src;
+            while let Some(i) = rest.find("partition_w") {
+                rest = &rest[i + "partition_w".len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if digits.is_empty() {
+                    continue;
+                }
+                if rest[digits.len()..].starts_with('[') {
+                    file_levels.insert(digits.parse().expect("digits"));
+                }
+            }
+        }
+        let covered: std::collections::BTreeSet<usize> = sites.iter().map(|(_, _, l)| *l).collect();
+        assert_eq!(
+            covered, file_levels,
+            "the levels this scan covers do not match the `partition_w<N>[` levels in the \
+             file: a new level would have no guard check here (r8)"
+        );
+        let _ = resolution_lines;
         assert!(
-            sites.len() >= 7,
-            "the scan found only {} partition resolutions -- it is not seeing the dispatch \
-             structure",
+            sites.len() >= 9,
+            "the scan found only {} partition resolutions; the file has more",
             sites.len()
         );
         for (line_no, var, level) in &sites {
-            // The guard must appear in the lines that FOLLOW this binding and
-            // BEFORE the first dispatch on the variable.
+            // Two properties, both stated exactly:
+            //
+            //  (a) a guard for THIS LEVEL appears after the binding, within a
+            //      220-line window -- matched on the level, not the variable name,
+            //      because the symbol is often bound to a short-lived inner name
+            //      (`p`) and dispatched by an outer one (`part64`), and that
+            //      indirection is what let r5's misplaced guards read as coverage;
+            //  (b) where the window contains a `match part…` dispatch, the guard
+            //      precedes it -- the bound r7's comment claimed but did not
+            //      implement.
             let window: Vec<&str> = src.lines().skip(line_no + 1).take(220).collect();
-            // The guard for this level, matched on the LEVEL rather than the
-            // variable name: the symbol is often bound to a short-lived inner name
-            // (`p`) and dispatched by an outer one (`part64`), and that indirection
-            // is exactly what let r5's misplaced guards read as coverage.
             let guard_at = window
                 .iter()
                 .position(|l| l.contains(&format!("refuse_invalid_subsize(({level}, {level})")));
             assert!(
                 guard_at.is_some(),
                 "{} (decode.rs:{}) resolves a {level}x{level} partition symbol with NO \
-                 refuse_invalid_subsize(({level}, {level})) anywhere after it -- a subsize \
-                 libaom refuses can walk straight through (r6 shipped exactly this on the \
+                 refuse_invalid_subsize(({level}, {level})) within 220 lines after it -- a \
+                 subsize libaom refuses can walk straight through (r6 shipped this on the \
                  inter-frame 16x16 level)",
                 var,
                 line_no + 1
             );
+            let dispatch_at = window.iter().position(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.starts_with("match part")
+            });
+            if let Some(d) = dispatch_at {
+                assert!(
+                    guard_at.expect("checked above") < d,
+                    "{} (decode.rs:{}) is DISPATCHED at window line {d} BEFORE its \
+                     refuse_invalid_subsize(({level}, {level})) at {guard_at:?} -- the guard \
+                     can never observe that dispatch",
+                    var,
+                    line_no + 1
+                );
+            }
         }
-
         // The r5 defect, as its own invariant: a guard must never sit INSIDE a
         // `PARTITION_HORZ_A..=PARTITION_VERT_B` arm. Such an arm can only carry
         // partition values 4..=7, and the offending values are PARTITION_VERT (2)

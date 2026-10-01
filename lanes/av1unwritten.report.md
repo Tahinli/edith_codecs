@@ -535,3 +535,58 @@ paths this lane owns lacks a guard above it. That is a statement about the
 `partition_w*` resolutions; a dispatch that selects a subsize WITHOUT reading a
 `partition_w*` symbol would not be caught by it, and I did not find one, but I am
 not claiming the scan proves none exists.
+
+---
+
+## 10. r8 — the test claimed more than it proved
+
+Maine's r7 read found three honesty gaps in the structural gate. All three were
+in what the test SAID, not what the decode does; none changed a decode path.
+
+1. **"BEFORE the first dispatch on the variable" was in the comment only.** r7
+   checked that a guard for the level appears somewhere in the next 220 lines.
+   r8 IMPLEMENTS the bound: where the window contains a `match part…` dispatch,
+   the guard must precede it.
+2. **The binding pattern was formatting-sensitive and failed silently.** A
+   resolution whose `dec.symbol(` is wrapped onto the next line used to vanish
+   from the list with nothing red. r8 reads the level and the symbol read from a
+   two-line window, so a wrapped site resolves instead of disappearing, and the
+   remaining cross-check is over **levels**, which a reformat cannot lose: every
+   `partition_w<N>[` in the file must appear among the resolutions found.
+3. **`var` was parsed as the text BEFORE `let `**, so it was always empty and the
+   diagnostic read `(decode.rs:1234) resolves…` with no name — exactly where the
+   name matters. r8 takes the token after `let `.
+
+### 10.1 Coverage, stated so a reader can tell it from a floor
+
+**Today: 10 partition-symbol resolutions, 13 `refuse_invalid_subsize((`
+occurrences**, of which 9 are guards at 9 resolutions and the rest are the
+function definition, its doc comment and this test's own example strings.
+
+What is asserted, exactly:
+
+* every `partition_w<N>[` level in the file appears among the resolutions found —
+  a new level cannot be added without a guard check;
+* each resolution is followed, within 220 lines, by a
+  `refuse_invalid_subsize((N, N), …)` for its own level, matched on the LEVEL
+  rather than the variable (the symbol is often bound to a short-lived `p` and
+  dispatched by an outer `part64`);
+* where that window contains a `match part…` dispatch, the guard precedes it;
+* no guard sits inside a `PARTITION_HORZ_A..=PARTITION_VERT_B` arm.
+
+What is NOT claimed: the test does not prove a guard is at the exact dispatch
+point — the window is a window. That limit is why the AB-arm invariant is a
+separate assertion and why `EC_AV1_SUBSIZE_GUARD_TRACE` records what each site
+really sees over the corpus.
+
+Two mutations, both red:
+
+```
+$ # delete the inter-16 guard
+part16 (decode.rs:36465) resolves a 16x16 partition symbol with NO
+refuse_invalid_subsize((16, 16)) within 220 lines after it
+
+$ # move the inter-64 guard inside a PARTITION_HORZ_A..=PARTITION_VERT_B arm
+p (decode.rs:54137) resolves a 64x64 partition symbol with NO
+refuse_invalid_subsize((64, 64)) within 220 lines after it
+```
