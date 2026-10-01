@@ -77,16 +77,32 @@ def split(raw, sizes, fsz, cell):
     return [raw[i * fsz:(i + 1) * fsz] for i in range(len(raw) // fsz)]
 
 
-def _matchings(cands, disp_n, cap=64):
+def _matchings(cands, disp_n, cap=64, node_cap=4_000_000):
     """Every way to assign each decode frame either a distinct display partner
     or the hidden role, covering the display side exactly. Enumerated, not
     guessed: a duplicated picture can make the assignment genuinely ambiguous,
-    and the caller then has to show the ambiguity does not change the answer."""
+    and the caller then has to show the ambiguity does not change the answer.
+
+    Two bounds, both learned the hard way: without the feasibility prune, an
+    instance whose candidate lists cannot cover the display side explores the
+    whole 2**frames tree before returning empty (that is what made three
+    43-frame cells burn a 300 s cap with 15 minutes of user CPU and never
+    finish), and without a node cap a pathological instance would hang the
+    comparator instead of reporting."""
     sols = []
+    nodes = 0
 
     def dfs(i, used, acc, hid):
+        nonlocal nodes
+        nodes += 1
+        if nodes > node_cap:
+            raise SystemExit(f"the decode->display assignment search exceeded {node_cap} nodes "
+                             f"at frame {i} of {len(cands)} ({disp_n} display frames) -- this "
+                             f"instance is not enumerable; report it rather than hang")
         if len(sols) >= cap:
             return
+        if disp_n - len(used) > len(cands) - i:
+            return  # not enough decode frames left to cover the display side
         if i == len(cands):
             if len(used) == disp_n:
                 sols.append((dict(acc), list(hid)))
@@ -181,15 +197,70 @@ def compare(cell, ours_prefix, disp, w, h, ss_x, ss_y, depth, want_hidden=None):
             per_dec.append(fcount)
         return tot, per_disp, per_dec, first, bb_all
 
-    measured = [measure(m, h) for m, h in sols]
-    totals = {tuple(t[0]) for t in measured}
-    if len(totals) > 1:
-        raise SystemExit(f"{cell}: the decode->display assignment is AMBIGUOUS "
-                         f"({len(sols)} solutions) and they DISAGREE on the counts "
-                         f"{sorted(totals)} -- pick the identity source explicitly, "
-                         f"this instrument will not choose for you")
-    tot, per_disp, per_dec, first, bbox = measured[0]
-    mapping, hidden = sols[0]
+    def xor_plane_counts(a, b):
+        """Per-plane differing-SAMPLE counts at 8-bit, at C speed: XOR the two
+        planes as big ints, then count non-zero bytes per plane. Equivalent to
+        the per-sample loop above, and the only reason a 43-frame cell with 64
+        candidate assignments used to cost half an hour."""
+        z = int.from_bytes(a, "big") ^ int.from_bytes(b, "big")
+        zb = z.to_bytes(len(a), "big")
+        out, off = [], 0
+        for sz in sizes:
+            seg = zb[off:off + sz]
+            off += sz
+            out.append(len(seg) - seg.count(0))
+        return out
+
+    if bps == 1:
+        pair_cache = {}
+
+        def pair_total(oi, di):
+            v = pair_cache.get((oi, di))
+            if v is None:
+                v = xor_plane_counts(ours[oi], disp[di])
+                pair_cache[(oi, di)] = v
+            return v
+
+        sol_totals = []
+        for m, _h in sols:
+            t = [0, 0, 0]
+            for oi, di in m.items():
+                p = pair_total(oi, di)
+                t[0] += p[0]
+                t[1] += p[1]
+                t[2] += p[2]
+            sol_totals.append(tuple(t))
+        if len(set(sol_totals)) > 1:
+            raise SystemExit(f"{cell}: the decode->display assignment is AMBIGUOUS "
+                             f"({len(sols)} solutions) and they DISAGREE on the counts "
+                             f"{sorted(set(sol_totals))} -- pick the identity source explicitly, "
+                             f"this instrument will not choose for you")
+        tot = list(sol_totals[0])
+        mapping, hidden = sols[0]
+        if tot == [0, 0, 0]:
+            per_disp = [[0, 0, 0] for _ in disp]
+            per_dec = [None if oi in hidden else [0, 0, 0] for oi in range(len(ours))]
+            first, bbox = None, [[None, None, None, None] for _ in range(3)]
+        else:
+            tot, per_disp, per_dec, first, bbox = measure(mapping, hidden)
+    else:
+        # 16-bit planes: the sample loop below is the only path today.
+        if all(all(ours[oi] == disp[di] for oi, di in m.items()) for m, h in sols):
+            hidden0 = sols[0][1]
+            measured = [([0, 0, 0], [[0, 0, 0] for _ in disp],
+                         [None if oi in hidden0 else [0, 0, 0] for oi in range(len(ours))],
+                         None, [[None, None, None, None] for _ in range(3)])]
+            measured *= len(sols)
+        else:
+            measured = [measure(m, h) for m, h in sols]
+        totals = {tuple(t[0]) for t in measured}
+        if len(totals) > 1:
+            raise SystemExit(f"{cell}: the decode->display assignment is AMBIGUOUS "
+                             f"({len(sols)} solutions) and they DISAGREE on the counts "
+                             f"{sorted(totals)} -- pick the identity source explicitly, "
+                             f"this instrument will not choose for you")
+        tot, per_disp, per_dec, first, bbox = measured[0]
+        mapping, hidden = sols[0]
     if want_hidden is not None and len(hidden) != want_hidden:
         raise SystemExit(f"{cell}: {len(hidden)} hidden decode frame(s) {hidden}, "
                          f"expected {want_hidden} -- the frame-count claim changed")
