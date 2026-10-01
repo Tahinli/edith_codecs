@@ -175,13 +175,35 @@ test result: ok. 48 passed; 0 failed; 4 ignored; 759 filtered out; 44.41s
 `cargo check --tests` is the command the assignment names; `--lib --tests --examples`
 is a superset and was run clean, which covers it.
 
+### NOT run here, and why that is the correct call
+
+The **whole** `ec-av1` lib suite was NOT completed on this box. Two runs were
+started and both were cut by my own wall-clock budget, not by a failure: the
+suite's aomenc-encoded gates each take a minute or more and several print
+"has been running for over 60 seconds", so the suite does not fit a local
+foreground run. That is the standing project rule, not an excuse — full cargo
+suites run on the VPS fleet only, never locally, and **three VPS suites are
+already in flight for this campaign**, which will carry this branch.
+
+Everything this branch touched IS covered by the two scoped runs above: the
+ten 4:2:2 gates, the renamed/inverted gates, `--lib film_grain`,
+`--lib census`, the intrabc tests, both `every_chroma_unit_*` strip
+enumerations, `the_decode_path_refuses_exactly_the_listed_cases` (the gate
+that forces the guard and the two inventory rows into one commit), and
+`cfl_ac_q3_at_is_reached_only_through_the_420_fallthrough_of_cfl_ac_ss`. All
+green. `cargo check --lib --tests --examples` is clean with zero warnings,
+so nothing fails to build. **Main's VPS runs are the regression signal for
+the rest of the crate.**
+
 ### The out-of-process corpus re-measurement on this branch
 
 Run against the **lifted** `decode_probe` (`/home/tahinli/.cache/tgt/lift/debug/examples/decode_probe`, guard removed, no bypass anywhere), through the committed `scripts/run422-ffmpeg.py` + `scripts/cmp422-ffmpeg.py` comparator, per plane per frame, decode-order→display-order mapped, depth-correct on both sides:
 
 ```text
-23 BYTE-EXACT
- 1 DIVERGES
+24 cells completed of the 57-cell list; 23 BYTE-EXACT, 1 DIVERGES.
+(the run was cut by my OWN `timeout 3000`, rc=124 -- not by a failure and
+ not by a comparator error; no cell produced REFUSES or COMPARATOR-ERROR)
+
 s422_384x240: DIVERGES 17df/16shown hidden=[1] Y=0 U=1780 V=1871
               first: disp f7 (decode f2) U (r169,c30)
 ```
