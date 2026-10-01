@@ -21136,18 +21136,14 @@ pub(crate) fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 ///
 /// (`round_ss` is the rounding the decoder's own plane extents use; at ss = 1 it
 /// is `div_ceil(2)`, so every 4:2:0 dump is byte-for-byte unchanged by this.)
-/// lane-mc64 r1: the decode-order index the stage dumps below key their file
-/// name on. `PREFILT_PICTURE_IDX` is bumped once per frame just BEFORE the
-/// deblock/CDEF stages run, so the frame being dumped here is `idx - 1` --
-/// without this every frame overwrote `.f0` and a per-frame bisection silently
-/// compared the LAST decoded frame (ledger, class stale-output-faked-measurement).
-#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
-fn stage_dump_idx() -> usize {
-    PREFILT_PICTURE_IDX
-        .load(std::sync::atomic::Ordering::SeqCst)
-        .saturating_sub(1)
-}
-
+/// lane-mc64 r1: the file name is keyed on [`dump_stage_idx`], a per-var
+/// decode-order counter -- both dumps used to write `.f0` unconditionally, so
+/// every frame overwrote the previous one and only the LAST frame survived,
+/// which silently defeats any per-frame filter-stage bisection (ledger, class
+/// stale-output-faked-measurement). A sibling accessor `stage_dump_idx()`, which
+/// derived the same number from `PREFILT_PICTURE_IDX`, had no caller and was
+/// deleted: `PREFILT_PICTURE_IDX` is bumped after this point, not before it, so
+/// the counter that names these files is the per-var map.
 fn dump_stage16(
     var: &str,
     y: &PlaneBuf<'_>,
@@ -21271,20 +21267,33 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     }
 }
 
-/// Enabled by `EC_AV1_PLANE_SENTINEL` (there is no separate flag for it): at
-/// each frame's pre-deblock point, print an
-/// EXACT census of the samples the tile walk never wrote -- with
-/// it, every plane still holding [`PLANE_SENTINEL`] at
-/// this point is a sample no block reconstructed, and no legal sample can
-/// equal `0xDEAD` (reconstruction clamps to `(1 << bit_depth) - 1`).
+/// Enabled by `EC_AV1_PLANE_SENTINEL` (there is no separate flag for it): print
+/// an EXACT census of the samples the tile walk never wrote -- with it, every
+/// plane still holding [`PLANE_SENTINEL`] at this point is a sample no block
+/// reconstructed, and no legal sample can equal `0xDEAD` (reconstruction clamps
+/// to `(1 << bit_depth) - 1`).
+///
+/// Coverage, stated as the code has it: this census runs at TWO of the four
+/// places [`apply_deblock`] is entered from -- the key-frame path and the
+/// non-pipelined inter path, both immediately before that frame's deblock. The
+/// two it does NOT cover are the encoder's filter search ([`replay_filters`],
+/// which runs the filters over a CAPTURED copy, not a live decode) and the
+/// pipelined inter branch, where deblock has already run band by band inside
+/// `par` by the time this tail is reached. A zero count therefore means "no hole
+/// on the paths that reach this call", not "no hole on any path". It is EXACT
+/// over the extent it scans -- the scan itself reads every sample of that
+/// extent, unlike the older [`dump_stage`] pair, which truncates to `as u8`.
 ///
 /// This is the shipped form of the four-line temporary scan the
 /// `lane/av1422seed` census used: it replaces a wrong-sample diff (which says
 /// where the OUTPUT is wrong, not whether the block was written at all) with a
 /// direct count plus the coordinates of every hole, grouped into per-row
 /// spans so a large hole stays readable. Scans each plane over its own
-/// `true_width` x `true_height` extent: past that is the padded coding
-/// surface's invented tail, which no decoder ever reads.
+/// `true_width` x `true_height` extent, PER AXIS (`true_width.min(p.width)`), so
+/// a 4:2:2 frame's chroma is scanned at its own `fw/2 x fh` shape rather than
+/// the 4:2:0 `div_ceil(2)` crop the older [`dump_stage16`] used: past that
+/// extent is the padded coding surface's invented tail, which no decoder ever
+/// reads.
 fn census_unwritten(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     if !plane_sentinel_on() {
         return;
@@ -21410,19 +21419,39 @@ fn plane_sentinel_on() -> bool {
 ///    content.
 ///
 /// What led here was the observation that this decoder's output for such a
-/// witness DEPENDS ON UNWRITTEN PLANE CONTENT. Measured on `8d6998d7` by two
-/// independent builds (`EC_AV1_FINAL_DUMP=<dir>/x`, the directory created
-/// FIRST -- the dump writes nothing if it does not exist): five runs with
-/// uninitialised planes give TWO different output hashes, five runs with
-/// `EC_AV1_PLANE_SENTINEL=1` give ONE hash, and the sentinel output differs
+/// witness DEPENDS ON UNWRITTEN PLANE CONTENT. Measured on lane/av1unwritten's
+/// branch point `8d6998d7` by two independent builds (`EC_AV1_FINAL_DUMP=<dir>/x`,
+/// the directory created FIRST -- the dump writes nothing if it does not exist):
+/// five runs with uninitialised planes gave TWO different output hashes, five runs
+/// with `EC_AV1_PLANE_SENTINEL=1` gave ONE hash, and the sentinel output differs
 /// from the plain one. At 8-bit the sentinel survives in the dump as the single
 /// byte `0xAD`, not the pair `DE AD` -- `PLANE_SENTINEL`'s u16 narrows in
 /// [`crate::stream`]'s u8 write path, so counting a two-byte `0xDEAD` in an
-/// 8-bit dump cannot find it. The lane's own pre-deblock census
-/// ([`census_unwritten`]) then localised the unwritten samples on THIS lane's
-/// tree: 112 per chroma plane on the witness, 224 total. That census number is a
-/// lane-tree measurement with a lane-only instrument and is cited as such;
-/// (1) and (2) are what make the refusal correct.
+/// 8-bit dump cannot find it.
+///
+/// That hash observation is HISTORICAL and its hash half did NOT reproduce: on
+/// the same `8d6998d7`, five plain runs of `440_request_is_422` gave ONE hash,
+/// `a761118c8dd5c8d0` (`lanes/unwritten-dep.report.md` §10, which also states in
+/// §13 that this pre-deblock census still has no committed reader on `main`).
+/// Ambient allocator content is machine-dependent, so a stable value on one host
+/// and a varying one on another would be the same defect; the hash spread is
+/// cited as measured-on-`8d6998d7`, not as a standing property.
+///
+/// What the census localised: the lane's own pre-deblock census
+/// ([`census_unwritten`]) found 112 unwritten samples per chroma plane on the
+/// witness, 224 total -- on that lane's tree, with a lane-only instrument. That
+/// count is a lane-tree measurement and is cited as such.
+///
+/// Which witness behaviour is CURRENT: `main` REFUSES this witness. The pin
+/// `440_request_is_422.obu` is exercised by
+/// `stream::tests::a_422_header_over_a_420_tile_refuses_the_subsize_libaom_calls_corrupt`,
+/// which asserts the decode ERRORS with libaom's own "invalid with this
+/// subsampling mode" wording, so `440_request_is_422` is not sweepable on the
+/// merge tree (`lanes/unwritten-dep.report.md` §10). The run-to-run hashes above
+/// are what the tree did BEFORE that refusal and cannot be re-measured on
+/// `main`. Facts (1) and (2) above -- libaom refusing the shape, and libaom's own
+/// encoder never emitting it -- are what make the refusal correct; the
+/// measurement history is why it was looked for.
 ///
 /// `av1_ss_size_lookup`'s `BLOCK_INVALID` cells, transcribed verbatim:
 /// `(common_data.c:17-41`, rows in `BLOCK_SIZES_ALL` order, indexed
