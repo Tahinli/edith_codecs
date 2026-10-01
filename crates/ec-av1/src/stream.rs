@@ -48167,47 +48167,45 @@ exit 0
     /// lane-unwritten-dep: the UNWRITTEN-SAMPLE census at the point the output is
     /// taken, over the real film fixtures that carry hidden alt-refs.
     ///
-    /// What this pins, and why the pre-deblock census could not: the tile walk's
-    /// pre-deblock scan sees a plane BEFORE deblock/CDEF/LR, and the loop filter
-    /// READS neighbours to decide an edge. So an unwritten sample changes its
-    /// neighbour's filtered value even when the unwritten sample itself is
-    /// overwritten afterwards -- the hole is invisible pre-deblock and gone from
-    /// the plane by the time anyone looks again. Measured on
-    /// `440_request_is_422` (8-bit, 64x64, a 4:2:2 header over a 4:2:0 tile,
-    /// which lane/av1unwritten refuses): the pre-deblock dump is BYTE-IDENTICAL
-    /// between an uninitialised and a `PLANE_SENTINEL`-filled run -- zero sentinel
-    /// samples either way -- while the final output differs by 1986 bytes, all in
-    /// the U/V planes' rows 30..63 of 64. The stage dump localises the entry
-    /// exactly: `EC_AV1_PREFILT_DUMP16` identical, `EC_AV1_POSTDEBLOCK_DUMP16`
-    /// differing by 26 bytes. `EC_AV1_DEBUG_SKIP_DEBLOCK=1` does NOT remove it,
-    /// because skipping deblock leaves the same neighbours unwritten for CDEF.
+    /// SCOPE, stated rather than implied: the census is taken where
+    /// `EC_AV1_FINAL_DUMP` writes, which is BEFORE `apply_grain`. The claim is
+    /// therefore over the PRE-GRAIN planes -- which is also the claim that matters
+    /// most, because those exact bytes are what the reference bank stores and what
+    /// every later frame predicts from. Film grain synthesises from that pre-grain
+    /// frame plus the grain parameters and does not read the plane buffer, so it
+    /// cannot introduce a hole. The claim is NOT "the caller's final grained
+    /// picture has no hole" and is not asserted.
     ///
-    /// This gate therefore counts at the SAME point `EC_AV1_FINAL_DUMP` writes,
-    /// which makes the claim the one a reader actually cares about: no sample the
-    /// tile walk never wrote survives into the frame the caller receives.
-    ///
-    /// NON-VACUITY, and it is the part that makes this gate worth having: the
-    /// census is only a measurement because it CAN report non-zero. The control
-    /// below is the same measurement on the one fixture in the corpus where a
-    /// hole really does reach the output, and it is asserted NON-ZERO (32 samples,
-    /// measured). A census that silently read zero everywhere would fail it.
+    /// NON-VACUITY, the part that makes this gate worth having: a census is only a
+    /// measurement if it CAN report non-zero. The control is a SYNTHETIC positive
+    /// -- the census is handed planes with a known number of sentinel samples and
+    /// must report exactly that number. It deliberately does NOT use a fixture:
+    /// the corpus's one witness with a real hole (`440_request_is_422`) is REFUSED
+    /// by lane/av1unwritten, so a fixture-carried control goes red on merge for a
+    /// reason unrelated to this gate. A synthetic control cannot be refused and
+    /// cannot change behaviour when a lane lands. It is proven by mutation in the
+    /// same run: neutering `census_unwritten_final` reds it (lane report §5).
     ///
     /// The four film fixtures are the corpus's real 10-bit streams with hidden
     /// alt-refs -- the shapes where a hidden frame's unwritten region would feed
     /// a later DISPLAYED frame through the reference bank, which is the only way
     /// an unwritten sample could reach output on a stream that decodes correctly.
-    /// All four measure 0.
+    /// All four measure 0 here AND 0 on the pre-deblock census.
     ///
-    /// Measured on `8d6998d7` with a provenance-verified probe
-    /// (`strings` on the binary names only this worktree; the fixture sha256s are
-    /// `7f3b060da5aa9c53` for hg_arf, `c9e721088766163b` for hg_rect64):
+    /// Measured on `8d6998d7` with a provenance-verified probe (`strings` on the
+    /// binary names only this worktree; hg_arf sha256 `7f3b060da5aa9c53`,
+    /// hg_rect64 `c9e721088766163b`):
     ///
     /// ```text
-    /// 440_request_is_422            FINAL_UNWRITTEN 32   frames=1    <- control, non-zero
-    /// hg_arf_witness                FINAL_UNWRITTEN 0    frames=37
-    /// hg_rect64_intra16x4_witness   FINAL_UNWRITTEN 0    frames=33
-    /// gm_small_side_witness         FINAL_UNWRITTEN 0    frames=33
-    /// troy_sb128_inter_witness      FINAL_UNWRITTEN 0    frames=15
+    /// pre-deblock census (u16, whole plane, 0xDEAD counted per frame)
+    ///   440_request_is_422            224     <- also lane/av1unwritten's own number
+    ///   hg_arf_witness                0
+    ///   hg_rect64_intra16x4_witness   0
+    /// this gate (pre-grain, at the output point)
+    ///   hg_arf_witness                0
+    ///   hg_rect64_intra16x4_witness   0
+    ///   gm_small_side_witness         0
+    ///   troy_sb128_inter_witness      0
     /// ```
     #[test]
     fn the_frame_the_caller_receives_carries_no_unwritten_plane_sample() {
@@ -48250,30 +48248,66 @@ exit 0
                 })
         };
 
-        // Non-vacuity FIRST: the census must be able to report non-zero, or every
-        // zero below would be meaningless.
-        let control = census("440_request_is_422");
-        assert!(
-            control > 0,
-            "{NAME}: the census reports 0 even on the one fixture whose output DOES depend \
-             on unwritten plane memory (measured 32) -- the census is blind or the sentinel \
-             fill is not live, so every assertion below would be vacuous"
+        // Non-vacuity FIRST, and SYNTHETIC on purpose (see the doc comment): the
+        // census is handed planes with a known number of sentinel samples and must
+        // report exactly that number. No fixture is involved, so this cannot be
+        // affected by lane/av1unwritten refusing `440_request_is_422` on merge.
+        // The fill is env-gated, so even this runs in the child.
+        let synthetic = census_synthetic();
+        assert_eq!(
+            synthetic, 7,
+            "{NAME}: the census reported {synthetic} for planes carrying exactly 7 sentinel \
+             samples -- the census is not measuring what it claims, so every zero below is \
+             meaningless (class: census-silently-blind)"
         );
 
-        for (fixture, frames) in [
-            ("hg_arf_witness", 37usize),
-            ("hg_rect64_intra16x4_witness", 33),
-            ("gm_small_side_witness", 33),
-            ("troy_sb128_inter_witness", 15),
+        for fixture in [
+            "hg_arf_witness",
+            "hg_rect64_intra16x4_witness",
+            "gm_small_side_witness",
+            "troy_sb128_inter_witness",
         ] {
             let n = census(fixture);
             assert_eq!(
                 n, 0,
-                "{NAME}: {fixture} hands the caller {n} samples the tile walk never wrote \
-                 (class: a hole the loop filter read)"
+                "{NAME}: {fixture} hands the caller {n} samples the tile walk never wrote"
             );
-            let _ = frames; // frame count is asserted inside the child
         }
+    }
+
+    /// Runs the census child with `UWDEP_CENSUS_FIXTURE` UNSET, which makes it
+    /// take the synthetic-positive path: hand [`census_unwritten_final`] planes
+    /// with a known number of `PLANE_SENTINEL` values and report what it counted.
+    /// This is the non-vacuity control, and it is a direct function-level check
+    /// rather than a decode, so no fixture's decode behaviour can change it.
+    fn census_synthetic() -> usize {
+        const NAME: &str = "the_frame_the_caller_receives_carries_no_unwritten_plane_sample";
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "stream::tests::uwdep_child_unwritten_census",
+                "--nocapture",
+            ])
+            .env("EC_AV1_PLANE_SENTINEL", "1")
+            .env("UWDEP_CENSUS_SYNTHETIC", "1")
+            .env_remove("UWDEP_CENSUS_FIXTURE")
+            .output()
+            .expect("running the census child");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        text.lines()
+            .find_map(|l| l.strip_prefix("UWDEP_CENSUS "))
+            .and_then(|v| v.split_whitespace().next().and_then(|n| n.parse().ok()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{NAME}: the census child reported no synthetic count (child said: {:?})",
+                    text.trim()
+                )
+            })
     }
 
     /// The child half of
@@ -48285,6 +48319,30 @@ exit 0
     /// in-process counter -- which no external binary could read.
     #[test]
     fn uwdep_child_unwritten_census() {
+        assert!(
+            std::env::var_os("EC_AV1_PLANE_SENTINEL").is_some(),
+            "the census child ran without EC_AV1_PLANE_SENTINEL, so the fill was never live \
+             and the count is meaningless"
+        );
+        // The non-vacuity control: no decode, no fixture, just the census over
+        // planes with a KNOWN number of sentinel samples. 3 + 4 + 0 = 7.
+        if std::env::var_os("UWDEP_CENSUS_SYNTHETIC").is_some() {
+            const S: u16 = 0xDEAD;
+            let mut a = vec![7u16; 16];
+            let mut b = vec![7u16; 16];
+            let c = vec![7u16; 8];
+            for s in a.iter_mut().take(3) {
+                *s = S;
+            }
+            for s in b.iter_mut().take(4) {
+                *s = S;
+            }
+            let _ = decode::take_final_unwritten_samples();
+            decode::census_unwritten_final(&a, &b, &c);
+            let n = decode::take_final_unwritten_samples();
+            println!("UWDEP_CENSUS {n} synthetic=1");
+            return;
+        }
         let Ok(fixture) = std::env::var("UWDEP_CENSUS_FIXTURE") else {
             // Not a census run: the parent invokes this test by name, so being
             // reached without the variable means a normal suite run.
@@ -48297,11 +48355,6 @@ exit 0
         let _ = decode::take_final_unwritten_samples();
         let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{fixture} refused: {e}"));
         let n = decode::take_final_unwritten_samples();
-        assert!(
-            std::env::var_os("EC_AV1_PLANE_SENTINEL").is_some(),
-            "the census child ran without EC_AV1_PLANE_SENTINEL, so the fill was never live \
-             and the count is meaningless"
-        );
         println!("UWDEP_CENSUS {n} frames={}", frames.len());
     }
 

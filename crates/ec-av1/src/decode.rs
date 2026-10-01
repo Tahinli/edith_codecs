@@ -21138,19 +21138,36 @@ fn dump_stage16(
     v: &PlaneBuf<'_>,
     fw: usize,
     fh: usize,
+    ss_x: usize,
+    ss_y: usize,
 ) {
     use std::io::Write;
     // lane-sbrect10 r2 / lane-cdef r1 (one shared helper): index the dump by
     // decode-order picture like EC_AV1_PREFILT_DUMP already does -- a fixed
     // `.f0` name kept only the LAST frame, so a mid-sequence divergence could
-    // not be read out at all.
+    // not be read at all.
+    //
+    // lane-unwritten-dep: the chroma extent is PER-AXIS subsampling, not
+    // `div_ceil(2)` on both. The hardcoded pair was a 4:2:0 assumption and it
+    // was load-bearing: on a 64x64 4:2:2 frame (ss_x = 1, ss_y = 0) it wrote
+    // 32x32 chroma per plane where the frame carries 32x64, so HALF of each
+    // chroma plane appeared in NO stage dump at all. A stage bisect that reads
+    // "identical pre-deblock, differs post-deblock" off these dumps is then
+    // measuring the dump's blind spot, not the pipeline's: the samples it could
+    // not see are exactly the region where the 4:2:2 witness's output diverges
+    // (chroma rows 30..63, 2048 samples). `round_ss` is the same rounding the
+    // decoder's own plane extents use, and it matches the oracle's
+    // `uv_crop_width` / `uv_crop_height` per axis.
+    // ONE file per frame: `dump_stage_idx` advances on every call, so creating
+    // the file inside the plane loop would write three files per frame and
+    // shift every later frame's index.
     if let Ok(path) = crate::envflags::var(var)
         && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for (p, w, h) in [
             (y, fw, fh),
-            (u, fw.div_ceil(2), fh.div_ceil(2)),
-            (v, fw.div_ceil(2), fh.div_ceil(2)),
+            (u, round_ss(fw, ss_x), round_ss(fh, ss_y)),
+            (v, round_ss(fw, ss_x), round_ss(fh, ss_y)),
         ] {
             for row in 0..h {
                 let mut bytes = Vec::with_capacity(w * 2);
@@ -37513,6 +37530,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
@@ -37595,6 +37614,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     apply_cdef(
         &mut y,
@@ -37615,6 +37636,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     capture_stages(&y, &u, &v, deblocked.as_ref(), fctx);
     // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
@@ -55797,6 +55820,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
@@ -55899,6 +55924,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     if !pipelined {
         apply_cdef(
@@ -55921,6 +55948,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         &v,
         frame_width as usize,
         frame_height as usize,
+        ss_x(fctx),
+        ss_y(fctx),
     );
     capture_stages(&y, &u, &v, deblocked.as_ref(), fctx);
     // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
