@@ -21154,7 +21154,6 @@ fn dump_stage16(
     ss_x: usize,
     ss_y: usize,
 ) {
-    use std::io::Write;
     // lane-sbrect10 r2 / lane-cdef r1 (one shared helper): index the dump by
     // decode-order picture like EC_AV1_PREFILT_DUMP already does -- a fixed
     // `.f0` name kept only the LAST frame, so a mid-sequence divergence could
@@ -21173,25 +21172,36 @@ fn dump_stage16(
     // the same rounding the
     // decoder's own plane extents use, and it matches the oracle's
     // `uv_crop_width` / `uv_crop_height` per axis.
+    //
     // ONE file per frame: `dump_stage_idx` advances on every call, so creating
     // the file inside the plane loop would write three files per frame and
     // shift every later frame's index.
-    if let Ok(path) = crate::envflags::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
-    {
-        for (p, w, h) in [
-            (y, fw, fh),
-            (u, round_ss(fw, ss_x), round_ss(fh, ss_y)),
-            (v, round_ss(fw, ss_x), round_ss(fh, ss_y)),
-        ] {
+    //
+    // lane-av1dumploud: this used to be `let _ = f.write_all(&bytes)` per row, so
+    // a full filesystem left a SHORT file that no reader could tell from a
+    // complete one. `LoudDump` is given the exact expected length this function
+    // knows -- `(fw*fh + 2*cw*ch) * 2`, u16 LE -- and checks it against the file
+    // on disk; a shortfall aborts the decode instead of leaving a plausible
+    // artefact behind.
+    if let Ok(path) = crate::envflags::var(var) {
+        let cw = round_ss(fw, ss_x);
+        let ch = round_ss(fh, ss_y);
+        let expected = (fw * fh + 2 * cw * ch) * 2;
+        let mut d = crate::dumpio::LoudDump::create(
+            var,
+            format!("{path}.f{}", dump_stage_idx(var)),
+            expected,
+        );
+        for (p, w, h) in [(y, fw, fh), (u, cw, ch), (v, cw, ch)] {
             for row in 0..h {
                 let mut bytes = Vec::with_capacity(w * 2);
                 for &s in &p.data[row * p.width..][..w] {
                     bytes.extend_from_slice(&s.to_le_bytes());
                 }
-                let _ = f.write_all(&bytes);
+                d.write(&bytes);
             }
         }
+        d.finish();
     }
 }
 
@@ -21214,14 +21224,17 @@ fn dump_stage_idx(var: &str) -> usize {
 }
 
 fn dump_stage(var: &str, y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
-    use std::io::Write;
-    if let Ok(path) = crate::envflags::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
-    {
-        for p in [y, u, v] {
-            let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
-            let _ = f.write_all(&narrow);
-        }
+    // lane-av1dumploud: loud on a short write (see [`crate::dumpio::LoudDump`]).
+    // The expected length is the three planes' own data lengths -- the writer
+    // iterates exactly `p.data`, so this is the same extent, not a re-derivation
+    // that could disagree with it.
+    if let Ok(path) = crate::envflags::var(var) {
+        let narrow = |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+        crate::dumpio::write_planes(
+            var,
+            format!("{path}.f{}", dump_stage_idx(var)),
+            &[&narrow(y), &narrow(u), &narrow(v)],
+        );
     }
 }
 
@@ -21247,7 +21260,9 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_WIDE_DUMP") else {
         return;
     };
-    use std::io::Write;
+    // lane-av1dumploud: loud on a short write. Expected length is
+    // `sum(true_width * true_height)` over the three planes -- the crop the
+    // writer itself builds, so the check cannot disagree with the bytes.
     let idx = dump_stage_idx("EC_AV1_PREFILT_WIDE_DUMP");
     let crop = |plane: &PlaneBuf<'_>| -> Vec<u8> {
         let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
@@ -21260,11 +21275,12 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
         }
         out
     };
-    if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-        let _ = f.write_all(&crop(y));
-        let _ = f.write_all(&crop(u));
-        let _ = f.write_all(&crop(v));
-    }
+    let (cy, cu, cv) = (crop(y), crop(u), crop(v));
+    crate::dumpio::write_planes(
+        "EC_AV1_PREFILT_WIDE_DUMP",
+        format!("{path}.f{idx}"),
+        &[&cy, &cu, &cv],
+    );
 }
 
 /// Enabled by `EC_AV1_PLANE_SENTINEL` (there is no separate flag for it): print
@@ -38219,15 +38235,18 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     );
     census_unwritten(&y, &u, &v);
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
-        use std::io::Write;
+        // lane-av1dumploud: loud on a short write (three discarded
+        // `write_all` results before). Expected length = the three planes' own
+        // data lengths: this dump is the PADDED plane, not a crop, so the
+        // writer's extent is `p.data` itself.
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            let narrow =
-                |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
-            let _ = f.write_all(&narrow(&y));
-            let _ = f.write_all(&narrow(&u));
-            let _ = f.write_all(&narrow(&v));
-        }
+        let narrow =
+            |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+        crate::dumpio::write_planes(
+            "EC_AV1_PREFILT_DUMP",
+            format!("{path}.f{idx}"),
+            &[&narrow(&y), &narrow(&u), &narrow(&v)],
+        );
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -38450,16 +38469,22 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         *m.borrow_mut() = if true_width > fw || true_height > fh {
             let yc = crop(&y, true_width, true_height);
             if let Ok(path) = crate::envflags::var("EC_AV1_MARGIN_DUMP") {
-                use std::io::Write;
                 static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let idx = IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-                    // corner-cut: this diagnostic dump stays 8-bit-narrowed
-                    // regardless of the stream's real bit depth (debug-only,
-                    // never read by a gate); widen if a >8-bit margin dump
-                    // is ever needed.
-                    let _ = f.write_all(&yc.iter().map(|&s| s as u8).collect::<Vec<u8>>());
-                }
+                // corner-cut: this diagnostic dump stays 8-bit-narrowed
+                // regardless of the stream's real bit depth (debug-only,
+                // never read by a gate); widen if a >8-bit margin dump
+                // is ever needed.
+                //
+                // lane-av1dumploud: loud on a short write. Expected length is
+                // `true_width * true_height` -- the crop this dump is exactly,
+                // not a re-derived geometry.
+                let narrow: Vec<u8> = yc.iter().map(|&s| s as u8).collect();
+                crate::dumpio::write_planes(
+                    "EC_AV1_MARGIN_DUMP",
+                    format!("{path}.f{idx}"),
+                    &[&narrow],
+                );
             }
             Some(Picture {
                 width: true_width,
@@ -56587,15 +56612,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     );
     census_unwritten(&y, &u, &v);
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
-        use std::io::Write;
+        // lane-av1dumploud: loud on a short write (see the key-frame twin
+        // above -- same file, same shape, same three planes).
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            let narrow =
-                |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
-            let _ = f.write_all(&narrow(&y));
-            let _ = f.write_all(&narrow(&u));
-            let _ = f.write_all(&narrow(&v));
-        }
+        let narrow =
+            |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+        crate::dumpio::write_planes(
+            "EC_AV1_PREFILT_DUMP",
+            format!("{path}.f{idx}"),
+            &[&narrow(&y), &narrow(&u), &narrow(&v)],
+        );
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }

@@ -1004,7 +1004,9 @@ pub(crate) mod symtrace {
     thread_local! {
         static BUF: RefCell<(String, usize)> = const { RefCell::new((String::new(), 0)) };
         static ECD: RefCell<VecDeque<(u32, u32, u32, u32)>> = RefCell::new(VecDeque::new());
-        static ECD_READER: RefCell<Option<std::fs::File>> = const { RefCell::new(None) };
+        // lane-av1dumploud: the file's PATH travels with it, so a short write
+        // can name the file it truncated instead of reconstructing a name.
+        static ECD_READER: RefCell<Option<(std::fs::File, String)>> = const { RefCell::new(None) };
         static ECD_IDX: RefCell<usize> = const { RefCell::new(0) };
     }
 
@@ -1027,15 +1029,26 @@ pub(crate) mod symtrace {
         let _ = idx;
         let line = format!("{idx} ({low},{value},{rng},{bitpos})\n");
         ECD_READER.with(|f| {
+            use std::io::Write;
             let mut slot = f.borrow_mut();
             if slot.is_none() {
                 let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let path = format!("{dir}/ecdump-{seq:05}.txt");
-                *slot = Some(std::fs::File::create(&path).expect("ecdump file"));
                 eprintln!("ECDUMP -> {path}");
+                *slot = Some((std::fs::File::create(&path).expect("ecdump file"), path));
             }
-            use std::io::Write;
-            let _ = slot.as_mut().unwrap().write_all(line.as_bytes());
+            // lane-av1dumploud: loud on a short write. This file is one line
+            // per symbol for a whole run, so its total length is unknowable at
+            // open time -- the failure line says "an unknown number of" rather
+            // than declaring a length it would have to invent.
+            let (file, path) = slot.as_mut().expect("just opened");
+            if let Err(e) = file.write_all(line.as_bytes()) {
+                panic!(
+                    "ec-av1 dump FAILED [EC_AV1_ECDUMP] {path}: \
+                     write failed after a partial line of {} bytes: {e}",
+                    line.len()
+                );
+            }
         });
         ECD.with(|q| {
             let mut q = q.borrow_mut();
@@ -1119,8 +1132,17 @@ pub(crate) mod symtrace {
         BUF.with(|b| {
             let (buf, n) = &mut *b.borrow_mut();
             if !buf.is_empty() {
+                // lane-av1dumploud: loud on a short write. `std::fs::write`
+                // returns a `Result` that this used to discard; the expected
+                // length is exactly the buffer's own.
                 let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _ = std::fs::write(format!("{dir}/{side}-{seq:05}.txt"), buf.as_bytes());
+                let (bytes, at) = (buf.as_bytes(), format!("{dir}/{side}-{seq:05}.txt"));
+                if let Err(e) = std::fs::write(&at, bytes) {
+                    panic!(
+                        "ec-av1 dump FAILED [EC_AV1_SYMTRACE] {at}: wrote 0 of {} bytes: {e}",
+                        bytes.len()
+                    );
+                }
             }
             buf.clear();
             *n = 0;
