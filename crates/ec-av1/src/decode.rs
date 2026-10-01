@@ -2132,6 +2132,25 @@ pub fn chroma422_square_hits() -> usize {
     CHROMA422_SQUARE_HITS.with(|c| c.get())
 }
 
+// lane-av1422tailskip: how many 4:2:2 (ss 1,0) intra-in-inter chroma TRANSFORM
+// UNITS took their own window on the block-sized chroma palette prediction --
+// `decode_inter_block`'s `side == 64` TX_32X32 walk, where the plane block is
+// 32x64 but codes two stacked square units per plane. Zero on a 4:2:0 or 4:4:4
+// frame (their chroma unit is the whole plane block, one window), and zero on
+// a 4:2:2 block with no palette, so a witness gate reading 0 proves the arm
+// never ran.
+thread_local! {
+    static PALETTE_422_UNIT_WINDOW_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_422_UNIT_WINDOW_HITS`].
+// lane-av1422tailskip: `pub` so `examples/decode_probe.rs` can census it the
+// way it does every other capability counter.
+pub fn palette_422_unit_window_hits() -> usize {
+    PALETTE_422_UNIT_WINDOW_HITS.with(|c| c.get())
+}
+
 // lane-av1-422f: how many RECT chroma coefficient units the square-block
 // path read on a 4:2:2 frame (ss 1,0) -- TX_4X8 / TX_8X16 / TX_16X32, the
 // plane block's own half-width, unhalved-height shape. A 4:2:0 or 4:4:4
@@ -45701,6 +45720,21 @@ fn decode_inter_block(
                             y.height,
                             fctx,
                         );
+                        // The 4:2:2 plane block is `(chroma_w, chroma_h)` --
+                        // 32x64 -- but codes TWO stacked TX_32X32 units, so
+                        // each unit needs its OWN window on the block-sized
+                        // chroma palette prediction. Armed once above, the
+                        // first unit consumed the whole 2048-entry buffer and
+                        // the second found none pending, silently falling back
+                        // to the edge DC prediction (s422_384x240 decode
+                        // frame 1, U/V rows 170..189 cols 23..31).
+                        if let Some((ub, _)) = &palette_uv_bufs {
+                            set_palette_pred(
+                                palette_window(ub, chroma_w, 0, cu_row * cu_h, cu_w, cu_h),
+                                fctx,
+                            );
+                        }
+                        hit!(PALETTE_422_UNIT_WINDOW_HITS);
                         let cu_grid = read_plane(
                             dec,
                             cdfs,
@@ -45828,6 +45862,14 @@ fn decode_inter_block(
                             y.height,
                             fctx,
                         );
+                        // The V twin of the U arm's per-unit window above.
+                        if let Some((_, vb)) = &palette_uv_bufs {
+                            set_palette_pred(
+                                palette_window(vb, chroma_w, 0, cu_row * cu_h, cu_w, cu_h),
+                                fctx,
+                            );
+                        }
+                        hit!(PALETTE_422_UNIT_WINDOW_HITS);
                         let cu_grid = read_plane(
                             dec,
                             cdfs,
