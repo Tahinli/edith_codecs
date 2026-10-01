@@ -2221,14 +2221,28 @@ fn decode_frame(
     // (scripts/instrument-aom-oracle.sh rung 12), which is what makes a
     // hidden frame's pixels comparable at all.
     // lane-unwritten-dep: the census AT the output point, beside the dump that
-    // defines "the output". The pre-deblock census cannot see a hole the loop
-    // filter later READS: deblock reads a neighbour to decide an edge, so an
-    // unwritten sample changes its neighbour's filtered value even when the
-    // unwritten sample itself is overwritten afterwards. Measured on
-    // `440_request_is_422`: pre-deblock 0 sentinel samples and byte-identical
-    // plain-vs-sentinel, yet the final output differs by 1986 bytes, entering
-    // the picture at the deblock pass (`EC_AV1_POSTDEBLOCK_DUMP16` is identical
-    // pre-deblock and differs by 26 bytes post-deblock).
+    // defines "the output" -- the same bytes, so the claim is about the frame the
+    // caller receives rather than about an intermediate stage.
+    //
+    // WHAT THIS IS FOR, corrected: an earlier revision of this comment said the
+    // pre-deblock plane was byte-identical plain-vs-sentinel and that deblock
+    // creates the dependence. That was wrong, and it was `dump_stage16`'s fault:
+    // it cropped chroma as `(fw/2, fh/2)`, a 4:2:0 assumption, so on a 64x64
+    // 4:2:2 frame 2048 chroma samples appeared in no stage dump at all -- exactly
+    // the region the difference lives in. With per-axis extents the corrected
+    // measurement on `440_request_is_422` is that the PRE-DEBLOCK dump already
+    // differs by 2158 bytes and an exact u16 census finds 224 unwritten samples
+    // (U 112, V 112, rows 36..63) -- the same count `lanes/av1unwritten.report.md`
+    // reports. The hole is present before any filter runs, and the pre-deblock
+    // census SEES it.
+    //
+    // So this second census is not a patch for a blind pre-deblock scan. It is
+    // the measurement taken where the output is taken, which covers the whole span
+    // from the tile walk to the caller's frame: anything a later stage could
+    // introduce (a filter, superres, a second pass) is inside its extent, where
+    // a scan taken before it would not be. It also runs before `apply_grain`, so
+    // the claim is over the PRE-GRAIN planes -- the bytes the reference bank
+    // stores and every later frame predicts from.
     decode::census_unwritten_final(&picture.y, &picture.u, &picture.v);
     if let Some(prefix) = final_dump {
         use std::io::Write;
@@ -48221,12 +48235,12 @@ exit 0
     ///
     /// SCOPE, stated rather than implied: the census is taken where
     /// `EC_AV1_FINAL_DUMP` writes, which is BEFORE `apply_grain`. The claim is
-    /// therefore over the PRE-GRAIN planes -- which is also the claim that matters
-    /// most, because those exact bytes are what the reference bank stores and what
-    /// every later frame predicts from. Film grain synthesises from that pre-grain
-    /// frame plus the grain parameters and does not read the plane buffer, so it
-    /// cannot introduce a hole. The claim is NOT "the caller's final grained
-    /// picture has no hole" and is not asserted.
+    /// therefore over the PRE-GRAIN planes -- which are also the bytes the
+    /// reference bank stores and every later frame predicts from, the dependency
+    /// that matters. Whether `apply_grain` can itself introduce a hole is NOT
+    /// measured: the census never sees the planes `apply_grain` allocates. So the
+    /// claim is NOT "the caller's final grained picture has no hole", and nothing
+    /// here asserts that grain cannot introduce one.
     ///
     /// NON-VACUITY, the part that makes this gate worth having: a census is only a
     /// measurement if it CAN report non-zero. The control is a SYNTHETIC positive
@@ -48237,6 +48251,20 @@ exit 0
     /// reason unrelated to this gate. A synthetic control cannot be refused and
     /// cannot change behaviour when a lane lands. It is proven by mutation in the
     /// same run: neutering `census_unwritten_final` reds it (lane report §5).
+    ///
+    /// WHAT THIS IS NOT, corrected from an earlier revision of this comment: it
+    /// does NOT rest on a claim that the pre-deblock census is blind. That claim
+    /// was wrong. It came from `dump_stage16` cropping chroma as `(fw/2, fh/2)` --
+    /// a 4:2:0 assumption -- so on a 64x64 4:2:2 frame 2048 chroma samples were in
+    /// no stage dump at all, and an earlier revision read that blind spot as
+    /// "identical pre-deblock, so deblock creates the dependence". With per-axis
+    /// extents the corrected measurement is the opposite: the pre-deblock dump on
+    /// `440_request_is_422` already DIFFERS by 2158 bytes and the exact u16 census
+    /// finds 224 unwritten samples (U 112, V 112, rows 36..63, whole 4x4 groups) --
+    /// the same count `lanes/av1unwritten.report.md` reports. The hole is present
+    /// before any filter runs and the pre-deblock census SEES it. This census is
+    /// here because it is the measurement taken where the OUTPUT is taken, which
+    /// spans the whole route from the tile walk to the caller.
     ///
     /// The four film fixtures are the corpus's real 10-bit streams with hidden
     /// alt-refs -- the shapes where a hidden frame's unwritten region would feed
@@ -48269,7 +48297,7 @@ exit 0
         // the fill cannot be switched from inside a test process. The child
         // process below is therefore how the measurement is taken; what the
         // parent asserts is the CHILD's reported count.
-        let census = |fixture: &str| -> usize {
+        let census = |fixture: &str| -> (usize, usize) {
             let exe = std::env::current_exe().expect("test binary path");
             let out = std::process::Command::new(exe)
                 .args([
@@ -48290,7 +48318,7 @@ exit 0
             );
             text.lines()
                 .find_map(|l| l.strip_prefix("UWDEP_CENSUS "))
-                .and_then(|v| v.split_whitespace().next().and_then(|n| n.parse().ok()))
+                .and_then(parse_census_line)
                 .unwrap_or_else(|| {
                     panic!(
                         "{NAME}: the census child reported no count for {fixture} \
@@ -48305,7 +48333,12 @@ exit 0
         // report exactly that number. No fixture is involved, so this cannot be
         // affected by lane/av1unwritten refusing `440_request_is_422` on merge.
         // The fill is env-gated, so even this runs in the child.
-        let synthetic = census_synthetic();
+        let (synthetic, synthetic_scanned) = census_synthetic();
+        assert_eq!(
+            synthetic_scanned, 40,
+            "{NAME}: the synthetic control scanned {synthetic_scanned} samples, expected 40 \
+             (16 + 16 + 8) -- the census did not look at what it was handed"
+        );
         assert_eq!(
             synthetic, 7,
             "{NAME}: the census reported {synthetic} for planes carrying exactly 7 sentinel \
@@ -48319,7 +48352,13 @@ exit 0
             "gm_small_side_witness",
             "troy_sb128_inter_witness",
         ] {
-            let n = census(fixture);
+            let (n, scanned) = census(fixture);
+            assert!(
+                scanned > 0,
+                "{NAME}: the census scanned 0 samples on {fixture} -- the call at the output \
+                 point is not running, so the {n} below proves nothing (class: \
+                 census-never-ran). Deleting the call site reproduces this."
+            );
             assert_eq!(
                 n, 0,
                 "{NAME}: {fixture} hands the caller {n} samples the tile walk never wrote"
@@ -48327,12 +48366,27 @@ exit 0
         }
     }
 
+    /// Parses the child's `UWDEP_CENSUS <unwritten> frames=<n> scanned=<n>` line
+    /// into `(unwritten, scanned)`. The scanned count is what makes the fixture
+    /// arms meaningful: `unwritten == 0` is also what a build with the census call
+    /// deleted reports, and only a non-zero scanned count distinguishes "scanned
+    /// and found nothing" from "never scanned".
+    fn parse_census_line(v: &str) -> Option<(usize, usize)> {
+        let mut parts = v.split_whitespace();
+        let unwritten = parts.next()?.parse().ok()?;
+        let scanned = parts
+            .find_map(|p| p.strip_prefix("scanned="))?
+            .parse()
+            .ok()?;
+        Some((unwritten, scanned))
+    }
+
     /// Runs the census child with `UWDEP_CENSUS_FIXTURE` UNSET, which makes it
     /// take the synthetic-positive path: hand [`census_unwritten_final`] planes
     /// with a known number of `PLANE_SENTINEL` values and report what it counted.
     /// This is the non-vacuity control, and it is a direct function-level check
     /// rather than a decode, so no fixture's decode behaviour can change it.
-    fn census_synthetic() -> usize {
+    fn census_synthetic() -> (usize, usize) {
         const NAME: &str = "the_frame_the_caller_receives_carries_no_unwritten_plane_sample";
         let exe = std::env::current_exe().expect("test binary path");
         let out = std::process::Command::new(exe)
@@ -48353,7 +48407,7 @@ exit 0
         );
         text.lines()
             .find_map(|l| l.strip_prefix("UWDEP_CENSUS "))
-            .and_then(|v| v.split_whitespace().next().and_then(|n| n.parse().ok()))
+            .and_then(parse_census_line)
             .unwrap_or_else(|| {
                 panic!(
                     "{NAME}: the census child reported no synthetic count (child said: {:?})",
@@ -48392,7 +48446,8 @@ exit 0
             let _ = decode::take_final_unwritten_samples();
             decode::census_unwritten_final(&a, &b, &c);
             let n = decode::take_final_unwritten_samples();
-            println!("UWDEP_CENSUS {n} synthetic=1");
+            let scanned = decode::take_final_census_scanned();
+            println!("UWDEP_CENSUS {n} synthetic=1 scanned={scanned}");
             return;
         }
         let Ok(fixture) = std::env::var("UWDEP_CENSUS_FIXTURE") else {
@@ -48407,7 +48462,8 @@ exit 0
         let _ = decode::take_final_unwritten_samples();
         let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{fixture} refused: {e}"));
         let n = decode::take_final_unwritten_samples();
-        println!("UWDEP_CENSUS {n} frames={}", frames.len());
+        let scanned = decode::take_final_census_scanned();
+        println!("UWDEP_CENSUS {n} frames={} scanned={scanned}", frames.len());
     }
 
     /// lane-t900 r6: the 128-superblock INTER witness.

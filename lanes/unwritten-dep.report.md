@@ -131,10 +131,11 @@ region r2's conclusion was drawn from.**
 **Coordinates, from the corrected pre-deblock dump** (8192 samples, u16, whole
 plane, `0xDEAD` counted):
 
-* unwritten samples, sentinel run: **U 112, V 112, Y 0** — U and V rows 36–63
-  (16 distinct rows), cols 0–15, in whole 4×4 groups (row 36: cols 0–3 and
-  12–15). **224 total, which is exactly lane/av1unwritten's own census number**
-  (`lanes/av1unwritten.report.md:152-156`).
+* unwritten samples, sentinel run: **U 112, V 112, Y 0** — U and V, 28 whole
+  4×4 groups each, spanning rows 36–63 (12 rows carrying 8 samples + 4 rows
+  carrying 4 = 96 + 16 = 112). The column span runs 0–15 but is NOT filled:
+  every row has cols 0–3 and 12–15. **224 total, exactly lane/av1unwritten's own
+  census number** (`lanes/av1unwritten.report.md:152-156`).
 * plain vs sentinel differing samples, pre-deblock: **U 1004 of 2048, V 1004 of
   2048, Y 0**, rows 32–63 — the hole plus everything predicted from it.
 
@@ -174,11 +175,12 @@ over the three planes at the point they are stored into the reference slots, wit
 `stream.rs`: the census is called beside the `EC_AV1_FINAL_DUMP` site.
 
 **SCOPE, stated not implied:** that point is **before `apply_grain`**, so the
-claim is over the **pre-grain** planes. That is also the claim that matters
-most — those exact bytes are what the reference bank stores and what every later
-frame predicts from, and grain synthesises from the pre-grain frame plus the
-grain parameters without reading the plane buffer. "The caller's final grained
-picture has no hole" is **not** claimed and is not asserted.
+claim is over the **pre-grain** planes only. Those are also the bytes the
+reference bank stores and every later frame predicts from, which is the
+dependency that matters. Whether `apply_grain` can itself introduce a hole is
+**not measured here** -- the census never sees the planes `apply_grain`
+allocates -- so "the caller's final grained picture has no hole" is **not
+claimed**, and no sentence asserts that grain cannot introduce one.
 
 Gate `the_frame_the_caller_receives_carries_no_unwritten_plane_sample`:
 
@@ -198,23 +200,43 @@ meaningless zero.
 merged into this branch (`c62eeda9`), then:
 
 ```
-$ CARGO_TARGET_DIR=.../uwdep-merge cargo test -p ec-av1 --lib -- the_frame_the_caller_receives_carries_no_unwritten_plane_sample
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 816 filtered out; finished in 71.58s
+$ cargo test -p ec-av1 --lib -- the_frame_the_caller_receives_carries_no_unwritten_plane_sample
+test result: ok. 1 passed; 0 failed; 0 ignored; 816 filtered out; finished in 71.59s
 ```
 
-816 filtered (vs 813 on the branch point) — the merged tree's extra tests are
-present, so this is the gate running against both lanes' content, not one.
+The proof that this tree really carries `av1unwritten`'s content is behavioural,
+not a test count (a filtered-test count is a count of names, and a merge that
+dropped hunks would print the same number):
+
+```
+$ decode_probe crates/ec-av1/fixtures/440_request_is_422.obu
+REFUSED: unsupported: AV1 tile (a block size 4x8, 8x16 or 16x4 (or 8x4 at 4:4:0) has no
+chroma plane block at this frame's subsampling mode ...
+```
+
+**0 frames, refused** — only reachable with the refusal present. On the branch
+point `8d6998d7` the same fixture decodes to `OK: 1 frames decoded`. That is the
+merge proof. (It is also why the fixture-carried control had to go: the census
+child could not run at all here.)
 
 ### Mutations
 
 | mutation | result |
 |---|---|
-| `census_unwritten_final` neutered (`if true { return; }`) | **RED**: "the census reported 0 for planes carrying exactly 7 sentinel samples … (class: census-silently-blind)" |
-| the `census_unwritten_final` call removed from the output point | RED at the same control |
+| `census_unwritten_final` neutered (`if true { return; }`) | **RED** at the synthetic control: "the census reported 0 for planes carrying exactly 7 sentinel samples … (class: census-silently-blind)" |
+| **the call at `stream.rs` DELETED** (the whole line replaced by a `let _ =`) | **RED**: "the census scanned 0 samples on hg_arf_witness -- the call at the output point is not running, so the 0 below proves nothing (class: census-never-ran). Deleting the call site reproduces this." |
 | one sentinel sample forced into a film frame's output (`p.y[0] = 0xDEAD`) | RED on the fixture: "hg_arf_witness hands the caller N samples the tile walk never wrote" |
 
-The first is the non-vacuity proof in the same run, and it no longer depends on
-any fixture's decode behaviour.
+The second row was **false as stated in r3** and is the substantive fix here: r3's
+control called `census_unwritten_final` directly, so deleting the pipeline call
+left every assertion passing and the gate pinned nothing about the decode. The
+gate now reads `take_final_census_scanned()` alongside
+`take_final_unwritten_samples()` — the same pairing the merged pre-deblock census
+already documents ("a gate that only asserts `take_unwritten_samples() == 0`
+passes on a decode that never scanned anything, so it reads THIS too"). The
+fixture arms require `scanned > 0`, the synthetic arm requires `scanned == 40`
+(16 + 16 + 8), so "scanned and found nothing" is now distinguishable from
+"never scanned".
 
 ## 7. Commands
 
@@ -295,3 +317,22 @@ contradictory: the witness's output depends on ambient memory, and what the
 allocator hands back is machine- and run-dependent, so a fixed value on one host
 and a varying one on another are the same defect. **Stated as measured: 3/3
 identical here, and no claim about reproducing their observation.**
+
+## 11. What the per-axis extent change invalidated in published work
+
+`round_ss(dim, 1)` is bit-identical to `dim.div_ceil(2)`, so **every 4:2:0 dump is
+byte-for-byte unchanged** by the `dump_stage16` fix. The change only affects 4:2:2
+and 4:4:0 frames.
+
+21 lane files reference the `*_DUMP16` dumps. Of those, exactly one,
+`lanes/av1422luma.report.md`, uses non-4:2:0 fixtures (`s422_416x250_10b`). Its
+stage table (line 77 onward) is a **Y-only** conclusion — every row reads
+"frame 0 Y wrong vs ffmpeg", and the reported numbers are luma sample counts and
+a luma first-differing coordinate — so that conclusion **survives** the extent
+change unchanged. What the change invalidates is only that report's **label**:
+"depth-correct `*_DUMP16`" is no longer accurate for the **chroma half** of those
+files, which the 4:2:0 crop had truncated to the top half-height. No published
+number moves.
+
+`lanes/unwritten-dep.report.md` (this file) is the only other DUMP16 reference
+touching a non-4:2:0 frame, and its numbers are the corrected ones above.
