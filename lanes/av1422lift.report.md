@@ -191,9 +191,12 @@ ten 4:2:2 gates, the renamed/inverted gates, `--lib film_grain`,
 enumerations, `the_decode_path_refuses_exactly_the_listed_cases` (the gate
 that forces the guard and the two inventory rows into one commit), and
 `cfl_ac_q3_at_is_reached_only_through_the_420_fallthrough_of_cfl_ac_ss`. All
-green. `cargo check --lib --tests --examples` is clean with zero warnings,
-so nothing fails to build. **Main's VPS runs are the regression signal for
-the rest of the crate.**
+green.
+
+A partial whole-suite run got **123 tests deep with zero failures** before I
+cut it, which is a floor and not a green suite. `cargo check --lib --tests
+--examples` is clean with zero warnings, so nothing fails to build.
+**Main's VPS runs are the regression signal for the rest of the crate.**
 
 ### The out-of-process corpus re-measurement on this branch
 
