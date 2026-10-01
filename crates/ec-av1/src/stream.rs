@@ -48501,6 +48501,19 @@ exit 0
     /// in-process counter -- which no external binary could read.
     #[test]
     fn uwdep_child_unwritten_census() {
+        // Reached with NEITHER variable set means a normal suite run: the parent
+        // invokes this test BY NAME with the variable set, so there is nothing to
+        // measure here. Asserting the fill instead made every full suite red
+        // (`stream::tests::uwdep_child_unwritten_census` is in the default test
+        // list), and the run it wanted to catch is already caught on the parent's
+        // side, which panics when the child prints no census line. A standalone
+        // run SAYS it skipped rather than passing silently.
+        if std::env::var_os("UWDEP_CENSUS_SYNTHETIC").is_none()
+            && std::env::var_os("UWDEP_CENSUS_FIXTURE").is_none()
+        {
+            println!("UWDEP_CENSUS skipped: not invoked as a census child");
+            return;
+        }
         assert!(
             std::env::var_os("EC_AV1_PLANE_SENTINEL").is_some(),
             "the census child ran without EC_AV1_PLANE_SENTINEL, so the fill was never live \
