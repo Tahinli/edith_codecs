@@ -336,3 +336,74 @@ number moves.
 
 `lanes/unwritten-dep.report.md` (this file) is the only other DUMP16 reference
 touching a non-4:2:0 frame, and its numbers are the corrected ones above.
+
+## 12. OPEN, filed: the `unsafe { v.set_len(n) }` in `fresh_plane` is not fully justified
+
+**This is the highest-risk item this lane found, and it is NOT closed here.** It
+is filed rather than fixed because closing it means either restoring a ~3% frame-
+head cost or building a reads-before-write instrument, and both are decisions
+that belong to a lane chartered for them. The comments in `decode.rs` now say
+this, so a reviewer can no longer approve the `unsafe` on a withdrawn proof.
+
+**The retracted claim.** `fresh_plane`'s doc asserted the SB-padded surface "is
+written sample-for-sample by the tile walk's reconstruction before anything reads
+it", and cited the sentinel gate as proof ("proven by the sentinel gate above").
+**The same file retracts it**, at `chroma_plane_block_codable`'s "What led here":
+on `440_request_is_422`, five runs with uninitialised planes give **two different
+output hashes**, five sentinel runs give one, and the pre-deblock census finds
+**112 unwritten samples per chroma plane, 224 total**
+(`lanes/av1unwritten.report.md:126-128`). Output that varies with the buffer's
+initial content means an uninitialised sample was **read**.
+
+**What the gate actually proves — the weaker claim.** The sentinel census counts
+at two points, pre-deblock and the output point, so it measures **survival, not
+reads**:
+
+* PROVEN: no sample the tile walk never wrote **survives into the frame the
+  caller receives**, on the corpus measured.
+* NOT PROVEN: "every sample is written before it is read". A sample read as a
+  prediction or filter neighbour and overwritten a moment later is invisible to
+  both counts. **No such read has been observed, and no instrument in this crate
+  measures for one.**
+* On `main` = `e45cc748` the one path where a read was **demonstrated** is now
+  unreachable — lane/av1unwritten refuses the subsize before descending.
+
+**Why this is UB-class and not a style issue.** `Vec::set_len` over
+uninitialised memory is not itself UB: `u16` has no invalid bit patterns and no
+`Drop`, so the vector validly *owns* `n` slots. The UB is in **reading** an
+uninitialised `u16`. `set_len` is therefore sound only under the "written before
+read" premise, and that premise is the one the measurement withdrew.
+
+**Two closures, neither taken here:**
+
+1. **Zero the allocation** — restore `vec![0u16; n]`. Sound unconditionally, at
+   the ~3% of frame-thread cycles at 4K that lane-picalloc removed. This is the
+   safe default and the honest cost of the optimisation.
+2. **Instrument reads-before-write** — a per-sample read/write map, so the premise
+   can be proved rather than assumed. That is a real instrument, not a comment,
+   and it is the only route that keeps the optimisation.
+
+**Reachability evidence** (what makes this fileable rather than theoretical): a
+demonstrated read on `440_request_is_422` at `8d6998d7` — 224 unwritten samples,
+output varying with initial content, two distinct plain hashes across five runs
+— and that path is refused on `main`, so the corpus contains no *currently
+reachable* instance. The claim that needs proving is universal ("every sample is
+written before it is read"), and one refused witness cannot establish it for the
+other 126 fixtures.
+
+## 13. Does this lane's gate supply the reader `take_unwritten_samples` lacked? — NO
+
+Checked, and the answer is the unflattering one. `take_unwritten_samples` and
+`take_census_scanned` (lane/av1unwritten's pre-deblock census API) still have
+**no committed reader** on `main` = `e45cc748`: the only references to them
+anywhere in `crates/ec-av1/src` are in their own doc comments. `grep` over
+`stream.rs` and the rest finds no call site.
+
+My gate reads only its OWN pair, `take_final_unwritten_samples` /
+`take_final_census_scanned`. So the r4 pairing is a **template** for how a census
+gate should be written (count AND scanned, so "scanned and found nothing" is
+distinguishable from "never scanned") — it is **not** a committed gate over the
+pre-deblock census, and this report does not claim one. Closing that gap means
+either adding the pre-deblock pair to an existing gate's assertions or giving it
+its own; that is a decision for the lane that owns the instrument, and it is named
+here rather than assumed done.
