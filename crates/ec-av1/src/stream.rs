@@ -318,13 +318,16 @@ pub fn intra128_lossless_counters() -> usize {
 
 /// lane-av1-128rectspan: chroma transform units re-stamped by
 /// `decode_block_128rect`'s end-of-block replay, and how many of those
-/// replays stamped a height that was not the unit's own. lane-av1422lift:
-/// that mismatch was described as "the 4:2:2 signature -- zero on every
-/// stream this decoder admits, since 4:2:2 is refused by name at the
-/// sequence header". 4:2:2 is decoded now, so the mismatch half is a live
-/// detector on 4:2:2 streams and stays zero only because the per-axis span
-/// is correct; the 4:2:2 rows of
-/// `the_pinned_422_corpus_cells_decode_pixel_exact` assert that.
+/// replays stamped a height that was not the unit's own.
+/// lane-av1422lift: the second half was described as "the 4:2:2 signature --
+/// zero on every stream this decoder admits, since 4:2:2 is refused by name
+/// at the sequence header", and that was TRUE. 4:2:2 is decoded now and the
+/// mismatch is NOT zero: measured on this branch's tip, the two
+/// `422_intrabc_sb128_strip*` pins each read `(72, 9)` while the other 19
+/// committed 4:2:2 cells read `(0, 0)`. Those two pins are byte-exact
+/// against ffmpeg, so the non-zero half counts the arm's own designed case
+/// and is not a defect. No 4:2:2 gate reads this pair; the two gates that do
+/// are on 4:2:0 and 4:4:4 streams, where the half is structurally zero.
 pub fn sb128rect_chroma_replay_counters() -> (usize, usize) {
     crate::decode::sb128rect_chroma_replay_hits()
 }
@@ -9201,13 +9204,16 @@ pub(crate) mod tests {
         // stopped replaying reads 0), and the mismatch half is the 4:2:2
         // signature: this stream is 4:4:4 (ss 0,0), where the unit's luma
         // width and height are equal, so a replay that stamped one axis with
-        // the other's span would still read 0 here. lane-av1422lift: 4:2:2 is
         // decoded now, so this counter no longer "names the day 4:2:2 is
-        // admitted" -- the 4:2:2 rows of
-        // `the_pinned_422_corpus_cells_decode_pixel_exact` read the mismatch
-        // half on streams where the two spans actually differ, which is what
-        // stops an 8-row spill below the block from corrupting the next
-        // block's `txb_skip` silently.
+        // admitted" -- it fires there. **DO NOT copy this zero assert onto a
+        // 4:2:2 stream**: measured on this branch's tip, the two
+        // `422_intrabc_sb128_strip*` pins each read `mismatch = 9` while
+        // being byte-exact against ffmpeg, because the mismatch half counts
+        // the replay's own designed 4:2:2 case rather than a defect. What
+        // stops the 8-row spill below the block from corrupting the next
+        // block's `txb_skip` is the per-axis span itself, and the 4:2:2
+        // exactness gates (`the_pinned_422_intrabc_sb128_strip_witnesses_
+        // decode_pixel_exact`) are what hold it -- not this counter.
         let after_replay = crate::decode::sb128rect_chroma_replay_hits();
         assert!(
             after_replay.0 > before_replay.0,
@@ -10765,10 +10771,13 @@ pub(crate) mod tests {
         // them over its own luma-mi rows -- the arm the span fix sits on, on
         // the OTHER admitted ss (1,1). The mismatch half is the 4:2:2
         // signature; lane-av1422lift: 4:2:2 is decoded now, so this is no
-        // longer "the tripwire for the day it is not" -- it is a zero this
-        // gate asserts on the stream in front of it, and the 4:2:2 rows of
-        // `the_pinned_422_corpus_cells_decode_pixel_exact` assert the same
-        // zero there.
+        // longer "the tripwire for the day it is not". It is a zero this gate
+        // asserts about the stream in front of it, and nothing else.
+        // **DO NOT carry it to a 4:2:2 stream**: the two
+        // `422_intrabc_sb128_strip*` pins read `mismatch = 9` each and are
+        // byte-exact against ffmpeg, so a 4:2:2 zero assert would red on a
+        // provably correct cell. The 4:2:2 rows of the corpus gate read
+        // neither half of this counter.
         let after_replay = crate::decode::sb128rect_chroma_replay_hits();
         assert!(
             after_replay.0 > before_replay.0,
