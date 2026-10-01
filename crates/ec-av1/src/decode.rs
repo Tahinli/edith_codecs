@@ -2856,9 +2856,12 @@ thread_local! {
     /// Chroma units of the same walk whose grid is exactly 1x2 (4:4:4 32x64,
     /// or 16x64 as two 16x32s).
     static RECT_TILED_CHROMA_1X2_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Chroma units of the same walk in any other multi-unit grid (2x2 and up
-    /// -- only reachable at 4:2:2, which is refused, so this stays 0 on
-    /// every admitted stream; kept so the match above is exhaustive).
+    /// Chroma units of the same walk in any other multi-unit grid (2x2 and
+    /// up). lane-av1422lift: 4:2:2 is DECODED, so this is no longer an arm
+    /// no admitted stream can reach -- a 4:2:2 block whose chroma plane is
+    /// wider than tall relative to its luma span lands here. The corpus gate
+    /// `the_pinned_422_corpus_cells_decode_pixel_exact` reads this counter
+    /// as a non-vacuity arm; kept so the match above is exhaustive).
     static RECT_TILED_CHROMA_NXN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -6136,9 +6139,10 @@ thread_local! {
 
 // lane-av1422luma: the ss (1,0) twin of `INTRABC_RECT4_OWN_CHROMA444_HITS`
 // -- how many intra-BC 1:4 strips at 4:2:2 took the own-chroma (no pair)
-// route. Same caveat as the 4:4:4 counter: it proves REACH and nothing else,
-// and 4:2:2 is refused at the sequence header, so no committed test can read
-// it (the count in `lanes/av1422luma.report.md` is from a bypassed probe build).
+// route. Same caveat as the 4:4:4 counter: it proves REACH and nothing else.
+// lane-av1422lift: 4:2:2 is DECODED, so committed tests CAN read this
+// counter now; `the_pinned_422_corpus_cells_decode_pixel_exact` reads its
+// delta on every corpus row.
 thread_local! {
     static INTRABC_RECT4_OWN_CHROMA422_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -17005,9 +17009,14 @@ fn decode_block_rect4(
     // 4:2:0 codes 16x4/4x16 (`TxbSet::Chroma8`); 4:4:4 codes the strip
     // itself, 32x8/8x32 (`get_txsize_entropy_ctx(TX_32X8)` =
     // `(wide_log2 + high_log2 + 1) >> 1` = the 16x16 set,
-    // `TxbSet::Chroma16`). The caller set is closed -- this reader only
-    // ever sees 32x8 / 8x32 luma and the sequence header admits ss 0/0
-    // and 1/1 only -- so the table is exhaustive.
+    // `TxbSet::Chroma16`). The caller set is closed -- this reader only ever
+    // sees 32x8 / 8x32 luma. lane-av1422lift: this sentence used to end "and
+    // the sequence header admits ss 0/0 and 1/1 only -- so the table is
+    // exhaustive", which was a claim about a guard rather than about this
+    // reader. The header admits ss (1,1), (1,0) and (0,0), and the (1,0)
+    // 4:2:2 arm is dispatched a few lines below (`chroma422_rect32`), so the
+    // table's exhaustiveness comes from the reader's own luma shape -- which
+    // is what the sentence now claims.
     let chroma422_rect32 = (chroma_w, chroma_h) == (4, 32) && ss_x(fctx) == 1 && ss_y(fctx) == 0;
     let (chroma_set, chroma_scan): (TxbSet, &[u16]) = match (chroma_w, chroma_h) {
         (16, 4) => (TxbSet::Chroma8, &SCAN_16X4[..]),
@@ -23406,13 +23415,14 @@ thread_local! {
     /// ... and the number of non-skip 128-root rect BLOCKS whose replay
     /// height differs from the unit's own LUMA-MI height -- the signature of the
     /// width passed to both axes (`luma_span` where the in-loop stamp used
-    /// `luma_span_h`). Zero on every stream this decoder admits: both
-    /// supported chroma formats have `ss_x == ss_y` (4:2:0 and 4:4:4), and
-    /// 4:2:2 -- the one format whose two spans differ -- is refused by name
-    /// at the sequence header (`stream::decode_frame`), so the arm is
-    /// defensive until that format is ported. The counter turns a future
-    /// 4:2:2 admission (or any hardcoded span) into a named red gate instead
-    /// of silent mi-state corruption.
+    /// `luma_span_h`). lane-av1422lift: this used to read zero on every
+    /// admitted stream because 4:2:2 -- the one format whose two spans differ
+    /// -- was refused by name at the sequence header. It is DECODED now, so
+    /// this is a REAL detector, not a defensive arm: a hardcoded 4:2:0 span on
+    /// a 4:2:2 stream lands here and reads non-zero. The two 4:2:0/4:4:4
+    /// tripwire gates that assert zero keep asserting zero; the 4:2:2 row of
+    /// `the_pinned_422_corpus_cells_decode_pixel_exact` asserts it stays zero
+    /// there too, which is the claim that replaces "it cannot fire".
     pub(crate) static SB128RECT_REPLAY_SPAN_MISMATCH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

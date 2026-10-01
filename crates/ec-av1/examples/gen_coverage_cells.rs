@@ -29,12 +29,17 @@
 //!    the format ("yuv4mpeg can only handle yuv444p, yuv422p, yuv420p,
 //!    yuv411p and gray8") are consequences of that, not the reason. The pin
 //!    is the byte-level evidence: a 4:4:0 request at profile 2 (4:2:2, and
-//!    no coded subsampling bit below 12 bits) lands on `(1,0)`, the shape
-//!    this decoder refuses by name. The frame OBU behind it is a real 4:2:0
-//!    key frame's, byte for byte -- the subsampling lives only in the
-//!    sequence header -- so the pin is a HEADER witness, not a decodable
-//!    4:2:2 stream, and the gate
-//!    `the_440_cell_is_not_a_codable_chroma_shape` says exactly that.
+//!    no coded subsampling bit below 12 bits) lands on `(1,0)`. The frame OBU
+//!    behind it is a real 4:2:0 key frame's, byte for byte -- the subsampling
+//!    lives only in the sequence header -- so the pin is a HEADER witness, NOT
+//!    a decodable 4:2:2 stream. lane-av1422lift: it was never decodable as
+//!    one; the decoder used to refuse it at the sequence header, and now
+//!    admits the header, which is exactly why this pin may not be turned into
+//!    a 4:2:2 exactness gate. The gate
+//!    `the_440_cell_is_not_a_codable_chroma_shape` says exactly that, and the
+//!    real 4:2:2 exactness lives in `a_real_422_stream_decodes_pixel_exact`
+//!    and `the_pinned_422_corpus_cells_decode_pixel_exact`, which read
+//!    genuinely 4:2:2 pins.
 //!
 //! ```text
 //! cargo run -p ec-av1 --example gen_coverage_cells -- crates/ec-av1/fixtures
@@ -252,9 +257,11 @@ fn main() {
     // OBU behind it is a real 4:2:0 key frame's, byte for byte: the
     // subsampling lives only in the sequence header, so the frame header is
     // the same one either way. The stream is NOT a decodable 4:2:2 stream
-    // (its tile is 4:2:0); it is pinned as the byte-level evidence for the
-    // claim, and the decoder refuses it by name, which is the honest
-    // outcome for the shape the request lands on.
+    // (its tile is 4:2:0). lane-av1422lift: the decoder no longer refuses it
+    // by name, and that is NOT an endorsement -- the header now claims 4:2:2
+    // over a 4:2:0 tile, so a decode of these bytes is a header/tile
+    // mismatch. This pin stays a byte-level shape witness; every 4:2:2
+    // exactness claim lives on genuinely 4:2:2 pins in `stream.rs`.
     let tile_stream = ec_av1::encode::encode_key_frame(&card(WITNESS, WITNESS), Q_IDX, 0.5)
         .expect("encoding the witness tile")
         .stream;
@@ -306,7 +313,8 @@ fn main() {
     );
     println!(
         "440_request_is_422: asked for subsampling (0,1) at profile {} -- got ({sx},{sy}) at \
-         max_frame {mw}x{mh}, i.e. 4:2:2, the shape this decoder refuses by name; frame header + \
+         max_frame {mw}x{mh}, i.e. 4:2:2 (DECODED since lane-av1422lift, but these bytes carry \
+         a 4:2:0 tile, so the pin is a shape witness and not an exactness witness); frame header + \
          one tile ({} bytes) from a 4:2:0 {WITNESS}x{WITNESS} key frame",
         seq.seq_profile,
         frame_bytes.len()
