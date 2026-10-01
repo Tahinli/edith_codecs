@@ -348,22 +348,38 @@ this, so a reviewer can no longer approve the `unsafe` on a withdrawn proof.
 **The retracted claim.** `fresh_plane`'s doc asserted the SB-padded surface "is
 written sample-for-sample by the tile walk's reconstruction before anything reads
 it", and cited the sentinel gate as proof ("proven by the sentinel gate above").
-**The same file retracts it**, at `chroma_plane_block_codable`'s "What led here":
-on `440_request_is_422`, five runs with uninitialised planes give **two different
-output hashes**, five sentinel runs give one, and the pre-deblock census finds
-**112 unwritten samples per chroma plane, 224 total**
-(`lanes/av1unwritten.report.md:126-128`). Output that varies with the buffer's
-initial content means an uninitialised sample was **read**.
+**The same file retracts it.** The basis is **this lane's own measurement**, not
+second-hand: on `440_request_is_422` an exact u16 whole-plane census at the
+pre-deblock point finds **112 unwritten samples per chroma plane, 224 total** (U
+and V, 28 whole 4×4 groups each, rows 36–63) in a frame that is **SHOWN**
+(`Key show=true`) and whose samples the caller receives (§4, §5). Uninitialised
+memory that reaches the caller was read, or the read that produced it was. That
+is the UB, and it stands without any hash-variation claim.
 
-**What the gate actually proves — the weaker claim.** The sentinel census counts
-at two points, pre-deblock and the output point, so it measures **survival, not
-reads**:
+A hash-variation observation also exists — five plain runs of the witness giving
+two different output hashes (`lanes/av1unwritten.report.md:118-124`) — but it is
+**second-hand and NOT reproduced here**: five plain runs on `8d6998d7` gave one
+hash, `a761118c8dd5c8d0` (§10). It is therefore not relied on, and it should not
+have been stated flatly in the `decode.rs` comment, where it did read as this
+lane's measurement. Ambient content is machine-dependent, so a stable value on one
+host and a varying one on another would be the same defect either way; the
+224-sample census is the basis, the hashes are an aside.
+
+**What the gate actually proves — the weaker claim.** The gate counts at the
+**output point only**: one census, one scan. The pre-deblock census
+(`census_unwritten`, `take_unwritten_samples` / `take_census_scanned`) is a
+**different instrument with no committed reader anywhere in the crate on `main`**
+(§13), so it backs nothing here. An earlier revision of this section credited
+the gate with both, which would have told a reviewer auditing the `unsafe` that
+the premise is covered by two scans when only one exists — and the missing one is
+exactly the scan that would catch a hole before the filters. What the gate
+measures is **survival, not reads**:
 
 * PROVEN: no sample the tile walk never wrote **survives into the frame the
   caller receives**, on the corpus measured.
 * NOT PROVEN: "every sample is written before it is read". A sample read as a
   prediction or filter neighbour and overwritten a moment later is invisible to
-  both counts. **No such read has been observed, and no instrument in this crate
+  that count. **No such read has been observed, and no instrument in this crate
   measures for one.**
 * On `main` = `e45cc748` the one path where a read was **demonstrated** is now
   unreachable — lane/av1unwritten refuses the subsize before descending.
@@ -400,13 +416,16 @@ fixes one without the other will re-derive the error.
    can be proved rather than assumed. That is a real instrument, not a comment,
    and it is the only route that keeps the optimisation as-is.
 
-**Reachability evidence** (what makes this fileable rather than theoretical): a
-demonstrated read on `440_request_is_422` at `8d6998d7` — 224 unwritten samples,
-output varying with initial content, two distinct plain hashes across five runs
-— and that path is refused on `main`, so the corpus contains no *currently
-reachable* instance. The claim that needs proving is universal ("every sample is
-written before it is read"), and one refused witness cannot establish it for the
-other 126 fixtures.
+**Reachability evidence** (what makes this fileable rather than theoretical),
+**this lane's own measurement**: on `440_request_is_422` at `8d6998d7`, an exact
+u16 whole-plane census finds **224 unwritten chroma samples** (U 112, V 112,
+whole 4×4 groups, rows 36–63) in a frame that is **SHOWN** and whose samples the
+caller receives — uninitialised memory reaching the caller IS the UB, and it
+needs no hash claim. That path is refused on `main`, so the corpus contains no
+*currently reachable* instance; the hash-variation observation that also exists is
+second-hand and was not reproduced here (§10), so it is not part of the basis.
+The claim that needs proving is universal ("every sample is written before it is
+read"), and one refused witness cannot establish it for the other 126 fixtures.
 
 ## 13. Does this lane's gate supply the reader `take_unwritten_samples` lacked? — NO
 

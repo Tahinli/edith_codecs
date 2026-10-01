@@ -21172,7 +21172,9 @@ fn dump_stage16(
     // "identical pre-deblock, differs post-deblock" off these dumps is then
     // measuring the dump's blind spot, not the pipeline's: the samples it could
     // not see are exactly the region where the 4:2:2 witness's output diverges
-    // (chroma rows 30..63, 2048 samples). `round_ss` is the same rounding the
+    // (chroma rows 32..63 -- the old `fh.div_ceil(2)` crop wrote 32 of 64 rows,
+    // so everything from row 32 up was invisible; 2048 samples). `round_ss` is
+    // the same rounding the
     // decoder's own plane extents use, and it matches the oracle's
     // `uv_crop_width` / `uv_crop_height` per axis.
     // ONE file per frame: `dump_stage_idx` advances on every call, so creating
@@ -21744,25 +21746,38 @@ pub(crate) fn census_unwritten_final(y: &[u16], u: &[u16], v: &[u16]) {
 /// This comment previously claimed the SB-padded surface "is written
 /// sample-for-sample by the tile walk's reconstruction before anything reads
 /// it", and cited the sentinel gate as proof. **That claim is RETRACTED by
-/// measurement, in this same file**: on `440_request_is_422` the decode produced
-/// TWO different output hashes across five runs with uninitialised planes, one
-/// hash under `EC_AV1_PLANE_SENTINEL=1`, and a pre-deblock census of 112
-/// unwritten samples per chroma plane (224 total) -- see
-/// `chroma_plane_block_codable`'s "What led here" paragraph and
-/// `lanes/av1unwritten.report.md`. Output that varies with the buffer's initial
-/// content means an uninitialised sample was READ. A reviewer approving this
-/// `unsafe` on the old text was approving it on a withdrawn proof.
+/// measurement.** The basis for the retraction is THIS LANE's own, not
+/// second-hand: on `440_request_is_422` an exact u16 whole-plane census at the
+/// pre-deblock point finds **112 unwritten samples per chroma plane, 224 total**
+/// (U and V, 28 whole 4x4 groups each, rows 36..63) in a frame that is SHOWN
+/// (`Key show=true`) and whose samples the caller receives. Uninitialised memory
+/// that reaches the caller was read, or the read that produced it was. That is
+/// the UB, and it needs no hash-variation claim to stand.
+///
+/// A hash-variation observation also exists -- five plain runs of the same
+/// witness giving two different output hashes (`lanes/av1unwritten.report.md`),
+/// which would point the same way -- but it is SECOND-HAND and was NOT
+/// reproduced here: five plain runs on `8d6998d7` gave one hash
+/// (`a761118c8dd5c8d0`, `lanes/unwritten-dep.report.md` §10). It is not relied
+/// on, and the ambient content a run happens to receive is machine-dependent,
+/// so a stable value on one host and a varying one on another would be the same
+/// defect either way. The 224-sample census is the basis; the hashes are aside.
 ///
 /// WHAT IS ACTUALLY ESTABLISHED, and it is weaker:
 ///
 /// * The sentinel gate ([`census_unwritten_final`],
 ///   `the_frame_the_caller_receives_carries_no_unwritten_plane_sample`) proves
 ///   that no sample the tile walk never wrote SURVIVES into the frame the caller
-///   receives, on the corpus measured. It counts at two points -- pre-deblock and
-///   the output point -- so it measures SURVIVAL, not reads.
+///   receives, on the corpus measured. **It counts at the OUTPUT POINT ONLY --
+///   one census, one scan.** The pre-deblock census ([`census_unwritten`],
+///   `take_unwritten_samples` / `take_census_scanned`) is a DIFFERENT instrument
+///   and has NO committed reader anywhere in the crate on `main`, so it backs
+///   nothing here; an earlier revision of this comment credited the gate with
+///   both, which would have told a reviewer the premise is covered by two scans
+///   when only one exists. It is measured SURVIVAL, not reads.
 /// * It does NOT prove "every sample is written before it is read". A sample read
 ///   as a prediction or filter neighbour and overwritten a moment later is
-///   invisible to both counts. **No such read has been observed, and no
+///   invisible to that count. **No such read has been observed, and no
 ///   instrument here measures for one.**
 /// * On `main` = `e45cc748` the one path where a read was demonstrated is
 ///   UNREACHABLE: lane/av1unwritten refuses the subsize before descending.
@@ -21792,8 +21807,10 @@ fn fresh_plane(n: usize) -> Vec<u16> {
     // sample before any read. That premise was RETRACTED by measurement (224
     // unwritten samples, output varying with initial content) on a path that is
     // now refused, and is UNMEASURED everywhere else. The sentinel gate measures
-    // survival at two points, not reads. So this `unsafe` is sound under a
-    // premise no current instrument proves.
+    // survival at the output point, not reads. The pre-deblock census is a
+    // separate instrument with no committed reader on main, so it adds nothing
+    // here. So this `unsafe` is sound under a premise no current instrument
+    // proves.
     #[allow(unsafe_code)]
     unsafe {
         v.set_len(n);
