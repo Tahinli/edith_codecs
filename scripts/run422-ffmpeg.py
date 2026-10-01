@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cmpff  # noqa: E402
 
-PROBE = "/home/user/.cache/probes/decode_probe-main-f151cb14"
+PROBE = "/home/user/.cache/probes/decode_probe-main-41037463"
 WORK = "/home/user/.cache/seed422"
 
 
