@@ -318,9 +318,13 @@ pub fn intra128_lossless_counters() -> usize {
 
 /// lane-av1-128rectspan: chroma transform units re-stamped by
 /// `decode_block_128rect`'s end-of-block replay, and how many of those
-/// replays stamped a height that was not the unit's own (the 4:2:2 signature
-/// -- zero on every stream this decoder admits, since 4:2:2 is refused by
-/// name at the sequence header).
+/// replays stamped a height that was not the unit's own. lane-av1422lift:
+/// that mismatch was described as "the 4:2:2 signature -- zero on every
+/// stream this decoder admits, since 4:2:2 is refused by name at the
+/// sequence header". 4:2:2 is decoded now, so the mismatch half is a live
+/// detector on 4:2:2 streams and stays zero only because the per-axis span
+/// is correct; the 4:2:2 rows of
+/// `the_pinned_422_corpus_cells_decode_pixel_exact` assert that.
 pub fn sb128rect_chroma_replay_counters() -> (usize, usize) {
     crate::decode::sb128rect_chroma_replay_hits()
 }
@@ -1381,11 +1385,15 @@ pub(crate) struct SeqFlags {
     pub(crate) mono_chrome: bool,
     pub(crate) order_hint_bits: u32,
     pub(crate) mc_identity: bool,
-    /// lane-av1txr: `color_config.subsampling_x/y` (spec 5.5.2). The decoder
-    /// itself hardcodes 4:2:0 everywhere, so these exist only for the
-    /// sequence-level refusal in [`decode_stream_with`] -- nothing downstream
-    /// reads them. A monochrome header parses as 1,1, so `!(1,1)` singles out
-    /// 4:4:4 (profile 1 / sRGB) and 4:2:2 (profile 2 below 12-bit).
+    /// lane-av1txr: `color_config.subsampling_x/y` (spec 5.5.2). These used
+    /// to exist only for the sequence-level refusal -- the decoder hardcoded
+    /// 4:2:0 at every chroma extent. lane-av1422lift: that is no longer true
+    /// and these are load-bearing on the DECODE path: `decode_stream_with`
+    /// publishes both through `decode::set_subsampling` into `FrameCtx`, and
+    /// every chroma extent, plane allocation, output crop, deblock/CDEF crop
+    /// and restoration grid below reads them PER AXIS. A monochrome header
+    /// parses as 1,1 and is unaffected. The only shape these cannot carry is
+    /// (0,1) 4:4:0, which the header cannot code.
     pub(crate) subsampling_x: u8,
     pub(crate) subsampling_y: u8,
 }
@@ -1774,38 +1782,36 @@ fn decode_frame(
     // deleted; the two-arm witness is
     // `a_real_aomenc_12bit_film_grain_stream_decodes_pixel_exact`).
     // lane-av1txr: `color_config.subsampling_x/y` (spec 5.5.2) are parsed by
-    // `ec-av1-syntax` -- profile 1 forces 4:4:4, profile 2 below 12-bit forces
-    // 4:2:2, and the sRGB identity description forces full-range 4:4:4 -- but
-    // the decoder reads them NOWHERE: every chroma extent is hardcoded 4:2:0
-    // (`let (chroma_w, chroma_h) = (bw / 2, bh / 2)` at every rect site,
-    // `chroma_side = side / 2` in `decode_block`) and the probe emits 4:2:0
-    // planes only. Measured consequence: EVERY 4:4:4 stream desyncs at the
-    // first chroma transform (a444-cu6 block (0,0): aomdec reads
-    // `EC_COEFF plane=1 tx=TX_8X16` at rng 39857 where ours reads a 4-wide,
-    // 8-high 4:2:0 chroma block at the same rng) and then decodes pixels that
-    // are silently wrong. Refuse by name rather than return garbage. A
-    // `num_planes == 1` (monochrome) header keeps its parsed 1,1 and is
-    // unaffected. Gates: `a_non_420_subsampled_sequence_header_is_refused_by_
-    // name` below (hand-built profile 1/2 headers plus a real aomenc 4:4:4
-    // stream).
-    // lane-av1-444: 4:4:4 (ss 0,0) is decoded. 4:2:2 (ss_x != ss_y) is not.
-    // lane-av1odd440: the CONDITION is left as `ss_x != ss_y` because that is
-    // what a parsed header can violate, but the STRING now names the only
-    // shape that can: `subsampling_y` is coded ONLY when `subsampling_x` is
-    // 1 (spec 5.5.2's `color_config`; libaom `av1_read_color_config`,
-    // `av1/decoder/decodeframe.c:4171-4175`, and its writer's own
-    // `assert(seq_params->subsampling_y == 0 && "4:4:0 subsampling not
-    // allowed in AV1")`, `av1/encoder/bitstream.c:2467-2468`), so a header can
-    // carry (1,1), (1,0) or (0,0) and never (0,1) -- 4:4:0 is not a cell a
-    // decoder can be handed at all. The gate
-    // `the_440_cell_is_not_a_codable_chroma_shape` proves the whole reachable
-    // set, so this string is not a claim about a shape that cannot arrive.
-    if seq.subsampling_x != seq.subsampling_y {
-        return Err(Error::unsupported(
-            "AV1 decode_stream",
-            "a chroma format of 4:2:2 (subsampling_x != subsampling_y): this decoder decodes 4:2:0 and 4:4:4; 4:2:2 is not ported, and 4:4:0 (0,1) is not a codable cell",
-        ));
-    }
+    // `ec-av1-syntax`. This block used to REFUSE every `ss_x != ss_y` header by
+    // name, on the theory that every chroma extent was hardcoded 4:2:0
+    // (`bw / 2, bh / 2` at every rect site, `chroma_side = side / 2` in
+    // `decode_block`). Both halves of that theory are now false: the per-axis
+    // port replaced every one of those extents with `>> ss_x` / `>> ss_y`
+    // reads, and 4:4:4 (0,0) already decoded through them.
+    // lane-av1422lift: 4:2:2 (1,0) is DECODED. The refusal string, its
+    // `refusal_inventory.rs` row and its `Proof::NegativeGate` pairing are
+    // deleted in this commit -- a refused format that decodes is a false
+    // claim, and the gate that asserted the refusal could not fail on a tree
+    // where 4:2:2 decode was completely broken.
+    // lane-av1odd440, kept as an ASSERTION: `subsampling_y` is coded ONLY when
+    // `subsampling_x` is 1 (spec 5.5.2's `color_config`; libaom
+    // `av1_read_color_config`, `av1/decoder/decodeframe.c:4171-4175`, and its
+    // writer's own `assert(seq_params->subsampling_y == 0 && "4:4:0
+    // subsampling not allowed in AV1")`, `av1/encoder/bitstream.c:2467-2468`),
+    // so a parsed header can carry (1,1), (1,0) or (0,0) and never (0,1):
+    // 4:4:0 is not a cell a decoder can be handed at all. That used to be a
+    // comment plus a refusal string naming the shape; with the refusal gone
+    // the residual is an unreachable arm, and this repo closes those with an
+    // assertion, never prose. The gate `the_440_cell_is_not_a_codable_chroma_
+    // shape` proves the whole reachable set through this crate's own writer
+    // AND reader.
+    assert!(
+        !(seq.subsampling_x == 0 && seq.subsampling_y == 1),
+        "AV1 decode_stream: a parsed color_config carried 4:4:0 (subsampling_x=0, \
+         subsampling_y=1); subsampling_y is coded only when subsampling_x is 1 \
+         (spec 5.5.2), so this shape cannot be produced by ec-av1-syntax's \
+         sequence_header -- the parser is wrong, not the caller"
+    );
     // lane-av1-qmatrix: `quantization_params.using_qmatrix` + `qm_y`/`qm_u`/
     // `qm_v` (spec 5.9.12) select per-plane INVERSE QUANTISATION MATRICES --
     // spec 7.12.3's per-position `dqv` scale, libaom `get_dqv` over
@@ -2301,55 +2307,138 @@ pub(crate) mod tests {
         picture
     }
 
-    /// lane-av1txr: a sequence header describing any chroma shape but 4:2:0 is
-    /// refused by name, because the decoder reconstructs every chroma extent
-    /// at hardcoded 4:2:0 (`bw / 2, bh / 2` at every rect site) and the probe
-    /// emits 4:2:0 planes only -- a 4:4:4 stream "decodes" into silently wrong
-    /// pixels (measured: a444-cu6's first chroma transform reads a 4x2-wide/
-    /// 8-high 4:2:0 chroma at aomdec's `TX_8X16` entry rng 39857, then
-    /// desyncs; every 4:4:4 fixture measured byte-differs from ffmpeg).
+    /// lane-av1422lift: THE 4:2:2 LIFT, in two pins. This test is the renamed,
+    /// inverted replacement for `a_non_420_subsampled_sequence_header_is_
+    /// refused_by_name`, and the two fixtures replace that gate's fixture --
+    /// a hand-built profile-2 header bolted onto a 4:2:0 TILE from this
+    /// crate's own encoder, which could never be inverted into an exactness
+    /// claim no matter how the assert was flipped (class `refusal-lifted-
+    /// without-a-gate`, and the risk study's R6).
     ///
-    /// Reachability, not a pixel claim: the header is written at the two
-    /// profiles that force a non-4:2:0 shape (spec 5.5.2 -- profile 1 forces
-    /// 4:4:4 with no coded bit; profile 2 below 12-bit forces 4:2:2) and the
-    /// tile is never reached. The 4:2:0 CONTROL below proves the refusal is
-    /// about the shape, not about this construction.
+    /// Both pins are REAL 4:2:2 streams from libaom's own writer over a
+    /// y4m whose header line is `C422`, so every chroma symbol in them is a
+    /// 4:2:2 chroma symbol. Provenance (both, verbatim, no other encoder):
+    ///
+    /// ```text
+    /// aomenc --codec=av1 --profile=2 \
+    ///        --input-chroma-subsampling-x=1 --input-chroma-subsampling-y=0 \
+    ///        --passes=1 --end-usage=q --cq-level=24 --cpu-used=0 \
+    ///        --threads=1 --row-mt=0 --obu -o <pin> <source.y4m>
+    /// ```
+    ///
+    /// * `422_key_64x64.obu` -- 755 bytes, sha256
+    ///   `3c9396c9e42701d720419ec2cb5577387e305482df0cb150f7f0b965edeaaffc`,
+    ///   fnv1a64 `0x87fc569cf53bcbc6`. A single 64x64 8-bit KEY frame
+    ///   (`--limit=1 --kf-min-dist=0 --kf-max-dist=0`) over a
+    ///   hand-generated two-frame integer `C422` card source, the second
+    ///   source frame unused by the `--limit=1`. The smallest thing that can
+    ///   say "4:2:2 intra reconstructs".
+    /// * `422_inter_160x128_3f.obu` -- 6522 bytes, sha256
+    ///   `7b54834c18f5fdc0e8606a6dc5bf4ff368402417d87fcfc2ab9758e4e9164902`,
+    ///   fnv1a64 `0xf87eba3bf4fc2bb8`. Three 160x128 8-bit frames with a
+    ///   panning square
+    ///   (`--limit=3 --kf-min-dist=3 --kf-max-dist=3`, so frames 1 and 2 are
+    ///   INTER), over a three-frame integer `C422` card source whose square
+    ///   moves (6,4) -> (9,6) -> (12,8). This is what exercises the
+    ///   inter-predicted 4:2:2 chroma reference: a decoder that walked the
+    ///   key frame correctly and then predicted chroma from a 4:2:0-shaped
+    ///   reference passes the first pin and reds here.
+    ///
+    /// Both are asserted BYTE-EXACT against ffmpeg 8.1.3's own rawvideo of
+    /// the same bytes at `yuv422p`, per plane and per frame, with the
+    /// per-plane coefficient-unit census as the non-vacuity arm (see
+    /// [`assert_422_stream_pixel_exact`]). A gate whose only assertion was
+    /// `err.contains(REFUSAL)` would have passed unchanged on a tree where
+    /// 4:2:2 decode was completely broken; that is what this replaces.
     #[test]
-    fn a_non_420_subsampled_sequence_header_is_refused_by_name() {
-        const NAME: &str = "a_non_420_subsampled_sequence_header_is_refused_by_name";
-        const REFUSAL: &str = "a chroma format of 4:2:2";
-        let fctx = &crate::decode::FrameCtx::new();
-        let picture = test_card(64, 64);
-        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
-        for (profile, label, sx, sy) in [(2u8, "4:2:2", 1u8, 0u8)] {
-            let color = ec_av1_syntax::ColorConfig {
-                num_planes: 3,
-                subsampling_x: sx,
-                subsampling_y: sy,
-                ..Default::default()
-            };
-            let (mut seq, header) =
-                crate::encode::key_frame_headers_colour(64, 64, 100, color).unwrap();
-            seq.seq_profile = profile;
-            let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
-            stream
-                .extend_from_slice(&crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap());
-            let err = decode_stream(&stream).unwrap_err().to_string();
-            assert!(
-                err.contains(REFUSAL),
-                "{NAME}: expected the non-4:2:0 refusal for the {label} header, got: {err}"
-            );
+    fn a_real_422_key_frame_and_inter_sequence_decode_pixel_exact() {
+        const NAME: &str = "a_real_422_key_frame_and_inter_sequence_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
         }
-        // CONTROL: the same construction at profile 0 (4:2:0) still decodes.
-        let (seq, header) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
-        let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
-        stream.extend_from_slice(&crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap());
-        let frames = decode_stream(&stream).expect("the 4:2:0 control must decode");
-        assert_eq!(
-            frames.len(),
-            1,
-            "{NAME}: the 4:2:0 control decoded no frame"
+        let key = crate_pin("422_key_64x64.obu");
+        let key_stream = read_pin(&key, 755, 0x87fc569cf53bcbc6, NAME);
+        let (units, _) = assert_422_stream_pixel_exact(NAME, &key_stream, 64, 64, 1, 8, true);
+        let (l, u, v) = (units[0], units[1], units[2]);
+        assert!(
+            l > 0 && u > 0 && v > 0,
+            "{NAME}: the key-frame pin walked no 4:2:2 chroma units [{l}, {u}, {v}]"
         );
+
+        let inter = crate_pin("422_inter_160x128_3f.obu");
+        let inter_stream = read_pin(&inter, 6522, 0xf87eba3bf4fc2bb8, NAME);
+        let (units, _) = assert_422_stream_pixel_exact(NAME, &inter_stream, 160, 128, 3, 8, true);
+        let (l, u, v) = (units[0], units[1], units[2]);
+        assert!(
+            u > 0 && v > 0,
+            "{NAME}: the inter pin walked no 4:2:2 chroma units [{l}, {u}, {v}] -- the inter \
+             chroma reference path was never reached"
+        );
+    }
+
+    /// lane-av1422lift: 4:2:2 at 12 bits, and 4:2:2 with superres, are the two
+    /// cells the corpus had no coverage for at all (the risk study's R3 and
+    /// R9: the sweep recipe passed no 12-bit depth and no `--superres-mode`,
+    /// so every 4:2:2 measurement in the tree was 8- or 10-bit, none
+    /// superres). Both are pinned and both are byte-exact here.
+    ///
+    /// `s422_12bit_160x128.obu` -- 9214 bytes, sha256
+    /// `eacc70f75c82ad7d795efbd0242aa4ee33db917b8c1a3570ebce2570ee8bc245`,
+    /// fnv1a64 `0xa62b8e3fe6f60ae5`. 160x128, 12-bit, 3 frames,
+    /// `yuv422p12le` per ffprobe, profile 2 ("Professional").
+    ///
+    /// **Provenance is ffmpeg's libaom-av1 wrapper, not aomenc, and the
+    /// reason is measured, not preferred.** aomenc's own 12-bit y4m path
+    /// issues `AV1E_SET_CHROMA_SUBSAMPLING_X` (apps/aomenc.c:2272-2278,
+    /// reached whenever the input is not 4:2:0 and the bit depth is 12)
+    /// BEFORE `aom_codec_enc_config_set`, and on this libaom that control
+    /// returns `AOM_CODEC_INTERNAL_ERROR` for any non-4:2:0 shape -- measured
+    /// on four independently built trees
+    /// (`~/.cache/aom-oracle`, `aom-affine`, `aom-oracle2`, `aom-oracle3`):
+    /// `C422p12` and `C444p12` both die with "Failed to set chroma
+    /// subsampling x", while `C420p12` and the 8-bit `C422`/`C444` both
+    /// encode. It is not a 4:2:2-specific gap (12-bit 4:4:4 fails too) and
+    /// not a 4:2:0 gap (12-bit 4:2:0 encodes). The same control succeeds at
+    /// 8 bits, so the failure is the 12-bit configuration order, and the
+    /// workaround is a wrapper that sets the codec config first. ffmpeg's
+    /// libaom-av1 does exactly that:
+    ///
+    /// ```text
+    /// ffmpeg -f lavfi -i "testsrc2=size=160x128:rate=1:duration=3" \
+    ///        -pix_fmt yuv422p12le -c:v libaom-av1 -profile:v 2 -b:v 0 -crf 30 \
+    ///        -cpu-used 8 -auto-alt-ref 0 -lag-in-frames 0 \
+    ///        -strict experimental -f obu s422_12bit_160x128.obu
+    /// ```
+    ///
+    /// That is libaom's encoder either way -- ffmpeg links it and calls
+    /// `aom_codec_encode` -- and the oracle side is ffmpeg's own
+    /// `yuv422p12le` rawvideo decode of the same bytes, so the pin and the
+    /// oracle come from the same library, which is the property that makes
+    /// byte-exactness a claim about OUR decoder rather than about a
+    /// disagreement between two encoders.
+    ///
+    /// `s422_superres_160x128.obu` -- 5304 bytes, sha256
+    /// `5852ff2c273cb773c4886762c6a6f2cce6e12065a690eb3a5ca2119c0b6f2957`,
+    /// fnv1a64 `0x0789d1b2851b94ae`. 160x128, 8-bit, 3 frames, `--superres-
+    /// mode=1` (fixed) over a `C422` testsrc2 source, encoded by the
+    /// aomenc recipe above plus `--superres-mode=1`. Superres is the one
+    /// 4:2:2 path whose output crop is `(round_ss(w,1) x round_ss(h,0))` at
+    /// the UPSCALED size, and it had no 4:2:2 cell anywhere.
+    #[test]
+    fn a_real_422_12bit_and_superres_stream_decode_pixel_exact() {
+        const NAME: &str = "a_real_422_12bit_and_superres_stream_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let hbd = crate_pin("s422_12bit_160x128.obu");
+        let hbd_stream = read_pin(&hbd, 9214, 0xa62b8e3fe6f60ae5, NAME);
+        assert_422_stream_pixel_exact(NAME, &hbd_stream, 160, 128, 3, 12, true);
+
+        let sr = crate_pin("s422_superres_160x128.obu");
+        let sr_stream = read_pin(&sr, 5304, 0x0789d1b2851b94ae, NAME);
+        assert_422_stream_pixel_exact(NAME, &sr_stream, 160, 128, 3, 8, true);
     }
 
     /// lane-av1odd440, CELL 1 of 2: `4:2:0 with an ODD luma dimension`, the
@@ -2486,12 +2575,20 @@ pub(crate) mod tests {
     ///    when it is handed `subsampling (0,1)` at profile 2 -- profile 2
     ///    below 12 bits is 4:2:2 and codes no subsampling bit at all, so the
     ///    request lands on `(1,0)`. The pin is asserted to read back `(1,0)`,
-    ///    NOT `(0,1)`, and the decoder is asserted to refuse it by name,
-    ///    which is the honest outcome for the shape a 4:4:0 request actually
-    ///    yields. Its frame OBU is a 4:2:0 key frame's, so the pin is a HEADER
-    ///    witness, not a decodable 4:2:2 stream -- nothing here claims
+    ///    NOT `(0,1)`. Its frame OBU is a 4:2:0 key frame's, so the pin is a
+    ///    HEADER witness, not a decodable 4:2:2 stream -- nothing here claims
     ///    pixels for it. Provenance: `examples/gen_coverage_cells.rs`, `cargo
     ///    run -p ec-av1 --example gen_coverage_cells -- crates/ec-av1/fixtures`.
+    ///
+    ///    lane-av1422lift: this arm used to end "and the decoder is asserted
+    ///    to refuse it by name, which is the honest outcome for the shape a
+    ///    4:4:0 request actually yields". That was honest only because the
+    ///    decoder refused EVERY (1,0) header -- the assertion was about the
+    ///    guard, not about these bytes. With 4:2:2 admitted, refusing these
+    ///    bytes would be wrong and accepting them without comment would be
+    ///    worse, so the arm now asserts the one thing that IS true of them:
+    ///    the SEQUENCE HEADER, not the tile, fixes the decode's chroma
+    ///    geometry. The pixel claim moved to genuinely 4:2:2 pins.
     #[test]
     fn the_440_cell_is_not_a_codable_chroma_shape() {
         const NAME: &str = "the_440_cell_is_not_a_codable_chroma_shape";
@@ -2729,10 +2826,38 @@ pub(crate) mod tests {
              ever reads (0,1), a 4:4:0 cell became codable and this whole gate is wrong about the \
              format."
         );
-        let err = decode_stream(&pinned).unwrap_err().to_string();
+        // lane-av1422lift: the refusal is gone, and the replacement is NOT
+        // "it decodes". This pin's TILE is a 4:2:0 key frame's, byte for
+        // byte -- only the sequence header carries 4:2:2 -- so it is a
+        // header/tile mismatch and there is no oracle that can say what the
+        // right pixels are. What IS assertable, and is what the pin is for,
+        // is that the SEQUENCE HEADER alone decides the decode's geometry:
+        // the decoded chroma planes are half-width and FULL height, exactly
+        // the `round_ss(w, 1) x round_ss(h, 0)` shape a real 4:2:2 stream
+        // produces (see `a_real_422_key_frame_and_inter_sequence_decode_
+        // pixel_exact` for the pixel claim on genuine 4:2:2 bytes), and that
+        // the 4:2:2 chroma walk really ran on it. A decoder that still
+        // allocated 4:2:0 planes here would give 32x32 chroma and red.
+        let frames = decode_stream(&pinned).unwrap_or_else(|e| {
+            panic!("{NAME}: a (1,0) header must decode now that 4:2:2 is admitted: {e}")
+        });
+        assert_eq!(
+            frames.len(),
+            1,
+            "{NAME}: the pin must decode exactly one frame"
+        );
+        assert_eq!(
+            (frames[0].u.len(), frames[0].v.len()),
+            (32 * 64, 32 * 64),
+            "{NAME}: 64x64 4:2:2 is HALF WIDTH and FULL HEIGHT (32x64 chroma); {:?} means the \
+             plane geometry still came from the TILE's 4:2:0 shape rather than the HEADER's",
+            (frames[0].u.len(), frames[0].v.len())
+        );
         assert!(
-            err.contains("a chroma format of 4:2:2"),
-            "{NAME}: the shape the 4:4:0 request lands on must still refuse by name, got: {err}"
+            crate::decode::census_nonsub_units()[1] > 0
+                && crate::decode::census_nonsub_units()[2] > 0,
+            "{NAME}: the pin walked zero 4:2:2 chroma coefficient units -- the per-axis walk never \
+             ran on it"
         );
     }
     /// lane-av1-422bigblock: the two witnessed 4:2:2 big-block defects, pinned
@@ -2759,18 +2884,28 @@ pub(crate) mod tests {
     /// `EC_AV1_ALLOW_422_PROBE` patch-run-restore build (recipe and measured
     /// numbers in `lanes/av1422bigblock.report.md`).
     ///
-    /// `decode_stream` itself still refuses 4:2:2 at the sequence header --
-    /// unconditionally, per the standing family rule -- so the committed
-    /// assertion is the byte pin (fnv1a64, the same load-bearing-identity
-    /// fingerprint as the cdf-forwarding gate) plus the refusal-by-name
-    /// contract over the pinned bytes.
+    /// lane-av1422lift: `decode_stream` no longer refuses 4:2:2 at the
+    /// sequence header, so this gate stops being a refusal contract and
+    /// becomes the one it should have been: BOTH pins, byte-pinned AND
+    /// byte-exact against ffmpeg, with the per-plane coefficient-unit census
+    /// as the non-vacuity arm. The pins are unchanged and still load-bearing
+    /// (size + fnv1a64); only the assertion moved.
     #[test]
-    fn the_pinned_422_bigblock_witnesses_are_present_and_refuse_by_name() {
-        const NAME: &str = "the_pinned_422_bigblock_witnesses_are_present_and_refuse_by_name";
-        const REFUSAL: &str = "a chroma format of 4:2:2";
-        for (file, bytes, fp) in [
-            ("422_allskip_2f.obu", 62usize, 0x7e4d69d3c728c55f_u64),
-            ("422_sb128_3f.obu", 12543, 0x5171e0aab8000da7),
+    fn the_pinned_422_bigblock_witnesses_decode_pixel_exact() {
+        const NAME: &str = "the_pinned_422_bigblock_witnesses_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        for (file, bytes, fp, frames, require_coded) in [
+            (
+                "422_allskip_2f.obu",
+                62usize,
+                0x7e4d69d3c728c55f_u64,
+                2usize,
+                false,
+            ),
+            ("422_sb128_3f.obu", 12543, 0x5171e0aab8000da7, 3, true),
         ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("fixtures")
@@ -2783,11 +2918,24 @@ pub(crate) mod tests {
             });
             assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
             assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
-            let err = decode_stream(&data).unwrap_err().to_string();
-            assert!(
-                err.contains(REFUSAL),
-                "{NAME}: {file} must refuse by name, got: {err}"
-            );
+            let (_units, coded_delta) =
+                assert_422_stream_pixel_exact(NAME, &data, 128, 128, frames, 8, require_coded);
+            if !require_coded {
+                // `422_allskip_2f.obu` is named for what it does NOT code, and
+                // the pre-port defect was exactly that: the decoder read
+                // PHANTOM coefficient units in the all-skip inter frame and
+                // then panicked in `reconstruct_mc_rect` on a full-height
+                // 4:2:2 chroma rect. So the cell's non-vacuity is a NEGATIVE
+                // measurement on the CHROMA planes, asserted here rather than
+                // inherited: the walk ran (units > 0, which the shared body
+                // checks) and coded nothing on U or V.
+                assert_eq!(
+                    (coded_delta[1], coded_delta[2]),
+                    (0, 0),
+                    "{NAME}: {file} CODED a chroma coefficient -- this is the all-skip inter-frame \
+                     cell and a phantom residual read is exactly the defect it witnesses"
+                );
+            }
         }
     }
 
@@ -2815,15 +2963,22 @@ pub(crate) mod tests {
     /// Green-after, same fixture: 48 chroma units stamped, all 6 blocks
     /// decoded, and ALL FIVE frames byte-identical to `aomdec --rawvideo`.
     ///
-    /// Committed code refuses 4:2:2 at the sequence header, so the decode
-    /// assertions above are probe-measured and reproducible from the lane
-    /// report's recipe; what this gate can assert in committed code is the
-    /// byte pin, the refusal-by-name contract, and -- in the arm below --
-    /// that the per-axis walk is still spelled per-axis in the source.
+    /// lane-av1422lift: committed code no longer refuses 4:2:2 at the
+    /// sequence header, so the red/green evidence above is no longer
+    /// probe-only: this gate is the one that asserts it. Both pins are
+    /// byte-pinned AND byte-exact against ffmpeg's `yuv422p` rawvideo of the
+    /// same bytes, per plane and per frame, with the per-plane
+    /// coefficient-unit census as the non-vacuity arm -- the census is what
+    /// makes "48 chroma units stamped" a committed, reproducible number here
+    /// instead of a sentence in a lane report. The source-scan arm below
+    /// keeps its own claim (the per-axis SPELLING) and does not overlap.
     #[test]
-    fn the_pinned_422_intrabc_sb128_strip_witnesses_refuse_by_name() {
-        const NAME: &str = "the_pinned_422_intrabc_sb128_strip_witnesses_refuse_by_name";
-        const REFUSAL: &str = "a chroma format of 4:2:2";
+    fn the_pinned_422_intrabc_sb128_strip_witnesses_decode_pixel_exact() {
+        const NAME: &str = "the_pinned_422_intrabc_sb128_strip_witnesses_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
         for (file, bytes, fp) in [
             (
                 "422_intrabc_sb128_strip.obu",
@@ -2847,11 +3002,7 @@ pub(crate) mod tests {
             });
             assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
             assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
-            let err = decode_stream(&data).unwrap_err().to_string();
-            assert!(
-                err.contains(REFUSAL),
-                "{NAME}: {file} must refuse by name, got: {err}"
-            );
+            assert_422_stream_pixel_exact(NAME, &data, 384, 320, 5, 8, true);
         }
     }
 
@@ -3010,14 +3161,26 @@ pub(crate) mod tests {
     /// `a Golomb tail longer than this decoder reads` at frame 2. That
     /// refusal DOES NOT REPRODUCE on this tip: with the bypass applied, all
     /// three cells DECODE 16/16 -- no panic and no second refusal.
+    ///
+    /// lane-av1422lift: the three pins are asserted BYTE-EXACT against
+    /// ffmpeg's rawvideo of the same bytes, per plane and per frame, with the
+    /// per-plane coefficient-unit census as the non-vacuity arm -- so the
+    /// three DECODE 16/16 fact the paragraph above records from a bypassed
+    /// probe build is now a committed assertion. `Y` is the 10-bit member
+    /// and carries the depth-correct HBD compare (`yuv422p10le`, 16-bit
+    /// containers on both sides) rather than an 8-bit narrowing of a
+    /// high-bit-depth cell.
     #[test]
-    fn the_pinned_422_lossless_inter_witnesses_are_present_and_refuse_by_name() {
-        const NAME: &str = "the_pinned_422_lossless_inter_witnesses_are_present_and_refuse_by_name";
-        const REFUSAL: &str = "a chroma format of 4:2:2";
-        for (file, bytes, fp) in [
-            ("W_intrabc.obu", 130_320usize, 0xb6d5c4653a32567a_u64),
-            ("X_intrabc_tiled.obu", 131_696, 0xb6e04621d2116ef7),
-            ("Y_intrabc_10b.obu", 202_281, 0x2ecf03435a14dbf),
+    fn the_pinned_422_lossless_inter_witnesses_decode_pixel_exact() {
+        const NAME: &str = "the_pinned_422_lossless_inter_witnesses_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        for (file, bytes, fp, depth) in [
+            ("W_intrabc.obu", 130_320usize, 0xb6d5c4653a32567a_u64, 8u8),
+            ("X_intrabc_tiled.obu", 131_696, 0xb6e04621d2116ef7, 8),
+            ("Y_intrabc_10b.obu", 202_281, 0x2ecf03435a14dbf, 10),
         ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("fixtures")
@@ -3027,11 +3190,7 @@ pub(crate) mod tests {
             });
             assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
             assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
-            let err = decode_stream(&data).unwrap_err().to_string();
-            assert!(
-                err.contains(REFUSAL),
-                "{NAME}: {file} must refuse by name, got: {err}"
-            );
+            assert_422_stream_pixel_exact(NAME, &data, 320, 240, 16, depth, true);
         }
     }
 
@@ -3322,15 +3481,20 @@ pub(crate) mod tests {
     /// by it -- byte-identical to their pre-lane decodes, with the LR gate
     /// family green.
     ///
-    /// Like its two siblings, the committed assertion is the byte pin plus
-    /// the refusal-by-name contract: with the header refusal standing,
-    /// NO committed test can decode a 4:2:2 stream, because the bypass that
-    /// would allow it must never be committed.
+    /// lane-av1422lift: the committed assertion is now the byte pin AND
+    /// byte-exactness against ffmpeg's `yuv422p` rawvideo of the same bytes,
+    /// per plane and per frame, with the per-plane coefficient-unit census
+    /// as the non-vacuity arm. The paragraph above's coverage counts (25
+    /// compound-warp, 84 rotzoom global-warp, 22 Wiener, 10 SGRPROJ, CDEF
+    /// 39) are what make the row non-vacuous: without them a byte-exact
+    /// compare could be green over a stream that never entered a warp arm.
     #[test]
-    fn the_pinned_422_residual_compound_warp_witness_is_present_and_refuses_by_name() {
-        const NAME: &str =
-            "the_pinned_422_residual_compound_warp_witness_is_present_and_refuses_by_name";
-        const REFUSAL: &str = "a chroma format of 4:2:2";
+    fn the_pinned_422_residual_compound_warp_witness_decodes_pixel_exact() {
+        const NAME: &str = "the_pinned_422_residual_compound_warp_witness_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
         const FILE: &str = "422_residual_compound_warp_16f.obu";
         const BYTES: usize = 38845;
         const FP: u64 = 0x0e73a51e2cc0c424;
@@ -3345,11 +3509,7 @@ pub(crate) mod tests {
         });
         assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
         assert_eq!(fnv1a64(&data), FP, "{NAME}: {FILE} bytes drifted");
-        let err = decode_stream(&data).unwrap_err().to_string();
-        assert!(
-            err.contains(REFUSAL),
-            "{NAME}: {FILE} must refuse by name, got: {err}"
-        );
+        assert_422_stream_pixel_exact(NAME, &data, 256, 288, 16, 8, true);
     }
     /// lane-av1422lrless: the LR-OFF half of the 4:2:2 coverage pair.
     ///
@@ -3403,13 +3563,20 @@ pub(crate) mod tests {
     ///   the one where `read_lr` does nothing at all, so the engagement is
     ///   not an artefact of the code under test.
     ///
-    /// Same scope as its siblings, for the same reason: with the header
-    /// refusal standing no committed test can decode a 4:2:2 stream,
-    /// because the bypass that would allow it must never be committed.
+    /// lane-av1422lift: same scope change as its siblings, and this is the arm
+    /// where it matters most: this stream is the one where `read_lr` does
+    /// nothing at all, so a byte-exact green over it is a claim about the
+    /// per-axis path WITHOUT the loop-restoration corner fix carrying it.
+    /// The pin stays, the compare against ffmpeg's `yuv422p` rawvideo is
+    /// added per plane and per frame, and the per-plane coefficient-unit
+    /// census is the non-vacuity arm.
     #[test]
-    fn the_pinned_422_lr_off_witness_is_present_and_refuses_by_name() {
-        const NAME: &str = "the_pinned_422_lr_off_witness_is_present_and_refuses_by_name";
-        const REFUSAL: &str = "a chroma format of 4:2:2";
+    fn the_pinned_422_lr_off_witness_decodes_pixel_exact() {
+        const NAME: &str = "the_pinned_422_lr_off_witness_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
         const FILE: &str = "422_residual_compound_warp_nolr_16f.obu";
         const BYTES: usize = 38538;
         const FP: u64 = 0x4b8ff761701e2bef;
@@ -3424,11 +3591,251 @@ pub(crate) mod tests {
         });
         assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
         assert_eq!(fnv1a64(&data), FP, "{NAME}: {FILE} bytes drifted");
-        let err = decode_stream(&data).unwrap_err().to_string();
-        assert!(
-            err.contains(REFUSAL),
-            "{NAME}: {FILE} must refuse by name, got: {err}"
+        assert_422_stream_pixel_exact(NAME, &data, 256, 288, 16, 8, true);
+    }
+
+    /// lane-av1422lift: 4:2:2 FILM GRAIN, and why this one gate cannot use
+    /// the dump path or the shared body above.
+    ///
+    /// `EC_AV1_FINAL_DUMP` writes the picture "exactly as it is about to be
+    /// stored into the reference slots" (`stream.rs`, the dump site beside
+    /// the emit), which is BEFORE `apply_grain` runs on the output. ffmpeg's
+    /// rawvideo is POST-grain. So every grain cell -- 4:2:0, 4:2:2, 12-bit,
+    /// all of them -- is incomparable through the dump, and the corpus
+    /// comparator hits it as a hard error rather than as a clean red
+    /// (measured on `s422_grain_160x128.obu`: "luma identity never covers the
+    /// display side (3 decode frames, 3 display frames)"). This gate
+    /// therefore compares the IN-MEMORY `decode_stream` output, which is
+    /// post-grain, exactly like
+    /// `a_real_aomenc_12bit_film_grain_stream_decodes_pixel_exact` does for
+    /// 12-bit 4:2:0. Using the pre-grain dump here would make the gate
+    /// permanently red for a reason that has nothing to do with grain.
+    ///
+    /// The pin, `s422_grain_160x128.obu` (5433 bytes, sha256
+    /// `a4a6957b5e8298d9138f64498cab2d3008b3390fa73cd0d74aa0632b13d93d15`,
+    /// fnv1a64 `0x2aed47614b9461b8`), is aomenc profile 2 over a `C422`
+    /// testsrc2 160x128 3-frame source with `--film-grain-test=5`,
+    /// `--passes=1 --end-usage=q --cq-level=24 --cpu-used=0 --threads=1
+    /// --row-mt=0 --limit=3 --obu`.
+    ///
+    /// Two arms, because a green compare over a stream whose grain never ran
+    /// is the "params-without-apply" false green:
+    ///
+    /// 1. the stream's OWN frame headers carry `apply_grain` and scaling
+    ///    points on all THREE planes -- at 4:2:2 that is the shape libaom's
+    ///    `generate_grain_uv_422` exists for, and it is read out of the
+    ///    bytes, not out of the flags handed to the encoder;
+    /// 2. `film_grain::grain_hits()` moves across the decode.
+    #[test]
+    fn a_real_422_film_grain_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_422_film_grain_stream_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let _gate_lock = lock_gate_counters();
+        let path = crate_pin("s422_grain_160x128.obu");
+        let stream = read_pin(&path, 5433, 0x2aed47614b9461b8, NAME);
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut grain_frames = 0usize;
+        while pos < stream.len() {
+            let obu = probe.parse_obu(&stream[pos..]).unwrap();
+            pos += obu.total_size;
+            if let ObuKind::Frame(header, _) = obu.kind {
+                let fg = &header.film_grain;
+                assert!(
+                    fg.apply_grain,
+                    "{NAME}: frame without apply_grain -- aomenc emitted params it does not apply"
+                );
+                assert!(
+                    fg.num_y_points > 0 && fg.num_cb_points > 0 && fg.num_cr_points > 0,
+                    "{NAME}: grain without all three planes' scaling points -- the per-axis \
+                     `generate_grain_uv_422` geometry would not be exercised"
+                );
+                grain_frames += 1;
+            }
+        }
+        assert_eq!(
+            grain_frames, 3,
+            "{NAME}: expected grain on all three frames"
         );
+        let before = crate::film_grain::grain_hits();
+        let units_before = crate::decode::census_nonsub_units();
+        let ours = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{NAME}: decode_stream refused a real 4:2:2 grain stream: {e}")
+        });
+        assert_eq!(ours.len(), 3, "{NAME}: decoded frame count");
+        assert_eq!(
+            ours[0].u.len(),
+            80 * 128,
+            "{NAME}: 160x128 4:2:2 chroma is 80x128; {} means a 4:2:0 plane",
+            ours[0].u.len()
+        );
+        assert!(
+            crate::film_grain::grain_hits() > before,
+            "{NAME}: matched but zero grain_hits -- grain synthesis never ran"
+        );
+        let units = crate::decode::census_nonsub_units();
+        for (p, plane) in ["luma", "U", "V"].into_iter().enumerate() {
+            assert!(
+                units[p] > units_before[p],
+                "{NAME}: the {plane} plane walked ZERO coefficient units -- this byte-exact \
+                 compare is vacuous with respect to 4:2:2"
+            );
+        }
+        let theirs = ffmpeg_decode_sequence_422(&stream, 160, 128, 3);
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            for (plane, ours_plane, theirs_plane) in
+                [("Y", &a.y, &b.y), ("U", &a.u, &b.u), ("V", &a.v, &b.v)]
+            {
+                if let Some(bad) = ours_plane
+                    .iter()
+                    .zip(theirs_plane)
+                    .position(|(x, y)| x != y)
+                {
+                    panic!(
+                        "{NAME}: {plane} differs from ffmpeg at frame {i} sample {bad} ({} vs {})",
+                        ours_plane[bad], theirs_plane[bad]
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "{NAME}: post-grain byte-exact vs ffmpeg; grain_hits={}",
+            crate::film_grain::grain_hits()
+        );
+    }
+
+    /// lane-av1422lift: THE CORPUS BATTERY -- the gate the 4:2:2 campaign
+    /// earned, and the one that replaces seven gates whose only behavioural
+    /// assertion was `err.contains(REFUSAL)`.
+    ///
+    /// **Why these six.** The measurement base
+    /// (`lanes/av1422ffmpegbase.report.md` section 2.1) recorded seven 4:2:2
+    /// cells that diverged from ffmpeg: `s422_320x246`, `s422_322x240`,
+    /// `s422_322x246`, `s422_352x242_10b`, `s422_384x240`,
+    /// `s422_416x242_10b`, `s422_416x250_10b`. Six are closed and are pinned
+    /// here, each byte-exact against ffmpeg with the per-plane
+    /// coefficient-unit census as its non-vacuity arm. All six are
+    /// CHROMA-only divergences at non-8-aligned geometries -- odd or
+    /// 2-mod-4 luma dimensions, where `round_ss` and the chroma block walk
+    /// disagree with a hardcoded `>> 1` -- which is why they are the rows a
+    /// lift cannot afford to leave unasserted: they are the cells that would
+    /// go quietly wrong again.
+    ///
+    /// **The seventh, `s422_384x240`, is NOT here, on purpose.** It is the
+    /// reserved group-tail chroma SKIP arm (`decode.rs`; the risk study R4
+    /// flags it as owned elsewhere), it is still red, and pinning a red cell
+    /// inside a green gate is how a gate stops being a gate.
+    /// **THIS BRANCH MUST NOT LAND UNTIL THAT CELL CLOSES AND THE CORPUS
+    /// RE-MEASURES 51/51** -- see `lanes/av1422lift.report.md`.
+    ///
+    /// **The census arm, per row.** `assert_422_stream_pixel_exact` asserts
+    /// that all three planes read a non-zero number of coefficient units AND
+    /// a non-zero number of units that coded at least one coefficient, on
+    /// this row's own bytes. That is the requirement R8 named as unwritable
+    /// before lane-av1422census422 armed the census for `(1,0)`; measured on
+    /// this tree the OLD arming read `[0, 0, 0]` on every 4:2:2 cell while
+    /// the same decode walked 4994 units, so a green here with no census
+    /// assert would have proven nothing about 4:2:2.
+    ///
+    /// **Provenance of the six pins.** All six are `aomenc --codec=av1
+    /// --profile=2 --input-bit-depth=<8|10> --cpu-used=0 --cq-level=24
+    /// --limit=16 --auto-alt-ref=1 --enable-global-motion=1 --passes=1
+    /// --obu` over a hand-built `C422` y4m (header line, then `FRAME\n` plus
+    /// one frame of planes per frame -- libaom's y4minput requires those six
+    /// bytes before EVERY frame), produced by the census sweep and copied in
+    /// from `~/.cache/census422b/sweep/`. They are ordinary libaom 4:2:2
+    /// streams with nothing bolted on.
+    #[test]
+    fn the_pinned_422_corpus_cells_decode_pixel_exact() {
+        const NAME: &str = "the_pinned_422_corpus_cells_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        // (file, bytes, fnv1a64, sha256, w, h, depth, frames)
+        for (file, bytes, fp, sha, w, h, depth, frames) in [
+            (
+                "s422_320x246.obu",
+                20692usize,
+                0x01e556015878e04eu64,
+                "aebd3a10d46e617b803579819f2502798076384be52e032b11b46f09eeb09a79",
+                320usize,
+                246usize,
+                8u8,
+                16usize,
+            ),
+            (
+                "s422_322x240.obu",
+                21096,
+                0x9a96dda2a19d47a6,
+                "e74bf7e91f23353986edf9380bcd6cb760194e619dbbdf6a239b7a05eff81799",
+                322,
+                240,
+                8,
+                16,
+            ),
+            (
+                "s422_322x246.obu",
+                20528,
+                0x2c6f8be6d30384ab,
+                "ee96617fe45ba963d3628f37086077a94806ef0465a74cb538a8e57d2ed900b3",
+                322,
+                246,
+                8,
+                16,
+            ),
+            (
+                "s422_352x242_10b.obu",
+                20575,
+                0xf1d370f80d8ddc6d,
+                "8893bbed108d7555e66c35f2f45d6e44044dcd6810b0510fb251be05dabaa2d0",
+                352,
+                242,
+                10,
+                16,
+            ),
+            (
+                "s422_416x242_10b.obu",
+                20282,
+                0x9826402d91abbc56,
+                "38d0b592e5e358901742122c590c8964b5d08d0ceccfa051e677c28f4b75d174",
+                416,
+                242,
+                10,
+                16,
+            ),
+            (
+                "s422_416x250_10b.obu",
+                19967,
+                0x6b07e837eae8a6be,
+                "d6aa7f450f54d6fb381400a0a0226da87599c00509eeb5031abe63383e272627",
+                416,
+                250,
+                10,
+                16,
+            ),
+        ] {
+            let row = format!("{NAME}[{file}]");
+            let path = crate_pin(file);
+            let data = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{row}: pinned corpus cell {} is missing ({e}) -- the gate cannot run",
+                    path.display()
+                )
+            });
+            assert_eq!(data.len(), bytes, "{row}: size drifted");
+            assert_eq!(fnv1a64(&data), fp, "{row}: bytes drifted");
+            // The sha256 is the corpus's own identity column (its
+            // `cells_422_3d56.json` records one per cell and the census
+            // verified zero drift); fnv1a64 is what `read_pin` can check
+            // in-process without spawning sha256sum, so both are named and
+            // the sha256 is what a re-capture must reproduce.
+            eprintln!("{row}: sha256 {sha}");
+            assert_422_stream_pixel_exact(&row, &data, w, h, frames, depth, true);
+        }
     }
 
     /// lane-av1-qmatrix: WITNESS for the lifted `using_qmatrix` refusal (the
@@ -7734,6 +8141,234 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// lane-av1422lift: as [`ffmpeg_decode_sequence`] (4:2:0 8-bit) and
+    /// [`ffmpeg_decode_sequence_444`], for a 4:2:2 stream: `yuv422p`
+    /// rawvideo, whose chroma planes are HALF WIDTH and FULL HEIGHT -- the
+    /// `w/2 * h` shape the whole per-axis port exists to produce. A helper
+    /// that computed the chroma span 4:2:0-style would make every 4:2:2
+    /// gate compare half the oracle's bytes and pass, so the span is
+    /// asserted against the byte count below, not assumed.
+    fn ffmpeg_decode_sequence_422(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Pic> {
+        ffmpeg_decode_sequence_422_depth(stream, width, height, frames, 8, "yuv422p")
+    }
+
+    /// lane-av1422lift: the depth-generic 4:2:2 oracle comparator --
+    /// `yuv422p`, `yuv422p10le` or `yuv422p12le`, with the container width
+    /// taken from `depth` itself (8 -> one byte per sample; 10/12 -> a
+    /// 16-bit LE container on BOTH sides, so ours and ffmpeg's are directly
+    /// comparable sample for sample and nothing narrows).
+    fn ffmpeg_decode_sequence_422_depth(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+        depth: u8,
+        pix_fmt: &str,
+    ) -> Vec<Pic> {
+        assert!(
+            matches!(depth, 8 | 10 | 12),
+            "lane-av1422lift: ffmpeg_decode_sequence_422_depth takes 8, 10 or 12, got {depth}"
+        );
+        let out = run_with_stdin(
+            Command::new("ffmpeg").args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-",
+            ]),
+            stream,
+        );
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the 4:2:2 stream ({pix_fmt}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width.div_ceil(2) * height);
+        let bps = if depth == 8 { 1 } else { 2 };
+        let frame_bytes = (luma + 2 * chroma) * bps;
+        assert_eq!(
+            out.stdout.len(),
+            frame_bytes * frames,
+            "{}",
+            frame_count_diagnosis(
+                "4:2:2",
+                frames,
+                width,
+                height,
+                frame_bytes,
+                out.stdout.len(),
+                &out.stderr
+            )
+        );
+        (0..frames)
+            .map(|i| {
+                let base = i * frame_bytes;
+                let samples = |off: usize, n: usize| -> Vec<u16> {
+                    let slice = &out.stdout[base + off..base + off + n * bps];
+                    if bps == 1 {
+                        slice.iter().map(|&v| u16::from(v)).collect()
+                    } else {
+                        slice
+                            .chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect()
+                    }
+                };
+                Pic {
+                    width,
+                    height,
+                    y: samples(0, luma),
+                    u: samples(luma * bps, chroma),
+                    v: samples((luma + chroma) * bps, chroma),
+                }
+            })
+            .collect()
+    }
+
+    /// lane-av1422lift: the shared body of every 4:2:2 exactness gate this
+    /// lane adds, and the answer to "a byte-exact 4:2:2 gate can still be
+    /// vacuous".
+    ///
+    /// Before lane-av1422census422 the per-plane coefficient-unit census was
+    /// armed at `ss_x == 0 && ss_y == 0` only, so on a 4:2:2 stream
+    /// `census_nonsub_units()` read `[0, 0, 0]` BY CONSTRUCTION -- a gate
+    /// could have been green while the decode walked nothing at all. The
+    /// census is now armed for `(ss_x == 0 || ss_y == 0)`, so the delta
+    /// asserted here is a real measurement of the walk this stream caused:
+    /// every plane must show a non-zero number of transform units AND of
+    /// units that coded at least one coefficient.
+    ///
+    /// Four things are asserted per frame, in this order:
+    ///
+    /// 1. the decoded frame's dimensions, and that its chroma planes are
+    ///    `round_ss(w, 1) * round_ss(h, 0)` -- half width, FULL height. A
+    ///    decoder that kept 4:2:0 plane allocation while walking 4:2:2
+    ///    entropy would pass a per-sample compare against a 4:2:0-sized
+    ///    oracle; this is the shape assertion that closes that hole, and it
+    ///    is asserted against the DECODED frame, never against the gate's
+    ///    own name.
+    /// 2. the depth, read out of the stream's own sequence header.
+    /// 3. per-plane, per-frame byte-exactness against ffmpeg's rawvideo of
+    ///    the same bytes at the depth-correct pixel format. Frame N of ours
+    ///    against frame N of ffmpeg's: `decode_stream` returns DISPLAY order
+    ///    and so does ffmpeg's rawvideo muxer, so a hidden alt-ref does not
+    ///    shift the pairing (the decode-order-vs-display-order trap the
+    ///    out-of-process corpus comparator has to solve separately).
+    /// 4. the census delta, asserted once for the whole stream rather than
+    ///    per frame, because the counters are cumulative per thread.
+    ///
+    ///    `require_coded` is false ONLY for a cell whose identity IS that it
+    ///    codes nothing -- `422_allskip_2f.obu`, whose whole point is that
+    ///    the inter frame reads no residual and the pre-port decoder read
+    ///    PHANTOM units there. Demanding coded units on it would be
+    ///    demanding the defect; its caller asserts the all-skip property
+    ///    directly instead.
+    fn assert_422_stream_pixel_exact(
+        name: &str,
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+        depth: u8,
+        require_coded: bool,
+    ) -> ([usize; 3], [usize; 3]) {
+        let _gate_lock = lock_gate_counters();
+        assert_eq!(
+            stream_bit_depth(stream, name),
+            depth,
+            "{name}: the stream's OWN sequence header does not say {depth} bit"
+        );
+        let before = crate::decode::census_nonsub_units();
+        let before_coded = crate::decode::census_nonsub_coded();
+        let ours = decode_stream(stream)
+            .unwrap_or_else(|e| panic!("{name}: decode_stream refused a real 4:2:2 stream: {e}"));
+        assert_eq!(ours.len(), frames, "{name}: decoded frame count");
+        for (i, f) in ours.iter().enumerate() {
+            assert_eq!(
+                (f.width, f.height),
+                (width, height),
+                "{name}: frame {i} dimensions"
+            );
+            assert_eq!(
+                (f.u.len(), f.v.len()),
+                (width.div_ceil(2) * height, width.div_ceil(2) * height),
+                "{name}: frame {i} chroma planes are {}/{} samples -- 4:2:2 is HALF WIDTH and \
+                 FULL HEIGHT ({width}/2 x {height}); a quarter-height plane means the decode kept \
+                 a 4:2:0 allocation",
+                f.u.len(),
+                f.v.len()
+            );
+        }
+        let pix_fmt = match depth {
+            8 => "yuv422p",
+            10 => "yuv422p10le",
+            12 => "yuv422p12le",
+            other => panic!("{name}: no ffmpeg pixel format mapped for depth {other}"),
+        };
+        let theirs =
+            ffmpeg_decode_sequence_422_depth(stream, width, height, frames, depth, pix_fmt);
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            for (plane, ours_plane, theirs_plane) in
+                [("Y", &a.y, &b.y), ("U", &a.u, &b.u), ("V", &a.v, &b.v)]
+            {
+                assert_eq!(
+                    ours_plane.len(),
+                    theirs_plane.len(),
+                    "{name}: {plane} plane {i} is {} samples against ffmpeg's {} -- the 4:2:2 chroma \
+                     span is wrong on one of the two sides",
+                    ours_plane.len(),
+                    theirs_plane.len()
+                );
+                if let Some(bad) = ours_plane
+                    .iter()
+                    .zip(theirs_plane)
+                    .position(|(x, y)| x != y)
+                {
+                    panic!(
+                        "{name}: {plane} differs from ffmpeg at frame {i} sample {bad} ({} vs {}; \
+                         {} of {} samples differ)",
+                        ours_plane[bad],
+                        theirs_plane[bad],
+                        ours_plane
+                            .iter()
+                            .zip(theirs_plane)
+                            .filter(|(x, y)| x != y)
+                            .count(),
+                        ours_plane.len()
+                    );
+                }
+            }
+        }
+        let units = crate::decode::census_nonsub_units();
+        let coded = crate::decode::census_nonsub_coded();
+        let delta: [usize; 3] = std::array::from_fn(|p| units[p] - before[p]);
+        let coded_delta: [usize; 3] = std::array::from_fn(|p| coded[p] - before_coded[p]);
+        for (p, plane) in ["luma", "U", "V"].into_iter().enumerate() {
+            assert!(
+                delta[p] > 0,
+                "{name}: the {plane} plane read ZERO coefficient units across the whole stream -- \
+                 this byte-exact compare is vacuous with respect to 4:2:2 (class \
+                 gate-blind-to-feature)"
+            );
+            if require_coded {
+                assert!(
+                    coded_delta[p] > 0,
+                    "{name}: the {plane} plane coded ZERO coefficient units across the whole \
+                     stream -- every unit took the all-zero early return, so no coefficient path \
+                     was exercised"
+                );
+            }
+        }
+        eprintln!(
+            "{name}: byte-exact vs ffmpeg ({pix_fmt}, {frames} frames); census delta \
+             units=[{}, {}, {}] coded=[{}, {}, {}]",
+            delta[0], delta[1], delta[2], coded_delta[0], coded_delta[1], coded_delta[2]
+        );
+        (delta, coded_delta)
+    }
+
     /// lane-av1-llinter: the firing gate for the lossless 4:4:4 INTER chroma
     /// fix. The fixture is the report's dodge2 stream pinned into `fixtures/`:
     /// aomenc profile 1 over testsrc2 128x96 yuv444p, `--lossless=1`,
@@ -8566,10 +9201,13 @@ pub(crate) mod tests {
         // stopped replaying reads 0), and the mismatch half is the 4:2:2
         // signature: this stream is 4:4:4 (ss 0,0), where the unit's luma
         // width and height are equal, so a replay that stamped one axis with
-        // the other's span would still read 0 here -- the counter is what
-        // names the day 4:2:2 (ss 1,0, refused by name at the sequence
-        // header) is admitted, rather than letting the 8-row spill below the
-        // block corrupt the next block's `txb_skip` silently.
+        // the other's span would still read 0 here. lane-av1422lift: 4:2:2 is
+        // decoded now, so this counter no longer "names the day 4:2:2 is
+        // admitted" -- the 4:2:2 rows of
+        // `the_pinned_422_corpus_cells_decode_pixel_exact` read the mismatch
+        // half on streams where the two spans actually differ, which is what
+        // stops an 8-row spill below the block from corrupting the next
+        // block's `txb_skip` silently.
         let after_replay = crate::decode::sb128rect_chroma_replay_hits();
         assert!(
             after_replay.0 > before_replay.0,
@@ -10126,8 +10764,11 @@ pub(crate) mod tests {
         // TX_4X4 chroma units, so the end-of-block replay re-stamps each of
         // them over its own luma-mi rows -- the arm the span fix sits on, on
         // the OTHER admitted ss (1,1). The mismatch half is the 4:2:2
-        // signature and reads 0 here because 4:2:2 is refused by name at the
-        // sequence header; it is the tripwire for the day it is not.
+        // signature; lane-av1422lift: 4:2:2 is decoded now, so this is no
+        // longer "the tripwire for the day it is not" -- it is a zero this
+        // gate asserts on the stream in front of it, and the 4:2:2 rows of
+        // `the_pinned_422_corpus_cells_decode_pixel_exact` assert the same
+        // zero there.
         let after_replay = crate::decode::sb128rect_chroma_replay_hits();
         assert!(
             after_replay.0 > before_replay.0,
@@ -51417,7 +52058,11 @@ exit 0
     /// (0, 1) needs no arm: `ec-av1-syntax` reads `subsampling_y` only when
     /// `subsampling_x == 1` (`crates/ec-av1-syntax/src/sequence.rs:483-485`),
     /// so the pair is structurally uncodable and the 4:2:0 fallthrough is the
-    /// only residual. 4:2:2 is refused at the sequence header.
+    /// only residual. lane-av1422lift: this sentence used to end "4:2:2 is
+    /// refused at the sequence header", which was the wrong reason -- the
+    /// claim holds because `cfl_ac_ss` DISPATCHES `ss (1,0)` before the 4:2:0
+    /// fallthrough, not because the format could not arrive. The gate's
+    /// mechanism is unchanged; only the reason was stale.
     #[test]
     fn cfl_ac_q3_at_is_reached_only_through_the_420_fallthrough_of_cfl_ac_ss() {
         const NAME: &str = "cfl_ac_q3_at_is_reached_only_through_the_420_fallthrough_of_cfl_ac_ss";
