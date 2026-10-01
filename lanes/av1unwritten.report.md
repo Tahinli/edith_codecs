@@ -24,6 +24,16 @@ Branch `lane/av1unwritten`, base `main` = `8d6998d7`. No push.
 > fixture carries a 16x8 block split `PARTITION_HORZ` at 4:2:2 — and that table
 > test is what covers that direction.
 >
+> **r4, on top of r3.** Main: "a found defect is swept whole, not partly."
+> r3 named the six remaining sites instead of installing them. r4 installs four
+> of them, via a helper that takes the PARTITION SYMBOL and maps it to its
+> subsize dimensions (`partition_subsize_dims`, spec 6.10.3
+> `get_partition_subsize`) so the check can never be applied to a parent's own
+> shape -- the r2 mistake in a new place. The sites, their subsize, the cell
+> they guard, and the SIBLING that must keep decoding are in §3.2. Two are still
+> open and named (the inter-frame duplicate of the 64-level match, and the
+> `decode_rect4_16_intrabc` exception, which is another lane's charter).
+>
 > **This report was rewritten once before. The first version of this lane claimed a libaom
 > `TX_4X8` chroma unit for a `BLOCK_4X8` subsize and landed a port of it. The
 > refutation pass (Yavuz-5, verified first-hand by Main) showed that port does
@@ -170,6 +180,22 @@ subsampling mode", av1/decoder/decodeframe.c:1456, refusing by the same rule))
 
 Same refusal class as the oracle, same rule, same shape named.
 
+### 3.2 The r4 site table
+
+| site | subsize it can select | cell it guards | sibling that must keep decoding |
+|---|---|---|---|
+| 128 root, `PARTITION_VERT` (`decode.rs`, `match part128`) | 64x128 | `(1,0)` INVALID | `PARTITION_HORZ` -> 128x64, `(1,0)` = 64x64 valid |
+| 64-level, `PARTITION_VERT` (`match part64`) | 32x64 | `(1,0)` INVALID | `PARTITION_HORZ` -> 64x32, `(1,0)` = 32x32 valid |
+| 32-level, `PARTITION_VERT` (`match part32`) | 16x32 | `(1,0)` INVALID | `PARTITION_HORZ` -> 32x16, `(1,0)` = 16x16 valid |
+| 16x16-level, `PARTITION_VERT_4` (`match part16`) | 4x16 | `(1,0)` INVALID | `PARTITION_HORZ_4` -> 16x4, `(1,0)` = 8x4 **valid** -- the exact shape r2 refused, and the one libaom's encoder emits |
+| 16-level, `PARTITION_HORZ`/`VERT` | 16x8 / 8x16 | 8x16 `(1,0)` INVALID | `PARTITION_HORZ` -> 16x8, `(1,0)` = 8x8 valid |
+| 8-level, `PARTITION_HORZ`/`VERT` | 8x4 / 4x8 | 4x8 `(1,0)` INVALID | `PARTITION_HORZ` -> 8x4, `(1,0)` = 4x4 valid |
+
+The sibling column is the r2 lesson turned into a rule: at every site the
+opposite-axis branch of the SAME dispatch must keep decoding, and the table test
+plus these guards are what prove it. `decode_rect4_16_intrabc` is the declared
+exception (another lane's charter).
+
 ### 3.1 Sites found, and the ones proven not to need it
 
 | site | subsizes it can produce | needs the check? |
@@ -177,11 +203,14 @@ Same refusal class as the oracle, same rule, same shape named.
 | `partition_w8` (2 sites, 36549 / 36767 region) | 8x4, 4x8 | **yes**, installed |
 | `partition_w16` intra (36175 region) | 16x8, 8x16 | **yes**, installed |
 | `partition_w16` edge split (`VERT_ALIKE`/`HORZ_ALIKE` gather) | same two, reached only when `has_cols16`/`has_rows16` is false | covered by the same rule at the sibling site; the edge arm's two-symbol gather can only choose SPLIT vs the matching strip |
-| `PARTITION_HORZ_4` / `VERT_4` on 8x16 / 16x8 (`decode_rect_split`) | 4x16 (INVALID at 4:2:2), 16x4 (legal at 4:2:2, INVALID at 4:4:0) | **NOT installed — named gap** |
-| `partition_w32` `PARTITION_VERT` | 16x32 — INVALID at 4:2:2 | **NOT installed — named gap** |
-| `partition_w64` `PARTITION_VERT` | 32x64 — INVALID at 4:2:2 | **NOT installed — named gap** |
-| 128 root `PARTITION_VERT` | 64x128 — INVALID at 4:2:2 | **NOT installed — named gap** |
-| the 4-way vertical splits at 16/32/64 (`VERT_A` / `VERT_B`) | 8x32, 16x64 — both INVALID at 4:2:2 | **NOT installed — named gap** |
+| `PARTITION_VERT_4` at the 16x16 level | 4x16 — INVALID at 4:2:2 | **yes, r4, installed** |
+| `partition_w32` `PARTITION_VERT` | 16x32 — INVALID at 4:2:2 | **yes, r4, installed** |
+| `partition_w64` `PARTITION_VERT` | 32x64 — INVALID at 4:2:2 | **yes, r4, installed** |
+| 128 root `PARTITION_VERT` | 64x128 — INVALID at 4:2:2 | **yes, r4, installed** |
+| the four-way vertical splits (`VERT_A` / `VERT_B`) at 16/32/64 | 8x32, 16x64 — both INVALID at 4:2:2 | **still open, named** |
+| `VERT_4` on 8x16 / 16x8 (`decode_rect_split`) | 8x32 — INVALID at 4:2:2 | **still open, named** |
+| the inter-frame duplicate of the 64-level match | 32x64 | **still open, named** |
+| `decode_rect4_16_intrabc` | 4x16 / 8x32 | **out of scope** — another lane's charter |
 | 32/64/128 roots' OWN plane blocks, the AB partitions, `PARTITION_SPLIT` | BLOCK_32X32 (16X32), BLOCK_64X64 (32X32), BLOCK_128X128 (64X64), all valid | no — a PARENT row being valid says nothing about its children, which is exactly what r2 got wrong; the child rows are the four rows above |
 | 4:4:4 square leaves, `decode_leaf8`, `decode_leaf_split4` | BLOCK_4X4 / BLOCK_8X8 / BLOCK_16X16 | no: `(0,0)` column is non-INVALID for all of them |
 
@@ -206,7 +235,7 @@ instrument is what would show it if one ever did.
 * **Corpus, both trees.** Every fixture decoded with `EC_AV1_FINAL_DUMP`, every
   `.f*` hashed. Pre-fix vs post-fix the **126 valid fixtures are byte-identical**
   and **none newly refuses**; the witness is the only difference and it now
-  refuses. Re-run on the r3 (corrected) predicate: `differing:
+  refuses. Re-run on the r4 predicate: `differing:
   ['440_request_is_422']`, 126 fixtures emitting dumps, and exactly one fixture
   whose output contains `REFUSED` — the witness. **The sweep cannot see the
   (16,4)-at-4:2:2 false positive**: no committed fixture carries a 16x8 block

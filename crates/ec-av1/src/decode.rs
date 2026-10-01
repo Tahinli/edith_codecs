@@ -21445,6 +21445,41 @@ fn chroma_plane_block_codable(bw: usize, bh: usize, sx: usize, sy: usize) -> boo
     }
 }
 
+/// libaom `get_partition_subsize` (spec 6.10.3, `common_data.c`'s
+/// `subsize_lookup`) reduced to its DIMENSIONS -- all the `av1_ss_size_lookup`
+/// check needs, and, by construction, never the PARENT block's own shape
+/// (that is the r2 mistake in a new place: refusing `16x4` at 4:2:2 by testing
+/// the 16x8 parent). `PARTITION_HORZ_A`/`_B` and `PARTITION_VERT_A`/`_B` are
+/// the four-way arms, whose subsizes are the strips they visit.
+fn partition_subsize_dims(bsize: (usize, usize), part: usize) -> (usize, usize) {
+    let (w, h) = bsize;
+    match part {
+        PARTITION_SPLIT => (w / 2, h / 2),
+        PARTITION_HORZ | PARTITION_HORZ_A | PARTITION_HORZ_B => (w, h / 2),
+        PARTITION_VERT | PARTITION_VERT_A | PARTITION_VERT_B => (w / 2, h),
+        PARTITION_HORZ_4 => (w, h / 4),
+        PARTITION_VERT_4 => (w / 4, h),
+        _ => (w, h),
+    }
+}
+
+/// [`chroma_plane_block_codable`] applied to the subsize a partition SYMBOL
+/// selected, exactly as `decode_partition` does at `decodeframe.c:1449-1458`
+/// before descending into it. Returns libaom's named refusal for the caller to
+/// propagate.
+fn refuse_invalid_subsize(
+    bsize: (usize, usize),
+    part: usize,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<()> {
+    let (bw, bh) = partition_subsize_dims(bsize, part);
+    if chroma_plane_block_codable(bw, bh, ss_x(fctx), ss_y(fctx)) {
+        Ok(())
+    } else {
+        Err(refuse_invalid_plane_block(bw, bh, fctx))
+    }
+}
+
 /// [`chroma_plane_block_codable`] as libaom's refusal: a returned error naming
 /// the shape and the subsampling mode, never an `assert!` -- a partition symbol
 /// is stream data, so a hostile file can reach it.
@@ -35424,6 +35459,14 @@ fn read_sb128_root(
     // root has no 1:4 arm at all (`PARTITION_HORZ_4`/`VERT_4` are excluded
     // for BLOCK_128X128 by `av1_get_partition_cdf`'s 8-symbol alphabet,
     // which stops at VERT_B).
+    // lane-av1unwritten r4: guard the subsize THIS SYMBOL selected, never the
+    // root's own plane block. VERT on a 128x128 root selects BLOCK_64X128,
+    // whose 4:2:2 plane block is BLOCK_INVALID; the AB arms select 64x64
+    // quadrants (valid), so PARTITION_HORZ / PARTITION_NONE / SPLIT keep
+    // decoding untouched.
+    if matches!(part128, PARTITION_VERT) {
+        refuse_invalid_subsize((128, 128), part128, fctx)?;
+    }
     match part128 {
         PARTITION_SPLIT => hit!(PART128_SPLIT_HITS),
         PARTITION_NONE => hit!(PART128_NONE_HITS),
@@ -36228,6 +36271,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     }
                                 }
                             };
+                            // lane-av1unwritten r4: VERT on a 32x32 block selects
+                            // BLOCK_16X32 -- INVALID at 4:2:2. HORZ on the same
+                            // block selects BLOCK_32X16, whose (1,0) cell is
+                            // BLOCK_16X16 (valid) and MUST keep decoding, so the
+                            // check is on the symbol's subsize, not the parent's.
+                            if matches!(part32, PARTITION_VERT) {
+                                refuse_invalid_subsize((32, 32), part32, fctx)?;
+                            }
                             match part32 {
                                 PARTITION_NONE => {
                                     decode_block(
@@ -36439,6 +36490,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 let br = (mi_row0 + 2, mi_col0 + 2);
                                                 let mut done: Vec<((usize, usize), usize)> =
                                                     Vec::new();
+                                                // lane-av1unwritten r4: the
+                                                // 16x16-level 1:4 split --
+                                                // VERT_4 selects BLOCK_4X16,
+                                                // INVALID at 4:2:2; HORZ_4
+                                                // selects BLOCK_16X4, whose (1,0)
+                                                // cell is BLOCK_8X4 (valid, the
+                                                // shape r2 wrongly refused).
+                                                if matches!(part16, PARTITION_VERT_4) {
+                                                    refuse_invalid_subsize((16, 16), part16, fctx)?;
+                                                }
                                                 match part16 {
                                                     PARTITION_HORZ_A => {
                                                         let m_tl =
@@ -54217,6 +54278,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 fctx,
                             )?
                         };
+                    }
+                    // lane-av1unwritten r4: VERT on a 64x64 block selects
+                    // BLOCK_32X64 -- INVALID at 4:2:2. HORZ on the same block
+                    // selects BLOCK_64X32, whose (1,0) cell is BLOCK_32X32
+                    // (valid) and MUST keep decoding.
+                    if matches!(part64, PARTITION_VERT) {
+                        refuse_invalid_subsize((64, 64), part64, fctx)?;
                     }
                     match part64 {
                         PARTITION_HORZ_A => {
