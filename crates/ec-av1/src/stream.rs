@@ -2915,6 +2915,82 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1subsizesweep: the FRAME-EDGE walk of a BLOCK_INVALID subsize,
+    /// pinned. This is the one install site the partition-symbol guards missed,
+    /// and the sibling pin above cannot see it -- that pin's 8x16 comes from a
+    /// 16x16-level `PARTITION_VERT_B` (an interior AB strip, refused at
+    /// decode.rs:36472), while this pin's comes from the key-frame 16-level
+    /// FRAME-EDGE arm, which is not a `dec.symbol(` site at all: it reads one
+    /// gathered bit with `dec.symbol_fixed(&gather(..))` and dispatches
+    /// `decode_leaf_rect` straight off it.
+    ///
+    /// `422_header_edge16_walk.obu` (128 bytes, sha256
+    /// `e8ab2bb229896f796cdec4d2cb383b41f057ef8d364da30f160a3f55a452657f`,
+    /// fnv1a64 `0xcfa2394ebe1f7764`) is a 4:2:2 sequence header over a 4:2:0
+    /// key frame's tile, at 88x64. Width 88 is 8 mod 16, so the last 16x16
+    /// column block is COLUMN-short and the frame-edge arm fires; height 64 is
+    /// 16-aligned, so the ROW is not short and the both-cut arm is not taken.
+    /// The gathered bit names `PARTITION_VERT`, so the strip is `BLOCK_8X16`.
+    ///
+    /// libaom's own verdict, which is the rule this pin pins:
+    ///
+    /// ```text
+    /// $ aomdec --rawvideo -o /dev/null fixtures/422_header_edge16_walk.obu
+    /// Warning: Failed to decode frame 1: Corrupt frame detected
+    /// Warning: Additional information: Block size 8x16 invalid with this subsampling mode
+    /// ```
+    ///
+    /// What makes this pin different from every other refusal gate in this file
+    /// is that the 8x16 is the ONLY offending subsize in the stream. Measured
+    /// over a 260-candidate sweep (4 card textures x 5 quantizers x 13 declared
+    /// widths), this is the one candidate whose decode with the guard removed
+    /// SUCCEEDS: with the `refuse_invalid_subsize` at decode.rs:37098 deleted,
+    /// this decoder returned a full 88x64 picture where libaom refuses the
+    /// frame. So the guard is not a redundant second refusal here -- it is the
+    /// only thing between a corrupt frame and a plausible-looking decode.
+    #[test]
+    fn a_422_header_whose_only_invalid_subsize_is_the_16_level_frame_edge_walk_is_refused() {
+        const NAME: &str =
+            "a_422_header_whose_only_invalid_subsize_is_the_16_level_frame_edge_walk_is_refused";
+        let _gate_lock = lock_gate_counters();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("422_header_edge16_walk.obu");
+        let pinned = read_pin(&path, 128, 0xcfa2394ebe1f7764, NAME);
+        // The shape must be the one this lane's arm carries: if the pin ever
+        // stops being an 8x16 strip the refusal is coming from somewhere else
+        // and this gate is measuring the wrong thing.
+        assert!(
+            !crate::decode::chroma_plane_block_codable(8, 16, 1, 0),
+            "{NAME}: BLOCK_8X16 must be BLOCK_INVALID at 4:2:2 -- this gate's whole \
+             subject is `av1_ss_size_lookup[BLOCK_8X16][1][0] == BLOCK_INVALID`"
+        );
+        assert!(
+            crate::decode::chroma_plane_block_codable(16, 8, 1, 0),
+            "{NAME}: the 16x8 mirror MUST stay legal at 4:2:2 (BLOCK_8X8) -- it is what \
+             keeps the new guard from refusing the sibling arm's strip"
+        );
+        let err = decode_stream(&pinned)
+            .err()
+            .unwrap_or_else(|| panic!("{NAME}: the pin must be REFUSED, not decoded"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid with this subsampling mode"),
+            "{NAME}: the refusal must name libaom's rule (its own wording), got: {msg}"
+        );
+        // Positive control: a genuine 4:2:2 stream must still decode, so this
+        // gate cannot pass by refusing everything.
+        let ok_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("422_key_64x64.obu");
+        let ok = decode_stream(&std::fs::read(&ok_path).expect("the 4:2:2 control fixture"))
+            .unwrap_or_else(|e| panic!("{NAME}: a genuine 4:2:2 pin must still decode: {e}"));
+        assert!(
+            !ok.is_empty(),
+            "{NAME}: the 4:2:2 control decoded no frames"
+        );
+    }
+
     /// lane-av1-422bigblock: the two witnessed 4:2:2 big-block defects, pinned
     /// as fixtures (`git add -f`; `fixtures/` is gitignored).
     ///
