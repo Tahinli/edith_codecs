@@ -24,6 +24,17 @@ Branch `lane/av1unwritten`, base `main` = `8d6998d7`. No push.
 > fixture carries a 16x8 block split `PARTITION_HORZ` at 4:2:2 — and that table
 > test is what covers that direction.
 >
+> **r5, on top of r4.** Main: "a found defect is swept whole, not partly."
+> r4 guarded only the plain `VERT` arm at four sites and named six more. r5
+> makes every guard UNCONDITIONAL on the resolved symbol — because
+> `partition_subsize_dims` is exact, passing the symbol covers `VERT`,
+> `VERT_A`/`VERT_B`, `HORZ_4` and `VERT_4` in one call, and the HORZ siblings
+> pass through — and adds the three inter-frame duplicates plus the 64x64 key-frame
+> level that binds its symbol to `part` rather than `part64`. One intermediate
+> attempt inserted `refuse_invalid_subsize(..., PARTITION_VERT_4, ...)` INSIDE a
+> `PARTITION_HORZ_4 | PARTITION_VERT_4 =>` arm, which fired for HORZ_4 too and
+> refused nine real 4:2:2 gates; the unconditional form is what shipped.
+>
 > **r4, on top of r3.** Main: "a found defect is swept whole, not partly."
 > r3 named the six remaining sites instead of installing them. r4 installs four
 > of them, via a helper that takes the PARTITION SYMBOL and maps it to its
@@ -180,6 +191,34 @@ subsampling mode", av1/decoder/decodeframe.c:1456, refusing by the same rule))
 
 Same refusal class as the oracle, same rule, same shape named.
 
+### 3.3 The r5 site table
+
+Every site below is guarded UNCONDITIONALLY: the symbol is passed to
+`refuse_invalid_subsize`, and because `partition_subsize_dims` is exact, every
+arm of the dispatch is covered at once — `VERT`, `VERT_A`/`VERT_B`, `HORZ_4` and
+`VERT_4` — while the HORZ siblings pass through. That replaced r4's narrower
+`matches!(sym, PARTITION_VERT)` guards, which covered only the plain `VERT` arm.
+
+| site (key frame unless noted) | subsize it can select | guarded cell | sibling that must keep decoding |
+|---|---|---|---|
+| 128 root, `match part128` | `VERT`/`VERT_A`/`VERT_B` -> 64x128 | `(1,0)` INVALID | `HORZ`/`HORZ_A`/`HORZ_B` -> 128x64, `(1,0)` = 64x64 valid |
+| 64 level, `match part` (symbol bound to `part`) | `VERT`/`VERT_A`/`VERT_B` -> 32x64; `VERT_4` -> 16x64 | `(1,0)` INVALID | `HORZ*` -> 64x32 `(1,0)` = 32x32 valid; `HORZ_4` -> 64x16 `(1,0)` = 32x16 valid |
+| 32 level, `match part32` | `VERT*` -> 16x32; `VERT_4` -> 8x32 | `(1,0)` INVALID | `HORZ*` -> 32x16 `(1,0)` = 16x16 valid; `HORZ_4` -> 32x8 `(1,0)` = 16x8 valid |
+| 16x16 level, `match part16` | `VERT_4` -> 4x16 | `(1,0)` INVALID | `HORZ_4` -> 16x4, `(1,0)` = **8x4 valid** — the shape r2 refused |
+| 8 level, `partition_w8` arms (r3) | `VERT` -> 4x8 | `(1,0)` INVALID | `HORZ` -> 8x4, `(1,0)` = 4x4 valid |
+| **inter** 128 root, `match part128` | 64x128 | `(1,0)` INVALID | as key |
+| **inter** 64 level, `match part64` | 32x64; `VERT_4` -> 16x64 | `(1,0)` INVALID | as key |
+| **inter** 32 level, `match part32` | 16x32; `VERT_4` -> 8x32 | `(1,0)` INVALID | as key |
+| **inter** 16x16 level, `match part16` | 4x16 | `(1,0)` INVALID | `HORZ_4` -> 16x4 valid |
+
+`decode_rect4_16_intrabc` remains the declared exception (another lane's
+charter). The 8x16 / 16x8 `VERT_4` case is covered by the level-16 guard, whose
+symbol is the same `PARTITION_VERT_4`; the shape it selects is the four-way child
+`4x16` at that level, not the `16x4` r2 wrongly refused.
+
+**Still open:** none of the four items in r5's list. Each is a one-line call
+behind the existing helper and all four landed.
+
 ### 3.2 The r4 site table
 
 | site | subsize it can select | cell it guards | sibling that must keep decoding |
@@ -235,7 +274,7 @@ instrument is what would show it if one ever did.
 * **Corpus, both trees.** Every fixture decoded with `EC_AV1_FINAL_DUMP`, every
   `.f*` hashed. Pre-fix vs post-fix the **126 valid fixtures are byte-identical**
   and **none newly refuses**; the witness is the only difference and it now
-  refuses. Re-run on the r4 predicate: `differing:
+  refuses. Re-run on the r5 predicate: `differing:
   ['440_request_is_422']`, 126 fixtures emitting dumps, and exactly one fixture
   whose output contains `REFUSED` — the witness. **The sweep cannot see the
   (16,4)-at-4:2:2 false positive**: no committed fixture carries a 16x8 block
