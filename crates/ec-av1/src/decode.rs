@@ -21285,9 +21285,9 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
 
 /// Enabled by `EC_AV1_PLANE_SENTINEL` (there is no separate flag for it): print
 /// an EXACT census of the samples the tile walk never wrote -- with it, every
-/// plane still holding [`PLANE_SENTINEL`] at this point is a sample no block
-/// reconstructed, and no legal sample can equal `0xDEAD` (reconstruction clamps
-/// to `(1 << bit_depth) - 1`).
+/// plane still holding [`plane_poison`] at this point is a sample no block
+/// reconstructed, and no legal sample can equal the poison (reconstruction
+/// clamps to `(1 << bit_depth) - 1`, at most 4095).
 ///
 /// Coverage, stated as the code has it: this census runs at TWO of the four
 /// places [`apply_deblock`] is entered from -- the key-frame path and the
@@ -21304,43 +21304,74 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
 /// `lane/av1422seed` census used: it replaces a wrong-sample diff (which says
 /// where the OUTPUT is wrong, not whether the block was written at all) with a
 /// direct count plus the coordinates of every hole, grouped into per-row
-/// spans so a large hole stays readable. Scans each plane over its own
-/// `true_width` x `true_height` extent, PER AXIS (`true_width.min(p.width)`), so
-/// a 4:2:2 frame's chroma is scanned at its own `fw/2 x fh` shape rather than
-/// the 4:2:0 `div_ceil(2)` crop the older [`dump_stage16`] used: past that
-/// extent is the padded coding surface's invented tail, which no decoder ever
-/// reads.
+/// spans so a large hole stays readable.
+///
+/// It scans TWO regions per plane, because they answer different questions and
+/// the earlier revision only scanned one of them:
+/// * the TRUE EXTENT -- each plane over its own `true_width` x `true_height`,
+///   PER AXIS (`true_width.min(p.width)`), so a 4:2:2 frame's chroma is scanned
+///   at its own `fw/2 x fh` shape rather than the 4:2:0 `div_ceil(2)` crop the
+///   older [`dump_stage16`] used. A hole here can reach the caller, and it is
+///   the region lane/av1unwritten's 224 samples sat in.
+/// * the PADDED TAIL -- everything outside that extent, out to the block-aligned
+///   coding surface -- counted separately into [`PAD_UNWRITTEN_SAMPLES`]. The
+///   earlier revision's doc comment asserted "past that is the padded coding
+///   surface's invented tail, which no decoder ever reads". That assertion is
+///   exactly what a tail that is never written and never read looks like, so it
+///   was self-certifying; the tail is now scanned and counted like any other
+///   region. `EC_AV1_PLANE_ALLOC=padzero`/`extzero` attribute a read to one
+///   side or the other (see [`fresh_plane`]).
 fn census_unwritten(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     if !plane_sentinel_on() {
         return;
     }
+    let poison = plane_poison();
     let idx = PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst);
     for (name, p) in [("Y", y), ("U", u), ("V", v)] {
-        let (w, h) = (p.true_width.min(p.width), p.true_height);
+        let (w, h) = (p.true_width.min(p.width), p.true_height.min(p.height));
         let mut total = 0usize;
         let mut spans: Vec<(usize, usize, usize)> = Vec::new();
         for row in 0..h {
             let mut run: Option<(usize, usize)> = None;
             for col in 0..w {
-                if p.data[row * p.width + col] == PLANE_SENTINEL {
+                if p.data[row * p.width + col] == poison {
                     total += 1;
                     run = Some(match run {
                         None => (col, col),
                         Some((a, _)) => (a, col),
                     });
                 }
-                if run.is_some()
-                    && (col + 1 == w || p.data[row * p.width + col + 1] != PLANE_SENTINEL)
-                {
+                if run.is_some() && (col + 1 == w || p.data[row * p.width + col + 1] != poison) {
                     let (a, b) = run.take().expect("a run is open here");
                     spans.push((row, a, b));
                 }
             }
         }
+        // The padded tail: columns `w..width` on rows `0..h`, plus every column
+        // on rows `h..height`.
+        let mut pad_total = 0usize;
+        let mut pad_scanned = 0usize;
+        for row in 0..p.height {
+            let (from, to) = if row < h { (w, p.width) } else { (0, p.width) };
+            if from >= to {
+                continue;
+            }
+            pad_scanned += to - from;
+            pad_total += p.data[row * p.width + from..row * p.width + to]
+                .iter()
+                .filter(|&&s| s == poison)
+                .count();
+        }
         UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
         CENSUS_SCANNED.fetch_add(w * h, std::sync::atomic::Ordering::SeqCst);
+        PAD_UNWRITTEN_SAMPLES.fetch_add(pad_total, std::sync::atomic::Ordering::SeqCst);
+        PAD_CENSUS_SCANNED.fetch_add(pad_scanned, std::sync::atomic::Ordering::SeqCst);
+        eprintln!(
+            "SENTINEL_CENSUS idx={idx} plane={name} surface={}x{} extent={w}x{h} \
+             pad_scanned={pad_scanned} unwritten={total} pad_unwritten={pad_total}",
+            p.width, p.height,
+        );
         if total == 0 {
-            eprintln!("SENTINEL_CENSUS idx={idx} plane={name} extent={w}x{h} unwritten=0");
             continue;
         }
         let body: Vec<String> = spans
@@ -21348,8 +21379,10 @@ fn census_unwritten(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
             .map(|&(r, a, b)| format!("y{r} x{a}..={b}"))
             .collect();
         eprintln!(
-            "SENTINEL_CENSUS idx={idx} plane={name} extent={w}x{h} unwritten={total} \
-             spans={}: {}",
+            "SENTINEL_CENSUS idx={idx} plane={name} surface={}x{} extent={w}x{h} \
+             unwritten={total} spans={}: {}",
+            p.width,
+            p.height,
             spans.len(),
             body.join(" ")
         );
@@ -21390,6 +21423,67 @@ static CENSUS_SCANNED: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 /// pairing.
 pub fn take_census_scanned() -> usize {
     CENSUS_SCANNED.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Samples in the PADDED TAIL -- every sample of each plane outside its own
+/// `true_width` x `true_height` extent -- that still holds [`plane_poison`] at
+/// the pre-deblock point. [`census_unwritten`] scans that region too, because
+/// "past the true extent nothing is ever read" was an ASSUMPTION the tail's
+/// census was built to avoid checking; this counter is the measurement.
+static PAD_UNWRITTEN_SAMPLES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Samples [`census_unwritten`] scanned in the padded tail, paired with
+/// [`PAD_UNWRITTEN_SAMPLES`] for the same reason as [`CENSUS_SCANNED`].
+static PAD_CENSUS_SCANNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Reads and clears [`PAD_UNWRITTEN_SAMPLES`].
+pub fn take_pad_unwritten_samples() -> usize {
+    PAD_UNWRITTEN_SAMPLES.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Reads and clears [`PAD_CENSUS_SCANNED`].
+pub fn take_pad_census_scanned() -> usize {
+    PAD_CENSUS_SCANNED.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The largest value reconstruction can produce, `(1 << 12) - 1`: the highest
+/// bit depth this decoder carries is 12. A sentinel at or below this could be
+/// a LEGAL sample, which would make the whole census vacuous -- every
+/// unwritten sample would look like an ordinary one.
+const MAX_LEGAL_SAMPLE: u16 = 4095;
+
+/// The value [`fresh_plane`] fills with when the sentinel is on.
+///
+/// [`PLANE_SENTINEL`] unless `EC_AV1_PLANE_SENTINEL` names a different one in
+/// hex. Two different poisons are what turns the sentinel from "did a hole
+/// survive into the output" into "did the output depend on the buffer's
+/// initial content": a hole whose value reaches the picture changes the hash
+/// when the poison changes, and one that does not cannot have influenced
+/// anything. A value at or below [`MAX_LEGAL_SAMPLE`] is REFUSED (falls back
+/// to [`PLANE_SENTINEL`]) because the census's soundness rests on the sentinel
+/// being impossible. `EC_AV1_PLANE_SENTINEL=1` -- the spelling every existing
+/// caller and gate uses, and `env_flag!`'s mere presence test -- keeps
+/// [`PLANE_SENTINEL`].
+fn plane_poison() -> u16 {
+    static V: std::sync::LazyLock<u16> = std::sync::LazyLock::new(|| {
+        let Ok(raw) = crate::envflags::var("EC_AV1_PLANE_SENTINEL") else {
+            return PLANE_SENTINEL;
+        };
+        let t = raw.trim();
+        if t.is_empty() || t == "1" {
+            return PLANE_SENTINEL;
+        }
+        let hex = t
+            .strip_prefix("0x")
+            .or_else(|| t.strip_prefix("0X"))
+            .unwrap_or(t);
+        match u16::from_str_radix(hex, 16) {
+            Ok(v) if v > MAX_LEGAL_SAMPLE => v,
+            _ => PLANE_SENTINEL,
+        }
+    });
+    *V
 }
 
 thread_local! {
@@ -21777,91 +21871,209 @@ pub(crate) fn census_unwritten_final(y: &[u16], u: &[u16], v: &[u16]) {
     // each plane IS the true-extent count.
     let (scanned, total): (usize, usize) = [y, u, v]
         .iter()
-        .map(|p| (p.len(), p.iter().filter(|&&s| s == PLANE_SENTINEL).count()))
+        .map(|p| (p.len(), p.iter().filter(|&&s| s == plane_poison()).count()))
         .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
     FINAL_CENSUS_SCANNED.fetch_add(scanned, std::sync::atomic::Ordering::SeqCst);
     FINAL_UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// A frame plane's own backing store, `n` samples, UNINITIALISED.
+/// Which closure [`fresh_plane`] applies to the allocation it hands back.
 ///
-/// (lane-picalloc) Replaced a `vec![0u16; n]` that zeroed the whole plane
-/// buffer: ~3% of the frame thread's cycles at 4K, serially at the frame's head,
-/// to initialise 25 MB the next pass overwrites.
+/// # WHY AN ENV ARM, and what each arm is
 ///
-/// # THE `unsafe` BELOW IS NOT FULLY JUSTIFIED -- read this before approving it
+/// The closure was a filed choice with no number behind it
+/// (`lanes/unwritten-dep.report.md` §12). lane-av1uballoc measured all of them
+/// on one stream in ONE binary, because three separate builds cannot make the
+/// comparison fair -- the allocator's recycled-arena state, the page-cache
+/// state and the code layout all differ between them. `EC_AV1_PLANE_ALLOC`
+/// (process-constant, read once -- see [`crate::envflags`]) picks the arm.
+/// Numbers: `lanes/av1uballoc.report.md`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlaneAlloc {
+    /// `vec![0u16; n]`, i.e. `alloc_zeroed`/`calloc`. **The default and the
+    /// shipped closure.** It removes the `unsafe` below from every build that
+    /// does not ask for a census arm.
+    ///
+    /// What it costs, measured on one stream in one binary
+    /// (`lanes/av1uballoc.report.md` §1): **+0.84%** of decode wall time at
+    /// 3840x2160 4:2:0 (96 frames, 6937.728 -> 6995.727 ms, mean 6995.769,
+    /// run-to-run spread of the arm 10.2 ms, so ~6 sigma), **+0.81%** at
+    /// 3840x2160 4:2:2, and **-1.63%** at 1920x1080 4:2:0 -- it is FASTER
+    /// there, reproducibly. The sign flip is not explained here; the numbers
+    /// are.
+    ///
+    /// What it is NOT is the "zero pages are free" story the arm's name
+    /// invites: glibc hands a RECYCLED arena block back from `calloc` with the
+    /// same memset an explicit fill does, which is why this arm and
+    /// [`PlaneAlloc::Fill`] land within 0.03% of each other at every size.
+    Zeroed,
+    /// The status quo this lane replaced: `Vec::with_capacity` + `set_len`,
+    /// nothing written. Kept as an arm because every number here is a delta
+    /// against it, and because `EC_AV1_PLANE_ALLOC=uninit` reproduces it.
+    Uninit,
+    /// An explicit zero-fill (`Vec::with_capacity` then `resize(n, 0)`) -- the
+    /// closure that costs the same as [`PlaneAlloc::Zeroed`]. Kept so the
+    /// "zero pages are free" hypothesis stays falsifiable from the outside.
+    Fill,
+    /// Census-only: zero the PADDED tail (everything outside the plane's true
+    /// extent) and leave the true extent uninitialised. Pairs with
+    /// [`PlaneAlloc::ExtZero`] to attribute a read to one region.
+    PadZero,
+    /// Census-only: the mirror of [`PlaneAlloc::PadZero`] -- zero the true
+    /// extent, leave the padded tail uninitialised.
+    ExtZero,
+}
+
+/// `EC_AV1_PLANE_ALLOC`'s arm. Defaults to [`PlaneAlloc::Zeroed`], the shipped
+/// closure; an unrecognised value is the default too, so a typo degrades to the
+/// safe arm rather than back to the `unsafe` one.
+fn plane_alloc() -> PlaneAlloc {
+    static ARM: std::sync::LazyLock<PlaneAlloc> = std::sync::LazyLock::new(|| {
+        match crate::envflags::var("EC_AV1_PLANE_ALLOC")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("uninit") => PlaneAlloc::Uninit,
+            Some("fill") => PlaneAlloc::Fill,
+            Some("padzero") => PlaneAlloc::PadZero,
+            Some("extzero") => PlaneAlloc::ExtZero,
+            _ => PlaneAlloc::Zeroed,
+        }
+    });
+    *ARM
+}
+
+/// Zeroes a plane's PADDED tail -- the SB-aligned coding surface's invented
+/// rows and columns outside `true_width` x `true_height` -- and leaves the
+/// true extent alone. [`PlaneAlloc::PadZero`] only.
+fn zero_pad(v: &mut [u16], width: usize, height: usize, true_width: usize, true_height: usize) {
+    for row in 0..height {
+        let base = row * width;
+        let first = if row < true_height { true_width } else { 0 };
+        v[base + first..base + width].fill(0);
+    }
+}
+
+/// Zeroes a plane's TRUE EXTENT and leaves the padded tail alone -- the mirror
+/// of [`zero_pad`]. [`PlaneAlloc::ExtZero`] only.
+fn zero_extent(v: &mut [u16], width: usize, true_width: usize, true_height: usize) {
+    for row in 0..true_height {
+        let base = row * width;
+        v[base..base + true_width].fill(0);
+    }
+}
+
+/// A frame plane's own backing store, `n` samples.
 ///
-/// This comment previously claimed the SB-padded surface "is written
-/// sample-for-sample by the tile walk's reconstruction before anything reads
-/// it", and cited the sentinel gate as proof. **That claim is RETRACTED by
-/// measurement.** The basis for the retraction is THIS LANE's own, not
-/// second-hand: on `440_request_is_422` an exact u16 whole-plane census at the
-/// pre-deblock point finds **112 unwritten samples per chroma plane, 224 total**
-/// (U and V, 28 whole 4x4 groups each, rows 36..63) in a frame that is SHOWN
-/// (`Key show=true`) and whose samples the caller receives. Uninitialised memory
-/// that reaches the caller was read, or the read that produced it was. That is
-/// the UB, and it needs no hash-variation claim to stand.
+/// `true_width`/`true_height` are the plane's decodable extent in its own
+/// units; `width`/`height` the block-aligned coding surface it is carved from
+/// (`cols32 * 32`, so at most 31 px of margin per axis). They are what
+/// [`zero_pad`]/[`zero_extent`] need and what the pad census reports against;
+/// [`PlaneAlloc::Zeroed`] reads none of them.
 ///
-/// A hash-variation observation also exists -- five plain runs of the same
-/// witness giving two different output hashes (`lanes/av1unwritten.report.md`),
-/// which would point the same way -- but it is SECOND-HAND and was NOT
-/// reproduced here: five plain runs on `8d6998d7` gave one hash
-/// (`a761118c8dd5c8d0`, `lanes/unwritten-dep.report.md` §10). It is not relied
-/// on, and the ambient content a run happens to receive is machine-dependent,
-/// so a stable value on one host and a varying one on another would be the same
-/// defect either way. The 224-sample census is the basis; the hashes are aside.
+/// # WHAT CAN BE READ BEFORE IT IS WRITTEN -- the region list
 ///
-/// WHAT IS ACTUALLY ESTABLISHED, and it is weaker:
+/// The premise an earlier revision of this comment carried -- "the SB-padded
+/// surface is written sample-for-sample by the tile walk's reconstruction
+/// before anything reads it" -- is RETRACTED by measurement
+/// (`lanes/unwritten-dep.report.md` §12). What replaces it is this list, which
+/// is checkable where a premise is not. TWO disjoint regions of the allocation
+/// can hold a sample no block wrote:
 ///
-/// * The sentinel gate ([`census_unwritten_final`],
-///   `the_frame_the_caller_receives_carries_no_unwritten_plane_sample`) proves
-///   that no sample the tile walk never wrote SURVIVES into the frame the caller
-///   receives, on the corpus measured. **It counts at the OUTPUT POINT ONLY --
-///   one census, one scan.** The pre-deblock census ([`census_unwritten`],
-///   `take_unwritten_samples` / `take_census_scanned`) is a DIFFERENT instrument
-///   and has NO committed reader anywhere in the crate on `main`, so it backs
-///   nothing here; an earlier revision of this comment credited the gate with
-///   both, which would have told a reviewer the premise is covered by two scans
-///   when only one exists. It is measured SURVIVAL, not reads.
-/// * It does NOT prove "every sample is written before it is read". A sample read
-///   as a prediction or filter neighbour and overwritten a moment later is
-///   invisible to that count. **No such read has been observed, and no
-///   instrument here measures for one.**
-/// * On `main` = `e45cc748` the one path where a read was demonstrated is
-///   UNREACHABLE: lane/av1unwritten refuses the subsize before descending.
+/// 1. THE PADDED TAIL -- every sample outside `true_width` x `true_height`, out
+///    to the block-aligned surface. Unwritten BY CONSTRUCTION: no block lands
+///    on it. Measured over all 128 committed fixtures at the pre-deblock point:
+///    **4,676,128 unwritten of 22,787,296 scanned tail samples (20.5%)**, on 38
+///    fixtures. It is also **not read**: valgrind memcheck over the same 128
+///    fixtures, on the `uninit` arm, reports ZERO uninitialised-value uses --
+///    and the instrument is shown live by a deliberate tail read, which
+///    produces 12 errors from 4 contexts (`lanes/av1uballoc.report.md` §2.4).
+/// 2. THE TRUE EXTENT -- a sample inside `true_width` x `true_height` that the
+///    tile walk skipped. This is where the withdrawn 224-sample demonstration
+///    sat (`440_request_is_422`, U/V rows 36..63, whole 4x4 groups). Measured
+///    over the same 127 fixtures at the pre-deblock point: **0 unwritten of
+///    1,466,581,280 scanned**, and 0 again at the output point. The one fixture
+///    that demonstrated it is REFUSED on main, so nothing current reaches
+///    region 2.
 ///
-/// Honest status: a read-before-write is DEMONSTRATED on a path that is now
-/// refused, UNMEASURED on every other path, and this `unsafe` is sound only under
-/// the unproven "written before read" premise. Filed as an open UB-class item
-/// (`lanes/unwritten-dep.report.md` §12) with two closures: (a) zero the
-/// allocation -- the safe default, at the ~3% this removed; or (b) an instrument
-/// counting reads-before-write per sample, so the premise can be proved rather
-/// than assumed.
-fn fresh_plane(n: usize) -> Vec<u16> {
+/// 3. THE WHOLE BUFFER, read-then-overwritten -- `pix_write` (`decode.rs:22073`,
+///    called at 22294/22450/39014/39029) takes the destination sample's own
+///    value as its `prev` argument, so on the first write to each sample it
+///    READS the initial content. Unlike regions 1 and 2 this one FIRES on
+///    every fixture and every store -- and neither census can see it, because
+///    `prev` is consumed only inside `if *PIXPROBE_ON`, so it never reaches a
+///    branch or a syscall. Confirmed: a DEBUG build under memcheck on the
+///    `uninit` arm still reports 0 errors. It does not affect output, and it is
+///    deleted by the shipped closure along with everything else.
+///
+/// The readers that could reach regions 1 and 2 are enumerated in
+/// `lanes/av1uballoc.report.md` §2; all of them clamp to `true_width`/
+/// `true_height`, which is why region 1 never fires, and none of them is
+/// reached on a current fixture, which is why region 2 does not either.
+///
+/// Those three measurements say no read of the initial content is reachable
+/// from today's corpus. That is a statement about today's corpus, NOT a
+/// licence for the `unsafe` below: a hostile file picks its own subsize values,
+/// and the refusal that closes region 2 lives in the tile walk, not here --
+/// which is why it is a refusal and not a proof. So the shipped closure is
+/// [`PlaneAlloc::Zeroed`] (+0.84% at 4K and -1.63% at 1080p, measured --
+/// `lanes/av1uballoc.report.md` §1), and the `unsafe` is reachable ONLY from
+/// the `uninit`, `padzero` and `extzero` arms.
+///
+/// ONE ORDERING CONSTRAINT on the two census arms, because it changes what
+/// they can be used for: the sentinel check comes FIRST, so
+/// [`PlaneAlloc::PadZero`] and [`PlaneAlloc::ExtZero`] never run while
+/// `EC_AV1_PLANE_SENTINEL` is set -- and that flag is what both census
+/// functions require (each returns early when it is off). The census arms are
+/// therefore meaningful only under **memcheck with the sentinel OFF**, where
+/// the zeroed/uninitialised split between the two regions is exactly what
+/// memcheck keys on. The order stays as it is: moving the sentinel check below
+/// the match would let the region census scan a buffer the sentinel never
+/// poisoned, which is the one thing it cannot recover from.
+///
+/// What IS sound and unchanged in that block: `u16` has no invalid bit patterns
+/// and no `Drop`, and the capacity was just reserved, so the vector validly
+/// owns `n` slots. Creating a `Vec` over uninitialised memory is not itself
+/// UB -- a READ of a slot in region 1, region 2 or region 3 is.
+fn fresh_plane(
+    n: usize,
+    true_width: usize,
+    true_height: usize,
+    width: usize,
+    height: usize,
+) -> Vec<u16> {
     if plane_sentinel_on() {
-        return vec![PLANE_SENTINEL; n];
+        return vec![plane_poison(); n];
+    }
+    match plane_alloc() {
+        PlaneAlloc::Zeroed => return vec![0u16; n],
+        PlaneAlloc::Fill => {
+            let mut v: Vec<u16> = Vec::with_capacity(n);
+            v.resize(n, 0);
+            return v;
+        }
+        PlaneAlloc::Uninit | PlaneAlloc::PadZero | PlaneAlloc::ExtZero => {}
     }
     let mut v: Vec<u16> = Vec::with_capacity(n);
-    // SAFETY, PARTIAL -- the premise is NOT established; see the block comment
-    // above ("THE `unsafe` BELOW IS NOT FULLY JUSTIFIED").
-    //
-    // What IS sound: `u16` has no invalid bit patterns and no `Drop`, and the
-    // capacity was just reserved, so the vector owns `n` slots that are valid to
-    // OWN. Creating a `Vec` over uninitialised memory is not itself UB.
-    //
-    // What is NOT sound, and is the reason this is a filed item rather than a
-    // settled one: reading an uninitialised `u16` IS UB, and the only thing that
-    // makes the reads sound is the premise that reconstruction writes every
-    // sample before any read. That premise was RETRACTED by measurement (224
-    // unwritten samples, output varying with initial content) on a path that is
-    // now refused, and is UNMEASURED everywhere else. The sentinel gate measures
-    // survival at the output point, not reads. The pre-deblock census is a
-    // separate instrument with no committed reader on main, so it adds nothing
-    // here. So this `unsafe` is sound under a premise no current instrument
-    // proves.
+    // SAFETY: OWNING `n` uninitialised `u16` slots is sound (`u16` has no
+    // invalid bit patterns and no `Drop`, and the capacity was just reserved).
+    // A READ of a slot in region 1, region 2 or region 3 above would not be,
+    // which is why the shipped arm returns above and never reaches here: this
+    // block is reachable only under `EC_AV1_PLANE_ALLOC=uninit|padzero|extzero`
+    // -- exactly the arms `plane_alloc()` lets fall through. `fill` is NOT one
+    // of them (it returns early at the `resize`), and an UNRECOGNISED value is
+    // not either: `plane_alloc()` maps it to `Zeroed`, so a typo picks the safe
+    // arm. The two region counts and the memcheck sweep are what make those
+    // arms' results readable; re-run them before believing a new "0".
     #[allow(unsafe_code)]
     unsafe {
         v.set_len(n);
+    }
+    match plane_alloc() {
+        PlaneAlloc::PadZero => zero_pad(&mut v, width, height, true_width, true_height),
+        PlaneAlloc::ExtZero => zero_extent(&mut v, width, true_width, true_height),
+        _ => {}
     }
     v
 }
@@ -35908,7 +36120,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     let (width, height) = (cols32 as usize * BLOCK, rows32 as usize * BLOCK);
 
     let mut y = PlaneBuf {
-        data: std::borrow::Cow::Owned(fresh_plane(width * height)),
+        data: std::borrow::Cow::Owned(fresh_plane(
+            width * height,
+            true_width,
+            true_height,
+            width,
+            height,
+        )),
         width,
         height,
         true_width,
@@ -35922,7 +36140,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     let (cw, ch) = (width >> ss_x(fctx), height >> ss_y(fctx));
     let (ctw, cth) = (true_width >> ss_x(fctx), true_height >> ss_y(fctx));
     let mut u = PlaneBuf {
-        data: std::borrow::Cow::Owned(fresh_plane(cw * ch)),
+        data: std::borrow::Cow::Owned(fresh_plane(cw * ch, ctw, cth, cw, ch)),
         width: cw,
         height: ch,
         true_width: ctw,
@@ -35934,7 +36152,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         plane: 1,
     };
     let mut v = PlaneBuf {
-        data: std::borrow::Cow::Owned(fresh_plane(cw * ch)),
+        data: std::borrow::Cow::Owned(fresh_plane(cw * ch, ctw, cth, cw, ch)),
         width: cw,
         height: ch,
         true_width: ctw,
@@ -53683,7 +53901,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let (width, height) = (cols as usize * BLOCK, rows as usize * BLOCK);
 
     let mut y = PlaneBuf {
-        data: std::borrow::Cow::Owned(fresh_plane(width * height)),
+        data: std::borrow::Cow::Owned(fresh_plane(
+            width * height,
+            true_width,
+            true_height,
+            width,
+            height,
+        )),
         width,
         height,
         true_width,
@@ -53697,7 +53921,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let (cw, ch) = (width >> ss_x(fctx), height >> ss_y(fctx));
     let (ctw, cth) = (true_width >> ss_x(fctx), true_height >> ss_y(fctx));
     let mut u = PlaneBuf {
-        data: std::borrow::Cow::Owned(fresh_plane(cw * ch)),
+        data: std::borrow::Cow::Owned(fresh_plane(cw * ch, ctw, cth, cw, ch)),
         width: cw,
         height: ch,
         true_width: ctw,
@@ -53709,7 +53933,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         plane: 1,
     };
     let mut v = PlaneBuf {
-        data: std::borrow::Cow::Owned(fresh_plane(cw * ch)),
+        data: std::borrow::Cow::Owned(fresh_plane(cw * ch, ctw, cth, cw, ch)),
         width: cw,
         height: ch,
         true_width: ctw,
