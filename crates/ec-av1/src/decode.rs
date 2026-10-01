@@ -21241,6 +21241,60 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
 /// the output does not depend on the plane buffer's initial content.
 const PLANE_SENTINEL: u16 = 0xDEAD;
 
+/// lane-unwritten-dep: the census count at the LAST point of the pipeline, after
+/// deblock/CDEF/LR -- i.e. on the exact bytes `EC_AV1_FINAL_DUMP` writes.
+///
+/// WHY A SECOND COUNT (the pre-deblock one is not enough, and this is the
+/// measured reason, not a guess): on `440_request_is_422` the pre-deblock plane
+/// is BYTE-IDENTICAL between an uninitialised and a `PLANE_SENTINEL`-filled run
+/// (0 sentinel samples in both) while the final output differs by 1986 bytes,
+/// all of it in the U/V planes' rows 30..63. The deblock pass is where the
+/// dependence is CREATED: `EC_AV1_POSTDEBLOCK_DUMP16` is identical pre-deblock
+/// and differs by 26 bytes post-deblock, and `EC_AV1_DEBUG_SKIP_DEBLOCK=1` does
+/// not remove the difference. So a pre-deblock scan cannot see a hole the loop
+/// filter then READS: deblock reads a neighbour to decide an edge, so an
+/// unwritten sample changes its neighbour's filtered value even when the
+/// unwritten sample itself is overwritten afterwards.
+///
+/// This count is the same measurement taken where the output is taken, so it is
+/// what a gate can assert: "no sample the tile walk never wrote survives into the
+/// frame the caller receives". Zero here AND zero pre-deblock = no dependence;
+/// non-zero here with zero pre-deblock = a loop-filter read, named.
+static FINAL_UNWRITTEN_SAMPLES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// lane-unwritten-dep: reads and clears [`FINAL_UNWRITTEN_SAMPLES`] -- unwritten
+/// samples still present in the frame as handed to the caller, summed over every
+/// frame and plane. Process-global, like the pre-deblock census's counter, so a
+/// gate can read it after the decode from a different thread than the one that
+/// scanned.
+pub fn take_final_unwritten_samples() -> usize {
+    FINAL_UNWRITTEN_SAMPLES.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// lane-unwritten-dep: the census at the pipeline's last point. Counts, over each
+/// plane's true extent, how many samples still hold [`PLANE_SENTINEL`] once every
+/// filter has run. Env-gated on the same flag as [`fresh_plane`] (there is no
+/// separate one: the fill and the census must agree on when they are live).
+///
+/// Scans IN PLACE at the point the picture is finished, which is what
+/// distinguishes it from the pre-deblock census: this one sees what the caller
+/// receives.
+pub(crate) fn census_unwritten_final(y: &[u16], u: &[u16], v: &[u16]) {
+    if !crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL") {
+        return;
+    }
+    // The caller passes the frame's planes exactly as they are about to be
+    // stored into the reference slots, which are already cropped to the true
+    // extent (no padding past it reaches this point), so a flat count over
+    // each plane IS the true-extent count.
+    let total: usize = [y, u, v]
+        .iter()
+        .map(|p| p.iter().filter(|&&s| s == PLANE_SENTINEL).count())
+        .sum();
+    FINAL_UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// A frame plane's own backing store, `n` samples, UNINITIALISED.
 ///
 /// (lane-picalloc) The SB-padded coding surface is written sample-for-sample
