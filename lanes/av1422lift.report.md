@@ -237,3 +237,52 @@ The single divergence reproduces the census422 lane's figure exactly (`U=1780 V=
 2. **`EC_AV1_FINAL_DUMP` is pre-grain**, so no grain cell — 4:2:0, 4:2:2, 12-bit — can ever be compared through it. The grain gate uses the in-memory decode. (Independently observed by `lanes/av1422census422.report.md` §7.2; confirmed here with a hard comparator error rather than a red.)
 3. **The census's coded-unit arm cannot be uniform across the corpus.** `422_allskip_2f.obu` codes no chroma coefficient by construction. A blanket "coded > 0 on every plane" gate would have been red on the one cell whose identity is that it codes nothing — and turning it green by deleting the assertion would have been the wrong fix. It is parameterised, with the row's own negative assertion standing in.
 4. **`cargo check --lib --tests --examples` is clean with zero warnings** on this branch — the three `dead_code` warnings the new helpers produced mid-edit are gone once the gates use them.
+
+---
+
+## 9. Refutation pass and the honesty correction (`d5422381`)
+
+`lanes/av1422liftverify.report.md` (`5ee10c61`) refuted exactly one thing about this branch: six prose sites where the lift replaced **true** "no committed test can read this counter" statements with **false** "the corpus gate reads this counter" statements. Everything else it checked held.
+
+**Confirmed by the verifier, not re-litigated here:** 45 committed 4:2:0/4:4:4 fixtures decode byte-identical between `4f206ec3` and this tip; the parser provably produces only `{(1,1),(0,0),(1,0)}` so the `assert!` is sound and reachable only with a parsed header; all three inventory deletions are independently load-bearing (3/3 mutations red); both new pins reproduce their sha256 and round-trip byte-exact against ffmpeg; all six renamed gates plus the three new pixel gates red on a shape-preserving one-LSB decoder mutation.
+
+**Re-measured here, independently** (throwaway probe appended inside `mod tests`, run, then removed; the tree was byte-identical to HEAD before the commit below). Over all 21 committed 4:2:2 cells:
+
+| counter | measured | verdict on my claim |
+|---|---|---|
+| `sb128rect_chroma_replay_hits().1` (span mismatch) | `422_intrabc_sb128_strip.obu` **9**, `..._notxsearch.obu` **9**, the other 19 cells **0** | my claim was false in both halves: no 4:2:2 gate reads it, and it does **not** stay zero |
+| `rect_tiled_chroma_grid_hits().3` (NXN) | **0** on all 21, and on the 4:2:0/4:4:4 cells probed | false: unwitnessed, not gate-read |
+| `intrabc_rect4_own_chroma422_hits()` | the six corpus cells step it **1..6**; every other cell leaves it at 6 | false: it fires, but the accessor has zero callers |
+| `440_request_is_422.obu` (the header/tile pin) | `reach=4, 1x2=4`, `nxn=0` | — |
+
+### The one that mattered
+
+`SB128RECT_REPLAY_SPAN_MISMATCH_HITS` reads **9** on `422_intrabc_sb128_strip.obu`, and that pin is one `the_pinned_422_intrabc_sb128_strip_witnesses_decode_pixel_exact` asserts **byte-exact against ffmpeg**. So the non-zero mismatch is the arm counting its own designed 4:2:2 case, not a defect — and **adding the zero assert my own comment promised would have turned a green gate red on a provably correct cell.** The pre-lift sentence the lift deleted ("zero on every stream this decoder admits, because 4:2:2 is refused by name") was true; admitting 4:2:2 is exactly what let it fire.
+
+### What changed (`d5422381`)
+
+Six sites, each corrected to the measured truth:
+
+1. `decode.rs` — `SB128RECT_REPLAY_SPAN_MISMATCH_HITS`: carries the two numbers, names the actual readers (two 4:2:0/4:4:4 gates), and says outright that adding the promised zero assert would red a correct cell.
+2. `decode.rs` — `RECT_TILED_CHROMA_NXN_HITS`: says **unwitnessed**, with `0` on all 21 cells, and names the only two readers.
+3. `decode.rs` — `INTRABC_RECT4_OWN_CHROMA422_HITS`: carries the `1..6` measurement and states the true half — **no committed test reads it**.
+4. `stream.rs` — `sb128rect_chroma_replay_counters` (the `pub` API doc): carries `(72, 9)`.
+5. `stream.rs` — inside **both** tripwire gates' own comments (4:4:4 and the 4:2:0 twin). These were the worst two: those are the gates that *do* read the counter, so the text invited a future lane to add the missing 4:2:2 zero assert and land a red on a correct cell. Both now carry an explicit **"DO NOT copy this zero assert onto a 4:2:2 stream"** plus the `mismatch = 9` measurement.
+6. `refusal_inventory.rs` — the retirement note named `a_real_422_stream_decodes_pixel_exact`, which does not exist (the gate is `a_real_422_key_frame_and_inter_sequence_decode_pixel_exact`); and a sibling-witness comment still pointed at `a_non_420_subsampled_sequence_header_is_refused_by_name`, the test this lift deleted. Both re-pointed.
+
+**No gate was added, and no decoder logic, assertion, fixture or gate body was touched.** Every line of the diff is a comment, verified mechanically:
+
+```text
+$ git diff -U0 crates/ec-av1/src/{decode,stream,refusal_inventory}.rs \
+    | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -vE '^[+-]\s*(///|//|\*)'
+(no output — every changed line is a comment)
+
+$ cargo check -p ec-av1 --lib --tests --examples
+CLEAN — 0 errors, 0 warnings
+
+$ EC_AV1_REQUIRE_FFMPEG=1 cargo test -p ec-av1 --lib -- --test-threads=4 \
+    a_real_422 the_pinned_422 the_440_cell
+running 10 tests ... test result: ok. 10 passed; 0 failed; 0 ignored; 801 filtered out; 7.84s
+```
+
+10 passed / 0 failed — the same shape as before the correction, which is the point: a prose-only diff cannot move a gate.
