@@ -374,14 +374,31 @@ uninitialised memory is not itself UB: `u16` has no invalid bit patterns and no
 uninitialised `u16`. `set_len` is therefore sound only under the "written before
 read" premise, and that premise is the one the measurement withdrew.
 
-**Two closures, neither taken here:**
+**The withdrawn premise was doing double duty, which is why one retraction
+untangles two findings.** It justified *this* `unsafe`, AND it was the reason the
+census's original story — a pre-deblock scan that is blind to a hole the loop
+filter later reads — looked plausible in the first place. The same measurement
+that withdrew the safety argument (output varying with initial content) is what
+made the blind-census reading wrong: there was never a blind pre-deblock scan,
+only a `dump_stage16` that could not see half the chroma plane. So §12 and the
+corrected stage bisect in §4 are the same fact read twice, and a later reader who
+fixes one without the other will re-derive the error.
 
-1. **Zero the allocation** — restore `vec![0u16; n]`. Sound unconditionally, at
+**Three closures, none taken here:**
+
+1. **Explicit zero-fill** — restore `vec![0u16; n]`. Sound unconditionally, at
    the ~3% of frame-thread cycles at 4K that lane-picalloc removed. This is the
    safe default and the honest cost of the optimisation.
-2. **Instrument reads-before-write** — a per-sample read/write map, so the premise
+2. **Allocator-zeroed allocation** — a zeroed allocation can come from the
+   allocator rather than a loop: `alloc_zeroed` / anonymous mmap hands back zero
+   pages on first touch, which for plane-sized buffers costs a page fault rather
+   than a per-sample store. **This is an option that needs its own measurement,
+   not a claim that it is free** — the cost at 4K is unmeasured in this lane, and
+   "a page fault per page" is a mechanism, not a benchmark. Whoever takes it must
+   measure it before calling it cheaper than (1).
+3. **Instrument reads-before-write** — a per-sample read/write map, so the premise
    can be proved rather than assumed. That is a real instrument, not a comment,
-   and it is the only route that keeps the optimisation.
+   and it is the only route that keeps the optimisation as-is.
 
 **Reachability evidence** (what makes this fileable rather than theoretical): a
 demonstrated read on `440_request_is_422` at `8d6998d7` — 224 unwritten samples,
