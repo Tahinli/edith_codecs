@@ -2829,93 +2829,92 @@ pub(crate) mod tests {
              ever reads (0,1), a 4:4:0 cell became codable and this whole gate is wrong about the \
              format."
         );
-        // lane-av1422lift: the refusal is gone, and the replacement is NOT
-        // "it decodes". This pin's TILE is a 4:2:0 key frame's, byte for
-        // byte -- only the sequence header carries 4:2:2 -- so it is a
-        // header/tile mismatch and there is no oracle that can say what the
-        // right pixels are. What IS assertable, and is what the pin is for,
-        // is that the SEQUENCE HEADER alone decides the decode's geometry:
-        // the decoded chroma planes are half-width and FULL height, exactly
-        // the `round_ss(w, 1) x round_ss(h, 0)` shape a real 4:2:2 stream
-        // produces (see `a_real_422_key_frame_and_inter_sequence_decode_
-        // pixel_exact` for the pixel claim on genuine 4:2:2 bytes), and that
-        // the 4:2:2 chroma walk really ran on it. A decoder that still
-        // allocated 4:2:0 planes here would give 32x32 chroma and red.
-        let frames = decode_stream(&pinned).unwrap_or_else(|e| {
-            panic!("{NAME}: a (1,0) header must decode now that 4:2:2 is admitted: {e}")
+        // lane-av1unwritten: lane-av1422lift replaced the old 4:2:2 header
+        // refusal with "it decodes, and the decoded chroma planes are 32x64".
+        // That was the wrong contract for THIS pin: its frame OBU is a 4:2:0
+        // key frame's, so at 4:2:2 its partition symbols name subsizes with no
+        // chroma plane block, which libaom rejects as a corrupt frame
+        // ("Block size 8x16 invalid with this subsampling mode",
+        // decodeframe.c:1456) and `aomdec` does. The replacement is the
+        // REFUSAL, by that rule.
+        //
+        // The pin's remaining job is unchanged and still worth saying: it
+        // proves a 4:4:0 REQUEST at profile 2 lands on 4:2:2 (1,0), i.e. that
+        // `the_440_cell_is_not_a_codable_chroma_shape`'s claim is still true.
+        let err = decode_stream(&pinned).err().unwrap_or_else(|| {
+            panic!(
+                "{NAME}: the pin is a 4:2:2 header over a 4:2:0 tile -- libaom refuses it \
+                     (aomdec: \"Block size 8x16 invalid with this subsampling mode\"), and so \
+                     must we"
+            )
         });
-        assert_eq!(
-            frames.len(),
-            1,
-            "{NAME}: the pin must decode exactly one frame"
-        );
-        assert_eq!(
-            (frames[0].u.len(), frames[0].v.len()),
-            (32 * 64, 32 * 64),
-            "{NAME}: 64x64 4:2:2 is HALF WIDTH and FULL HEIGHT (32x64 chroma); {:?} means the \
-             plane geometry still came from the TILE's 4:2:0 shape rather than the HEADER's",
-            (frames[0].u.len(), frames[0].v.len())
-        );
         assert!(
-            crate::decode::census_nonsub_units()[1] > 0
-                && crate::decode::census_nonsub_units()[2] > 0,
-            "{NAME}: the pin walked zero 4:2:2 chroma coefficient units -- the per-axis walk never \
-             ran on it"
+            err.to_string()
+                .contains("invalid with this subsampling mode"),
+            "{NAME}: the refusal must name libaom's rule, got: {err}"
         );
+        // The pixels this pin never had: the sibling gate
+        // `a_422_header_over_a_420_tile_refuses_the_subsize_libaom_calls_corrupt`
+        // pins the refusal plus a genuine 4:2:2 positive control, and every
+        // real 4:2:2 exactness claim lives on genuinely 4:2:2 pins in this
+        // file.
     }
 
-    /// lane-av1unwritten: the same pin decoded NONDETERMINISTICALLY. Its
-    /// 4:2:2 header hands the chroma planes 4x8 blocks (libaom's
-    /// `av1_get_max_uv_txsize(BLOCK_4X8, 1, 0)` == TX_4X8), and this
-    /// decoder's `sub8_leaf_chroma422` wrote a single square TX_4X4 per
-    /// chroma reference -- so the bottom four chroma rows of every 8x8
-    /// `PARTITION_HORZ` group were never written at all and the uninitialised
-    /// plane memory reached the output: five runs of the one file gave five
-    /// different `EC_AV1_FINAL_DUMP` hashes while every census count read
-    /// identical.
+    /// lane-av1unwritten: this pin is a MISSING REFUSAL, not a pixel defect.
     ///
-    /// The property pinned here is the one that stops that: with freshly
-    /// allocated planes filled with `PLANE_SENTINEL` (a value no legal sample
-    /// can equal), the decode must leave NO sample still holding it. A
-    /// wrong-sample diff cannot assert this -- it cannot tell an unwritten
-    /// sample from a mis-predicted one -- and `take_census_scanned` is read
-    /// alongside so a census that scanned nothing cannot pass as a census
-    /// that found nothing.
+    /// `440_request_is_422.obu` is a 4:2:2 sequence header wrapped around a
+    /// 4:2:0 key frame's tile, so the tile's partition symbols make subsizes
+    /// (8x16 among them) that have NO chroma plane block at ss (1,0). libaom
+    /// refuses exactly that, before descending into the subsize:
+    ///
+    /// ```text
+    /// $ aomdec --rawvideo -o /dev/null fixtures/440_request_is_422.obu
+    /// Warning: Failed to decode frame 1: Corrupt frame detected
+    /// Warning: Additional information: Block size 8x16 invalid with this subsampling mode
+    /// ```
+    ///
+    /// (`av1/decoder/decodeframe.c:1449-1458`,
+    /// `get_plane_block_size(subsize, ss_x, ss_y) == BLOCK_INVALID` ->
+    /// `AOM_CODEC_CORRUPT_FRAME`.) We walked those subsizes instead, and the
+    /// first version of this lane misread the downstream symptom -- a chroma
+    /// plane block covered by a square unit, whole 4x4 blocks left unwritten,
+    /// and a `EC_AV1_FINAL_DUMP` hash that CHANGED RUN TO RUN because the
+    /// unwritten samples were uninitialised plane memory.
+    ///
+    /// The contract pinned here is the one libaom has: the pin REFUSES, by a
+    /// named error that says which shape and which subsampling mode. The
+    /// positive control is a genuinely 4:2:2 pin, which must still decode --
+    /// so this gate cannot pass by refusing everything.
     #[test]
-    fn a_422_header_over_a_420_tile_leaves_no_sample_unwritten() {
-        const NAME: &str = "a_422_header_over_a_420_tile_leaves_no_sample_unwritten";
-        struct Sentinel(bool);
-        impl Drop for Sentinel {
-            fn drop(&mut self) {
-                crate::decode::set_plane_sentinel(self.0);
-            }
-        }
+    fn a_422_header_over_a_420_tile_refuses_the_subsize_libaom_calls_corrupt() {
+        const NAME: &str = "a_422_header_over_a_420_tile_refuses_the_subsize_libaom_calls_corrupt";
         let _gate_lock = lock_gate_counters();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
             .join("440_request_is_422.obu");
         let pinned = read_pin(&path, 2014, 0x98a1378df976253d, NAME);
-        crate::decode::set_plane_sentinel(true);
-        let _sentinel = Sentinel(false);
-        crate::decode::take_unwritten_samples();
-        crate::decode::take_census_scanned();
-        let frames =
-            decode_stream(&pinned).unwrap_or_else(|e| panic!("{NAME}: the pin must decode: {e}"));
-        assert_eq!(frames.len(), 1, "{NAME}: the pin decodes exactly one frame");
-        let scanned = crate::decode::take_census_scanned();
-        let unwritten = crate::decode::take_unwritten_samples();
+        let err = decode_stream(&pinned)
+            .err()
+            .unwrap_or_else(|| panic!("{NAME}: the pin must be REFUSED, not decoded"));
+        let msg = err.to_string();
         assert!(
-            scanned >= 64 * 64 + 2 * 32 * 64,
-            "{NAME}: the sentinel census scanned only {scanned} samples -- a census that \
-             looked at less than the whole frame proves nothing"
+            msg.contains("invalid with this subsampling mode"),
+            "{NAME}: the refusal must name the rule it refuses by (libaom's own wording), got: \
+             {msg}"
         );
-        assert_eq!(
-            unwritten, 0,
-            "{NAME}: {unwritten} samples of the frame were handed to the tile walk and never \
-             written, so they reach the output as whatever the allocator left there (the five \
-             different dump hashes this pin used to give)"
+        // Positive control: a real 4:2:2 stream must still decode, so the gate
+        // cannot pass by refusing everything.
+        let ok_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("422_key_64x64.obu");
+        let ok = decode_stream(&std::fs::read(&ok_path).expect("the 4:2:2 control fixture"))
+            .unwrap_or_else(|e| panic!("{NAME}: a genuine 4:2:2 pin must still decode: {e}"));
+        assert!(
+            !ok.is_empty(),
+            "{NAME}: the 4:2:2 control decoded no frames"
         );
     }
+
     /// lane-av1-422bigblock: the two witnessed 4:2:2 big-block defects, pinned
     /// as fixtures (`git add -f`; `fixtures/` is gitignored).
     ///
