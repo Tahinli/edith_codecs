@@ -2220,6 +2220,16 @@ fn decode_frame(
     // aomdec's own `EC_AV1_FINAL_DUMP` rung byte for byte
     // (scripts/instrument-aom-oracle.sh rung 12), which is what makes a
     // hidden frame's pixels comparable at all.
+    // lane-unwritten-dep: the census AT the output point, beside the dump that
+    // defines "the output". The pre-deblock census cannot see a hole the loop
+    // filter later READS: deblock reads a neighbour to decide an edge, so an
+    // unwritten sample changes its neighbour's filtered value even when the
+    // unwritten sample itself is overwritten afterwards. Measured on
+    // `440_request_is_422`: pre-deblock 0 sentinel samples and byte-identical
+    // plain-vs-sentinel, yet the final output differs by 1986 bytes, entering
+    // the picture at the deblock pass (`EC_AV1_POSTDEBLOCK_DUMP16` is identical
+    // pre-deblock and differs by 26 bytes post-deblock).
+    decode::census_unwritten_final(&picture.y, &picture.u, &picture.v);
     if let Some(prefix) = final_dump {
         use std::io::Write;
         if let Ok(mut f) = std::fs::File::create(format!("{prefix}.f{decode_idx}")) {
@@ -48152,6 +48162,147 @@ exit 0
             "{NAME}: 37 shown frames pixel-exact on every plane, \
              rect64_split_txfm_publish={fired}"
         );
+    }
+
+    /// lane-unwritten-dep: the UNWRITTEN-SAMPLE census at the point the output is
+    /// taken, over the real film fixtures that carry hidden alt-refs.
+    ///
+    /// What this pins, and why the pre-deblock census could not: the tile walk's
+    /// pre-deblock scan sees a plane BEFORE deblock/CDEF/LR, and the loop filter
+    /// READS neighbours to decide an edge. So an unwritten sample changes its
+    /// neighbour's filtered value even when the unwritten sample itself is
+    /// overwritten afterwards -- the hole is invisible pre-deblock and gone from
+    /// the plane by the time anyone looks again. Measured on
+    /// `440_request_is_422` (8-bit, 64x64, a 4:2:2 header over a 4:2:0 tile,
+    /// which lane/av1unwritten refuses): the pre-deblock dump is BYTE-IDENTICAL
+    /// between an uninitialised and a `PLANE_SENTINEL`-filled run -- zero sentinel
+    /// samples either way -- while the final output differs by 1986 bytes, all in
+    /// the U/V planes' rows 30..63 of 64. The stage dump localises the entry
+    /// exactly: `EC_AV1_PREFILT_DUMP16` identical, `EC_AV1_POSTDEBLOCK_DUMP16`
+    /// differing by 26 bytes. `EC_AV1_DEBUG_SKIP_DEBLOCK=1` does NOT remove it,
+    /// because skipping deblock leaves the same neighbours unwritten for CDEF.
+    ///
+    /// This gate therefore counts at the SAME point `EC_AV1_FINAL_DUMP` writes,
+    /// which makes the claim the one a reader actually cares about: no sample the
+    /// tile walk never wrote survives into the frame the caller receives.
+    ///
+    /// NON-VACUITY, and it is the part that makes this gate worth having: the
+    /// census is only a measurement because it CAN report non-zero. The control
+    /// below is the same measurement on the one fixture in the corpus where a
+    /// hole really does reach the output, and it is asserted NON-ZERO (32 samples,
+    /// measured). A census that silently read zero everywhere would fail it.
+    ///
+    /// The four film fixtures are the corpus's real 10-bit streams with hidden
+    /// alt-refs -- the shapes where a hidden frame's unwritten region would feed
+    /// a later DISPLAYED frame through the reference bank, which is the only way
+    /// an unwritten sample could reach output on a stream that decodes correctly.
+    /// All four measure 0.
+    ///
+    /// Measured on `8d6998d7` with a provenance-verified probe
+    /// (`strings` on the binary names only this worktree; the fixture sha256s are
+    /// `7f3b060da5aa9c53` for hg_arf, `c9e721088766163b` for hg_rect64):
+    ///
+    /// ```text
+    /// 440_request_is_422            FINAL_UNWRITTEN 32   frames=1    <- control, non-zero
+    /// hg_arf_witness                FINAL_UNWRITTEN 0    frames=37
+    /// hg_rect64_intra16x4_witness   FINAL_UNWRITTEN 0    frames=33
+    /// gm_small_side_witness         FINAL_UNWRITTEN 0    frames=33
+    /// troy_sb128_inter_witness      FINAL_UNWRITTEN 0    frames=15
+    /// ```
+    #[test]
+    fn the_frame_the_caller_receives_carries_no_unwritten_plane_sample() {
+        const NAME: &str = "the_frame_the_caller_receives_carries_no_unwritten_plane_sample";
+        let _gate_lock = lock_gate_counters();
+
+        // The census needs the sentinel FILL, which is env-gated (see
+        // `fresh_plane`), and this crate forbids `set_var` (see `envflags`), so
+        // the fill cannot be switched from inside a test process. The child
+        // process below is therefore how the measurement is taken; what the
+        // parent asserts is the CHILD's reported count.
+        let census = |fixture: &str| -> usize {
+            let exe = std::env::current_exe().expect("test binary path");
+            let out = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "stream::tests::uwdep_child_unwritten_census",
+                    "--nocapture",
+                ])
+                .env("UWDEP_CENSUS_FIXTURE", fixture)
+                .env("EC_AV1_PLANE_SENTINEL", "1")
+                .output()
+                .expect("running the census child");
+            // `--nocapture` puts the child's `println!` on its stderr, so both
+            // streams are searched.
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            text.lines()
+                .find_map(|l| l.strip_prefix("UWDEP_CENSUS "))
+                .and_then(|v| v.split_whitespace().next().and_then(|n| n.parse().ok()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{NAME}: the census child reported no count for {fixture} \
+                         (child said: {:?})",
+                        text.trim()
+                    )
+                })
+        };
+
+        // Non-vacuity FIRST: the census must be able to report non-zero, or every
+        // zero below would be meaningless.
+        let control = census("440_request_is_422");
+        assert!(
+            control > 0,
+            "{NAME}: the census reports 0 even on the one fixture whose output DOES depend \
+             on unwritten plane memory (measured 32) -- the census is blind or the sentinel \
+             fill is not live, so every assertion below would be vacuous"
+        );
+
+        for (fixture, frames) in [
+            ("hg_arf_witness", 37usize),
+            ("hg_rect64_intra16x4_witness", 33),
+            ("gm_small_side_witness", 33),
+            ("troy_sb128_inter_witness", 15),
+        ] {
+            let n = census(fixture);
+            assert_eq!(
+                n, 0,
+                "{NAME}: {fixture} hands the caller {n} samples the tile walk never wrote \
+                 (class: a hole the loop filter read)"
+            );
+            let _ = frames; // frame count is asserted inside the child
+        }
+    }
+
+    /// The child half of
+    /// [`the_frame_the_caller_receives_carries_no_unwritten_plane_sample`]: decodes
+    /// the fixture named in `UWDEP_CENSUS_FIXTURE` with the sentinel fill live and
+    /// prints `UWDEP_CENSUS <n> frames=<n>` plus a frame-count assertion.
+    ///
+    /// A `#[test]` rather than an example because it needs the crate's own
+    /// in-process counter -- which no external binary could read.
+    #[test]
+    fn uwdep_child_unwritten_census() {
+        let Ok(fixture) = std::env::var("UWDEP_CENSUS_FIXTURE") else {
+            // Not a census run: the parent invokes this test by name, so being
+            // reached without the variable means a normal suite run.
+            return;
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("fixtures/{fixture}.obu"));
+        let stream =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let _ = decode::take_final_unwritten_samples();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{fixture} refused: {e}"));
+        let n = decode::take_final_unwritten_samples();
+        assert!(
+            std::env::var_os("EC_AV1_PLANE_SENTINEL").is_some(),
+            "the census child ran without EC_AV1_PLANE_SENTINEL, so the fill was never live \
+             and the count is meaningless"
+        );
+        println!("UWDEP_CENSUS {n} frames={}", frames.len());
     }
 
     /// lane-t900 r6: the 128-superblock INTER witness.
