@@ -21370,12 +21370,77 @@ fn plane_sentinel_on() -> bool {
 /// CHANGED RUN TO RUN. `aomdec` on the same file:
 /// `Failed to decode frame 1: Corrupt frame detected` / `Block size 8x16
 /// invalid with this subsampling mode`.
+/// `av1_ss_size_lookup`'s `BLOCK_INVALID` cells, transcribed verbatim:
+/// `(common_data.c:17-41`, rows in `BLOCK_SIZES_ALL` order, indexed
+/// `[subsampling_x][subsampling_y])`. Every entry below is an (luma width,
+/// luma height) whose plane block does not EXIST at that subsampling pair, so
+/// libaom refuses any subsize of that shape
+/// (`av1/decoder/decodeframe.c:1449-1458`, `AOM_CODEC_CORRUPT_FRAME`,
+/// "Block size %dx%d invalid with this subsampling mode").
+///
+/// There is no other `BLOCK_INVALID` cell in the table: at (0,0) 4:4:4 and at
+/// (1,1) 4:2:0 every row is valid, and the sixteen shapes below are the only
+/// ones that are invalid at (1,0) 4:2:2 or (0,1) 4:4:0. The table test
+/// [`chroma_plane_block_codable_matches_the_libaom_table`] re-transcribes all
+/// 22 rows and checks this list cell for cell -- a diff against the C source,
+/// not a restatement of it.
+///
+/// ```
+/// BLOCK_4X8    {4X8, 4X4}      {INVALID, 4X4}      <- INVALID @ (1,0)
+/// BLOCK_8X4    {8X4, INVALID}  {4X4, 4X4}          <- INVALID @ (0,1)
+/// BLOCK_8X16   {8X16, 8X8}     {INVALID, 4X8}      <- INVALID @ (1,0)
+/// BLOCK_16X8   {16X8, INVALID} {8X8, 8X4}          <- INVALID @ (0,1)
+/// BLOCK_16X32  {16X32, 16X16}  {INVALID, 8X16}     <- INVALID @ (1,0)
+/// BLOCK_32X16  {32X16, INVALID}{16X16, 16X8}       <- INVALID @ (0,1)
+/// BLOCK_32X64  {32X64, 32X32}  {INVALID, 16X32}    <- INVALID @ (1,0)
+/// BLOCK_64X32  {64X32, INVALID}{32X32, 32X16}      <- INVALID @ (0,1)
+/// BLOCK_64X128 {64X128,64X64}  {INVALID, 32X64}    <- INVALID @ (1,0)
+/// BLOCK_128X64 {128X64,INVALID}{64X64, 64X32}      <- INVALID @ (0,1)
+/// BLOCK_4X16   {4X16, 4X8}     {INVALID, 4X8}      <- INVALID @ (1,0)
+/// BLOCK_16X4   {16X4, 8X4}     {8X4, 8X4}                         <- valid @ (1,0)
+/// BLOCK_8X32   {8X32, 8X16}    {INVALID, 4X16}     <- INVALID @ (1,0)
+/// BLOCK_32X8   {32X8, 16X8}    {32X8, 16X4}                      <- valid @ (0,1)
+/// BLOCK_16X64  {16X64,16X32}   {INVALID, 8X32}     <- INVALID @ (1,0)
+/// BLOCK_64X16  {64X16,32X16}   {32X16, 32X8}                     <- valid @ (0,1)
+/// ```
+///
+/// The two "valid" rows are here on purpose: an earlier version of this
+/// predicate hardcoded BLOCK_16X4@(1,0) and BLOCK_32X8@(0,1) as invalid, which
+/// REFUSED a legal 4:2:2 shape -- one aomenc itself emits, since its own
+/// `partition_search.c:3383-3389` gates `partition_rect_allowed[HORZ]` with
+/// exactly this table.
+const PLANE_BLOCK_INVALID_422: &[(usize, usize)] = &[
+    (4, 8),
+    (8, 16),
+    (16, 32),
+    (32, 64),
+    (64, 128),
+    (4, 16),
+    (8, 32),
+    (16, 64),
+];
+
+/// The same list at 4:4:0 `(0, 1)` -- a shape no `color_config` can request
+/// (libaom asserts `subsampling_y == 0` when `subsampling_x == 0`), kept so
+/// the table test can cover every cell rather than only the reachable ones.
+const PLANE_BLOCK_INVALID_440: &[(usize, usize)] = &[
+    (8, 4),
+    (16, 8),
+    (32, 16),
+    (64, 32),
+    (128, 64),
+    (16, 4),
+    (32, 8),
+    (64, 16),
+];
+
+/// Whether `av1_ss_size_lookup[(bw, bh)][sx][sy]` is not `BLOCK_INVALID` -- i.e.
+/// whether libaom lets a subsize of this luma shape have a chroma plane block
+/// at this subsampling at all.
 fn chroma_plane_block_codable(bw: usize, bh: usize, sx: usize, sy: usize) -> bool {
-    match (bw, bh) {
-        (4, 8) => (sx, sy) != (1, 0),
-        (8, 4) => (sx, sy) != (0, 1),
-        (8, 16) => (sx, sy) != (1, 0),
-        (16, 4) => (sx, sy) != (1, 0),
+    match (sx, sy) {
+        (1, 0) => !PLANE_BLOCK_INVALID_422.contains(&(bw, bh)),
+        (0, 1) => !PLANE_BLOCK_INVALID_440.contains(&(bw, bh)),
         _ => true,
     }
 }
@@ -56260,6 +56325,136 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-av1unwritten: the port is a TRANSCRIPTION, and this is the artefact
+    /// that makes it checkable. It re-writes `av1_ss_size_lookup`'s 22 rows
+    /// (`common_data.c:17-41`) literally -- every shape, every subsampling
+    /// pair, the real BLOCK_INVALID markers -- and asserts
+    /// [`chroma_plane_block_codable`] agrees cell for cell. A predicate that
+    /// hardcodes the wrong cell (this lane's first version marked BLOCK_16X4 at
+    /// 4:2:2 invalid; the table says `BLOCK_8X4`) reds here, not in a corpus
+    /// that happens not to carry the shape.
+    #[test]
+    fn chroma_plane_block_codable_matches_the_libaom_table() {
+        // (width, height, [ss_x=0][ss_y=0], [0][1], [1][0], [1][1]); `None` is
+        // BLOCK_INVALID.
+        const I: Option<(usize, usize)> = None;
+        let table: &[(usize, usize, [Option<(usize, usize)>; 4])] = &[
+            (
+                4,
+                4,
+                [Some((4, 4)), Some((4, 4)), Some((4, 4)), Some((4, 4))],
+            ),
+            (4, 8, [Some((4, 8)), Some((4, 4)), I, Some((4, 4))]),
+            (8, 4, [Some((8, 4)), I, Some((4, 4)), Some((4, 4))]),
+            (
+                8,
+                8,
+                [Some((8, 8)), Some((8, 4)), Some((4, 8)), Some((4, 4))],
+            ),
+            (8, 16, [Some((8, 16)), Some((8, 8)), I, Some((4, 8))]),
+            (16, 8, [Some((16, 8)), I, Some((8, 8)), Some((4, 4))]),
+            (
+                16,
+                16,
+                [Some((16, 16)), Some((8, 16)), Some((8, 8)), Some((4, 8))],
+            ),
+            (16, 32, [Some((16, 32)), Some((16, 16)), I, Some((8, 16))]),
+            (32, 16, [Some((32, 16)), I, Some((16, 16)), Some((16, 8))]),
+            (
+                32,
+                32,
+                [
+                    Some((32, 32)),
+                    Some((16, 32)),
+                    Some((16, 16)),
+                    Some((16, 8)),
+                ],
+            ),
+            (32, 64, [Some((32, 64)), Some((32, 32)), I, Some((16, 32))]),
+            (64, 32, [Some((64, 32)), I, Some((32, 32)), Some((32, 16))]),
+            (
+                64,
+                64,
+                [
+                    Some((64, 64)),
+                    Some((32, 64)),
+                    Some((32, 32)),
+                    Some((32, 16)),
+                ],
+            ),
+            (
+                64,
+                128,
+                [Some((64, 128)), Some((64, 64)), I, Some((32, 64))],
+            ),
+            (
+                128,
+                64,
+                [Some((128, 64)), I, Some((64, 64)), Some((64, 32))],
+            ),
+            (
+                128,
+                128,
+                [
+                    Some((128, 128)),
+                    Some((64, 128)),
+                    Some((64, 64)),
+                    Some((64, 32)),
+                ],
+            ),
+            (4, 16, [Some((4, 16)), Some((4, 8)), I, Some((4, 8))]),
+            (16, 4, [Some((16, 4)), I, Some((8, 4)), Some((8, 4))]),
+            (8, 32, [Some((8, 32)), Some((8, 16)), I, Some((4, 16))]),
+            (32, 8, [Some((32, 8)), I, Some((16, 8)), Some((16, 4))]),
+            (16, 64, [Some((16, 64)), Some((16, 32)), I, Some((8, 32))]),
+            (64, 16, [Some((64, 16)), I, Some((32, 16)), Some((32, 8))]),
+            (
+                128,
+                256,
+                [
+                    Some((128, 256)),
+                    Some((64, 256)),
+                    Some((64, 128)),
+                    Some((64, 64)),
+                ],
+            ),
+            (
+                256,
+                128,
+                [
+                    Some((256, 128)),
+                    Some((128, 256)),
+                    Some((128, 64)),
+                    Some((128, 64)),
+                ],
+            ),
+        ];
+        for &(w, h, cells) in table {
+            for sx in 0..2usize {
+                for sy in 0..2usize {
+                    let want_codable = cells[sx * 2 + sy].is_some();
+                    assert_eq!(
+                        chroma_plane_block_codable(w, h, sx, sy),
+                        want_codable,
+                        "av1_ss_size_lookup[{w}x{h}][{sx}][{sy}] is {:?} in libaom \
+                         (common_data.c) but our predicate says the opposite",
+                        cells[sx * 2 + sy]
+                    );
+                }
+            }
+        }
+        // The two cells an earlier, hand-picked predicate got wrong: both are
+        // LEGAL at 4:2:2, and libaom's own encoder emits the 16x4 one.
+        assert!(
+            chroma_plane_block_codable(16, 4, 1, 0),
+            "16x4 at 4:2:2 is BLOCK_8X4"
+        );
+        assert!(
+            !chroma_plane_block_codable(32, 8, 0, 1),
+            "32x8 at 4:4:0 is BLOCK_INVALID"
+        );
+    }
     /// lane-av1chrtx: [`covering_leaf_tx_type`] resolves a chroma unit's
     /// `tx_type` from the luma leaf covering the unit's OWN quadrant, and
     /// reports "no leaf there" as `None` so the caller can fall back to the

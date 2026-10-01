@@ -10,7 +10,21 @@ sentinel census that found the class is kept as the instrument.**
 
 Branch `lane/av1unwritten`, base `main` = `8d6998d7`. No push.
 
-> **This report was rewritten.** The first version of this lane claimed a libaom
+> **r3 correction, on top of r2.** The r2 predicate was a four-cell hand-picked
+> `match`, and it was wrong in BOTH directions. It refused `(16, 4)` at ss (1,0),
+> where `av1_ss_size_lookup[BLOCK_16X4][1][0]` is `BLOCK_8X4` — a LEGAL 4:2:2
+> shape, and one libaom's own encoder emits (`partition_search.c:3383-3389`
+> gates `partition_rect_allowed[HORZ]` with this very table), so we were refusing
+> a stream aomenc produces. And it covered only two of the eight shapes libaom
+> refuses at 4:2:2. r3 replaces the `match` with a verbatim transcription of
+> the table's `BLOCK_INVALID` cells (§3.1) and adds
+> `chroma_plane_block_codable_matches_the_libaom_table`, which re-writes all 22
+> rows x 4 subsampling pairs from `common_data.c:17-41` and checks the predicate
+> cell for cell. The corpus sweep CANNOT see the false positive — no committed
+> fixture carries a 16x8 block split `PARTITION_HORZ` at 4:2:2 — and that table
+> test is what covers that direction.
+>
+> **This report was rewritten once before. The first version of this lane claimed a libaom
 > `TX_4X8` chroma unit for a `BLOCK_4X8` subsize and landed a port of it. The
 > refutation pass (Yavuz-5, verified first-hand by Main) showed that port does
 > not exist: `get_plane_block_size` is a single indexed return
@@ -120,8 +134,18 @@ diff cannot tell an unwritten sample from a mis-predicted one).
 
 `crates/ec-av1/src/decode.rs`:
 
-* `chroma_plane_block_codable(bw, bh, ss_x, ss_y)` — the four
-  `BLOCK_INVALID` cells of `av1_ss_size_lookup`, nothing else.
+* `chroma_plane_block_codable(bw, bh, ss_x, ss_y)` — a verbatim transcription
+  of `av1_ss_size_lookup`'s `BLOCK_INVALID` cells, in two const lists so a
+  reader can diff them against `common_data.c` line by line:
+
+  | subsampling | INVALID luma shapes |
+  |---|---|
+  | 4:2:2 `(1,0)` | 4x8, 8x16, 16x32, 32x64, 64x128, 4x16, 8x32, 16x64 |
+  | 4:4:0 `(0,1)` | 8x4, 16x8, 32x16, 64x32, 128x64, 16x4, 32x8, 64x16 |
+  | 4:4:4 `(0,0)`, 4:2:0 `(1,1)` | none |
+
+  Checked by `chroma_plane_block_codable_matches_the_libaom_table`, which
+  transcribes all 22 rows x 4 pairs literally from `common_data.c:17-41`.
 * `refuse_invalid_plane_block(...)` — a **returned** error (never an
   `assert!`: a partition symbol is stream data, so hostile bytes reach it),
   carrying libaom's own wording so the message names the rule:
@@ -153,11 +177,22 @@ Same refusal class as the oracle, same rule, same shape named.
 | `partition_w8` (2 sites, 36549 / 36767 region) | 8x4, 4x8 | **yes**, installed |
 | `partition_w16` intra (36175 region) | 16x8, 8x16 | **yes**, installed |
 | `partition_w16` edge split (`VERT_ALIKE`/`HORZ_ALIKE` gather) | same two, reached only when `has_cols16`/`has_rows16` is false | covered by the same rule at the sibling site; the edge arm's two-symbol gather can only choose SPLIT vs the matching strip |
-| `PARTITION_HORZ_4` / `VERT_4` on 8x16 / 16x8 (`decode_rect_split`) | 4x16, 16x4 | **NOT installed — known gap, stated here** |
-| 32/64-level partitions, 128 root, AB partitions | squares and 32x64/64x32 | no: every cell of those rows is non-INVALID at every subsampling this decoder accepts |
+| `PARTITION_HORZ_4` / `VERT_4` on 8x16 / 16x8 (`decode_rect_split`) | 4x16 (INVALID at 4:2:2), 16x4 (legal at 4:2:2, INVALID at 4:4:0) | **NOT installed — named gap** |
+| `partition_w32` `PARTITION_VERT` | 16x32 — INVALID at 4:2:2 | **NOT installed — named gap** |
+| `partition_w64` `PARTITION_VERT` | 32x64 — INVALID at 4:2:2 | **NOT installed — named gap** |
+| 128 root `PARTITION_VERT` | 64x128 — INVALID at 4:2:2 | **NOT installed — named gap** |
+| the 4-way vertical splits at 16/32/64 (`VERT_A` / `VERT_B`) | 8x32, 16x64 — both INVALID at 4:2:2 | **NOT installed — named gap** |
+| 32/64/128 roots' OWN plane blocks, the AB partitions, `PARTITION_SPLIT` | BLOCK_32X32 (16X32), BLOCK_64X64 (32X32), BLOCK_128X128 (64X64), all valid | no — a PARENT row being valid says nothing about its children, which is exactly what r2 got wrong; the child rows are the four rows above |
 | 4:4:4 square leaves, `decode_leaf8`, `decode_leaf_split4` | BLOCK_4X4 / BLOCK_8X8 / BLOCK_16X16 | no: `(0,0)` column is non-INVALID for all of them |
 
-The 1:4 sites are the honest gap: `PARTITION_HORZ_4` on an 8x16 yields a 4x16,
+So r3 installs the check at two sites and NAMES the other six rather than
+claiming them covered. The predicate is now correct for every shape, so each
+remaining site is a one-line call at a dispatch that is already written; none of
+them is reachable by a committed fixture (§4 shows the corpus cannot see even
+the false-positive direction), which is why they are a declared gap and not a
+claim.
+
+The 1:4 sites were already the honest gap: `PARTITION_HORZ_4` on an 8x16 yields a 4x16,
 whose 4:2:2 plane block is `BLOCK_INVALID`, and this lane did not install the
 check there. `decode_rect4_16_intrabc` is on another lane's charter and was not
 touched; the neighbouring non-intrabc `decode_rect4_16_strip` site is where the
@@ -171,8 +206,13 @@ instrument is what would show it if one ever did.
 * **Corpus, both trees.** Every fixture decoded with `EC_AV1_FINAL_DUMP`, every
   `.f*` hashed. Pre-fix vs post-fix the **126 valid fixtures are byte-identical**
   and **none newly refuses**; the witness is the only difference and it now
-  refuses. Measured by the same loop as the §2 hashes, with the per-fixture
-  stderr scanned for `REFUSED`.
+  refuses. Re-run on the r3 (corrected) predicate: `differing:
+  ['440_request_is_422']`, 126 fixtures emitting dumps, and exactly one fixture
+  whose output contains `REFUSED` — the witness. **The sweep cannot see the
+  (16,4)-at-4:2:2 false positive**: no committed fixture carries a 16x8 block
+  split `PARTITION_HORZ` at 4:2:2, which is why r2's over-refusal passed 126/126
+  unnoticed. That direction is covered by
+  `chroma_plane_block_codable_matches_the_libaom_table`, not by the sweep.
 * **Sentinel sweep** (127 fixtures, `EC_AV1_PLANE_SENTINEL=1`): pre-fix exactly
   one fixture had a non-empty census (the witness, 112+112); post-fix the corpus
   has no unwritten sample anywhere — the witness decodes nothing at all now, and
