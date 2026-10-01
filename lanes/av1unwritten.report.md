@@ -4,9 +4,9 @@
 4:2:0 tile, so its partition symbols name subsizes (8x16 among them) with NO
 chroma plane block at ss (1,0) — libaom calls that `AOM_CODEC_CORRUPT_FRAME`
 ("Block size 8x16 invalid with this subsampling mode") and `aomdec` refuses the
-file outright; we walked those subsizes, and the nondeterministic output was the
-symptom. The fix mirrors libaom's own check and returns a named refusal; the
-sentinel census that found the class is kept as the instrument.**
+file outright, and libaom's own encoder never emits such a shape; we walked those
+subsizes anyway. The fix mirrors libaom's check and returns a named refusal; the
+sentinel census that led here is kept as the instrument.**
 
 Branch `lane/av1unwritten`, base `main` = `8d6998d7`. No push.
 
@@ -107,49 +107,30 @@ exactly one of the four libaom refuses.
 
 ---
 
-## 2. What the symptom looked like, and how the census found it
+## 2. What led here, and what it is worth
 
-`440_request_is_422.obu` is what `examples/gen_coverage_cells.rs` produces when
-the writer is handed `subsampling (0, 1)` at profile 2: the header lands on 4:2:2
-and the frame OBU behind it is a real 4:2:0 key frame's, byte for byte. The
-header/tile chroma mismatch is exactly what produces a subsize whose plane block
-does not exist.
+The refusal rests on two facts about libaom, both verified first-hand:
 
-```
-$ for i in 1 2 3 4 5; do EC_AV1_FINAL_DUMP=/tmp/wt_aw/u$i \
-      ./target/debug/examples/decode_probe crates/ec-av1/fixtures/440_request_is_422.obu \
-      >/dev/null 2>&1; sha256sum /tmp/wt_aw/u$i.f0; done
-de5051156b7cfd00dc7ed5f2c6ad404e2a49822a8a728bc027a938aac00219f1  /tmp/wt_aw/u1.f0
-eb0e513ff07d9780b03e70861d1a7f507f540e4724f62384511a71e06c386aa9  /tmp/wt_aw/u2.f0
-2985b82874579807efb8bc88136d1b8f5f1f0121410cde26723d5be7e6ba8715  /tmp/wt_aw/u3.f0
-204645ad20d7e557d7b04f0027d9aafd5790fe685dc39bdf7cfb117d9dd1f0fc  /tmp/wt_aw/u4.f0
-80908a1712c4fe78070a6a3ad57464e8bd6a9d0b8d73e86e8f9cf7ea7cbd3496  /tmp/wt_aw/u5.f0
-```
+1. **libaom refuses the shape.** `aomdec --rawvideo` on
+   `440_request_is_422.obu` prints `Failed to decode frame 1: Corrupt frame
+   detected` / `Block size 8x16 invalid with this subsampling mode`
+   (`decodeframe.c:1449-1458`).
+2. **libaom's encoder never emits it.** `partition_search.c:3383-3389` gates
+   `partition_rect_allowed` on this same table, so no conformant 4:2:2 stream
+   can contain the shape and the refusal cannot reject legal content.
 
-Five hashes from one file, with every census count identical — the difference was
-purely the samples the walk never wrote.
+Neither of those is this lane's pixel measurement. What led here was the lane's
+own pre-deblock census (`census_unwritten`, §5), which on THIS LANE'S TREE at
+r1 reported 112 unwritten chroma samples per plane (224 total) on the witness —
+a lane-tree measurement made with a lane-only instrument, cited as such and not
+as a property of `main`. An earlier version of this report asserted more
+strongly that the witness's output hash "changed run to run"; that sentence has
+been removed as not established on `main` (Main re-measured on `main`
+`8d6998d7` with a provenance-checked probe and did not reproduce it).
 
-`EC_AV1_PLANE_SENTINEL=1` (the census has no separate flag) plus the new
-`EC_AV1_SENTINEL_CENSUS` printout — the shipped form of the four-line temporary
-scan `lanes/av1422seed.report.md` §3 used and explicitly did not commit — gave an
-exact census at each frame's pre-deblock point:
-
-```
-SENTINEL_CENSUS idx=0 plane=Y extent=64x64 unwritten=0
-SENTINEL_CENSUS idx=0 plane=U extent=32x64 unwritten=112 spans=24: (six 4x4 blocks)
-SENTINEL_CENSUS idx=0 plane=V extent=32x64 unwritten=112 spans=24: (identical)
-```
-
-Whole 4x4 chroma blocks, and each was the lower half of the plane block of one of
-the subsizes §1 says are not decodable. That is the whole chain: the walk
-accepted a subsize libaom refuses, and the chroma plane block it then covered
-was shaped differently from the luma one.
-
-The instrument is **kept**: it is env-gated, off by default, and it is the only
-way to ask "did the tile walk write every sample it was handed" (a wrong-sample
-diff cannot tell an unwritten sample from a mis-predicted one).
-
----
+The instrument is **kept** regardless: it is env-gated, off by default, and it
+is the only way to ask "did the tile walk write every sample it was handed" (a
+wrong-sample diff cannot tell an unwritten sample from a mis-predicted one).
 
 ## 3. The fix
 
@@ -321,11 +302,14 @@ test stream::tests::a_422_header_over_a_420_tile_refuses_the_subsize_libaom_call
 test result: ok. 1 passed; 0 failed; ...
 ```
 
-**Determinism, now a consequence rather than the pinned property.** The witness
-no longer produces output at all, so there is no hash to vary. Before the fix,
-`for i in 1..5` gave five hashes (top of §2); after, the file refuses. The
-nondeterminism was never a property of the pin worth pinning — it was the shape
-of a stream we should not have decoded at all.
+**No pixel property is pinned, because there is none to pin.** The witness no
+longer produces output at all — it refuses, which is the contract. An earlier
+version of this report pinned "the output hash must not change run to run" and
+justified it with five differing hashes on the lane tree; that measurement is not
+established on `main` (Main re-measured on `8d6998d7` with a
+provenance-checked probe and did not reproduce it), so the sentence and the
+assertion are both gone. The gate asserts the refusal and a positive control,
+which is what libaom actually does.
 
 **Mutation.** Deleting the two `chroma_plane_block_codable` call sites puts the
 witness back to `OK: 1 frames decoded` and the gate's `unwrap_or_else` panics

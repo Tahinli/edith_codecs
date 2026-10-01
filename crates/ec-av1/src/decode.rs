@@ -21354,22 +21354,30 @@ fn plane_sentinel_on() -> bool {
 ///     aom_internal_error(xd->error_info, AOM_CODEC_CORRUPT_FRAME,
 ///                        "Block size %dx%d invalid with this subsampling mode", ...);
 /// ```
-/// (`decodeframe.c:1449-1458`). Only the four cells that are ever BLOCK_INVALID
-/// are listed, from that table's rows:
-/// BLOCK_4X8 `{BLOCK_4X8, BLOCK_4X4 | BLOCK_INVALID, BLOCK_4X4}`,
-/// BLOCK_8X4 `{BLOCK_8X4, BLOCK_INVALID | BLOCK_4X4, BLOCK_4X4}`,
-/// BLOCK_8X16 `{BLOCK_8X16, BLOCK_8X8 | BLOCK_INVALID, BLOCK_4X8}`,
-/// BLOCK_16X4 `{BLOCK_16X4, BLOCK_INVALID | BLOCK_8X8, BLOCK_4X4}`.
+/// (`decodeframe.c:1449-1458`).
 ///
-/// So at 4:2:2 a 4x8, 8x16 or 16x4 subsize is NOT DECODABLE: libaom rejects
-/// the frame outright and never reaches a transform size for it. This decoder
-/// walked those subsizes anyway, and the chroma plane block it then covered was
-/// a different shape than the luma one -- on the pinned
-/// `440_request_is_422.obu` (a 4:2:2 sequence header over a 4:2:0 key frame's
-/// tile) that left whole 4x4 chroma blocks unwritten and the output hash
-/// CHANGED RUN TO RUN. `aomdec` on the same file:
-/// `Failed to decode frame 1: Corrupt frame detected` / `Block size 8x16
-/// invalid with this subsampling mode`.
+/// So at 4:2:2 a 4x8, 8x16, 16x32, 32x64, 64x128, 4x16, 8x32 or 16x64
+/// subsize is NOT DECODABLE: libaom rejects the frame outright and never
+/// reaches a transform size for it. This decoder walked those subsizes anyway,
+/// covering a chroma plane block whose shape did not match the luma one.
+///
+/// Two independent facts justify refusing rather than decoding, and NEITHER is
+/// this lane's pixel measurement:
+///
+/// 1. libaom REFUSES the shape. `aomdec` on the pinned
+///    `440_request_is_422.obu` (a 4:2:2 sequence header over a 4:2:0 key
+///    frame's tile) prints `Failed to decode frame 1: Corrupt frame detected`
+///    and `Block size 8x16 invalid with this subsampling mode`.
+/// 2. libaom's own ENCODER never emits it: `partition_search.c:3383-3389`
+///    gates `partition_rect_allowed` on this same table, so no conformant
+///    4:2:2 stream can contain the shape and the refusal cannot reject legal
+///    content.
+///
+/// What led here was this lane's own pre-deblock census
+/// ([`census_unwritten`]), which reported unwritten chroma samples on THIS
+/// lane's tree at r1. That is a lane-tree measurement with a lane-only
+/// instrument and is cited as such; the refusal stands on (1) and (2).
+///
 /// `av1_ss_size_lookup`'s `BLOCK_INVALID` cells, transcribed verbatim:
 /// `(common_data.c:17-41`, rows in `BLOCK_SIZES_ALL` order, indexed
 /// `[subsampling_x][subsampling_y])`. Every entry below is an (luma width,
