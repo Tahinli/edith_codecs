@@ -21235,6 +21235,113 @@ fn dump_prefilter_wide(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     }
 }
 
+/// `EC_AV1_SENTINEL_CENSUS=1`: at each frame's pre-deblock point, print an
+/// EXACT census of the samples the tile walk never wrote -- with
+/// `EC_AV1_PLANE_SENTINEL=1` every plane still holding [`PLANE_SENTINEL`] at
+/// this point is a sample no block reconstructed, and no legal sample can
+/// equal `0xDEAD` (reconstruction clamps to `(1 << bit_depth) - 1`).
+///
+/// This is the shipped form of the four-line temporary scan the
+/// `lane/av1422seed` census used: it replaces a wrong-sample diff (which says
+/// where the OUTPUT is wrong, not whether the block was written at all) with a
+/// direct count plus the coordinates of every hole, grouped into per-row
+/// spans so a large hole stays readable. Scans each plane over its own
+/// `true_width` x `true_height` extent: past that is the padded coding
+/// surface's invented tail, which no decoder ever reads.
+fn census_unwritten(y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
+    if !plane_sentinel_on() {
+        return;
+    }
+    let idx = PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst);
+    for (name, p) in [("Y", y), ("U", u), ("V", v)] {
+        let (w, h) = (p.true_width.min(p.width), p.true_height);
+        let mut total = 0usize;
+        let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+        for row in 0..h {
+            let mut run: Option<(usize, usize)> = None;
+            for col in 0..w {
+                if p.data[row * p.width + col] == PLANE_SENTINEL {
+                    total += 1;
+                    run = Some(match run {
+                        None => (col, col),
+                        Some((a, _)) => (a, col),
+                    });
+                }
+                if run.is_some()
+                    && (col + 1 == w || p.data[row * p.width + col + 1] != PLANE_SENTINEL)
+                {
+                    let (a, b) = run.take().expect("a run is open here");
+                    spans.push((row, a, b));
+                }
+            }
+        }
+        UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
+        CENSUS_SCANNED.fetch_add(w * h, std::sync::atomic::Ordering::SeqCst);
+        if total == 0 {
+            eprintln!("SENTINEL_CENSUS idx={idx} plane={name} extent={w}x{h} unwritten=0");
+            continue;
+        }
+        let body: Vec<String> = spans
+            .iter()
+            .map(|&(r, a, b)| format!("y{r} x{a}..={b}"))
+            .collect();
+        eprintln!(
+            "SENTINEL_CENSUS idx={idx} plane={name} extent={w}x{h} unwritten={total} \
+             spans={}: {}",
+            spans.len(),
+            body.join(" ")
+        );
+    }
+}
+
+/// Unwritten samples [`census_unwritten`] has counted since the last
+/// [`take_unwritten_samples`] -- process-global (not thread-local) because the
+/// gate reads it after the decode, from a different thread than the one that
+/// scanned the plane.
+static UNWRITTEN_SAMPLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Turns [`PLANE_SENTINEL`] filling on for the CALLING thread, independently
+/// of `EC_AV1_PLANE_SENTINEL`. A gate cannot set a process-constant env var
+/// (see [`crate::envflags`]), and the census is the only honest way to ask
+/// "did the tile walk write every sample it was handed" -- a wrong-sample diff
+/// cannot tell an unwritten sample from a mis-predicted one.
+pub fn set_plane_sentinel(on: bool) {
+    PLANE_SENTINEL_ON.with(|c| c.set(on));
+}
+
+/// Reads and clears [`UNWRITTEN_SAMPLES`]: the number of samples the decode
+/// just handed to the tile walk never wrote, summed over every frame and
+/// plane. Zero is the only acceptable answer for a decoder whose output must
+/// not depend on its allocator.
+pub fn take_unwritten_samples() -> usize {
+    UNWRITTEN_SAMPLES.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Samples [`census_unwritten`] has looked at since the last
+/// [`take_census_scanned`]. A gate that only asserts
+/// [`take_unwritten_samples`] == 0 passes on a decode that never scanned
+/// anything, so it reads THIS too: a census that scanned nothing has proved
+/// nothing.
+static CENSUS_SCANNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Reads and clears [`CENSUS_SCANNED`]; see [`take_unwritten_samples`] for the
+/// pairing.
+pub fn take_census_scanned() -> usize {
+    CENSUS_SCANNED.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+thread_local! {
+    /// The [`set_plane_sentinel`] override; `EC_AV1_PLANE_SENTINEL` is the
+    /// process-wide default.
+    static PLANE_SENTINEL_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether freshly allocated planes are [`PLANE_SENTINEL`]-filled.
+fn plane_sentinel_on() -> bool {
+    crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL")
+        || PLANE_SENTINEL_ON.with(std::cell::Cell::get)
+}
+
 /// The value [`fresh_plane`] fills with under `EC_AV1_PLANE_SENTINEL`: no
 /// legal sample can equal it (reconstruction clamps to `(1 << bit_depth) - 1`,
 /// at most 4095), so a decode that hashes identically under the flag proves
@@ -21252,7 +21359,7 @@ const PLANE_SENTINEL: u16 = 0xDEAD;
 /// ways (see the lane report) and the two agree, which is the proof that no
 /// unwritten sample reaches the output.
 fn fresh_plane(n: usize) -> Vec<u16> {
-    if crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL") {
+    if plane_sentinel_on() {
         return vec![PLANE_SENTINEL; n];
     }
     let mut v: Vec<u16> = Vec::with_capacity(n);
@@ -21294,6 +21401,8 @@ struct PlaneBuf<'a> {
     /// old unclipped behaviour exactly.
     tile_x1: usize,
     tile_y1: usize,
+    /// Which plane this buffer IS (0 luma, 1 U, 2 V) -- TEMPORARY probe.
+    plane: u8,
 }
 
 /// One entry per `MV_REFERENCE_FRAME` (index 0/1 unused -- `NONE`/
@@ -26322,8 +26431,32 @@ fn sub8_leaf_chroma422(
     // (`reconintra.c:1804-1806`, `:1815-1817`); the tile end is the frame end
     // for every leaf this reader owns, and the unit is one TX_4X4 chroma
     // transform wide and tall (`4 << ss` luma px per axis).
+    // lane-av1unwritten: at ss (1,0) a BLOCK_4X8 chroma reference's plane
+    // block is 4x8 -- `get_plane_block_size(BLOCK_4X8, 1, 0)` is BLOCK_4X8
+    // (`common_data.c`'s `av1_ss_size_lookup[BLOCK_4X8][1][0]` is
+    // BLOCK_INVALID, but `blockd.h:1372` takes the per-axis MIN of the two
+    // lookups) -- and `av1_get_max_uv_txsize` (blockd.h:1372-1379) resolves
+    // it through `max_txsize_rect_lookup[BLOCK_4X8]` == TX_4X8
+    // (`common_data.h:126`). So away from lossless the WHOLE 4x8 plane block
+    // is ONE rect transform unit, exactly the one [`leaf8_chroma422_unit`]
+    // already reads for a BLOCK_8X8 leaf. Emitting the single square TX_4X4
+    // this arm used to wrote left the block's bottom four chroma rows
+    // UNWRITTEN: on the pinned `440_request_is_422.obu` (a 4:2:2 header over
+    // a 4:2:0 tile, whose legal 8x8 `PARTITION_HORZ` groups make this shape
+    // legal syntax) the sentinel census found 112 unwritten samples per
+    // chroma plane, one 4x4 block per group, and the decode's output hash
+    // CHANGED RUN TO RUN because the unwritten samples were uninitialised
+    // memory (class `writer-gap-reaches-output`).
+    //
+    // At LOSSLESS the single-unit reading is wrong the other way:
+    // `av1_get_tx_size`'s first line returns TX_4X4 on every plane
+    // (blockd.h:1383), so the 4x8 plane block is walked as TWO stacked 4x4
+    // units -- which is exactly what the two chroma-reference leaves of the
+    // `decode_leaf_split4` route below already emit, so the square arms stay
+    // for lossless.
+    let rect48 = leaf_shape == (4, 8) && !lossless(fctx);
     let tx_w = 4 << ss_x(fctx);
-    let tx_h = 4 << ss_y(fctx);
+    let tx_h = (if rect48 { 8 } else { 4 }) << ss_y(fctx);
     let reach = Reach::of_tu_chroma(
         mi_bw,
         mi_bh,
@@ -26339,15 +26472,95 @@ fn sub8_leaf_chroma422(
         py > 0 && px + (tx_w << ss_x(fctx)) < y.width,
         px > 0 && py + (tx_h << ss_y(fctx)) < y.height,
     );
-    let chroma_around = neighbours.around_mi_422_chroma(ctx_mi, 8, 4);
+    let chroma_around = neighbours.around_mi_422_chroma(ctx_mi, 8, if rect48 { 8 } else { 4 });
     // lane-av1422sub8pix: the CfL AC signal spans the UNIT's luma footprint,
     // anchored at the same FLOORED luma x the write/prediction anchor below
     // uses -- `px` (the odd leaf's own luma x) steps half the span into the
     // RIGHT neighbour group (t422 frame-1 leaf (1,23): the unit reconstructs
     // chroma px 44..47 from luma 88..95, while a `px`-anchored source
     // averaged luma 92..99 and every CFL unit of the group mismatched).
-    let ac = alpha.map(|_| cfl_src_rect((lmi.1 & !1) * MI, py, 8, 4));
-    let grids: (Grid, Grid) = if let Some(dv) = intrabc_dv.filter(|_| skip) {
+    let ac = alpha.map(|_| cfl_src_rect((lmi.1 & !1) * MI, py, 8, if rect48 { 8 } else { 4 }));
+    let grids: (Grid, Grid) = if rect48 {
+        // The 4:2:2 vert pair's ONE chroma reference codes the PAIR's whole
+        // 4x8 chroma plane block. libaom reaches the same unit through
+        // `decode_token_recon_block`'s plane/row/col loop with
+        // `tx_size = av1_get_tx_size(1, xd)` == TX_4X8 (stepr/stepc = 2/1 over
+        // `unit_height = ROUND_POWER_OF_TWO(min(mu_blocks_high + row,
+        // max_blocks_high), ss_y)` = 2 and `unit_width` = 1, i.e. one
+        // iteration), so [`leaf8_chroma422_unit`] -- the port of that walk for
+        // a BLOCK_8X8 leaf -- is the unit, unchanged. The DV arms supply the
+        // frame copy through `pred_override`, which is how the BLOCK_8X8 leaf
+        // hands the same two intrabc shapes over.
+        let (ub, vb) = match intrabc_dv {
+            Some(dv) => {
+                let mut ub = vec![0u16; 4 * 8];
+                mc::predict_with_filter(
+                    &u.data,
+                    u.width,
+                    u.true_width,
+                    u.true_height,
+                    mv_to_q4(cpx, dv.1, ss_x(fctx)),
+                    mv_to_q4(cpy, dv.0, ss_y(fctx)),
+                    4,
+                    8,
+                    mc::InterpFilterKind::Bilinear,
+                    &mut ub,
+                    fctx,
+                );
+                let mut vb = vec![0u16; 4 * 8];
+                mc::predict_with_filter(
+                    &v.data,
+                    v.width,
+                    v.true_width,
+                    v.true_height,
+                    mv_to_q4(cpx, dv.1, ss_x(fctx)),
+                    mv_to_q4(cpy, dv.0, ss_y(fctx)),
+                    4,
+                    8,
+                    mc::InterpFilterKind::Bilinear,
+                    &mut vb,
+                    fctx,
+                );
+                (Some(ub), Some(vb))
+            }
+            None => (None, None),
+        };
+        let u_grid = leaf8_chroma422_unit(
+            dec,
+            cdfs,
+            chroma_around[1],
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            1,
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+            skip,
+            ub,
+            u,
+            cpx,
+            cpy,
+            smooth_neighbor_uv,
+            fctx,
+        )?;
+        let v_grid = leaf8_chroma422_unit(
+            dec,
+            cdfs,
+            chroma_around[2],
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            2,
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+            skip,
+            vb,
+            v,
+            cpx,
+            cpy,
+            smooth_neighbor_uv,
+            fctx,
+        )?;
+        (u_grid, v_grid)
+    } else if let Some(dv) = intrabc_dv.filter(|_| skip) {
         // lane-av1422ctattr: a SKIPPED intrabc chroma leaf still predicts the
         // frame copy at its DV. libaom's `decode_token_recon_block` takes the
         // INTER arm for an intrabc block (`is_inter_block` counts it,
@@ -35287,6 +35500,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+        plane: 0,
     };
     let (cw, ch) = (width >> ss_x(fctx), height >> ss_y(fctx));
     let (ctw, cth) = (true_width >> ss_x(fctx), true_height >> ss_y(fctx));
@@ -35300,6 +35514,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: cw,
         tile_y1: ch,
+        plane: 1,
     };
     let mut v = PlaneBuf {
         data: std::borrow::Cow::Owned(fresh_plane(cw * ch)),
@@ -35311,6 +35526,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: cw,
         tile_y1: ch,
+        plane: 2,
     };
 
     let scan32 = default_scan(TX32);
@@ -37460,6 +37676,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         frame_width as usize,
         frame_height as usize,
     );
+    census_unwritten(&y, &u, &v);
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -37598,6 +37815,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             tile_y0: 0,
             tile_x1: out_w,
             tile_y1: in_h,
+            plane: p.plane,
         };
         let (cw, ch, cuw) = (
             round_ss(fw, ss_x(fctx)),
@@ -38945,6 +39163,7 @@ fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+        plane: 0,
     }
 }
 
@@ -52903,6 +53122,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+        plane: 0,
     };
     let (cw, ch) = (width >> ss_x(fctx), height >> ss_y(fctx));
     let (ctw, cth) = (true_width >> ss_x(fctx), true_height >> ss_y(fctx));
@@ -52916,6 +53136,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: cw,
         tile_y1: ch,
+        plane: 1,
     };
     let mut v = PlaneBuf {
         data: std::borrow::Cow::Owned(fresh_plane(cw * ch)),
@@ -52927,6 +53148,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y0: 0,
         tile_x1: cw,
         tile_y1: ch,
+        plane: 2,
     };
 
     let scan32 = default_scan(TX32);
@@ -55744,6 +55966,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         frame_width as usize,
         frame_height as usize,
     );
+    census_unwritten(&y, &u, &v);
     if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -55904,6 +56127,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             tile_y0: 0,
             tile_x1: out_w,
             tile_y1: in_h,
+            plane: p.plane,
         };
         let (cw, ch, cuw) = (
             round_ss(fw, ss_x(fctx)),
@@ -58298,6 +58522,7 @@ mod tests {
             tile_y0: 0,
             tile_x1: width,
             tile_y1: height,
+            plane: 0,
         };
         let mut u = PlaneBuf {
             data: std::borrow::Cow::Owned(vec![0u16; (width / 2) * (height / 2)]),
@@ -58309,6 +58534,7 @@ mod tests {
             tile_y0: 0,
             tile_x1: width / 2,
             tile_y1: height / 2,
+            plane: 1,
         };
         let mut v = PlaneBuf {
             data: std::borrow::Cow::Owned(vec![0u16; (width / 2) * (height / 2)]),
@@ -58320,6 +58546,7 @@ mod tests {
             tile_y0: 0,
             tile_x1: width / 2,
             tile_y1: height / 2,
+            plane: 2,
         };
 
         let mut cdfs = Cdfs::new(q_ctx_of(100));

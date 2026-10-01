@@ -2863,6 +2863,59 @@ pub(crate) mod tests {
              ran on it"
         );
     }
+
+    /// lane-av1unwritten: the same pin decoded NONDETERMINISTICALLY. Its
+    /// 4:2:2 header hands the chroma planes 4x8 blocks (libaom's
+    /// `av1_get_max_uv_txsize(BLOCK_4X8, 1, 0)` == TX_4X8), and this
+    /// decoder's `sub8_leaf_chroma422` wrote a single square TX_4X4 per
+    /// chroma reference -- so the bottom four chroma rows of every 8x8
+    /// `PARTITION_HORZ` group were never written at all and the uninitialised
+    /// plane memory reached the output: five runs of the one file gave five
+    /// different `EC_AV1_FINAL_DUMP` hashes while every census count read
+    /// identical.
+    ///
+    /// The property pinned here is the one that stops that: with freshly
+    /// allocated planes filled with `PLANE_SENTINEL` (a value no legal sample
+    /// can equal), the decode must leave NO sample still holding it. A
+    /// wrong-sample diff cannot assert this -- it cannot tell an unwritten
+    /// sample from a mis-predicted one -- and `take_census_scanned` is read
+    /// alongside so a census that scanned nothing cannot pass as a census
+    /// that found nothing.
+    #[test]
+    fn a_422_header_over_a_420_tile_leaves_no_sample_unwritten() {
+        const NAME: &str = "a_422_header_over_a_420_tile_leaves_no_sample_unwritten";
+        struct Sentinel(bool);
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                crate::decode::set_plane_sentinel(self.0);
+            }
+        }
+        let _gate_lock = lock_gate_counters();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("440_request_is_422.obu");
+        let pinned = read_pin(&path, 2014, 0x98a1378df976253d, NAME);
+        crate::decode::set_plane_sentinel(true);
+        let _sentinel = Sentinel(false);
+        crate::decode::take_unwritten_samples();
+        crate::decode::take_census_scanned();
+        let frames =
+            decode_stream(&pinned).unwrap_or_else(|e| panic!("{NAME}: the pin must decode: {e}"));
+        assert_eq!(frames.len(), 1, "{NAME}: the pin decodes exactly one frame");
+        let scanned = crate::decode::take_census_scanned();
+        let unwritten = crate::decode::take_unwritten_samples();
+        assert!(
+            scanned >= 64 * 64 + 2 * 32 * 64,
+            "{NAME}: the sentinel census scanned only {scanned} samples -- a census that \
+             looked at less than the whole frame proves nothing"
+        );
+        assert_eq!(
+            unwritten, 0,
+            "{NAME}: {unwritten} samples of the frame were handed to the tile walk and never \
+             written, so they reach the output as whatever the allocator left there (the five \
+             different dump hashes this pin used to give)"
+        );
+    }
     /// lane-av1-422bigblock: the two witnessed 4:2:2 big-block defects, pinned
     /// as fixtures (`git add -f`; `fixtures/` is gitignored).
     ///
