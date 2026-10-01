@@ -84,9 +84,9 @@ const REFUSALS: &[&str] = &[
     // pixel-exact vs ffmpeg).
     // lane-av1txr: `a sub-8x8 leaf that uses intrabc (…)` is GONE -- the
     // capability landed in this lane (4x4 / 4x8 / 8x4 intrabc leaves read the
-    // DV and reconstruct a frame copy + the INTER residual; gates
-    // `a_non_420_subsampled_sequence_header_is_refused_by_name`'s sibling
-    // witnesses and the `warped.obu`/`allintra.obu` traces). Its census gate
+    // DV and reconstruct a frame copy + the INTER residual; the sub-8x8
+    // intrabc leaf witnesses in `stream.rs` and the `warped.obu` /
+    // `allintra.obu` traces). Its census gate
     // (`a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal`)
     // still runs: it now reports `reached = 0` with the same non-vacuous
     // premise (allow_intrabc frames + decoded sub-8 leaves).
@@ -512,9 +512,9 @@ const PROVEN: &[(&str, &str, Proof)] = &[
     // REFUSAL STRING, so it could not fail on a tree where 4:2:2 decode was
     // completely broken -- it passed unchanged on the broken tree and would
     // have kept passing if the port had been reverted. Its replacement
-    // `a_real_422_stream_decodes_pixel_exact` (and the corpus battery
-    // `the_pinned_422_corpus_cells_decode_pixel_exact`) assert BYTE-EXACT
-    // planes against ffmpeg on real 4:2:2 streams, with the
+    // `a_real_422_key_frame_and_inter_sequence_decode_pixel_exact` (and the
+    // corpus battery `the_pinned_422_corpus_cells_decode_pixel_exact`) assert
+    // BYTE-EXACT planes against ffmpeg on real 4:2:2 streams, with the
     // per-plane coefficient-unit census as the non-vacuity arm.
     // lane-av1txr-r2 paired, lane-av1-qmatrix RETIRED with its gate: the
     // refusal's witness is now
