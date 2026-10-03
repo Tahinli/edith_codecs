@@ -563,9 +563,18 @@ fn a_webp_animation_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_t
     // express that: it measures the host's memcpy bandwidth, measured at
     // 0.75-0.89 s on this desktop host against 3.89 s on a VPS for
     // byte-identical decoder work, which is what reddened the old 2 s
-    // ceiling. The decoder's own total budget is the machine-independent
-    // ceiling: it refuses once the running total crosses it, so nothing
-    // beyond it can have been allocated.
+    // ceiling.
+    //
+    // The byte bound is an INDEPENDENT measurement, not the guard's own
+    // tally: `AllocBudget::spend` sums DECLARED byte counts at chosen call
+    // sites, while `counting_allocations` sums the ACTUAL `layout.size()` of
+    // every allocation (and every realloc's full new size, so an
+    // incrementally grown Vec contributes more than its final size), plus the
+    // refusal's own formatting inside the measured window. So "refused at the
+    // budget" does NOT by itself mean "allocated no more than the budget" --
+    // and this test's red proof (one clone moved past the spend -> 5.12e9
+    // bytes against the 4.29e9 budget) is exactly the check that the two
+    // stay close enough for the budget to be a meaningful ceiling.
     let budget = ec_image::Limits::default().max_total_alloc as u64;
     let data = one_pixel_animated_webp(16000, 16000, 64);
     let (err, allocated) = counting_allocations(|| {

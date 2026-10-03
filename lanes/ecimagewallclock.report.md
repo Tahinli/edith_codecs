@@ -47,9 +47,25 @@ Bound the work in **bytes allocated**, measured with a thread-local counting
 global allocator in the test binary, against the decoder's *own* limit
 (`Limits::default().max_total_alloc`). No clock survives in these tests.
 
-The ceiling is not a fitted constant — it is the budget the guard enforces, so
-the assertion states the invariant directly: a decode that has refused at the
-total budget cannot have allocated more than the total budget.
+The ceiling is not a fitted constant — it is the guard's own `max_total_alloc`.
+It is also NOT the same statement as the guard's meaning, and this lane's own
+red proof is the counterexample: `AllocBudget::spend` sums DECLARED byte
+counts at chosen call sites, while `counting_allocations` sums the ACTUAL
+`layout.size()` of every allocation (and every realloc's full new size, so an
+incrementally grown `Vec` contributes about 2N rather than N), and the refusal
+path itself formats an `Error` inside the measured window. The two diverge:
+relocating `spend` one clone later produced 5120024246 bytes against a
+4294967296-byte budget — a decode that refused "at the total budget" allocated
+more than it. So the byte bound is best described as an independent
+measurement of actual work performed, and the red proofs as tests of the
+correspondence between the declared budget and actual allocation — which is
+the stronger and more accurate framing.
+
+The tally deliberately keeps measuring total allocation TRAFFIC (realloc's
+full new size included) rather than switching to net-live bytes or deltas:
+the host difference this class exists to measure is memcpy bandwidth, which
+is a property of traffic, not of liveness. So the divergence above is the
+measurement doing its job, not an error to close.
 
 Two additional facts fall out of the byte measurement for free:
 
@@ -82,6 +98,13 @@ memory-subsystem difference, not just a clock difference:
 
 1. 16 CPU spinners on 12 cores + 6 `dd oflag=direct` memory hammers.
 2. The same plus 24 spinners and 10 more hammers (1-minute load average 46).
+
+The concurrency figures (spinners, hammers, load average 46) are INFERRED from
+elapsed times, not recorded alongside the runs: the shell wedged, the load ran
+as detached processes, and the two coincide by construction, not by measurement.
+The elapsed numbers above are the measured part; the process counts are the
+reconstructed part, and the distinction matters because a reader could
+otherwise take "load 46 while the test ran" as a single observed fact.
 
 Under mechanism 1, decode elapsed measured **1.46–1.75 s**; under mechanism 2,
 **2.42 / 6.30 / 7.31 / 8.91 / 9.26 / 9.34 s**. That range straddles and then
@@ -128,7 +151,10 @@ written for, and the byte bound does.
 
 A second mutation (guard spent only on the first frame, so it never trips at
 all) was killed by the memguard cgroup at 10 GiB — SIGKILL before any
-assertion, i.e. unbounded work as intended.
+assertion. That is evidence about the MUTATION's severity, not a red proof of
+the byte bound: the byte assertion never ran, and the memguard cgroup would
+catch an unbounded process with or without this lane. The first mutation is
+the only red proof of the bound.
 
 ### Non-vacuity
 
@@ -171,3 +197,7 @@ allocations, and needs no arm/disarm flag.
   `git checkout -- crates/ec-image/tests/fuzz.rs` and redone against the
   absolute worktree path. The primary checkout is clean apart from the
   untracked `.wt/` directory.
+- For the record, `crates/ec-image` is now clock-free for this class: the only
+  remaining `elapsed()` uses feed `eprintln` rather than assertions, and the
+  one sub-millisecond comparison that remains is on GIF frame-delay metadata,
+  not on measured time.
