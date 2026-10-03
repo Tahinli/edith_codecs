@@ -459,6 +459,165 @@ fn require_fixture(path: &std::path::Path, generator: &str) -> bool {
     present
 }
 
+/// Write `bytes` to `path` and PROVE the file on disk is exactly that long.
+///
+/// lane-h26xpinloud: every write below used `std::fs::write(..).ok()?` and then
+/// handed `path` to ffmpeg, which closes only the ERROR path. An Ok-but-short
+/// write -- a filesystem that reports success and stores fewer bytes (ENOSPC on
+/// a full mount, EFBIG under a size cap, a quota, a failed final flush) -- left
+/// ffmpeg decoding a truncated stream, and the failure surfaced as a
+/// plausible-looking wrong pixel or a shifted PSNR number, not as a write
+/// failure. MEASURED: 1234 bytes written through a path that LOOKS like a
+/// stream file in a scratch directory but whose filesystem accepts every byte
+/// and stores none returns `Ok`, and the file on disk is 0 bytes. So the length
+/// is checked here once, from the same `bytes.len()` the writer used, and any
+/// shortfall carries the path, both counts, and the OS error -- or, for the
+/// write that reported success and left a short file, the plain statement that
+/// there was no OS error, which is exactly the case that used to print nothing.
+///
+/// Returns the failure LINE rather than a bare bool, so the bail callers and any
+/// panic caller all end on one format that cannot drift apart. The success path
+/// is byte-identical to the old `fs::write`: same bytes, same path, truncate
+/// then write.
+fn pin_loud(site: &str, path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let expected = bytes.len();
+    if let Err(e) = std::fs::write(path, bytes) {
+        // The count here is the file's REAL length, not what the writer had
+        // confirmed in hand: under a size cap the kernel stores everything up
+        // to the cap and only THEN returns the error, and `fs::write` confirms
+        // none of it.
+        let on_disk = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+        return Err(short_line(
+            site,
+            path,
+            on_disk,
+            expected,
+            &format!("the write failed: {e}"),
+        ));
+    }
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() as usize == expected => Ok(()),
+        Ok(m) => Err(short_line(
+            site,
+            path,
+            m.len() as usize,
+            expected,
+            "the write reported success and the file on disk is still not that long (no OS error)",
+        )),
+        Err(e) => Err(short_line(
+            site,
+            path,
+            0,
+            expected,
+            &format!("the written file could not be stat'ed: {e}"),
+        )),
+    }
+}
+
+/// The one failure line every short pin ends on: site, path, the bytes the file
+/// holds vs the bytes owed, and the reason.
+fn short_line(
+    site: &str,
+    path: &std::path::Path,
+    on_disk: usize,
+    expected: usize,
+    why: &str,
+) -> String {
+    format!(
+        "ec-h264 encode pin SHORT [{}] {}: file holds {on_disk} of {expected} bytes: {why}",
+        site,
+        path.display()
+    )
+}
+
+/// A pin whose shortfall is reported and then BAILED on, for a caller that
+/// returns `None` today. Prints the same line [`pin_loud`] returns, so `None`
+/// from here never reads as a plain "ffmpeg said no".
+fn pin_or_bail(site: &str, path: &std::path::Path, bytes: &[u8]) -> Option<()> {
+    pin_loud(site, path, bytes)
+        .map_err(|why| eprintln!("{why}"))
+        .ok()
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_loud_reds_on_an_ok_but_short_write() {
+    // The shape the four sites left open: a write that reports success and
+    // leaves a file of a different length. A symlink to /dev/null accepts every
+    // byte and stores none, so `fs::write` returns Ok and the file is 0 bytes --
+    // a stream path, silently empty.
+    let dir = std::env::temp_dir().join(format!("ec-h264-pinloud-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("ok-but-short.264");
+    let _ = std::fs::remove_file(&path);
+    std::os::unix::fs::symlink("/dev/null", &path).expect("symlink to /dev/null");
+    let why = pin_loud("ok_but_short", &path, &[7u8; 1234]).unwrap_err();
+    assert!(why.contains(&path.display().to_string()), "{why}");
+    assert!(why.contains("file holds 0 of 1234 bytes"), "{why}");
+    std::fs::remove_file(&path).ok();
+
+    // The control: the same call on a real file succeeds and leaves every byte.
+    let good = dir.join("whole.264");
+    let bytes = vec![7u8; 1234];
+    pin_loud("control", &good, &bytes).expect("a whole write is not short");
+    assert_eq!(std::fs::read(&good).expect("read back"), bytes);
+    std::fs::remove_file(&good).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_loud_reports_what_landed_under_a_size_cap() {
+    // The Err arm, driven for real: `ulimit -f` caps the file, the kernel stores
+    // everything up to the cap and only then returns EFBIG. The line must carry
+    // the bytes that actually LANDED (512 of a 1 KiB-block cap), not the count
+    // the writer confirmed, which is zero.
+    use std::process::Command;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // SIGXFSZ's default action would kill the child before it can print;
+    // `trap '' XFSZ` sets SIG_IGN, which survives the exec.
+    let script = format!(
+        "ulimit -f 1; trap '' XFSZ; exec {} --exact pin_loud_cap_child --nocapture",
+        exe.display()
+    );
+    let out = Command::new("sh")
+        .args(["-c", &script])
+        .env("EC_PINLOUD_CHILD", "1")
+        .output()
+        .expect("run the capped child");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "the capped write must fail: {text}");
+    assert!(text.contains("file holds 512 of 4096 bytes"), "{text}");
+    assert!(
+        text.contains("EFBIG") || text.contains("File too large"),
+        "{text}"
+    );
+}
+
+/// Child of [`pin_loud_reports_what_landed_under_a_size_cap`]: runs under
+/// `ulimit -f 1` (a 1 KiB block cap) and pins 4096 bytes, so the write fails
+/// partway. Inert unless the parent set `EC_PINLOUD_CHILD`.
+#[test]
+fn pin_loud_cap_child() {
+    if std::env::var_os("EC_PINLOUD_CHILD").is_none() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ec-h264-pinloud-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("capped.264");
+    let why = pin_loud("capped", &path, &[7u8; 4096])
+        .expect_err("4096 bytes cannot fit a 1 KiB cap");
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+    panic!("{why}");
+}
+
 /// Decode an Annex B stream with ffmpeg, returning one I420 triple per picture.
 fn ffmpeg_decode(stream: &[u8], w: usize, h: usize, extra: &[&str]) -> Option<Vec<Planes>> {
     // Distinct per call, not per process: several #[test]s in this binary
@@ -472,7 +631,7 @@ fn ffmpeg_decode(stream: &[u8], w: usize, h: usize, extra: &[&str]) -> Option<Ve
         stream.len(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::write(&path, stream).ok()?;
+    pin_or_bail("ffmpeg_decode", &path, stream)?;
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-v", "error"]);
     cmd.args(extra);
@@ -1065,7 +1224,7 @@ fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32, gop: u32) -> 
         buf.extend_from_slice(u);
         buf.extend_from_slice(v);
     }
-    std::fs::write(&raw, &buf).ok()?;
+    pin_or_bail("x264_encode_qp", &raw, &buf)?;
     let status = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-y"])
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
