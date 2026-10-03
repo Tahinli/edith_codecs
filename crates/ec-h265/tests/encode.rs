@@ -6,6 +6,9 @@
 //! own reconstruction — and x265's psychovisual and adaptive tools are off so
 //! the comparison is at matched features, not at matched marketing.
 
+mod common;
+
+use common::{pin_loud, pin_or_bail};
 use ec_core::frame::VideoFrame;
 use ec_h265::encoder::{Encoder, EncoderConfig, RateControl, TransformSkip};
 
@@ -281,12 +284,91 @@ fn have_x265() -> bool {
         .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("libx265"))
 }
 
+#[cfg(unix)]
+#[test]
+fn pin_loud_reds_on_an_ok_but_short_write() {
+    // The shape the two sites above left open: a write that reports success and
+    // leaves a file of a different length. A symlink to /dev/null accepts every
+    // byte and stores none, so `fs::write` returns Ok and the file is 0 bytes --
+    // a stream path, silently empty.
+    let dir = std::env::temp_dir().join(format!("ec-h265-pinloud-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("ok-but-short.265");
+    let _ = std::fs::remove_file(&path);
+    std::os::unix::fs::symlink("/dev/null", &path).expect("symlink to /dev/null");
+    let why = pin_loud("ok_but_short", &path, &[7u8; 1234]).unwrap_err();
+    assert!(why.contains(&path.display().to_string()), "{why}");
+    assert!(why.contains("file holds 0 of 1234 bytes"), "{why}");
+    std::fs::remove_file(&path).ok();
+
+    // The control: the same call on a real file succeeds and leaves every byte.
+    let good = dir.join("whole.265");
+    let bytes = vec![7u8; 1234];
+    pin_loud("control", &good, &bytes).expect("a whole write is not short");
+    assert_eq!(std::fs::read(&good).expect("read back"), bytes);
+    std::fs::remove_file(&good).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_loud_reports_what_landed_under_a_size_cap() {
+    // The Err arm, driven for real: `ulimit -f` caps the file, the kernel stores
+    // everything up to the cap and only then returns EFBIG. The line must carry
+    // the bytes that actually LANDED (512 of a 1 KiB-block cap), not the count
+    // the writer confirmed, which is zero.
+    use std::process::Command;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // SIGXFSZ's default action would kill the child before it can print;
+    // `trap '' XFSZ` sets SIG_IGN, which survives the exec.
+    let script = format!(
+        "ulimit -f 1; trap '' XFSZ; exec {} --exact pin_loud_cap_child --nocapture",
+        exe.display()
+    );
+    let out = Command::new("sh")
+        .args(["-c", &script])
+        .env("EC_PINLOUD_CHILD", "1")
+        .output()
+        .expect("run the capped child");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "the capped write must fail: {text}");
+    assert!(text.contains("file holds 512 of 4096 bytes"), "{text}");
+    assert!(
+        text.contains("EFBIG") || text.contains("File too large"),
+        "{text}"
+    );
+}
+
+/// Child of [`pin_loud_reports_what_landed_under_a_size_cap`]: runs under
+/// `ulimit -f 1` (a 1 KiB block cap) and pins 4096 bytes, so the write fails
+/// partway. Inert unless the parent set `EC_PINLOUD_CHILD`.
+#[test]
+fn pin_loud_cap_child() {
+    if std::env::var_os("EC_PINLOUD_CHILD").is_none() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ec-h265-pinloud-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("capped.265");
+    let why = pin_loud("capped", &path, &[7u8; 4096])
+        .expect_err("4096 bytes cannot fit a 1 KiB cap");
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+    panic!("{why}");
+}
+
 /// Decode an Annex-B stream with ffmpeg, returning one I420 triple per picture.
 fn ffmpeg_decode(stream: &[u8], w: usize, h: usize) -> Option<Vec<Planes>> {
     let dir = std::env::temp_dir().join(format!("ec-h265-enc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("s{}.265", stream.len()));
-    std::fs::write(&path, stream).ok()?;
+    pin_or_bail("ffmpeg_decode", &path, stream)?;
     let out = std::process::Command::new("ffmpeg")
         .args(["-v", "error"])
         .arg("-i")
@@ -338,7 +420,7 @@ fn x265_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
         buf.extend_from_slice(u);
         buf.extend_from_slice(v);
     }
-    std::fs::write(&raw, &buf).ok()?;
+    pin_or_bail("x265_encode_qp", &raw, &buf)?;
     // The param list is the h264 gate's x264 list translated to x265's option
     // names: psychovisual (psy-rd, psy-rdoq) and adaptive (aq-mode) tools off,
     // plus the in-loop filters x265 adds and x264 does not have (no-sao,

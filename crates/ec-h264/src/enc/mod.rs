@@ -744,14 +744,20 @@ fn rd_trace_write(pic: &Picture, src: &Source, frame: u64, pre: Option<Vec<(i64,
     for (addr, &(pre_luma, pre_chroma)) in pre.iter().enumerate() {
         let (post_luma, post_chroma) = rd_trace_ssd(pic, src, addr % pic.mb_w, addr / pic.mb_w);
         let f = pic.mb_flags[addr];
-        let _ = writeln!(
+        // A discarded write result here is a SILENTLY SHORT trace: the reader
+        // of `$EC_H264_RD_TRACE` attributes decisions from it and cannot tell a
+        // short line count from a real one. No length check is possible (append
+        // mode has no knowable total), so this is the ec-av1 `append_unknown`
+        // shape: the write error is fatal instead.
+        writeln!(
             out,
             "{frame} {addr} {} {} {} {} {pre_luma} {pre_chroma} {post_luma} {post_chroma}",
             u8::from(f & FLAG_INTER == 0),
             u8::from(f & FLAG_TRANS8X8 != 0),
             u8::from(f & FLAG_SKIP != 0),
             pic.mb_qp[addr]
-        );
+        )
+        .expect("write EC_H264_RD_TRACE");
     }
 }
 

@@ -6,10 +6,9 @@
 
 mod common;
 
-use common::{natural_frame, test_frame};
+use common::{natural_frame, pin_or_panic, test_frame};
 use ec_core::frame::VideoFrame;
 use ec_h265::encoder::{EncodedPicture, Encoder, EncoderConfig, RateControl, TransformSkip};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,10 +46,17 @@ fn ffmpeg_decode(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(&out).map_err(|e| e.to_string())
 }
 
+/// Pin one access unit as an Annex-B file for [`ffmpeg_decode`].
+///
+/// lane-h26xpinloud: this used `File::create(..).expect(..)` +
+/// `write_all(..).expect("write bitstream")`, which closes only the ERROR path.
+/// A write that reports success and leaves a short file put a truncated stream
+/// at exactly the path ffmpeg then decoded, so the shortfall now carries the
+/// path, both counts, and the OS error. Panic semantics kept: this caller
+/// panicked before and still does, with the failure line as the message.
 fn write_au(name: &str, picture: &EncodedPicture) -> PathBuf {
     let path = scratch_dir().join(format!("{name}.265"));
-    let mut file = std::fs::File::create(&path).expect("create bitstream");
-    file.write_all(&picture.au).expect("write bitstream");
+    pin_or_panic("write_au", &path, &picture.au);
     path
 }
 
