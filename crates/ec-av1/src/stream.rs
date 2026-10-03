@@ -6894,7 +6894,12 @@ pub(crate) mod tests {
 
         let decoded = decode_stream(&data)
             .unwrap_or_else(|e| panic!("{NAME}: the committed 4:2:0 pin did not decode: {e}"));
-        let want = ffmpeg_decode_sequence(&data, 256, 128, decoded.len());
+        // The pin name is the spec: `420_mixll_256x128_6f` is 6 shown frames.
+        // `decoded.len()` is the value under test, so it must not be the count
+        // handed to ffmpeg (count-vacuity ceiling is 0).
+        const SHOWN: usize = 6;
+        assert_eq!(decoded.len(), SHOWN, "{NAME}: the pin is 6 shown frames");
+        let want = ffmpeg_decode_sequence(&data, 256, 128, SHOWN);
         assert_eq!(decoded.len(), want.len(), "{NAME}: decoded/frame count");
 
         let plane_mismatches = |ours: &[Pic], theirs: &[Pic], plane: u8| -> usize {
