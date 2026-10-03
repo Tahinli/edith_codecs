@@ -38458,8 +38458,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         // data lengths: this dump is the PADDED plane, not a crop, so the
         // writer's extent is `p.data` itself.
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let narrow =
-            |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+        let narrow = |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
         crate::dumpio::write_planes(
             "EC_AV1_PREFILT_DUMP",
             format!("{path}.f{idx}"),
@@ -56839,8 +56838,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         // lane-av1dumploud: loud on a short write (see the key-frame twin
         // above -- same file, same shape, same three planes).
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let narrow =
-            |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+        let narrow = |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
         crate::dumpio::write_planes(
             "EC_AV1_PREFILT_DUMP",
             format!("{path}.f{idx}"),
@@ -58157,6 +58155,134 @@ mod tests {
             "inter_strip_chroma gained a second writer -- the inter 1:4 strips can now \
              come from a level whose guard this census has not checked"
         );
+
+        // (g) PER-SITE rows. Everything above claims a guard by LEVEL --
+        // "there is a `refuse_invalid_subsize((8, 8))` somewhere in the
+        // key-frame tile decoder" -- and that is exactly what makes two
+        // guards deletable: the key-frame 8x8 level has TWO resolution
+        // sites (37322 and 37621) and the walk census's `decode_leaf_rect8`
+        // row is satisfied by the first one, so deleting the SECOND left the
+        // test green; the inter decoder carries its OWN 128-root guard
+        // (54495) while the `decode_block_128rect` row names
+        // `read_sb128_root`, so deleting the inter copy also left it green.
+        // The merged scan's count cross-check is what reds them, and a
+        // count is not a location.
+        //
+        // So each row below names an ANCHOR that is unique in the decode
+        // body -- the code the site hangs off -- and requires the level's
+        // guard to sit between that anchor and the dispatch the site
+        // feeds, within the same function. A level guard elsewhere in that
+        // function cannot stand in, because the search starts AT the
+        // anchor. Deleting the named guard finds no guard after the anchor
+        // and reds; moving it below the dispatch reds the ordering assert.
+        //
+        // Row shape: (site label, guard's function, level, unique anchor,
+        // dispatch token the guard must precede, shapes the site walks).
+        let body_of = |name: &str| -> &str {
+            let start = decode_body
+                .find(&format!("\nfn {name}("))
+                .or_else(|| decode_body.find(&format!("\npub(crate) fn {name}(")))
+                .or_else(|| decode_body.find(&format!("\npub fn {name}(")))
+                .unwrap_or_else(|| panic!("{name} is not a function in this file"));
+            let end = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                .iter()
+                .filter_map(|pat| decode_body[start + 1..].find(pat).map(|i| start + 1 + i))
+                .min()
+                .unwrap_or(decode_body.len());
+            &decode_body[start..end]
+        };
+        let site_rows: &[(&str, &str, usize, &str, &str, &[(usize, usize)])] = &[
+            // The key-frame 8x8 level resolves TWICE (37322 for the frame
+            // interior, 37621 for the `pre8` probe path). Both feed
+            // `decode_leaf_rect8` on a raw `part8`, whose VERT shape is 4x8 --
+            // BLOCK_INVALID at 4:2:2. The anchor `let pre8 = ...` is what
+            // makes this row about the SECOND site: with `find()` scoped to
+            // the function alone the search would return 37322 and never
+            // look here.
+            (
+                "the key-frame 8x8 SECOND resolution",
+                KF,
+                8,
+                "let pre8 = dec.debug_state().0;",
+                "decode_leaf_rect8(",
+                &[(8, 4), (4, 8)],
+            ),
+            // The inter decoder resolves its own 128 root at 54495 rather
+            // than routing through `read_sb128_root` (which is where the
+            // `decode_block_128rect` row's guard lives). The dispatch token
+            // is the `half128_inter!` arm that descends into a 128x64 /
+            // 64x128 rect -- both BLOCK_INVALID at 4:2:2 in
+            // `PLANE_BLOCK_INVALID_422`. `macro_rules! half128_inter` is
+            // unique in the file, so this row cannot drift onto the other
+            // one.
+            (
+                "the inter decoder's own 128-root guard",
+                INTER,
+                128,
+                "macro_rules! half128_inter",
+                "half128_inter!((br_mi, base_mi.1), 128, 64,",
+                &[(128, 64), (64, 128)],
+            ),
+        ];
+        for (label, fscope, level, anchor, dispatch, shapes) in site_rows {
+            assert_eq!(
+                decode_body.matches(anchor).count(),
+                1,
+                "{label}: the site anchor {anchor:?} is not unique in the decode body, so it \
+                 cannot name one site -- re-derive the anchor for this row"
+            );
+            // Why the site needs a guard at all: something it dispatches is
+            // BLOCK_INVALID at a mode a `color_config` can select. (0, 1) is
+            // excluded for the same reason as the walk census above.
+            let offending: Vec<(usize, usize, usize, usize)> = shapes
+                .iter()
+                .flat_map(|&(bw, bh)| {
+                    [(1, 0), (1, 1), (0, 0)]
+                        .into_iter()
+                        .filter_map(move |(sx, sy)| {
+                            invalid_at(bw, bh, sx, sy).then_some((bw, bh, sx, sy))
+                        })
+                })
+                .collect();
+            assert!(
+                !offending.is_empty(),
+                "{label} claims a guard but libaom codes every shape it walks at every \
+                 selectable subsampling mode -- then it needs none"
+            );
+            let body = body_of(fscope);
+            let a = body.find(anchor).unwrap_or_else(|| {
+                panic!(
+                    "{label}: the anchor {anchor:?} is not inside `{fscope}` -- the guard \
+                     moved to another function, and the row's scope is stale"
+                )
+            });
+            let gpat = format!("refuse_invalid_subsize(({level}, {level})");
+            let g = body[a..].find(&gpat).map(|i| a + i).unwrap_or_else(|| {
+                panic!(
+                    "{label}: `{fscope}` has NO {gpat} at or after the site anchor {anchor:?} \
+                     -- this site's guard is gone. The level claim elsewhere in this test is \
+                     still satisfied by the OTHER {level}x{level} guard in the file, which is \
+                     precisely why this row exists"
+                )
+            });
+            let gap = body[a..g].lines().count();
+            assert!(
+                gap <= 40,
+                "{label}: the {gpat} sits {gap} lines below its own anchor {anchor:?} -- that is \
+                 a different site, so this row has stopped naming what it claims to name"
+            );
+            let d = body[g..].find(dispatch).map(|i| g + i).unwrap_or_else(|| {
+                panic!(
+                    "{label}: `{fscope}` dispatches {dispatch:?} nowhere AFTER its {gpat} -- \
+                     either the dispatch moved above the guard or the site was rewritten"
+                )
+            });
+            assert!(
+                g < d,
+                "{label}: guard at {g} sits at or after the dispatch at {d} -- a guard BELOW \
+                 the dispatch can never observe it"
+            );
+        }
     }
 
     /// lane-av1chrtx: [`covering_leaf_tx_type`] resolves a chroma unit's
