@@ -48760,7 +48760,17 @@ exit 0
             println!("ALLOCDET_SYNTHETIC {a:016x} {b:016x}");
             return;
         }
-        let list = std::env::var("ALLOCDET_FIXTURES").expect("ALLOCDET_FIXTURES");
+        let Ok(list) = std::env::var("ALLOCDET_FIXTURES") else {
+            // Reached without either variable == a normal suite run: the parent
+            // names this test with ALLOCDET_FIXTURES (or ALLOCDET_SYNTHETIC) set,
+            // so there is nothing to measure here. Asserting the variable instead
+            // made every full suite red (caught by the VPS suite at the merged
+            // head); the parent already fails when the child prints no ALLOCDET
+            // line, so a skip cannot hide a broken child. Print rather than
+            // pass silently.
+            println!("ALLOCDET skipped: not invoked as a census child");
+            return;
+        };
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         for fixture in list.split(',').filter(|s| !s.is_empty()) {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

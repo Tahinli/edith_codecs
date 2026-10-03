@@ -448,6 +448,7 @@ mod tests {
         ("census.rs", include_str!("census.rs")),
         ("compound.rs", include_str!("compound.rs")),
         ("decode.rs", include_str!("decode.rs")),
+        ("dumpio.rs", include_str!("dumpio.rs")),
         ("encode.rs", include_str!("encode.rs")),
         ("encoder.rs", include_str!("encoder.rs")),
         ("envflags.rs", include_str!("envflags.rs")),
