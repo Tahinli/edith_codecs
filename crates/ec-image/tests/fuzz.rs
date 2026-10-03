@@ -7,7 +7,57 @@
 //! `Err` — a decoder reached by a file picker is reached by every broken file
 //! on the disk.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+
+/// Counting allocator: the "refused without doing unbounded work" tests
+/// below bound that work by *bytes allocated*, not by wall time. A clock is
+/// a machine-dependent proxy for exactly the thing those tests care about --
+/// it measures the host's memcpy bandwidth, not the decoder's behaviour --
+/// and it was measured failing that way: the same refused WebP decode takes
+/// 0.75-0.89 s on this desktop host and 3.89 s on a VPS, a 5x spread with
+/// byte-identical decoder work, which is what reddened a 2 s ceiling.
+/// Lives in the test binary only; the shipped crate has no allocator games.
+///
+/// The tally is per-thread, not global: `cargo test` runs these tests in
+/// parallel, so a shared counter sums concurrent decodes together and
+/// reports work none of them did.
+struct CountingAlloc;
+
+std::thread_local! {
+    static ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn count_alloc(size: usize) {
+    let _ = ALLOC_BYTES.try_with(|b| b.set(b.get() + size as u64));
+}
+
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        count_alloc(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        count_alloc(new_size);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
+
+/// Runs `f` on this thread and returns its value together with every byte
+/// that thread allocated while it ran. That count is the decoder's own
+/// work, independent of how fast the host is at moving those bytes around.
+fn counting_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    ALLOC_BYTES.with(|b| b.set(0));
+    let out = f();
+    (out, ALLOC_BYTES.with(Cell::get))
+}
 
 const ROUNDS: usize = 10_000;
 
@@ -364,10 +414,18 @@ fn a_gif_frame_asking_for_more_pixels_than_the_limit_is_refused() {
     data.extend_from_slice(&60000u16.to_le_bytes());
     data.push(0x00);
 
-    let start = std::time::Instant::now();
-    let err = ec_image::decode_animation(&data).expect_err("60000x60000 frame is past the limit");
-    assert!(start.elapsed().as_millis() < 100, "{:?}", start.elapsed());
+    // Bounded by bytes, not by a clock: this refusal happens before the
+    // frame sizes anything at all, so the whole decode is a few hundred
+    // bytes of header parsing (measured: 421 B in 2.6 us) whatever the host's
+    // speed. The old 100 ms clock was a machine-dependent proxy for that.
+    let (err, allocated) = counting_allocations(|| {
+        ec_image::decode_animation(&data).expect_err("60000x60000 frame is past the limit")
+    });
     assert!(format!("{err}").contains("limit"), "{err}");
+    assert!(
+        allocated <= 64 * 1024,
+        "a header-only refusal allocated {allocated} bytes; it must refuse before sizing the frame"
+    );
 }
 
 #[test]
@@ -378,14 +436,36 @@ fn a_gif_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget
     // must be caught by the decode-wide budget even though no single frame
     // or single buffer ever looks large by itself.
     let data = one_pixel_gif(16000, 16000, 64);
-    let start = std::time::Instant::now();
-    let err = ec_image::decode_animation(&data)
-        .expect_err("64 clones of a near-limit canvas is past the total budget");
     // A few real canvas clones run before the budget catches up (the budget
     // is spent per frame, so it can't refuse before at least one clone), so
-    // this bounds "a handful of gigabyte copies", not "no allocation at all".
-    assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+    // this bounds "the decoder's own total budget, not a byte more", not "no
+    // allocation at all". Bytes, not a clock -- see the counting allocator
+    // above.
+    let budget = ec_image::Limits::default().max_total_alloc as u64;
+    let (err, allocated) = counting_allocations(|| {
+        ec_image::decode_animation(&data)
+            .expect_err("64 clones of a near-limit canvas is past the total budget")
+    });
     assert!(format!("{err}").contains("limit"), "{err}");
+    assert!(
+        allocated <= budget,
+        "refused decode allocated {allocated} bytes, past the {budget}-byte total budget"
+    );
+
+    // Size-relative, and the half that pins the guard: 64x the frames in the
+    // file must not buy 64x the work. A budget spent per *input* frame, or
+    // after the clone instead of before it, refuses later or not at all as
+    // the frame count grows.
+    let bomb = one_pixel_gif(16000, 16000, 4096);
+    let (err, allocated) = counting_allocations(|| {
+        ec_image::decode_animation(&bomb)
+            .expect_err("4096 clones of a near-limit canvas is past the total budget")
+    });
+    assert!(format!("{err}").contains("limit"), "{err}");
+    assert!(
+        allocated <= budget,
+        "a 64x larger file allocated {allocated} bytes, past the {budget}-byte total budget"
+    );
 }
 
 #[test]
@@ -476,28 +556,58 @@ fn one_pixel_animated_webp(canvas_w: u32, canvas_h: u32, frames: usize) -> Vec<u
 fn a_webp_animation_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget() {
     // The WebP analogue of the GIF test above: `decode_frames` clones the
     // whole composited canvas into the result once per ANMF chunk.
+    //
+    // The bound here is *bytes*, not a clock. What this protects against is
+    // a guard that stops refusing and lets the clone multiplier run -- 64
+    // frames over this canvas is 64 GiB of compositing -- and a clock cannot
+    // express that: it measures the host's memcpy bandwidth, measured at
+    // 0.75-0.89 s on this desktop host against 3.89 s on a VPS for
+    // byte-identical decoder work, which is what reddened the old 2 s
+    // ceiling.
+    //
+    // The byte bound is an INDEPENDENT measurement, not the guard's own
+    // tally: `AllocBudget::spend` sums DECLARED byte counts at chosen call
+    // sites, while `counting_allocations` sums the ACTUAL `layout.size()` of
+    // every allocation (and every realloc's full new size, so an
+    // incrementally grown Vec contributes more than its final size), plus the
+    // refusal's own formatting inside the measured window. So "refused at the
+    // budget" does NOT by itself mean "allocated no more than the budget" --
+    // and this test's red proof (one clone moved past the spend -> 5.12e9
+    // bytes against the 4.29e9 budget) is exactly the check that the two
+    // stay close enough for the budget to be a meaningful ceiling.
+    let budget = ec_image::Limits::default().max_total_alloc as u64;
     let data = one_pixel_animated_webp(16000, 16000, 64);
-    let run = || {
-        let start = std::time::Instant::now();
-        let err = ec_image::decode_animation(&data)
-            .expect_err("64 clones of a near-limit canvas is past the total budget");
-        (start.elapsed(), err)
-    };
-    let (mut elapsed, mut err) = run();
-    // A miss within 1.5x of the budget can be another lane's parallel test
-    // threads contending for CPU rather than the refusal itself doing extra
-    // work: rerun once and keep the faster attempt. A genuine regression
-    // (the refusal doing real unbounded work) is slow on both attempts and
-    // still fails below.
-    if elapsed.as_millis() >= 2000 && elapsed.as_millis() < 3000 {
-        let (elapsed2, err2) = run();
-        if elapsed2 < elapsed {
-            elapsed = elapsed2;
-            err = err2;
-        }
-    }
-    assert!(elapsed.as_millis() < 2000, "{elapsed:?}");
+    let (err, allocated) = counting_allocations(|| {
+        ec_image::decode_animation(&data)
+            .expect_err("64 clones of a near-limit canvas is past the total budget")
+    });
     assert!(format!("{err}").contains("limit"), "{err}");
+    assert!(
+        allocated <= budget,
+        "the refused decode allocated {allocated} bytes, past the {budget}-byte total budget"
+    );
+
+    // Size-relative, and the half that pins the guard: 64x the frames in
+    // the file must not buy 64x the work. A budget spent per *input* frame,
+    // or after the clone instead of before it, refuses later or not at all
+    // as the frame count grows -- and no clock can tell those apart, since
+    // the work is the same order either way.
+    let bomb = one_pixel_animated_webp(16000, 16000, 4096);
+    assert!(
+        bomb.len() > data.len() * 16,
+        "the second input is meant to be far larger: {} vs {} bytes",
+        bomb.len(),
+        data.len()
+    );
+    let (err, allocated) = counting_allocations(|| {
+        ec_image::decode_animation(&bomb)
+            .expect_err("4096 clones of a near-limit canvas is past the total budget")
+    });
+    assert!(format!("{err}").contains("limit"), "{err}");
+    assert!(
+        allocated <= budget,
+        "a 64x larger file allocated {allocated} bytes, past the {budget}-byte total budget"
+    );
 }
 
 /// Build an LZW-compressed data stream that keeps expanding after the
@@ -573,9 +683,16 @@ fn a_gif_lzw_bomb_does_not_expand_past_its_declared_frame() {
     data.push(0); // sub-block terminator
     data.push(0x3B); // trailer
 
-    let start = std::time::Instant::now();
-    let _ = ec_image::decode(&data);
-    assert!(start.elapsed().as_secs() < 1, "{:?}", start.elapsed());
+    // The frame declares 4x4, so the decoder may hold 16 indices, a 4-colour
+    // palette and a 4x4 canvas -- kilobytes at most. Unbounded expansion is
+    // hundreds of megabytes. Bytes, not a clock: the same clock-versus-bytes
+    // split as the budget tests above, and here the signal is much larger
+    // than any host's speed difference.
+    let (_out, allocated) = counting_allocations(|| ec_image::decode(&data));
+    assert!(
+        allocated <= 1 << 20,
+        "a 4x4 GIF frame allocated {allocated} bytes; the LZW stream expanded past its frame"
+    );
 }
 
 fn crc32(data: &[u8]) -> u32 {
