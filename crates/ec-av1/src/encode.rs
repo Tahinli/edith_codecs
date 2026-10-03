@@ -17061,6 +17061,240 @@ mod tests {
         );
     }
 
+    /// lane-av1paletteuv: the census for `crate::tile::palette_uv_side`, the
+    /// `(side / 2).max(4)` named in `lanes/av1subsizesweep.report.md` as a
+    /// "4:2:2/4:4:0 palette map mis-sized" site.
+    ///
+    /// **What the site computes.** libaom reads the plane-1 colour-index map
+    /// at `av1_get_block_dimensions(bsize, 1, xd)` (blockd.h:1512): per axis,
+    /// `plane_block = block >> ss`, then `+2` when that came out under 4
+    /// (the chroma sub-8x8 bump, blockd.h:1533-1541). For a SQUARE 4:2:0
+    /// block both axes carry `ss = 1`, so both come to `side / 2` with the
+    /// bump -- which is exactly `(side / 2).max(4)`. The value is right.
+    ///
+    /// **What it is not.** At 4:2:2 the correct map is `(side >> 1) x side`
+    /// and at 4:4:4 it is `side x side` -- neither is square. So the value is
+    /// 4:2:0-only BY CONSTRUCTION, and this gate is what keeps it that way:
+    /// if an encoder that can emit another chroma shape ever appears, this
+    /// reds rather than the writer silently writing a half-height map.
+    ///
+    /// The three arms are (1) the value matches libaom's own per-axis
+    /// formula at 4:2:0 over every side the palette syntax admits, (2) no
+    /// reachable writer path can be handed another chroma shape, (3) a real
+    /// encode really fires chroma palettes, so arm 1 is not arithmetic on a
+    /// function nothing calls (class `gate-blind-to-feature`).
+    #[test]
+    fn the_chroma_palette_map_side_is_the_420_plane_block_and_nothing_else_reaches_it() {
+        const NAME: &str =
+            "the_chroma_palette_map_side_is_the_420_plane_block_and_nothing_else_reaches_it";
+        let encode_src = include_str!("encode.rs");
+        let encoder_src = include_str!("encoder.rs");
+
+        // ---- arm 1: the value, against libaom's formula --------------------
+        // blockd.h:1530-1541, transcribed. A plane_block under 4 gains 2.
+        let libaom_plane1 = |block: usize, ss: usize| {
+            let plane_block = block >> ss;
+            plane_block + 2 * usize::from(plane_block < 4)
+        };
+        let mut admitted = 0usize;
+        for side in 4usize..=64 {
+            // `palette_bsize_ctx`'s own domain: both sides <= 64 and
+            // bw * bh >= 64 (`av1_allow_palette`). A side outside it codes no
+            // palette syntax at all, so its map size is unobservable.
+            if side > 64 || side * side < 64 {
+                continue;
+            }
+            admitted += 1;
+            let want_x = libaom_plane1(side, 1);
+            let want_y = libaom_plane1(side, 1);
+            assert_eq!(want_x, want_y, "{NAME}: 4:2:0 arms the libaom formula");
+            assert_eq!(
+                crate::tile::palette_uv_side(side),
+                want_x,
+                "{NAME}: side {side} -- palette_uv_side disagrees with libaom's plane-1 block"
+            );
+        }
+        assert_eq!(
+            admitted, 57,
+            "{NAME}: the sweep admitted {admitted} sides, expected 57 (every integer 8..=64 -- \
+             `palette_bsize_ctx`'s whole square domain, not just the powers of two a real block \
+             takes) -- it must cover that domain, or it is not measuring it"
+        );
+
+        // Why `.max(4)` cannot fire, stated as a measurement rather than left
+        // for a reader to assume: `palette_bsize_ctx` refuses `bw * bh < 64`,
+        // so the smallest admitted square side is 8, whose halved plane block
+        // is already 4. The floor's only reachable input would be a side
+        // under 8, and libaom's own chroma sub-8x8 bump (+2) is likewise
+        // unreachable there. Dropping the floor is therefore NOT a witness
+        // mutation for this gate -- the mutation that bites is dropping the
+        // halving (measured, see the lane report) -- and this arm says why,
+        // so nobody later mistakes a green floor mutation for coverage.
+        for side in [8usize, 16, 32, 64] {
+            assert!(
+                side / 2 >= 4 && libaom_plane1(side, 1) == side / 2,
+                "{NAME}: side {side} -- the admitted domain moved, so `.max(4)` may now be \
+                 reachable and the floor needs a witness mutation of its own"
+            );
+        }
+
+        // The claim the gate rests on, stated as arithmetic so a future
+        // reader cannot mistake "correct" for "correct at any shape": at
+        // these shapes the per-axis answer is NOT this square.
+        for side in [8usize, 16, 32, 64] {
+            let square = crate::tile::palette_uv_side(side);
+            let want_422 = (libaom_plane1(side, 1), libaom_plane1(side, 0));
+            let want_444 = (libaom_plane1(side, 0), libaom_plane1(side, 0));
+            assert_ne!(
+                (square, square),
+                want_422,
+                "{NAME}: side {side} -- a square map IS the 4:2:2 map, so this gate's premise \
+                 (the site is 4:2:0-only) is wrong"
+            );
+            assert_ne!(
+                (square, square),
+                want_444,
+                "{NAME}: side {side} -- a square map IS the 4:4:4 map"
+            );
+        }
+
+        // ---- arm 2: nothing can hand the writer another shape --------------
+        // (a) Every non-test `ColorConfig` literal in the encoder names
+        // subsampling (1, 1). These are the two constructors the whole
+        // encoder reaches its colour config through; the test-module copies
+        // are excluded by scanning only the pre-`mod tests` prefix.
+        fn head(src: &str) -> &str {
+            let cut = src.find("\nmod tests").unwrap_or(src.len());
+            &src[..cut]
+        }
+        for (label, src) in [
+            ("encode.rs", head(encode_src)),
+            ("encoder.rs", head(encoder_src)),
+        ] {
+            // Every `subsampling_*` the non-test encoder names, counted: a
+            // `(0, y)` or `(1, 0)` here is a chroma shape
+            // `palette_uv_side` cannot express. The one value allowed is 1
+            // -- 4:2:0, the shape the square map is the right size for.
+            let mut shapes: std::collections::BTreeSet<(usize, usize)> = Default::default();
+            for (sx, _) in src.match_indices("subsampling_x:") {
+                let rest = &src[sx + "subsampling_x:".len()..];
+                let digits = |s: &str| {
+                    s.trim_start()
+                        .split(|c: char| !c.is_ascii_digit())
+                        .next()
+                        .and_then(|d| d.parse::<usize>().ok())
+                        .unwrap_or(usize::MAX)
+                };
+                let x = digits(rest);
+                let y = rest
+                    .find("subsampling_y:")
+                    .map(|y| digits(&rest[y + "subsampling_y:".len()..]))
+                    .unwrap_or(usize::MAX);
+                shapes.insert((x, y));
+            }
+            assert_eq!(
+                shapes,
+                std::collections::BTreeSet::from([(1usize, 1usize)]),
+                "{NAME}: the non-test {label} names chroma shapes {shapes:?} -- any shape other \
+                 than 4:2:0 is one palette_uv_side's square map cannot express (at 4:2:2 the \
+                 map is (side >> 1) x side, at 4:4:4 side x side)"
+            );
+        }
+
+        // (b) `key_frame_headers_colour` is the only PUBLIC entry that takes
+        // a caller-chosen ColorConfig -- it is how a 4:2:2 or 4:4:4 header is
+        // written at all -- so it is the one door a non-4:2:0 shape comes
+        // through. It builds HEADERS only: no tile writer is reachable from
+        // its body. (Its own doc says so; this measures it.)
+        let headers_at = encode_src
+            .find("pub fn key_frame_headers_colour(")
+            .expect("key_frame_headers_colour is gone -- re-derive this arm's scan anchor");
+        let body_end = encode_src[headers_at..]
+            .find("\npub fn ")
+            .map(|n| headers_at + n)
+            .unwrap_or(encode_src.len());
+        let headers_body = &encode_src[headers_at..body_end];
+        for writer in [
+            "write_palette_syntax",
+            "write_color_index_map",
+            "encode_key_frame_inner",
+            "tile::",
+        ] {
+            assert!(
+                !headers_body.contains(writer),
+                "{NAME}: key_frame_headers_colour now reaches {writer} -- a caller can pair a \
+                 4:2:2/4:4:4 header with a tile, and palette_uv_side writes a square map into \
+                 the per-axis slot libaom reads as (side >> ss_x) x (side >> ss_y)"
+            );
+        }
+
+        // (c) Every tile-producing entry point goes through
+        // `encode_key_frame_inner`, whose five non-test call sites all pass
+        // one of the two 4:2:0 constructors above. Counted over the
+        // non-test source only, so a new road is a red rather than a line
+        // somebody has to notice.
+        let inner_calls = head(encode_src).matches("encode_key_frame_inner(").count()
+            + head(encoder_src).matches("encode_key_frame_inner(").count()
+            - 1; // the definition itself
+        assert_eq!(
+            inner_calls, 5,
+            "{NAME}: encode_key_frame_inner has {inner_calls} non-test call sites, expected 5 -- \
+             a new one must pass a colour config this gate has read"
+        );
+
+        // (d) The picture itself is 4:2:0-shaped at the door, so a 4:2:2 or
+        // 4:4:4 frame cannot even be handed to an encode entry. Measured by
+        // calling `check`, not by reading it.
+        for (label, divisor) in [("4:2:2", 2usize), ("4:4:4", 1)] {
+            let p = Picture {
+                width: 64,
+                height: 64,
+                y: vec![0; 64 * 64],
+                u: vec![0; 64 * 64 / divisor],
+                v: vec![0; 64 * 64 / divisor],
+            };
+            assert!(
+                p.check().is_err(),
+                "{NAME}: Picture::check accepted a {label}-shaped picture -- if the encoder can be \
+                 fed one, palette_uv_side's square map is wrong by construction"
+            );
+        }
+
+        // ---- arm 3: the site really fires ---------------------------------
+        // Without this, arms 1 and 2 are arithmetic and a source scan over a
+        // function no encode reaches (class `gate-blind-to-feature`).
+        //
+        // The fire count is the DECODER's thread-local one, not the writer's
+        // process-global `tile::take_palette_uv_hits`: that one is a
+        // swap-to-zero, so a parallel sibling test's encode steals this test's
+        // count (measured: it read `[0; 9]` under `cargo test palette`, and
+        // passed alone). Round-tripping the stream instead also proves the
+        // stronger half -- the reader took the map at the extent the WRITER
+        // sized, which is what makes the square value right rather than merely
+        // unchallenged.
+        let _knobs = crate::speed::knob_read();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
+        let before = crate::decode::palette_uv_hits();
+        let encoded = encode_key_frame_with_ctx(&screen_card(192, 96), 100, 0.5, fctx).unwrap();
+        let decoded = crate::stream::decode_stream(&encoded.stream)
+            .unwrap_or_else(|e| panic!("{NAME}: our own stream refused: {e}"));
+        let fired = crate::decode::palette_uv_hits() - before;
+        assert!(
+            fired > 0,
+            "{NAME}: no block took a chroma palette -- palette_uv_side was never exercised, so \
+             this gate measures nothing"
+        );
+        assert_eq!(
+            decoded[0].u, encoded.reconstruction.u,
+            "{NAME}: the decoder did not read the chroma map at the extent the writer sized it"
+        );
+        assert_eq!(
+            decoded[0].v, encoded.reconstruction.v,
+            "{NAME}: the decoder did not read the chroma map at the extent the writer sized it"
+        );
+        eprintln!("{NAME}: {fired} chroma palette block(s) round-tripped");
+    }
+
     /// The lane's keep-rule measurement: the gate's own screen capture, one
     /// KEY FRAME, coded with and without `allow_intrabc` at four quantizers.
     /// Setting the bit forces deblocking, CDEF and loop restoration off for
