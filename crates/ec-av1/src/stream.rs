@@ -3208,6 +3208,169 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-av1floorshift: the two FRAME chroma plane allocators
+    /// (`decode_key_frame_tile_with_cdfs`, `decode_inter_tile`) size U and V as
+    /// `(width >> ss_x) x (height >> ss_y)`. `lanes/av1subsizesweep.report.md`
+    /// named them "floor-`>>` chroma plane allocators -- shape assumption at
+    /// frame edges; not probed" and left them open. This is the probe.
+    ///
+    /// **The verdict is ALREADY CORRECT, and it is structural, not
+    /// corpus-luck.** `width`/`height` are `block_grid(mi_cols, mi_rows) *
+    /// BLOCK` (`BLOCK == 32`) and the allocator is handed those, not the frame's
+    /// own `true_width`/`true_height`: both axes are multiples of 32, and
+    /// `ss_x`/`ss_y` are the sequence header's single-bit subsampling fields,
+    /// so `ss <= 1` on every stream that exists. `32k >> ss == round_ss(32k, ss)`
+    /// for every `k` and every `ss <= 1` -- the `>>` can never floor one sample
+    /// short of libaom's own chroma crop, at a frame edge or anywhere else. The
+    /// static half of the gate below proves that exhaustively over every
+    /// `mi_cols`/`mi_rows` this decoder admits.
+    ///
+    /// The corpus half keeps the instrument honest: it decodes one frame per
+    /// selectable subsampling cell and asserts the allocators were REACHED
+    /// (`frame_chroma_alloc_calls` moved), so a green run cannot be the census
+    /// having been wired to nothing.
+    ///
+    /// Witnesses, all byte-pinned (`size`, `fnv1a64`), chosen to cover all
+    /// three selectable cells and both allocators:
+    ///
+    /// | file | cell | frame | covers |
+    /// |---|---|---|---|
+    /// | `420_odd65x65_key.obu` | 4:2:0, **odd** 65x65 | key | key allocator, the odd-dimension cell where a floor WOULD show |
+    /// | `422_key_64x64.obu` | 4:2:2 (1,0) | key | key allocator, half-width/full-height |
+    /// | `444_intrabc_rect4_witness.obu` | 4:4:4 (0,0) | key | key allocator, the `ss == 0` cell where `>> ss` is the identity |
+    ///
+    /// 4:4:0 (`0,1`) is excluded and cannot be added: libaom's
+    /// `av1_read_color_config` asserts `subsampling_y == 0` when
+    /// `subsampling_x == 0`, and no of 256 header bytes reads back `(0,1)` --
+    /// the reader census at `the_reader_never_produces_440` names it.
+    #[test]
+    fn the_frame_chroma_planes_are_allocated_on_the_per_axis_floor_that_never_rounds() {
+        const NAME: &str =
+            "the_frame_chroma_planes_are_allocated_on_the_per_axis_floor_that_never_rounds";
+        let _gate_lock = lock_gate_counters();
+        for (file, bytes, fp, cell, ss) in [
+            (
+                "420_odd65x65_key.obu",
+                2305usize,
+                0xf55645c4b139e8f7u64,
+                "4:2:0",
+                (1usize, 1usize),
+            ),
+            (
+                "422_key_64x64.obu",
+                755,
+                0x87fc569cf53bcbc6,
+                "4:2:2",
+                (1, 0),
+            ),
+            (
+                "444_intrabc_rect4_witness.obu",
+                1016,
+                0x27c2fad540472994,
+                "4:4:4",
+                (0, 0),
+            ),
+        ] {
+            let data = std::fs::read(crate_pin(file))
+                .unwrap_or_else(|e| panic!("{NAME}: the committed pin {file} is missing ({e})"));
+            assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
+            assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
+            let calls_before = crate::decode::frame_chroma_alloc_calls();
+            let short_before = crate::decode::frame_chroma_alloc_short_samples();
+            let crop_before = crate::decode::frame_chroma_alloc_crop_shapes();
+            let frames = decode_stream(&data)
+                .unwrap_or_else(|e| panic!("{NAME}: {file} ({cell}) refused: {e}"));
+            let calls = crate::decode::frame_chroma_alloc_calls() - calls_before;
+            assert!(
+                calls >= frames.len(),
+                "{NAME}: {file} ({cell}) decoded {} frames but the chroma plane allocator ran \
+                 {calls} times -- the instrument is not on the path this gate claims to cover",
+                frames.len()
+            );
+            // The shape the allocator owes the tile, and the shape the output
+            // crop owes the caller: libaom's chroma CROP of the frame's own
+            // dimensions (`av1_round_shift`), which is what
+            // `decode_key_frame_tile_with_cdfs`'s `Picture` crop uses. At the
+            // odd 65x65 4:2:0 cell this is 33x33 -- 1089 samples, NOT the
+            // floor 32x32 an `>>` short of the true extent would have left.
+            for (i, f) in frames.iter().enumerate() {
+                let (cw, ch) = (
+                    crate::decode::round_ss(f.width, ss.0),
+                    crate::decode::round_ss(f.height, ss.1),
+                );
+                assert_eq!(
+                    (f.u.len(), f.v.len()),
+                    (cw * ch, cw * ch),
+                    "{NAME}: {file} ({cell}) frame {i} is {}x{} and its chroma planes are {} / {} \
+                     samples; {cell} is a {cw}x{ch} = {} crop",
+                    f.width,
+                    f.height,
+                    f.u.len(),
+                    f.v.len(),
+                    cw * ch
+                );
+            }
+            let short = crate::decode::frame_chroma_alloc_short_samples() - short_before;
+            assert_eq!(
+                short, 0,
+                "{NAME}: {file} ({cell}) allocated {short} chroma samples SHORT of the `round_ss` \
+                 extent the tile's chroma walks may address -- the frame chroma planes are sized \
+                 by a FLOOR `>> ss` that does not round"
+            );
+            let crop = crate::decode::frame_chroma_alloc_crop_shapes() - crop_before;
+            assert_eq!(
+                crop, 0,
+                "{NAME}: {file} ({cell}) reached a frame shape on which `>> ss` and `round_ss` \
+                 disagree ({crop} frames) -- the allocators are handed a MULTIPLE OF 32 \
+                 (block_grid * BLOCK) and `ss <= 1`, so this can only mean the allocator's own \
+                 argument changed, and the shortfall assertion above is then vacuous on this file"
+            );
+        }
+    }
+
+    /// lane-av1floorshift: the STATIC half of the same claim, and the part that
+    /// does not need a corpus. The frame chroma allocators' shift argument is
+    /// `block_grid(mi_cols, mi_rows) * BLOCK` with `BLOCK == 32`, so for every
+    /// `mi_cols`/`mi_rows` this decoder can admit and every subsampling the
+    /// header can carry (`ss in {0, 1}` per axis), `>> ss` and `round_ss` are
+    /// the same number. Exhaustively checked here over a range wider than any
+    /// frame a header can declare; the two counters above are zero for a
+    /// reason, and this is the reason.
+    #[test]
+    fn the_frame_chroma_alloc_shift_argument_cannot_floor_below_round_ss() {
+        const NAME: &str = "the_frame_chroma_alloc_shift_argument_cannot_floor_below_round_ss";
+        const BLOCK: usize = 32;
+        // `block_grid(mi) = mi.div_ceil(BLOCK_MI)` with `BLOCK_MI == 8`
+        // (`tile.rs`), so the allocator's width is `(mi.div_ceil(8)) * 32`.
+        for mi in 1..=512usize {
+            let coded = mi.div_ceil(8) * BLOCK;
+            for ss in 0..=1usize {
+                assert_eq!(
+                    coded >> ss,
+                    crate::decode::round_ss(coded, ss),
+                    "{NAME}: coded {coded} (mi {mi}) at ss {ss}: the floor and the crop differ -- \
+                     the frame chroma plane would be allocated short"
+                );
+                // The TRUE extent is `mi * 4`; it is what the allocator
+                // derives `true_width` from and what every chroma walk is
+                // clamped against, so it earns the same check.
+                let truth = mi * 4;
+                assert_eq!(
+                    truth >> ss,
+                    crate::decode::round_ss(truth, ss),
+                    "{NAME}: true {truth} (mi {mi}) at ss {ss}: the floor and the crop differ"
+                );
+            }
+        }
+        // And the 4:4:0 cell libaom refuses, spelled out rather than left as
+        // an assumption: at `ss (0,1)` the shift is exact too, so the site
+        // would be correct even if the cell were ever admitted.
+        for mi in 1..=64usize {
+            assert_eq!(mi * 4 >> 1, crate::decode::round_ss(mi * 4, 1));
+            assert_eq!(mi * 4, crate::decode::round_ss(mi * 4, 0));
+        }
+    }
+
     /// lane-av1422tailskip: the WITNESS cell for the 4:2:2 intra-in-inter
     /// PALETTE chroma per-unit window, and its byte pin.
     ///
