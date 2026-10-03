@@ -2936,6 +2936,16 @@ pub(crate) mod tests {
             .join("fixtures")
             .join("440_request_is_422.obu");
         let pinned = read_pin(&path, 2014, 0x98a1378df976253d, NAME);
+        // The refusal this gate PROVES, quoted whole -- the anchor the PROVEN
+        // row in `refusal_inventory.rs` is checked against inside this body's
+        // own bounds. The assertion below used to match only the libaom
+        // citation *inside* the string, so a reworded guard kept passing for
+        // as long as it kept citing `decodeframe.c:1456`: the half that names
+        // OUR shapes (4x8 / 8x16 / 16x4, and 8x4 at 4:4:0) was never pinned.
+        const REFUSAL: &str = "a block size 4x8, 8x16 or 16x4 (or 8x4 at 4:4:0) has no chroma \
+                               plane block at this frame's subsampling mode (libaom: \"Block \
+                               size %dx%d invalid with this subsampling mode\", \
+                               av1/decoder/decodeframe.c:1456, refusing by the same rule)";
         let err = decode_stream(&pinned)
             .err()
             .unwrap_or_else(|| panic!("{NAME}: the pin must be REFUSED, not decoded"));
@@ -2944,6 +2954,11 @@ pub(crate) mod tests {
             msg.contains("invalid with this subsampling mode"),
             "{NAME}: the refusal must name the rule it refuses by (libaom's own wording), got: \
              {msg}"
+        );
+        assert!(
+            msg.contains(REFUSAL),
+            "{NAME}: the refusal must be this decoder's OWN string, whole -- the guard's wording \
+             drifted, so the PROVEN row no longer names what fires, got: {msg}"
         );
         // Positive control: a real 4:2:2 stream must still decode, so the gate
         // cannot pass by refusing everything.
