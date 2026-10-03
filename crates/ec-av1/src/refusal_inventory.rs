@@ -62,6 +62,12 @@ const REFUSALS: &[&str] = &[
     "a 128x128 superblock partition value outside the 8-symbol alphabet",
     "an inter var-tx tree with a leaf transform larger than 64x64",
     "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
+    // lane-av1unwritten + lane-av1subsizesweep: the BLOCK_INVALID subsize
+    // refusal that mirrors libaom's own (decodeframe.c:1456). The source
+    // string carries escaped quotes around the libaom citation and this
+    // table is matched against the scanner's collected form, so the quotes
+    // stay escaped here the way the scanner keeps them.
+    "a block size 4x8, 8x16 or 16x4 (or 8x4 at 4:4:0) has no chroma plane block at this frame's subsampling mode (libaom: \\\"Block size %dx%d invalid with this subsampling mode\\\", av1/decoder/decodeframe.c:1456, refusing by the same rule)",
     // lane-t900 r23: palette RECONSTRUCTION now covers the key-frame paths
     // (earlier lanes), the intra-in-inter square/rect paths (r22) and the
     // 8x8 LEAF inside an inter frame (this round, gate
