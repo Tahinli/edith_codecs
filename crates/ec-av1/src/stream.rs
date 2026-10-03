@@ -3136,6 +3136,78 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1muchroma: the `chroma_side * chroma_side` mu-chroma site
+    /// census, over the whole committed 4:2:2 corpus, as a per-site
+    /// REACHABILITY measurement with a non-vacuity arm.
+    ///
+    /// `lanes/av1subsizesweep.report.md` named "mu-chroma sites using
+    /// `chroma_side * chroma_side`" as unprobed residue. This lane's sweep
+    /// (env-gated probe at each of the 12 sites, run over every pinned 4:2:2
+    /// gate) measured them:
+    ///
+    /// - sites 4, 7, 10 are guarded `ss_x == 0 && ss_y == 0`, i.e. 4:4:4
+    ///   ONLY -- structurally unreachable at 4:2:2, not merely unwitnessed.
+    /// - sites 2, 8 (`side > 64` mu-chunk walks) were not reached by any
+    ///   committed 4:2:2 fixture; their single-reference twin, site 5, is
+    ///   (side 128, plane 64x128), and its square allocation is the ENCLOSING
+    ///   square, so it is 2x oversized, never short.
+    /// - sites 1, 3, 5, 6, 9, 11, 12 ARE reached. For 3/5/6/9/11/12
+    ///   `chroma_side` is `max(side >> ss_x, side >> ss_y)` (decode.rs), the
+    ///   ENCLOSING square of the plane rect, so at 4:2:2 the square is 2x
+    ///   the per-axis extent: oversized, never short.
+    /// - site 1 alone still used `side >> ss_x` and was therefore sized at
+    ///   HALF the plane block at 4:2:2. Fixed per-axis; this gate pins it.
+    ///
+    /// Non-vacuity: [`crate::decode::skip_arm_chroma_plane_block_hits`]
+    /// fires only where the per-axis and square forms differ, so a green run
+    /// that never reached the site would be vacuous and this asserts > 0.
+    #[test]
+    fn the_422_skip_arm_chroma_grid_is_sized_per_axis_not_square() {
+        const NAME: &str = "the_422_skip_arm_chroma_grid_is_sized_per_axis_not_square";
+        const FILE: &str = "s422_322x240.obu";
+        const BYTES: usize = 21096;
+        const FP: u64 = 0x9a96dda2a19d47a6;
+        const W: usize = 322;
+        const H: usize = 240;
+        const FRAMES: usize = 16;
+        let _gate_lock = lock_gate_counters();
+        let data = std::fs::read(crate_pin(FILE)).unwrap_or_else(|e| {
+            panic!("{NAME}: the committed pin {FILE} is missing ({e}) -- a failure, not a skip")
+        });
+        assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FP, "{NAME}: {FILE} bytes drifted");
+        let rect_before = crate::decode::skip_arm_chroma_rect_shapes();
+        let short_before = crate::decode::skip_arm_chroma_short_samples();
+        let ours = decode_stream(&data)
+            .unwrap_or_else(|e| panic!("{NAME}: decode_stream refused a real 4:2:2 stream: {e}"));
+        assert_eq!(ours.len(), FRAMES, "{NAME}: decoded frame count");
+        for (i, f) in ours.iter().enumerate() {
+            assert_eq!((f.width, f.height), (W, H), "{NAME}: frame {i} dimensions");
+            assert_eq!(
+                (f.u.len(), f.v.len()),
+                (W.div_ceil(2) * H, W.div_ceil(2) * H),
+                "{NAME}: frame {i} chroma planes are {}/{} samples -- 4:2:2 is HALF WIDTH and \
+                 FULL HEIGHT; a quarter-height plane means the decode kept a 4:2:0 allocation",
+                f.u.len(),
+                f.v.len()
+            );
+        }
+        let rect_after = crate::decode::skip_arm_chroma_rect_shapes();
+        assert!(
+            rect_after > rect_before,
+            "{NAME}: no skipped block decoded at a rect chroma shape ({rect_before} -> \
+             {rect_after}) -- this gate is then VACUOUS: per-axis and square sizing are the \
+             same number at 4:2:0 and 4:4:4, so it proves nothing about the site it claims"
+        );
+        let short_after = crate::decode::skip_arm_chroma_short_samples();
+        assert_eq!(
+            short_after, short_before,
+            "{NAME}: decode_block's SKIP arm chroma grids fell {short_after} samples SHORT of \
+             their own plane block -- the square `side >> ss_x` form this lane removed allocates \
+             exactly half the plane block at 4:2:2 (ss (1,0))"
+        );
+    }
+
     /// lane-av1422tailskip: the WITNESS cell for the 4:2:2 intra-in-inter
     /// PALETTE chroma per-unit window, and its byte pin.
     ///

@@ -2125,6 +2125,43 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+// lane-av1muchroma site 1: the total number of samples by which
+// `decode_block`'s SKIP arm chroma bookkeeping grids fell SHORT of their own
+// plane block, summed over every skipped block decoded. It reads the
+// allocation's real length, so it measures the shape rather than proxying a
+// condition: the square form this lane removed is `side >> ss_x` squared,
+// which at 4:2:2 (ss (1,0)) is exactly HALF the `side >> ss_x` x `side >> ss_y`
+// plane block, and restoring it drives this counter strictly positive on
+// every 4:2:2 skip block. Zero on 4:2:0 and 4:4:4, where the two forms are
+// the same number.
+thread_local! {
+    static SKIP_ARM_CHROMA_SHORT_SAMPLES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SKIP_ARM_CHROMA_SHORT_SAMPLES`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn skip_arm_chroma_short_samples() -> usize {
+    SKIP_ARM_CHROMA_SHORT_SAMPLES.with(|c| c.get())
+}
+
+// Number of times `decode_block`'s SKIP arm ran at a shape where the
+// per-axis and square chroma allocations DIFFER -- i.e. at 4:2:2, where
+// the square is half the plane block. Zero on 4:2:0 and 4:4:4, where the
+// two forms are the same number, so a gate that wants to prove it actually
+// exercised the shape under test (rather than passing vacuously) asserts
+// this moved.
+thread_local! {
+    static SKIP_ARM_CHROMA_RECT_SHAPES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SKIP_ARM_CHROMA_RECT_SHAPES`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn skip_arm_chroma_rect_shapes() -> usize {
+    SKIP_ARM_CHROMA_RECT_SHAPES.with(|c| c.get())
+}
+
 /// Current value of [`CHROMA422_SQUARE_HITS`].
 // lane-av1-422b: `pub` so `examples/decode_probe.rs` can census it the way
 // it does every other capability counter.
@@ -23545,8 +23582,36 @@ fn decode_block(
             }
         }
         let luma_grid = vec![0i32; side * side];
-        let u_grid = vec![0i32; chroma_side * chroma_side];
-        let v_grid = vec![0i32; chroma_side * chroma_side];
+        // lane-av1muchroma site 1: the skip arm's chroma grids are the
+        // block's PLANE BLOCK per axis (`chroma_side` x `chroma_height`),
+        // not a square. `chroma_side` here is `side >> ss_x` -- the key-frame
+        // path's own binding, which at 4:2:2 (ss (1,0)) is `side / 2`, so the
+        // old `chroma_side * chroma_side` allocated HALF the block's chroma:
+        // a 64x64 block's plane block is 32x64 = 2048 samples and the square
+        // held 1024, a 2x under-read for any per-row consumer. No current
+        // consumer indexes it -- `record_rect` -> `record_mi_rect` reduces
+        // each plane through `neighbour_state`, which sums the slice and
+        // reads `grid[0]` only, and every sample is zero on a skip block --
+        // so the shape is latent, not live (mutation-verified: sizing this
+        // per-axis leaves every pinned 4:2:2 gate green, shrinking sites
+        // 11/12 to per-axis reds two). Fixed here so the allocation cannot
+        // go short if a per-row consumer ever lands. At 4:2:0 the two are
+        // the same number and at 4:4:4 `chroma_side == chroma_height ==
+        // side`, so only 4:2:2 changes.
+        let u_grid = vec![0i32; chroma_side * chroma_height];
+        let v_grid = vec![0i32; chroma_side * chroma_height];
+        // The measured arm, not a proxy: how many samples this block's
+        // chroma bookkeeping grid is SHORT of its own plane block. The
+        // square form this lane removed is `chroma_side * chroma_side`,
+        // which at 4:2:2 is half the plane block; restoring it makes this
+        // non-zero on every 4:2:2 skip block, and the witness gate asserts
+        // the total stayed 0.
+        let plane_block = chroma_side * chroma_height;
+        let short = plane_block.saturating_sub(u_grid.len());
+        hit_do!(SKIP_ARM_CHROMA_SHORT_SAMPLES.with(|c| c.set(c.get() + short)));
+        if chroma_side != chroma_height {
+            hit!(SKIP_ARM_CHROMA_RECT_SHAPES);
+        }
         neighbours.record(
             at,
             side,
