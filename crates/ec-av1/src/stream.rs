@@ -11306,6 +11306,200 @@ pub(crate) mod tests {
             );
         }
     }
+
+    /// lane-av1p1pin: the permanent pin for the 4:4:4 superblock-128
+    /// 128-root rect witness -- recipe P1 of `lanes/av1witness2recheck.report.md`.
+    ///
+    /// Provenance. Encoder: `~/.cache/aom-oracle/build/aomenc --codec=av1
+    /// --obu -o s1d.obu --passes=1 --threads=1 bands444.y4m --limit=3
+    /// --kf-max-dist=1 --cpu-used=2 --end-usage=q --cq-level=20 --sb-size=128
+    /// --enable-rect-partitions=1 --enable-1to4-partitions=1
+    /// --min-partition-size=4`, over the ffmpeg 8.1.2 lavfi source
+    /// `nullsrc=s=320x256:rate=30:d=1,geq=lum='mod(floor((Y+T*160)/8)*67,255)':
+    /// cb='128+20*sin(Y/17+T)':cr='128+20*sin(X/23+T*2)' -pix_fmt yuv444p`
+    /// (`bands444.y4m`, sha256
+    /// `fa6218399cce8dd9eaadb6e24642d31cb2d2bde505b39a8df237938492c642ee`).
+    /// Pinned bytes: `crates/ec-av1/fixtures/444_sb128rect_chroma_tile_witness.obu`,
+    /// 595 bytes, sha256
+    /// `68773f2c6e01a2d211bf0213479accb4c2c360132c0e1bc3b326eab7861925b1`
+    /// (FNV-1a `0xd4fa_ac7b_dccc_520b`). Rebuilt byte-for-byte from the recipe
+    /// on `9a535ccb` -- the recipe did not drift. 3 frames, 320x256, yuv444p.
+    /// This is NOT `fixtures/444_sb128rect_lr_witness.obu` (794 B, sha256
+    /// `27825e14...`), the other in-tree 4:4:4 sb128 stream.
+    ///
+    /// What it guards. At the report's old base `fe3e8418` this stream
+    /// panicked -- rc=101, `decode.rs:17631: assertion failed: lossless_frame
+    /// || (chroma_w / chroma_tx, chroma_h / chroma_tx) == (nch_x, nch_y)` --
+    /// because the 128-rect chroma unit walk was hardcoded to the 4:2:0 mu-chunk
+    /// span, so a 128-root HORZ/VERT block at 4:4:4 coded half its chroma units.
+    /// Closed by `349b3918` (the per-axis invariant now at `decode.rs:24515`);
+    /// byte-exactness by `fa70a68c`.
+    ///
+    /// Two load-bearing arms, both proven to bite (lanes/av1p1pin.report.md):
+    /// (1) the census deltas -- 6 gathered edge-VERT 128-roots, 6
+    /// `PARTITION_VERT` 128 roots, 6 key-frame intra 128-axis blocks, 8 coded
+    /// `32x32` VERT strips -- so the gate fails, rather than passes, if a
+    /// future stream stops coding the shape (class `gate-blind-to-feature`);
+    /// (2) every sample of every frame against ffmpeg `yuv444p` rawvideo, with
+    /// the plane-length guard that stops a short plane from zip-truncating the
+    /// compare. Oracle arm is aomdec `--rawvideo` as well; neither is a shim.
+    #[test]
+    fn a_444_sb128_rect_chroma_tile_witness_is_byte_exact() {
+        const NAME: &str = "a_444_sb128_rect_chroma_tile_witness_is_byte_exact";
+        const FIXTURE_LEN: usize = 595;
+        const FIXTURE_FNV: u64 = 0xd4fa_ac7b_dccc_520b;
+        const W: usize = 320;
+        const H: usize = 256;
+        const FRAMES: usize = 3;
+        /// The guarded path: 128-root rect chroma tiling at 4:4:4.
+        const EDGE_VERT: usize = 6;
+        const PART128_VERT: usize = 6;
+        const INTRA128_VERT: usize = 6;
+        const RECT4_32_VERT: usize = 8;
+        const RECT4_32_CODED: usize = 8;
+        let obu = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/444_sb128rect_chroma_tile_witness.obu");
+        let stream = read_pin(&obu, FIXTURE_LEN, FIXTURE_FNV, NAME);
+
+        let _guard = lock_gate_counters();
+        let rect_before = sb128_rect_counters();
+        let part_before = part128_census();
+        let r432_before = rect4_32_counters();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned stream no longer decodes cleanly: {e}"));
+        let rect_after = sb128_rect_counters();
+        let part_after = part128_census();
+        let r432_after = rect4_32_counters();
+
+        assert_eq!(frames.len(), FRAMES, "{NAME}: frame count");
+        for f in &frames {
+            assert_eq!(
+                (f.width, f.height),
+                (W, H),
+                "{NAME}: dimensions -- a resized frame would make the oracle \
+                 slices below compare the wrong samples"
+            );
+        }
+
+        // Non-vacuity: the guarded 128-root VERT path really fired.
+        assert_eq!(
+            rect_after.1 - rect_before.1,
+            EDGE_VERT,
+            "{NAME}: gathered edge-VERT 128 roots moved (expected {EDGE_VERT}) -- this \
+             stream is the witness for the 128-rect 4:4:4 chroma tiling, so a \
+             different count means the shape is gone or the counter moved (class \
+             gate-blind-to-feature)"
+        );
+        assert_eq!(
+            part_after.3 - part_before.3,
+            PART128_VERT,
+            "{NAME}: 128-root PARTITION_VERT blocks moved (expected {PART128_VERT})"
+        );
+        assert_eq!(
+            part_after.6 - part_before.6,
+            INTRA128_VERT,
+            "{NAME}: key-frame intra 128-axis blocks moved (expected {INTRA128_VERT})"
+        );
+        assert_eq!(
+            part_after.2 - part_before.2,
+            0,
+            "{NAME}: 128-root PARTITION_HORZ fired on this VERT witness"
+        );
+        assert_eq!(
+            rect_after.0 - rect_before.0,
+            0,
+            "{NAME}: gathered edge-HORZ 128 roots fired on this VERT witness"
+        );
+        assert_eq!(
+            (r432_after.1 - r432_before.1, r432_after.2 - r432_before.2),
+            (RECT4_32_VERT, RECT4_32_CODED),
+            "{NAME}: the 32x32 VERT strip counts moved -- the coded half of the \
+             chroma tiling is what the old assert under-counted"
+        );
+
+        // Oracle 1: aomdec rawvideo.
+        if aomdec_available(NAME) {
+            let dir = std::env::temp_dir().join(format!("ec-av1-p1pin-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let raw = dir.join("aomdec.raw");
+            let out = Command::new(aomdec_path())
+                .args(["--codec=av1", "--rawvideo", "-o"])
+                .arg(&raw)
+                .arg(&obu)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("aomdec failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: the oracle aomdec refused the stream: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let ref_raw = std::fs::read(&raw).expect("aomdec rawvideo output");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(ref_raw.len(), W * H * 3 * FRAMES, "{NAME}: aomdec raw size");
+            for (i, f) in frames.iter().enumerate() {
+                let base = i * W * H * 3;
+                for ((plane, off), p) in [(&f.y, 0usize), (&f.u, W * H), (&f.v, 2 * W * H)]
+                    .into_iter()
+                    .zip(["y", "u", "v"])
+                {
+                    let want = &ref_raw[base + off..base + off + W * H];
+                    assert_eq!(
+                        plane.len(),
+                        want.len(),
+                        "{NAME}: aomdec frame {i} plane {p}: ours has {} samples, the oracle's \
+                         has {} -- a short plane would zip-truncate the compare below and \
+                         hide a chroma-span defect",
+                        plane.len(),
+                        want.len()
+                    );
+                    let bad = plane
+                        .iter()
+                        .zip(want)
+                        .filter(|&(&a, &b)| a as u8 != b)
+                        .count();
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: aomdec frame {i} plane {p}: {bad} samples differ (class \
+                         sb128-rect-chroma-tiling)"
+                    );
+                }
+            }
+        }
+
+        // Oracle 2: ffmpeg yuv444p rawvideo. Hard-fails, never skips, when
+        // EC_AV1_REQUIRE_FFMPEG=1 (see have_ffmpeg).
+        if have_ffmpeg() {
+            let refs = ffmpeg_decode_sequence_444(&stream, W, H, FRAMES);
+            for (i, (got, want)) in frames.iter().zip(refs.iter()).enumerate() {
+                for (p, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                    .iter()
+                    .enumerate()
+                {
+                    assert_eq!(
+                        g.len(),
+                        r.len(),
+                        "{NAME}: ffmpeg frame {i} plane {p}: ours has {} samples, ffmpeg's has \
+                         {} -- a short plane would zip-truncate the compare below and hide a \
+                         chroma-span defect",
+                        g.len(),
+                        r.len()
+                    );
+                    let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        bad, 0,
+                        "{NAME}: ffmpeg frame {i} plane {p}: {bad} samples differ (class \
+                         sb128-rect-chroma-tiling)"
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP {NAME}: no ffmpeg -- the ffmpeg oracle arm only");
+        }
+    }
     /// lane-lossless128: a LOSSLESS key frame that codes a 128-axis
     /// (`BLOCK_64X128`) intra block -- the shape libaom's `read_tx_size` forces
     /// to `TX_4X4` on its very first line (`decodeframe.c:1183`), so every plane
@@ -25361,7 +25555,7 @@ exit 0
     /// single-reference, and the compound arm contributes 8 of 96 route hits
     /// and none of the 8 that change an answer.
     ///
-    /// The other 26 pinned 4:4:4 fixtures in this tree reach the arm zero
+    /// The other 27 pinned 4:4:4 fixtures in this tree reach the arm zero
     /// times (`444_intrabc_rect4_witness`, `444_leaf8_oob`,
     /// `444_lossy_rect4_*`, `444_lossy_superres_*`, `444_sb128rect_lr_witness`,
     /// and every `ll444_*`), so this one witness is the only thing pinning
