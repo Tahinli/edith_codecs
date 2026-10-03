@@ -6537,6 +6537,252 @@ pub(crate) mod tests {
             .color_config
             .bit_depth
     }
+    /// The stream's OWN `color_config.subsampling_x/y` (spec 5.5.2), read
+    /// from its bytes the same way [`stream_bit_depth`] reads the depth.
+    fn stream_subsampling(stream: &[u8], name: &str) -> (u8, u8) {
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe
+                .parse_obu(&stream[pos..])
+                .unwrap_or_else(|e| panic!("{name}: OBU at byte {pos} does not parse: {e:?}"));
+            pos += obu.total_size;
+        }
+        let cc = &probe
+            .sequence_header()
+            .unwrap_or_else(|| panic!("{name}: the stream carries no sequence header OBU"))
+            .color_config;
+        (cc.subsampling_x, cc.subsampling_y)
+    }
+
+    /// The chroma shape a `(subsampling_x, subsampling_y)` pair means.
+    fn chroma_shape(sx: u8, sy: u8) -> &'static str {
+        match (sx, sy) {
+            (1, 1) => "4:2:0",
+            (1, 0) => "4:2:2",
+            (0, 0) => "4:4:4",
+            (0, 1) => "4:4:0",
+            _ => "an unassigned subsampling",
+        }
+    }
+
+    /// lane-av1oracleguard: HARD REFUSAL for the 4:2:0 ffmpeg oracle helpers.
+    ///
+    /// `ffmpeg_decode_sequence`, `ffmpeg_decode_sequence_10bit` and
+    /// `ffmpeg_decode_sequence_12bit` ask ffmpeg for `-pix_fmt yuv420p*` and
+    /// size chroma at `width * height / 4`. Those are the 4:2:0 numbers, so
+    /// for a stream that is NOT (1,1) ffmpeg does not fail -- it CONVERTS,
+    /// and the helper then slices a 4:2:0-shaped picture out of it. A 4:2:2
+    /// gate built on one of them compares the wrong planes and passes green:
+    /// the exact failure `lanes/av1subsizesweep.report.md` names. The correct
+    /// siblings (`ffmpeg_decode_sequence_422` / `_422_depth` /
+    /// `ffmpeg_decode_sequence_444`) exist and take the same bytes, so the
+    /// refusal points at them by name rather than leaving the caller to
+    /// rediscover the shape.
+    ///
+    /// Refused by SUBSAMPLING read from the stream's own sequence header, not
+    /// from the caller's `width`/`height` (class
+    /// `helper-assumes-the-shape-the-gate-name-implies`).
+    fn assert_420_oracle_stream(stream: &[u8], helper: &str, sibling: &str) {
+        let (sx, sy) = stream_subsampling(stream, helper);
+        assert!(
+            (sx, sy) == (1, 1),
+            "{helper} REFUSED a ({sx},{sy}) stream: this helper asks ffmpeg for a 4:2:0 \
+             pix_fmt, which CONVERTS the stream's real {} chroma down to 4:2:0 instead of \
+             failing, then sizes chroma at `width * height / 4` rather than the {} shape. A \
+             gate built on it would compare converted planes against real ones and pass green. \
+             Use `{sibling}` for a ({sx},{sy}) stream.",
+            chroma_shape(sx, sy),
+            chroma_shape(sx, sy),
+        );
+    }
+    /// lane-av1oracleguard: run `f`, return the panic MESSAGE it raised (or
+    /// `None` if it did not panic). The panic hook is silenced so a refusal
+    /// that PASSES its gate prints nothing -- the assertion is the return.
+    fn panic_message<F: FnOnce()>(f: F) -> Option<String> {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::panic::set_hook(hook);
+        match caught {
+            Ok(()) => None,
+            Err(payload) => Some(
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+            ),
+        }
+    }
+
+    /// lane-av1oracleguard, direction 1 of 2: the 4:2:0 helper's COMPARATOR
+    /// still bites on a real 4:2:0 pin, so the refusal added above did not
+    /// buy its non-vacuity by making the helper stop comparing.
+    ///
+    /// `420_mixll_256x128_6f.obu` is 8-bit 4:2:0 at 256x128. Ours and ffmpeg
+    /// agree on every sample of every output frame (bad == 0), then ONE U
+    /// sample of the oracle is flipped and the same count must move to 1. A
+    /// count that stays 0 on a flipped oracle is a comparator that compares
+    /// nothing, and the refusal would then be the only thing this gate could
+    /// prove.
+    #[test]
+    fn a_420_oracle_comparator_counts_a_flipped_oracle_sample() {
+        const NAME: &str = "a_420_oracle_comparator_counts_a_flipped_oracle_sample";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = crate_pin("420_mixll_256x128_6f.obu");
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: the committed pin is missing ({e})"));
+        assert_eq!(data.len(), 22336, "{NAME}: pin size drifted");
+        assert_eq!(
+            fnv1a64(&data),
+            5694016005779287373,
+            "{NAME}: pin bytes drifted"
+        );
+        assert_eq!(
+            stream_subsampling(&data, NAME),
+            (1, 1),
+            "{NAME}: this cell must be a 4:2:0 pin -- the refusal arm uses other pins"
+        );
+
+        let decoded = decode_stream(&data)
+            .unwrap_or_else(|e| panic!("{NAME}: the committed 4:2:0 pin did not decode: {e}"));
+        let want = ffmpeg_decode_sequence(&data, 256, 128, decoded.len());
+        assert_eq!(decoded.len(), want.len(), "{NAME}: decoded/frame count");
+
+        let plane_mismatches = |ours: &[Pic], theirs: &[Pic], plane: u8| -> usize {
+            ours.iter()
+                .zip(theirs)
+                .map(|(a, b)| {
+                    let (a, b) = match plane {
+                        0 => (&a.y, &b.y),
+                        1 => (&a.u, &b.u),
+                        _ => (&a.v, &b.v),
+                    };
+                    a.iter().zip(b).filter(|&(x, y)| x != y).count()
+                })
+                .sum()
+        };
+        let clean: Vec<usize> = (0..3)
+            .map(|p| plane_mismatches(&decoded, &want, p))
+            .collect();
+        assert_eq!(
+            clean,
+            vec![0, 0, 0],
+            "{NAME}: the 4:2:0 oracle arm is not byte-exact to start with, so a flipped sample \
+             would prove nothing"
+        );
+
+        // Flip exactly one oracle sample and the count MUST move.
+        let mut flipped = want.clone();
+        flipped[0].u[0] ^= 1;
+        let moved: Vec<usize> = (0..3)
+            .map(|p| plane_mismatches(&decoded, &flipped, p))
+            .collect();
+        assert_eq!(
+            moved,
+            vec![0, 1, 0],
+            "{NAME}: one flipped oracle U sample must move the U comparison count 0 -> 1 and \
+             leave Y and V at 0; got {moved:?} -- the comparator does not bite, so this gate \
+             cannot tell a working oracle arm from a vacuous one"
+        );
+        eprintln!(
+            "{NAME}: clean per-plane counts {clean:?}, after one flipped oracle U sample {moved:?}"
+        );
+    }
+
+    /// lane-av1oracleguard, direction 2 of 2 (8-bit): the 4:2:0 helper must
+    /// REFUSE a real 4:2:2 pin instead of letting ffmpeg convert it. The
+    /// message must name the REAL subsampling AND the sibling to use -- a
+    /// bare "wrong shape" would leave the caller to rediscover the fix.
+    ///
+    /// Before this lane, `ffmpeg_decode_sequence(&422_key_64x64, 64, 64, 1)`
+    /// RETURNED a 4:2:0-converted picture without complaint, which is the
+    /// silent-green the refusal exists to stop. This gate needs no ffmpeg at
+    /// all: the guard runs before the spawn, so a host without ffmpeg still
+    /// proves the refusal.
+    #[test]
+    fn a_420_oracle_helper_refuses_a_422_pin() {
+        const NAME: &str = "a_420_oracle_helper_refuses_a_422_pin";
+        let _gate_lock = lock_gate_counters();
+        let path = crate_pin("422_key_64x64.obu");
+        let stream = read_pin(&path, 755, 0x87fc569cf53bcbc6, NAME);
+        assert_eq!(
+            stream_subsampling(&stream, NAME),
+            (1, 0),
+            "{NAME}: the pin must really be 4:2:2 (1,0), or this proves nothing"
+        );
+        let msg = panic_message(|| {
+            ffmpeg_decode_sequence(&stream, 64, 64, 1);
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{NAME}: ffmpeg_decode_sequence ACCEPTED a (1,0) stream. ffmpeg converted it to \
+                 4:2:0 and the helper returned a green-looking comparison"
+            )
+        });
+        for needle in ["(1,0)", "4:2:2", "ffmpeg_decode_sequence_422"] {
+            assert!(
+                msg.contains(needle),
+                "{NAME}: the refusal must name {needle:?}; it said: {msg}"
+            );
+        }
+        eprintln!("{NAME}: refused -> {msg}");
+    }
+
+    /// lane-av1oracleguard, direction 2 of 2 (high depth): the same refusal on
+    /// `ffmpeg_decode_sequence_10bit` and `_12bit`, which ask ffmpeg for
+    /// `yuv420p10le`/`yuv420p12le` and slice chroma at `width * height / 4`
+    /// exactly as the 8-bit helper does. Pinned 4:2:2 at both depths.
+    #[test]
+    fn a_420_high_bit_depth_oracle_helpers_refuse_a_422_pin() {
+        const NAME: &str = "a_420_high_bit_depth_oracle_helpers_refuse_a_422_pin";
+        let _gate_lock = lock_gate_counters();
+        let cells: [(&str, usize, u64, fn(&[u8]) -> Vec<Pic>); 2] = [
+            (
+                "s422_352x242_10b.obu",
+                20575,
+                17425395593908182125,
+                |s: &[u8]| ffmpeg_decode_sequence_10bit(s, 352, 242, 1),
+            ),
+            (
+                "s422_12bit_160x128.obu",
+                9214,
+                0xa62b8e3fe6f60ae5,
+                |s: &[u8]| ffmpeg_decode_sequence_12bit(s, 160, 128, 1),
+            ),
+        ];
+        for (file, len, fnv, call) in cells {
+            let path = crate_pin(file);
+            let stream = read_pin(&path, len, fnv, NAME);
+            assert_eq!(
+                stream_subsampling(&stream, NAME),
+                (1, 0),
+                "{NAME}/{file}: the pin must really be 4:2:2 (1,0), or this proves nothing"
+            );
+            let msg = panic_message(|| {
+                call(&stream);
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{NAME}/{file}: the 4:2:0 high-bit-depth oracle helper ACCEPTED a (1,0) \
+                     stream -- ffmpeg converted it and the helper returned a comparison that \
+                     could pass green"
+                )
+            });
+            for needle in ["(1,0)", "4:2:2", "ffmpeg_decode_sequence_422_depth"] {
+                assert!(
+                    msg.contains(needle),
+                    "{NAME}/{file}: the refusal must name {needle:?}; it said: {msg}"
+                );
+            }
+            eprintln!("{NAME}/{file}: refused -> {msg}");
+        }
+    }
 
     /// Packs decoded planes the way `aomdec --rawvideo` writes them for
     /// `bit_depth`: 1 byte per sample at 8-bit, 2 bytes little-endian at
@@ -6836,6 +7082,13 @@ pub(crate) mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Pic> {
+        // lane-av1oracleguard: this helper's numbers are 4:2:0's. A (1,0) or
+        // (0,0) stream would be CONVERTED by ffmpeg rather than refused.
+        assert_420_oracle_stream(
+            stream,
+            "ffmpeg_decode_sequence",
+            "ffmpeg_decode_sequence_422 (4:2:2) or ffmpeg_decode_sequence_444 (4:4:4)",
+        );
         let out = run_with_stdin(
             Command::new(ffmpeg_path()).args([
                 "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
@@ -6927,6 +7180,11 @@ pub(crate) mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Pic> {
+        assert_420_oracle_stream(
+            stream,
+            "ffmpeg_decode_sequence_10bit",
+            "ffmpeg_decode_sequence_422_depth(.., 10, \"yuv422p10le\") (4:2:2); ffmpeg_decode_sequence_444 is 8-bit only",
+        );
         let out = run_with_stdin(
             Command::new(ffmpeg_path()).args([
                 "-v",
@@ -17229,6 +17487,11 @@ exit 0
         height: usize,
         frames: usize,
     ) -> Vec<Pic> {
+        assert_420_oracle_stream(
+            stream,
+            "ffmpeg_decode_sequence_12bit",
+            "ffmpeg_decode_sequence_422_depth(.., 12, \"yuv422p12le\") (4:2:2); ffmpeg_decode_sequence_444 is 8-bit only",
+        );
         let out = run_with_stdin(
             Command::new("ffmpeg").args([
                 "-v",
