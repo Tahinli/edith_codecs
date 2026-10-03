@@ -21465,7 +21465,11 @@ const MAX_LEGAL_SAMPLE: u16 = 4095;
 /// being impossible. `EC_AV1_PLANE_SENTINEL=1` -- the spelling every existing
 /// caller and gate uses, and `env_flag!`'s mere presence test -- keeps
 /// [`PLANE_SENTINEL`].
-fn plane_poison() -> u16 {
+/// `pub(crate)` for lane-av1graincensus: `film_grain::uninit_plane` fills its
+/// destination with the SAME poison `fresh_plane` does, and
+/// [`census_unwritten_grained`] counts the same value. The fill and the census
+/// must agree on both the value and the predicate, or a "0" means nothing.
+pub(crate) fn plane_poison() -> u16 {
     static V: std::sync::LazyLock<u16> = std::sync::LazyLock::new(|| {
         let Ok(raw) = crate::envflags::var("EC_AV1_PLANE_SENTINEL") else {
             return PLANE_SENTINEL;
@@ -21493,7 +21497,8 @@ thread_local! {
 }
 
 /// Whether freshly allocated planes are [`PLANE_SENTINEL`]-filled.
-fn plane_sentinel_on() -> bool {
+/// `pub(crate)` for the same reason as [`plane_poison`].
+pub(crate) fn plane_sentinel_on() -> bool {
     crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL")
         || PLANE_SENTINEL_ON.with(std::cell::Cell::get)
 }
@@ -21855,6 +21860,11 @@ pub fn take_final_census_scanned() -> usize {
 /// plane, how many samples still hold [`PLANE_SENTINEL`] once every filter has
 /// run, and records how many samples it LOOKED at in [`FINAL_CENSUS_SCANNED`].
 ///
+/// SCOPE, which lane-av1graincensus did not change but had to be true about:
+/// this runs BEFORE `apply_grain`, over the PRE-grain planes. It does NOT and
+/// never did measure the grained picture the caller receives -- that is
+/// [`census_unwritten_grained`], a separate counter over a separate buffer.
+///
 /// Gated on [`plane_sentinel_on`] -- the SAME predicate as [`fresh_plane`] and as
 /// the pre-deblock [`census_unwritten`]: the env flag OR the thread-local
 /// [`set_plane_sentinel`] override. An earlier revision gated this on the raw env
@@ -21862,19 +21872,86 @@ pub fn take_final_census_scanned() -> usize {
 /// the thread-local switch that the rest of the crate honours. The fill and both
 /// censuses must agree on when they are live, or a "0" means nothing.
 pub(crate) fn census_unwritten_final(y: &[u16], u: &[u16], v: &[u16]) {
-    if !plane_sentinel_on() {
+    let Some((scanned, total)) = census_sentinels(y, u, v) else {
         return;
+    };
+    FINAL_CENSUS_SCANNED.fetch_add(scanned, std::sync::atomic::Ordering::SeqCst);
+    FINAL_UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The `(scanned, unwritten)` pair both output-point censuses accumulate, or
+/// `None` when the sentinel fill is not live.
+///
+/// Shared so the two censuses cannot drift into disagreeing about what counts
+/// as unwritten -- the failure this crate's other paired counters exist to
+/// prevent. `None` (rather than `(0, 0)`) is what keeps a caller from
+/// publishing a meaningless zero when the fill was off.
+fn census_sentinels(y: &[u16], u: &[u16], v: &[u16]) -> Option<(usize, usize)> {
+    if !plane_sentinel_on() {
+        return None;
     }
-    // The caller passes the frame's planes exactly as they are about to be
-    // stored into the reference slots, which are already cropped to the true
-    // extent (no padding past it reaches this point), so a flat count over
-    // each plane IS the true-extent count.
+    // Both callers pass planes cropped to the true extent (no padding past it
+    // reaches either point), so a flat count over each plane IS the
+    // true-extent count.
     let (scanned, total): (usize, usize) = [y, u, v]
         .iter()
         .map(|p| (p.len(), p.iter().filter(|&&s| s == plane_poison()).count()))
         .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
-    FINAL_CENSUS_SCANNED.fetch_add(scanned, std::sync::atomic::Ordering::SeqCst);
-    FINAL_UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
+    Some((scanned, total))
+}
+
+/// lane-av1graincensus: samples still holding the poison after film grain, over
+/// the picture [`crate::film_grain::apply_grain`] RETURNS -- i.e. the picture the
+/// caller receives on a grained frame.
+static GRAINED_UNWRITTEN_SAMPLES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The scanned half of the pairing for [`GRAINED_UNWRITTEN_SAMPLES`]. A gate
+/// asserting only `== 0` passes on a build whose census call was deleted.
+static GRAINED_CENSUS_SCANNED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Reads and clears [`GRAINED_UNWRITTEN_SAMPLES`].
+pub fn take_grained_unwritten_samples() -> usize {
+    GRAINED_UNWRITTEN_SAMPLES.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Reads and clears [`GRAINED_CENSUS_SCANNED`]; the pairing is the reason it
+/// exists, exactly as for [`take_final_census_scanned`].
+pub fn take_grained_census_scanned() -> usize {
+    GRAINED_CENSUS_SCANNED.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// lane-av1graincensus: the SECOND output-point census -- the one
+/// [`census_unwritten_final`] structurally cannot be.
+///
+/// # WHY IT EXISTS
+///
+/// `census_unwritten_final` runs at `stream.rs`'s `EC_AV1_FINAL_DUMP` site, which
+/// is BEFORE `apply_grain`. Every filter (deblock/CDEF/LR/superres) writes in
+/// place into the same buffer that census scanned, so those stages cannot open a
+/// hole outside its extent. `apply_grain` is the ONE stage after it that
+/// allocates a fresh picture -- `uninit_plane`, `Vec::with_capacity` +
+/// `set_len`, no fill -- and whose soundness rests on a band row partition
+/// rather than on the type system. Its destination therefore reaches the caller
+/// having never been looked at by any census, and `lanes/unwritten-dep.report.md`
+/// §6/§8 explicitly declines to claim otherwise.
+///
+/// # WHAT IT IS WORTH ONLY IF THE FILL IS LIVE
+///
+/// Counting `== plane_poison()` over an uninitialised buffer is a census that
+/// can only ever report ~0: garbage is arbitrary, so a hole survives with
+/// probability ~1/65536 rather than always. `uninit_plane` therefore fills with
+/// the poison when [`plane_sentinel_on`] -- under the SAME predicate
+/// [`fresh_plane`] honours -- so "the band copy wrote every sample" becomes a
+/// measurement instead of an assumption. With the sentinel off (every shipped
+/// build) nothing here runs and `uninit_plane` keeps its corner-cut.
+pub(crate) fn census_unwritten_grained(y: &[u16], u: &[u16], v: &[u16]) {
+    let Some((scanned, total)) = census_sentinels(y, u, v) else {
+        return;
+    };
+    GRAINED_CENSUS_SCANNED.fetch_add(scanned, std::sync::atomic::Ordering::SeqCst);
+    GRAINED_UNWRITTEN_SAMPLES.fetch_add(total, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Which closure [`fresh_plane`] applies to the allocation it hands back.
@@ -38458,8 +38535,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         // data lengths: this dump is the PADDED plane, not a crop, so the
         // writer's extent is `p.data` itself.
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let narrow =
-            |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+        let narrow = |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
         crate::dumpio::write_planes(
             "EC_AV1_PREFILT_DUMP",
             format!("{path}.f{idx}"),
@@ -56839,8 +56915,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         // lane-av1dumploud: loud on a short write (see the key-frame twin
         // above -- same file, same shape, same three planes).
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let narrow =
-            |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+        let narrow = |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
         crate::dumpio::write_planes(
             "EC_AV1_PREFILT_DUMP",
             format!("{path}.f{idx}"),

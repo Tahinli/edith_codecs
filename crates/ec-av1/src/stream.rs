@@ -2246,12 +2246,20 @@ fn decode_frame(
     // census SEES it.
     //
     // So this second census is not a patch for a blind pre-deblock scan. It is
-    // the measurement taken where the output is taken, which covers the whole span
-    // from the tile walk to the caller's frame: anything a later stage could
-    // introduce (a filter, superres, a second pass) is inside its extent, where
-    // a scan taken before it would not be. It also runs before `apply_grain`, so
-    // the claim is over the PRE-GRAIN planes -- the bytes the reference bank
-    // stores and every later frame predicts from.
+    // the measurement taken where the reference-bank bytes are taken, which
+    // covers the whole span from the tile walk to those bytes: every filter
+    // writes IN PLACE into the very buffer this scans, so nothing a later
+    // filter does can open a hole outside its extent.
+    //
+    // lane-av1graincensus, the scope correction this comment needed: "to the
+    // caller's frame" was WRONG, and this call is not what makes it right.
+    // `apply_grain` runs after this and ALLOCATES a fresh picture
+    // (`film_grain::uninit_plane`, `with_capacity` + `set_len`, no fill), so
+    // that destination never passes through here. The claim over the PRE-GRAIN
+    // planes -- the bytes the reference bank stores and every later frame
+    // predicts from -- is what this line supports; the grained picture the
+    // caller receives is censused by `decode::census_unwritten_grained`, at
+    // `apply_grain`'s own return, over its own counters.
     decode::census_unwritten_final(&picture.y, &picture.u, &picture.v);
     if let Some(prefix) = final_dump {
         // lane-av1dumploud: this is the site that produced the 13 320 192-byte
@@ -48658,10 +48666,17 @@ exit 0
     /// `EC_AV1_FINAL_DUMP` writes, which is BEFORE `apply_grain`. The claim is
     /// therefore over the PRE-GRAIN planes -- which are also the bytes the
     /// reference bank stores and every later frame predicts from, the dependency
-    /// that matters. Whether `apply_grain` can itself introduce a hole is NOT
-    /// measured: the census never sees the planes `apply_grain` allocates. So the
-    /// claim is NOT "the caller's final grained picture has no hole", and nothing
-    /// here asserts that grain cannot introduce one.
+    /// that matters. Every filter writes IN PLACE into the buffer this scans, so
+    /// none of them can open a hole outside its extent. `apply_grain` is the one
+    /// stage after this scan that ALLOCATES a new picture, and this census never
+    /// sees it: the claim is NOT "the caller's final grained picture has no hole".
+    ///
+    /// lane-av1graincensus: that paragraph is still true of THIS gate and is not
+    /// weakened by the pointer below -- what changed is that the gap it names is
+    /// no longer UNMEASURED.
+    /// [`the_grained_picture_the_caller_receives_carries_no_unwritten_plane_sample`]
+    /// measures the grained picture `apply_grain` returns, over its own counters,
+    /// and is the gate that carries the post-grain claim.
     ///
     /// NON-VACUITY, the part that makes this gate worth having: a census is only a
     /// measurement if it CAN report non-zero. The control is a SYNTHETIC positive
@@ -48787,6 +48802,165 @@ exit 0
         }
     }
 
+    /// lane-av1graincensus: the picture the caller RECEIVES -- including film
+    /// grain -- carries no unwritten plane sample.
+    ///
+    /// # WHAT THIS GATE IS FOR, and the blind spot it closes
+    ///
+    /// [`the_frame_the_caller_receives_carries_no_unwritten_plane_sample`] scans
+    /// at `stream.rs`'s `EC_AV1_FINAL_DUMP` site, which is BEFORE `apply_grain`.
+    /// Every filter (deblock/CDEF/LR/superres) writes IN PLACE into the buffer it
+    /// scans, so none of them can open a hole outside its extent -- but
+    /// `apply_grain` is the one stage after that scan that ALLOCATES a fresh
+    /// picture: `film_grain::uninit_plane`, `Vec::with_capacity` + `set_len`, no
+    /// fill, with correctness resting on a band row partition rather than on the
+    /// type system. `lanes/unwritten-dep.report.md` §6 and §8 declined to claim
+    /// anything about that destination. This gate measures it.
+    ///
+    /// # WHY THE COUNT CAN BE NON-ZERO (the part that makes it a census)
+    ///
+    /// Counting `== plane_poison()` over an uninitialised buffer is a census that
+    /// reports ~0 either way: a hole survives with probability ~1/65536, not
+    /// always. `uninit_plane` therefore fills with the poison under the SAME
+    /// predicate `fresh_plane` honours. With the sentinel off -- every shipped
+    /// build -- `uninit_plane` is still `with_capacity` + `set_len`, so the
+    /// corner-cut it documents is untouched.
+    ///
+    /// # SCOPE, stated not implied
+    ///
+    /// The claim is over the picture the caller receives ON A GRAINED FRAME, in
+    /// its final form, after the noise. It is NOT a claim that the pre-grain
+    /// census already covered this -- that census never sees this buffer -- and it
+    /// is NOT a claim about a frame whose grain step does not run.
+    ///
+    /// # NON-VACUITY, two arms, both required
+    ///
+    /// 1. **synthetic, first, and with a DIFFERENT known count (5, not the
+    ///    pre-grain arm's 7)** so a gate reading the wrong counter goes red. No
+    ///    fixture involved, so no lane's refusal can redden it.
+    /// 2. **per-fixture `scanned > 0`** -- `unwritten == 0` is also what a build
+    ///    with the census call deleted reports. `scanned > 0` is reachable only by
+    ///    `apply_grain` actually running, so it is at once the
+    ///    proof-that-grain-fired and the deletion control.
+    ///
+    /// Both mutations are in `lanes/av1graincensus.report.md`: deleting the
+    /// `census_unwritten_grained` call at `apply_grain`'s return reds arm 2, and
+    /// forcing ONE poison sample into a grained picture reds arm 2's count.
+    #[test]
+    fn the_grained_picture_the_caller_receives_carries_no_unwritten_plane_sample() {
+        const NAME: &str =
+            "the_grained_picture_the_caller_receives_carries_no_unwritten_plane_sample";
+        let _gate_lock = lock_gate_counters();
+
+        let (syn, syn_scanned) = grain_census_synthetic();
+        assert_eq!(
+            syn_scanned, 40,
+            "{NAME}: the synthetic control scanned {syn_scanned} samples, expected 40 \
+             (16 + 16 + 8) -- the grained census did not look at what it was handed"
+        );
+        assert_eq!(
+            syn, 5,
+            "{NAME}: the grained census reported {syn} for planes carrying exactly 5 sentinel \
+             samples -- it is not measuring what it claims, so every zero below is \
+             meaningless (class: census-silently-blind). Note 5, not the pre-grain arm's 7: \
+             reading the wrong counter is the failure this number catches."
+        );
+
+        // Small and cheap: a 4:2:2 grain stream, a 4:2:0 one that also runs
+        // CDEF+LR, and the real 10-bit 3840x1608 hidden-alt-ref film whose height
+        // is not a multiple of the 32-pixel band row -- the shape where the band
+        // row partition has a tail.
+        for fixture in [
+            "s422_grain_160x128",
+            "grain_cdef_lr_128x128",
+            "hg_arf_witness",
+        ] {
+            let (n, scanned) = grain_census(fixture);
+            assert!(
+                scanned > 0,
+                "{NAME}: the grained census scanned 0 samples on {fixture} -- the call at \
+                 `apply_grain`'s return is not running (or grain never fired), so the {n} \
+                 below proves nothing (class: census-never-ran). Deleting the call in \
+                 apply_grain reproduces this."
+            );
+            assert_eq!(
+                n, 0,
+                "{NAME}: {fixture} hands the caller a grained picture with {n} samples the \
+                 grain destination's band copy never wrote"
+            );
+        }
+    }
+
+    /// Runs the census child on `fixture` and returns the `GRAINCENSUS` line's
+    /// `(unwritten, scanned)` -- the POST-grain pair, over the picture
+    /// `apply_grain` returns.
+    fn grain_census(fixture: &str) -> (usize, usize) {
+        const NAME: &str =
+            "the_grained_picture_the_caller_receives_carries_no_unwritten_plane_sample";
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "stream::tests::uwdep_child_unwritten_census",
+                "--nocapture",
+            ])
+            .env("UWDEP_CENSUS_FIXTURE", fixture)
+            .env("EC_AV1_PLANE_SENTINEL", "1")
+            .output()
+            .expect("running the census child");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        text.lines()
+            .find_map(|l| l.strip_prefix("GRAINCENSUS "))
+            .and_then(parse_census_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{NAME}: the census child reported no grained count for {fixture} \
+                     (child said: {:?})",
+                    text.trim()
+                )
+            })
+    }
+
+    /// The synthetic non-vacuity control for the grained census: the child with
+    /// `UWDEP_CENSUS_FIXTURE` UNSET hands [`census_unwritten_grained`] planes
+    /// carrying 5 sentinel samples and reports what it counted. Function-level,
+    /// so no fixture's decode behaviour can change it.
+    fn grain_census_synthetic() -> (usize, usize) {
+        const NAME: &str =
+            "the_grained_picture_the_caller_receives_carries_no_unwritten_plane_sample";
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "stream::tests::uwdep_child_unwritten_census",
+                "--nocapture",
+            ])
+            .env("EC_AV1_PLANE_SENTINEL", "1")
+            .env("UWDEP_CENSUS_SYNTHETIC", "1")
+            .env_remove("UWDEP_CENSUS_FIXTURE")
+            .output()
+            .expect("running the census child");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        text.lines()
+            .find_map(|l| l.strip_prefix("GRAINCENSUS "))
+            .and_then(parse_census_line)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{NAME}: the census child reported no synthetic grained count (child said: \
+                     {:?})",
+                    text.trim()
+                )
+            })
+    }
+
     /// Parses the child's `UWDEP_CENSUS <unwritten> frames=<n> scanned=<n>` line
     /// into `(unwritten, scanned)`. The scanned count is what makes the fixture
     /// arms meaningful: `unwritten == 0` is also what a build with the census call
@@ -48882,6 +49056,27 @@ exit 0
             let n = decode::take_final_unwritten_samples();
             let scanned = decode::take_final_census_scanned();
             println!("UWDEP_CENSUS {n} synthetic=1 scanned={scanned}");
+            // lane-av1graincensus: the grained census over the SAME planes but a
+            // DIFFERENT known count, 2 + 3 + 0 = 5. Deliberately not 7: a parent
+            // that read the pre-grain counter for the grained arm would see 7 and
+            // go red, so the two arms cannot be confused for one another.
+            for s in a.iter_mut().take(3) {
+                *s = 7;
+            }
+            for s in b.iter_mut().take(4) {
+                *s = 7;
+            }
+            for s in a.iter_mut().take(2) {
+                *s = S;
+            }
+            for s in b.iter_mut().take(3) {
+                *s = S;
+            }
+            let _ = decode::take_grained_unwritten_samples();
+            decode::census_unwritten_grained(&a, &b, &c);
+            let gn = decode::take_grained_unwritten_samples();
+            let gscanned = decode::take_grained_census_scanned();
+            println!("GRAINCENSUS {gn} synthetic=1 scanned={gscanned}");
             return;
         }
         let Ok(fixture) = std::env::var("UWDEP_CENSUS_FIXTURE") else {
@@ -48894,10 +49089,23 @@ exit 0
         let stream =
             std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
         let _ = decode::take_final_unwritten_samples();
+        // Both counters are drained BEFORE the decode: they are process-global
+        // and this child may inherit nothing, but a partial run must not be able
+        // to add its numbers to another test's.
+        let _ = decode::take_grained_unwritten_samples();
         let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{fixture} refused: {e}"));
         let n = decode::take_final_unwritten_samples();
         let scanned = decode::take_final_census_scanned();
         println!("UWDEP_CENSUS {n} frames={} scanned={scanned}", frames.len());
+        // lane-av1graincensus: the post-grain census, over the picture
+        // `apply_grain` returns. A different prefix from `UWDEP_CENSUS`, so
+        // neither parent can pick up the other's line.
+        let gn = decode::take_grained_unwritten_samples();
+        let gscanned = decode::take_grained_census_scanned();
+        println!(
+            "GRAINCENSUS {gn} frames={} scanned={gscanned}",
+            frames.len()
+        );
     }
 
     /// lane-av1uballoc: the frame the caller receives does not depend on what
@@ -48937,6 +49145,18 @@ exit 0
         // 4:2:2 (12-bit key, inter, sb128 intrabc, 17-frame odd-size), 4:4:4
         // (lossless sb64, intrabc rect4, 128-root mu), a padded odd size, an
         // off-tile chroma walk, and superres+CDEF+LR -- for ~1.3 s per arm.
+        //
+        // lane-av1graincensus adds FILM GRAIN. `apply_grain`'s `uninit_plane` is
+        // the crate's only OTHER `Vec::with_capacity` + `set_len` allocation, and
+        // before this row the only gate that can catch a READ of it had no grain
+        // fixture at all, so that `unsafe` had no coverage here. It matters: with
+        // the grain band's clean-row copy neutered, the noise kernels read the
+        // destination to build `avgLuma` and the picture's values then depend on
+        // whatever the buffer held -- a dependence the 0xDEAD-vs-0xBEEF arm
+        // exists to catch and the unwritten-sample census cannot (the read value
+        // is overwritten before the census runs). Measured in
+        // `lanes/av1graincensus.report.md` §5. `s422_grain_160x128` is the
+        // smallest grain fixture, so the arm grows by ~0.05 s.
         const FIXTURES: &[&str] = &[
             "s422_12bit_160x128",
             "422_inter_160x128_3f",
@@ -48948,6 +49168,7 @@ exit 0
             "svt1-split-tx-pin",
             "mix176_offtile_chroma_clip",
             "superres_kf_cdef_lr_64x64",
+            "s422_grain_160x128",
         ];
 
         let (a, b) = allocdet_synthetic();

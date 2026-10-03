@@ -1281,12 +1281,28 @@ fn copy_clean_rows(
 /// [`crate::par::Shared`]'s disjointness is; the byte-exact 1-vs-4-thread
 /// gate is what checks it. Upgrade path: `Box<[MaybeUninit<u16>]>` plumbed
 /// through the kernels.
+///
+/// # lane-av1graincensus: the fill under the census arm
+///
+/// That corner-cut is also why the buffer must be POISONED, not merely
+/// uninitialised, whenever the sentinel is live. Counting `== plane_poison()`
+/// over ambient garbage is a census that can only ever report ~0: a hole
+/// survives with probability ~1/65536 rather than always, so
+/// [`crate::decode::census_unwritten_grained`] would report 0 whether or not
+/// the band copy covered every row. Filling here makes "the band copy wrote
+/// every sample" a measurement. It is the same predicate
+/// [`crate::decode::fresh_plane`] honours, and with the sentinel off -- every
+/// shipped build -- this is the `with_capacity` + `set_len` it always was, so
+/// the corner-cut is untouched where it is paid for.
 #[allow(unsafe_code)]
 fn uninit_plane(n: usize) -> Vec<u16> {
     let mut v: Vec<u16> = Vec::with_capacity(n);
     // SAFETY: `u16` has no invalid bit pattern and no uninitialised sample is
     // read -- see the doc comment.
     unsafe { v.set_len(n) };
+    if crate::decode::plane_sentinel_on() {
+        v.fill(crate::decode::plane_poison());
+    }
     v
 }
 
@@ -1338,7 +1354,12 @@ pub(crate) fn apply_grain(
     fctx: &crate::decode::FrameCtx,
 ) -> Picture {
     if !fg.apply_grain {
-        return picture.clone();
+        let clean = picture.clone();
+        // lane-av1graincensus: this exit censuses too, so "the picture
+        // `apply_grain` hands back is censused in its final form" is a property
+        // of the FUNCTION rather than of one branch.
+        crate::decode::census_unwritten_grained(&clean.y, &clean.u, &clean.v);
+        return clean;
     }
     fctx.grain_bit_depth.with(|c| c.set(bit_depth));
     hit!(GRAIN_HITS);
@@ -1992,6 +2013,16 @@ pub(crate) fn apply_grain(
     });
     let _ = so;
 
+    // lane-av1graincensus: the post-grain census, at the point the caller takes
+    // the picture. `census_unwritten_final` runs in `stream.rs` BEFORE this
+    // function, over the clean planes, and every filter writes in place into
+    // that same buffer -- so the destination allocated above by `uninit_plane`
+    // is the ONLY picture between that census and the caller that no census has
+    // ever looked at. `lanes/unwritten-dep.report.md` §6/§8 declined to claim
+    // anything about it; this measures it. `uninit_plane` poisons the buffer
+    // under the same predicate, so the count is a measurement rather than a
+    // coin flip on ambient garbage.
+    crate::decode::census_unwritten_grained(&out.y, &out.u, &out.v);
     out
 }
 
