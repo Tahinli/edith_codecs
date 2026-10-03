@@ -2936,6 +2936,16 @@ pub(crate) mod tests {
             .join("fixtures")
             .join("440_request_is_422.obu");
         let pinned = read_pin(&path, 2014, 0x98a1378df976253d, NAME);
+        // The refusal this gate PROVES, quoted whole -- the anchor the PROVEN
+        // row in `refusal_inventory.rs` is checked against inside this body's
+        // own bounds. The assertion below used to match only the libaom
+        // citation *inside* the string, so a reworded guard kept passing for
+        // as long as it kept citing `decodeframe.c:1456`: the half that names
+        // OUR shapes (4x8 / 8x16 / 16x4, and 8x4 at 4:4:0) was never pinned.
+        const REFUSAL: &str = "a block size 4x8, 8x16 or 16x4 (or 8x4 at 4:4:0) has no chroma \
+                               plane block at this frame's subsampling mode (libaom: \"Block \
+                               size %dx%d invalid with this subsampling mode\", \
+                               av1/decoder/decodeframe.c:1456, refusing by the same rule)";
         let err = decode_stream(&pinned)
             .err()
             .unwrap_or_else(|| panic!("{NAME}: the pin must be REFUSED, not decoded"));
@@ -2944,6 +2954,11 @@ pub(crate) mod tests {
             msg.contains("invalid with this subsampling mode"),
             "{NAME}: the refusal must name the rule it refuses by (libaom's own wording), got: \
              {msg}"
+        );
+        assert!(
+            msg.contains(REFUSAL),
+            "{NAME}: the refusal must be this decoder's OWN string, whole -- the guard's wording \
+             drifted, so the PROVEN row no longer names what fires, got: {msg}"
         );
         // Positive control: a real 4:2:2 stream must still decode, so the gate
         // cannot pass by refusing everything.
@@ -3979,25 +3994,51 @@ pub(crate) mod tests {
     /// earned, and the one that replaces seven gates whose only behavioural
     /// assertion was `err.contains(REFUSAL)`.
     ///
-    /// **Why these six.** The measurement base
+    /// **Why these seven.** The measurement base
     /// (`lanes/av1422ffmpegbase.report.md` section 2.1) recorded seven 4:2:2
     /// cells that diverged from ffmpeg: `s422_320x246`, `s422_322x240`,
     /// `s422_322x246`, `s422_352x242_10b`, `s422_384x240`,
-    /// `s422_416x242_10b`, `s422_416x250_10b`. Six are closed and are pinned
-    /// here, each byte-exact against ffmpeg with the per-plane
-    /// coefficient-unit census as its non-vacuity arm. All six are
+    /// `s422_416x242_10b`, `s422_416x250_10b`. ALL SEVEN are closed and are
+    /// pinned here, each byte-exact against ffmpeg with the per-plane
+    /// coefficient-unit census as its non-vacuity arm. Six of them are
     /// CHROMA-only divergences at non-8-aligned geometries -- odd or
     /// 2-mod-4 luma dimensions, where `round_ss` and the chroma block walk
     /// disagree with a hardcoded `>> 1` -- which is why they are the rows a
     /// lift cannot afford to leave unasserted: they are the cells that would
     /// go quietly wrong again.
     ///
-    /// **The seventh, `s422_384x240`, is NOT here, on purpose.** It is the
-    /// reserved group-tail chroma SKIP arm (`decode.rs`; the risk study R4
-    /// flags it as owned elsewhere), it is still red, and pinning a red cell
-    /// inside a green gate is how a gate stops being a gate.
-    /// **THIS BRANCH MUST NOT LAND UNTIL THAT CELL CLOSES AND THE CORPUS
-    /// RE-MEASURES 51/51** -- see `lanes/av1422lift.report.md`.
+    /// **The seventh, `s422_384x240`, IS here now.** lane-av1422lift pinned six
+    /// of the seven and deliberately left this one out: it was still red, and
+    /// pinning a red cell inside a green gate is how a gate stops being a gate
+    /// ("THIS BRANCH MUST NOT LAND UNTIL THAT CELL CLOSES AND THE CORPUS
+    /// RE-MEASURES 51/51", `lanes/av1422lift.report.md` §7). The cell closed in
+    /// lane-av1422tailskip, and NOT through the reserved group-tail chroma SKIP
+    /// arm the risk study's R4 blamed: that lane measured it byte-exact against
+    /// ffmpeg on all 16 displayed frames and all 17 decode-order frames, 0/0/0
+    /// wrong samples in Y/U/V, with the fix's own counter
+    /// (`palette_422_unit_window_hits`) non-zero on this stream.
+    /// `lanes/av1422tailskip.report.md` §1 records the measurement and the
+    /// refutation of the arm attribution.
+    ///
+    /// That lane had already committed these exact bytes under the name
+    /// `422_palette_intra_in_inter_384x240_17f.obu` (sha256 `bf1c658e...a815b`,
+    /// the sweep artifact byte for byte), so the row below pins THAT file
+    /// rather than committing a second copy of one stream under a second name.
+    /// Unlike the other six, this cell sits at an 8- AND 16-aligned geometry
+    /// (384x240): it was the late-starting frame-1 alt-ref chroma residual
+    /// (`lanes/av1422late.report.md`), not the `round_ss` class -- which is why
+    /// it is pinned as its own row here rather than folded into that sentence.
+    ///
+    /// **The corpus re-measures 51/51**, which was the second half of the
+    /// condition the paragraph above quotes. Re-run for this row with the
+    /// ffmpeg-oracle census driver (`~/.cache/census422b/ffcensus.py`: display
+    /// order, shown frames, geometry from `ffprobe`, a count over zero frames
+    /// is a hard error) and a `dump_yuv` built from THIS lane's tree:
+    /// **51 of 51 4:2:2 cells BYTE-EXACT** -- `s422_384x240` among them at
+    /// 0/0/0 -- and, in the same run, all 44 4:2:0 / 4:4:4 controls BYTE-EXACT
+    /// (95/95 over the whole corpus). That run is a measurement of this tree,
+    /// not a re-reading of the closure report; the per-cell rows here are what
+    /// keep the seven named ones from drifting back.
     ///
     /// **The census arm, per row.** `assert_422_stream_pixel_exact` asserts
     /// that all three planes read a non-zero number of coefficient units AND
@@ -4008,14 +4049,18 @@ pub(crate) mod tests {
     /// the same decode walked 4994 units, so a green here with no census
     /// assert would have proven nothing about 4:2:2.
     ///
-    /// **Provenance of the six pins.** All six are `aomenc --codec=av1
+    /// **Provenance of the seven pins.** All seven are `aomenc --codec=av1
     /// --profile=2 --input-bit-depth=<8|10> --cpu-used=0 --cq-level=24
     /// --limit=16 --auto-alt-ref=1 --enable-global-motion=1 --passes=1
     /// --obu` over a hand-built `C422` y4m (header line, then `FRAME\n` plus
     /// one frame of planes per frame -- libaom's y4minput requires those six
-    /// bytes before EVERY frame), produced by the census sweep and copied in
-    /// from `~/.cache/census422b/sweep/`. They are ordinary libaom 4:2:2
-    /// streams with nothing bolted on.
+    /// bytes before EVERY frame), produced by the census sweep. The first six
+    /// were copied in from `~/.cache/census422b/sweep/`; the seventh is the
+    /// same sweep's `s422_384x240.obu`, which lane-av1422tailskip had already
+    /// committed under the name in its own row (the two files are byte for
+    /// byte identical -- sha256 `bf1c658e9bfdc13ec1ed51e59049d2b81201941b6ef45\
+    /// 71f8382f356ea4b815b`), so it is pinned under that name here. They are
+    /// ordinary libaom 4:2:2 streams with nothing bolted on.
     #[test]
     fn the_pinned_422_corpus_cells_decode_pixel_exact() {
         const NAME: &str = "the_pinned_422_corpus_cells_decode_pixel_exact";
@@ -4084,6 +4129,20 @@ pub(crate) mod tests {
                 250,
                 10,
                 16,
+            ),
+            (
+                // Census cell `s422_384x240` -- the seventh previously
+                // diverging cell, closed by lane-av1422tailskip. Same bytes as
+                // the sweep's `s422_384x240.obu`, already in this fixtures dir
+                // under the name lane-av1422tailskip's own gate pins.
+                "422_palette_intra_in_inter_384x240_17f.obu",
+                19344usize,
+                0x923ccabfcb933e90u64,
+                "bf1c658e9bfdc13ec1ed51e59049d2b81201941b6ef4571f8382f356ea4b815b",
+                384usize,
+                240usize,
+                8u8,
+                16usize,
             ),
         ] {
             let row = format!("{NAME}[{file}]");

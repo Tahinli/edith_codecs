@@ -696,6 +696,35 @@ const PROVEN: &[(&str, &str, Proof)] = &[
         "an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name",
         Proof::NegativeGate,
     ),
+    // lane-av1bookkeep W1-4, NEGATIVE: the BLOCK_INVALID subsize refusal
+    // (`refuse_invalid_plane_block`, decode.rs). It is libaom's own rule
+    // (`get_plane_block_size` -> `AOM_CODEC_CORRUPT_FRAME`, decodeframe.c:1456)
+    // applied to a stream whose header and tile disagree. The pin is a 4:2:2
+    // sequence header over a 4:2:0 key frame's tile, whose partition symbols
+    // name 8x16 -- a subsize with no chroma plane block at ss (1,0) -- so the
+    // guard FIRES, by name, and the gate also drives a genuine 4:2:2 pin that
+    // must still decode, so it cannot pass by refusing everything. The gate's
+    // body quotes the refusal WHOLE (not just the libaom citation inside it),
+    // which is what makes this row an anchor the checker can hold.
+    (
+        "a block size 4x8, 8x16 or 16x4 (or 8x4 at 4:4:0) has no chroma plane block at this frame's subsampling mode (libaom: \\\"Block size %dx%d invalid with this subsampling mode\\\", av1/decoder/decodeframe.c:1456, refusing by the same rule)",
+        "a_422_header_over_a_420_tile_refuses_the_subsize_libaom_calls_corrupt",
+        Proof::NegativeGate,
+    ),
+    // lane-av1bookkeep W1-4, ENUMERATION: the LONE capability claim. The guard
+    // in `decode_block_rect` fires only when `filter_intra.is_some()`, and that
+    // flag is `Some` only where `filter_intra_size_class_rect` says so. The
+    // strips the guard protects are `(64, 32)` / `(32, 64)`;
+    // `av1_filter_intra_allowed_bsize` caps both sides at 32x32, so no conformant
+    // stream offers the symbol there. The gate walks every EXPLICIT arm of the
+    // table (none admits a 64 axis), drives the square-delegate's callee
+    // `filter_intra_size_class` at 32 and 64 directly, and quotes the claim's
+    // leading clause in its own body.
+    (
+        "filter intra on a superblock-level HORZ/VERT strip (never expected -- av1_filter_intra_allowed_bsize caps at 32x32)",
+        "a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol",
+        Proof::Enumeration,
+    ),
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
@@ -2695,6 +2724,45 @@ mod tests {
              test that does not use the string it is said to prove is not a proof:\n\
              {unanchored:#?}\n\
              Name a gate that quotes the refusal (or its leading clause), or write one."
+        );
+    }
+
+    /// The OTHER half of the inventory's invariant: every string LISTED in
+    /// [`REFUSALS`] or [`CAPABILITY_CLAIMS`] has a row in [`PROVEN`].
+    ///
+    /// `every_proven_refusal_names_a_test_that_exists` checks the direction
+    /// row -> live refusal, so a string added to the inventory with no proving
+    /// gate was invisible: the file could list 33 strings, carry 31 rows, and
+    /// every test in the module stayed green. Two rows were missing on main
+    /// (the BLOCK_INVALID subsize refusal and the lone filter-intra capability
+    /// claim) precisely because nothing compared the two sets. This is that
+    /// comparison, so the next one cannot land unmeasured.
+    #[test]
+    fn every_listed_refusal_and_capability_claim_has_a_proven_row() {
+        let mut listed = 0usize;
+        let mut unmeasured: Vec<&str> = Vec::new();
+        for reason in REFUSALS.iter().chain(CAPABILITY_CLAIMS.iter()) {
+            listed += 1;
+            if !PROVEN.iter().any(|(row, _, _)| *row == *reason) {
+                unmeasured.push(reason);
+            }
+        }
+        assert!(
+            unmeasured.is_empty(),
+            "these strings are listed as refusals / capability claims but no PROVEN row names a \
+             gate that proves them -- an unmeasured claim is what this table exists to make \
+             visible:\n{unmeasured:#?}"
+        );
+        assert_eq!(
+            listed,
+            PROVEN.len(),
+            "{listed} strings are listed and {} rows exist -- they must be one to one, so a row \
+             can never stand in for a string that is not listed",
+            PROVEN.len()
+        );
+        eprintln!(
+            "refusal inventory: {listed} listed strings, {} PROVEN rows, one to one",
+            PROVEN.len()
         );
     }
 
