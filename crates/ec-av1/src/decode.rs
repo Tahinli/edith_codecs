@@ -2162,6 +2162,110 @@ pub(crate) fn skip_arm_chroma_rect_shapes() -> usize {
     SKIP_ARM_CHROMA_RECT_SHAPES.with(|c| c.get())
 }
 
+// lane-av1floorshift: the two FRAME chroma plane allocators
+// (`decode_key_frame_tile_with_cdfs` and `decode_inter_tile`'s `PlaneBuf` trio)
+// size U and V as `(width >> ss_x) x (height >> ss_y)` with `width`/`height`
+// the 32-aligned coded size and `true_width`/`true_height` its `mi_cols * 4`
+// counterpart. `lanes/av1subsizesweep.report.md` named these "floor-`>>`
+// chroma plane allocators -- shape assumption at frame edges; not probed":
+// the `>>` FLOORS where libaom's own producer CROPS (`round_ss`), so the
+// question was whether an odd frame dimension makes the allocation one sample
+// short of the extent every chroma walk inside the tile indexes.
+//
+// `FRAME_CHROMA_ALLOC_SHORT_SAMPLES` is the measured answer: the number of
+// samples by which the allocated `cw * ch` fell SHORT of the `round_ss`
+// extent the tile's chroma walks may address, summed over every frame. It
+// reads the allocation's real length against a recomputed `round_ss` bound, so
+// it measures the shape rather than proxying a condition. Restoring a bare
+// `>> 1` on either axis drives it strictly positive at an odd dimension.
+thread_local! {
+    static FRAME_CHROMA_ALLOC_SHORT_SAMPLES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+// lane-av1floorshift: frames whose coded luma dimension made `>>` and
+// `round_ss` DISAGREE on a chroma axis -- i.e. the only frames on which the
+// floor-vs-crop question is even decidable. Zero on every even dimension,
+// which is why a gate asserting `FRAME_CHROMA_ALLOC_SHORT_SAMPLES == 0` is
+// vacuous without this: on an even frame the two forms are the same number
+// and the shortfall cannot move.
+thread_local! {
+    static FRAME_CHROMA_ALLOC_CROP_SHAPES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+// How many times a frame chroma plane allocator ran at all -- one per frame,
+// from either the key-frame or the inter call site. The non-vacuity arm: the
+// other two counters are ZERO on every input that exists (see
+// [`note_frame_chroma_alloc`]), so a gate that only asserted them would pass
+// with the instrument removed entirely.
+thread_local! {
+    static FRAME_CHROMA_ALLOC_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FRAME_CHROMA_ALLOC_CALLS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn frame_chroma_alloc_calls() -> usize {
+    FRAME_CHROMA_ALLOC_CALLS.with(|c| c.get())
+}
+
+/// Current value of [`FRAME_CHROMA_ALLOC_SHORT_SAMPLES`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn frame_chroma_alloc_short_samples() -> usize {
+    FRAME_CHROMA_ALLOC_SHORT_SAMPLES.with(|c| c.get())
+}
+
+/// Current value of [`FRAME_CHROMA_ALLOC_CROP_SHAPES`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn frame_chroma_alloc_crop_shapes() -> usize {
+    FRAME_CHROMA_ALLOC_CROP_SHAPES.with(|c| c.get())
+}
+
+/// The census both frame chroma plane allocators share. `shape` is the frame's
+/// own 32-aligned coded `(width, height)`, `ss` its `(ss_x, ss_y)`.
+///
+/// `round_ss` is libaom's chroma CROP (`av1_round_shift`), the extent the
+/// committed reference planes are stored at and the bound every chroma walk
+/// inside the tile is clamped against.
+///
+/// `alloc` is the allocator's OWN `(cw, ch)` -- the numbers that size the
+/// `PlaneBuf` -- not a recomputation of them. That is what makes the gate
+/// bite: the shortfall is a difference between what was allocated and what the
+/// tile may address, so replacing the shift with a bare `>> 1` (the 4:2:0-only
+/// form this lane's target class is made of) moves it on the 4:2:2 and 4:4:4
+/// witnesses, where the correct shift and the hardcoded one are different
+/// numbers. A counter that recomputed `shape >> ss` beside the allocation
+/// would have read the same value either way and proved nothing.
+fn note_frame_chroma_alloc(shape: (usize, usize), alloc: (usize, usize), ss: (usize, usize)) {
+    hit!(FRAME_CHROMA_ALLOC_CALLS);
+    let (need_w, need_h) = (round_ss(shape.0, ss.0), round_ss(shape.1, ss.1));
+    // Decidability: the floor and the crop are the same number on this frame,
+    // so the shortfall below is the same number the two forms would have given.
+    if (need_w, need_h) != (shape.0 >> ss.0, shape.1 >> ss.1) {
+        hit!(FRAME_CHROMA_ALLOC_CROP_SHAPES);
+        if crate::envflags::env_flag!("EC_AV1_CHROMA_ALLOC_SWEEP") {
+            eprintln!(
+                "CHROMA_ALLOC luma={}x{} ss={:?} floor={}x{} round_ss={}x{} alloc={}x{}",
+                shape.0,
+                shape.1,
+                ss,
+                shape.0 >> ss.0,
+                shape.1 >> ss.1,
+                need_w,
+                need_h,
+                alloc.0,
+                alloc.1,
+            );
+        }
+    }
+    let want = need_w * need_h;
+    let got = alloc.0 * alloc.1;
+    if want > got {
+        hit_do!(FRAME_CHROMA_ALLOC_SHORT_SAMPLES.with(|c| c.set(c.get() + want - got)));
+    }
+}
+
 /// Current value of [`CHROMA422_SQUARE_HITS`].
 // lane-av1-422b: `pub` so `examples/decode_probe.rs` can census it the way
 // it does every other capability counter.
@@ -36280,6 +36384,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         plane: 0,
     };
     let (cw, ch) = (width >> ss_x(fctx), height >> ss_y(fctx));
+    note_frame_chroma_alloc((width, height), (cw, ch), (ss_x(fctx), ss_y(fctx)));
     let (ctw, cth) = (true_width >> ss_x(fctx), true_height >> ss_y(fctx));
     let mut u = PlaneBuf {
         data: std::borrow::Cow::Owned(fresh_plane(cw * ch, ctw, cth, cw, ch)),
@@ -54060,6 +54165,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         plane: 0,
     };
     let (cw, ch) = (width >> ss_x(fctx), height >> ss_y(fctx));
+    note_frame_chroma_alloc((width, height), (cw, ch), (ss_x(fctx), ss_y(fctx)));
     let (ctw, cth) = (true_width >> ss_x(fctx), true_height >> ss_y(fctx));
     let mut u = PlaneBuf {
         data: std::borrow::Cow::Owned(fresh_plane(cw * ch, ctw, cth, cw, ch)),
