@@ -3676,6 +3676,113 @@ pub(crate) mod tests {
             );
         }
     }
+
+    /// lane-av1422gather3: `decode_block_128rect`'s per-chunk CHROMA unit
+    /// walk gathered its coefficient context with the plain square-cut
+    /// `around_mi_rect`, so at ss (1,0) its above dc vote summed 16 LUMA mi
+    /// cells where libaom's `get_txb_ctx_general` reads `txb_w_unit` =
+    /// `chroma_tx / 4` = 8 CHROMA cells (one chroma column per PAIR of luma
+    /// mi columns; both luma cells of a column carry the covering unit's
+    /// whole-unit dc sign). That is the same pair rule the mu-chunk walks
+    /// take (`around_mi_422_chroma`), and the gather now routes through it
+    /// under the ss guard -- verbatim `around_mi_rect` at every other shape.
+    ///
+    /// Reachability is MEASURED, not assumed: the walk fires at ss (1,0) on
+    /// both pinned `422_intrabc_sb128_strip*.obu` cells, 72 chroma unit
+    /// gathers each (`sb128rect_chroma_replay_hits().0`, the same walk's own
+    /// replay counter). No committed cell DISCRIMINATES the change: with the
+    /// pair rule in place all 21 committed 4:2:2 cells are byte-exact
+    /// against ffmpeg, exactly as the pre-change tree was (the gathered
+    /// votes cancel at every reached unit), so THIS gate -- not a pixel
+    /// compare -- is what stops the routing being reverted.
+    #[test]
+    fn the_422_block_128rect_chroma_chunk_gather_stays_per_axis() {
+        const NAME: &str = "the_422_block_128rect_chroma_chunk_gather_stays_per_axis";
+        let src = include_str!("decode.rs");
+        let body = src
+            .split_once("fn decode_block_128rect(")
+            .expect("decode_block_128rect must exist")
+            .1
+            .split_once("\nfn ")
+            .expect("decode_block_128rect must be a top-level fn")
+            .0;
+        // Scan CODE only: the fix's own comment quotes the guard form, and a
+        // prose mention must not read as a reintroduction (nor mask one).
+        let stripped: Vec<&str> = body
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
+            .collect();
+        let code = stripped.join("\n");
+        let body = code.as_str();
+        assert_eq!(
+            body.matches("if ss_x(fctx) == 1 && ss_y(fctx) == 0 {")
+                .count(),
+            1,
+            "{NAME}: the ss (1, 0) guard over the per-chunk chroma gather must \
+             appear exactly once in decode_block_128rect, found {}",
+            body.matches("if ss_x(fctx) == 1 && ss_y(fctx) == 0 {")
+                .count()
+        );
+        for name in [
+            "neighbours.around_mi_422_chroma(cu_mi, luma_span, luma_span_h)",
+            "neighbours.around_mi_rect(cu_mi, luma_span, luma_span_h)",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{NAME}: `{name}` must appear exactly once in \
+                 decode_block_128rect's per-chunk chroma gather, found {} -- one \
+                 arm has been dropped, so the gather has fallen back to the \
+                 square per-mi rule at ss (1, 0)",
+                body.matches(name).count()
+            );
+        }
+        // Reachability arm: the walk must actually RUN at ss (1, 0) on the
+        // pinned strips, or the routing above is a no-op the gate cannot see.
+        // A stream that stopped coding 128-axis intra blocks reads 0 and this
+        // assert fails instead of passing over a decode that never reached
+        // the fixed gather (class gate-blind-to-feature).
+        for (file, bytes, fp) in [
+            (
+                "422_intrabc_sb128_strip.obu",
+                1672usize,
+                0x50f5cfc576e4cd00_u64,
+            ),
+            (
+                "422_intrabc_sb128_strip_notxsearch.obu",
+                1675,
+                0xd4936f252ff8cff0,
+            ),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(file);
+            let data = std::fs::read(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{NAME}: pinned witness {} is missing ({e}) -- the gate cannot run",
+                    path.display()
+                )
+            });
+            assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
+            assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
+            let _guard = lock_gate_counters();
+            let before = crate::decode::sb128rect_chroma_replay_hits().0;
+            let frames = decode_stream(&data)
+                .unwrap_or_else(|e| panic!("{NAME}: {file} no longer decodes cleanly: {e}"));
+            let after = crate::decode::sb128rect_chroma_replay_hits().0;
+            assert_eq!(
+                after - before,
+                72,
+                "{NAME}: {file} gathered {} chroma unit context(s) in \
+                 decode_block_128rect's per-chunk walk; 72 were measured at ss (1, 0) -- \
+                 a lower number means the gather is no longer REACHED here \
+                 (class gate-blind-to-feature)",
+                after - before
+            );
+            assert_eq!(frames.len(), 5, "{NAME}: {file} frame count");
+        }
+    }
+
     /// lane-av1422lpf: the three 4:2:2 LOSSLESS INTER witness fixtures,
     /// PINNED, and asserted to refuse at the SEQUENCE HEADER.
     ///
