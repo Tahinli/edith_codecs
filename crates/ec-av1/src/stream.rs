@@ -3624,6 +3624,27 @@ pub(crate) mod tests {
                 body.matches(name).count()
             );
         }
+        // lane-av1muchunk422sym: the CHROMA gather of that same walk must take
+        // the 4:2:2 pair rule, exactly as `decode_inter_block`'s mu-chunk walk
+        // does (one chroma column per pair of luma mi cells; the plain rect
+        // gather doubles the above dc vote and flips `dc_sign_ctx` wherever
+        // above and left cancel). Reachability is measured: the walk fires at
+        // ss (1, 0) on `422_intrabc_sb128_strip.obu` (`EC_IBC128_BANDS`
+        // prints); that fixture's own votes do not cancel, so THIS gate -- not
+        // a pixel compare -- is what stops the routing being reverted.
+        for name in [
+            "let cu_around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {",
+            "neighbours.around_mi_422_chroma(",
+        ] {
+            assert_eq!(
+                body.matches(name).count(),
+                1,
+                "{NAME}: `{name}` must appear exactly once in \
+                 decode_intrabc_128rect's chroma chunk walk, found {} -- the \
+                 gather has fallen back to the square per-mi rule",
+                body.matches(name).count()
+            );
+        }
         // The replay's own unit luma span is the lossless/lossy `cu << ss` form
         // (site 2 spells it separately from the read walk's `cu_tx << ss`).
         for name in [
@@ -42895,22 +42916,19 @@ exit 0
     /// shares this exact source text and is routed out of the counter by
     /// `is_compound`.
     ///
-    /// **7 of the 8 streams this lane generated DIVERGE from ffmpeg; only
+    /// **7 of the 8 streams this lane generated DIVERGED from ffmpeg; only
     /// `i6_grad128_iis` (the intra-in-inter fixture, pinned in the twin test
-    /// below) is byte-exact. This compound pin is therefore the COUNTER
-    /// WITNESS, not an exactness witness** -- it asserts the walk ran, and
-    /// nothing about pixels. The divergence on this tip is Y and U exact, V
-    /// differing on a fixed column band (2063/8192, 2138/8192, 2105/8192 and
-    /// 1988/8192 V samples on shown frames 1-4, first at V row 60 col 36), the
-    /// same shape on all four compound streams this lane produced, while the
-    /// committed 4:2:2 128-root SINGLE-reference stream (`422_sb128_3f.obu`)
-    /// and the committed compound-warp stream whose blocks are all <= 64
-    /// (`422_residual_compound_warp_16f.obu`) both stay exact against the same
-    /// oracle -- so it tracks the 128-root COMPOUND path these counters name.
-    /// It is a NEW defect and fixing the walk is explicitly out of this lane's
-    /// charter. When a fix lane lands, add the oracle compare to this test; the
-    /// counter half already stops this fixture silently ceasing to reach the
-    /// walk it was pinned for.
+    /// below) was byte-exact.** lane-av1muchunk422sym has since fixed this
+    /// pin's stream: the compound mu-chunk walk gathered its CHROMA
+    /// coefficient context with the plain rect rule, which at ss (1, 0) counts
+    /// one chroma column twice in the above vote (see the walk's own comment).
+    /// **The stream is now byte-exact against the instrumented aomdec over all
+    /// 7 decode-order frames (6 shown + 1 hidden alt-ref)**, so this test
+    /// carries both halves: the counter witness that the walk ran AND the
+    /// exactness witness. The pinned V-plane hashes run without an oracle;
+    /// `decode_all_frames_vs_oracle` adds the decode-order compare when one is
+    /// present. The counter half still stops this fixture silently ceasing to
+    /// reach the walk it was pinned for.
     ///
     /// Recipe (byte-reproducible; whole aomenc argv):
     /// ```text
@@ -42932,6 +42950,17 @@ exit 0
         const LEN: usize = 895;
         const FNV: u64 = 0xfb28_f9a7_cf23_9897;
         const MIN_UNITS: usize = 32;
+        // lane-av1muchunk422sym: shown frame 2's V plane byte-for-byte (it is
+        // the first intrinsically wrong frame; the pre-fix square gather put
+        // 2138 of these 8192 samples off by up to 4), and shown frame 0's as
+        // the unaffected control. 0xa0e5_8bf4_207b_29ba is the ffmpeg/aomdec
+        // exact plane.
+        const SHOWN_F2_V_FNV: u64 = 0xa0e5_8bf4_207b_29ba;
+        const SHOWN_F0_V_FNV: u64 = 0xcc5e_3291_1915_9024;
+        /// Chroma (36, 60) of shown frame 2 -- the FIRST sample that moved,
+        /// `60 * 64 + 36`. The pre-fix square gather read 113, the oracle 112.
+        const FIRST_WRONG_V: usize = 3876;
+        const SHOWN_F2_V_AT_FIRST_WRONG: u16 = 112;
         let _gate_lock = lock_gate_counters();
         let stream = read_pinned_muchunk_fixture(FILE, LEN, FNV, NAME);
         assert_eq!(
@@ -42943,9 +42972,9 @@ exit 0
             crate::decode::mu_chunk_compound_units(),
             crate::decode::mu_chunk_intra_in_inter_units(),
         );
-        let frames = crate::stream::decode_stream(&stream)
-            .unwrap_or_else(|e| panic!("{NAME}: {FILE} no longer decodes cleanly: {e}"))
-            .len();
+        let shown = crate::stream::decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: {FILE} no longer decodes cleanly: {e}"));
+        let frames = shown.len();
         let (compound, intra) = (
             crate::decode::mu_chunk_compound_units() - before.0,
             crate::decode::mu_chunk_intra_in_inter_units() - before.1,
@@ -42961,13 +42990,59 @@ exit 0
             "{NAME}: {FILE} also ran the intra-in-inter walk ({intra} units) -- the two fixtures \
              no longer separate the cells"
         );
-        // DELIBERATELY NO ORACLE COMPARE: 7 of the 8 streams this lane generated
-        // diverge and this fixture is one of them. This test is the counter
-        // witness, not an exactness witness -- see the doc comment.
-        eprintln!(
-            "{NAME}: {FILE} compound_units={compound} intra_in_inter_units={intra} -- counter \
-             witness, pixels NOT asserted (this stream is measured DIVERGENT)"
+        // lane-av1muchunk422sym: the EXACTNESS half the diagnostic lane handed
+        // over ("when a fix lane lands, add the oracle compare to this test").
+        // The fix routes this walk's CHROMA context gather through the 4:2:2
+        // pair rule (`around_mi_422_chroma`): at ss (1, 0) one chroma column
+        // spans two luma mi columns, so the plain rect gather summed the unit's
+        // above dc sign twice and `dc_sign_ctx`'s signum flipped whenever above
+        // and left cancelled. The first wrong symbol was the DC SIGN of the V
+        // unit at chunk (1, 1) of decode frame 2 -- ours read
+        // `dc_sign_cdf[1]`, the oracle row 0.
+        //
+        // The pinned half below needs NO oracle and is therefore the one that
+        // cannot silently skip: shown frame 2 (the first intrinsically wrong
+        // frame) is asserted sample-for-sample on its V plane. Frame 0's is
+        // asserted too, as the unaffected control that fails if the gather is
+        // "fixed" past its own cell.
+        assert_eq!(
+            shown[0].v.len(),
+            64 * 128,
+            "{NAME}: {FILE} is no longer 4:2:2 -- the V plane shape moved"
         );
+        assert_eq!(
+            fnv1a64(&shown[2].v.iter().map(|&s| s as u8).collect::<Vec<u8>>()),
+            SHOWN_F2_V_FNV,
+            "{NAME}: {FILE} shown frame 2's V plane moved -- the compound mu-chunk walk's 4:2:2 \
+             chroma context gather is wrong again (first sample to move is chroma (36, 60), index \
+             3876, expected {})",
+            SHOWN_F2_V_AT_FIRST_WRONG
+        );
+        assert_eq!(
+            shown[2].v[FIRST_WRONG_V], SHOWN_F2_V_AT_FIRST_WRONG,
+            "{NAME}: {FILE} shown frame 2 V[3876] (chroma (36, 60)) is {} -- the pre-fix square \
+             gather read 113 here",
+            shown[2].v[FIRST_WRONG_V]
+        );
+        assert_eq!(
+            fnv1a64(&shown[0].v.iter().map(|&s| s as u8).collect::<Vec<u8>>()),
+            SHOWN_F0_V_FNV,
+            "{NAME}: {FILE} shown frame 0's V plane moved -- the 4:2:2 routing changed a frame it \
+             must not touch"
+        );
+        if aomdec_available(NAME) {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert_eq!(decoded, 7, "{NAME}: {FILE} decode-order frame count");
+            eprintln!(
+                "{NAME}: {FILE} byte-exact over {decoded} decode-order frame(s) ({hidden} hidden), \
+                 compound_units={compound} intra_in_inter_units={intra}"
+            );
+        } else {
+            eprintln!(
+                "{NAME}: {FILE} compound_units={compound} intra_in_inter_units={intra} -- the \
+                 decode-order oracle compare above did NOT run (no aomdec)"
+            );
+        }
     }
 
     /// lane-av1muchunk422b: the **intra-in-inter** `side > 64` mu-chunk walk --

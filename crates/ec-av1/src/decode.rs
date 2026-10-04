@@ -15431,8 +15431,18 @@ fn decode_intrabc_128rect(
                             );
                             // Per unit, AFTER the earlier units' stamps: this
                             // unit's coefficient context must see them.
-                            let cu_around =
-                                neighbours.around_mi_rect(unit_mi, unit_luma_w, unit_luma_h);
+                            //
+                            // lane-av1muchunk422sym: same 4:2:2 pair rule as
+                            // `decode_inter_block`'s mu-chunk walk -- at ss
+                            // (1, 0) one CHROMA column spans two luma mi
+                            // columns, so the plain rect gather doubles the
+                            // above dc vote and flips `dc_sign_ctx` whenever
+                            // above and left cancel.
+                            let cu_around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                                neighbours.around_mi_422_chroma(unit_mi, unit_luma_w, unit_luma_h)
+                            } else {
+                                neighbours.around_mi_rect(unit_mi, unit_luma_w, unit_luma_h)
+                            };
                             if crate::envflags::env_flag!("EC_ECDUMP") {
                                 for p in 1..3 {
                                     let ab: Vec<String> = (0..unit_luma_w / MI)
@@ -43842,14 +43852,16 @@ fn decode_inter_block(
                                 // The unit's own footprint on the LUMA mi
                                 // grid, per axis (32 << ss) px: 64x64 (16x16
                                 // mi) at 4:2:0, 32x32 (8x8 mi) at 4:4:4,
-                                // 64x32 (16x8 mi) at 4:2:2. `around_mi_rect`
-                                // reads and
-                                // `record_mi_chroma` stamps span exactly the
-                                // unit's own cells -- `get_txb_ctx` reads the
-                                // 8 context cells of the TX_32X32 itself, and
-                                // `av1_set_entropy_contexts` memsets the same
-                                // 8, so the unit over never sees this unit's
-                                // state and the unit below always does.
+                                // 64x32 (16x8 mi) at 4:2:2. The context
+                                // gather and `record_mi_chroma`'s stamp span
+                                // exactly the unit's own cells -- `get_txb_ctx`
+                                // reads the 8 context cells of the TX_32X32
+                                // itself, and `av1_set_entropy_contexts` memsets
+                                // the same 8, so the unit over never sees this
+                                // unit's state and the unit below always does.
+                                // At ss (1, 0) those 8 are CHROMA cells, so the
+                                // gather routes through the 4:2:2 pair rule
+                                // (lane-av1muchunk422sym, see the walk below).
                                 let unit_luma_w = cu_tx << ss_x(fctx);
                                 let unit_luma_h = cu_tx << ss_y(fctx);
                                 let cu_scan = default_scan(cu_tx);
@@ -43924,11 +43936,36 @@ fn decode_inter_block(
                                             // units' stamps: this unit's
                                             // coefficient context must see
                                             // them.
-                                            let cu_around = neighbours.around_mi_rect(
-                                                unit_mi,
-                                                unit_luma_w,
-                                                unit_luma_h,
-                                            );
+                                            //
+                                            // lane-av1muchunk422sym: at ss
+                                            // (1, 0) one CHROMA column spans
+                                            // two luma mi columns, so the plain
+                                            // rect gather sums this unit's
+                                            // above dc sign TWICE where
+                                            // libaom's `get_txb_ctx_general`
+                                            // reads `txb_w_unit` CHROMA cells --
+                                            // one per column. `dc_sign_ctx`
+                                            // only sees the vote's signum, so
+                                            // the doubled vote flips the row
+                                            // exactly when above and left
+                                            // cancel; `around_mi_422_chroma`
+                                            // samples every second above cell,
+                                            // which IS libaom's sum. Same guard
+                                            // as the intra twin (13169) and the
+                                            // block-8 arm (19810).
+                                            let cu_around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                                                neighbours.around_mi_422_chroma(
+                                                    unit_mi,
+                                                    unit_luma_w,
+                                                    unit_luma_h,
+                                                )
+                                            } else {
+                                                neighbours.around_mi_rect(
+                                                    unit_mi,
+                                                    unit_luma_w,
+                                                    unit_luma_h,
+                                                )
+                                            };
                                             let (cu_x, cu_y) = (
                                                 cpx + cc * chunk_chroma_w + uc * cu_tx,
                                                 cpy + cr * chunk_chroma_h + ur * cu_tx,
@@ -45665,14 +45702,16 @@ fn decode_inter_block(
                                 // The unit's own footprint on the LUMA mi
                                 // grid, per axis (32 << ss) px: 64x64 (16x16
                                 // mi) at 4:2:0, 32x32 (8x8 mi) at 4:4:4,
-                                // 64x32 (16x8 mi) at 4:2:2. `around_mi_rect`
-                                // reads and
-                                // `record_mi_chroma` stamps span exactly the
-                                // unit's own cells -- `get_txb_ctx` reads the
-                                // 8 context cells of the TX_32X32 itself, and
-                                // `av1_set_entropy_contexts` memsets the same
-                                // 8, so the unit over never sees this unit's
-                                // state and the unit below always does.
+                                // 64x32 (16x8 mi) at 4:2:2. The context
+                                // gather and `record_mi_chroma`'s stamp span
+                                // exactly the unit's own cells -- `get_txb_ctx`
+                                // reads the 8 context cells of the TX_32X32
+                                // itself, and `av1_set_entropy_contexts` memsets
+                                // the same 8, so the unit over never sees this
+                                // unit's state and the unit below always does.
+                                // At ss (1, 0) those 8 are CHROMA cells, so the
+                                // gather routes through the 4:2:2 pair rule
+                                // (lane-av1muchunk422sym, see the walk below).
                                 let unit_luma_w = cu_tx << ss_x(fctx);
                                 let unit_luma_h = cu_tx << ss_y(fctx);
                                 let cu_scan = default_scan(cu_tx);
@@ -45727,11 +45766,36 @@ fn decode_inter_block(
                                             // units' stamps: this unit's
                                             // coefficient context must see
                                             // them.
-                                            let cu_around = neighbours.around_mi_rect(
-                                                unit_mi,
-                                                unit_luma_w,
-                                                unit_luma_h,
-                                            );
+                                            //
+                                            // lane-av1muchunk422sym: at ss
+                                            // (1, 0) one CHROMA column spans
+                                            // two luma mi columns, so the plain
+                                            // rect gather sums this unit's
+                                            // above dc sign TWICE where
+                                            // libaom's `get_txb_ctx_general`
+                                            // reads `txb_w_unit` CHROMA cells --
+                                            // one per column. `dc_sign_ctx`
+                                            // only sees the vote's signum, so
+                                            // the doubled vote flips the row
+                                            // exactly when above and left
+                                            // cancel; `around_mi_422_chroma`
+                                            // samples every second above cell,
+                                            // which IS libaom's sum. Same guard
+                                            // as the intra twin (13169) and the
+                                            // block-8 arm (19810).
+                                            let cu_around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                                                neighbours.around_mi_422_chroma(
+                                                    unit_mi,
+                                                    unit_luma_w,
+                                                    unit_luma_h,
+                                                )
+                                            } else {
+                                                neighbours.around_mi_rect(
+                                                    unit_mi,
+                                                    unit_luma_w,
+                                                    unit_luma_h,
+                                                )
+                                            };
                                             let (cu_x, cu_y) = (
                                                 cpx + cc * chunk_chroma_w + uc * cu_tx,
                                                 cpy + cr * chunk_chroma_h + ur * cu_tx,
