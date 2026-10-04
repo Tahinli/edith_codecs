@@ -43453,6 +43453,277 @@ exit 0
         }
     }
 
+    /// lane-av1muchunkluma: the **compound-arm CONTENT** stream that reaches
+    /// only the intra-in-inter `side > 64` mu-chunk walk. `aomenc` was driven
+    /// with the compound arm's own flags (`--enable-masked-comp=1
+    /// --enable-onesided-comp=1 --auto-alt-ref=1`), so it *is* the compound
+    /// hunt's `c3_grad128_comp` -- but its partition search never enters the
+    /// compound mu-chunk walk (0 `compound/singleref` probe lines, 16
+    /// `intra_in_inter` ones), so its ONLY mu-chunk walk is site 8.
+    ///
+    /// lane-av1muchunk422class measured this stream diverging on the
+    /// then-current tree: first wrong sample **Y (62, 6) of shown frame 1**
+    /// (`62 * 128 + 6 = 7942`, ours 74, ffmpeg 75) and a byte-identical decode
+    /// before and after the compound DC-sign fix. lane-av1muchunk422iis's
+    /// intra-in-inter gather fix closed it: the pinned halves below are the
+    /// exact plane and the exact sample the pre-fix square gather moved.
+    ///
+    /// Recipe (byte-reproducible; re-encoded by this lane from the frozen
+    /// `grad128.y4m`, sha256 `ab8b23137c4efc818884efcf0bb6ccda363bae4b8360f2ca10ca68506cbb777d`,
+    /// which itself regenerates byte-for-byte):
+    /// ```text
+    /// ffmpeg -v error -f lavfi -i "gradients=size=128x128:c0=0xa1128f:\
+    ///   c1=0xd98c48:c2=0x120601:c3=0x4abfba:seed=63:duration=0.24:rate=25,\
+    ///   noise=all_seed=63:alls=6:allf=t" -t 0.24 -pix_fmt yuv422p \
+    ///   -f yuv4mpegpipe - > grad128.y4m
+    /// aomenc --codec=av1 --profile=2 --input-chroma-subsampling-x=1 \
+    ///   --input-chroma-subsampling-y=0 --passes=1 --end-usage=q --cq-level=40 \
+    ///   --cpu-used=0 --threads=1 --row-mt=0 --sb-size=128 \
+    ///   --min-partition-size=128 --max-partition-size=128 \
+    ///   --enable-rect-partitions=0 --enable-ab-partitions=0 \
+    ///   --enable-1to4-partitions=0 --enable-palette=0 --enable-intrabc=0 \
+    ///   --deltaq-mode=0 --enable-tx-size-search=0 --limit=6 --lag-in-frames=25 \
+    ///   --auto-alt-ref=1 --enable-global-motion=1 --enable-warped-motion=1 \
+    ///   --enable-masked-comp=1 --enable-diff-wtd-comp=1 --enable-onesided-comp=1 \
+    ///   --obu -o c3_grad128_comp.obu grad128.y4m
+    /// ```
+    #[test]
+    fn a_422_muchunk_iis_128root_grad128_comp_stream_is_exact_and_reaches_its_unit_walk() {
+        const NAME: &str =
+            "a_422_muchunk_iis_128root_grad128_comp_stream_is_exact_and_reaches_its_unit_walk";
+        const FILE: &str = "422_muchunk_iis_128root_grad128.obu";
+        const LEN: usize = 34449;
+        const FNV: u64 = 0xfc59_a295_38db_577e;
+        const MIN_UNITS: usize = 16;
+        const SHOWN: usize = 6;
+        // The stream carried in frame 1, the first frame the pre-fix gather
+        // moved; frame 0 is the unaffected control.
+        const F1_Y_FNV: u64 = 0x1b17_b4c2_4bd3_58d9;
+        const F0_Y_FNV: u64 = 0x7666_cd9b_dc47_be3f;
+        // Y (62, 6) of shown frame 1: the first sample that moved. The
+        // pre-fix square gather read 74 here, ffmpeg 75.
+        const FIRST_WRONG_Y: usize = 62 * 128 + 6;
+        const F1_Y_AT_FIRST_WRONG: u16 = 75;
+        let _gate_lock = lock_gate_counters();
+        let stream = read_pinned_muchunk_fixture(FILE, LEN, FNV, NAME);
+        assert_eq!(
+            obu_stream_shape(&stream),
+            Some((true, 1, 0, false)),
+            "{NAME}: {FILE} is not a 4:2:2 (ss 1/0, non-mono) 128x128-superblock stream"
+        );
+        let before = (
+            crate::decode::mu_chunk_compound_units(),
+            crate::decode::mu_chunk_intra_in_inter_units(),
+        );
+        let shown = crate::stream::decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: {FILE} no longer decodes cleanly: {e}"));
+        let frames = shown.len();
+        let (compound, intra) = (
+            crate::decode::mu_chunk_compound_units() - before.0,
+            crate::decode::mu_chunk_intra_in_inter_units() - before.1,
+        );
+        assert_eq!(frames, SHOWN, "{NAME}: {FILE} shown-frame count");
+        assert!(
+            intra >= MIN_UNITS,
+            "{NAME}: {FILE} allocated only {intra} intra-in-inter `side > 64` mu-chunk units \
+             (expected >= {MIN_UNITS}) -- the site counter this gate names did not move"
+        );
+        assert_eq!(
+            compound, 0,
+            "{NAME}: {FILE} moved the compound-named counter ({compound} units) -- this stream's \
+             only mu-chunk walk is the intra-in-inter one and the cells are no longer separated"
+        );
+        // (b) the oracle-free half: shown frame 1 (the first frame the pre-fix
+        // gather moved) is asserted sample-for-sample on its luma plane, plus
+        // the single sample that moved first; shown frame 0's luma is the
+        // unaffected control that fails if the gather is "fixed" past its own
+        // cell.
+        assert_eq!(
+            shown[1].y.len(),
+            128 * 128,
+            "{NAME}: {FILE} is no longer 4:2:2 at 128x128 -- the luma plane shape moved"
+        );
+        assert_eq!(
+            fnv1a64(&shown[1].y.iter().map(|&s| s as u8).collect::<Vec<u8>>()),
+            F1_Y_FNV,
+            "{NAME}: {FILE} shown frame 1's luma moved -- the intra-in-inter mu-chunk walk's 4:2:2 \
+             chroma context gather is wrong again (first sample to move is Y (62, 6), index \
+             {FIRST_WRONG_Y})"
+        );
+        assert_eq!(
+            shown[1].y[FIRST_WRONG_Y], F1_Y_AT_FIRST_WRONG,
+            "{NAME}: {FILE} shown frame 1 Y[{FIRST_WRONG_Y}] (luma (62, 6)) is {} -- the pre-fix \
+             square gather read 74 here",
+            shown[1].y[FIRST_WRONG_Y]
+        );
+        assert_eq!(
+            fnv1a64(&shown[0].y.iter().map(|&s| s as u8).collect::<Vec<u8>>()),
+            F0_Y_FNV,
+            "{NAME}: {FILE} shown frame 0's luma moved -- the 4:2:2 routing changed a frame it \
+             must not touch"
+        );
+        // (c) the required ffmpeg compare: every plane of every shown frame.
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP {NAME}: no ffmpeg -- the 4:2:2 pixel compare this gate exists for did NOT \
+                 run (set EC_AV1_REQUIRE_FFMPEG=1 to make this a failure)"
+            );
+            return;
+        }
+        let ff = ffmpeg_decode_sequence_422(&stream, 128, 128, SHOWN);
+        assert_eq!(ff.len(), SHOWN, "{NAME}: {FILE} ffmpeg shown-frame count");
+        for (i, (got, want)) in shown.iter().zip(&ff).enumerate() {
+            assert_eq!(
+                got.y, want.y,
+                "{NAME}: {FILE} shown frame {i} luma vs ffmpeg"
+            );
+            assert_eq!(got.u, want.u, "{NAME}: {FILE} shown frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{NAME}: {FILE} shown frame {i} V vs ffmpeg");
+        }
+        if aomdec_available(NAME) {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert_eq!(
+                decoded,
+                SHOWN + 1,
+                "{NAME}: {FILE} decode-order frame count (6 shown + the hidden alt-ref)"
+            );
+            eprintln!(
+                "{NAME}: {FILE} byte-exact vs ffmpeg over {SHOWN} shown frames and vs the \
+                 decode-order oracle over {decoded} frame(s) ({hidden} hidden), \
+                 compound_units={compound} intra_in_inter_units={intra}"
+            );
+        } else {
+            eprintln!(
+                "{NAME}: {FILE} byte-exact vs ffmpeg over {SHOWN} shown frames, \
+                 compound_units={compound} intra_in_inter_units={intra} -- the decode-order \
+                 oracle compare above did NOT run (no aomdec)"
+            );
+        }
+    }
+
+    /// lane-av1muchunkluma: the 128x256 twin of the gate above -- the compound
+    /// hunt's `c4_grad256_comp`. Unlike c3 this stream reaches BOTH `side > 64`
+    /// mu-chunk walks (16 `intra_in_inter` probe lines, 24 `compound/singleref`
+    /// ones with `compound=false`, i.e. the single-reference twin), yet
+    /// lane-av1muchunk422class measured it diverging luma-first (first wrong
+    /// sample **Y (126, 3) of shown frame 1**, `126 * 128 + 3 = 16131`, ours
+    /// 94, ffmpeg 93). This lane re-measured it: still diverging on the
+    /// pre-iis-gather tree, byte-exact on current `main`, so the
+    /// intra-in-inter gather is what closed it -- its `MU_CHUNK_COMPOUND_UNITS`
+    /// delta stays 0 (the counter names the compound arm only), which is why
+    /// the gate's site half asserts the intra-in-inter counter.
+    ///
+    /// Recipe: same `aomenc` argv as the 128x128 gate above with the 128x256
+    /// source (`gradients=size=128x256`, the frozen `grad256.y4m`, sha256
+    /// `03c7fab7a6abc4e6764836cd2d35e76489438ecdba4ca1167fcd868250c0464c`,
+    /// which regenerates byte-for-byte).
+    #[test]
+    fn a_422_muchunk_iis_128x256_grad256_comp_stream_is_exact_and_reaches_its_unit_walk() {
+        const NAME: &str =
+            "a_422_muchunk_iis_128x256_grad256_comp_stream_is_exact_and_reaches_its_unit_walk";
+        const FILE: &str = "422_muchunk_iis_128x256_grad256.obu";
+        const LEN: usize = 68925;
+        const FNV: u64 = 0x65b8_d4dd_3806_7e09;
+        const MIN_UNITS: usize = 16;
+        const SHOWN: usize = 6;
+        const F1_Y_FNV: u64 = 0x75e6_e790_47a8_9882;
+        const F0_Y_FNV: u64 = 0x1265_8460_c00e_a10f;
+        // Y (126, 3) of shown frame 1: the first sample that moved. The
+        // pre-fix square gather read 94 here, ffmpeg 93.
+        const FIRST_WRONG_Y: usize = 126 * 128 + 3;
+        const F1_Y_AT_FIRST_WRONG: u16 = 93;
+        let _gate_lock = lock_gate_counters();
+        let stream = read_pinned_muchunk_fixture(FILE, LEN, FNV, NAME);
+        assert_eq!(
+            obu_stream_shape(&stream),
+            Some((true, 1, 0, false)),
+            "{NAME}: {FILE} is not a 4:2:2 (ss 1/0, non-mono) 128x128-superblock stream"
+        );
+        let before = (
+            crate::decode::mu_chunk_compound_units(),
+            crate::decode::mu_chunk_intra_in_inter_units(),
+        );
+        let shown = crate::stream::decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: {FILE} no longer decodes cleanly: {e}"));
+        let frames = shown.len();
+        let (compound, intra) = (
+            crate::decode::mu_chunk_compound_units() - before.0,
+            crate::decode::mu_chunk_intra_in_inter_units() - before.1,
+        );
+        assert_eq!(frames, SHOWN, "{NAME}: {FILE} shown-frame count");
+        assert!(
+            intra >= MIN_UNITS,
+            "{NAME}: {FILE} allocated only {intra} intra-in-inter `side > 64` mu-chunk units \
+             (expected >= {MIN_UNITS}) -- the site counter this gate names did not move"
+        );
+        assert_eq!(
+            compound, 0,
+            "{NAME}: {FILE} moved the compound-named counter ({compound} units) -- the fixture's \
+             `compound/singleref` hits are its single-reference twin, which must not be counted \
+             here"
+        );
+        assert_eq!(
+            shown[1].y.len(),
+            128 * 256,
+            "{NAME}: {FILE} is no longer 4:2:2 at 128x256 -- the luma plane shape moved"
+        );
+        assert_eq!(
+            fnv1a64(&shown[1].y.iter().map(|&s| s as u8).collect::<Vec<u8>>()),
+            F1_Y_FNV,
+            "{NAME}: {FILE} shown frame 1's luma moved -- the intra-in-inter mu-chunk walk's 4:2:2 \
+             chroma context gather is wrong again (first sample to move is Y (126, 3), index \
+             {FIRST_WRONG_Y})"
+        );
+        assert_eq!(
+            shown[1].y[FIRST_WRONG_Y], F1_Y_AT_FIRST_WRONG,
+            "{NAME}: {FILE} shown frame 1 Y[{FIRST_WRONG_Y}] (luma (126, 3)) is {} -- the pre-fix \
+             square gather read 94 here",
+            shown[1].y[FIRST_WRONG_Y]
+        );
+        assert_eq!(
+            fnv1a64(&shown[0].y.iter().map(|&s| s as u8).collect::<Vec<u8>>()),
+            F0_Y_FNV,
+            "{NAME}: {FILE} shown frame 0's luma moved -- the 4:2:2 routing changed a frame it \
+             must not touch"
+        );
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP {NAME}: no ffmpeg -- the 4:2:2 pixel compare this gate exists for did NOT \
+                 run (set EC_AV1_REQUIRE_FFMPEG=1 to make this a failure)"
+            );
+            return;
+        }
+        let ff = ffmpeg_decode_sequence_422(&stream, 128, 256, SHOWN);
+        assert_eq!(ff.len(), SHOWN, "{NAME}: {FILE} ffmpeg shown-frame count");
+        for (i, (got, want)) in shown.iter().zip(&ff).enumerate() {
+            assert_eq!(
+                got.y, want.y,
+                "{NAME}: {FILE} shown frame {i} luma vs ffmpeg"
+            );
+            assert_eq!(got.u, want.u, "{NAME}: {FILE} shown frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{NAME}: {FILE} shown frame {i} V vs ffmpeg");
+        }
+        if aomdec_available(NAME) {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert_eq!(
+                decoded,
+                SHOWN + 1,
+                "{NAME}: {FILE} decode-order frame count (6 shown + the hidden alt-ref)"
+            );
+            eprintln!(
+                "{NAME}: {FILE} byte-exact vs ffmpeg over {SHOWN} shown frames and vs the \
+                 decode-order oracle over {decoded} frame(s) ({hidden} hidden), \
+                 compound_units={compound} intra_in_inter_units={intra}"
+            );
+        } else {
+            eprintln!(
+                "{NAME}: {FILE} byte-exact vs ffmpeg over {SHOWN} shown frames, \
+                 compound_units={compound} intra_in_inter_units={intra} -- the decode-order \
+                 oracle compare above did NOT run (no aomdec)"
+            );
+        }
+    }
+
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level
     /// partition decision is genuinely HORZ/VERT (not NONE/SPLIT) must
     /// decode pixel-exact through [`crate::decode::decode_block_rect64`] --
