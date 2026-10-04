@@ -42836,6 +42836,256 @@ exit 0
         }
     }
 
+    /// lane-av1muchunk422b: read a pinned 4:2:2 128-root mu-chunk fixture,
+    /// asserting its byte length and FNV-1a64 -- a missing fixture is a
+    /// failure, not a skip.
+    fn read_pinned_muchunk_fixture(name: &str, len: usize, fnv: u64, gate: &str) -> Vec<u8> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(name);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{gate}: pinned fixture {} is missing ({e}) -- the gate cannot run, which is a \
+                 failure, not a skip",
+                path.display()
+            )
+        });
+        assert_eq!(bytes.len(), len, "{gate}: {name} length moved");
+        assert_eq!(fnv1a64(&bytes), fnv, "{gate}: {name} bytes moved");
+        bytes
+    }
+
+    /// lane-av1muchunk422b: `(use_128x128_superblock, ss_x, ss_y, mono_chrome)`
+    /// of an OBU stream's sequence header. Shape first: a stream that came back
+    /// 4:2:0 would leave the `side > 64` mu-chunk walk unexercised while every
+    /// counter assert below still passed.
+    fn obu_stream_shape(stream: &[u8]) -> Option<(bool, u8, u8, bool)> {
+        let mut parser = ec_av1_syntax::Av1Parser::new();
+        let mut pos = 0usize;
+        while let Ok(obu) = parser.parse_obu(&stream[pos..]) {
+            pos += obu.total_size;
+            if pos >= stream.len() {
+                break;
+            }
+        }
+        parser.sequence_header().map(|q| {
+            (
+                q.use_128x128_superblock,
+                q.color_config.subsampling_x,
+                q.color_config.subsampling_y,
+                q.color_config.mono_chrome,
+            )
+        })
+    }
+
+    /// lane-av1muchunk422b: the **compound** `side > 64` mu-chunk walk --
+    /// per-unit chroma allocation of `decode_inter_block`'s compound arm, site
+    /// 2 of `lanes/av1muchunk422.report.md`, which that lane's recipes all
+    /// missed (`part128 none=0` on a 384x256 frame).
+    ///
+    /// Reachability, shared with the intra-in-inter twin below: the streams
+    /// that reach this walk are 128-as-the-whole-frame (`--sb-size=128
+    /// --min-partition-size=128 --max-partition-size=128`, PARTITION_NONE
+    /// forced; here `part128 none=7`) and LOSSY, which is load-bearing: each arm
+    /// has a lossless branch that returns before the unit loop, and
+    /// `W_intrabc.obu` reaches both guards at ss (1,0) allocating nothing. That
+    /// is why [`crate::decode::mu_chunk_compound_units`] counts at the
+    /// ALLOCATION and not at the guard; the counter-proof at the end of the
+    /// intra test pins that gap. The single-reference twin of site 2 (site 5)
+    /// shares this exact source text and is routed out of the counter by
+    /// `is_compound`.
+    ///
+    /// **7 of the 8 streams this lane generated DIVERGE from ffmpeg; only
+    /// `i6_grad128_iis` (the intra-in-inter fixture, pinned in the twin test
+    /// below) is byte-exact. This compound pin is therefore the COUNTER
+    /// WITNESS, not an exactness witness** -- it asserts the walk ran, and
+    /// nothing about pixels. The divergence on this tip is Y and U exact, V
+    /// differing on a fixed column band (2063/8192, 2138/8192, 2105/8192 and
+    /// 1988/8192 V samples on shown frames 1-4, first at V row 60 col 36), the
+    /// same shape on all four compound streams this lane produced, while the
+    /// committed 4:2:2 128-root SINGLE-reference stream (`422_sb128_3f.obu`)
+    /// and the committed compound-warp stream whose blocks are all <= 64
+    /// (`422_residual_compound_warp_16f.obu`) both stay exact against the same
+    /// oracle -- so it tracks the 128-root COMPOUND path these counters name.
+    /// It is a NEW defect and fixing the walk is explicitly out of this lane's
+    /// charter. When a fix lane lands, add the oracle compare to this test; the
+    /// counter half already stops this fixture silently ceasing to reach the
+    /// walk it was pinned for.
+    ///
+    /// Recipe (byte-reproducible; whole aomenc argv):
+    /// ```text
+    /// ffmpeg -v error -f lavfi -i "testsrc2=size=128x128:rate=25" -t 0.24 \
+    ///   -pix_fmt yuv422p -f yuv4mpegpipe - > tsrc128.y4m
+    /// aomenc --codec=av1 --profile=2 --input-chroma-subsampling-x=1 \
+    ///   --input-chroma-subsampling-y=0 --passes=1 --end-usage=q --cq-level=62 \
+    ///   --cpu-used=0 --threads=1 --row-mt=0 --sb-size=128 \
+    ///   --min-partition-size=128 --max-partition-size=128 \
+    ///   --enable-rect-partitions=0 --enable-ab-partitions=0 \
+    ///   --enable-1to4-partitions=0 --enable-palette=0 --enable-intrabc=0 \
+    ///   --deltaq-mode=0 --enable-tx-size-search=0 --enable-interintra-comp=1 \
+    ///   --enable-interintra-wedge=1 --enable-smooth-interintra=1 --obu -o X
+    /// ```
+    #[test]
+    fn a_422_muchunk_compound_128root_pinned_stream_reaches_its_unit_walk() {
+        const NAME: &str = "a_422_muchunk_compound_128root_pinned_stream_reaches_its_unit_walk";
+        const FILE: &str = "422_muchunk_compound_128root.obu";
+        const LEN: usize = 895;
+        const FNV: u64 = 0xfb28_f9a7_cf23_9897;
+        const MIN_UNITS: usize = 32;
+        let _gate_lock = lock_gate_counters();
+        let stream = read_pinned_muchunk_fixture(FILE, LEN, FNV, NAME);
+        assert_eq!(
+            obu_stream_shape(&stream),
+            Some((true, 1, 0, false)),
+            "{NAME}: {FILE} is not a 4:2:2 (ss 1/0, non-mono) 128x128-superblock stream"
+        );
+        let before = (
+            crate::decode::mu_chunk_compound_units(),
+            crate::decode::mu_chunk_intra_in_inter_units(),
+        );
+        let frames = crate::stream::decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: {FILE} no longer decodes cleanly: {e}"))
+            .len();
+        let (compound, intra) = (
+            crate::decode::mu_chunk_compound_units() - before.0,
+            crate::decode::mu_chunk_intra_in_inter_units() - before.1,
+        );
+        assert_eq!(frames, 6, "{NAME}: {FILE} shown-frame count");
+        assert!(
+            compound >= MIN_UNITS,
+            "{NAME}: {FILE} allocated only {compound} compound `side > 64` mu-chunk units \
+             (expected >= {MIN_UNITS}) -- the walk this gate names did not run"
+        );
+        assert_eq!(
+            intra, 0,
+            "{NAME}: {FILE} also ran the intra-in-inter walk ({intra} units) -- the two fixtures \
+             no longer separate the cells"
+        );
+        // DELIBERATELY NO ORACLE COMPARE: 7 of the 8 streams this lane generated
+        // diverge and this fixture is one of them. This test is the counter
+        // witness, not an exactness witness -- see the doc comment.
+        eprintln!(
+            "{NAME}: {FILE} compound_units={compound} intra_in_inter_units={intra} -- counter \
+             witness, pixels NOT asserted (this stream is measured DIVERGENT)"
+        );
+    }
+
+    /// lane-av1muchunk422b: the **intra-in-inter** `side > 64` mu-chunk walk --
+    /// per-unit chroma allocation of the intra-in-inter arm (site 8 of
+    /// `lanes/av1muchunk422.report.md`). This is the ONE stream of the eight
+    /// this lane generated that is BYTE-EXACT against the ffmpeg/aom oracle
+    /// (`i6_grad128_iis`), so unlike its compound twin this gate asserts
+    /// pixel-exactness over every decode-order frame AND that the site counter
+    /// moved. See the compound test above for the shared reachability and
+    /// count-at-the-ALLOCATION argument.
+    ///
+    /// Recipe (byte-reproducible; same aomenc argv as the compound test except
+    /// for the source):
+    /// ```text
+    /// ffmpeg -v error -f lavfi -i "gradients=size=128x256:c0=0xa1128f:\
+    ///   c1=0xd98c48:c2=0x120601:c3=0x4abfba:seed=63:duration=0.24:rate=25,\
+    ///   noise=all_seed=63:alls=6:allf=t" -t 0.24 -pix_fmt yuv422p \
+    ///   -f yuv4mpegpipe - > grad256.y4m
+    /// aomenc --codec=av1 --profile=2 --input-chroma-subsampling-x=1 \
+    ///   --input-chroma-subsampling-y=0 --passes=1 --end-usage=q --cq-level=62 \
+    ///   --cpu-used=0 --threads=1 --row-mt=0 --sb-size=128 \
+    ///   --min-partition-size=128 --max-partition-size=128 \
+    ///   --enable-rect-partitions=0 --enable-ab-partitions=0 \
+    ///   --enable-1to4-partitions=0 --enable-palette=0 --enable-intrabc=0 \
+    ///   --deltaq-mode=0 --enable-tx-size-search=0 --enable-interintra-comp=1 \
+    ///   --enable-interintra-wedge=1 --enable-smooth-interintra=1 --obu -o X
+    /// ```
+    #[test]
+    fn a_422_muchunk_intra_in_inter_128root_pinned_stream_is_exact_and_reaches_its_unit_walk() {
+        const NAME: &str =
+            "a_422_muchunk_intra_in_inter_128root_pinned_stream_is_exact_and_reaches_its_unit_walk";
+        const FILE: &str = "422_muchunk_intra_in_inter_128root.obu";
+        const LEN: usize = 391;
+        const FNV: u64 = 0xe4d7_2c19_5a11_1f4f;
+        const MIN_UNITS: usize = 16;
+        // 6 shown frames + the 1 hidden alt-ref frame the oracle also emits.
+        const DECODED: usize = 7;
+        let _gate_lock = lock_gate_counters();
+        let stream = read_pinned_muchunk_fixture(FILE, LEN, FNV, NAME);
+        assert_eq!(
+            obu_stream_shape(&stream),
+            Some((true, 1, 0, false)),
+            "{NAME}: {FILE} is not a 4:2:2 (ss 1/0, non-mono) 128x128-superblock stream"
+        );
+        let before = (
+            crate::decode::mu_chunk_compound_units(),
+            crate::decode::mu_chunk_intra_in_inter_units(),
+        );
+        let frames = crate::stream::decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: {FILE} no longer decodes cleanly: {e}"))
+            .len();
+        let (compound, intra) = (
+            crate::decode::mu_chunk_compound_units() - before.0,
+            crate::decode::mu_chunk_intra_in_inter_units() - before.1,
+        );
+        assert_eq!(frames, 6, "{NAME}: {FILE} shown-frame count");
+        assert!(
+            intra >= MIN_UNITS,
+            "{NAME}: {FILE} allocated only {intra} intra-in-inter `side > 64` mu-chunk units \
+             (expected >= {MIN_UNITS}) -- the site counter this gate names did not move"
+        );
+        assert_eq!(
+            compound, 0,
+            "{NAME}: {FILE} also ran the compound walk ({compound} units) -- the two fixtures no \
+             longer separate the cells"
+        );
+        if aomdec_available(NAME) {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert_eq!(decoded, DECODED, "{NAME}: {FILE} decode-order frame count");
+            eprintln!(
+                "{NAME}: {FILE} byte-exact over {decoded} decode-order frame(s) ({hidden} \
+                 hidden), intra_in_inter_units={intra}"
+            );
+        }
+
+        // The counter-proof: the LOSSLESS 4:2:2 stream that reaches both
+        // `side > 64` guards at ss (1,0) and allocates nothing. `W_intrabc`
+        // is the fixture the prior lane measured `site 2 = 0` on, and this
+        // pins why that zero was real -- the arm's lossless branch returns
+        // before the unit loop.
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let intrabc = std::fs::read(dir.join("W_intrabc.obu"))
+            .expect("W_intrabc.obu is missing -- the counter-proof cannot run");
+        let proof_before = (
+            crate::decode::mu_chunk_compound_units(),
+            crate::decode::mu_chunk_intra_in_inter_units(),
+            crate::decode::intra_128_in_inter_mu_chroma_hits(),
+        );
+        let proof_frames = crate::stream::decode_stream(&intrabc)
+            .expect("W_intrabc.obu no longer decodes")
+            .len();
+        let proof = (
+            crate::decode::mu_chunk_compound_units() - proof_before.0,
+            crate::decode::mu_chunk_intra_in_inter_units() - proof_before.1,
+            crate::decode::intra_128_in_inter_mu_chroma_hits() - proof_before.2,
+        );
+        assert_eq!(proof_frames, 16, "{NAME}: W_intrabc shown-frame count");
+        assert_eq!(
+            (proof.0, proof.1),
+            (0, 0),
+            "{NAME}: W_intrabc now allocates mu-chunk units ({}, {}) -- it cannot be the \
+             counter-proof any more",
+            proof.0,
+            proof.1
+        );
+        assert!(
+            proof.2 > 0,
+            "{NAME}: W_intrabc no longer reaches the intra-in-inter guard at all \
+             (INTRA_128_IN_INTER_MU_CHROMA_HITS delta 0), so its zero allocations prove \
+             nothing about the guard-to-allocation gap this gate rests on"
+        );
+        eprintln!(
+            "{NAME}: counter-proof W_intrabc allocations=({}, {}) with the intra-in-inter guard \
+             fired {} time(s)",
+            proof.0, proof.1, proof.2
+        );
+    }
+
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level
     /// partition decision is genuinely HORZ/VERT (not NONE/SPLIT) must
     /// decode pixel-exact through [`crate::decode::decode_block_rect64`] --
