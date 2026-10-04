@@ -24931,7 +24931,23 @@ fn decode_block_128rect(
                             );
                             continue;
                         }
-                        let cu_around = neighbours.around_mi_rect(cu_mi, luma_span, luma_span_h);
+                        // lane-av1422gather3: libaom's `get_txb_ctx_general`
+                        // reads the unit's above votes over `txb_w_unit` =
+                        // `chroma_tx / 4` CHROMA cells, and at ss_x 1 one
+                        // chroma cell spans TWO luma mi columns -- the same
+                        // pair rule the mu-chunk walks take
+                        // (`around_mi_422_chroma`). Reachability measured on
+                        // the pinned `422_intrabc_sb128_strip*.obu` (72 unit
+                        // gathers each, `sb128rect_chroma_replay_hits().0`);
+                        // output-inert on all 21 committed 4:2:2 cells, so
+                        // the source-scan gate
+                        // `the_422_block_128rect_chroma_chunk_gather_stays_per_axis`
+                        // is what stops a revert.
+                        let cu_around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                            neighbours.around_mi_422_chroma(cu_mi, luma_span, luma_span_h)
+                        } else {
+                            neighbours.around_mi_rect(cu_mi, luma_span, luma_span_h)
+                        };
                         let buf: &mut PlaneBuf<'static> =
                             if plane_pass == 1 { &mut *u } else { &mut *v };
                         let grid = read_plane(
@@ -25008,15 +25024,13 @@ fn decode_block_128rect(
         // rows below the block on the last unit of a 128x64/64x128 strip and
         // smearing a neighbour chunk's unit over its neighbour's rows.
         //
-        // DEFENSIVE at the decoder's current capability set: both admitted
-        // chroma formats have `ss_x == ss_y` (4:2:0 ss (1,1), 4:4:4 ss
-        // (0,0)), so the two spans are equal and this line is a no-op on
-        // every stream `decode_stream` accepts; 4:2:2 (ss (1,0)) -- the one
-        // format where they differ -- is refused by name at the sequence
-        // header, so the arm is unreachable there. It stays per-axis because
-        // the walk it replays is per-axis, and a 4:2:2 port must not have to
-        // re-derive this. `SB128RECT_REPLAY_SPAN_MISMATCH_HITS` names the
-        // day that changes.
+        // 4:2:2 (ss (1,0)) is the one format where the two spans differ, and
+        // it is ADMITTED since lane-av1422lift: this branch does fire there
+        // (`SB128RECT_REPLAY_SPAN_MISMATCH_HITS` reads 9 on each of the two
+        // pinned `422_intrabc_sb128_strip*.obu` cells, whose five frames are
+        // byte-exact against ffmpeg) -- that is the replay's own designed
+        // 4:2:2 case, not a defect signature. Nothing here asserts the
+        // mismatch is zero.
         if luma_span != luma_span_h {
             hit!(SB128RECT_REPLAY_SPAN_MISMATCH_HITS);
         }
@@ -49559,6 +49573,10 @@ fn decode_intra_sub8_leaf(
         } else {
             // The leaf's own TX_8X4/TX_4X8 chroma unit: it IS the chroma plane
             // block, so `get_txb_ctx` fixes the skip context at above+left.
+            // lane-av1422gather3: 4:4:4-only -- this `ca` arm sits inside the
+            // `chroma_444` guard (ss 0/0), so the 4:2:2 pair rule does not
+            // apply here. Probed at ss (1,0) over all 21 committed 4:2:2
+            // cells: 0 hits.
             let ca = neighbours.around_mi_rect(lmi, bw, bh);
             let scan_c: &[u16] = if vert { &SCAN_4X8 } else { &SCAN_8X4 };
             let uv_tx = default_intra_tx_type(uv_predict_mode as u8);
@@ -50407,6 +50425,10 @@ fn decode_inter_sub8_rect2(
                     fctx,
                 )?;
             } else {
+                // lane-av1422gather3: 4:4:4-only -- this `ca` arm sits inside
+                // the `chroma_444` guard (ss 0/0); the 4:2:2 per-piece arm
+                // below already reads through `around_mi_422_chroma`. Probed
+                // at ss (1,0) over all 21 committed 4:2:2 cells: 0 hits.
                 let ca = neighbours.around_mi_rect(lmi, bw, bh);
                 let (ug, _) = read_inter_plane_rect(
                     dec,
