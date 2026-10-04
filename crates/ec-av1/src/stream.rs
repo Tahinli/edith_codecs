@@ -326,8 +326,15 @@ pub fn intra128_lossless_counters() -> usize {
 /// `422_intrabc_sb128_strip*` pins each read `(72, 9)` while the other 19
 /// committed 4:2:2 cells read `(0, 0)`. Those two pins are byte-exact
 /// against ffmpeg, so the non-zero half counts the arm's own designed case
-/// and is not a defect. No 4:2:2 gate reads this pair; the two gates that do
-/// are on 4:2:0 and 4:4:4 streams, where the half is structurally zero.
+/// and is not a defect. lane-av1422mismatch9: the predicate is
+/// `luma_span != luma_span_h` (`chroma_tx << ss_x` vs `<< ss_y`), true by
+/// CONSTRUCTION at ss (1,0), and the replay re-stamps with the same per-axis
+/// pair the in-loop walk used, so the counter is a 4:2:2 shape test, not a
+/// divergence test (`record_mi_chroma` writes only the left/above context
+/// arrays, never a pixel). One 4:2:2 gate now reads the pair and asserts the
+/// measured `(72, 9)`:
+/// `the_422_block_128rect_chroma_chunk_gather_stays_per_axis`; the other
+/// reader is on a 4:4:4 stream, where the mismatch half is structurally zero.
 pub fn sb128rect_chroma_replay_counters() -> (usize, usize) {
     crate::decode::sb128rect_chroma_replay_hits()
 }
@@ -3695,6 +3702,13 @@ pub(crate) mod tests {
     /// against ffmpeg, exactly as the pre-change tree was (the gathered
     /// votes cancel at every reached unit), so THIS gate -- not a pixel
     /// compare -- is what stops the routing being reverted.
+    ///
+    /// lane-av1422mismatch9: the same decode loop now also asserts the
+    /// `SB128RECT_REPLAY_SPAN_MISMATCH_HITS` count (NINE per pin) and states
+    /// why it is not a pixel miss -- the counter's predicate is a span
+    /// DIFFERENCE, true by construction at ss (1,0); the replay re-stamps the
+    /// identical context cells with the same per-axis pair the read walk used;
+    /// and `record_mi_chroma` writes no pixel sample. See the assert's message.
     #[test]
     fn the_422_block_128rect_chroma_chunk_gather_stays_per_axis() {
         const NAME: &str = "the_422_block_128rect_chroma_chunk_gather_stays_per_axis";
@@ -3766,18 +3780,58 @@ pub(crate) mod tests {
             assert_eq!(data.len(), bytes, "{NAME}: {file} size drifted");
             assert_eq!(fnv1a64(&data), fp, "{NAME}: {file} bytes drifted");
             let _guard = lock_gate_counters();
-            let before = crate::decode::sb128rect_chroma_replay_hits().0;
+            let before = crate::decode::sb128rect_chroma_replay_hits();
             let frames = decode_stream(&data)
                 .unwrap_or_else(|e| panic!("{NAME}: {file} no longer decodes cleanly: {e}"));
-            let after = crate::decode::sb128rect_chroma_replay_hits().0;
+            let after = crate::decode::sb128rect_chroma_replay_hits();
             assert_eq!(
-                after - before,
+                after.0 - before.0,
                 72,
                 "{NAME}: {file} gathered {} chroma unit context(s) in \
                  decode_block_128rect's per-chunk walk; 72 were measured at ss (1, 0) -- \
                  a lower number means the gather is no longer REACHED here \
                  (class gate-blind-to-feature)",
-                after - before
+                after.0 - before.0
+            );
+            // lane-av1422mismatch9: `SB128RECT_REPLAY_SPAN_MISMATCH_HITS` reads
+            // NINE on each of these two pins, and this is the only place that
+            // number is asserted. It is NOT a pixel miss, and the three facts
+            // below are why -- the assert encodes the measurement, not a wish:
+            //
+            //  1. The predicate (`decode.rs`, end of `decode_block_128rect`) is
+            //     `luma_span != luma_span_h` -- `chroma_tx << ss_x` vs
+            //     `chroma_tx << ss_y`. At ss (1, 0) the two DIFFER BY
+            //     CONSTRUCTION for every 128-root rect block, so the counter is
+            //     a shape test ("this is the 4:2:2 span shape"), not a
+            //     divergence test. Nine is the number of such blocks the five
+            //     frames code.
+            //  2. The replay re-stamps with the SAME per-axis pair the in-loop
+            //     walk stamped with (`record_mi_chroma(cu_mi, luma_span,
+            //     luma_span_h, ...)` at both the read walk and the replay), so
+            //     it rewrites the identical context cells -- this is exactly
+            //     the `record_mi_chroma(cu_mi, luma_span, luma_span_h)` pairing
+            //     the source-scan arm above pins. The pre-lane-av1-128rectspan
+            //     defect (width passed on both axes) is caught by that
+            //     spelling arm, not by this counter.
+            //  3. `record_mi_chroma` writes only `Neighbours::left`/`above`
+            //     (entropy-context arrays); it touches ZERO pixel samples. So
+            //     the 9 events cannot write a sample the oracle lacks. The
+            //     pixel proof is the same file's
+            //     `the_pinned_422_intrabc_sb128_strip_witnesses_decode_pixel_
+            //     exact`, which pins all five frames byte-exact against
+            //     ffmpeg's `yuv422p` rawvideo.
+            //
+            // Change this expected count ONLY with a new measurement; a 4:2:2
+            // stream coding more 128-root rect blocks legitimately changes it.
+            assert_eq!(
+                after.1 - before.1,
+                9,
+                "{NAME}: {file} fired the 4:2:2 span-shape arm {} time(s); NINE were \
+                 measured and are NOT a pixel miss (the predicate is `luma_span != \
+                 luma_span_h`, true by construction at ss (1,0); the replay re-stamps the \
+                 identical context cells with the same per-axis pair; `record_mi_chroma` \
+                 writes no pixel) -- see the report above",
+                after.1 - before.1
             );
             assert_eq!(frames.len(), 5, "{NAME}: {file} frame count");
         }
