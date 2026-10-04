@@ -24511,30 +24511,40 @@ thread_local! {
     /// of them, so this reads 0 on any stream that never codes one -- the
     /// non-vacuity anchor for the replay's own gate.
     pub(crate) static SB128RECT_CHROMA_REPLAY_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// ... and the number of non-skip 128-root rect BLOCKS whose replay
-    /// height differs from the unit's own LUMA-MI height -- the signature of the
-    /// width passed to both axes (`luma_span` where the in-loop stamp used
-    /// `luma_span_h`). lane-av1422lift: the doc here used to read "Zero on
-    /// every stream this decoder admits ... 4:2:2 ... is refused by name at
-    /// the sequence header", and that was TRUE. Admitting 4:2:2 genuinely made
-    /// this counter able to fire, and it does fire: measured on this branch's
-    /// tip over all 21 committed 4:2:2 cells, `422_intrabc_sb128_strip.obu`
-    /// and `422_intrabc_sb128_strip_notxsearch.obu` each read
-    /// `replay = 72, mismatch = 9`; the other 19 read 0.
+    /// ... and the number of non-skip 128-root rect BLOCKS whose two LUMA-MI
+    /// spans differ (`luma_span = chroma_tx << ss_x` vs
+    /// `luma_span_h = chroma_tx << ss_y`). lane-av1422lift: the doc here used
+    /// to read "Zero on every stream this decoder admits ... 4:2:2 ... is
+    /// refused by name at the sequence header", and that was TRUE. Admitting
+    /// 4:2:2 genuinely made this counter able to fire, and it does fire:
+    /// measured, `422_intrabc_sb128_strip.obu` and
+    /// `422_intrabc_sb128_strip_notxsearch.obu` each read
+    /// `replay = 72, mismatch = 9`; the other 19 committed 4:2:2 cells read 0.
     ///
-    /// **Those two pins are byte-exact against ffmpeg**
-    /// (`the_pinned_422_intrabc_sb128_strip_witnesses_decode_pixel_exact`, all
-    /// five frames, every plane), so a non-zero mismatch is NOT a defect
-    /// signature at 4:2:2 -- it is the arm counting its own designed case.
-    /// Nothing here asserts zero, and nothing should: adding a zero assert
-    /// would red a gate on a cell that is provably correct.
+    /// lane-av1422mismatch9: the predicate is the span DIFFERENCE, which at
+    /// ss (1, 0) is true BY CONSTRUCTION for every 128-root rect block -- so
+    /// this is a shape test ("a 4:2:2-shaped block replayed"), NOT a
+    /// divergence test, and it does not witness the lane-av1-128rectspan
+    /// defect it was named for (that defect passed `luma_span` to both axes;
+    /// the source-scan arm in
+    /// `the_422_block_128rect_chroma_chunk_gather_stays_per_axis` is what
+    /// pins the per-axis spelling). It is not a pixel-miss signature either:
+    /// the replay re-stamps with the same per-axis pair the in-loop walk
+    /// stamped with, and `record_mi_chroma` writes only the `left`/`above`
+    /// context arrays -- zero pixel samples. Both pins are byte-exact against
+    /// ffmpeg (`the_pinned_422_intrabc_sb128_strip_witnesses_decode_pixel_
+    /// exact`, all five frames, every plane).
     ///
-    /// The only readers of the pair are
-    /// [`sb128rect_chroma_replay_hits`]'s two gates, both on 4:4:4 and 4:2:0
-    /// streams, where the unit's luma width and height are equal so the
-    /// mismatch half is structurally zero. That is the zero this counter is
-    /// currently a tripwire FOR, and it is a statement about those two
-    /// streams, not about the format.
+    /// **Nothing asserts zero here, and nothing should**: a zero assert would
+    /// red on a provably correct cell. The measured NINE is asserted instead,
+    /// in `the_422_block_128rect_chroma_chunk_gather_stays_per_axis` (with
+    /// this reasoning in its message), so a change in the count is a red gate
+    /// rather than a silent drift.
+    ///
+    /// The pair's other reader is `sb128rect_chroma_replay_hits` on a 4:4:4
+    /// stream, where the unit's luma width and height are equal so the
+    /// mismatch half is structurally zero -- a zero that is a statement about
+    /// that stream, not about the format.
     pub(crate) static SB128RECT_REPLAY_SPAN_MISMATCH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
