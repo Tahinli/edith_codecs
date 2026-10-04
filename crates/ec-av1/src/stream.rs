@@ -43322,6 +43322,137 @@ exit 0
         );
     }
 
+    /// lane-av1muchunk422iis: the **intra-in-inter** `side > 64` mu-chunk
+    /// walk at 128x256 (TWO 128-superblock rows), site 8's second stream.
+    /// lane-av1muchunk422class measured this stream diverging with the class
+    /// signature -- V-plane-only diffs, first wrong sample V (row 190, col 36)
+    /// of shown frame 2 (V index `190 * 64 + 36 = 12196`, ours 147 vs
+    /// ffmpeg's 146), a byte-identical decode before and after the compound
+    /// fix, and the SAME `dc_sign_ctx` fork the compound fix targeted, on the
+    /// TX_32X32 chroma unit of THIS walk. The walk gathered its chroma
+    /// context with the plain luma `around_mi` (decode.rs:46820), which at
+    /// ss (1, 0) sums `unit_luma_w / MI` above cells where libaom sums
+    /// `txb_w_unit` -- twice as many -- flipping the signum whenever the
+    /// doubled above vote cancels the left one (see the walk's own comment).
+    ///
+    /// The fixture is the hunt's `i5_grad256_iis.obu` (sha256
+    /// `64794f278eee738dcc59d90dc0c7c4ef2828c5b7c13724760a33be11f224908e`),
+    /// pinned byte-for-byte. Recipe: same aomenc argv as the 128x128 twin
+    /// below, source `gradients=size=128x256:...:seed=63:duration=0.24:rate=25,
+    /// noise=all_seed=63:alls=6:allf=t` (NOT re-encoded by this lane; the
+    /// bytes are the hunted bytes).
+    ///
+    /// Three halves, in order: (a) the site counter moved AND this stream
+    /// never enters the compound walk; (b) an ORACLE-FREE V-plane pin of
+    /// shown frame 2 plus the one sample that moved, so the exactness half
+    /// cannot silently skip; (c) the required ffmpeg compare -- every plane
+    /// of every shown frame byte-exact -- and the decode-order oracle compare
+    /// when one is available.
+    #[test]
+    fn a_422_muchunk_intra_in_inter_128x256_stream_is_exact_and_reaches_its_unit_walk() {
+        const NAME: &str =
+            "a_422_muchunk_intra_in_inter_128x256_stream_is_exact_and_reaches_its_unit_walk";
+        const FILE: &str = "422_muchunk_intra_in_inter_128x256.obu";
+        const LEN: usize = 667;
+        const FNV: u64 = 0x2bee_eba3_052b_f9a3;
+        const MIN_UNITS: usize = 96;
+        // 6 shown frames; the oracle also emits 1 hidden alt-ref frame.
+        const SHOWN: usize = 6;
+        // Shown frame 2's V plane, 4:2:2 at 128x256 -> 64 x 256 chroma.
+        const F2_V_FNV: u64 = 0xa7ba_8711_9d13_8fe5;
+        // V (row 190, col 36): the first sample that moved. The pre-fix
+        // square gather read 147 here, ffmpeg 146.
+        const FIRST_WRONG_V: usize = 190 * 64 + 36;
+        const F2_V_AT_FIRST_WRONG: u16 = 146;
+        let _gate_lock = lock_gate_counters();
+        let stream = read_pinned_muchunk_fixture(FILE, LEN, FNV, NAME);
+        assert_eq!(
+            obu_stream_shape(&stream),
+            Some((true, 1, 0, false)),
+            "{NAME}: {FILE} is not a 4:2:2 (ss 1/0, non-mono) 128-superblock stream"
+        );
+        let before = (
+            crate::decode::mu_chunk_compound_units(),
+            crate::decode::mu_chunk_intra_in_inter_units(),
+        );
+        let shown = crate::stream::decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: {FILE} no longer decodes cleanly: {e}"));
+        let frames = shown.len();
+        let (compound, intra) = (
+            crate::decode::mu_chunk_compound_units() - before.0,
+            crate::decode::mu_chunk_intra_in_inter_units() - before.1,
+        );
+        assert_eq!(frames, SHOWN, "{NAME}: {FILE} shown-frame count");
+        assert!(
+            intra >= MIN_UNITS,
+            "{NAME}: {FILE} allocated only {intra} intra-in-inter `side > 64` mu-chunk units \
+             (expected >= {MIN_UNITS}) -- the site counter this gate names did not move"
+        );
+        assert_eq!(
+            compound, 0,
+            "{NAME}: {FILE} also ran the compound walk ({compound} units) -- the two cells are \
+             no longer separated"
+        );
+        // (b) the oracle-free half: the V plane of the first intrinsically
+        // wrong frame, sample-for-sample, plus the one sample the pre-fix
+        // gather got wrong.
+        assert_eq!(
+            shown[2].v.len(),
+            64 * 256,
+            "{NAME}: {FILE} is no longer 4:2:2 at 128x256 -- the V plane shape moved"
+        );
+        assert_eq!(
+            shown[2].v[FIRST_WRONG_V], F2_V_AT_FIRST_WRONG,
+            "{NAME}: {FILE} shown frame 2 V[{FIRST_WRONG_V}] (chroma (190, 36)) is {} -- the \
+             pre-fix square gather read 147 here",
+            shown[2].v[FIRST_WRONG_V]
+        );
+        assert_eq!(
+            fnv1a64(&shown[2].v.iter().map(|&s| s as u8).collect::<Vec<u8>>()),
+            F2_V_FNV,
+            "{NAME}: {FILE} shown frame 2's V plane moved -- the intra-in-inter mu-chunk walk's \
+             4:2:2 chroma context gather is wrong again (first sample to move is chroma (190, \
+             36), index {FIRST_WRONG_V})"
+        );
+        // (c) the required ffmpeg compare: every plane of every shown frame.
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP {NAME}: no ffmpeg -- the 4:2:2 pixel compare this gate exists for did NOT \
+                 run (set EC_AV1_REQUIRE_FFMPEG=1 to make this a failure)"
+            );
+            return;
+        }
+        let ff = ffmpeg_decode_sequence_422(&stream, 128, 256, SHOWN);
+        assert_eq!(ff.len(), SHOWN, "{NAME}: {FILE} ffmpeg shown-frame count");
+        for (i, (got, want)) in shown.iter().zip(&ff).enumerate() {
+            assert_eq!(
+                got.y, want.y,
+                "{NAME}: {FILE} shown frame {i} luma vs ffmpeg"
+            );
+            assert_eq!(got.u, want.u, "{NAME}: {FILE} shown frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{NAME}: {FILE} shown frame {i} V vs ffmpeg");
+        }
+        if aomdec_available(NAME) {
+            let (decoded, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+            assert_eq!(
+                decoded,
+                SHOWN + 1,
+                "{NAME}: {FILE} decode-order frame count"
+            );
+            eprintln!(
+                "{NAME}: {FILE} byte-exact vs ffmpeg over {SHOWN} shown frames and vs the \
+                 decode-order oracle over {decoded} frame(s) ({hidden} hidden), \
+                 intra_in_inter_units={intra}"
+            );
+        } else {
+            eprintln!(
+                "{NAME}: {FILE} byte-exact vs ffmpeg over {SHOWN} shown frames, \
+                 intra_in_inter_units={intra} -- the decode-order oracle compare above did NOT \
+                 run (no aomdec)"
+            );
+        }
+    }
+
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level
     /// partition decision is genuinely HORZ/VERT (not NONE/SPLIT) must
     /// decode pixel-exact through [`crate::decode::decode_block_rect64`] --
