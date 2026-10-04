@@ -46817,7 +46817,29 @@ fn decode_inter_block(
                                 // The unit's own entropy-cell span, so the
                                 // NEXT unit of this chunk reads THIS one's
                                 // state and the next chunk reads the last.
-                                let cu_around = neighbours.around_mi(unit_mi, unit_luma_w);
+                                //
+                                // lane-av1muchunk422iis: the intra-in-inter twin
+                                // of the compound mu-chunk gather. At ss (1, 0)
+                                // one CHROMA column spans two luma mi columns,
+                                // so libaom's `get_txb_ctx_general` reads its
+                                // above votes over `txb_w_unit` chroma cells
+                                // while a plain luma `around_mi` gathers
+                                // `unit_luma_w / MI` -- twice as many -- and
+                                // `dc_sign_ctx`'s signum flips whenever the
+                                // doubled above vote cancels the left one. The
+                                // LEFT extent is unsubsampled at ss_y 0, so the
+                                // per-axis footprint is what the pair-aware
+                                // helper needs; 4:2:0 / 4:4:4 have square
+                                // footprints and keep the plain gather verbatim.
+                                let cu_around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                                    neighbours.around_mi_422_chroma(
+                                        unit_mi,
+                                        unit_luma_w,
+                                        unit_luma_h,
+                                    )
+                                } else {
+                                    neighbours.around_mi(unit_mi, unit_luma_w)
+                                };
                                 let (cu_x, cu_y) = (
                                     cpx + cc * chunk_chroma_w + uc * cu_tx,
                                     cpy + cr * chunk_chroma_h + ur * cu_tx,
