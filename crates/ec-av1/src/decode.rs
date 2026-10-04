@@ -18019,6 +18019,21 @@ fn decode_intrabc_owned_rect(
             u_grid = ug;
             v_grid = vg;
         } else {
+            // lane-av1422gathercensus: the only `around_mi_rect` in the file
+            // that feeds a CHROMA coefficient context and can run at ss
+            // (1, 0): its above extent is the whole block's LUMA width, and
+            // libaom's `get_txb_ctx_general` reads one vote per CHROMA 4-px
+            // cell, so at ss (1, 0) the per-mi sum counts each chroma column
+            // twice (the class `around_mi_422_chroma` fixes).
+            // Kept verbatim because it is UNWITNESSED, not because it is
+            // unreachable: it runs only for a NON-skipped, non-lossless
+            // intrabc-owned 64x32/32x64 (or smaller) rect strip, and no
+            // committed 4:2:2 fixture codes one -- an env-gated probe here
+            // fired 0 times across the whole committed 4:2:2 corpus (24 gate
+            // tests, 21 decoding cells; see
+            // `lanes/av1422gathercensus.report.md`). A future fixture that
+            // enters it must route through `around_mi_422_chroma` under the
+            // ss (1, 0) guard.
             let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
             let (ug, _) = read_inter_plane_rect(
                 dec,
