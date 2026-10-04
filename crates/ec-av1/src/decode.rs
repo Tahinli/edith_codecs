@@ -36023,6 +36023,46 @@ thread_local! {
 }
 
 thread_local! {
+    /// lane-av1muchunk422b: how many TX_32X32 chroma units the **compound**
+    /// `side > 64` mu-chunk walk allocated (`decode_inter_block`'s compound
+    /// arm, `mu_units(.., chroma_side * chroma_side)`). This is the walk
+    /// `lanes/av1muchunk422.report.md` called site 2 and could not reach at
+    /// 4:2:2; `CHROMA_SPLIT_TX_HITS` fires at all seventeen unit sites and
+    /// cannot attribute a bump to this arm. The single-reference twin (that
+    /// report's site 5) shares this exact source text, so the bump is routed
+    /// through `is_compound` and only this counter names site 2.
+    ///
+    /// Counted at the ALLOCATION, not at the `side > 64` guard: the arm's
+    /// lossless branch returns before the unit loop, so `W_intrabc.obu`
+    /// reaches the guard at ss (1,0) four times and allocates nothing -- a
+    /// guard-level counter would call that stream a witness of this walk.
+    pub(crate) static MU_CHUNK_COMPOUND_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// lane-av1muchunk422b: the intra-in-inter twin of
+    /// [`MU_CHUNK_COMPOUND_UNITS`] -- TX_32X32 chroma units allocated by the
+    /// intra-in-inter `side > 64` mu-chunk walk (site 8 of the same report).
+    /// Same allocation-vs-guard argument: `INTRA_128_IN_INTER_MU_CHROMA_HITS`
+    /// is bumped once per mu chunk BEFORE this arm's own lossless branch, so
+    /// it is not a witness of the per-unit walk, and `W_intrabc.obu` fires it
+    /// eight times at ss (1,0) with zero allocations.
+    pub(crate) static MU_CHUNK_INTRA_IN_INTER_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`MU_CHUNK_COMPOUND_UNITS`], for a gate's before/after
+/// delta.
+pub fn mu_chunk_compound_units() -> usize {
+    MU_CHUNK_COMPOUND_UNITS.with(std::cell::Cell::get)
+}
+
+/// Current value of [`MU_CHUNK_INTRA_IN_INTER_UNITS`], for a gate's
+/// before/after delta.
+pub fn mu_chunk_intra_in_inter_units() -> usize {
+    MU_CHUNK_INTRA_IN_INTER_UNITS.with(std::cell::Cell::get)
+}
+
+thread_local! {
     /// lane-av1h5: how many blocks had their leaf walk actually PERMUTED into
     /// libaom's chunk-major order by [`mu_chunk_order`] -- a block above 64
     /// whose sort was not a no-op. Deliberately not "took the order": a
@@ -43945,6 +43985,16 @@ fn decode_inter_block(
                                             );
                                             hit!(CHROMA_SPLIT_TX_HITS);
                                             mu_chroma = true;
+                                            // lane-av1muchunk422b: the allocation of this
+                                            // mu-chunk walk, counted per TX_32X32 UNIT.
+                                            // The compound and single-reference arms share
+                                            // this source text, so `is_compound` routes the
+                                            // bump: `MU_CHUNK_COMPOUND_UNITS` names site 2
+                                            // and the single-reference twin (site 5) stays
+                                            // out of it.
+                                            if is_compound {
+                                                hit!(MU_CHUNK_COMPOUND_UNITS);
+                                            }
                                             let dst = mu_units(
                                                 if plane_idx == 1 {
                                                     &mut u_units
@@ -45738,6 +45788,16 @@ fn decode_inter_block(
                                             );
                                             hit!(CHROMA_SPLIT_TX_HITS);
                                             mu_chroma = true;
+                                            // lane-av1muchunk422b: the allocation of this
+                                            // mu-chunk walk, counted per TX_32X32 UNIT.
+                                            // The compound and single-reference arms share
+                                            // this source text, so `is_compound` routes the
+                                            // bump: `MU_CHUNK_COMPOUND_UNITS` names site 2
+                                            // and the single-reference twin (site 5) stays
+                                            // out of it.
+                                            if is_compound {
+                                                hit!(MU_CHUNK_COMPOUND_UNITS);
+                                            }
                                             let dst = mu_units(
                                                 if plane_idx == 1 {
                                                     &mut u_units
@@ -46752,6 +46812,9 @@ fn decode_inter_block(
                                 // libaom never selects (class
                                 // `override-slot-on-one-arm`).
                                 mu_chroma = true;
+                                // lane-av1muchunk422b: the allocation of the intra-in-inter
+                                // mu-chunk walk (site 8), per TX_32X32 unit.
+                                hit!(MU_CHUNK_INTRA_IN_INTER_UNITS);
                                 let dst = mu_units(
                                     if plane_idx == 1 {
                                         &mut u_units
