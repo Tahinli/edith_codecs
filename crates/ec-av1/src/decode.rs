@@ -21724,7 +21724,7 @@ pub(crate) fn plane_sentinel_on() -> bool {
 /// 22 rows and checks this list cell for cell -- a diff against the C source,
 /// not a restatement of it.
 ///
-/// ```
+/// ```text
 /// BLOCK_4X8    {4X8, 4X4}      {INVALID, 4X4}      <- INVALID @ (1,0)
 /// BLOCK_8X4    {8X4, INVALID}  {4X4, 4X4}          <- INVALID @ (0,1)
 /// BLOCK_8X16   {8X16, 8X8}     {INVALID, 4X8}      <- INVALID @ (1,0)
