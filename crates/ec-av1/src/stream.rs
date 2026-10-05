@@ -3539,6 +3539,100 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1422ibctxsel: the firing gate for `decode_intrabc_owned_rect`'s
+    /// NON-SPLIT chroma coefficient context at 4:2:2.
+    ///
+    /// `lanes/av1422gathercensus.report.md` closed its ss (1, 0) class sweep
+    /// with this one gather at STOP -- unwitnessed: `around_mi_rect` over the
+    /// block's LUMA span feeds the CHROMA `dc_sign_ctx`, and at ss (1, 0) a
+    /// chroma 4-px cell spans TWO luma mi columns, so the per-mi sum counts
+    /// every chroma column twice (`around_mi_422_chroma`'s every-second
+    /// sampling is libaom's one-vote-per-cell sum). `lane-av1422ibcrect`
+    /// found a stream that ENTERS the gather (24 entries) but whose two
+    /// gathers agree on every entry, so the class stayed harmless-ON-THAT-
+    /// STREAM, not proven.
+    ///
+    /// This fixture is the discriminating witness: aomenc profile 2, 384x288
+    /// 4:2:2, 4 key frames, `--sb-size=64` with the last superblock row half
+    /// outside the frame (so the 64-root partition is a single gathered bit
+    /// and the strips are 64x32 HORZ intra-BC strips), `--enable-tx-size-
+    /// search=1` plus a high-frequency patch that keeps the frame's `tx_mode`
+    /// at `TX_MODE_SELECT` (`txb_split_count > 0`; without it encodeframe.c
+    /// :2690 downgrades every frame to `TX_MODE_LARGEST`), and a chroma band
+    /// above the strips so a full-weight above context meets a full-weight
+    /// left one of the opposite sign.
+    ///
+    /// Measured on the pinned bytes: 24 non-split chroma gathers entered (6
+    /// strips x 4 frames; 48 plane reads), and FIVE of them -- plane 2, strips
+    /// mi (64,16)..(64,80) of frame 0 -- read `dc_sign_ctx` 1 through the
+    /// luma-span gather against libaom's 0 through the pair rule (`full = 2A +
+    /// L = -8`, `pair = A + L = 0`: the double-counted above vote crosses
+    /// zero, and the context is a sign).
+    ///
+    /// Red-before (the route reverted, same fixture bytes): the wrong sign
+    /// context changes the decoded dc-sign CDF and desyncs the tile -- the
+    /// decoder refuses the stream mid-frame with "a block size 4x8, 8x16 or
+    /// 16x4 ... has no chroma plane block at this frame's subsampling mode",
+    /// so NO frame decodes at all. That refusal is also the proof it is a
+    /// desync symptom and not a real sub-8x8 shape: both oracles decode the
+    /// pinned bytes fully. Green-after: 4/4 frames byte-exact against
+    /// ffmpeg's `yuv422p` rawvideo, with the per-plane coefficient-unit
+    /// census (the helper's) and the pair-rule route counter as the
+    /// non-vacuity arms. The 4:4:4 arm below pins the guard's other side:
+    /// the same function at ss (0, 0) keeps the verbatim luma-span gather and
+    /// must NOT fire the route.
+    #[test]
+    fn a_422_intrabc_owned_rect_nonsplit_chroma_context_uses_the_pair_rule() {
+        const NAME: &str = "a_422_intrabc_owned_rect_nonsplit_chroma_context_uses_the_pair_rule";
+        const FILE: &str = "ibc422_nonsplit_ctx.obu";
+        const LEN: usize = 2170;
+        /// sha256 `4f82d5da8b4c3d6553953fc373001a1c7a729c9b189214b65503af1e04eb6b68`,
+        /// fnv1a64 `0x92e2c4e45ca27e34`.
+        const FNV: u64 = 0x92e2c4e45ca27e34;
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(FILE);
+        let data = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned witness {} is missing ({e}) -- the gate cannot run",
+                path.display()
+            )
+        });
+        assert_eq!(data.len(), LEN, "{NAME}: {FILE} size drifted");
+        assert_eq!(fnv1a64(&data), FNV, "{NAME}: {FILE} bytes drifted");
+        // No `lock_gate_counters()` here: the bumps are thread-local, and
+        // `assert_422_stream_pixel_exact` takes that same (non-reentrant)
+        // mutex itself -- holding it across this call self-deadlocks.
+        crate::decode::reset_ibc_owned_rect_422_pair_hits();
+        assert_422_stream_pixel_exact(NAME, &data, 384, 288, 4, 8, true);
+        let hits = crate::decode::ibc_owned_rect_422_pair_hits();
+        assert_eq!(
+            hits, 24,
+            "{NAME}: the pair-rule route fired {hits} times, not 24 (6 non-split chroma gathers \
+             x 4 frames) -- the witness stopped exercising the arm, or the guard's extent moved"
+        );
+        // The guard's other arm: the 4:4:4 owner-rect stream (`r512.obu`,
+        // pinned by the gate below) reaches this same function at ss (0, 0),
+        // where the verbatim luma-span gather is correct -- the route counter
+        // must stay put.
+        let r512 = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/r512.obu"),
+        )
+        .expect("r512.obu must exist");
+        crate::decode::reset_ibc_owned_rect_422_pair_hits();
+        let _ = decode_stream(&r512).expect("the 4:4:4 owner-rect witness decodes");
+        assert_eq!(
+            crate::decode::ibc_owned_rect_422_pair_hits(),
+            0,
+            "{NAME}: the 4:2:2 pair-rule route fired on a 4:4:4 stream -- the ss (1, 0) guard \
+             leaks (class gate-blind-to-feature)"
+        );
+    }
+
     /// lane-av1-ibc128chunk: the SOURCE-SCAN arm of the witness gate above.
     ///
     /// The decode-level half of the red/green evidence cannot run in
