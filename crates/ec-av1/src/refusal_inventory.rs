@@ -2180,8 +2180,8 @@ mod tests {
                 // 4:2:0. `(0, 1)` is uncodable -- `color_config` reads
                 // `subsampling_y` only when `subsampling_x == 1`
                 // (sequence.rs:481) -- so these three are the whole
-                // reachable set, and each is walked whether or not the
-                // sequence header still refuses it.
+                // reachable set, and each is walked independently of any
+                // sequence-header guard (lifted by lane-av1422lift).
                 for (ss_x, ss_y) in [(0usize, 0usize), (1, 0), (1, 1)] {
                     let (chroma_w, chroma_h) = (bw >> ss_x, bh >> ss_y);
                     let unit = (chroma_w.min(32), chroma_h.min(32));

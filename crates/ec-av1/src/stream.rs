@@ -3406,14 +3406,14 @@ pub(crate) mod tests {
     /// **The committed assertion follows the family's standing rule** (same
     /// shape as
     /// [`the_pinned_422_bigblock_witnesses_are_present_and_refuse_by_name`]):
-    /// the byte pin plus this decoder's disposition of those bytes. While
-    /// `decode_stream` still refuses 4:2:2 at the sequence header
-    /// (`decode_frame`, `subsampling_x != subsampling_y`) that is the refusal
-    /// BY NAME, and the gate additionally asserts the arm's counter reads 0 --
-    /// the pin alone must never be able to fake a green. When the header lift
-    /// lands the same test becomes the full gate: 17 decode-order frames
-    /// byte-exact against aomdec with `palette_422_unit_window_hits()` fired,
-    /// which is what it asserts then. Both branches are loud.
+    /// the byte pin plus this decoder's disposition of those bytes.
+    /// lane-av1422lift: `decode_stream` no longer refuses 4:2:2 at the sequence
+    /// header, so the OK arm is the live one -- the gate decodes the pin and
+    /// asserts 17 decode-order frames byte-exact against aomdec with
+    /// `palette_422_unit_window_hits()` fired. The `Err` arm below is the
+    /// stale half: it still compiles in the old refusal string (`REFUSAL`,
+    /// `"a chroma format of 4:2:2"`) and a counter-stays-put assertion. That is
+    /// code, not a comment, and this prose sweep deliberately leaves it alone.
     #[test]
     fn the_pinned_422_palette_intra_in_inter_cell_window_is_byte_exact() {
         const NAME: &str = "the_pinned_422_palette_intra_in_inter_cell_window_is_byte_exact";
@@ -3541,8 +3541,11 @@ pub(crate) mod tests {
 
     /// lane-av1-ibc128chunk: the SOURCE-SCAN arm of the witness gate above.
     ///
-    /// The decode-level half of the red/green evidence cannot run in
-    /// committed code (the 4:2:2 refusal stands), so this arm pins the thing
+    /// The decode-level half of the red/green evidence now runs in committed
+    /// code too -- the witness gate above,
+    /// `the_pinned_422_intrabc_sb128_strip_witnesses_decode_pixel_exact`,
+    /// decodes both pins byte-exact against ffmpeg (lane-av1422lift lifted the
+    /// sequence-header refusal). This arm complements it by pinning the thing
     /// that would silently bring the defect back: the square-cut
     /// `chunk_chroma = cside * 64 / side` expression, and the per-axis
     /// replacements that replaced it at BOTH sites in
@@ -3838,7 +3841,9 @@ pub(crate) mod tests {
     }
 
     /// lane-av1422lpf: the three 4:2:2 LOSSLESS INTER witness fixtures,
-    /// PINNED, and asserted to refuse at the SEQUENCE HEADER.
+    /// PINNED. As of lane-av1422lift they are asserted to DECODE pixel-exact
+    /// against ffmpeg (the lane-av1422lift paragraph at the end of this doc);
+    /// before the lift this gate asserted the SEQUENCE-HEADER refusal instead.
     ///
     /// W/X/Y (`W_intrabc.obu`, `X_intrabc_tiled.obu`, `Y_intrabc_10b.obu`) are
     /// the streams on which lane-av1422lpf found the seven-site chroma-extent
@@ -3847,22 +3852,23 @@ pub(crate) mod tests {
     /// PER-AXIS `(bw >> ss_x, bh >> ss_y)` -- so the pins keep the bytes that
     /// witnessed it from silently changing under the gate.
     ///
-    /// WHAT THIS GATE DOES NOT COVER, measured rather than argued: the
-    /// refusal it asserts is the HEADER refusal, which fires BEFORE any of
-    /// the seven sites is reachable, and it fires IDENTICALLY on the pre-fix
-    /// tree (commit `aef4fa67` prints the same string, built and run for
-    /// this correction). This gate is therefore VACUOUS with respect to the
-    /// seven-site fix -- it passes before and after the fix. Its only real
-    /// content is the three pins.
+    /// WHAT THIS GATE DID NOT COVER BEFORE THE LIFT, measured rather than
+    /// argued: the refusal it asserted was the HEADER refusal, which fired
+    /// BEFORE any of the seven sites is reachable, and it fired IDENTICALLY on
+    /// the pre-fix tree (commit `aef4fa67` prints the same string, built and
+    /// run for this correction). As a refusal contract the gate was therefore
+    /// VACUOUS with respect to the seven-site fix -- it passed before and
+    /// after the fix, and its only real content was the three pins.
     ///
-    /// Nor can any committed gate witness that fix's DECODE behaviour: with
-    /// the header refusal standing, no committed test reaches a 4:2:2 decode,
-    /// because the `EC_AV1_ALLOW_422_PROBE` bypass is a patch-run-restore
-    /// hack that must never be committed. The panic fix's evidence is the
-    /// BYPASSED manual measurement in `lanes/av1422lpf.report.md`; what is
-    /// committed for the fix is the source-scan arm
-    /// `the_422_lossless_inter_chroma_walk_sites_stay_per_axis`, which
-    /// proves the per-axis SPELLING and nothing about pixels.
+    /// That refusal is GONE (lane-av1422lift lifted the sequence-header
+    /// refusal), so the decode-level half of the evidence now runs in
+    /// committed code: this gate's own byte-exact arm below decodes all three
+    /// fixtures against ffmpeg. `EC_AV1_ALLOW_422_PROBE` was only ever the
+    /// patch-run-restore bypass for the manual measurement in
+    /// `lanes/av1422lpf.report.md`; it is still deliberately not committed.
+    /// The source-scan arm
+    /// `the_422_lossless_inter_chroma_walk_sites_stay_per_axis` remains the
+    /// per-axis SPELLING proof; the pixel proof is now the committed decode.
     ///
     /// CORRECTED by lane-av1422llintra: the name said `..._panics_refuse_
     /// by_name`, and lane-av1422lpf's report claimed W and X now REFUSE with
@@ -4164,7 +4170,9 @@ pub(crate) mod tests {
     ///
     /// Measured on a patch-run-restore build (the `EC_AV1_ALLOW_422_PROBE`
     /// bypass applied for the run, reverted after -- it is deliberately NOT
-    /// committed, and the refusal below is what the committed tree asserts):
+    /// committed). This block is the bypassed measurement; the committed
+    /// assertion is now the byte-exact compare in the lane-av1422lift
+    /// paragraph below:
     ///
     /// - all 16 frames pixel-exact against `aomdec --rawvideo`, 2359296
     ///   bytes each, sha256 `4bfc2395e5ca6ea178f606e6b1ced773e26fc2d85b
@@ -4249,7 +4257,9 @@ pub(crate) mod tests {
     ///
     /// Measured on a patch-run-restore build (the `EC_AV1_ALLOW_422_PROBE`
     /// bypass applied for the run, reverted after -- deliberately not
-    /// committed, and the refusal asserted below is what this tree ships):
+    /// committed). This block is the bypassed measurement; the committed
+    /// assertion is now the byte-exact compare in the lane-av1422lift
+    /// paragraph below:
     ///
     /// - all 16 frames pixel-exact against `aomdec --rawvideo`, 2359296
     ///   bytes each, sha256 `1cf47bc9e06a6e286452dfe4ffe457a85b6badd25
@@ -42500,8 +42510,10 @@ exit 0
     /// frame splits to 64x64 (detailed testsrc2 content), so the whole
     /// stream stays inside the 4:2:0 paths this tree decodes. The 4:4:4 twin
     /// of this shape (FOUR TX_32X32 units per chunk per plane) is witnessed
-    /// in `lanes/av1444128.report.md` against the merged 444 tree -- this
-    /// tree still refuses non-4:2:0 sequences by name.
+    /// in `lanes/av1444128.report.md` and committed here as
+    /// `a_real_aomenc_444_intra_in_inter_128_root_codes_chroma_per_mu_chunk_unit_pixel_exact`.
+    /// lane-av1422lift: the sequence-header refusal is gone, so this tree no
+    /// longer refuses non-4:2:0 sequences by name.
     #[test]
     fn a_real_aomenc_128x128_none_inter_blocks_coded_chroma_per_mu_chunk_decodes_pixel_exact() {
         const NAME: &str =
@@ -52879,8 +52891,10 @@ exit 0
     /// --end-usage=q --cq-level=20 --cpu-used=2 --threads=1 --row-mt=0
     /// --lag-in-frames=0 --kf-max-dist=100 --limit=6 --obu -o - -`.
     /// aomenc picks `seq_profile=2` here (12-bit forces it) with
-    /// `subsampling_x/y = 0,0` -- still 4:4:4 planes, and the decoder's
-    /// refusal only rejects `subsampling_x != subsampling_y`.
+    /// `subsampling_x/y = 0,0` -- still 4:4:4 planes. lane-av1422lift: 4:2:2
+    /// (1,0) is DECODED now, so the only subsampling the decoder still asserts
+    /// against is the uncodable 4:4:0 (0,1) cell, closed by
+    /// `the_440_cell_is_not_a_codable_chroma_shape`.
     #[test]
     fn a_444_12bit_inter_sequence_decodes_pixel_exact() {
         const NAME: &str = "a_444_12bit_inter_sequence_decodes_pixel_exact";

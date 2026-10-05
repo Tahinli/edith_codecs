@@ -419,8 +419,13 @@ fn write_inter_block_128(
             // 32x64 (two stacked units) with a (64, 32) luma footprint per
             // unit, so `unit_mi`, the `64`-spans and the whole `CHUNKS`
             // raster need the same per-axis treatment before 4:2:2 could be
-            // written here. Refused by name at the sequence header today, so
-            // this is a PORT note, not a live defect.
+            // written here. This is a PORT note, not a live defect, because
+            // nothing feeds this writer 4:2:2: every non-test `ColorConfig`
+            // the encoder names is (1,1), pinned by arm 2 of
+            // `the_chroma_palette_map_side_is_the_420_plane_block_and_nothing_
+            // else_reaches_it`. lane-av1422lift lifted the decoder's
+            // sequence-header refusal, so the reason this is not live is the
+            // writer's 4:2:0-only source, not a refusal.
             let mut pair = [Vec::new(), Vec::new()];
             for plane in 1..3usize {
                 let grid = unit_of(plane, cr, cc);
