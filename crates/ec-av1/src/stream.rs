@@ -3533,6 +3533,49 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1422a2a4: the firing gate for `decode_block`'s var-tx EITHER/OR
+    /// tail at 4:2:2 -- an INTRABC block whose var-tx tree resolved MIXED
+    /// leaves, where the old blanket `set_txfm_ctxs` + `fill_lf_grid` publishes
+    /// clobbered the per-leaf TXFM_CONTEXT bands libaom keeps.
+    ///
+    /// Provenance: aomenc profile 2, `testsrc2=size=128x112:rate=25` tiled 2x2
+    /// to 256x224, cq 30, 3 frames (`lanes/av1422ibcrect.report.md` §2, stream
+    /// A4). The oracle decodes it to completion; the pre-fix tree refused it
+    /// mid-tile with the documented `decodeframe.c:1456` subsize string -- the
+    /// E6/E7 desync-symptom class, NOT an invalid shape.
+    ///
+    /// Measured on the pinned bytes: the 32x32 intrabc block at mi(32,8)
+    /// resolves leaves (0,0)+((0,4) 8x8, (4,0)+(4,4) 16x16, so
+    /// `left_txfm[32..35]` must read 16 when the NEXT tree's sub-unit at
+    /// (32,16) row0col0 reads its `txfm_partition` context (oracle operands
+    /// `above=16 left=16`, ctx 9). The blanket publishes reset those cells to
+    /// 8 -> ctx 10 -> a wrong `is_split` -> the first divergent read, and the
+    /// refusal surfaced ~30 partition symbols later.
+    #[test]
+    fn the_pinned_422_intrabc_vartx_mixedtree_witnesses_decode_pixel_exact() {
+        const NAME: &str = "the_pinned_422_intrabc_vartx_mixedtree_witnesses_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("422_intrabc_vartx_mixedtree_a4.obu");
+        let data = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{NAME}: pinned witness {} is missing ({e}) -- the gate cannot run",
+                path.display()
+            )
+        });
+        assert_eq!(data.len(), 30937, "{NAME}: pinned witness size drifted");
+        assert_eq!(
+            fnv1a64(&data),
+            0x6f0fc77c2217910a_u64,
+            "{NAME}: pinned witness bytes drifted"
+        );
+        assert_422_stream_pixel_exact(NAME, &data, 256, 224, 3, 8, true);
+    }
+
     /// lane-av1422ibctxsel: the firing gate for `decode_intrabc_owned_rect`'s
     /// NON-SPLIT chroma coefficient context at 4:2:2.
     ///
