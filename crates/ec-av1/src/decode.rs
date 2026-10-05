@@ -18500,6 +18500,26 @@ fn decode_rect4_16_intrabc(
     let (cw, ch) = if own_chroma {
         (bw >> ss_x(fctx), bh >> ss_y(fctx))
     } else {
+        // lane/av1422rect4dead: this arm is the 4:2:0 PAIR geometry, and at ss
+        // (1, 0) it cannot run. The sole caller is `decode_rect4_16_strip`,
+        // reached only through the two 16x16-level 1:4 arms; both sit under
+        // `refuse_invalid_subsize((16, 16), part16)`, and at ss (1, 0) that
+        // guard refuses exactly the shape that would land here:
+        // `partition_subsize_dims((16, 16), PARTITION_VERT_4) == (4, 16)`,
+        // which is in `PLANE_BLOCK_INVALID_422`. The surviving 16x4 HORZ_4
+        // strip takes `own422` above, not this arm. At ss (1, 1) the arm is
+        // live and correct (the pair IS the geometry), and at ss (0, 0)
+        // `own444` already won, so this assert never fires there. The
+        // assertion is the closure the repo rule asks for; the census test
+        // `decode_rect4_16_intrabc_else_arm_stays_closed_at_422` below reds if
+        // either this assert or its guard chain is removed.
+        assert!(
+            !(ss_x(fctx) == 1 && ss_y(fctx) == 0),
+            "decode_rect4_16_intrabc else arm entered at ss (1, 0) with a 4x16 \
+             VERT_4 strip: (4, 16) is BLOCK_INVALID at 4:2:2 and the 16x16-level \
+             refuse_invalid_subsize above both callers must have refused this \
+             before the dispatch -- the closure is gone"
+        );
         (pw / 2, ph / 2)
     };
     let pair_mi = if has_chroma {
@@ -58727,6 +58747,178 @@ mod tests {
                  the dispatch can never observe it"
             );
         }
+    }
+
+    /// lane/av1422rect4dead: the `(pw / 2, ph / 2)` / `MI / 2` origin `else`
+    /// arm of [`decode_rect4_16_intrabc`] is the 4:2:0 PAIR geometry. It is
+    /// still LIVE at ss (1, 1) -- a 1:4 strip's chroma lies inside its
+    /// 4:2:0 pair there -- so the arm is not deleted; it is CLOSED at ss
+    /// (1, 0), where it would run on a 4x16 VERT_4 strip whose chroma plane
+    /// block is BLOCK_INVALID, and where libaom's own
+    /// `is_chroma_reference` (av1_common_int.h:1454, `|| !subsampling_y`)
+    /// makes every strip its own chroma reference anyway (the `own422` arm
+    /// handles that). The proof: the sole caller `decode_rect4_16_strip` is
+    /// reached only via the two 16x16-level 1:4 arms, each under
+    /// `refuse_invalid_subsize((16, 16), part16)` -- at ss (1, 0) that guard
+    /// refuses `partition_subsize_dims((16, 16), PARTITION_VERT_4) == (4, 16)`
+    /// (in `PLANE_BLOCK_INVALID_422`), and the surviving HORZ_4 16x4 strip
+    /// takes `own422`. This test re-derives that chain from the file so it
+    /// REDS when any half stops holding: deleting the in-arm assertion, a
+    /// caller moving under a level whose guard does not refuse (4, 16) at
+    /// ss (1, 0), or the `(pw / 2, ph / 2)` form drifting. 4:2:0 and 4:4:4
+    /// behaviour are unchanged: the gate runs only the file scan and the
+    /// closed cell's arithmetic, no decode.
+    #[test]
+    fn decode_rect4_16_intrabc_else_arm_stays_closed_at_422() {
+        let src = include_str!("decode.rs");
+        let decode_body = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+
+        // (a) The closure assertion must exist INSIDE the function, in the
+        // `else` arm of the `(cw, ch)` select, naming the shape and the
+        // subsampling. Deleting it -- or re-adding the bare halving without
+        // it -- reds here.
+        let fstart = decode_body
+            .find("\nfn decode_rect4_16_intrabc(")
+            .expect("decode_rect4_16_intrabc is gone -- this gate guards its else arm");
+        let fend = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+            .iter()
+            .filter_map(|pat| decode_body[fstart + 1..].find(pat).map(|i| fstart + 1 + i))
+            .min()
+            .unwrap_or(decode_body.len());
+        let body = &decode_body[fstart..fend];
+        let else_arm = body
+            .find("    let (cw, ch) = if own_chroma {")
+            .expect("the (cw, ch) select moved out of decode_rect4_16_intrabc");
+        let closure = &body[else_arm..];
+        assert!(
+            closure.contains("assert!(") && closure.contains("ss_x(fctx) == 1 && ss_y(fctx) == 0"),
+            "the decode_rect4_16_intrabc else arm's ss (1, 0) closure assertion is \
+             GONE -- the 4:2:0 pair geometry is unreachable at ss (1, 0) only while \
+             that assert (and the guards below) stand; re-add it"
+        );
+
+        // (b) The sole-caller chain, re-derived from the file: exactly one
+        // call to `decode_rect4_16_intrabc(` outside its own definition, in
+        // `decode_rect4_16_strip`; exactly two calls to
+        // `decode_rect4_16_strip(` from the two 1:4 routes.
+        let code_lines: String = decode_body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let count_calls = |name: &str| -> usize {
+            code_lines.matches(&format!("{name}(")).count()
+                - usize::from(code_lines.contains(&format!("fn {name}(")))
+        };
+        assert_eq!(
+            count_calls("decode_rect4_16_intrabc"),
+            1,
+            "decode_rect4_16_intrabc gained a caller -- re-derive whether the new route \
+             sits under a guard that refuses (4, 16) at ss (1, 0) before this gate \
+             stays green"
+        );
+        assert_eq!(
+            count_calls("decode_rect4_16_strip"),
+            2,
+            "decode_rect4_16_strip's caller set moved -- both routes must be \
+             16x16-level 1:4 arms under a (16, 16) guard that refuses (4, 16) at \
+             ss (1, 0)"
+        );
+
+        // (c) Both routes sit under a `refuse_invalid_subsize((16, 16), ...)`:
+        // the key-frame arm's guard ordered above the arm test, the inter
+        // arm's guard in the inter decoder above its own 1:4 test. Scoped to
+        // the enclosing function so the other decoder's guard cannot stand in
+        // (the r2 class this file already fixed once).
+        let fn_scope = |at: usize| -> std::ops::Range<usize> {
+            let head = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                .iter()
+                .filter_map(|pat| decode_body[..at].rfind(pat))
+                .max()
+                .unwrap_or(0);
+            let tail = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                .iter()
+                .filter_map(|pat| decode_body[at..].find(pat).map(|i| at + i))
+                .min()
+                .unwrap_or(decode_body.len());
+            head..tail
+        };
+        let kf_test = decode_body
+            .find("if part16 == PARTITION_HORZ_4")
+            .expect("the key-frame 16-level 1:4 arm test is gone");
+        let kf_scope = fn_scope(kf_test);
+        let kf_guard = decode_body[kf_scope.clone()]
+            .find("refuse_invalid_subsize((16, 16)")
+            .map(|i| kf_scope.start + i)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the key-frame 16-level 1:4 arm has NO \
+                     refuse_invalid_subsize((16, 16)) above it in its own \
+                     function -- the VERT_4 (4, 16) refusal that closed \
+                     decode_rect4_16_intrabc's else arm at ss (1, 0) is gone"
+                )
+            });
+        assert!(
+            kf_guard < kf_test,
+            "the key-frame (16, 16) guard sits below the 1:4 arm test -- it can never \
+             observe the VERT_4 symbol that must be refused before \
+             decode_rect4_16_intrabc's else arm can run at ss (1, 0)"
+        );
+        let inter_writer = decode_body
+            .find("let horz = part16 == PARTITION_HORZ_4;")
+            .expect("the inter 16-level 1:4 arm is gone");
+        let inter_scope = fn_scope(inter_writer);
+        let inter_guard = decode_body[inter_scope.clone()]
+            .find("refuse_invalid_subsize((16, 16)")
+            .map(|i| inter_scope.start + i)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the inter-frame 16-level 1:4 arm has NO \
+                     refuse_invalid_subsize((16, 16)) in its function -- the VERT_4 \
+                     (4, 16) refusal that closed decode_rect4_16_intrabc's else arm \
+                     at ss (1, 0) is gone"
+                )
+            });
+        assert!(
+            inter_guard < inter_writer,
+            "the inter (16, 16) guard sits below the 1:4 arm test -- it can never \
+             observe the VERT_4 symbol that must be refused before \
+             decode_rect4_16_intrabc's else arm can run at ss (1, 0)"
+        );
+
+        // (d) The shape/subsampling cells the closure is written against,
+        // re-executed: (4, 16) must still be BLOCK_INVALID at ss (1, 0) while
+        // (16, 4) stays codable there, and at ss (1, 1) BOTH are codable --
+        // which is what keeps the arm live at 4:2:0 and the assertion inert
+        // there. At ss (0, 0) everything is codable, so `own444` (and the
+        // assertion) never see the else arm.
+        assert!(
+            !chroma_plane_block_codable(4, 16, 1, 0),
+            "(4, 16) left PLANE_BLOCK_INVALID_422 -- the else arm is now REACHABLE at \
+             ss (1, 0) with the halved pair geometry, which is a real defect, not a \
+             closure: re-derive the whole chain, then fix the halving instead of the \
+             assert"
+        );
+        assert!(
+            chroma_plane_block_codable(16, 4, 1, 0),
+            "(16, 4) became BLOCK_INVALID at ss (1, 0) -- the surviving HORZ_4 strip \
+             takes own422, and the closure assert would fire on a legal shape; \
+             re-derive"
+        );
+        assert!(
+            chroma_plane_block_codable(4, 16, 1, 1) && chroma_plane_block_codable(16, 4, 1, 1),
+            "a 1:4 strip's plane block moved at ss (1, 1) -- the else arm is LIVE there \
+             and the pair geometry is what decodes it; the assertion must stay inert at \
+             4:2:0"
+        );
+        assert!(
+            chroma_plane_block_codable(4, 16, 0, 0) && chroma_plane_block_codable(16, 4, 0, 0),
+            "a 1:4 strip's plane block became invalid at ss (0, 0) -- the assertion sits \
+             after the own444 arm and must never fire at 4:4:4; re-derive"
+        );
     }
 
     /// lane-av1chrtx: [`covering_leaf_tx_type`] resolves a chroma unit's
