@@ -3410,17 +3410,17 @@ pub(crate) mod tests {
     /// lane-av1422lift: `decode_stream` no longer refuses 4:2:2 at the sequence
     /// header, so the OK arm is the live one -- the gate decodes the pin and
     /// asserts 17 decode-order frames byte-exact against aomdec with
-    /// `palette_422_unit_window_hits()` fired. The `Err` arm below is the
-    /// stale half: it still compiles in the old refusal string (`REFUSAL`,
-    /// `"a chroma format of 4:2:2"`) and a counter-stays-put assertion. That is
-    /// code, not a comment, and this prose sweep deliberately leaves it alone.
+    /// `palette_422_unit_window_hits()` fired. lane-av1oracledepth: the stale
+    /// `Err` arm (it matched the pre-lift refusal string
+    /// `"a chroma format of 4:2:2"` the decoder no longer returns, and could
+    /// have swallowed a future decode error as green) is deleted; a refusal
+    /// now fails this gate loudly.
     #[test]
     fn the_pinned_422_palette_intra_in_inter_cell_window_is_byte_exact() {
         const NAME: &str = "the_pinned_422_palette_intra_in_inter_cell_window_is_byte_exact";
         const FILE: &str = "422_palette_intra_in_inter_384x240_17f.obu";
         const BYTES: usize = 19344;
         const FP: u64 = 0x923ccabfcb933e90;
-        const REFUSAL: &str = "a chroma format of 4:2:2";
         let _gate_lock = lock_gate_counters();
         let data = std::fs::read(crate_pin(FILE)).unwrap_or_else(|e| {
             panic!("{NAME}: the committed pin {FILE} is missing ({e}) -- a failure, not a skip")
@@ -3428,27 +3428,21 @@ pub(crate) mod tests {
         assert_eq!(data.len(), BYTES, "{NAME}: {FILE} size drifted");
         assert_eq!(fnv1a64(&data), FP, "{NAME}: {FILE} bytes drifted");
         let before = crate::decode::palette_422_unit_window_hits();
+        // lane-av1oracledepth: the OK arm is MEASURED to be the live one (the
+        // pinned bytes decode, 17 decode-order frames byte-exact vs aomdec,
+        // 16 windowed units) and the old `Err` arm matching the pre-lift
+        // refusal string "a chroma format of 4:2:2" is deleted: committed
+        // code no longer returns that string, so the arm could only ever
+        // swallow a FUTURE decode error that happened to contain it and read
+        // green off a stream that decoded nothing. A refusal today now fails
+        // this gate loudly, as it should.
         match decode_stream(&data) {
             Err(e) => {
-                let err = e.to_string();
-                assert!(
-                    err.contains(REFUSAL),
-                    "{NAME}: {FILE} neither refused by name nor decoded to the 17 \
-                     decode-order frames this gate claims -- if 4:2:2 has been lifted the \
-                     ERROR arm is stale, got: {err}"
-                );
-                assert_eq!(
-                    crate::decode::palette_422_unit_window_hits(),
-                    before,
-                    "{NAME}: a refusal cannot reach the palette arm, so its counter moved \
-                     from {before} -- this is not the refusal this gate models"
-                );
-                eprintln!(
-                    "{NAME}: {FILE} refuses 4:2:2 at the sequence header (the standing \
-                     family rule), so the per-unit palette window could not be exercised \
-                     here; the exactness and fired-counter claims are measured on a local \
-                     patch-run-restore build -- see lanes/av1422tailskip.report.md"
-                );
+                panic!(
+                    "{NAME}: {FILE} was refused by the current decoder: {e}. 4:2:2 is a \
+                     DECODED format; a refusal here is a regression, not the old sequence-\
+                     header gate"
+                )
             }
             Ok(_) => {
                 let windows = crate::decode::palette_422_unit_window_hits() - before;
@@ -7224,6 +7218,251 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1oracledepth: the 8-bit `ffmpeg_decode_sequence_444` must REFUSE
+    /// a real 10-bit 4:4:4 pin instead of letting ffmpeg convert it down to
+    /// `yuv444p`. ffmpeg does not fail on the depth mismatch -- it re-scales
+    /// -- so a gate built on the 8-bit helper would compare ffmpeg's rescaled
+    /// planes against our 10-bit decode and could read exact. The message
+    /// must name the real depth AND the depth-generic sibling
+    /// `ffmpeg_decode_sequence_444_depth`, so the caller has the fix in front
+    /// of it.
+    ///
+    /// Needs no ffmpeg at all: the guard runs before the spawn, so a host
+    /// without ffmpeg still proves the refusal.
+    #[test]
+    fn the_8bit_444_oracle_helper_refuses_a_10bit_444_pin() {
+        const NAME: &str = "the_8bit_444_oracle_helper_refuses_a_10bit_444_pin";
+        let _gate_lock = lock_gate_counters();
+        let path = crate_pin("444_lossy_palette_chroma_352x242_10b.obu");
+        let stream = read_pin(&path, 24875, 0x7fda_dbb4_3bbf_9af3, NAME);
+        assert_eq!(
+            stream_bit_depth(&stream, NAME),
+            10,
+            "{NAME}: the pin must really be 10-bit, or this proves nothing"
+        );
+        assert_eq!(
+            stream_subsampling(&stream, NAME),
+            (0, 0),
+            "{NAME}: the pin must really be 4:4:4 (0,0), or this proves nothing"
+        );
+        let msg = panic_message(|| {
+            ffmpeg_decode_sequence_444(&stream, 352, 242, 1);
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{NAME}: ffmpeg_decode_sequence_444 ACCEPTED a 10-bit 4:4:4 stream. ffmpeg \
+                 converted it to yuv444p and the helper returned a green-looking comparison"
+            )
+        });
+        for needle in ["not 8-bit", "ffmpeg_decode_sequence_444_depth"] {
+            assert!(
+                msg.contains(needle),
+                "{NAME}: the refusal must name {needle:?}; it said: {msg}"
+            );
+        }
+        eprintln!("{NAME}: refused -> {msg}");
+    }
+
+    /// lane-av1oracledepth: the depth-generic 4:4:4 oracle comparator, armed
+    /// on the same pinned 10-bit 4:4:4 cell
+    /// `a_444_lossy_palette_chroma_unit_window_is_byte_exact_at_352x242_10bit`
+    /// gates (fixture sha256
+    /// `84df2f37cc7982f9a572443d85dfcc13bf366a64f3fb567391dcd5acd58a0ad2`):
+    /// every plane of every SHOWN frame must come back byte-exact against
+    /// ffmpeg's `yuv444p10le` rawvideo of the same bytes, with the depth read
+    /// from the stream's own sequence header, never assumed.
+    ///
+    /// The flip control is the crate's own comparator-liveness shape (the
+    /// same one
+    /// [`every_ffmpeg_comparator_reds_on_a_one_sample_wrong_ffmpeg`] runs for
+    /// the other helpers): with a thread-local ffmpeg shim that rotates ONE
+    /// byte of the oracle's own rawvideo stdout, the compare must move from
+    /// 0 to EXACTLY 1 differing sample in the tampered plane and stay at 0 in
+    /// the other two -- a comparator that cannot see a one-sample difference
+    /// would make every "byte-exact" claim above vacuous.
+    #[test]
+    fn the_444_depth_helper_is_byte_exact_on_a_pinned_10bit_444_cell() {
+        const NAME: &str = "the_444_depth_helper_is_byte_exact_on_a_pinned_10bit_444_cell";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let _gate_lock = lock_gate_counters();
+        let path = crate_pin("444_lossy_palette_chroma_352x242_10b.obu");
+        let stream = read_pin(&path, 24875, 0x7fda_dbb4_3bbf_9af3, NAME);
+        // The fixture is 16 SHOWN frames; ffmpeg's rawvideo muxer emits shown
+        // frames only, and so does decode_stream's return.
+        const W: usize = 352;
+        const H: usize = 242;
+        const FRAMES: usize = 16;
+        assert_eq!(stream_bit_depth(&stream, NAME), 10, "{NAME}: pin depth");
+        let ours = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the pinned 10-bit 4:4:4 cell was refused: {e}"));
+        assert_eq!(ours.len(), FRAMES, "{NAME}: decoded frame count");
+        let theirs = ffmpeg_decode_sequence_444_depth(&stream, W, H, FRAMES, 10, "yuv444p10le");
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            for (plane, x, y) in [("Y", &a.y, &b.y), ("U", &a.u, &b.u), ("V", &a.v, &b.v)] {
+                if let Some(at) = x.iter().zip(y).position(|(p, q)| p != q) {
+                    panic!(
+                        "{NAME}: {plane} differs from ffmpeg's yuv444p10le at frame {i} sample \
+                         {at} (ours {} vs {}); {n} of {m} samples differ",
+                        x[at],
+                        y[at],
+                        n = x.iter().zip(y).filter(|(p, q)| p != q).count(),
+                        m = x.len()
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "{NAME}: {FRAMES} shown frames byte-exact vs ffmpeg yuv444p10le on the pinned \
+             10-bit 4:4:4 cell"
+        );
+
+        // ---- the flip control: one wrong oracle sample must move the count
+        //      0 -> 1 in exactly the tampered plane -------------------------
+        let dir = std::env::temp_dir().join(format!("ec-av1-{NAME}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let real = if let Some(p) = std::env::var_os("EC_AV1_FFMPEG") {
+            std::path::PathBuf::from(p)
+        } else {
+            let found = Command::new("ffmpeg")
+                .arg("-version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(found, "{NAME}: no working ffmpeg on PATH to wrap");
+            let path_env = std::env::var_os("PATH").unwrap_or_default();
+            std::env::split_paths(&path_env)
+                .map(|d| d.join("ffmpeg"))
+                .find(|p| p.is_file())
+                .expect("{NAME}: ffmpeg is on PATH but not resolvable to a file")
+        };
+        std::fs::write(dir.join("real-ffmpeg"), real.as_os_str().as_encoded_bytes())
+            .expect("recording the real ffmpeg's path for the shim");
+        let script = r#"#!/bin/sh
+REAL=$(cat "$(dirname "$0")/real-ffmpeg")
+OUT=$(mktemp)
+"$REAL" "$@" > "$OUT" || exit $?
+while read -r o; do
+  [ -n "$o" ] || continue
+  b=$(od -An -tu1 -j "$o" -N 1 "$OUT" 2>/dev/null | tr -d ' \n')
+  [ -n "$b" ] || continue
+  esc=$(printf '\\%03o' $(( (b + 128) % 256 )))
+  printf "$esc" | dd of="$OUT" bs=1 seek="$o" count=1 conv=notrunc 2>/dev/null
+done < "$(dirname "$0")/offsets"
+cat "$OUT"
+rm -f "$OUT"
+exit 0
+"#;
+        let shim = dir.join("one-sample-wrong-ffmpeg.sh");
+        std::fs::write(&shim, script).expect("writing the ffmpeg shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("the ffmpeg shim must be executable");
+        }
+        let set_offsets = |bytes: &[usize]| {
+            let body: String = bytes
+                .iter()
+                .map(|b| format!("{b}\n"))
+                .collect::<Vec<_>>()
+                .concat();
+            std::fs::write(dir.join("offsets"), body).expect("writing the offsets file");
+        };
+        let count = |theirs_t: &[Pic]| -> [usize; 3] {
+            let mut wrong = [0usize; 3];
+            for (a, b) in ours.iter().zip(theirs_t) {
+                for (plane, (x, y)) in
+                    [(0usize, (&a.y, &b.y)), (1, (&a.u, &b.u)), (2, (&a.v, &b.v))]
+                {
+                    wrong[plane] += x.iter().zip(y).filter(|(p, q)| p != q).count();
+                }
+            }
+            wrong
+        };
+        // Frame bytes are 3 planes x W*H samples x 2 bytes (10-bit container).
+        let plane_bytes = W * H * 2;
+        let mut blind: Vec<String> = Vec::new();
+        set_ffmpeg_path(Some(shim.clone()));
+        for (plane, base) in [("Y", 0usize), ("U", plane_bytes), ("V", 2 * plane_bytes)] {
+            // Byte 2000 of the named plane: sample 1000, still frame 0 on
+            // every plane at this geometry.
+            set_offsets(&[base + 2000]);
+            let theirs_t =
+                ffmpeg_decode_sequence_444_depth(&stream, W, H, FRAMES, 10, "yuv444p10le");
+            let got = count(&theirs_t);
+            let mut expected = [0usize, 0, 0];
+            expected[match plane {
+                "Y" => 0,
+                "U" => 1,
+                _ => 2,
+            }] = 1;
+            if got != expected {
+                blind.push(format!(
+                    "{plane} arm: counted {got:?}, expected {expected:?} (exactly the one \
+                     tampered sample)"
+                ));
+            }
+        }
+        set_ffmpeg_path(None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            blind.is_empty(),
+            "{NAME}: {} of 3 flip arms stayed GREEN against an ffmpeg that is wrong by exactly \
+             one sample -- {blind:#?} -- the comparator cannot see a difference, so its \
+             byte-exact verdict proves nothing (class comparator-that-never-reads-the-oracle)",
+            blind.len()
+        );
+        eprintln!(
+            "{NAME}: flip control bites on Y, U and V separately (0 -> 1 per tampered plane)"
+        );
+    }
+
+    /// lane-av1oracledepth: `ffmpeg_decode_sequence_10bit` must REFUSE a
+    /// wrong-depth stream by the stream's OWN sequence header, the way the
+    /// 12-bit gates read `assert_12bit_sequence_header`. An 8-bit 4:2:0
+    /// stream handed to the 10-bit helper is the wrong-depth shape: ffmpeg
+    /// converts it to `yuv420p10le` and sizes no plane differently, so
+    /// without the depth assert a gate could compare a converted 8-bit
+    /// reference against our 10-bit decode and read exact.
+    #[test]
+    fn the_10bit_oracle_helper_refuses_a_wrong_depth_stream() {
+        const NAME: &str = "the_10bit_oracle_helper_refuses_a_wrong_depth_stream";
+        let _gate_lock = lock_gate_counters();
+        let path = crate_pin("mix176_offtile_chroma_clip.obu");
+        let stream = read_pin(&path, 4581, 0x5e31be5efc9c3c1d, NAME);
+        assert_eq!(
+            stream_bit_depth(&stream, NAME),
+            8,
+            "{NAME}: the control pin must really be 8-bit, or this proves nothing"
+        );
+        assert_eq!(
+            stream_subsampling(&stream, NAME),
+            (1, 1),
+            "{NAME}: the control pin must really be 4:2:0, or the refusal below could be the \
+             shape guard instead of the depth guard"
+        );
+        let msg = panic_message(|| {
+            ffmpeg_decode_sequence_10bit(&stream, 176, 144, 1);
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{NAME}: ffmpeg_decode_sequence_10bit ACCEPTED an 8-bit stream -- ffmpeg \
+                 converted it to yuv420p10le and the helper returned a comparison that could \
+                 pass green"
+            )
+        });
+        assert!(
+            msg.contains("not 10-bit"),
+            "{NAME}: the refusal must name the depth guard (\"not 10-bit\"); it said: {msg}"
+        );
+        eprintln!("{NAME}: refused -> {msg}");
+    }
+
     /// Packs decoded planes the way `aomdec --rawvideo` writes them for
     /// `bit_depth`: 1 byte per sample at 8-bit, 2 bytes little-endian at
     /// 10/12-bit. Plane order is Y, U, V at the frame's own subsampled
@@ -7614,6 +7853,14 @@ pub(crate) mod tests {
     /// stream's real 10-bit depth (ffmpeg's rawvideo muxer never packs to the
     /// bit depth). The 8-bit helper above stays untouched -- every existing
     /// gate depends on it.
+    ///
+    /// lane-av1oracledepth: the stream's OWN sequence header must parse
+    /// 10-bit, the same way `assert_12bit_sequence_header` covers the 12-bit
+    /// gates. A wrong-depth stream handed here would otherwise CONVERT
+    /// silently -- ffmpeg re-scales 8-bit samples into the 16-bit container
+    /// and sizes no plane differently -- so a gate could compare ffmpeg's
+    /// rescaled 8-bit planes against our 10-bit decode and read exact (class
+    /// `helper-assumes-the-shape-the-gate-name-implies`, the depth axis).
     fn ffmpeg_decode_sequence_10bit(
         stream: &[u8],
         width: usize,
@@ -7623,7 +7870,15 @@ pub(crate) mod tests {
         assert_420_oracle_stream(
             stream,
             "ffmpeg_decode_sequence_10bit",
-            "ffmpeg_decode_sequence_422_depth(.., 10, \"yuv422p10le\") (4:2:2); ffmpeg_decode_sequence_444 is 8-bit only",
+            "ffmpeg_decode_sequence_422_depth(.., 10, \"yuv422p10le\") (4:2:2); \
+             ffmpeg_decode_sequence_444_depth(.., 10, \"yuv444p10le\") (4:4:4)",
+        );
+        assert_eq!(
+            stream_bit_depth(stream, "ffmpeg_decode_sequence_10bit"),
+            10,
+            "ffmpeg_decode_sequence_10bit REFUSED a stream whose own sequence header is not \
+             10-bit -- ffmpeg converts it to yuv420p10le instead of failing, and the comparison \
+             would read a converted reference"
         );
         let out = run_with_stdin(
             Command::new(ffmpeg_path()).args([
@@ -9116,25 +9371,75 @@ pub(crate) mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Pic> {
+        ffmpeg_decode_sequence_444_depth(stream, width, height, frames, 8, "yuv444p")
+    }
+
+    /// lane-av1oracledepth: the depth-generic 4:4:4 oracle comparator -- the
+    /// [`ffmpeg_decode_sequence_422_depth`] twin for full-resolution chroma.
+    /// `yuv444p`, `yuv444p10le` or `yuv444p12le`, with the container width
+    /// taken from `depth` itself (8 -> one byte per sample; 10/12 -> a 16-bit
+    /// LE container on BOTH sides, so ours and ffmpeg's are directly
+    /// comparable sample for sample and nothing narrows). Until this helper
+    /// existed a 10/12-bit 4:4:4 gate had to fall back to the 8-bit
+    /// `ffmpeg_decode_sequence_444`, which ffmpeg converts at `yuv444p`
+    /// instead of refusing, or to a raw hand-rolled spawn (class
+    /// `helper-assumes-the-shape-the-gate-name-implies`, the depth axis).
+    ///
+    /// Refused by SHAPE read from the stream's own sequence header, like its
+    /// 4:2:0 siblings: `(0,0)` only, so a 4:2:2 or 4:2:0 stream handed here
+    /// cannot have ffmpeg silently convert it.
+    fn ffmpeg_decode_sequence_444_depth(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+        depth: u8,
+        pix_fmt: &str,
+    ) -> Vec<Pic> {
+        assert!(
+            matches!(depth, 8 | 10 | 12),
+            "lane-av1oracledepth: ffmpeg_decode_sequence_444_depth takes 8, 10 or 12, got {depth}"
+        );
+        let (sx, sy) = stream_subsampling(stream, "ffmpeg_decode_sequence_444_depth");
+        assert!(
+            (sx, sy) == (0, 0),
+            "ffmpeg_decode_sequence_444_depth REFUSED a ({sx},{sy}) stream: this helper asks \
+             ffmpeg for a 4:4:4 pix_fmt, which CONVERTS the stream's real {} chroma instead of \
+             failing, then slices full-resolution planes from converted bytes. \
+             ffmpeg_decode_sequence_422_depth handles (1,0); ffmpeg_decode_sequence handles \
+             (1,1).",
+            chroma_shape(sx, sy)
+        );
+        assert_eq!(
+            stream_bit_depth(stream, "ffmpeg_decode_sequence_444_depth"),
+            depth,
+            "ffmpeg_decode_sequence_444_depth REFUSED a stream whose own sequence header is \
+             not {depth}-bit -- ffmpeg would convert it to {pix_fmt} instead of failing"
+        );
         let out = run_with_stdin(
-            Command::new("ffmpeg").args([
-                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv444p", "-",
+            Command::new(ffmpeg_path()).args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-",
             ]),
             stream,
         );
         assert!(
             out.status.success(),
-            "ffmpeg refused the 4:4:4 stream: {}",
+            "ffmpeg refused the 4:4:4 stream ({pix_fmt}): {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let plane = width * height;
-        let frame_bytes = 3 * plane;
+        let bps = if depth == 8 { 1 } else { 2 };
+        let frame_bytes = 3 * plane * bps;
         assert_eq!(
             out.stdout.len(),
             frame_bytes * frames,
             "{}",
             frame_count_diagnosis(
-                "4:4:4",
+                if depth == 8 {
+                    "4:4:4"
+                } else {
+                    "4:4:4 high depth"
+                },
                 frames,
                 width,
                 height,
@@ -9146,21 +9451,23 @@ pub(crate) mod tests {
         (0..frames)
             .map(|i| {
                 let base = i * frame_bytes;
+                let samples = |off: usize| -> Vec<u16> {
+                    let slice = &out.stdout[base + off..base + off + plane * bps];
+                    if bps == 1 {
+                        slice.iter().map(|&v| u16::from(v)).collect()
+                    } else {
+                        slice
+                            .chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect()
+                    }
+                };
                 Pic {
                     width,
                     height,
-                    y: out.stdout[base..base + plane]
-                        .iter()
-                        .map(|&v| u16::from(v))
-                        .collect(),
-                    u: out.stdout[base + plane..base + 2 * plane]
-                        .iter()
-                        .map(|&v| u16::from(v))
-                        .collect(),
-                    v: out.stdout[base + 2 * plane..base + 3 * plane]
-                        .iter()
-                        .map(|&v| u16::from(v))
-                        .collect(),
+                    y: samples(0),
+                    u: samples(plane * bps),
+                    v: samples(2 * plane * bps),
                 }
             })
             .collect()
@@ -18124,7 +18431,8 @@ exit 0
         assert_420_oracle_stream(
             stream,
             "ffmpeg_decode_sequence_12bit",
-            "ffmpeg_decode_sequence_422_depth(.., 12, \"yuv422p12le\") (4:2:2); ffmpeg_decode_sequence_444 is 8-bit only",
+            "ffmpeg_decode_sequence_422_depth(.., 12, \"yuv422p12le\") (4:2:2); \
+             ffmpeg_decode_sequence_444_depth(.., 12, \"yuv444p12le\") (4:4:4)",
         );
         let out = run_with_stdin(
             Command::new("ffmpeg").args([
