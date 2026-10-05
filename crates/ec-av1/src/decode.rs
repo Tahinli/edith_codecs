@@ -5167,6 +5167,15 @@ thread_local! {
     /// strip's chroma plane block.
     static IBC_OWNED_RECT_CHROMA_FOOTPRINT_444_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// lane-av1422ibctxsel: `decode_intrabc_owned_rect`'s NON-SPLIT chroma
+    /// gather taken through the 4:2:2 pair rule (`around_mi_422_chroma`)
+    /// under the ss (1, 0) guard -- both residual branches (the var-tx tree
+    /// and the no-leaves twin). `>= 1` can only come from a 4:2:2 stream
+    /// that reaches this function's non-split chroma arm; the 4:2:0/4:4:4
+    /// arms keep the plain `around_mi_rect` gather (`ss_y != 0` / `ss_x == 0`
+    /// take the else), so the counter stays 0 for them.
+    static IBC_OWNED_RECT_422_PAIR_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// lane-av1-intrabc r4: coded (`skip == 0`) rect intrabc blocks reconstructed,
@@ -5220,6 +5229,18 @@ pub fn ibc_owned_rect_chroma_footprint_444_hits() -> usize {
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_ibc_owned_rect_chroma_footprint_444_hits() {
     IBC_OWNED_RECT_CHROMA_FOOTPRINT_444_HITS.with(|c| c.set(0));
+}
+
+/// lane-av1422ibctxsel: [`IBC_OWNED_RECT_422_PAIR_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub fn ibc_owned_rect_422_pair_hits() -> usize {
+    IBC_OWNED_RECT_422_PAIR_HITS.with(|c| c.get())
+}
+
+/// lane-av1422ibctxsel: zeroes [`IBC_OWNED_RECT_422_PAIR_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn reset_ibc_owned_rect_422_pair_hits() {
+    IBC_OWNED_RECT_422_PAIR_HITS.with(|c| c.set(0));
 }
 
 /// lane-whtshape: [`INTRABC_RECT_LOSSLESS_CHROMA4_HITS`].
@@ -18019,22 +18040,29 @@ fn decode_intrabc_owned_rect(
             u_grid = ug;
             v_grid = vg;
         } else {
-            // lane-av1422gathercensus: the only `around_mi_rect` in the file
-            // that feeds a CHROMA coefficient context and can run at ss
-            // (1, 0): its above extent is the whole block's LUMA width, and
-            // libaom's `get_txb_ctx_general` reads one vote per CHROMA 4-px
-            // cell, so at ss (1, 0) the per-mi sum counts each chroma column
-            // twice (the class `around_mi_422_chroma` fixes).
-            // Kept verbatim because it is UNWITNESSED, not because it is
-            // unreachable: it runs only for a NON-skipped, non-lossless
-            // intrabc-owned 64x32/32x64 (or smaller) rect strip, and no
-            // committed 4:2:2 fixture codes one -- an env-gated probe here
-            // fired 0 times across the whole committed 4:2:2 corpus (24 gate
-            // tests, 21 decoding cells; see
-            // `lanes/av1422gathercensus.report.md`). A future fixture that
-            // enters it must route through `around_mi_422_chroma` under the
-            // ss (1, 0) guard.
-            let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+            // lane-av1422ibctxsel: at ss (1, 0) a chroma 4-px cell spans TWO
+            // luma mi columns, so a luma-span gather counts each chroma
+            // column twice; libaom's `get_txb_ctx_general` reads one vote per
+            // CHROMA cell, which is what `around_mi_422_chroma`'s
+            // every-second sampling produces. Both non-split chroma arms of
+            // this function route through it under the ss (1, 0) guard; every
+            // other subsampling keeps the plain gather verbatim. WITNESS: the
+            // no-leaves twin below (24 entries on
+            // `fixtures/ibc422_nonsplit_ctx.obu`, five of them V-plane reads
+            // whose two gathers disagree -- `dc_sign_ctx` 1 vs 0; gate
+            // `a_422_intrabc_owned_rect_nonsplit_chroma_context_uses_the_pair_rule`).
+            // THIS branch has no stream that splits a transform on the strip:
+            // it needs `TX_MODE_SELECT` plus a `txfm_partition` split of the
+            // 64x32 strip, a conjunction no measured stream has produced
+            // (`lane-av1422ibcrect` measured 0 entries under
+            // `TX_MODE_LARGEST`); the routing here is identical, so a future
+            // witness takes the same code.
+            let around = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                hit!(IBC_OWNED_RECT_422_PAIR_HITS);
+                neighbours.around_mi_422_chroma((mi_r, mi_c), bw, bh)
+            } else {
+                neighbours.around_mi_rect((mi_r, mi_c), bw, bh)
+            };
             let (ug, _) = read_inter_plane_rect(
                 dec,
                 cdfs,
@@ -18115,6 +18143,19 @@ fn decode_intrabc_owned_rect(
             u_grid = ug;
             v_grid = vg;
         } else {
+            // lane-av1422ibctxsel: the twin of the tree branch above -- the
+            // CHROMA context at ss (1, 0) is the pair rule (one vote per
+            // chroma 4-px cell); `around` stays the plain luma-span gather
+            // for plane 0 (lane-av1422ibcrect measured this arm entered 24
+            // times by a 4:2:2 64x32 strip whose two gathers happened to
+            // agree -- `fixtures/ibc422_nonsplit_ctx.obu` is the stream where
+            // they do not).
+            let around_chroma = if ss_x(fctx) == 1 && ss_y(fctx) == 0 {
+                hit!(IBC_OWNED_RECT_422_PAIR_HITS);
+                neighbours.around_mi_422_chroma((mi_r, mi_c), bw, bh)
+            } else {
+                around
+            };
             let (ug, _) = read_inter_plane_rect(
                 dec,
                 cdfs,
@@ -18122,7 +18163,7 @@ fn decode_intrabc_owned_rect(
                 (cw, ch),
                 cside,
                 1,
-                around[1],
+                around_chroma[1],
                 0,
                 u,
                 cpx,
@@ -18139,7 +18180,7 @@ fn decode_intrabc_owned_rect(
                 (cw, ch),
                 cside,
                 2,
-                around[2],
+                around_chroma[2],
                 0,
                 v,
                 cpx,
