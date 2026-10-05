@@ -24525,13 +24525,32 @@ fn decode_block(
         .map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
     neighbours.record_palette_uv(at, side, puv_size, puv_colors);
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
-    neighbours.fill_lf_grid(
-        (r * (SUB / MI), c * (SUB / MI)),
-        side / MI,
-        logical_tx as u8,
-        0,
-        fctx,
-    );
+    if intrabc_leaves.is_some() {
+        // lane-av1422a2a4: the var-tx tree already published the
+        // TXFM_CONTEXT bands per leaf ([`read_var_tx_size`] →
+        // [`txfm_partition_update_rect`]); [`Self::fill_lf_grid_rect`]'s
+        // whole-footprint publish would overwrite them with the block's own
+        // `logical_tx` -- the same class [`Self::fill_lf_grid_rect_after_vartx`]
+        // exists for (lane-av1oddheightfork3). Only the deblock grid is
+        // still wanted here, so publish nothing.
+        neighbours.fill_lf_grid_rect_after_vartx(
+            (r * (SUB / MI), c * (SUB / MI)),
+            side / MI,
+            side / MI,
+            logical_tx as u8,
+            logical_tx as u8,
+            0,
+            fctx,
+        );
+    } else {
+        neighbours.fill_lf_grid(
+            (r * (SUB / MI), c * (SUB / MI)),
+            side / MI,
+            logical_tx as u8,
+            0,
+            fctx,
+        );
+    }
     // lane-t900 r32 / lane-av1txbands: libaom runs `set_txfm_ctxs(mbmi->tx_size,
     // n4_w, n4_h, skip_txfm && is_inter_block(mbmi), xd)` at the end of EVERY
     // `decode_block`. An intra-only frame's blocks also publish their TRANSFORM
@@ -24541,7 +24560,22 @@ fn decode_block(
     // "inter" block an intra-only frame codes (`blockd.h:373`). So this call
     // stays the authority wherever one can appear; with `allow_intrabc` unset
     // it writes exactly what the grid already did.
-    if allow_intrabc {
+    //
+    // lane-av1422a2a4: `parse_decode_block`'s tx branch (decodeframe.c:1227-1236)
+    // is an EITHER/OR. When the var-tx branch ran, `read_tx_size_vartx` already
+    // published per-leaf band sizes and libaom NEVER calls `set_txfm_ctxs` --
+    // the blanket write below is the `else` branch's publish only. Writing it
+    // after a var-tx tree clobbers the per-leaf band values with
+    // `leaves[0]`'s transform: measured on the pinned A4 witness (256x224 4:2:2,
+    // cq 30), the 32x32 intrabc block at mi(32,8) resolved a mixed tree
+    // (8x8 leaves at (0,0)+(0,4), 16x16 leaves at (4,0)+(4,4)), leaving
+    // `left_txfm[32..35] == 16`; the blanket write reset those cells to 8, so
+    // the NEXT tree's sub-read at (32,16) took `txfm_partition_ctx` 10 where
+    // libaom takes 9 (oracle operands: above=16, left=16) -- that frame's first
+    // divergent read, surfacing ~30 partition symbols later as the
+    // "block size 4x8 ... invalid" refusal (an E6/E7-class desync symptom, not
+    // an invalid shape). Gate the blanket write on the tree NOT having run.
+    if allow_intrabc && !(intrabc_leaves.is_some() && intrabc_leaves.as_ref().unwrap().len() > 1) {
         set_txfm_ctxs(
             neighbours,
             (mi_r, mi_c),
