@@ -32,6 +32,11 @@ Mirrors `ffmpeg_decode_sequence_422_depth` (lane-av1422lift) shape for shape:
 its guard set GROWS (shape + depth now asserted where none was), and all 8
 sites still pass.
 
+[CORRECTED 2026-10-05 by the merge review, annotate do not rewrite: the
+"8 existing call sites" count above is 6. Reviewer counted the surviving
+base call sites at tip stream.rs 9812/10327/10639/11789/12215/16367. The
+delegate and the guard growth are unaffected.]
+
 ### New test 1: refusal — `the_8bit_444_oracle_helper_refuses_a_10bit_444_pin`
 
 Pinned real 10-bit 4:4:4 stream `444_lossy_palette_chroma_352x242_10b.obu`
