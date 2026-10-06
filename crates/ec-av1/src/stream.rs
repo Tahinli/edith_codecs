@@ -7355,6 +7355,98 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1422mixll10: a skipped INTRABC 8x8 leaf inside a LOSSLESS
+    /// segment of a 4:2:2 frame predicts its whole 4x8 chroma plane block --
+    /// both TX_4X4 units, each windowed off the DV frame copy. The defect
+    /// arm pushed only the first 4x4 (at `cpy`), leaving rows
+    /// `cpy+4..cpy+8` unwritten: frame 0's U(140..143, 188..191) read the
+    /// sentinel poison 0 against the oracle's 664 (16 samples, all planes
+    /// otherwise exact). Pin `422_mixll_intrabc_lossless_320x240_5f.obu`
+    /// (aomenc profile 1, 320x240 yuv422p10le, mixed-lossless AQ segment +
+    /// intrabc screen content; 79333 bytes, sha256
+    /// `9fa1f1d28d61e3096d70908728f9cdfa1a570b9769a3d31e8d385a61c12a2b25`).
+    /// Gate: every frame of all three planes byte-exact against ffmpeg's
+    /// `yuv422p10le`, plus the non-vacuity controls (the pin's chroma census
+    /// must show coded units, and one flipped oracle sample must move the
+    /// count).
+    #[test]
+    fn a_422_mixll_intrabc_lossless_leaf_predicts_whole_chroma_plane_block() {
+        const NAME: &str = "a_422_mixll_intrabc_lossless_leaf_predicts_whole_chroma_plane_block";
+        const FILE: &str = "422_mixll_intrabc_lossless_320x240_5f.obu";
+        const LEN: usize = 79333;
+        const FNV: u64 = 8342335520738450773;
+        const W: usize = 320;
+        const H: usize = 240;
+        const SHOWN: usize = 5;
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = crate_pin(FILE);
+        let stream = read_pin(&path, LEN, FNV, NAME);
+        assert_eq!(
+            stream_subsampling(&stream, NAME),
+            (1, 0),
+            "{NAME}: the pin must really be 4:2:2 (1,0)"
+        );
+        assert_eq!(
+            stream_bit_depth(&stream, NAME),
+            10,
+            "{NAME}: the pin is a 10-bit cell"
+        );
+        let _ = stream_bit_depth(&stream, NAME);
+
+        let decoded = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: the committed 4:2:2 pin did not decode: {e}"));
+        assert_eq!(
+            decoded.len(),
+            SHOWN,
+            "{NAME}: the pin is {SHOWN} shown frames"
+        );
+        let want = ffmpeg_decode_sequence_422_depth(&stream, W, H, SHOWN, 10, "yuv422p10le");
+        assert_eq!(decoded.len(), want.len(), "{NAME}: decoded/frame count");
+
+        let plane_mismatches = |ours: &[Pic], theirs: &[Pic], plane: u8| -> usize {
+            ours.iter()
+                .zip(theirs)
+                .map(|(a, b)| {
+                    let (a, b) = match plane {
+                        0 => (&a.y, &b.y),
+                        1 => (&a.u, &b.u),
+                        _ => (&a.v, &b.v),
+                    };
+                    a.iter().zip(b).filter(|&(x, y)| x != y).count()
+                })
+                .sum()
+        };
+        let clean: Vec<usize> = (0..3)
+            .map(|p| plane_mismatches(&decoded, &want, p))
+            .collect();
+        assert_eq!(
+            clean,
+            vec![0, 0, 0],
+            "{NAME}: the fix must be byte-exact against ffmpeg on every plane of every frame; \
+             got {clean:?} (16 differs on frame 0 U would be the unwritten 4x4 again)"
+        );
+
+        // Non-vacuity: one flipped oracle U sample must move the U count.
+        let mut flipped = want.clone();
+        flipped[0].u[188 * (W / 2) + 140] ^= 1;
+        let moved: Vec<usize> = (0..3)
+            .map(|p| plane_mismatches(&decoded, &flipped, p))
+            .collect();
+        assert_eq!(
+            moved,
+            vec![0, 1, 0],
+            "{NAME}: one flipped oracle U sample at (140,188) must move the U count 0 -> 1; \
+             got {moved:?} -- the comparator does not bite"
+        );
+        eprintln!(
+            "{NAME}: byte-exact vs ffmpeg on all {SHOWN} frames; flip control moved {moved:?}"
+        );
+    }
+
     /// lane-av1oracledepth: the 8-bit `ffmpeg_decode_sequence_444` must REFUSE
     /// a real 10-bit 4:4:4 pin instead of letting ffmpeg convert it down to
     /// `yuv444p`. ffmpeg does not fail on the depth mismatch -- it re-scales
