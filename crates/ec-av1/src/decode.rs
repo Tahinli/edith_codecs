@@ -25692,20 +25692,82 @@ fn decode_leaf8(
                     }
                 }
             } else {
-                push_intra(
-                    1,
-                    cpx,
-                    cpy,
-                    csz,
-                    uv_predict_mode,
-                    angle_delta_uv,
-                    reach,
-                    &ZERO_RESIDUAL[..csz * csz],
-                    alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
-                    None,
-                    smooth_neighbor_uv,
-                    fctx,
-                );
+                // lane-av1422mixll10: with a prediction override (intrabc's
+                // frame copy at the DV, or a palette colour map), a skipped
+                // leaf predicts its WHOLE chroma plane block, not one csz x
+                // csz corner of it. At 4:2:2 that plane block is 4x8 (csz
+                // stays 4), so the single 4x4 push below left rows
+                // `cpy+4..cpy+8` unwritten -- sentinel-poisoned at frame 0
+                // (cell5 U(140..143,188..191) read 0 against the oracle's
+                // 664) because an intrabc+lossless leaf takes exactly this
+                // arm (`chroma_units_ll` requires `intrabc_bufs.is_none()`).
+                // Window the override per 4x4 unit off the cw-stride buffer,
+                // the same slice `read_intra_chroma_lossless` feeds
+                // `set_palette_pred` with.
+                let (cw, ch) = (8 >> ss_x(fctx), 8 >> ss_y(fctx));
+                let has_override = intrabc_bufs.is_some() || palette_uv_bufs.is_some();
+                if chroma_422 && has_override && ch == 8 {
+                    let ub = intrabc_bufs
+                        .as_ref()
+                        .map(|(_, ub, _)| ub.clone())
+                        .or_else(|| palette_uv_bufs.as_ref().map(|(ub, _)| ub.clone()));
+                    let vb = intrabc_bufs
+                        .as_ref()
+                        .map(|(_, _, vb)| vb.clone())
+                        .or_else(|| palette_uv_bufs.as_ref().map(|(_, vb)| vb.clone()));
+                    for (buf, plane) in [(ub, 1usize), (vb, 2usize)] {
+                        if let Some(buf) = buf {
+                            for cu_row in 0..2 {
+                                let cu_reach = tu_reach(
+                                    8,
+                                    8,
+                                    0,
+                                    cu_row * 4,
+                                    4,
+                                    reach,
+                                    px,
+                                    py,
+                                    y.width,
+                                    y.height,
+                                    fctx,
+                                );
+                                set_palette_pred(
+                                    palette_window(&buf, cw, 0, cu_row * 4, 4, 4),
+                                    fctx,
+                                );
+                                push_intra(
+                                    plane,
+                                    cpx,
+                                    cpy + cu_row * 4,
+                                    4,
+                                    uv_predict_mode,
+                                    angle_delta_uv,
+                                    cu_reach,
+                                    &ZERO_RESIDUAL[..16],
+                                    None,
+                                    None,
+                                    smooth_neighbor_uv,
+                                    fctx,
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    push_intra(
+                        1,
+                        cpx,
+                        cpy,
+                        csz,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        reach,
+                        &ZERO_RESIDUAL[..csz * csz],
+                        alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
+                        None,
+                        smooth_neighbor_uv,
+                        fctx,
+                    );
+                }
             }
             if let Some((_, _, vb)) = &intrabc_bufs {
                 set_palette_pred(vb.clone(), fctx);
@@ -25745,20 +25807,64 @@ fn decode_leaf8(
                     }
                 }
             } else {
-                push_intra(
-                    2,
-                    cpx,
-                    cpy,
-                    csz,
-                    uv_predict_mode,
-                    angle_delta_uv,
-                    reach,
-                    &ZERO_RESIDUAL[..csz * csz],
-                    alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
-                    None,
-                    smooth_neighbor_uv,
-                    fctx,
-                );
+                // lane-av1422mixll10: same whole-plane-block rule as the U
+                // plane above -- with an override, both 4x4 units of the 4x8
+                // plane block predict, not just the first.
+                let (cw, ch) = (8 >> ss_x(fctx), 8 >> ss_y(fctx));
+                let has_override = intrabc_bufs.is_some() || palette_uv_bufs.is_some();
+                if chroma_422 && has_override && ch == 8 {
+                    let vb = intrabc_bufs
+                        .as_ref()
+                        .map(|(_, _, vb)| vb.clone())
+                        .or_else(|| palette_uv_bufs.as_ref().map(|(_, vb)| vb.clone()));
+                    if let Some(vb) = vb {
+                        for cu_row in 0..2 {
+                            let cu_reach = tu_reach(
+                                8,
+                                8,
+                                0,
+                                cu_row * 4,
+                                4,
+                                reach,
+                                px,
+                                py,
+                                y.width,
+                                y.height,
+                                fctx,
+                            );
+                            set_palette_pred(palette_window(&vb, cw, 0, cu_row * 4, 4, 4), fctx);
+                            push_intra(
+                                2,
+                                cpx,
+                                cpy + cu_row * 4,
+                                4,
+                                uv_predict_mode,
+                                angle_delta_uv,
+                                cu_reach,
+                                &ZERO_RESIDUAL[..16],
+                                None,
+                                None,
+                                smooth_neighbor_uv,
+                                fctx,
+                            );
+                        }
+                    }
+                } else {
+                    push_intra(
+                        2,
+                        cpx,
+                        cpy,
+                        csz,
+                        uv_predict_mode,
+                        angle_delta_uv,
+                        reach,
+                        &ZERO_RESIDUAL[..csz * csz],
+                        alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
+                        None,
+                        smooth_neighbor_uv,
+                        fctx,
+                    );
+                }
             }
             luma_grid = Grid::Zero(64);
             u_grid = Grid::Zero(csz * csz);
