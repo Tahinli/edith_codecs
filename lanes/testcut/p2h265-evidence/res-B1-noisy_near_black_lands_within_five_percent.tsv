@@ -1,0 +1,10 @@
+crates/ec-h265/src/ctu.rs:534:29: replace + with - in CtuEncoder<'a>::save_meta	KILLED	rc=100 ran=1 timeout=False 
+crates/ec-h265/src/dec/pic.rs:330:9: replace PicState::available -> bool with true	KILLED	rc=100 ran=1 timeout=False 
+crates/ec-h265/src/enc_p.rs:666:74: replace > with < in PCoder<'a>::write_split	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/enc_p.rs:820:24: replace << with >> in PCoder<'a>::analyse	KILLED	rc=100 ran=1 timeout=False 
+crates/ec-h265/src/residual.rs:609:42: replace + with * in residual_header	KILLED	rc=100 ran=1 timeout=False 
+crates/ec-h265/src/ctu.rs:416:50: replace < with == in CtuEncoder<'a>::code_quadtree	KILLED	rc=100 ran=1 timeout=False 
+crates/ec-h265/src/dec/deblock.rs:253:59: replace + with - in luma_segment	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/intra.rs:460:49: replace & with ^ in predict_angular	KILLED	rc=100 ran=1 timeout=False 
+crates/ec-h265/src/residual.rs:112:19: replace += with *= in encode_remaining	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/encoder.rs:818:67: replace / with * in Encoder::code_picture_planes	KILLED	rc=100 ran=1 timeout=False 

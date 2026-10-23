@@ -49,19 +49,30 @@ def apply(orig, hunks):
     res.extend(orig[cur:])
     return res
 
-def run_once():
-    cmd = ["cargo", "nextest", "run", "-p", "ec-h265", "--no-fail-fast", "-E", expr]
-    if profile:
-        cmd[-2:-2] = ["--profile", profile]
+def sh(cmd, tmo):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          start_new_session=True)
     try:
-        output, _ = p.communicate(timeout=timeout)
+        output, _ = p.communicate(timeout=tmo)
         return p.returncode, output, False
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, 9)
         output, _ = p.communicate()
         return -1, output or "", True
+
+BUILD_TO = int(os.environ.get("BUILD_TO", "2400"))
+
+def run_once():
+    # release profile; build first (own generous timeout), then run with the measured-baseline timeout
+    cmd = ["cargo", "nextest", "run", "--release", "-p", "ec-h265", "--no-fail-fast", "-E", expr]
+    if os.environ.get("FAILFAST"):
+        cmd.remove("--no-fail-fast")
+    if profile:
+        cmd[-2:-2] = ["--profile", profile]
+    rc, out, to = sh([c for c in cmd if c != "--no-fail-fast"] + ["--no-run"], BUILD_TO)
+    if to or rc != 0:
+        return rc, out, "BUILDFAIL"
+    return sh(cmd, timeout)
 
 rows = []
 for name in names:
@@ -81,13 +92,19 @@ for name in names:
     try:
         open(fname, "w").write("\n".join(new))
         rc, output, timed_out = run_once()
+        timed_out = timed_out
     finally:
         open(fname, "wb").write(raw)
-    summary = re.findall(r"Summary \[[^\]]*\] (\d+) tests? run", output)
+    summary = re.findall(r"Summary \[[^\]]*\] (\d+)(?:/\d+)? tests? run", output)
     ran = int(summary[-1]) if summary else 0
-    if timed_out:
+    if timed_out == "BUILDFAIL":
+        status = "UNVIABLE"
+    elif timed_out:
         # A timeout is kill evidence only if the test run had started (build time alone is not).
         status = "KILLED" if re.search(r"Starting \d+ tests?", output) else "TIMEOUT_NOSTART"
+    elif rc != 0 and re.search(r"EC_REQUIRE_FIXTURES|fixtures? (missing|not found)", output):
+        # A fixture-missing failure is not a kill.
+        status = "FIXTURE_FAIL"
     elif "could not compile" in output or "error[E" in output:
         status = "UNVIABLE"
     elif rc == 0 and ran > 0:
