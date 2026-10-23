@@ -83,3 +83,36 @@ Settings and coverage:
 | warm cache | 817 ok / 0 failed / 40 ignored | 1361 s (−58%) |
 
 Diff check: no test or assertion removed (+1 cache unit test, +2 asserts); clippy `-D warnings` clean.
+
+## Phase 2: evidence-gated deletion of heavy tests (2026-10-23 to 10-24)
+
+Protocol: `lanes/testcut.phase2.md`. Each lane report has the full rows.
+
+| lane | candidates | deleted | runtime saved | report |
+|---|---|---|---|---|
+| ec-h264 | 7 | 4: `every_quantiser_with_motion_matches_ffmpeg`, `every_quantiser_matches_ffmpeg`, `high_profile_8x8_matches_ffmpeg`, `x264_hi444_10bit` | 222 s | `lanes/testcut/p2-h264.md` |
+| ec-h265 | 5 | 3: `pixel_pipeline_runs_over_conformance_streams`, `cu_syntax_sweep_over_conformance_streams`, `motion_derivation_is_deterministic_over_conformance_streams` | 317 s | `lanes/testcut/p2-h265.md` |
+| ec-av1 stream | 98 | 0 (every candidate has unique coverage) | 0 | `lanes/testcut/p2-av1stream.md` |
+| ec-av1 encoder | 38 | 0 (unique coverage) | 0 | `lanes/testcut/p2-av1enc.md` |
+| ec-aac, misc crates (earlier) | – | 0 | 0 | `lanes/testcut/p2-aac.md`, `p2-misc.md` |
+| **total** | | **7** | **≈539 s** | |
+
+**Kept on evidence:**
+- `x264_hi444_8bit` (K'=4).
+- `corrupt_streams_never_panic` and `truncated_and_corrupted_conformance_streams_never_panic`, each killing 4 mutants the fast suite misses; they are also the only corrupt-input robustness tests.
+- `ffmpeg_decodes_bit_exactly_at_every_shape` (K'=1, a hang mutant).
+- `noisy_near_black_lands_within_five_percent`.
+
+**Evidence validity.** The mutant results looked valid but were not, in four ways, and each one would have made the fast suite look like it killed everything:
+1. Before 2bb4439, the cargo runner needed `.git`. In cargo-mutants scratch copies it never started.
+2. The scratch copies skip the gitignored `fixtures`. Under `EC_REQUIRE_FIXTURES=1` a fixture test then failed on every mutant, and `--baseline skip` hid this.
+3. `--re` selection got mangled through remote-run, ssh and `bash -c`. Mutants are now applied by index (`scripts/mutate.py`, `mutrun.py`).
+4. On the 4-core servers, timeouts fired under load.
+
+The final runs use unmutated baselines, log sampling per status, and a conservative timeout rule: a fast-suite TIMEOUT is not a kill. Any test that fails on an unmutated tree is excluded from kill attribution. These are `real_library_frames_encode_and_decode_exactly` (needs personal media) and `aom_vectors_match_per_frame_md5`.
+
+**Caveats:**
+- Samples were small (10–30 mutants per candidate), because each mutant pays a release build plus test runs.
+- The h265 motion and cu_syntax deletions rest on 1 T-kill each.
+- The coverage rule (unique coverage means keep) blocked every av1 deletion, even though the fast suite killed 31 of 32 heavy-killed stream mutants. A larger sample, or a fine-grained test rewrite, is the next lever there.
+- Names of deleted tests in the `.config/nextest.toml` fast filter are harmless leftovers.
