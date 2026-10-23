@@ -93,8 +93,8 @@ fn main() {
     };
     let cfg = &seq.color_config;
     let bit_depth = cfg.bit_depth;
-    if let Some(claimed) = claimed_depth {
-        if claimed != bit_depth {
+    if let Some(claimed) = claimed_depth
+        && claimed != bit_depth {
             let theirs = if bit_depth == 8 {
                 format!(
                     "aomdec --rawvideo / ffmpeg -pix_fmt yuv420p ({} bytes per sample, \
@@ -122,7 +122,6 @@ fn main() {
             );
             std::process::exit(1);
         }
-    }
     // 8 bit -> one byte per sample; anything above -> little-endian u16, which
     // is what both oracles emit for `*p10le` / `*p12le` (they never pack to
     // the bit depth itself, they use a full 16-bit container).
@@ -172,8 +171,7 @@ fn main() {
             .into_iter()
             .take(if cfg.mono_chrome { 1 } else { 3 })
             .find_map(|(name, plane)| plane.iter().max().map(|&s| (name, s)))
-        {
-            if u32::from(sample) > max {
+            && u32::from(sample) > max {
                 eprintln!(
                     "dump_yuv: {path}: frame {i} plane {plane_name} carries sample {sample} above \
                      the {bit_depth}-bit maximum {max} -- the decoded output does not match the \
@@ -182,7 +180,6 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-        }
         let samples: usize = planes.iter().map(|p| p.len()).sum();
         let mut buf = Vec::with_capacity(samples * bytes_per_sample);
         for plane in planes {

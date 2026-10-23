@@ -1,0 +1,8 @@
+   Compiling ec-truehd v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-truehd)
+   Compiling ec-dvdsub v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dvdsub)
+   Compiling ec-mpegts v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-mpegts)
+   Compiling ec-dvbsub v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dvbsub)
+    Finished `release` profile [optimized] target(s) in 4.64s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_dvbsub-78fdb1266645d038)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-a58fea9ed9a14524)
+   Doc-tests ec_dvbsub

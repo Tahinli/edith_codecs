@@ -23,6 +23,8 @@ pub enum PixelFormat {
     I210,
     /// Planar Y/U/V 4:4:4, 10-bit in 16-bit little-endian samples.
     I410,
+    /// Planar Y/U/V 4:4:4, 12-bit in 16-bit little-endian samples.
+    I412,
     /// Y plane + interleaved U/V, 4:2:0, 8-bit.
     Nv12,
     /// Y plane + interleaved V/U, 4:2:0, 8-bit.
@@ -50,7 +52,7 @@ impl PixelFormat {
     pub fn plane_count(&self) -> usize {
         use PixelFormat::*;
         match self {
-            I420 | I422 | I444 | I010 | I210 | I410 => 3,
+            I420 | I422 | I444 | I010 | I210 | I410 | I412 => 3,
             Nv12 | Nv21 | P010 | P016 => 2,
             Gray8 | Gray16 | Rgb8 | Bgr8 | Rgba8 | Bgra8 => 1,
         }
@@ -66,7 +68,7 @@ impl PixelFormat {
         use PixelFormat::*;
         matches!(
             self,
-            I420 | I422 | I444 | I010 | I210 | I410 | Nv12 | Nv21 | P010 | P016
+            I420 | I422 | I444 | I010 | I210 | I410 | I412 | Nv12 | Nv21 | P010 | P016
         )
     }
 
@@ -80,6 +82,7 @@ impl PixelFormat {
         use PixelFormat::*;
         match self {
             I010 | I210 | I410 | P010 => 10,
+            I412 => 12,
             Gray16 | P016 => 16,
             _ => 8,
         }
@@ -110,7 +113,7 @@ impl PixelFormat {
         let cw = w.div_ceil(1 << sx);
         let ch = h.div_ceil(1 << sy);
         match self {
-            I420 | I422 | I444 | I010 | I210 | I410 => {
+            I420 | I422 | I444 | I010 | I210 | I410 | I412 => {
                 vec![(w * bpc, h), (cw * bpc, ch), (cw * bpc, ch)]
             }
             Nv12 | Nv21 | P010 | P016 => vec![(w * bpc, h), (cw * 2 * bpc, ch)],
@@ -175,6 +178,29 @@ impl Default for ColorInfo {
     }
 }
 
+/// How the two fields of a frame relate, for pictures from interlaced sources.
+///
+/// The planes of a [`VideoFrame`] always hold the fields woven together (top
+/// field on the even lines); this says whether they were captured as two
+/// moments in time, and which of them came first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Interlace {
+    /// One moment in time for the whole frame.
+    #[default]
+    Progressive,
+    /// Interlaced; the top field (even lines) is displayed first.
+    TopFieldFirst,
+    /// Interlaced; the bottom field (odd lines) is displayed first.
+    BottomFieldFirst,
+}
+
+impl Interlace {
+    /// True for either interlaced order.
+    pub fn is_interlaced(self) -> bool {
+        self != Interlace::Progressive
+    }
+}
+
 /// A decoded picture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrame {
@@ -190,6 +216,8 @@ pub struct VideoFrame {
     pub color: ColorInfo,
     /// Presentation time, when the source provided one.
     pub pts: Option<Timestamp>,
+    /// Whether the frame is interlaced and in which order its fields display.
+    pub interlace: Interlace,
 }
 
 impl VideoFrame {
@@ -235,6 +263,7 @@ impl VideoFrame {
             planes,
             color: ColorInfo::default(),
             pts: None,
+            interlace: Interlace::Progressive,
         })
     }
 
@@ -252,6 +281,7 @@ impl VideoFrame {
             planes,
             color: ColorInfo::default(),
             pts: None,
+            interlace: Interlace::Progressive,
         }
     }
 }

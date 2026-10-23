@@ -1,0 +1,42 @@
+[package]
+name = "ec-mp4-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-core]
+path = "../../ec-core"
+
+[dependencies.ec-mp4]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "demux_mp4"
+path = "fuzz_targets/demux_mp4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "esds_parse"
+path = "fuzz_targets/esds_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "is_mp4"
+path = "fuzz_targets/is_mp4.rs"
+test = false
+doc = false
+bench = false

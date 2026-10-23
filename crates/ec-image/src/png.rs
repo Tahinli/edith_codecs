@@ -80,7 +80,7 @@ const CRC_TABLE: [u32; 256] = {
     table
 };
 
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut c = 0xffff_ffffu32;
     for &b in data {
         c = CRC_TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
@@ -174,14 +174,39 @@ fn header(data: &[u8]) -> Result<Header> {
     Ok(header)
 }
 
-/// Dimensions from IHDR alone.
+/// Dimensions from IHDR and EXIF orientation from `eXIf`, without decoding pixels.
+///
+/// The chunk list is walked by length, so the CRCs are not checked here; the
+/// decoder checks them. A chunk whose body runs past the end ends the walk.
 pub fn info(data: &[u8]) -> Result<Info> {
     let h = header(data)?;
     Ok(Info {
         format: ImageFormat::Png,
         width: h.width,
         height: h.height,
+        orientation: exif_orientation(data),
     })
+}
+
+/// The first valid orientation in an `eXIf` chunk, or 1.
+fn exif_orientation(data: &[u8]) -> u8 {
+    let mut at = 8;
+    while let Some(head) = data.get(at..at + 8) {
+        let len = be32(head) as usize;
+        let kind = &head[4..8];
+        let Some(body) = data.get(at + 8..at.saturating_add(8).saturating_add(len)) else {
+            break;
+        };
+        let found = if kind == b"eXIf" { crate::exif::tiff_orientation(body) } else { None };
+        if let Some(o) = found {
+            return o;
+        }
+        if kind == b"IEND" {
+            break;
+        }
+        at = at.saturating_add(12).saturating_add(len);
+    }
+    1
 }
 
 /// Decode a PNG.
@@ -206,13 +231,18 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
                         c.data.len()
                     )));
                 }
-                palette = c.data.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect();
+                palette = c.data.as_chunks::<3>().0.iter().map(|p| [p[0], p[1], p[2]]).collect();
             }
             b"tRNS" => trns = Some(c.data.to_vec()),
             b"gAMA" if c.data.len() == 4 => {
                 meta.gamma = Some(f64::from(be32(c.data)) / 100_000.0);
             }
             b"sRGB" if c.data.len() == 1 => meta.srgb_intent = Some(c.data[0]),
+            b"eXIf" => {
+                if meta.orientation.is_none() {
+                    meta.orientation = crate::exif::tiff_orientation(c.data);
+                }
+            }
             b"IDAT" => idat.extend_from_slice(c.data),
             b"IEND" => saw_end = true,
             // Anything else is skipped by its own length: unknown ancillary
@@ -245,6 +275,20 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
             format!("{expected} bytes of pixel data is past the allocation limit"),
         ));
     }
+
+    let channels_out = out_channels(&hdr, &trns);
+    // The decoded picture is refused by name before the expansion below is sized.
+    let sample_bytes = if hdr.depth == 16 { 2 } else { 1 };
+    limits.check_output(hdr.width, hdr.height, channels_out * sample_bytes)?;
+    // The expansion buffer is 16-bit whatever the depth, so it can be twice the raw
+    // scanlines the check above saw; it is budgeted on its own size too.
+    let out_bytes = limits.check_bytes(
+        "PNG pixels",
+        (hdr.width as usize)
+            .checked_mul(hdr.height as usize)
+            .and_then(|p| p.checked_mul(channels_out))
+            .and_then(|s| s.checked_mul(2)),
+    )?;
     let raw = ec_inflate::inflate_zlib(&idat, expected).map_err(Error::from)?;
     if raw.len() < expected {
         return Err(Error::corrupt(format!(
@@ -256,8 +300,7 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
     // Samples are carried at 16 bits internally whatever the file's depth, so
     // one expansion path serves every colour type; the narrowing back to 8
     // happens once, at the end.
-    let channels_out = out_channels(&hdr, &trns);
-    let mut out = vec![0u16; (hdr.width as usize) * (hdr.height as usize) * channels_out];
+    let mut out = vec![0u16; out_bytes / 2];
     let mut offset = 0;
     for (pass, &(pw, ph)) in passes(&hdr).iter().enumerate() {
         if pw == 0 || ph == 0 {

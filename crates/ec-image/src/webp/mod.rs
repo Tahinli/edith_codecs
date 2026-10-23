@@ -11,7 +11,7 @@ pub mod vp8;
 mod vp8_tables;
 pub mod vp8l;
 
-use crate::{Image, ImageFormat, Info, Limits, Metadata, Pixels};
+use crate::{exif, Image, ImageFormat, Info, Limits, Metadata, Pixels};
 use ec_core::{Error, Result};
 
 /// One RIFF chunk.
@@ -65,45 +65,55 @@ pub fn is_animated(data: &[u8]) -> bool {
     })
 }
 
-/// Dimensions from the container's headers alone.
+/// Dimensions and EXIF orientation from the container's headers alone.
+///
+/// Walks the chunk headers without requiring the whole file: a chunk whose body
+/// runs past the end is read up to the end. A prefix of a file therefore reports
+/// the same answer as the whole file, as long as the image header and the `EXIF`
+/// chunk lie inside the prefix.
 pub fn info(data: &[u8]) -> Result<Info> {
-    let chunks = chunks(data)?;
-    for chunk in &chunks {
-        match &chunk.tag {
-            b"VP8X" if chunk.data.len() >= 10 => {
-                let d = chunk.data;
-                let width = 1 + (u32::from(d[4]) | u32::from(d[5]) << 8 | u32::from(d[6]) << 16);
-                let height = 1 + (u32::from(d[7]) | u32::from(d[8]) << 8 | u32::from(d[9]) << 16);
-                return Ok(Info {
-                    format: ImageFormat::WebP,
-                    width,
-                    height,
-                });
+    let riff_size = data
+        .get(4..8)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        .ok_or_else(|| Error::corrupt("WebP: truncated RIFF header"))?;
+    let end = riff_size.saturating_add(8).min(data.len());
+    let mut dims: Option<(u32, u32)> = None;
+    let mut orientation = 1;
+    let mut at = 12usize;
+    while at + 8 <= end {
+        let tag = [data[at], data[at + 1], data[at + 2], data[at + 3]];
+        let size =
+            u32::from_le_bytes([data[at + 4], data[at + 5], data[at + 6], data[at + 7]]) as usize;
+        let body = &data[at + 8..(at + 8).saturating_add(size).min(end)];
+        match &tag {
+            b"VP8X" if dims.is_none() && body.len() >= 10 => {
+                let width = 1 + (u32::from(body[4]) | u32::from(body[5]) << 8 | u32::from(body[6]) << 16);
+                let height = 1 + (u32::from(body[7]) | u32::from(body[8]) << 8 | u32::from(body[9]) << 16);
+                dims = Some((width, height));
             }
-            b"VP8 " => {
-                let (width, height) = vp8::dimensions(chunk.data)?;
-                return Ok(Info {
-                    format: ImageFormat::WebP,
-                    width,
-                    height,
-                });
-            }
-            b"VP8L" => {
-                let d = chunk.data;
-                if d.len() < 5 || d[0] != 0x2f {
+            b"VP8 " if dims.is_none() => dims = Some(vp8::dimensions(body)?),
+            b"VP8L" if dims.is_none() => {
+                if body.len() < 5 || body[0] != 0x2f {
                     return Err(Error::corrupt("WebP: short VP8L header"));
                 }
-                let packed = u32::from_le_bytes([d[1], d[2], d[3], d[4]]);
-                return Ok(Info {
-                    format: ImageFormat::WebP,
-                    width: (packed & 0x3fff) + 1,
-                    height: ((packed >> 14) & 0x3fff) + 1,
-                });
+                let packed = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+                dims = Some(((packed & 0x3fff) + 1, ((packed >> 14) & 0x3fff) + 1));
+            }
+            b"EXIF" if orientation == 1 => {
+                orientation = exif::tiff_orientation(body).unwrap_or(1);
             }
             _ => {}
         }
+        // Chunks are padded to an even length.
+        at += 8 + size + (size & 1);
     }
-    Err(Error::corrupt("WebP: no image chunk"))
+    let (width, height) = dims.ok_or_else(|| Error::corrupt("WebP: no image chunk"))?;
+    Ok(Info {
+        format: ImageFormat::WebP,
+        width,
+        height,
+        orientation,
+    })
 }
 
 /// Decode a WebP file.
@@ -140,11 +150,7 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
                     image = Some((&chunk.tag, chunk.data));
                 }
             }
-            b"EXIF" => {
-                if let Some(o) = exif_orientation(chunk.data) {
-                    meta.orientation = Some(o);
-                }
-            }
+            b"EXIF" => meta.orientation = meta.orientation.or(exif::tiff_orientation(chunk.data)),
             _ => {}
         }
     }
@@ -184,6 +190,9 @@ fn decode_payload(
         });
     }
 
+    // The RGB or RGBA picture is refused by name before the VP8 planes are formed.
+    let (dw, dh) = vp8::dimensions(body)?;
+    limits.check_output(dw, dh, if alpha.is_some() { 4 } else { 3 })?;
     let frame = vp8::decode(body, limits)?;
     let (w, h) = (frame.width as usize, frame.height as usize);
     // Chroma is stored at half resolution and upsampled with the same triangle
@@ -238,7 +247,7 @@ pub fn decode_frames(data: &[u8], limits: Limits) -> Result<Vec<crate::Animation
         let info = info(data)?;
         (info.width, info.height)
     };
-    limits.check(canvas_width, canvas_height)?;
+    limits.check_output(canvas_width, canvas_height, 4)?;
 
     let mut frames: Vec<crate::AnimationFrame> = Vec::new();
     // The canvas starts fully transparent.  The `ANIM` background colour is
@@ -448,43 +457,6 @@ fn unfilter_alpha(plane: &mut [u8], width: usize, height: usize, filter: u8) {
     }
 }
 
-/// EXIF orientation out of a bare TIFF block (no `Exif\0\0` prefix here).
-fn exif_orientation(data: &[u8]) -> Option<u8> {
-    let little = match data.get(..2)? {
-        b"II" => true,
-        b"MM" => false,
-        _ => return None,
-    };
-    let u16_at = |at: usize| -> Option<u16> {
-        let b = data.get(at..at + 2)?;
-        Some(if little {
-            u16::from_le_bytes([b[0], b[1]])
-        } else {
-            u16::from_be_bytes([b[0], b[1]])
-        })
-    };
-    let u32_at = |at: usize| -> Option<u32> {
-        let b = data.get(at..at + 4)?;
-        Some(if little {
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-        } else {
-            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-        })
-    };
-    if u16_at(2)? != 42 {
-        return None;
-    }
-    let ifd = u32_at(4)? as usize;
-    let count = usize::from(u16_at(ifd)?);
-    for i in 0..count {
-        let entry = ifd + 2 + i * 12;
-        if u16_at(entry)? == 0x0112 {
-            let value = u16_at(entry + 8)?;
-            return (1..=8).contains(&value).then_some(value as u8);
-        }
-    }
-    None
-}
 
 #[cfg(test)]
 mod tests {

@@ -84,6 +84,15 @@ pub fn parse_keyframe_dims(data: &[u8]) -> Result<KeyFrameDims> {
     }
     let w = u16::from_le_bytes([c[3], c[4]]);
     let h = u16::from_le_bytes([c[5], c[6]]);
+    // A zero-size frame has no macroblocks; it cannot be reconstructed or
+    // used as a reference (libvpx rejects it the same way).
+    if w & 0x3fff == 0 || h & 0x3fff == 0 {
+        return Err(Error::corrupt(format!(
+            "VP8 key frame has a zero dimension ({}x{})",
+            w & 0x3fff,
+            h & 0x3fff
+        )));
+    }
     Ok(KeyFrameDims {
         width: w & 0x3fff,
         height: h & 0x3fff,
@@ -96,7 +105,7 @@ pub fn parse_keyframe_dims(data: &[u8]) -> Result<KeyFrameDims> {
 /// pixels (the encoded frame is padded up to whole macroblocks).
 pub fn mb_geometry(width: u16, height: u16) -> (usize, usize) {
     (
-        (usize::from(width) + 15) / 16,
-        (usize::from(height) + 15) / 16,
+        usize::from(width).div_ceil(16),
+        usize::from(height).div_ceil(16),
     )
 }

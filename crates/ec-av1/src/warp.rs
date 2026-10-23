@@ -616,9 +616,9 @@ fn warp_inner(
             let y4 = dst_y >> subsampling_y;
 
             let ix4 = (x4 >> WARPEDMODEL_PREC_BITS) as i32;
-            let mut sx4 = (x4 & ((1 << WARPEDMODEL_PREC_BITS) - 1)) as i64;
+            let mut sx4 = x4 & ((1 << WARPEDMODEL_PREC_BITS) - 1);
             let iy4 = (y4 >> WARPEDMODEL_PREC_BITS) as i32;
-            let mut sy4 = (y4 & ((1 << WARPEDMODEL_PREC_BITS) - 1)) as i64;
+            let mut sy4 = y4 & ((1 << WARPEDMODEL_PREC_BITS) - 1);
 
             sx4 += alpha * -4 + beta * -4;
             sy4 += gamma * -4 + delta * -4;
@@ -679,7 +679,7 @@ fn warp_inner(
 
 /// `av1_warped_filter` (`warped_motion.c`): 193 rows (`WARPEDPIXEL_PREC_SHIFTS
 /// * 3 + 1`), one per 1/64-pel fraction across `[-1, 2)`, each an 8-tap
-/// kernel (row 192 is a dummy replicate of row 191, transcribed verbatim).
+///   kernel (row 192 is a dummy replicate of row 191, transcribed verbatim).
 #[rustfmt::skip]
 const AV1_WARPED_FILTER: [[i16; 8]; 193] = [
     [0, 0, 127, 1, 0, 0, 0, 0],

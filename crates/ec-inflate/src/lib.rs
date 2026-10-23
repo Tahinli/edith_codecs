@@ -21,6 +21,9 @@
 //! resuming across buffer boundaries stays a change to the entry points rather
 //! than a rewrite; today the public API is one-shot because both callers are.
 //!
+//! The encoder side ([`deflate_raw`], [`deflate_zlib`]) is a simple greedy LZ77 with
+//! fixed Huffman codes, enough for PNG output; it does not aim to match zlib's ratio.
+//!
 //! No async, no unsafe, no external dependencies.
 
 #![forbid(unsafe_code)]
@@ -28,11 +31,14 @@
 
 mod bits;
 mod huffman;
+mod deflate;
 mod inflate;
 
 use std::fmt;
 
 use bits::Bits;
+
+pub use deflate::{deflate_raw, deflate_zlib};
 
 /// Everything a compressed stream can get wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]

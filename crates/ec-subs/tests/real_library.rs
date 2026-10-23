@@ -106,7 +106,9 @@ fn a_real_pgs_stream_decodes_to_plausible_bitmaps() {
         assert_eq!(stride, 1920 * 4);
         let opaque = frame.planes[0]
             .data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] > 0)
             .count();
         if opaque == 0 {
@@ -126,7 +128,9 @@ fn a_real_pgs_stream_decodes_to_plausible_bitmaps() {
         let rows = (0..1080)
             .filter(|y| {
                 frame.planes[0].data[y * stride..(y + 1) * stride]
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|p| p[3] > 0)
             })
             .count();

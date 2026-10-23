@@ -212,10 +212,10 @@ pub(crate) enum TxbSet {
     /// 8x8 block (lane-tx4x8), under this encoder's `reduced_tx_set`.
     /// `get_txsize_entropy_ctx` ((`txsize_sqr_map` + `txsize_sqr_up_map` + 1)
     /// >> 1) resolves `TX_4X8` to `TX_8X8`, so every coefficient table here is
-    /// [`Luma8`](TxbSet::Luma8)'s -- except `eob_pt`, a true 32-position
-    /// alphabet ([`crate::cdf::EOB_PT_32_LUMA`]), and `tx_type`, whose CDF row
-    /// is `txsize_sqr_map[TX_4X8]` = `TX_4X4` (libaom `read_tx_type`'s
-    /// `square_tx_size`), i.e. [`Luma4`](TxbSet::Luma4)'s own table.
+    /// > >    [`Luma8`](TxbSet::Luma8)'s -- except `eob_pt`, a true 32-position
+    /// > >    alphabet ([`crate::cdf::EOB_PT_32_LUMA`]), and `tx_type`, whose CDF row
+    /// > >    is `txsize_sqr_map[TX_4X8]` = `TX_4X4` (libaom `read_tx_type`'s
+    /// > >    `square_tx_size`), i.e. [`Luma4`](TxbSet::Luma4)'s own table.
     LumaRect4x8,
     /// [`LumaRect4x8`](TxbSet::LumaRect4x8)'s `reduced_tx_set: false`
     /// counterpart: `av1_get_ext_tx_set_type` at `tx_size_sqr_up == TX_8X8`,

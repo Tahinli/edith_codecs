@@ -18,6 +18,8 @@ pub fn upsample(plane: &[u8], pw: usize, ph: usize, out_w: usize, out_h: usize) 
     // Horizontal first, then vertical; each pass either doubles with the
     // triangle filter or falls back to nearest for uncommon ratios.
     let mut wide = vec![0u8; out_w * ph];
+    // The source column for each output column, computed once rather than per row.
+    let columns: Vec<usize> = (0..out_w).map(|x| (x * pw / out_w).min(pw - 1)).collect();
     for y in 0..ph {
         let row = &plane[y * pw..y * pw + pw];
         if out_w.div_ceil(2) == pw {
@@ -35,10 +37,14 @@ pub fn upsample(plane: &[u8], pw: usize, ph: usize, out_w: usize, out_h: usize) 
                 }
             }
         } else {
-            for x in 0..out_w {
-                wide[y * out_w + x] = row[(x * pw / out_w).min(pw - 1)];
+            for (dst, &src) in wide[y * out_w..(y + 1) * out_w].iter_mut().zip(&columns) {
+                *dst = row[src];
             }
         }
+    }
+    if out_h == ph {
+        // No vertical resampling: every output row is the source row it was built from.
+        return wide;
     }
     let mut out = vec![0u8; out_w * out_h];
     for y in 0..out_h {

@@ -425,9 +425,9 @@ mod tests {
         // Empty/1-byte partitions are legal for unused token partitions;
         // the init shortfall counts as overreads.
         let mut d = BoolDecoder::new(&[]).unwrap();
-        assert_eq!(d.read_bool(128), false);
+        assert!(!d.read_bool(128));
         let mut d = BoolDecoder::new(&[0]).unwrap();
-        assert_eq!(d.read_bool(128), false);
+        assert!(!d.read_bool(128));
     }
 
     #[test]

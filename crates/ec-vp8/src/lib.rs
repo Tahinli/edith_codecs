@@ -7,11 +7,12 @@
 //!
 //! [RFC 6386]: https://www.rfc-editor.org/rfc/rfc6386
 //!
-//! # Unsafe
+//! # Safety
 //!
-//! This crate contains no `unsafe` code.
+//! Every SIMD kernel is a safe `#[target_feature]` function, dispatched at
+//! runtime by `multiversion`; the crate-level `forbid` below keeps it so.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod bool;
@@ -46,14 +47,6 @@ pub(crate) fn trace_enabled() -> bool {
         1 => false,
         _ => true,
     }
-}
-
-/// Cached AVX2 availability for the explicit-SIMD kernels (`mc`).
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn avx2_supported() -> bool {
-    static AVX2: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
-    *AVX2
 }
 
 /// Whether `EC_VP8_DEBUG` per-macroblock dumps are enabled (same shape as

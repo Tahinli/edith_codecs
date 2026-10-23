@@ -8,6 +8,38 @@ use ec_core::{Error, Result};
 
 use crate::{FORMAT_EXTENSIBLE, SampleType, WavSpec};
 
+/// Data bytes at or above which [`WavWriter`] writes an RF64 header instead of
+/// RIFF: the 32-bit size fields cannot hold them. The margin below `u32::MAX`
+/// is the room the RIFF header and a pad byte take up, so a RIFF file never
+/// reaches the limit it would then overflow.
+pub const RF64_THRESHOLD: u64 = 0xFFFF_F000;
+
+/// What the header needs to know before the first sample is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WavOptions {
+    /// Frames the caller will write. The header's container is chosen from it,
+    /// since a RIFF header cannot be turned into an RF64 one after the fact.
+    /// `0` means unknown, which keeps RIFF; a file that then grows past the
+    /// 32-bit limit is refused at finalize.
+    pub expected_frames: u64,
+    /// Data bytes at or above which the header is RF64. Defaults to
+    /// [`RF64_THRESHOLD`]; tests lower it to exercise the RF64 path cheaply.
+    pub rf64_threshold: u64,
+}
+
+impl Default for WavOptions {
+    fn default() -> Self {
+        WavOptions {
+            expected_frames: 0,
+            rf64_threshold: RF64_THRESHOLD,
+        }
+    }
+}
+
+/// Size of a `ds64` chunk body with an empty table: riffSize, dataSize,
+/// sampleCount (three u64) and tableLength (u32).
+const DS64_LEN: u32 = 28;
+
 /// A sample a [`WavWriter`] accepts.
 ///
 /// Integer types write to integer files and `f32` writes to float files; the
@@ -71,6 +103,9 @@ pub struct WavWriter<W: Write + Seek> {
     fact_pos: Option<u64>,
     /// Absolute offset of the `data` size field.
     data_size_pos: u64,
+    /// Absolute offset of the `ds64` body when the header is RF64; the 64-bit
+    /// sizes are patched there, and the 32-bit fields stay at `0xFFFFFFFF`.
+    ds64_pos: Option<u64>,
     /// Samples (not frames) written so far.
     samples: u64,
 }
@@ -78,23 +113,54 @@ pub struct WavWriter<W: Write + Seek> {
 impl WavWriter<BufWriter<File>> {
     /// Create `path`, truncating it, and write the header for `spec`.
     pub fn create<P: AsRef<Path>>(path: P, spec: WavSpec) -> Result<Self> {
-        WavWriter::new(BufWriter::new(File::create(path)?), spec)
+        WavWriter::create_with_options(path, spec, WavOptions::default())
+    }
+
+    /// [`WavWriter::create`] with the header choices in `options`.
+    pub fn create_with_options<P: AsRef<Path>>(
+        path: P,
+        spec: WavSpec,
+        options: WavOptions,
+    ) -> Result<Self> {
+        WavWriter::with_options(BufWriter::new(File::create(path)?), spec, options)
     }
 }
 
 impl<W: Write + Seek> WavWriter<W> {
-    /// Write the header for `spec` at the writer's current position.
-    pub fn new(mut inner: W, spec: WavSpec) -> Result<Self> {
+    /// Write the header for `spec` at the writer's current position, as RIFF.
+    pub fn new(inner: W, spec: WavSpec) -> Result<Self> {
+        WavWriter::with_options(inner, spec, WavOptions::default())
+    }
+
+    /// Write the header for `spec` at the writer's current position. The
+    /// container (RIFF or RF64) follows `options.expected_frames`.
+    pub fn with_options(mut inner: W, spec: WavSpec, options: WavOptions) -> Result<Self> {
         spec.validate()?;
         let start = inner.stream_position()?;
         let extensible = spec.is_extensible();
         let fmt_len: u32 = if extensible { 40 } else { 16 };
-        let mut h: Vec<u8> = Vec::with_capacity(60);
+        let mut h: Vec<u8> = Vec::with_capacity(100);
 
-        h.extend_from_slice(b"RIFF");
-        let riff_size_pos = start + h.len() as u64;
-        h.extend_from_slice(&0u32.to_le_bytes()); // patched by finalize
-        h.extend_from_slice(b"WAVE");
+        let expected_data = options
+            .expected_frames
+            .saturating_mul(spec.block_align() as u64);
+        let rf64 = expected_data >= options.rf64_threshold;
+        let ds64_pos = if rf64 {
+            h.extend_from_slice(b"RF64");
+            h.extend_from_slice(&u32::MAX.to_le_bytes()); // the size is ds64's
+            h.extend_from_slice(b"WAVE");
+            h.extend_from_slice(b"ds64");
+            h.extend_from_slice(&DS64_LEN.to_le_bytes());
+            let pos = start + h.len() as u64;
+            h.extend_from_slice(&[0u8; DS64_LEN as usize]); // patched by finalize
+            Some(pos)
+        } else {
+            h.extend_from_slice(b"RIFF");
+            h.extend_from_slice(&0u32.to_le_bytes()); // patched by finalize
+            h.extend_from_slice(b"WAVE");
+            None
+        };
+        let riff_size_pos = start + 4;
 
         h.extend_from_slice(b"fmt ");
         h.extend_from_slice(&fmt_len.to_le_bytes());
@@ -135,7 +201,9 @@ impl<W: Write + Seek> WavWriter<W> {
 
         h.extend_from_slice(b"data");
         let data_size_pos = start + h.len() as u64;
-        h.extend_from_slice(&0u32.to_le_bytes());
+        // RF64 keeps the 32-bit data size at its sentinel; ds64 has the real one.
+        let data_placeholder = if rf64 { u32::MAX } else { 0 };
+        h.extend_from_slice(&data_placeholder.to_le_bytes());
         inner.write_all(&h)?;
 
         Ok(WavWriter {
@@ -144,6 +212,7 @@ impl<W: Write + Seek> WavWriter<W> {
             riff_size_pos,
             fact_pos,
             data_size_pos,
+            ds64_pos,
             samples: 0,
         })
     }
@@ -236,29 +305,45 @@ impl<W: Write + Seek> WavWriter<W> {
         // own size field does not count.
         let pad = data_bytes % 2;
         let riff_size = end + pad - (self.riff_size_pos + 4);
-        if riff_size > u64::from(u32::MAX) {
+        let frames = self.samples / u64::from(self.spec.channels);
+        if self.ds64_pos.is_none() && riff_size > u64::from(u32::MAX) {
             return Err(Error::unsupported(
-                "a WAVE file larger than 4 GiB",
-                "the 64-bit RF64/BW64 extension is not implemented",
+                "a RIFF WAVE file larger than 4 GiB",
+                "the writer took no expected length, so it wrote RIFF; \
+                 give WavOptions::expected_frames to get RF64",
             ));
         }
         let (riff_pos, data_pos) = (self.riff_size_pos, self.data_size_pos);
+        // The `fact` field is 32 bits in both containers; RF64 keeps the full
+        // count in ds64, so past 2^32 frames this field saturates.
         let fact = self
             .fact_pos
-            .map(|pos| (pos, (self.samples / u64::from(self.spec.channels)) as u32));
+            .map(|pos| (pos, frames.min(u64::from(u32::MAX)) as u32));
+        let ds64 = self.ds64_pos;
         let w = self.w();
         if pad == 1 {
             w.seek(SeekFrom::Start(end))?;
             w.write_all(&[0])?;
         }
-        w.seek(SeekFrom::Start(riff_pos))?;
-        w.write_all(&(riff_size as u32).to_le_bytes())?;
+        match ds64 {
+            Some(pos) => {
+                w.seek(SeekFrom::Start(pos))?;
+                w.write_all(&riff_size.to_le_bytes())?;
+                w.write_all(&data_bytes.to_le_bytes())?;
+                w.write_all(&frames.to_le_bytes())?;
+                // tableLength stays 0: no extra 64-bit sizes to record.
+            }
+            None => {
+                w.seek(SeekFrom::Start(riff_pos))?;
+                w.write_all(&(riff_size as u32).to_le_bytes())?;
+                w.seek(SeekFrom::Start(data_pos))?;
+                w.write_all(&(data_bytes as u32).to_le_bytes())?;
+            }
+        }
         if let Some((pos, frames)) = fact {
             w.seek(SeekFrom::Start(pos))?;
             w.write_all(&frames.to_le_bytes())?;
         }
-        w.seek(SeekFrom::Start(data_pos))?;
-        w.write_all(&(data_bytes as u32).to_le_bytes())?;
         w.seek(SeekFrom::Start(end + pad))?;
         Ok(())
     }

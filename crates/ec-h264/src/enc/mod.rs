@@ -24,8 +24,10 @@ mod cabac_enc;
 mod entropy;
 mod headers;
 mod mb;
+mod pool;
 mod quant;
 mod rc;
+pub(crate) mod timing;
 mod vlc;
 
 use ec_core::BitWriter;
@@ -43,7 +45,11 @@ use crate::transform::{LevelScale4x4, LevelScale8x8};
 use entropy::EncEntropy;
 use headers::{SeqParams, SliceParams, write_pps, write_slice_header, write_sps};
 use mb::{MbEnc, Source, encode_mb};
+use pool::BandPool;
 use rc::RateControl;
+use std::sync::Arc;
+use std::time::Instant;
+pub use timing::EncodeTimings;
 
 pub use mb::Preset;
 
@@ -147,6 +153,8 @@ pub struct Encoder {
     /// One private picture per worker; worker 0's doubles as the picture the
     /// other bands are stitched into.
     workers: Vec<Picture>,
+    /// The band workers, started on the first multi-band picture.
+    pool: Option<BandPool<BandMsg, BandOut>>,
     src: Source,
     rc: RateControl,
     threads: usize,
@@ -160,6 +168,7 @@ pub struct Encoder {
     have_reference: bool,
     /// Macroblocks coded with transform_size_8x8_flag set: (intra, inter).
     t8x8_mbs: (u64, u64),
+    timings: timing::EncodeTimings,
 }
 
 /// A picture handed to the encoder: three planes, no padding assumptions.
@@ -253,6 +262,7 @@ impl Encoder {
             sps,
             reference: Picture::default(),
             workers,
+            pool: None,
             src: Source {
                 y: Vec::new(),
                 u: Vec::new(),
@@ -270,6 +280,7 @@ impl Encoder {
             next_id: 0,
             have_reference: false,
             t8x8_mbs: (0, 0),
+            timings: timing::EncodeTimings::default(),
             cfg,
         })
     }
@@ -283,6 +294,11 @@ impl Encoder {
 
     pub fn config(&self) -> &EncoderConfig {
         &self.cfg
+    }
+
+    /// Where the encode time went so far; see [`EncodeTimings`].
+    pub fn timings(&self) -> EncodeTimings {
+        self.timings
     }
 
     /// The reconstruction of the last coded picture, cropped, as I420 planes.
@@ -317,7 +333,9 @@ impl Encoder {
         if frame.width != self.cfg.width || frame.height != self.cfg.height {
             return Err(Error::corrupt("frame size differs from the encoder's"));
         }
+        let t_pad = Instant::now();
         self.pad_source(frame)?;
+        self.timings.pad += t_pad.elapsed().as_secs_f64();
         if self.frames == 0 {
             self.cqo = chroma_qp_offset_for_source(&self.src, self.cfg.width, self.cfg.height);
             let pps_rbsp = write_pps(self.cfg.cabac, self.cfg.transform_8x8, self.cqo);
@@ -341,54 +359,78 @@ impl Encoder {
         self.next_id = self.next_id.wrapping_add(1);
 
         // Per-band coding. Every worker owns its picture and its bitstream;
-        // the only shared state is the immutable reference picture and source.
-        let sps = &self.sps;
-        let src = &self.src;
-        let cfg = &self.cfg;
-        let rc = &self.rc;
-        let reference = (!idr).then_some(&self.reference);
-        let frame_num = self.frame_num;
-        let idr_pic_id = self.idr_pic_id;
-        let target = rc.frame_target(idr);
-        let cqo = self.cqo;
-        let total_mbs = (mb_w * mb_h) as f64;
-
-        let mut outputs: Vec<Vec<u8>> = Vec::new();
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(bands.len());
-            for (slice_id, (&(row0, row1), worker)) in
-                bands.iter().zip(self.workers.iter_mut()).enumerate()
-            {
-                handles.push(scope.spawn(move || {
-                    worker.start(sps);
-                    worker.id = picture_id;
-                    let band_mbs = ((row1 - row0) * mb_w) as f64;
-                    code_band(
-                        worker,
-                        BandJob {
-                            src,
-                            reference,
-                            cfg,
-                            rc,
-                            slice_id: slice_id as u16,
-                            slice_type,
-                            first_mb: (row0 * mb_w) as u32,
-                            rows: (row0, row1),
-                            qp,
-                            cabac: cfg.cabac,
-                            frame_num,
-                            idr,
-                            idr_pic_id,
-                            band_target: target * band_mbs / total_mbs,
-                            cqo,
-                        },
-                    )
-                }));
-            }
-            for h in handles {
-                outputs.push(h.join().expect("a band worker panicked"));
-            }
+        // the frame's shared inputs (source, reference, parameters) travel in
+        // one `Arc`, and come back to the encoder once every band has answered.
+        let shared = Arc::new(FrameShared {
+            sps: self.sps.clone(),
+            cfg: self.cfg.clone(),
+            rc: self.rc.clone(),
+            src: std::mem::take(&mut self.src),
+            reference: (!idr).then(|| std::mem::take(&mut self.reference)),
+            bands: bands.clone(),
+            slice_type,
+            frame_num: self.frame_num,
+            idr,
+            idr_pic_id: self.idr_pic_id,
+            qp,
+            target: self.rc.frame_target(idr),
+            total_mbs: (mb_w * mb_h) as f64,
+            cqo: self.cqo,
+            mb_w,
         });
+
+        let mut busiest = 0.0f64;
+        let mut busy = 0.0f64;
+        let t_bands = Instant::now();
+        let mut answers = Vec::with_capacity(bands.len());
+        if self.threads == 1 {
+            // One band: coded on this thread, with no workers.
+            let pic = std::mem::take(&mut self.workers[0]);
+            answers.push(run_band(BandMsg {
+                pic,
+                shared: Arc::clone(&shared),
+                band: 0,
+                picture_id,
+            }));
+        } else {
+            let threads = self.threads;
+            let pool = self
+                .pool
+                .get_or_insert_with(|| BandPool::new(threads, run_band));
+            for (band, worker) in self.workers.iter_mut().enumerate() {
+                pool.submit(
+                    band,
+                    BandMsg {
+                        pic: std::mem::take(worker),
+                        shared: Arc::clone(&shared),
+                        band,
+                        picture_id,
+                    },
+                );
+            }
+            for band in 0..bands.len() {
+                answers.push(pool.collect(band));
+            }
+        }
+        let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(bands.len());
+        for (band, answer) in answers.into_iter().enumerate() {
+            busiest = busiest.max(answer.secs);
+            busy += answer.secs;
+            outputs.push(answer.rbsp);
+            self.workers[band] = answer.pic;
+        }
+        // Every band has answered, so the source and reference are unshared.
+        let shared = Arc::try_unwrap(shared)
+            .ok()
+            .expect("bands released the frame");
+        self.src = shared.src;
+        if let Some(reference) = shared.reference {
+            self.reference = reference;
+        }
+        self.timings.bands_wall += t_bands.elapsed().as_secs_f64();
+        self.timings.bands_busy += busy;
+        self.timings.bands_slowest += busiest;
+        let t_stitch = Instant::now();
 
         // Stitch the bands into worker 0's picture, then filter the whole
         // picture the way a decoder does.
@@ -407,6 +449,7 @@ impl Encoder {
         for (band, worker) in bands.iter().skip(1).zip(rest.iter()) {
             merge_band(master, worker, *band);
         }
+        self.timings.stitch += t_stitch.elapsed().as_secs_f64();
         for &f in &master.mb_flags {
             if f & FLAG_TRANS8X8 != 0 {
                 if f & FLAG_INTER != 0 {
@@ -423,9 +466,12 @@ impl Encoder {
         // exact pre/post comparison with no hooks inside the RD trials.
         #[cfg(feature = "rd-ablation")]
         let rd_pre = rd_trace_capture(master, &self.src);
+        let t_deblock = Instant::now();
         deblock_picture(master);
+        self.timings.deblock += t_deblock.elapsed().as_secs_f64();
         #[cfg(feature = "rd-ablation")]
         rd_trace_write(master, &self.src, self.frames, rd_pre);
+        let t_output = Instant::now();
         master.extend_borders();
         master.complete = true;
         std::mem::swap(master, &mut self.reference);
@@ -447,6 +493,8 @@ impl Encoder {
         }
 
         let bits = au.len() as u64 * 8;
+        self.timings.output += t_output.elapsed().as_secs_f64();
+        self.timings.pictures += 1;
         self.rc.update(idr, qp, bits);
         self.frames += 1;
         self.frame_num = (self.frame_num + 1) % (1 << headers::LOG2_MAX_FRAME_NUM);
@@ -580,6 +628,84 @@ const CHROMA_FLAT_RATIO: f64 = 0.5;
 /// The offset flat chroma is coded with.
 const CHROMA_FLAT_QP_OFFSET: i32 = -2;
 
+/// What every band of one picture reads. The workers share it through an `Arc`.
+struct FrameShared {
+    sps: Sps,
+    cfg: EncoderConfig,
+    rc: RateControl,
+    src: Source,
+    /// The previous reconstruction; `None` for an IDR picture.
+    reference: Option<Picture>,
+    /// Macroblock rows `[start, end)` of each band.
+    bands: Vec<(usize, usize)>,
+    slice_type: SliceType,
+    frame_num: u32,
+    idr: bool,
+    idr_pic_id: u32,
+    qp: i32,
+    /// The picture's bit target, shared out over the bands pro rata.
+    target: f64,
+    total_mbs: f64,
+    cqo: i32,
+    mb_w: usize,
+}
+
+/// One band's job: the worker's picture, moved in and back out with the answer.
+struct BandMsg {
+    pic: Picture,
+    shared: Arc<FrameShared>,
+    band: usize,
+    picture_id: i32,
+}
+
+/// One band's answer: its picture, its RBSP and the time it took.
+struct BandOut {
+    pic: Picture,
+    rbsp: Vec<u8>,
+    secs: f64,
+}
+
+/// Code one band on a worker picture.
+fn run_band(msg: BandMsg) -> BandOut {
+    let BandMsg {
+        mut pic,
+        shared,
+        band,
+        picture_id,
+    } = msg;
+    let t_band = Instant::now();
+    let (row0, row1) = shared.bands[band];
+    let mb_w = shared.mb_w;
+    pic.start(&shared.sps);
+    pic.id = picture_id;
+    let band_mbs = ((row1 - row0) * mb_w) as f64;
+    let rbsp = code_band(
+        &mut pic,
+        BandJob {
+            src: &shared.src,
+            reference: shared.reference.as_ref(),
+            cfg: &shared.cfg,
+            rc: &shared.rc,
+            slice_id: band as u16,
+            slice_type: shared.slice_type,
+            first_mb: (row0 * mb_w) as u32,
+            rows: (row0, row1),
+            qp: shared.qp,
+            cabac: shared.cfg.cabac,
+            frame_num: shared.frame_num,
+            idr: shared.idr,
+            idr_pic_id: shared.idr_pic_id,
+            band_target: shared.target * band_mbs / shared.total_mbs,
+            cqo: shared.cqo,
+        },
+    );
+    BandOut {
+        pic,
+        rbsp,
+        secs: t_band.elapsed().as_secs_f64(),
+    }
+}
+
 struct BandJob<'a> {
     src: &'a Source,
     reference: Option<&'a Picture>,
@@ -633,6 +759,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         lambda: lambda_for(job.qp, rd_lambda_standard(job.cfg)),
         t8x8_margin_bits: rd_transform_8x8_margin_bits(job.cfg),
         preset: job.cfg.preset,
+        fast: fast_knobs(),
         lambda_standard: rd_lambda_standard(job.cfg),
         transform_8x8: job.cfg.transform_8x8,
         transform_8x8_intra: rd_transform_8x8_intra(job.cfg),
@@ -664,6 +791,56 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         }
     }
     w.finish(job.slice_type == SliceType::P)
+}
+
+/// The Fast-preset speed settings: the defaults, with `EC_H264_INTRA_GATE`
+/// (a number) and `EC_H264_SKIP_I8` (any value but 0 skips Intra_8x8) as
+/// sweep overrides. Read once per band, so they cost nothing per macroblock.
+fn fast_knobs() -> mb::FastKnobs {
+    let mut k = mb::FastKnobs::default();
+    if let Some(g) = std::env::var("EC_H264_INTRA_GATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        k.intra_gate = g;
+    }
+    if let Ok(v) = std::env::var("EC_H264_SKIP_I8") {
+        k.skip_i8 = v != "0";
+    }
+    if let Some(v) = std::env::var("EC_H264_ME_SUB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        k.me_sub = v;
+    }
+    if let Ok(v) = std::env::var("EC_H264_ME_SATD") {
+        k.me_satd = v != "0";
+    }
+    if let Some(v) = std::env::var("EC_H264_INTER_TX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        k.inter_tx = v;
+    }
+    if let Ok(v) = std::env::var("EC_H264_LAZY_I16") {
+        k.lazy_i16 = v != "0";
+    }
+    if let Some(v) = std::env::var("EC_H264_EARLY_SKIP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        k.early_skip = v;
+    }
+    if let Some(v) = std::env::var("EC_H264_TX8_NZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        k.tx8_nz_limit = v;
+    }
+    if let Ok(v) = std::env::var("EC_H264_P_SKIP_I8") {
+        k.p_skip_i8 = v != "0";
+    }
+    k
 }
 
 /// Standard Lagrangian multiplier in the squared-error domain.

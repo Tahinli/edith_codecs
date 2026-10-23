@@ -22,7 +22,6 @@
 //! `EC_AV1_FILTER_THREADS=4` with frame threading off, and the product with
 //! `EC_AV1_THREADS` kept at or below the core count once it lands (e.g. 2
 //! frame workers x 4 filter threads on 12 cores).
-#![allow(unsafe_code)]
 
 /// `EC_AV1_FILTER_THREADS`, the number of worker threads each in-frame filter
 /// stage splits itself across (default 1 = single-threaded, the shipped
@@ -71,10 +70,17 @@ pub(crate) fn filter_threads() -> usize {
             let n = crate::envflags::var("EC_AV1_FILTER_THREADS")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(1)
-                .clamp(1, 64);
-            FILTER_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
-            n
+                .map(|n| n.clamp(1, 64));
+            // lane-av1recon: an unset env falls through to the split the
+            // running decode picked ([`DecodeSplit`]); only a set value (or a
+            // test override) is cached.
+            match n {
+                Some(n) => {
+                    FILTER_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+                    n
+                }
+                None => AUTO_FILTER.load(std::sync::atomic::Ordering::Relaxed),
+            }
         }
         n => n,
     }
@@ -143,102 +149,193 @@ pub(crate) fn bands(units: usize, threads: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// A `&mut T` handed to several scoped workers that write provably disjoint
-/// parts of it.
-///
-/// corner-cut: the disjointness is proved by the caller's band arithmetic and
-/// checked end-to-end by the 1-vs-4-thread byte-exact gate, not by the borrow
-/// checker -- so Miri/stacked-borrows would flag the overlapping `&mut`s. The
-/// upgrade path is per-stage `chunks_mut`/`split_at_mut` plumbing (an origin
-/// offset through `filter_edge`, `cdef_filter_block`,
-/// `filter_restoration_unit` and `add_noise_to_block`), which is a far larger
-/// diff for the same output.
-pub(crate) struct Shared<'a, T: ?Sized>(*mut T, std::marker::PhantomData<&'a mut T>);
-
-// SAFETY: `Shared` only ever hands out the pointer it was built from; sending
-// it to a scoped thread is sending the `&mut T` the constructor consumed, and
-// the bands each worker touches are disjoint.
-unsafe impl<T: ?Sized + Send> Send for Shared<'_, T> {}
-unsafe impl<T: ?Sized + Send> Sync for Shared<'_, T> {}
-
-impl<T: ?Sized> Clone for Shared<'_, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T: ?Sized> Copy for Shared<'_, T> {}
-
-impl<'a, T: ?Sized> Shared<'a, T> {
-    pub(crate) fn new(v: &'a mut T) -> Self {
-        Self(v, std::marker::PhantomData)
-    }
-
-    /// [`Shared::new`] from a raw pointer, for a caller that keeps using the
-    /// `&mut T` itself (lane-pipefilt: the frame thread parses into the
-    /// planes and the mode-info grids while the filter pipeline reads the
-    /// superblock rows the parse is already three bands past).
-    ///
-    /// # Safety
-    /// `p` must stay valid and unaliased-in-practice for `'a` -- the same
-    /// band-disjointness contract as [`Shared::get`], proved by the caller's
-    /// row-lag arithmetic and the byte-exact gate.
-    pub(crate) unsafe fn from_ptr(p: *mut T) -> Self {
-        Self(p, std::marker::PhantomData)
-    }
-
-    /// # Safety
-    /// The caller must touch only its own band, disjoint from every other
-    /// worker's, for as long as the returned reference lives.
-    pub(crate) unsafe fn get(&self) -> &mut T {
-        unsafe { &mut *self.0 }
-    }
-}
-
-/// Runs `f(band_start, band_end, ctx)` once per band: band 0 on this thread
-/// with the caller's own [`crate::decode::FrameCtx`], the rest on scoped
-/// worker threads, each with its own filter-scope copy of it (`FrameCtx` is
-/// `!Sync` by design). Nothing outlives the call.
+/// Runs `f(lo, hi, slice, ctx)` once per band, band 0 on this thread and the
+/// rest on scoped threads, all joined before the call returns. Band `(lo, hi)`
+/// gets `data[lo * unit..hi * unit]` as its own `&mut` slice, carved with
+/// `split_at_mut`, so no `unsafe` and no shared `&mut` is needed. `bands` must
+/// be ascending and non-overlapping, and `hi * unit` must fit in `data`.
 #[inline]
-pub(crate) fn run_bands<F>(bands: &[(usize, usize)], fctx: &crate::decode::FrameCtx, f: F)
-where
-    F: Fn(usize, usize, &crate::decode::FrameCtx) + Sync,
+pub(crate) fn run_bands_mut<T, F>(
+    bands: &[(usize, usize)],
+    unit: usize,
+    fctx: &crate::decode::FrameCtx,
+    data: &mut [T],
+    f: F,
+) where
+    T: Send,
+    F: Fn(usize, usize, &mut [T], &crate::decode::FrameCtx) + Sync,
 {
-    match bands {
-        [] => {}
-        [(a, b)] => f(*a, *b, fctx),
-        [(a0, b0), rest @ ..] => {
-            // lane-pool1: same shape as the `thread::scope` this replaced --
-            // band 0 inline, the rest on this thread's persistent pool, all
-            // waited out by `batch`'s drop at the end of the block.
-            let batch = Batch::new("ec-av1-filter");
-            for &(a, b) in rest {
-                let ctx = crate::decode::filter_ctx_copy(fctx);
-                let f = &f;
-                batch.submit(move || f(a, b, &ctx));
-            }
-            f(*a0, *b0, fctx);
-            drop(batch);
+    let mut slices = Vec::with_capacity(bands.len());
+    let mut rest = data;
+    let mut pos = 0;
+    for &(lo, hi) in bands {
+        let (_, tail) = rest.split_at_mut((lo * unit) - pos);
+        let (mine, after) = tail.split_at_mut((hi - lo) * unit);
+        slices.push((lo, hi, mine));
+        pos = hi * unit;
+        rest = after;
+    }
+    let mut it = slices.into_iter();
+    let Some((a0, b0, first)) = it.next() else {
+        return;
+    };
+    if bands.len() == 1 {
+        f(a0, b0, first, fctx);
+        return;
+    }
+    scope("ec-av1-filter", |batch| {
+        for (a, b, mine) in it {
+            let ctx = crate::decode::filter_ctx_copy(fctx);
+            let f = &f;
+            batch.submit(move || f(a, b, mine, &ctx));
         }
+        f(a0, b0, first, fctx);
+    });
+}
+
+/// Carves `data` into one `&mut` slice per element range, `ranges` ascending
+/// and non-overlapping (`split_at_mut` only, so no `unsafe`). Elements outside
+/// every range are left alone.
+pub(crate) fn carve_ranges<'a, T>(data: &'a mut [T], ranges: &[(usize, usize)]) -> Vec<&'a mut [T]> {
+    split_bands_mut(ranges, 1, data)
+}
+
+/// Carves `data` into the slices [`run_bands_mut`] hands out, without running
+/// anything: band `(lo, hi)` is `data[lo * unit..hi * unit]`. `bands` must be
+/// ascending and non-overlapping.
+#[inline]
+pub(crate) fn split_bands_mut<'a, T>(
+    bands: &[(usize, usize)],
+    unit: usize,
+    data: &'a mut [T],
+) -> Vec<&'a mut [T]> {
+    let mut out = Vec::with_capacity(bands.len());
+    let mut rest: &'a mut [T] = data;
+    let mut pos = 0;
+    for &(lo, hi) in bands {
+        let (_, tail) = std::mem::take(&mut rest).split_at_mut((lo * unit) - pos);
+        let (mine, after) = tail.split_at_mut((hi - lo) * unit);
+        out.push(mine);
+        pos = hi * unit;
+        rest = after;
+    }
+    out
+}
+
+/// [`run_bands_mut`] where band `i` also gets its own payload `parts[i]`
+/// (moved in, so a caller can hand each band the disjoint `&mut` slices
+/// [`carve_ranges`] made). `parts` is in the same order as `bands`.
+#[inline]
+pub(crate) fn run_bands_with<P, F>(
+    bands: &[(usize, usize)],
+    parts: Vec<P>,
+    fctx: &crate::decode::FrameCtx,
+    f: F,
+) where
+    P: Send,
+    F: Fn(usize, usize, P, &crate::decode::FrameCtx) + Sync,
+{
+    debug_assert_eq!(bands.len(), parts.len());
+    let mut it = bands.iter().zip(parts);
+    let Some(((a0, b0), first)) = it.next() else {
+        return;
+    };
+    if bands.len() == 1 {
+        f(*a0, *b0, first, fctx);
+        return;
+    }
+    scope("ec-av1-filter", |batch| {
+        for (&(a, b), p) in it {
+            let ctx = crate::decode::filter_ctx_copy(fctx);
+            let f = &f;
+            batch.submit(move || f(a, b, p, &ctx));
+        }
+        f(*a0, *b0, first, fctx);
+    });
+}
+
+/// [`run_bands_mut`] for parts the caller has already carved, each one holding
+/// its own `&mut` views: `f` runs once per part, part 0 inline and the rest on
+/// the scope's threads, the same shape as [`run_bands_mut`].
+#[inline]
+pub(crate) fn run_parts_mut<S, F>(parts: &mut [S], fctx: &crate::decode::FrameCtx, f: F)
+where
+    S: Send,
+    F: Fn(&mut S, &crate::decode::FrameCtx) + Sync,
+{
+    let Some((first, rest)) = parts.split_first_mut() else {
+        return;
+    };
+    if rest.is_empty() {
+        f(first, fctx);
+        return;
+    }
+    scope("ec-av1-filter", |batch| {
+        for part in rest.iter_mut() {
+            let ctx = crate::decode::filter_ctx_copy(fctx);
+            let f = &f;
+            batch.submit(move || f(part, &ctx));
+        }
+        f(first, fctx);
+    });
+}
+
+/// lane-av1recon: the in-frame thread split a decode at `EC_AV1_THREADS > 1`
+/// picked ([`crate::autothreads::split`]), used only while the matching env
+/// variable is unset. 1 = serial, which is what everything outside a threaded
+/// `decode_stream_with_threads` call (the encoder's own decodes, the gates)
+/// sees.
+static AUTO_RECON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+static AUTO_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// Holds the default in-frame split for the span of one threaded decode and
+/// restores the previous one on drop.
+pub(crate) struct DecodeSplit(usize, usize);
+
+impl DecodeSplit {
+    /// Installs the split [`crate::autothreads::split`] picks for `threads`
+    /// decode threads. Does nothing in the crate's own test build, where the
+    /// gates read thread-local counters the in-frame workers never touch (a
+    /// test forces the knobs through the env).
+    pub(crate) fn install(threads: usize) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let prev = Self(AUTO_RECON.load(Relaxed), AUTO_FILTER.load(Relaxed));
+        if !cfg!(test) {
+            let (r, f) = crate::autothreads::split(threads);
+            AUTO_RECON.store(r, Relaxed);
+            AUTO_FILTER.store(f, Relaxed);
+        }
+        prev
     }
 }
 
-/// `EC_AV1_RECON_THREADS`, the number of worker threads a tile's
-/// reconstruction (lane-wave1) is spread across, in superblock-row wavefront
-/// order (default 1 = reconstruct inline at the parse site, i.e. exactly the
-/// pre-wavefront decoder). Read once per process, same shape as
-/// [`filter_threads`].
+impl Drop for DecodeSplit {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        AUTO_RECON.store(self.0, Relaxed);
+        AUTO_FILTER.store(self.1, Relaxed);
+    }
+}
+
+/// The superblock-row reconstruction workers per tile ([`crate::decode::wave`]).
 static RECON_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The recon thread count: `EC_AV1_RECON_THREADS` when set, else the split a
+/// threaded decode installed ([`DecodeSplit`]). 1 means inline reconstruction.
 pub(crate) fn recon_threads() -> usize {
     match RECON_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {
             let n = crate::envflags::var("EC_AV1_RECON_THREADS")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(1)
-                .clamp(1, 64);
-            RECON_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
-            n
+                .map(|n| n.clamp(1, 64));
+            match n {
+                Some(n) => {
+                    RECON_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+                    n
+                }
+                None => AUTO_RECON.load(std::sync::atomic::Ordering::Relaxed),
+            }
         }
         n => n,
     }
@@ -253,20 +350,21 @@ pub(crate) fn set_recon_threads(n: usize) {
 // --- lane-pool1: persistent worker pools ---------------------------------
 //
 // Every threaded stage of the decoder used to spawn its threads per unit of
-// work: one `thread::scope` per filter STAGE per frame, `EC_AV1_RECON_THREADS`
-// workers per TILE, one frame worker per coded frame -- 2363 distinct threads
-// in a 13 s 4K decode. The cost is not the clone of the thread itself but what
+// work: one `thread::scope` per filter STAGE per frame, one frame worker per
+// coded frame -- 2363 distinct threads in a 13 s 4K decode. The cost is not the clone of the thread itself but what
 // dies with it: every `thread_local!` scratch pool in `decode.rs` (planes,
 // rows, dq, mc, wiener, sgr) is allocated and faulted in again on each new
 // thread, which is where the 3.65 M page faults and the 2.7x malloc traffic of
 // the composed setting came from.
 //
 // The replacement is one pool per POOL-OWNING THREAD, kept in a thread-local
-// and joined when that thread exits: a stage submits a [`Batch`] of jobs, the
-// pool hands each to an idle worker (growing to `busy + queued` so a job never
-// queues behind a blocking one -- the recon wavefront's workers block on their
-// dependencies), and the batch's `Drop` waits every job out. Scratch then
-// lives as long as the worker, not as long as the frame.
+// and joined when that thread exits: the frame workers submit a [`Batch`] of
+// `'static` jobs, the pool hands each to an idle worker (growing to
+// `busy + queued` so a job never queues behind a blocking one -- a frame
+// worker blocks on its references' promises), and the batch's `Drop` waits
+// every job out. Scratch then lives as long as the worker, not as long as the
+// frame. Borrowed jobs (filter bands, tile search) go through [`scope`]
+// instead.
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 struct PoolQ {
@@ -365,14 +463,8 @@ fn pool_push(inner: &std::sync::Arc<PoolInner>, job: Job, class: &'static str) {
     inner.cv.notify_one();
 }
 
-/// Live threads across every ec-av1 pool -- what the bounded-growth test
-/// asserts on, and what a profiler counts as `ec-av1-*`.
+/// Live threads across every ec-av1 pool (what a profiler counts as `ec-av1-*`).
 static POOL_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn pool_threads() -> usize {
-    POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 impl Drop for Pool {
     fn drop(&mut self) {
@@ -407,25 +499,18 @@ struct BatchState {
     panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
-/// A set of jobs running on the submitting thread's pool. `Drop` waits for
-/// every one of them and re-raises the first panic, which is what makes
-/// [`Batch::submit`]'s borrow of non-`'static` data sound -- exactly
-/// `thread::scope`'s contract, minus the spawns.
-///
-/// corner-cut: soundness rests on this `Drop` running; `std::mem::forget` of a
-/// `Batch` would let a job outlive its borrows. The type is crate-private and
-/// every construction site below binds it to a local. Upgrade path is the
-/// closure-taking `scope(|s| ...)` shape, which costs every caller a level of
-/// indentation for the same guarantee.
-pub(crate) struct Batch<'a> {
+/// A set of `'static` jobs running on the submitting thread's pool. `Drop`
+/// waits for every one of them and re-raises the first panic. Jobs own what
+/// they touch (`Arc`s, moved values): a job that needs borrowed data uses
+/// [`scope`] instead, which joins on its own threads.
+pub(crate) struct Batch {
     st: std::sync::Arc<BatchState>,
     class: &'static str,
-    _p: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> Batch<'a> {
+impl Batch {
     /// `class` is the thread-name prefix for any pool worker this batch has
-    /// to spawn -- see [`Pool::push`].
+    /// to spawn -- see [`pool_push`].
     pub(crate) fn new(class: &'static str) -> Self {
         Self {
             class,
@@ -434,14 +519,13 @@ impl<'a> Batch<'a> {
                 cv: std::sync::Condvar::new(),
                 panic: std::sync::Mutex::new(None),
             }),
-            _p: std::marker::PhantomData,
         }
     }
 
-    pub(crate) fn submit<F: FnOnce() + Send + 'a>(&self, f: F) {
+    pub(crate) fn submit<F: FnOnce() + Send + 'static>(&self, f: F) {
         *self.st.left.lock().unwrap() += 1;
         let st = std::sync::Arc::clone(&self.st);
-        let job: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+        let job: Job = Box::new(move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
             if let Err(p) = r {
                 let mut slot = st.panic.lock().unwrap();
@@ -449,24 +533,25 @@ impl<'a> Batch<'a> {
                     *slot = Some(p);
                 }
             }
-            let mut left = st.left.lock().unwrap();
+            // Poison-tolerant (lane-av1panichang): the count must come down
+            // even if some other holder of this lock panicked, or `drop`
+            // would wait forever.
+            let mut left = st
+                .left
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *left -= 1;
             st.cv.notify_all();
         });
-        // SAFETY: the job is dropped before `Batch::drop` returns (it waits
-        // for `left == 0`), and `Batch<'a>` cannot outlive `'a`, so the
-        // laundered lifetime is never observed past the real one.
-        let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(job) };
         // lane-memfix: on a pool worker, back into the pool it is serving; on
         // any other thread, this thread's own pool.
         //
         // No deadlock: a job blocked in `Batch::drop` is counted in `busy`,
         // so `pool_push` grows the pool by one thread for every queued job
         // that has no idle worker -- the child of a blocked parent always
-        // gets a thread. The only waits inside a job are on its own sub-batch
-        // (same rule, one level deeper) and on wavefront row atomics /
-        // `PipeSync` counters, which are published by jobs that are already
-        // running, never by a job still in the queue.
+        // gets a thread. A frame worker does wait on its references' promises,
+        // which are published by jobs that are already running (never by one
+        // still in the queue), so the growth rule covers those waits too.
         let on = ON_POOL.with(|c| c.borrow().clone());
         match on {
             Some(inner) => pool_push(&inner, job, self.class),
@@ -480,17 +565,92 @@ impl<'a> Batch<'a> {
     }
 }
 
-impl Drop for Batch<'_> {
+impl Drop for Batch {
     fn drop(&mut self) {
-        let mut left = self.st.left.lock().unwrap();
+        let mut left = self
+            .st
+            .left
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *left > 0 {
-            left = self.st.cv.wait(left).unwrap();
+            left = self
+                .st
+                .cv
+                .wait(left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         drop(left);
-        if let Some(p) = self.st.panic.lock().unwrap().take() {
+        let panicked = self
+            .st
+            .panic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Re-raise the first job panic on the waiting thread, unless this
+        // thread is already unwinding: a second panic here would abort the
+        // process (lane-av1panichang).
+        if let Some(p) = panicked
+            && !std::thread::panicking()
+        {
             std::panic::resume_unwind(p);
         }
     }
+}
+
+/// Jobs of a [`scope`] that may borrow from the caller's stack. Each one runs
+/// on its own `std::thread::scope` thread and is joined before `scope`
+/// returns; the first job panic is re-raised after all of them have finished,
+/// as [`Batch`] does.
+pub(crate) struct Scope<'scope, 'env: 'scope> {
+    inner: &'scope std::thread::Scope<'scope, 'env>,
+    class: &'static str,
+    panic: std::sync::Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>,
+}
+
+impl<'scope> Scope<'scope, '_> {
+    /// Runs `f` on a new thread named `class`, joined when the scope ends.
+    pub(crate) fn submit<F: FnOnce() + Send + 'scope>(&self, f: F) {
+        let panic = std::sync::Arc::clone(&self.panic);
+        std::thread::Builder::new()
+            .name(self.class.to_owned())
+            .spawn_scoped(self.inner, move || {
+                if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                    let mut slot = panic
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.is_none() {
+                        *slot = Some(p);
+                    }
+                }
+            })
+            .expect("spawning an ec-av1 scoped worker");
+    }
+}
+
+/// Runs `f` with a [`Scope`] whose jobs may borrow anything that outlives the
+/// call, and returns once every job has finished. The borrowed counterpart of
+/// [`Batch`]: a job here waits on nothing but its own work, so it needs no
+/// pool growth rule, and its `thread_local!` scratch is freed with the thread.
+pub(crate) fn scope<'env, R>(
+    class: &'static str,
+    f: impl for<'scope> FnOnce(&Scope<'scope, 'env>) -> R,
+) -> R {
+    let panic = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let out = std::thread::scope(|inner| {
+        f(&Scope {
+            inner,
+            class,
+            panic: std::sync::Arc::clone(&panic),
+        })
+    });
+    let panicked = panic
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(p) = panicked {
+        std::panic::resume_unwind(p);
+    }
+    out
 }
 
 // --- lane-av1fpar: encoder per-stage wall breakdown -----------------------

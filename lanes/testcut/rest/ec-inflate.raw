@@ -1,0 +1,32 @@
+{ "type": "suite", "event": "started", "test_count": 6 }
+{ "type": "test", "event": "started", "name": "deflate::tests::empty_and_tiny_inputs_round_trip" }
+{ "type": "test", "event": "started", "name": "deflate::tests::matches_reach_the_longest_and_furthest_codes" }
+{ "type": "test", "event": "started", "name": "deflate::tests::random_input_round_trips_within_framing_overhead" }
+{ "type": "test", "event": "started", "name": "deflate::tests::repetitive_input_compresses_and_round_trips" }
+{ "type": "test", "name": "deflate::tests::repetitive_input_compresses_and_round_trips", "event": "ok", "exec_time": 0.002071604 }
+{ "type": "test", "event": "started", "name": "tests::adler32_matches_the_rfc_example" }
+{ "type": "test", "name": "deflate::tests::empty_and_tiny_inputs_round_trip", "event": "ok", "exec_time": 0.002012162 }
+{ "type": "test", "event": "started", "name": "tests::zlib_header_is_checked" }
+{ "type": "test", "name": "deflate::tests::matches_reach_the_longest_and_furthest_codes", "event": "ok", "exec_time": 0.002408698 }
+{ "type": "test", "name": "tests::adler32_matches_the_rfc_example", "event": "ok", "exec_time": 0.000051268 }
+{ "type": "test", "name": "tests::zlib_header_is_checked", "event": "ok", "exec_time": 0.000000821 }
+{ "type": "test", "name": "deflate::tests::random_input_round_trips_within_framing_overhead", "event": "ok", "exec_time": 0.010786073 }
+{ "type": "suite", "event": "ok", "passed": 6, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.011468926 }
+{ "type": "suite", "event": "started", "test_count": 7 }
+{ "type": "test", "event": "started", "name": "adler32_mismatch_is_detected" }
+{ "type": "test", "event": "started", "name": "limit_is_a_boundary_not_a_panic" }
+{ "type": "test", "event": "started", "name": "malformed_input_never_panics" }
+{ "type": "test", "event": "started", "name": "refuses_what_it_does_not_implement" }
+{ "type": "test", "name": "adler32_mismatch_is_detected", "event": "ok", "exec_time": 0.000495271 }
+{ "type": "test", "event": "started", "name": "round_trips_every_level_bit_exactly" }
+{ "type": "test", "name": "refuses_what_it_does_not_implement", "event": "ok", "exec_time": 0.000001472 }
+{ "type": "test", "event": "started", "name": "stored_block_decodes_by_hand" }
+{ "type": "test", "name": "limit_is_a_boundary_not_a_panic", "event": "ok", "exec_time": 0.000777061 }
+{ "type": "test", "event": "started", "name": "truncation_is_an_error" }
+{ "type": "test", "name": "stored_block_decodes_by_hand", "event": "ok", "exec_time": 0.000001002 }
+{ "type": "test", "name": "truncation_is_an_error", "event": "ok", "exec_time": 0.000934376 }
+{ "type": "test", "name": "malformed_input_never_panics", "event": "ok", "exec_time": 0.019392848 }
+{ "type": "test", "name": "round_trips_every_level_bit_exactly", "event": "ok", "exec_time": 0.132310212 }
+{ "type": "suite", "event": "ok", "passed": 7, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.135357751 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000038644 }

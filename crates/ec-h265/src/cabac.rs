@@ -17,24 +17,25 @@ use std::sync::LazyLock;
 /// Number of context variables this encoder keeps.
 pub const NUM_CONTEXTS: usize = ctx::TOTAL;
 
-/// Context index layout: one named base per syntax element, I-slice only.
+/// Context index layout: one named base per syntax element. Intra elements
+/// come first (their indices predate the inter tables), inter elements follow.
 pub mod ctx {
     /// `split_cu_flag`, 3 contexts.
     pub const SPLIT_CU: usize = 0;
-    /// `part_mode`, 1 context in an I slice.
+    /// `part_mode`, 4 contexts (intra uses the first; inter uses all four).
     pub const PART_MODE: usize = SPLIT_CU + 3;
     /// `prev_intra_luma_pred_flag`.
-    pub const PREV_INTRA_LUMA_PRED: usize = PART_MODE + 1;
+    pub const PREV_INTRA_LUMA_PRED: usize = PART_MODE + 4;
     /// `intra_chroma_pred_mode`.
     pub const INTRA_CHROMA_PRED_MODE: usize = PREV_INTRA_LUMA_PRED + 1;
     /// `split_transform_flag`, 3 contexts.
     pub const SPLIT_TRANSFORM: usize = INTRA_CHROMA_PRED_MODE + 1;
     /// `cbf_luma`, 2 contexts.
     pub const CBF_LUMA: usize = SPLIT_TRANSFORM + 3;
-    /// `cbf_cb` / `cbf_cr`, 4 contexts.
+    /// `cbf_cb` / `cbf_cr`, 5 contexts (indexed by trafoDepth).
     pub const CBF_CHROMA: usize = CBF_LUMA + 2;
     /// `transform_skip_flag`, 2 contexts (luma, chroma).
-    pub const TRANSFORM_SKIP: usize = CBF_CHROMA + 4;
+    pub const TRANSFORM_SKIP: usize = CBF_CHROMA + 5;
     /// `last_sig_coeff_x_prefix`, 18 contexts.
     pub const LAST_X: usize = TRANSFORM_SKIP + 2;
     /// `last_sig_coeff_y_prefix`, 18 contexts.
@@ -47,45 +48,168 @@ pub mod ctx {
     pub const GREATER1: usize = SIG_COEFF + 44;
     /// `coeff_abs_level_greater2_flag`, 6 contexts.
     pub const GREATER2: usize = GREATER1 + 24;
+    /// `cu_skip_flag`, 3 contexts.
+    pub const CU_SKIP: usize = GREATER2 + 6;
+    /// `pred_mode_flag`, 1 context.
+    pub const PRED_MODE: usize = CU_SKIP + 3;
+    /// `merge_flag`, 1 context.
+    pub const MERGE_FLAG: usize = PRED_MODE + 1;
+    /// `merge_idx`, 1 context (the first bin; the rest are bypass).
+    pub const MERGE_IDX: usize = MERGE_FLAG + 1;
+    /// `inter_pred_idc`, 5 contexts (0..3 by CtDepth, 4 for the 8x4/4x8 case).
+    pub const INTER_PRED_IDC: usize = MERGE_IDX + 1;
+    /// `ref_idx_lX`, 2 contexts (the first two bins; the rest are bypass).
+    pub const REF_IDX: usize = INTER_PRED_IDC + 5;
+    /// `mvp_lX_flag`, 1 context.
+    pub const MVP_FLAG: usize = REF_IDX + 2;
+    /// `abs_mvd_greater0_flag`, 1 context.
+    pub const ABS_MVD_GT0: usize = MVP_FLAG + 1;
+    /// `abs_mvd_greater1_flag`, 1 context.
+    pub const ABS_MVD_GT1: usize = ABS_MVD_GT0 + 1;
+    /// `rqt_root_cbf`, 1 context.
+    pub const RQT_ROOT_CBF: usize = ABS_MVD_GT1 + 1;
+    /// `cu_qp_delta_abs`, 2 contexts (first bin; bins 1..4).
+    pub const CU_QP_DELTA_ABS: usize = RQT_ROOT_CBF + 1;
+    /// `sao_merge_left_flag` / `sao_merge_up_flag`, 1 context.
+    pub const SAO_MERGE: usize = CU_QP_DELTA_ABS + 2;
+    /// `sao_type_idx_luma` / `sao_type_idx_chroma`, 1 context.
+    pub const SAO_TYPE_IDX: usize = SAO_MERGE + 1;
     /// Total context count.
-    pub const TOTAL: usize = GREATER2 + 6;
+    /// `cu_transquant_bypass_flag`, 1 context.
+    pub const CU_TRANSQUANT_BYPASS: usize = SAO_TYPE_IDX + 1;
+    /// `cu_chroma_qp_offset_flag`, 1 context.
+    pub const CU_CHROMA_QP_OFFSET_FLAG: usize = CU_TRANSQUANT_BYPASS + 1;
+    /// `cu_chroma_qp_offset_idx`, 1 context (every bin).
+    pub const CU_CHROMA_QP_OFFSET_IDX: usize = CU_CHROMA_QP_OFFSET_FLAG + 1;
+    /// `explicit_rdpcm_flag`, 2 contexts (luma, chroma).
+    pub const EXPLICIT_RDPCM_FLAG: usize = CU_CHROMA_QP_OFFSET_IDX + 1;
+    /// `explicit_rdpcm_dir_flag`, 2 contexts (luma, chroma).
+    pub const EXPLICIT_RDPCM_DIR: usize = EXPLICIT_RDPCM_FLAG + 2;
+    /// `log2_res_scale_abs_plus1`, 8 contexts (`4 * c + binIdx`).
+    pub const LOG2_RES_SCALE_ABS: usize = EXPLICIT_RDPCM_DIR + 2;
+    /// `res_scale_sign_flag`, 2 contexts (one per chroma component).
+    pub const RES_SCALE_SIGN: usize = LOG2_RES_SCALE_ABS + 8;
+    /// Number of context slots.
+    pub const TOTAL: usize = RES_SCALE_SIGN + 2;
 }
 
-/// `initValue` for every context, initType 0 (I slices), Tables 9-7 to 9-31.
+/// The `initValue`s of one syntax element for each initType (Tables 9-5 to 9-37).
+/// Rows are in [`ctx`] layout order; `t0` is I slices, `t1` and `t2` are P and B
+/// slices (initType 1 and 2, swapped by `cabac_init_flag`). Elements that do not
+/// occur in I slices carry the 154 filler in `t0`, which no I-slice bin reads.
+struct InitRow {
+    t0: &'static [u8],
+    t1: &'static [u8],
+    t2: &'static [u8],
+}
+
 #[rustfmt::skip]
-const INIT_VALUES: [u8; ctx::TOTAL] = [
-    // split_cu_flag (Table 9-7)
-    139, 141, 157,
-    // part_mode (Table 9-11)
-    184,
-    // prev_intra_luma_pred_flag (Table 9-12)
-    184,
-    // intra_chroma_pred_mode (Table 9-13)
-    63,
-    // split_transform_flag (Table 9-20)
-    153, 138, 138,
-    // cbf_luma (Table 9-21)
-    111, 141,
-    // cbf_cb / cbf_cr (Table 9-22)
-    94, 138, 182, 154,
-    // transform_skip_flag (Table 9-25)
-    139, 139,
-    // last_sig_coeff_x_prefix (Table 9-26)
-    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63,
-    // last_sig_coeff_y_prefix (Table 9-27)
-    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63,
-    // coded_sub_block_flag (Table 9-28)
-    91, 171, 134, 141,
-    // sig_coeff_flag (Table 9-29), ctxIdx 0..41 then the two transform-skip ones
-    111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153, 125, 107,
-    125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140, 139, 182, 182, 152,
-    136, 152, 136, 153, 136, 139, 111, 136, 139, 111,
-    141, 111,
-    // coeff_abs_level_greater1_flag (Table 9-30)
-    140, 92, 137, 138, 140, 152, 138, 139, 153, 74, 149, 92, 139, 107, 122, 152,
-    140, 179, 166, 182, 140, 227, 122, 197,
-    // coeff_abs_level_greater2_flag (Table 9-31)
-    138, 153, 136, 167, 152, 152,
+const INIT_ROWS: &[InitRow] = &[
+    // split_cu_flag (9-7)
+    InitRow { t0: &[139, 141, 157], t1: &[107, 139, 126], t2: &[107, 139, 126] },
+    // part_mode (9-11): initType 0 has one context
+    InitRow { t0: &[184, 154, 154, 154], t1: &[154, 139, 154, 154], t2: &[154, 139, 154, 154] },
+    // prev_intra_luma_pred_flag (9-12)
+    InitRow { t0: &[184], t1: &[154], t2: &[183] },
+    // intra_chroma_pred_mode (9-13)
+    InitRow { t0: &[63], t1: &[152], t2: &[152] },
+    // split_transform_flag (9-20)
+    InitRow { t0: &[153, 138, 138], t1: &[124, 138, 94], t2: &[224, 167, 122] },
+    // cbf_luma (9-21)
+    InitRow { t0: &[111, 141], t1: &[153, 111], t2: &[153, 111] },
+    // cbf_cb / cbf_cr (9-22); the fifth context is 154 in every initType
+    InitRow { t0: &[94, 138, 182, 154, 154], t1: &[149, 107, 167, 154, 154], t2: &[149, 92, 167, 154, 154] },
+    // transform_skip_flag (9-25)
+    InitRow { t0: &[139, 139], t1: &[139, 139], t2: &[139, 139] },
+    // last_sig_coeff_x_prefix (9-26)
+    InitRow {
+        t0: &[110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63],
+        t1: &[125, 110, 94, 110, 95, 79, 125, 111, 110, 78, 110, 111, 111, 95, 94, 108, 123, 108],
+        t2: &[125, 110, 124, 110, 95, 94, 125, 111, 111, 79, 125, 126, 111, 111, 79, 108, 123, 93],
+    },
+    // last_sig_coeff_y_prefix (9-27)
+    InitRow {
+        t0: &[110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63],
+        t1: &[125, 110, 94, 110, 95, 79, 125, 111, 110, 78, 110, 111, 111, 95, 94, 108, 123, 108],
+        t2: &[125, 110, 124, 110, 95, 94, 125, 111, 111, 79, 125, 126, 111, 111, 79, 108, 123, 93],
+    },
+    // coded_sub_block_flag (9-28)
+    InitRow { t0: &[91, 171, 134, 141], t1: &[121, 140, 61, 154], t2: &[121, 140, 61, 154] },
+    // sig_coeff_flag (9-29): 42 transform contexts, then the two transform-skip ones
+    InitRow {
+        t0: &[
+            111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153, 125, 107,
+            125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140, 139, 182, 182, 152,
+            136, 152, 136, 153, 136, 139, 111, 136, 139, 111, 141, 111,
+        ],
+        t1: &[
+            155, 154, 139, 153, 139, 123, 123, 63, 153, 166, 183, 140, 136, 153, 154, 166,
+            183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170, 153, 123, 123, 107,
+            121, 107, 121, 167, 151, 183, 140, 151, 183, 140, 140, 140,
+        ],
+        t2: &[
+            170, 154, 139, 153, 139, 123, 123, 63, 124, 166, 183, 140, 136, 153, 154, 166,
+            183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170, 153, 138, 138, 122,
+            121, 122, 121, 167, 151, 183, 140, 151, 183, 140, 140, 140,
+        ],
+    },
+    // coeff_abs_level_greater1_flag (9-30)
+    InitRow {
+        t0: &[
+            140, 92, 137, 138, 140, 152, 138, 139, 153, 74, 149, 92, 139, 107, 122, 152,
+            140, 179, 166, 182, 140, 227, 122, 197,
+        ],
+        t1: &[
+            154, 196, 196, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121, 136, 137,
+            169, 194, 166, 167, 154, 167, 137, 182,
+        ],
+        t2: &[
+            154, 196, 167, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121, 136, 122,
+            169, 208, 166, 167, 154, 152, 167, 182,
+        ],
+    },
+    // coeff_abs_level_greater2_flag (9-31)
+    InitRow { t0: &[138, 153, 136, 167, 152, 152], t1: &[107, 167, 91, 122, 107, 167], t2: &[107, 167, 91, 107, 107, 167] },
+    // cu_skip_flag (9-9): no I-slice value
+    InitRow { t0: &[154, 154, 154], t1: &[197, 185, 201], t2: &[197, 185, 201] },
+    // pred_mode_flag (9-10)
+    InitRow { t0: &[154], t1: &[149], t2: &[134] },
+    // merge_flag (9-15)
+    InitRow { t0: &[154], t1: &[110], t2: &[154] },
+    // merge_idx (9-16)
+    InitRow { t0: &[154], t1: &[122], t2: &[137] },
+    // inter_pred_idc (9-17)
+    InitRow { t0: &[154, 154, 154, 154, 154], t1: &[95, 79, 63, 31, 31], t2: &[95, 79, 63, 31, 31] },
+    // ref_idx_lX (9-18)
+    InitRow { t0: &[154, 154], t1: &[153, 153], t2: &[153, 153] },
+    // mvp_lX_flag (9-19)
+    InitRow { t0: &[154], t1: &[168], t2: &[168] },
+    // abs_mvd_greater0_flag (9-23)
+    InitRow { t0: &[154], t1: &[140], t2: &[169] },
+    // abs_mvd_greater1_flag (9-23)
+    InitRow { t0: &[154], t1: &[198], t2: &[198] },
+    // rqt_root_cbf (9-14)
+    InitRow { t0: &[154], t1: &[79], t2: &[79] },
+    // cu_qp_delta_abs (9-24)
+    InitRow { t0: &[154, 154], t1: &[154, 154], t2: &[154, 154] },
+    // sao_merge_left_flag / sao_merge_up_flag (9-5)
+    InitRow { t0: &[153], t1: &[153], t2: &[153] },
+    // sao_type_idx_luma / sao_type_idx_chroma (9-6)
+    InitRow { t0: &[200], t1: &[185], t2: &[160] },
+    // cu_transquant_bypass_flag (9-22)
+    InitRow { t0: &[154], t1: &[154], t2: &[154] },
+    // cu_chroma_qp_offset_flag (9-38)
+    InitRow { t0: &[154], t1: &[154], t2: &[154] },
+    // cu_chroma_qp_offset_idx (9-39)
+    InitRow { t0: &[154], t1: &[154], t2: &[154] },
+    // explicit_rdpcm_flag (9-40)
+    InitRow { t0: &[139, 139], t1: &[139, 139], t2: &[139, 139] },
+    // explicit_rdpcm_dir_flag (9-41)
+    InitRow { t0: &[139, 139], t1: &[139, 139], t2: &[139, 139] },
+    // log2_res_scale_abs_plus1 (9-42)
+    InitRow { t0: &[154; 8], t1: &[154; 8], t2: &[154; 8] },
+    // res_scale_sign_flag (9-43)
+    InitRow { t0: &[154, 154], t1: &[154, 154], t2: &[154, 154] },
 ];
 
 /// `rangeTabLps[pStateIdx][qRangeIdx]` (Table 9-52).
@@ -151,28 +275,52 @@ static ENTROPY_BITS: LazyLock<[[f64; 2]; 64]> = LazyLock::new(|| {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Contexts {
     state: [u8; ctx::TOTAL],
+    /// `StatCoeff[0..4]` of persistent Rice adaptation (9.3.2.4); stored and restored with
+    /// the contexts at wavefront and dependent-slice-segment boundaries.
+    pub stat_coeff: [u8; 4],
 }
 
 impl Contexts {
     /// Initialise every context for an I slice at `slice_qp` (9.3.2.2).
     pub fn new(slice_qp: i32) -> Contexts {
+        Contexts::for_init_type(slice_qp, 0)
+    }
+
+    /// Initialise every context for `init_type` (0 for I slices, 1 and 2 for
+    /// P and B slices, Table 9-4) at `slice_qp` (9.3.2.2, equations 9-4 to 9-6).
+    pub fn for_init_type(slice_qp: i32, init_type: u8) -> Contexts {
         let qp = slice_qp.clamp(0, 51);
         let mut state = [0u8; ctx::TOTAL];
-        for (i, &init_value) in INIT_VALUES.iter().enumerate() {
-            let slope_idx = (init_value >> 4) as i32;
-            let offset_idx = (init_value & 15) as i32;
-            let m = slope_idx * 5 - 45;
-            let n = (offset_idx << 3) - 16;
-            let pre_ctx_state = (((m * qp) >> 4) + n).clamp(1, 126);
-            let val_mps = i32::from(pre_ctx_state > 63);
-            let p_state = if val_mps == 1 {
-                pre_ctx_state - 64
-            } else {
-                63 - pre_ctx_state
+        let mut k = 0usize;
+        for row in INIT_ROWS {
+            let values = match init_type {
+                0 => row.t0,
+                1 => row.t1,
+                _ => row.t2,
             };
-            state[i] = ((p_state as u8) << 1) | val_mps as u8;
+            for &init_value in values {
+                if k >= ctx::TOTAL {
+                    break;
+                }
+                let slope_idx = (init_value >> 4) as i32;
+                let offset_idx = (init_value & 15) as i32;
+                let m = slope_idx * 5 - 45;
+                let n = (offset_idx << 3) - 16;
+                let pre_ctx_state = (((m * qp) >> 4) + n).clamp(1, 126);
+                let val_mps = i32::from(pre_ctx_state > 63);
+                let p_state = if val_mps == 1 {
+                    pre_ctx_state - 64
+                } else {
+                    63 - pre_ctx_state
+                };
+                state[k] = ((p_state as u8) << 1) | val_mps as u8;
+                k += 1;
+            }
         }
-        Contexts { state }
+        Contexts {
+            state,
+            stat_coeff: [0; 4],
+        }
     }
 }
 
@@ -273,6 +421,16 @@ impl CabacEncoder {
         } else {
             self.bits as f64
         }
+    }
+
+    /// Whether the engine is in `estimating` mode.
+    pub fn is_estimating(&self) -> bool {
+        self.estimating
+    }
+
+    /// Add `bits` to the estimating-mode total (a caller's own closed-form estimate).
+    pub fn add_estimated_bits(&mut self, bits: f64) {
+        self.est_bits += bits;
     }
 
     /// Switch between exact range/renorm costing and the estimated
@@ -591,6 +749,28 @@ impl<'a> CabacDecoder<'a> {
     pub fn byte_position_aligned(&self) -> usize {
         self.bit.div_ceil(8)
     }
+
+    /// Bits of the slice data read so far, including the bits read ahead by the
+    /// 9-bit offset register (9.3.2.5).
+    pub fn bits_read(&self) -> usize {
+        self.bit
+    }
+
+    /// The slice data this engine reads.
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Restart the arithmetic decoder at byte `byte` of the data (9.3.2.5 after
+    /// PCM samples): the offset is read again, the contexts are kept.
+    pub fn restart_at_byte(&mut self, byte: usize) {
+        self.bit = byte * 8;
+        self.range = 510;
+        self.offset = 0;
+        for _ in 0..9 {
+            self.offset = (self.offset << 1) | self.read_bit();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -735,5 +915,36 @@ mod tests {
         let bytes = enc.finish();
         assert!(bits < 400, "{bits} bits for 4000 skewed bins");
         assert!(!bytes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod init_table_tests {
+    use super::*;
+
+    /// Every syntax element's init row covers exactly its contexts, in all three
+    /// initTypes, so `Contexts::for_init_type` never reads past a row.
+    #[test]
+    fn init_rows_cover_every_context_for_each_init_type() {
+        let total: usize = INIT_ROWS.iter().map(|r| r.t0.len()).sum();
+        assert_eq!(total, ctx::TOTAL);
+        for row in INIT_ROWS {
+            assert_eq!(row.t0.len(), row.t1.len());
+            assert_eq!(row.t0.len(), row.t2.len());
+        }
+    }
+
+    /// initType 0 reproduces the I-slice states the intra path has always used.
+    #[test]
+    fn init_type_zero_is_the_intra_table() {
+        assert_eq!(Contexts::new(30), Contexts::for_init_type(30, 0));
+        assert_ne!(
+            Contexts::for_init_type(30, 0),
+            Contexts::for_init_type(30, 1)
+        );
+        assert_ne!(
+            Contexts::for_init_type(30, 1),
+            Contexts::for_init_type(30, 2)
+        );
     }
 }

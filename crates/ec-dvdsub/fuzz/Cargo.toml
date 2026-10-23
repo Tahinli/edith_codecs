@@ -1,0 +1,32 @@
+[package]
+name = "ec-dvdsub-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-dvdsub]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "unit"
+path = "fuzz_targets/unit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sub_file"
+path = "fuzz_targets/sub_file.rs"
+test = false
+doc = false
+bench = false

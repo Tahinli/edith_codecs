@@ -161,7 +161,7 @@ fn utf16(data: &[u8], bom: bool) -> String {
         _ => (data, false),
     };
     let units: Vec<u16> = data
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|c| match little {
             true => u16::from_le_bytes([c[0], c[1]]),
             false => u16::from_be_bytes([c[0], c[1]]),

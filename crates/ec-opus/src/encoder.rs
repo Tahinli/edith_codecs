@@ -16,8 +16,12 @@
 //!
 //! Rate control is CBR by default — every packet the same size, derived from
 //! the bitrate — or constrained VBR, the reference's reservoir scheme, when
-//! [`Encoder::set_vbr_constrained`] is on. SILK packets are not yet budgeted
-//! against the target rate (D2b).
+//! [`Encoder::set_vbr_constrained`] is on. A CBR SILK packet of 10 or 20 ms
+//! is held to the same byte budget as a CELT one: its rate loop coarsens
+//! until it fits (D2b). It is not padded up to the budget: a SILK-only
+//! packet with spare bytes is read as carrying redundancy (RFC 6716
+//! Section 4.5.1.4), so padding would change the frame. The multi-frame
+//! stereo SILK path (40/60 ms) is not budgeted yet.
 
 use ec_core::{Error, Result};
 
@@ -628,11 +632,21 @@ impl Encoder {
         Ok((toc, &self.silk_buf[..pos]))
     }
 
+    /// The CBR packet budget for a `frame_48k`-sample frame, in payload bytes,
+    /// by the figure the CELT path uses; `None` under constrained VBR (D2b).
+    fn packet_budget(&self, frame_48k: usize, cap: usize) -> Option<usize> {
+        if self.vbr {
+            return None;
+        }
+        let b = ((self.bitrate as u64 * frame_48k as u64 + 4 * 48000) / (8 * 48000)) as usize;
+        Some(b.saturating_sub(1).max(2).min(cap))
+    }
+
     /// Picks SILK or CELT for one frame and encodes it, returning the TOC
     /// byte and the payload bytes (excluding TOC), borrowed from scratch
     /// space owned by `self` — no allocation on the steady-state path.
-    /// `cap` bounds the CELT path only — SILK isn't budgeted against a byte
-    /// cap yet (D2b).
+    /// `cap` bounds the packet; under CBR a SILK packet is held to the same budget
+    /// as a CELT one (D2b).
     fn encode_toc_and_payload(
         &mut self,
         pcm: &[f32],
@@ -650,6 +664,7 @@ impl Encoder {
             AnalysisInfo::default()
         };
         if let Some(fs_khz) = self.silk_choice(frame_48k) {
+            let budget = self.packet_budget(frame_48k, cap);
             if self.channels == 2 {
                 Self::zero_stuff_stereo(pcm, frame_size, self.upsample, &mut self.silk_stuff);
                 if frame_48k > 960 {
@@ -667,6 +682,7 @@ impl Encoder {
                         .get_or_insert_with(|| Box::new(SilkStereoEncoder::new(true))),
                 };
                 enc.set_bitrate(self.bitrate);
+                enc.set_max_bytes(budget);
                 let n =
                     enc.encode_frame_ms(&self.silk_stuff, &mut self.silk_buf[..], frame_48k / 48)?;
                 self.final_range = enc.final_range();
@@ -688,6 +704,7 @@ impl Encoder {
             // Encoder's current target on every frame — cheap (an Option<u32>
             // store) and catches set_bitrate calls made between frames.
             enc.set_bitrate(self.bitrate);
+            enc.set_max_bytes(budget);
             let n =
                 enc.encode_frame_ms(&self.silk_stuff, &mut self.silk_buf[..], frame_48k / 48)?;
             self.final_range = enc.final_range();
@@ -1008,6 +1025,10 @@ impl Encoder {
         let frame_ms = frame_48k / 48;
         let budget = ((self.bitrate as u64 * frame_48k as u64 + 4 * 48000) / (8 * 48000)) as usize;
         let budget = budget.saturating_sub(1).clamp(2, cap);
+        // D2b: under CBR the SILK layer leaves CELT its minimum, plus two bytes
+        // for the range coder's conservative `tell()` the hybrid split reads.
+        let silk_max =
+            (!self.vbr).then(|| budget.saturating_sub(HYBRID_CELT_MIN_BYTES + 2));
         if cap < HYBRID_CELT_MIN_BYTES + 2 {
             return Err(Error::corrupt(
                 "opus encode: output buffer smaller than the minimum hybrid packet",
@@ -1037,12 +1058,14 @@ impl Encoder {
                 .silk_stereo_wb
                 .get_or_insert_with(|| Box::new(SilkStereoEncoder::new(true)));
             silk.set_bitrate(silk_rate);
+            silk.set_max_bytes(silk_max);
             silk.encode_hybrid_ms(&delayed, &mut self.range, frame_ms)?;
         } else {
             let silk = self
                 .silk_wb
                 .get_or_insert_with(|| Box::new(SilkEncoder::new(true)));
             silk.set_bitrate(silk_rate);
+            silk.set_max_bytes(silk_max);
             silk.encode_hybrid_ms(&delayed, &mut self.range, frame_ms)?;
         }
         let silk_bytes = (self.range.tell() as usize).div_ceil(8);

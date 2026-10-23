@@ -38,6 +38,7 @@ mod encode;
 mod floor;
 mod residue;
 mod setup;
+mod trim;
 mod window;
 
 pub use decode::{VorbisDecoder, channel_map};

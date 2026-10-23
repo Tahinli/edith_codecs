@@ -27,12 +27,12 @@ static ON: AtomicBool = AtomicBool::new(false);
 #[inline]
 pub fn on() -> bool {
     static INIT: OnceLock<bool> = OnceLock::new();
-    let armed = *INIT.get_or_init(|| {
+    
+    *INIT.get_or_init(|| {
         let armed = crate::envflags::var("EC_AV1_BITCENSUS").ok().as_deref() == Some("1");
         ON.store(armed, Ordering::Relaxed);
         armed
-    });
-    armed
+    })
 }
 
 /// The per-symbol fast path: one relaxed load, nothing else, when off.

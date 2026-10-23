@@ -7,7 +7,7 @@
 //! driver is handed `RefPicSetStCurrBefore`, `StCurrAfter` and `LtCurr` as
 //! finished picture lists.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ec_core::color::{ColorDescription, ContentLight, Tags};
 use ec_h265_syntax::{
@@ -15,17 +15,16 @@ use ec_h265_syntax::{
     unescape_rbsp,
 };
 use ec_va::caps::Profile;
-use ec_va::{Buffer, Display, sys};
+use ec_va::{Buffer, Display};
 
 use super::{ReadyFrames, Session, StreamInfo};
 use crate::error::{Error, Result};
 use crate::frame::{Colour, Frame};
 use crate::params::hevc::{
-    IQMatrixBufferHEVC, PICTURE_INVALID, PICTURE_LONG_TERM_REFERENCE, PICTURE_RPS_LT_CURR,
-    PICTURE_RPS_ST_CURR_AFTER, PICTURE_RPS_ST_CURR_BEFORE, PictureParameterBufferHEVC,
-    SliceParameterBufferHEVC, VAPictureHEVC,
+    IQMatrixBufferHEVC, LongSliceFlags, PICTURE_INVALID, PICTURE_LONG_TERM_REFERENCE,
+    PICTURE_RPS_LT_CURR, PICTURE_RPS_ST_CURR_AFTER, PICTURE_RPS_ST_CURR_BEFORE, PicFields,
+    PictureParameterBufferHEVC, SliceParameterBufferHEVC, SliceParsingFields, VAPictureHEVC,
 };
-use crate::params::param_buffer;
 use crate::pool::PooledSurface;
 
 /// Beyond `sps_max_dec_pic_buffering`: the picture being decoded plus the ones
@@ -40,8 +39,26 @@ enum Mark {
     LongTerm,
 }
 
+/// One DPB slot as the parameter builder sees it: its surface, POC and marking.
+#[derive(Clone, Copy)]
+struct DpbSlot {
+    id: u32,
+    poc: i32,
+    mark: Mark,
+}
+
+impl DpbSlot {
+    fn of(p: &StoredPicture) -> DpbSlot {
+        DpbSlot {
+            id: p.surface.id(),
+            poc: p.poc,
+            mark: p.mark,
+        }
+    }
+}
+
 struct StoredPicture {
-    surface: Arc<PooledSurface>,
+    surface: Rc<PooledSurface>,
     poc: i32,
     timestamp: i64,
     mark: Mark,
@@ -65,7 +82,7 @@ struct Rps {
 
 /// The picture being assembled from its slices.
 struct Current {
-    surface: Arc<PooledSurface>,
+    surface: Rc<PooledSurface>,
     sps_id: u32,
     poc: i32,
     timestamp: i64,
@@ -82,7 +99,7 @@ struct Current {
 
 /// A stateless HEVC decoder.
 pub struct HevcDecoder {
-    display: Arc<Display>,
+    display: Rc<Display>,
     vps_map: Vec<Option<Vps>>,
     sps_map: Vec<Option<Sps>>,
     pps_map: Vec<Option<Pps>>,
@@ -110,9 +127,9 @@ pub struct HevcDecoder {
 
 impl HevcDecoder {
     /// A decoder with no stream state.
-    pub fn new(display: &Arc<Display>) -> HevcDecoder {
+    pub fn new(display: &Rc<Display>) -> HevcDecoder {
         HevcDecoder {
-            display: Arc::clone(display),
+            display: Rc::clone(display),
             vps_map: (0..16).map(|_| None).collect(),
             sps_map: (0..16).map(|_| None).collect(),
             pps_map: (0..64).map(|_| None).collect(),
@@ -312,7 +329,7 @@ impl HevcDecoder {
         let poc = self.picture_order_count(sps, sh, nal_type);
         // 8.3.2 runs before the picture is decoded and after its POC is known:
         // every stored picture the set does not name stops being a reference.
-        let rps = self.apply_rps(sps, sh, nal_type, poc);
+        let rps = self.apply_rps(sps, sh, nal_type, poc)?;
 
         if nal_type.is_irap() && (nal_type.is_idr() || sh.no_output_of_prior_pics) {
             // An IRAP that restarts output order: everything ahead of it in the
@@ -413,13 +430,19 @@ impl HevcDecoder {
     }
 
     /// Reference picture set derivation and marking (8.3.2).
-    fn apply_rps(&mut self, sps: &Sps, sh: &SliceHeader, nal_type: NalUnitType, poc: i32) -> Rps {
+    fn apply_rps(
+        &mut self,
+        sps: &Sps,
+        sh: &SliceHeader,
+        nal_type: NalUnitType,
+        poc: i32,
+    ) -> Result<Rps> {
         if nal_type.is_irap() && (nal_type.is_idr() || !self.started) {
             for pic in &mut self.dpb {
                 pic.mark = Mark::Unused;
             }
             self.dpb.retain(|p| p.stored());
-            return Rps::default();
+            return Ok(Rps::default());
         }
 
         let set = &sh.short_term_ref_pic_set;
@@ -445,6 +468,7 @@ impl HevcDecoder {
 
         let mut rps = Rps::default();
         let mut keep = vec![false; self.dpb.len()];
+        let mut missing_used = false;
         for (target, used, lsb_only) in wanted {
             let found = self.dpb.iter().position(|p| {
                 if lsb_only {
@@ -453,7 +477,13 @@ impl HevcDecoder {
                     p.poc == target
                 }
             });
-            let Some(idx) = found else { continue };
+            let Some(idx) = found else {
+                // 8.3.2: a picture the current one predicts from must be in the
+                // buffer. One that is not is a broken GOP, and a reference list
+                // built without it would name a surface that was never decoded.
+                missing_used |= used;
+                continue;
+            };
             keep[idx] = true;
             if !used {
                 continue;
@@ -488,6 +518,11 @@ impl HevcDecoder {
             }
         }
         self.dpb.retain(|p| p.stored());
+        if missing_used {
+            return Err(Error::Stream(ec_core::Error::corrupt(
+                "HEVC reference picture set names a picture used for prediction that was never decoded",
+            )));
+        }
         for list in [
             &mut rps.st_curr_before,
             &mut rps.st_curr_after,
@@ -498,7 +533,7 @@ impl HevcDecoder {
                 *entry = remap[*entry];
             }
         }
-        rps
+        Ok(rps)
     }
 
     fn render_slice(
@@ -520,16 +555,32 @@ impl HevcDecoder {
         }
 
         if current.slices == 0 {
-            let pic_param = picture_parameters(sps, pps, sh, pos, nal_type, current, &self.dpb);
-            current
-                .buffers
-                .push(param_buffer(&session.context, &pic_param)?);
+            let slots: Vec<DpbSlot> = self.dpb.iter().map(DpbSlot::of).collect();
+            let pic_param = picture_parameters(
+                sps,
+                pps,
+                sh,
+                pos,
+                nal_type,
+                (current.surface.id(), current.poc),
+                &current.rps,
+                &slots,
+            );
+            current.buffers.push(ec_va::picture::buffer(
+                &session.context,
+                pic_param.to_buffer(),
+            )?);
             if sps.scaling_list_enabled {
-                // The syntax crate refuses a stream that codes its own lists, so
-                // "enabled" here always means the flat default matrices.
-                current.buffers.push(param_buffer(
+                // The PPS lists override the SPS lists, and with neither sent the
+                // defaults of Tables 7-5 and 7-6 apply.
+                let list = pps
+                    .scaling_list
+                    .clone()
+                    .or_else(|| sps.scaling_list.clone())
+                    .unwrap_or_default();
+                current.buffers.push(ec_va::picture::buffer(
                     &session.context,
-                    &IQMatrixBufferHEVC::default(),
+                    iq_matrix(&list).to_buffer(),
                 )?);
             }
         }
@@ -556,32 +607,39 @@ impl HevcDecoder {
             slice_beta_offset_div2: sh.beta_offset_div2 as i8,
             slice_tc_offset_div2: sh.tc_offset_div2 as i8,
             five_minus_max_num_merge_cand: sh.five_minus_max_num_merge_cand as u8,
-            num_entry_point_offsets: sh.entry_point_offsets.len().min(u16::MAX as usize) as u16,
+            num_entry_point_offsets: entry_point_count(&sh.entry_point_offsets),
             slice_data_num_emu_prevn_bytes: ec_h265_syntax::count_emulation_prevention_bytes(
                 payload,
             )
             .min(u16::MAX as usize) as u16,
             ..SliceParameterBufferHEVC::default()
         };
-        slice_param.long_slice_flags = slice_param
-            .long_slice_flags
-            .last_slice_of_pic(0)
-            .dependent_slice_segment_flag(u32::from(sh.dependent_slice_segment))
-            .slice_type(sh.slice_type.code())
-            .color_plane_id(u32::from(sh.colour_plane_id))
-            .slice_sao_luma_flag(u32::from(sh.sao_luma))
-            .slice_sao_chroma_flag(u32::from(sh.sao_chroma))
-            .mvd_l1_zero_flag(u32::from(sh.mvd_l1_zero))
-            .cabac_init_flag(u32::from(sh.cabac_init))
-            .slice_temporal_mvp_enabled_flag(u32::from(sh.temporal_mvp_enabled))
-            .slice_deblocking_filter_disabled_flag(u32::from(sh.deblocking_filter_disabled))
-            .collocated_from_l0_flag(u32::from(sh.collocated_from_l0))
-            .slice_loop_filter_across_slices_enabled_flag(u32::from(
+        slice_param.long_slice_flags = LongSliceFlags {
+            last_slice_of_pic: 0,
+            dependent_slice_segment_flag: u32::from(sh.dependent_slice_segment),
+            slice_type: sh.slice_type.code(),
+            color_plane_id: u32::from(sh.colour_plane_id),
+            slice_sao_luma_flag: u32::from(sh.sao_luma),
+            slice_sao_chroma_flag: u32::from(sh.sao_chroma),
+            mvd_l1_zero_flag: u32::from(sh.mvd_l1_zero),
+            cabac_init_flag: u32::from(sh.cabac_init),
+            slice_temporal_mvp_enabled_flag: u32::from(sh.temporal_mvp_enabled),
+            slice_deblocking_filter_disabled_flag: u32::from(sh.deblocking_filter_disabled),
+            collocated_from_l0_flag: u32::from(sh.collocated_from_l0),
+            slice_loop_filter_across_slices_enabled_flag: u32::from(
                 sh.loop_filter_across_slices_enabled,
-            ));
+            ),
+        };
 
         if sh.slice_type != SliceType::I {
             let lists = reference_lists(sh, &current.rps);
+            // A P or B slice with no reference picture at all is a broken GOP:
+            // its list would name no surface.
+            if lists[0].is_empty() || (sh.slice_type == SliceType::B && lists[1].is_empty()) {
+                return Err(Error::Stream(ec_core::Error::corrupt(
+                    "HEVC inter slice with no reference picture in its reference picture set",
+                )));
+            }
             for (x, list) in lists.iter().enumerate() {
                 for (i, &dpb_idx) in list.iter().take(15).enumerate() {
                     slice_param.ref_pic_list[x][i] =
@@ -591,18 +649,18 @@ impl HevcDecoder {
         }
         write_weights(&mut slice_param, sh);
 
-        current
-            .buffers
-            .push(param_buffer(&session.context, &slice_param)?);
+        current.buffers.push(ec_va::picture::buffer(
+            &session.context,
+            slice_param.to_buffer(),
+        )?);
         // Rebuild the NAL unit: `split_annex_b` hands over the payload without
         // its two header bytes, and the driver counts from them.
         let mut nal = Vec::with_capacity(nal_bytes);
         nal.extend_from_slice(&ec_h265_syntax::NalHeader::new(nal_type).to_bytes());
         nal.extend_from_slice(payload);
-        current.buffers.push(Buffer::from_bytes(
+        current.buffers.push(ec_va::picture::buffer(
             &session.context,
-            sys::VASliceDataBufferType,
-            &nal,
+            ec_va::va::BufferType::SliceData(nal),
         )?);
         current.slices += 1;
         Ok(())
@@ -621,7 +679,7 @@ impl HevcDecoder {
         session.submit(&current.surface, current.buffers)?;
 
         self.dpb.push(StoredPicture {
-            surface: Arc::clone(&current.surface),
+            surface: Rc::clone(&current.surface),
             poc: current.poc,
             timestamp: current.timestamp,
             mark: if current.is_reference {
@@ -663,8 +721,8 @@ impl HevcDecoder {
             };
             let pic = &self.dpb[idx];
             self.ready.push(Frame::new(
-                Arc::clone(&pic.surface),
-                Arc::clone(&session.images),
+                Rc::clone(&pic.surface),
+                Rc::clone(&self.display),
                 pic.timestamp,
                 session.display_size,
                 session.coded_size,
@@ -790,11 +848,12 @@ fn picture_parameters(
     sh: &SliceHeader,
     pos: &ParsePositions,
     nal_type: NalUnitType,
-    current: &Current,
-    dpb: &[StoredPicture],
+    (curr_id, curr_poc): (u32, i32),
+    rps: &Rps,
+    dpb: &[DpbSlot],
 ) -> PictureParameterBufferHEVC {
     let mut p = PictureParameterBufferHEVC {
-        curr_pic: VAPictureHEVC::new(current.surface.id(), current.poc, 0),
+        curr_pic: VAPictureHEVC::new(curr_id, curr_poc, 0),
         pic_width_in_luma_samples: sps.pic_width_in_luma_samples as u16,
         pic_height_in_luma_samples: sps.pic_height_in_luma_samples as u16,
         sps_max_dec_pic_buffering_minus1: sps.max_dec_pic_buffering_minus1 as u8,
@@ -868,64 +927,68 @@ fn picture_parameters(
         if pic.mark == Mark::LongTerm {
             flags |= PICTURE_LONG_TERM_REFERENCE;
         }
-        if current.rps.st_curr_before.contains(&i) {
+        if rps.st_curr_before.contains(&i) {
             flags |= PICTURE_RPS_ST_CURR_BEFORE;
-        } else if current.rps.st_curr_after.contains(&i) {
+        } else if rps.st_curr_after.contains(&i) {
             flags |= PICTURE_RPS_ST_CURR_AFTER;
-        } else if current.rps.lt_curr.contains(&i) {
+        } else if rps.lt_curr.contains(&i) {
             flags |= PICTURE_RPS_LT_CURR;
         }
-        p.reference_frames[n] = VAPictureHEVC::new(pic.surface.id(), pic.poc, flags);
+        p.reference_frames[n] = VAPictureHEVC::new(pic.id, pic.poc, flags);
         n += 1;
     }
     for entry in p.reference_frames.iter_mut().skip(n) {
-        *entry = VAPictureHEVC::new(ec_va::sys::VA_INVALID_SURFACE, 0, PICTURE_INVALID);
+        *entry = VAPictureHEVC::new(ec_va::va::VA_INVALID_SURFACE, 0, PICTURE_INVALID);
     }
 
-    p.pic_fields = p
-        .pic_fields
-        .chroma_format_idc(sps.chroma_format_idc)
-        .separate_colour_plane_flag(u32::from(sps.separate_colour_plane))
-        .pcm_enabled_flag(u32::from(sps.pcm_enabled))
-        .scaling_list_enabled_flag(u32::from(sps.scaling_list_enabled))
-        .transform_skip_enabled_flag(u32::from(pps.transform_skip_enabled))
-        .amp_enabled_flag(u32::from(sps.amp_enabled))
-        .strong_intra_smoothing_enabled_flag(u32::from(sps.strong_intra_smoothing))
-        .sign_data_hiding_enabled_flag(u32::from(pps.sign_data_hiding_enabled))
-        .constrained_intra_pred_flag(u32::from(pps.constrained_intra_pred))
-        .cu_qp_delta_enabled_flag(u32::from(pps.cu_qp_delta_enabled))
-        .weighted_pred_flag(u32::from(pps.weighted_pred))
-        .weighted_bipred_flag(u32::from(pps.weighted_bipred))
-        .transquant_bypass_enabled_flag(u32::from(pps.transquant_bypass_enabled))
-        .tiles_enabled_flag(u32::from(pps.tiles_enabled))
-        .entropy_coding_sync_enabled_flag(u32::from(pps.entropy_coding_sync_enabled))
-        .pps_loop_filter_across_slices_enabled_flag(u32::from(
-            pps.loop_filter_across_slices_enabled,
-        ))
-        .loop_filter_across_tiles_enabled_flag(u32::from(pps.loop_filter_across_tiles_enabled))
-        .pcm_loop_filter_disabled_flag(u32::from(sps.pcm.map(|p| p.4).unwrap_or(false)))
-        .no_pic_reordering_flag(u32::from(sps.max_num_reorder_pics == 0))
-        .no_bi_pred_flag(u32::from(sh.slice_type != SliceType::B));
+    p.pic_fields = PicFields {
+        chroma_format_idc: sps.chroma_format_idc,
+        separate_colour_plane_flag: u32::from(sps.separate_colour_plane),
+        pcm_enabled_flag: u32::from(sps.pcm_enabled),
+        scaling_list_enabled_flag: u32::from(sps.scaling_list_enabled),
+        transform_skip_enabled_flag: u32::from(pps.transform_skip_enabled),
+        amp_enabled_flag: u32::from(sps.amp_enabled),
+        strong_intra_smoothing_enabled_flag: u32::from(sps.strong_intra_smoothing),
+        sign_data_hiding_enabled_flag: u32::from(pps.sign_data_hiding_enabled),
+        constrained_intra_pred_flag: u32::from(pps.constrained_intra_pred),
+        cu_qp_delta_enabled_flag: u32::from(pps.cu_qp_delta_enabled),
+        weighted_pred_flag: u32::from(pps.weighted_pred),
+        weighted_bipred_flag: u32::from(pps.weighted_bipred),
+        transquant_bypass_enabled_flag: u32::from(pps.transquant_bypass_enabled),
+        tiles_enabled_flag: u32::from(pps.tiles_enabled),
+        entropy_coding_sync_enabled_flag: u32::from(pps.entropy_coding_sync_enabled),
+        pps_loop_filter_across_slices_enabled_flag: u32::from(pps.loop_filter_across_slices_enabled),
+        loop_filter_across_tiles_enabled_flag: u32::from(pps.loop_filter_across_tiles_enabled),
+        pcm_loop_filter_disabled_flag: u32::from(sps.pcm.map(|p| p.4).unwrap_or(false)),
+        no_pic_reordering_flag: u32::from(sps.max_num_reorder_pics == 0),
+        no_bi_pred_flag: u32::from(sh.slice_type != SliceType::B),
+    };
 
-    p.slice_parsing_fields = p
-        .slice_parsing_fields
-        .lists_modification_present_flag(u32::from(pps.lists_modification_present))
-        .long_term_ref_pics_present_flag(u32::from(sps.long_term_ref_pics_present))
-        .sps_temporal_mvp_enabled_flag(u32::from(sps.temporal_mvp_enabled))
-        .cabac_init_present_flag(u32::from(pps.cabac_init_present))
-        .output_flag_present_flag(u32::from(pps.output_flag_present))
-        .dependent_slice_segments_enabled_flag(u32::from(pps.dependent_slice_segments_enabled))
-        .pps_slice_chroma_qp_offsets_present_flag(u32::from(pps.slice_chroma_qp_offsets_present))
-        .sample_adaptive_offset_enabled_flag(u32::from(sps.sao_enabled))
-        .deblocking_filter_override_enabled_flag(u32::from(pps.deblocking_filter_override_enabled))
-        .pps_disable_deblocking_filter_flag(u32::from(pps.deblocking_filter_disabled))
-        .slice_segment_header_extension_present_flag(u32::from(
-            pps.slice_segment_header_extension_present,
-        ))
-        .rap_pic_flag(u32::from(nal_type.is_irap()))
-        .idr_pic_flag(u32::from(nal_type.is_idr()))
-        .intra_pic_flag(u32::from(sh.slice_type == SliceType::I));
+
+    p.slice_parsing_fields = SliceParsingFields {
+        lists_modification_present_flag: u32::from(pps.lists_modification_present),
+        long_term_ref_pics_present_flag: u32::from(sps.long_term_ref_pics_present),
+        sps_temporal_mvp_enabled_flag: u32::from(sps.temporal_mvp_enabled),
+        cabac_init_present_flag: u32::from(pps.cabac_init_present),
+        output_flag_present_flag: u32::from(pps.output_flag_present),
+        dependent_slice_segments_enabled_flag: u32::from(pps.dependent_slice_segments_enabled),
+        pps_slice_chroma_qp_offsets_present_flag: u32::from(pps.slice_chroma_qp_offsets_present),
+        sample_adaptive_offset_enabled_flag: u32::from(sps.sao_enabled),
+        deblocking_filter_override_enabled_flag: u32::from(pps.deblocking_filter_override_enabled),
+        pps_disable_deblocking_filter_flag: u32::from(pps.deblocking_filter_disabled),
+        slice_segment_header_extension_present_flag: u32::from(pps.slice_segment_header_extension_present),
+        rap_pic_flag: u32::from(nal_type.is_irap()),
+        idr_pic_flag: u32::from(nal_type.is_idr()),
+        intra_pic_flag: u32::from(sh.slice_type == SliceType::I),
+    };
     p
+}
+
+/// `num_entry_point_offsets` for the slice parameter buffer. The count comes from
+/// the stream, not a fixed array: a 4K wavefront HEVC has 33 (one past the 32 a
+/// fixed `[u32; 32]` holds), and a tiled one can pass 255.
+fn entry_point_count(offsets: &[u32]) -> u16 {
+    offsets.len().min(u16::MAX as usize) as u16
 }
 
 /// Copy the parsed `pred_weight_table()` into the slice parameter buffer.
@@ -963,5 +1026,105 @@ fn write_weights(s: &mut SliceParameterBufferHEVC, sh: &SliceHeader) {
                 }
             }
         }
+    }
+}
+
+/// The `VAIQMatrixBufferHEVC` for a parsed list set. VA takes the coefficients in
+/// up-right diagonal order, which is how the syntax crate stores them. For 32x32
+/// only matrixId 0 (intra luma) and 3 (inter luma) are coded, so VA's two entries
+/// are those.
+fn iq_matrix(list: &ec_h265_syntax::ScalingList) -> IQMatrixBufferHEVC {
+    let mut iq = IQMatrixBufferHEVC::default();
+    for m in 0..6 {
+        iq.scaling_list_4x4[m].copy_from_slice(&list.coefficients[0][m][..16]);
+        iq.scaling_list_8x8[m] = list.coefficients[1][m];
+        iq.scaling_list_16x16[m] = list.coefficients[2][m];
+        iq.scaling_list_dc_16x16[m] = list.dc[2][m];
+    }
+    for (slot, matrix_id) in [0usize, 3].into_iter().enumerate() {
+        iq.scaling_list_32x32[slot] = list.coefficients[3][matrix_id];
+        iq.scaling_list_dc_32x32[slot] = list.dc[3][matrix_id];
+    }
+    iq
+}
+
+/// Fuzzing entry point for the VA-API picture and slice parameter builders. Walks
+/// the Annex B `data` as a stream: each SPS and PPS replaces the last, and each
+/// slice that parses against them runs through [`picture_parameters`] and
+/// [`write_weights`] with a synthetic DPB of up to 15 slots. Returns the number of
+/// slices built. No GPU: the surface ids are plain numbers here.
+#[doc(hidden)]
+pub fn fuzz_build_parameters(data: &[u8]) -> usize {
+    let mut sps: Option<Sps> = None;
+    let mut pps: Option<Pps> = None;
+    let mut built = 0usize;
+    for nal in ec_h265_syntax::split_annex_b(data) {
+        let rbsp = nal.rbsp();
+        match nal.header.nal_type {
+            NalUnitType::Sps => sps = Sps::parse(&rbsp).ok(),
+            NalUnitType::Pps => pps = Pps::parse(&rbsp).ok(),
+            nal_type => {
+                let (Some(s), Some(p)) = (sps.as_ref(), pps.as_ref()) else {
+                    continue;
+                };
+                let Ok((sh, pos)) = SliceHeader::parse(&rbsp, s, p, nal_type) else {
+                    continue;
+                };
+                let n = (data.len() % 16).max(1);
+                let slots: Vec<DpbSlot> = (0..n)
+                    .map(|i| DpbSlot {
+                        id: 0x100 + i as u32,
+                        poc: i as i32 - (n as i32 / 2),
+                        mark: match i % 3 {
+                            0 => Mark::ShortTerm,
+                            1 => Mark::LongTerm,
+                            _ => Mark::Unused,
+                        },
+                    })
+                    .collect();
+                let rps = Rps {
+                    st_curr_before: (0..n).step_by(2).collect(),
+                    st_curr_after: (1..n).step_by(3).collect(),
+                    lt_curr: (2..n).step_by(4).collect(),
+                };
+                let pic = picture_parameters(
+                    s,
+                    p,
+                    &sh,
+                    &pos,
+                    nal_type,
+                    (0x200, data.len() as i32),
+                    &rps,
+                    &slots,
+                );
+                let mut slice = SliceParameterBufferHEVC::default();
+                write_weights(&mut slice, &sh);
+                slice.num_entry_point_offsets = entry_point_count(&sh.entry_point_offsets);
+                std::hint::black_box((pic, slice));
+                built += 1;
+            }
+        }
+    }
+    built
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_points_are_counted_past_32_and_past_u8() {
+        // 33 is a 4K wavefront film (PicHeightInCtbsY - 1); 440 is 20 x 22 tiles.
+        assert_eq!(entry_point_count(&[1; 33]), 33);
+        assert_eq!(entry_point_count(&[1; 440]), 440);
+        // Past u16 saturates rather than wrapping to a small count.
+        assert_eq!(entry_point_count(&vec![1; 70_000]), u16::MAX);
+        assert_eq!(entry_point_count(&[]), 0);
+    }
+
+    #[test]
+    fn fuzz_entry_is_total_on_garbage() {
+        assert_eq!(fuzz_build_parameters(&[]), 0);
+        assert_eq!(fuzz_build_parameters(&[0, 0, 1, 0x26, 0x01, 0xff, 0xff]), 0);
     }
 }

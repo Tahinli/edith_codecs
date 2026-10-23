@@ -1,0 +1,450 @@
+{ "type": "suite", "event": "started", "test_count": 97 }
+{ "type": "test", "event": "started", "name": "cabac::init_table_tests::init_rows_cover_every_context_for_each_init_type" }
+{ "type": "test", "event": "started", "name": "cabac::init_table_tests::init_type_zero_is_the_intra_table" }
+{ "type": "test", "event": "started", "name": "cabac::tests::a_skewed_symbol_stream_compresses" }
+{ "type": "test", "event": "started", "name": "cabac::tests::context_init_matches_the_worked_formula" }
+{ "type": "test", "name": "cabac::init_table_tests::init_type_zero_is_the_intra_table", "event": "ok", "exec_time": 0.000009547 }
+{ "type": "test", "event": "started", "name": "cabac::tests::counting_engine_tracks_the_writing_engine" }
+{ "type": "test", "name": "cabac::tests::a_skewed_symbol_stream_compresses", "event": "ok", "exec_time": 0.000082906 }
+{ "type": "test", "event": "started", "name": "cabac::tests::decoder_inverts_the_encoder_bin_by_bin" }
+{ "type": "test", "name": "cabac::tests::counting_engine_tracks_the_writing_engine", "event": "ok", "exec_time": 0.000056837 }
+{ "type": "test", "event": "started", "name": "cabac::tests::state_tables_are_consistent" }
+{ "type": "test", "name": "cabac::tests::context_init_matches_the_worked_formula", "event": "ok", "exec_time": 0.000001943 }
+{ "type": "test", "event": "started", "name": "cabac::tests::the_spec_decoder_reads_back_what_the_encoder_wrote" }
+{ "type": "test", "name": "cabac::init_table_tests::init_rows_cover_every_context_for_each_init_type", "event": "ok", "exec_time": 0.000000551 }
+{ "type": "test", "event": "started", "name": "ctu::tests::lambda_grows_with_qp" }
+{ "type": "test", "name": "cabac::tests::state_tables_are_consistent", "event": "ok", "exec_time": 0.000000391 }
+{ "type": "test", "event": "started", "name": "ctu::tests::satd_is_zero_for_an_exact_prediction_and_grows_with_error" }
+{ "type": "test", "name": "ctu::tests::lambda_grows_with_qp", "event": "ok", "exec_time": 0.000000281 }
+{ "type": "test", "event": "started", "name": "ctu::tests::satd_vector_path_matches_the_scalar_one" }
+{ "type": "test", "name": "cabac::tests::decoder_inverts_the_encoder_bin_by_bin", "event": "ok", "exec_time": 0.000113252 }
+{ "type": "test", "event": "started", "name": "deblock::tests::an_edge_between_two_transform_blocks_is_filtered" }
+{ "type": "test", "name": "cabac::tests::the_spec_decoder_reads_back_what_the_encoder_wrote", "event": "ok", "exec_time": 0.000182812 }
+{ "type": "test", "event": "started", "name": "deblock::tests::no_transform_boundary_means_no_filtering" }
+{ "type": "test", "name": "ctu::tests::satd_is_zero_for_an_exact_prediction_and_grows_with_error", "event": "ok", "exec_time": 0.000004919 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::b_candidate_fills_the_a_slot_when_no_a_neighbour" }
+{ "type": "test", "name": "deblock::tests::an_edge_between_two_transform_blocks_is_filtered", "event": "ok", "exec_time": 0.000004188 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::equal_a_and_b_collapse_to_one_predictor" }
+{ "type": "test", "name": "deblock::tests::no_transform_boundary_means_no_filtering", "event": "ok", "exec_time": 0.000001062 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::long_term_mismatch_skips_the_neighbour" }
+{ "type": "test", "name": "dec::amvp::tests::equal_a_and_b_collapse_to_one_predictor", "event": "ok", "exec_time": 0.000003286 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::long_term_neighbour_is_not_scaled" }
+{ "type": "test", "name": "dec::amvp::tests::b_candidate_fills_the_a_slot_when_no_a_neighbour", "event": "ok", "exec_time": 0.000004648 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::mv_wraps_at_sixteen_bits" }
+{ "type": "test", "name": "dec::amvp::tests::long_term_mismatch_skips_the_neighbour", "event": "ok", "exec_time": 0.000001053 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::mvd_wrap_through_the_full_derivation" }
+{ "type": "test", "name": "dec::amvp::tests::long_term_neighbour_is_not_scaled", "event": "ok", "exec_time": 0.000001664 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::scale_mv_with_negative_and_positive_distances" }
+{ "type": "test", "name": "dec::amvp::tests::mvd_wrap_through_the_full_derivation", "event": "ok", "exec_time": 0.000001423 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::spatial_a_scales_by_distance" }
+{ "type": "test", "name": "dec::amvp::tests::mv_wraps_at_sixteen_bits", "event": "ok", "exec_time": 0.00000016 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::spatial_a_scales_with_negative_distance" }
+{ "type": "test", "name": "dec::amvp::tests::spatial_a_scales_by_distance", "event": "ok", "exec_time": 0.000001673 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::spatial_a_with_the_same_reference_is_used_unscaled" }
+{ "type": "test", "name": "dec::amvp::tests::scale_mv_with_negative_and_positive_distances", "event": "ok", "exec_time": 0.00000015 }
+{ "type": "test", "event": "started", "name": "dec::amvp::tests::temporal_fills_the_second_slot" }
+{ "type": "test", "name": "dec::amvp::tests::spatial_a_with_the_same_reference_is_used_unscaled", "event": "ok", "exec_time": 0.000001433 }
+{ "type": "test", "event": "started", "name": "dec::deblock::tests::a_flat_picture_is_unchanged" }
+{ "type": "test", "name": "dec::amvp::tests::spatial_a_scales_with_negative_distance", "event": "ok", "exec_time": 0.000001303 }
+{ "type": "test", "event": "started", "name": "dec::deblock::tests::a_pcm_unit_on_the_p_side_is_not_modified" }
+{ "type": "test", "name": "dec::deblock::tests::a_flat_picture_is_unchanged", "event": "ok", "exec_time": 0.000008106 }
+{ "type": "test", "event": "started", "name": "dec::deblock::tests::a_step_across_an_8x8_edge_is_smoothed" }
+{ "type": "test", "name": "dec::amvp::tests::temporal_fills_the_second_slot", "event": "ok", "exec_time": 0.00001042 }
+{ "type": "test", "event": "started", "name": "dec::inter::tests::shared_reference_in_both_lists_locks_once" }
+{ "type": "test", "name": "dec::deblock::tests::a_pcm_unit_on_the_p_side_is_not_modified", "event": "ok", "exec_time": 0.000007063 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::bench_1080p_bipred_8x8_frame" }
+{ "type": "test", "name": "dec::deblock::tests::a_step_across_an_8x8_edge_is_smoothed", "event": "ok", "exec_time": 0.000006853 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::chroma_edges_clamp_at_all_four_borders" }
+{ "type": "test", "name": "dec::mc::tests::chroma_edges_clamp_at_all_four_borders", "event": "ok", "exec_time": 0.0000059 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::chroma_impulse_fractions_hand_values" }
+{ "type": "test", "name": "dec::mc::tests::chroma_impulse_fractions_hand_values", "event": "ok", "exec_time": 0.00000498 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::chroma_motion_vector_splits_integer_and_eighth" }
+{ "type": "test", "name": "dec::mc::tests::chroma_motion_vector_splits_integer_and_eighth", "event": "ok", "exec_time": 0.000003927 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::default_uni_and_bi_hand_values" }
+{ "type": "test", "name": "ctu::tests::satd_vector_path_matches_the_scalar_one", "event": "ok", "exec_time": 0.002893949 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::explicit_uni_and_bi_hand_values_8bit" }
+{ "type": "test", "name": "dec::mc::tests::default_uni_and_bi_hand_values", "event": "ok", "exec_time": 0.000001854 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::explicit_uni_hand_value_10bit_with_scaled_offset" }
+{ "type": "test", "name": "dec::mc::tests::explicit_uni_and_bi_hand_values_8bit", "event": "ok", "exec_time": 0.000000782 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::luma_edges_clamp_at_all_four_borders" }
+{ "type": "test", "name": "dec::mc::tests::explicit_uni_hand_value_10bit_with_scaled_offset", "event": "ok", "exec_time": 0.000000751 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::luma_fractional_edges_clamp_to_the_border_sample" }
+{ "type": "test", "name": "dec::mc::tests::luma_fractional_edges_clamp_to_the_border_sample", "event": "ok", "exec_time": 0.000007505 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::luma_impulse_fractions_10bit_hand_values" }
+{ "type": "test", "name": "dec::mc::tests::luma_impulse_fractions_10bit_hand_values", "event": "ok", "exec_time": 0.000003847 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::luma_impulse_fractions_8bit_hand_values" }
+{ "type": "test", "name": "dec::mc::tests::luma_impulse_fractions_8bit_hand_values", "event": "ok", "exec_time": 0.000002915 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::luma_two_dimensional_hand_values" }
+{ "type": "test", "name": "dec::mc::tests::luma_two_dimensional_hand_values", "event": "ok", "exec_time": 0.000007024 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::luma_vertical_only_matches_horizontal_by_symmetry" }
+{ "type": "test", "name": "dec::mc::tests::luma_vertical_only_matches_horizontal_by_symmetry", "event": "ok", "exec_time": 0.000003056 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::predict_pu_constant_planes_recover_the_value" }
+{ "type": "test", "name": "dec::mc::tests::predict_pu_constant_planes_recover_the_value", "event": "ok", "exec_time": 0.000041087 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::predict_pu_rejects_bad_input" }
+{ "type": "test", "name": "dec::mc::tests::predict_pu_rejects_bad_input", "event": "ok", "exec_time": 0.000012353 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::random_blocks_match_the_reference_model" }
+{ "type": "test", "name": "dec::mc::tests::luma_edges_clamp_at_all_four_borders", "event": "ok", "exec_time": 0.000007013 }
+{ "type": "test", "event": "started", "name": "dec::mc::tests::weight_table_derivation_with_chroma_offsets" }
+{ "type": "test", "name": "dec::mc::tests::weight_table_derivation_with_chroma_offsets", "event": "ok", "exec_time": 0.00000537 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::a1_is_first_and_intra_or_missing_neighbour_is_skipped" }
+{ "type": "test", "name": "dec::merge::tests::a1_is_first_and_intra_or_missing_neighbour_is_skipped", "event": "ok", "exec_time": 0.000007164 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::b1_identical_to_a1_is_pruned" }
+{ "type": "test", "name": "dec::merge::tests::b1_identical_to_a1_is_pruned", "event": "ok", "exec_time": 0.000002725 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::bi_candidate_becomes_uni_for_an_8x4_block" }
+{ "type": "test", "name": "dec::merge::tests::bi_candidate_becomes_uni_for_an_8x4_block", "event": "ok", "exec_time": 0.000002705 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::combined_bi_candidate_from_l0_and_l1_neighbours" }
+{ "type": "test", "name": "dec::merge::tests::combined_bi_candidate_from_l0_and_l1_neighbours", "event": "ok", "exec_time": 0.000002745 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::neighbour_in_other_slice_is_unavailable" }
+{ "type": "test", "name": "dec::merge::tests::neighbour_in_other_slice_is_unavailable", "event": "ok", "exec_time": 0.000002645 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::no_neighbours_gives_zero_candidate" }
+{ "type": "test", "name": "dec::merge::tests::no_neighbours_gives_zero_candidate", "event": "ok", "exec_time": 0.000003927 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::parallel_merge_level_hides_neighbours_in_the_same_region" }
+{ "type": "test", "name": "dec::merge::tests::parallel_merge_level_hides_neighbours_in_the_same_region", "event": "ok", "exec_time": 0.000003377 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::parallel_merge_level_two_uses_the_neighbour" }
+{ "type": "test", "name": "dec::merge::tests::parallel_merge_level_two_uses_the_neighbour", "event": "ok", "exec_time": 0.000001633 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::second_vertical_partition_skips_a1" }
+{ "type": "test", "name": "dec::merge::tests::second_vertical_partition_skips_a1", "event": "ok", "exec_time": 0.000001643 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::temporal_candidate_scales_with_negative_distance" }
+{ "type": "test", "name": "dec::merge::tests::temporal_candidate_scales_with_negative_distance", "event": "ok", "exec_time": 0.000009828 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::temporal_candidate_with_long_term_mismatch_is_unavailable" }
+{ "type": "test", "name": "dec::merge::tests::temporal_candidate_with_long_term_mismatch_is_unavailable", "event": "ok", "exec_time": 0.00000535 }
+{ "type": "test", "event": "started", "name": "dec::merge::tests::zero_candidates_use_increasing_reference_indices" }
+{ "type": "test", "name": "dec::merge::tests::zero_candidates_use_increasing_reference_indices", "event": "ok", "exec_time": 0.000001022 }
+{ "type": "test", "event": "started", "name": "dec::sao::tests::band_offset_adds_offset_only_inside_bands" }
+{ "type": "test", "name": "dec::sao::tests::band_offset_adds_offset_only_inside_bands", "event": "ok", "exec_time": 0.000013015 }
+{ "type": "test", "event": "started", "name": "dec::sao::tests::bypass_units_are_untouched" }
+{ "type": "test", "name": "dec::sao::tests::bypass_units_are_untouched", "event": "ok", "exec_time": 0.000011201 }
+{ "type": "test", "event": "started", "name": "dec::sao::tests::disabled_type_leaves_samples_unchanged" }
+{ "type": "test", "name": "dec::sao::tests::disabled_type_leaves_samples_unchanged", "event": "ok", "exec_time": 0.000006702 }
+{ "type": "test", "event": "started", "name": "dec::sao::tests::edge_offset_class0_on_ramp_keeps_picture_edges" }
+{ "type": "test", "name": "dec::sao::tests::edge_offset_class0_on_ramp_keeps_picture_edges", "event": "ok", "exec_time": 0.000013406 }
+{ "type": "test", "event": "started", "name": "dec::tiles::tests::single_tile_is_raster" }
+{ "type": "test", "name": "dec::tiles::tests::single_tile_is_raster", "event": "ok", "exec_time": 0.000002114 }
+{ "type": "test", "event": "started", "name": "dec::tiles::tests::two_by_two_tiles_scan_tile_by_tile" }
+{ "type": "test", "name": "dec::tiles::tests::two_by_two_tiles_scan_tile_by_tile", "event": "ok", "exec_time": 0.000001403 }
+{ "type": "test", "event": "started", "name": "dec::tiles::tests::uniform_split_matches_6_3" }
+{ "type": "test", "name": "dec::tiles::tests::uniform_split_matches_6_3", "event": "ok", "exec_time": 0.000001543 }
+{ "type": "test", "event": "started", "name": "enc_me::tests::cost_at_the_low_bound_reads_the_padded_plane" }
+{ "type": "test", "name": "enc_me::tests::cost_at_the_low_bound_reads_the_padded_plane", "event": "ok", "exec_time": 0.000327795 }
+{ "type": "test", "event": "started", "name": "enc_me::tests::sad_vector_path_matches_the_scalar_one" }
+{ "type": "test", "name": "enc_me::tests::sad_vector_path_matches_the_scalar_one", "event": "ok", "exec_time": 0.000012032 }
+{ "type": "test", "event": "started", "name": "enc_me::tests::se_bits_matches_the_exp_golomb_table" }
+{ "type": "test", "name": "enc_me::tests::se_bits_matches_the_exp_golomb_table", "event": "ok", "exec_time": 0.000000341 }
+{ "type": "test", "event": "started", "name": "enc_me::tests::search_finds_a_large_vertical_shift" }
+{ "type": "test", "name": "enc_me::tests::search_finds_a_large_vertical_shift", "event": "ok", "exec_time": 0.0021538 }
+{ "type": "test", "event": "started", "name": "enc_me::tests::search_finds_a_shifted_block" }
+{ "type": "test", "name": "enc_me::tests::search_finds_a_shifted_block", "event": "ok", "exec_time": 0.002561285 }
+{ "type": "test", "event": "started", "name": "enc_rc::tests::converges_to_the_target" }
+{ "type": "test", "name": "enc_rc::tests::converges_to_the_target", "event": "ok", "exec_time": 0.000032241 }
+{ "type": "test", "event": "started", "name": "enc_rc::tests::qp_stays_in_range" }
+{ "type": "test", "name": "enc_rc::tests::qp_stays_in_range", "event": "ok", "exec_time": 0.000006892 }
+{ "type": "test", "event": "started", "name": "intra::tests::diagonal_mode_2_walks_the_left_column" }
+{ "type": "test", "name": "intra::tests::diagonal_mode_2_walks_the_left_column", "event": "ok", "exec_time": 0.000016992 }
+{ "type": "test", "event": "started", "name": "intra::tests::every_mode_predicts_a_flat_block_flat" }
+{ "type": "test", "name": "intra::tests::every_mode_predicts_a_flat_block_flat", "event": "ok", "exec_time": 0.00010148 }
+{ "type": "test", "event": "started", "name": "intra::tests::mpm_list_follows_the_spec_cases" }
+{ "type": "test", "name": "intra::tests::mpm_list_follows_the_spec_cases", "event": "ok", "exec_time": 0.000000351 }
+{ "type": "test", "event": "started", "name": "intra::tests::scan_index_is_mode_dependent_only_for_small_blocks" }
+{ "type": "test", "name": "intra::tests::scan_index_is_mode_dependent_only_for_small_blocks", "event": "ok", "exec_time": 0.00000025 }
+{ "type": "test", "event": "started", "name": "intra::tests::substitution_fills_from_the_nearest_real_sample" }
+{ "type": "test", "name": "intra::tests::substitution_fills_from_the_nearest_real_sample", "event": "ok", "exec_time": 0.000000771 }
+{ "type": "test", "event": "started", "name": "intra::tests::vector_and_cached_prediction_match_the_plain_one" }
+{ "type": "test", "name": "intra::tests::vector_and_cached_prediction_match_the_plain_one", "event": "ok", "exec_time": 0.008423721 }
+{ "type": "test", "event": "started", "name": "intra::tests::vertical_and_horizontal_modes_copy_their_edge" }
+{ "type": "test", "name": "intra::tests::vertical_and_horizontal_modes_copy_their_edge", "event": "ok", "exec_time": 0.000003757 }
+{ "type": "test", "event": "started", "name": "residual::tests::decode_residual_inverts_encode_residual" }
+{ "type": "test", "name": "residual::tests::decode_residual_inverts_encode_residual", "event": "ok", "exec_time": 0.002593505 }
+{ "type": "test", "event": "started", "name": "residual::tests::diagonal_scan_matches_the_spec_walk" }
+{ "type": "test", "name": "residual::tests::diagonal_scan_matches_the_spec_walk", "event": "ok", "exec_time": 0.000002935 }
+{ "type": "test", "event": "started", "name": "residual::tests::every_block_size_and_scan_codes_without_panicking" }
+{ "type": "test", "name": "residual::tests::every_block_size_and_scan_codes_without_panicking", "event": "ok", "exec_time": 0.001015515 }
+{ "type": "test", "event": "started", "name": "residual::tests::last_position_binarization_inverts_the_spec_formula" }
+{ "type": "test", "name": "residual::tests::last_position_binarization_inverts_the_spec_formula", "event": "ok", "exec_time": 0.000000512 }
+{ "type": "test", "event": "started", "name": "residual::tests::residual_coding_costs_less_for_sparser_blocks" }
+{ "type": "test", "name": "residual::tests::residual_coding_costs_less_for_sparser_blocks", "event": "ok", "exec_time": 0.000013715 }
+{ "type": "test", "event": "started", "name": "residual::tests::sub_block_cursor_matches_full_recompute" }
+{ "type": "test", "name": "dec::inter::tests::shared_reference_in_both_lists_locks_once", "event": "ok", "exec_time": 0.102678723 }
+{ "type": "test", "event": "started", "name": "simd_tx::tests::forward_matches_scalar" }
+{ "type": "test", "name": "simd_tx::tests::forward_matches_scalar", "event": "ok", "exec_time": 0.029271327 }
+{ "type": "test", "event": "started", "name": "simd_tx::tests::inverse_matches_scalar" }
+{ "type": "test", "name": "dec::mc::tests::bench_1080p_bipred_8x8_frame", "event": "ok", "exec_time": 0.174867583 }
+{ "type": "test", "event": "started", "name": "simd_tx::tests::quant_dequant_match_scalar" }
+{ "type": "test", "name": "simd_tx::tests::inverse_matches_scalar", "event": "ok", "exec_time": 0.117487161 }
+{ "type": "test", "event": "started", "name": "simd_tx::tests::timing" }
+{ "type": "test", "name": "simd_tx::tests::timing", "event": "ignored" }
+{ "type": "test", "event": "started", "name": "transform::tests::chroma_qp_table" }
+{ "type": "test", "name": "transform::tests::chroma_qp_table", "event": "ok", "exec_time": 0.000001062 }
+{ "type": "test", "event": "started", "name": "transform::tests::dc_only_coefficient_is_flat_after_inverse" }
+{ "type": "test", "name": "transform::tests::dc_only_coefficient_is_flat_after_inverse", "event": "ok", "exec_time": 0.000020028 }
+{ "type": "test", "event": "started", "name": "transform::tests::fast_forward_matches_reference" }
+{ "type": "test", "name": "transform::tests::fast_forward_matches_reference", "event": "ok", "exec_time": 0.004363315 }
+{ "type": "test", "event": "started", "name": "transform::tests::matrix_rows_are_orthogonal" }
+{ "type": "test", "name": "transform::tests::matrix_rows_are_orthogonal", "event": "ok", "exec_time": 0.000028614 }
+{ "type": "test", "event": "started", "name": "transform::tests::mirrored_half_matches_the_spec_second_table" }
+{ "type": "test", "name": "transform::tests::mirrored_half_matches_the_spec_second_table", "event": "ok", "exec_time": 0.000000451 }
+{ "type": "test", "event": "started", "name": "transform::tests::quant_scale_is_the_reciprocal" }
+{ "type": "test", "name": "transform::tests::quant_scale_is_the_reciprocal", "event": "ok", "exec_time": 0.00000025 }
+{ "type": "test", "event": "started", "name": "transform::tests::round_trip_is_near_lossless_at_low_qp" }
+{ "type": "test", "name": "transform::tests::round_trip_is_near_lossless_at_low_qp", "event": "ok", "exec_time": 0.000044774 }
+{ "type": "test", "event": "started", "name": "transform::tests::round_trip_recovers_flat_blocks" }
+{ "type": "test", "name": "transform::tests::round_trip_recovers_flat_blocks", "event": "ok", "exec_time": 0.000075541 }
+{ "type": "test", "event": "started", "name": "transform::tests::transform_skip_round_trips_every_residual_sample" }
+{ "type": "test", "name": "transform::tests::transform_skip_round_trips_every_residual_sample", "event": "ok", "exec_time": 0.000001482 }
+{ "type": "test", "name": "simd_tx::tests::quant_dequant_match_scalar", "event": "ok", "exec_time": 0.980599489 }
+{ "type": "test", "name": "residual::tests::sub_block_cursor_matches_full_recompute", "event": "ok", "exec_time": 1.81747897 }
+{ "type": "test", "name": "dec::mc::tests::random_blocks_match_the_reference_model", "event": "ok", "exec_time": 18.090679884 }
+{ "type": "suite", "event": "ok", "passed": 96, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 18.096713313 }
+{ "type": "suite", "event": "started", "test_count": 15 }
+{ "type": "test", "event": "started", "name": "a_bit_target_lands_near_its_target" }
+{ "type": "test", "event": "started", "name": "chroma_mode_search_decodes_bit_exactly" }
+{ "type": "test", "event": "started", "name": "cu64_decodes_bit_exactly" }
+{ "type": "test", "event": "started", "name": "ffmpeg_decodes_bit_exactly_at_every_shape" }
+{ "type": "test", "name": "cu64_decodes_bit_exactly", "event": "ok", "exec_time": 1.628619171 }
+{ "type": "test", "event": "started", "name": "ffmpeg_verifies_the_decoded_picture_hash" }
+{ "type": "test", "name": "ffmpeg_verifies_the_decoded_picture_hash", "event": "ok", "exec_time": 2.720354502 }
+{ "type": "test", "event": "started", "name": "intra_nxn_decodes_bit_exactly" }
+{ "type": "test", "name": "chroma_mode_search_decodes_bit_exactly", "event": "ok", "exec_time": 5.833847035 }
+{ "type": "test", "event": "started", "name": "quality_rises_as_qp_falls" }
+{ "type": "test", "name": "intra_nxn_decodes_bit_exactly", "event": "ok", "exec_time": 3.332662498 }
+{ "type": "test", "event": "started", "name": "rdoq_decodes_bit_exactly" }
+{ "type": "test", "name": "quality_rises_as_qp_falls", "event": "ok", "exec_time": 2.168421886 }
+{ "type": "test", "event": "started", "name": "rqt_decodes_bit_exactly" }
+{ "type": "test", "name": "rdoq_decodes_bit_exactly", "event": "ok", "exec_time": 2.417695972 }
+{ "type": "test", "event": "started", "name": "sign_hiding_decodes_bit_exactly" }
+{ "type": "test", "name": "rqt_decodes_bit_exactly", "event": "ok", "exec_time": 2.548059174 }
+{ "type": "test", "event": "started", "name": "the_batch_helper_codes_every_picture_as_its_own_access_unit" }
+{ "type": "test", "name": "the_batch_helper_codes_every_picture_as_its_own_access_unit", "event": "ok", "exec_time": 1.267377399 }
+{ "type": "test", "event": "started", "name": "the_default_tree_costs_almost_nothing_against_64" }
+{ "type": "test", "name": "a_bit_target_lands_near_its_target", "event": "ok", "exec_time": 11.993562003 }
+{ "type": "test", "event": "started", "name": "threads_do_not_change_the_bitstream" }
+{ "type": "test", "name": "sign_hiding_decodes_bit_exactly", "event": "ok", "exec_time": 3.075076126 }
+{ "type": "test", "event": "started", "name": "transform_skip_decodes_bit_exactly" }
+{ "type": "test", "name": "the_default_tree_costs_almost_nothing_against_64", "event": "ok", "exec_time": 2.414770044 }
+{ "type": "test", "event": "started", "name": "vaapi_hardware_decodes_the_stream" }
+{ "type": "test", "name": "threads_do_not_change_the_bitstream", "event": "ok", "exec_time": 3.4573199150000002 }
+{ "type": "test", "name": "transform_skip_decodes_bit_exactly", "event": "ok", "exec_time": 2.8796882139999997 }
+{ "type": "test", "name": "vaapi_hardware_decodes_the_stream", "event": "ok", "exec_time": 19.772098197 }
+{ "type": "test", "name": "ffmpeg_decodes_bit_exactly_at_every_shape", "event": "ok", "exec_time": 47.804248595 }
+{ "type": "suite", "event": "ok", "passed": 15, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 47.804928694 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "conformance_pictures_match_the_sei_hash" }
+{ "type": "test", "event": "started", "name": "whole_output_digest_reads_the_first_word" }
+{ "type": "test", "name": "whole_output_digest_reads_the_first_word", "event": "ok", "exec_time": 0.000001203 }
+{ "type": "test", "event": "timeout", "name": "conformance_pictures_match_the_sei_hash" }
+{ "type": "test", "name": "conformance_pictures_match_the_sei_hash", "event": "ok", "exec_time": 85.075069081 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 85.134219148 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "rext_conformance_pictures_match_the_sei_hash" }
+{ "type": "test", "event": "started", "name": "whole_output_digest_reads_the_first_word" }
+{ "type": "test", "name": "whole_output_digest_reads_the_first_word", "event": "ok", "exec_time": 0.000001312 }
+{ "type": "test", "event": "timeout", "name": "rext_conformance_pictures_match_the_sei_hash" }
+{ "type": "test", "name": "rext_conformance_pictures_match_the_sei_hash", "event": "ok", "exec_time": 83.297068458 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 83.307392837 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "committed_422_stream_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "rext_422_vectors_are_byte_exact" }
+{ "type": "test", "name": "committed_422_stream_matches_ffmpeg", "event": "ok", "exec_time": 0.406715818 }
+{ "type": "test", "name": "rext_422_vectors_are_byte_exact", "event": "ok", "exec_time": 2.8553265420000002 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 2.856595989 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "cu_syntax_sweep_over_conformance_streams" }
+{ "type": "test", "event": "started", "name": "inter_placeholder_runs_over_pb_slices" }
+{ "type": "test", "event": "started", "name": "motion_derivation_is_deterministic_over_conformance_streams" }
+{ "type": "test", "event": "started", "name": "pixel_pipeline_runs_over_conformance_streams" }
+{ "type": "test", "name": "inter_placeholder_runs_over_pb_slices", "event": "ok", "exec_time": 16.156962404 }
+{ "type": "test", "name": "cu_syntax_sweep_over_conformance_streams", "event": "ok", "exec_time": 54.747341714 }
+{ "type": "test", "event": "timeout", "name": "motion_derivation_is_deterministic_over_conformance_streams" }
+{ "type": "test", "event": "timeout", "name": "pixel_pipeline_runs_over_conformance_streams" }
+{ "type": "test", "name": "motion_derivation_is_deterministic_over_conformance_streams", "event": "ok", "exec_time": 119.179241457 }
+{ "type": "test", "name": "pixel_pipeline_runs_over_conformance_streams", "event": "ok", "exec_time": 142.991043838 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 143.08159215 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "dolby_vision_nal_units_change_nothing" }
+{ "type": "test", "event": "started", "name": "hdr_sei_applies_to_every_frame_from_the_irap_on" }
+{ "type": "test", "event": "started", "name": "malformed_sei_is_skipped_and_the_stream_decodes_the_same" }
+{ "type": "test", "event": "started", "name": "picture_hash_attaches_to_the_picture_it_follows" }
+{ "type": "test", "name": "hdr_sei_applies_to_every_frame_from_the_irap_on", "event": "ok", "exec_time": 0.035668035 }
+{ "type": "test", "name": "picture_hash_attaches_to_the_picture_it_follows", "event": "ok", "exec_time": 0.036321233 }
+{ "type": "test", "name": "dolby_vision_nal_units_change_nothing", "event": "ok", "exec_time": 0.040889058 }
+{ "type": "test", "name": "malformed_sei_is_skipped_and_the_stream_decodes_the_same", "event": "ok", "exec_time": 0.044670867 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.04725235 }
+{ "type": "suite", "event": "started", "test_count": 13 }
+{ "type": "test", "event": "started", "name": "bumping_drops_a_full_buffer_only_when_asked" }
+{ "type": "test", "event": "started", "name": "bumping_honours_the_latency_limit" }
+{ "type": "test", "event": "started", "name": "bumping_outputs_in_poc_order_under_the_reorder_limit" }
+{ "type": "test", "event": "started", "name": "conformance_output_order_matches_ffprobe" }
+{ "type": "test", "name": "bumping_drops_a_full_buffer_only_when_asked", "event": "ok", "exec_time": 0.000012774 }
+{ "type": "test", "event": "started", "name": "decoder_refuses_out_of_scope_parameter_sets_and_skips_layers" }
+{ "type": "test", "name": "bumping_honours_the_latency_limit", "event": "ok", "exec_time": 0.000027843 }
+{ "type": "test", "event": "started", "name": "poc_follows_the_lsb_without_wrapping" }
+{ "type": "test", "name": "bumping_outputs_in_poc_order_under_the_reorder_limit", "event": "ok", "exec_time": 0.000002926 }
+{ "type": "test", "event": "started", "name": "poc_msb_wraps_backward_past_the_maximum" }
+{ "type": "test", "name": "poc_follows_the_lsb_without_wrapping", "event": "ok", "exec_time": 0.00000012 }
+{ "type": "test", "event": "started", "name": "poc_msb_wraps_forward_at_the_half_window" }
+{ "type": "test", "name": "poc_msb_wraps_backward_past_the_maximum", "event": "ok", "exec_time": 0.00000011 }
+{ "type": "test", "event": "started", "name": "poc_of_an_irap_with_no_rasl_output_has_no_msb" }
+{ "type": "test", "name": "poc_msb_wraps_forward_at_the_half_window", "event": "ok", "exec_time": 0.00000006 }
+{ "type": "test", "event": "started", "name": "reference_lists_cycle_and_follow_the_modification" }
+{ "type": "test", "name": "decoder_refuses_out_of_scope_parameter_sets_and_skips_layers", "event": "ok", "exec_time": 0.000258185 }
+{ "type": "test", "event": "started", "name": "rps_generates_a_missing_reference_as_grey" }
+{ "type": "test", "name": "rps_generates_a_missing_reference_as_grey", "event": "ok", "exec_time": 0.000009038 }
+{ "type": "test", "event": "started", "name": "rps_long_term_entry_matches_by_lsb_and_converts_marking" }
+{ "type": "test", "name": "poc_of_an_irap_with_no_rasl_output_has_no_msb", "event": "ok", "exec_time": 0.000000762 }
+{ "type": "test", "event": "started", "name": "rps_marks_what_it_names_and_drops_the_rest" }
+{ "type": "test", "name": "reference_lists_cycle_and_follow_the_modification", "event": "ok", "exec_time": 0.000025719 }
+{ "type": "test", "name": "rps_long_term_entry_matches_by_lsb_and_converts_marking", "event": "ok", "exec_time": 0.000007574 }
+{ "type": "test", "name": "rps_marks_what_it_names_and_drops_the_rest", "event": "ok", "exec_time": 0.000007043 }
+{ "type": "test", "event": "timeout", "name": "conformance_output_order_matches_ffprobe" }
+{ "type": "test", "name": "conformance_output_order_matches_ffprobe", "event": "ok", "exec_time": 133.712278539 }
+{ "type": "suite", "event": "ok", "passed": 13, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 133.712907101 }
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "decode_matches_the_encoders_own_reconstruction_at_an_extreme_odd_size" }
+{ "type": "test", "event": "started", "name": "decode_matches_the_encoders_own_reconstruction_at_an_odd_padded_size" }
+{ "type": "test", "event": "started", "name": "decode_matches_the_encoders_own_reconstruction_at_another_odd_size" }
+{ "type": "test", "event": "started", "name": "decode_matches_the_encoders_own_reconstruction_at_one_ctb" }
+{ "type": "test", "name": "decode_matches_the_encoders_own_reconstruction_at_one_ctb", "event": "ok", "exec_time": 0.040187114 }
+{ "type": "test", "event": "started", "name": "decode_matches_the_encoders_own_reconstruction_over_several_ctbs" }
+{ "type": "test", "name": "decode_matches_the_encoders_own_reconstruction_at_an_extreme_odd_size", "event": "ok", "exec_time": 0.041147289 }
+{ "type": "test", "name": "decode_matches_the_encoders_own_reconstruction_at_an_odd_padded_size", "event": "ok", "exec_time": 0.068585411 }
+{ "type": "test", "name": "decode_matches_the_encoders_own_reconstruction_at_another_odd_size", "event": "ok", "exec_time": 0.26211708 }
+{ "type": "test", "name": "decode_matches_the_encoders_own_reconstruction_over_several_ctbs", "event": "ok", "exec_time": 0.22103364 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.263936841 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "dolby_vision_p8_base_layer_decodes_and_rpu_is_ignored" }
+{ "type": "test", "name": "dolby_vision_p8_base_layer_decodes_and_rpu_is_ignored", "event": "ok", "exec_time": 0.809456283 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.811642675 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "eight_bit_bitstreams_are_unchanged" }
+{ "type": "test", "name": "eight_bit_bitstreams_are_unchanged", "event": "ok", "exec_time": 2.110029106 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 2.111236024 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "bd_psnr_vs_x265" }
+{ "type": "test", "event": "started", "name": "pin_loud_cap_child" }
+{ "type": "test", "event": "started", "name": "pin_loud_reds_on_an_ok_but_short_write" }
+{ "type": "test", "event": "started", "name": "pin_loud_reports_what_landed_under_a_size_cap" }
+{ "type": "test", "name": "pin_loud_cap_child", "event": "ok", "exec_time": 0.000000721 }
+{ "type": "test", "name": "pin_loud_reds_on_an_ok_but_short_write", "event": "ok", "exec_time": 0.000281561 }
+{ "type": "test", "name": "pin_loud_reports_what_landed_under_a_size_cap", "event": "ok", "exec_time": 0.003453514 }
+{ "type": "test", "name": "bd_psnr_vs_x265", "event": "ok", "exec_time": 19.574261341 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 19.574987717 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "wavefront_intra_pictures_are_identical_at_1_2_4_and_6_threads" }
+{ "type": "test", "event": "started", "name": "wavefront_p_pictures_are_identical_at_1_2_4_and_6_threads" }
+{ "type": "test", "event": "started", "name": "wavefront_p_stream_decodes_to_the_encoder_reconstruction" }
+{ "type": "test", "name": "wavefront_p_stream_decodes_to_the_encoder_reconstruction", "event": "ok", "exec_time": 0.286147383 }
+{ "type": "test", "name": "wavefront_p_pictures_are_identical_at_1_2_4_and_6_threads", "event": "ok", "exec_time": 1.1876260969999999 }
+{ "type": "test", "name": "wavefront_intra_pictures_are_identical_at_1_2_4_and_6_threads", "event": "ok", "exec_time": 14.130672473 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 14.131015547 }
+{ "type": "suite", "event": "started", "test_count": 7 }
+{ "type": "test", "event": "started", "name": "cu_qp_delta_depth_deeper_than_ctb_does_not_panic" }
+{ "type": "test", "event": "started", "name": "escape_prefix_shift_overflow_does_not_panic" }
+{ "type": "test", "event": "started", "name": "parallel_merge_level_above_ctb_does_not_panic" }
+{ "type": "test", "event": "started", "name": "pcm_bit_depth_above_coded_depth_does_not_panic" }
+{ "type": "test", "name": "cu_qp_delta_depth_deeper_than_ctb_does_not_panic", "event": "ok", "exec_time": 0.000256462 }
+{ "type": "test", "event": "started", "name": "slice_qp_below_qp_bd_offset_does_not_panic" }
+{ "type": "test", "name": "pcm_bit_depth_above_coded_depth_does_not_panic", "event": "ok", "exec_time": 0.000338827 }
+{ "type": "test", "event": "started", "name": "sps_size_not_multiple_of_min_cb_does_not_panic" }
+{ "type": "test", "name": "escape_prefix_shift_overflow_does_not_panic", "event": "ok", "exec_time": 0.000309663 }
+{ "type": "test", "event": "started", "name": "sps_transform_size_above_32_does_not_panic" }
+{ "type": "test", "name": "parallel_merge_level_above_ctb_does_not_panic", "event": "ok", "exec_time": 0.000847794 }
+{ "type": "test", "name": "slice_qp_below_qp_bd_offset_does_not_panic", "event": "ok", "exec_time": 0.00043646 }
+{ "type": "test", "name": "sps_size_not_multiple_of_min_cb_does_not_panic", "event": "ok", "exec_time": 0.000319221 }
+{ "type": "test", "name": "sps_transform_size_above_32_does_not_panic", "event": "ok", "exec_time": 0.001554302 }
+{ "type": "suite", "event": "ok", "passed": 7, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00324424 }
+{ "type": "suite", "event": "started", "test_count": 11 }
+{ "type": "test", "event": "started", "name": "bit_depth_other_than_8_or_10_is_refused" }
+{ "type": "test", "event": "started", "name": "bitrate_mode_lands_within_five_percent_at_10_bits" }
+{ "type": "test", "event": "started", "name": "defaults_write_no_hdr_signalling" }
+{ "type": "test", "event": "started", "name": "eight_bit_planes_are_refused_by_a_10_bit_encoder" }
+{ "type": "test", "name": "bit_depth_other_than_8_or_10_is_refused", "event": "ok", "exec_time": 0.000057028 }
+{ "type": "test", "event": "started", "name": "main10_extremes_black_white_and_alternating" }
+{ "type": "test", "name": "eight_bit_planes_are_refused_by_a_10_bit_encoder", "event": "ok", "exec_time": 0.000120347 }
+{ "type": "test", "event": "started", "name": "main10_hdr_signalling_vui_and_sei" }
+{ "type": "test", "name": "defaults_write_no_hdr_signalling", "event": "ok", "exec_time": 0.02005567 }
+{ "type": "test", "event": "started", "name": "main10_idr_decodes_to_the_encoder_reconstruction" }
+{ "type": "test", "name": "main10_hdr_signalling_vui_and_sei", "event": "ok", "exec_time": 0.030552598 }
+{ "type": "test", "event": "started", "name": "main10_rich_content_across_qp_range" }
+{ "type": "test", "name": "main10_idr_decodes_to_the_encoder_reconstruction", "event": "ok", "exec_time": 0.047020763 }
+{ "type": "test", "event": "started", "name": "main10_sequence_with_p_pictures_decodes_to_the_reconstruction" }
+{ "type": "test", "name": "main10_sequence_with_p_pictures_decodes_to_the_reconstruction", "event": "ok", "exec_time": 0.015378907 }
+{ "type": "test", "event": "started", "name": "main10_smooth_gradient_has_no_overflow_or_mismatch" }
+{ "type": "test", "name": "bitrate_mode_lands_within_five_percent_at_10_bits", "event": "ok", "exec_time": 0.287098051 }
+{ "type": "test", "event": "started", "name": "main10_sps_carries_the_profile_depth_and_the_colour_description" }
+{ "type": "test", "name": "main10_sps_carries_the_profile_depth_and_the_colour_description", "event": "ok", "exec_time": 0.000136387 }
+{ "type": "test", "name": "main10_extremes_black_white_and_alternating", "event": "ok", "exec_time": 1.33121631 }
+{ "type": "test", "name": "main10_smooth_gradient_has_no_overflow_or_mismatch", "event": "ok", "exec_time": 1.262792132 }
+{ "type": "test", "name": "main10_rich_content_across_qp_range", "event": "ok", "exec_time": 4.1800266090000004 }
+{ "type": "suite", "event": "ok", "passed": 11, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 4.212412414 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "ctb_32_is_the_faster_tree_at_1080p" }
+{ "type": "test", "event": "started", "name": "intra_1080p_beats_the_incumbent_on_twelve_threads" }
+{ "type": "test", "event": "started", "name": "speedup_curve" }
+{ "type": "test", "event": "timeout", "name": "ctb_32_is_the_faster_tree_at_1080p" }
+{ "type": "test", "event": "timeout", "name": "intra_1080p_beats_the_incumbent_on_twelve_threads" }
+{ "type": "test", "event": "timeout", "name": "speedup_curve" }
+{ "type": "test", "name": "speedup_curve", "event": "ok", "exec_time": 114.861104588 }
+{ "type": "test", "name": "ctb_32_is_the_faster_tree_at_1080p", "event": "ok", "exec_time": 165.463790618 }
+{ "type": "test", "name": "intra_1080p_beats_the_incumbent_on_twelve_threads", "event": "ok", "exec_time": 451.035376989 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 451.038402017 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "bitrate_lands_within_five_percent_of_each_target" }
+{ "type": "test", "event": "started", "name": "bitrate_output_is_identical_at_any_thread_count" }
+{ "type": "test", "event": "started", "name": "flat_near_black_descends_to_the_qp_floor" }
+{ "type": "test", "event": "started", "name": "noisy_near_black_lands_within_five_percent" }
+{ "type": "test", "name": "flat_near_black_descends_to_the_qp_floor", "event": "ok", "exec_time": 0.248839325 }
+{ "type": "test", "name": "bitrate_output_is_identical_at_any_thread_count", "event": "ok", "exec_time": 8.189732518 }
+{ "type": "test", "name": "bitrate_lands_within_five_percent_of_each_target", "event": "ok", "exec_time": 11.444554538 }
+{ "type": "test", "name": "noisy_near_black_lands_within_five_percent", "event": "ok", "exec_time": 41.169792566 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 41.18588655 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "rdoq_cache_hash_1920x1080" }
+{ "type": "test", "event": "started", "name": "rdoq_cache_hash_416x240" }
+{ "type": "test", "event": "started", "name": "rdoq_cache_hash_is_pinned" }
+{ "type": "test", "name": "rdoq_cache_hash_416x240", "event": "ok", "exec_time": 0.585056329 }
+{ "type": "test", "name": "rdoq_cache_hash_1920x1080", "event": "ok", "exec_time": 8.127160412 }
+{ "type": "test", "name": "rdoq_cache_hash_is_pinned", "event": "ok", "exec_time": 8.740039956 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 8.74376734 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "real_library_hevc_streams_match_ffmpeg" }
+{ "type": "test", "name": "real_library_hevc_streams_match_ffmpeg", "event": "ignored", "message": "sweeps the PERSONAL media library (fixtures/real-library-manifest.tsv, hevc rows) through ffmpeg; minutes of wall time. Local only: run with --ignored." }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.00004244 }
+{ "type": "suite", "event": "started", "test_count": 14 }
+{ "type": "test", "event": "started", "name": "control_streams_decode" }
+{ "type": "test", "event": "started", "name": "layer_one_nal_units_are_skipped_and_base_layer_decodes" }
+{ "type": "test", "event": "started", "name": "pps_3d_extension_is_refused_by_name" }
+{ "type": "test", "event": "started", "name": "pps_multilayer_extension_is_refused_by_name" }
+{ "type": "test", "name": "pps_3d_extension_is_refused_by_name", "event": "ok", "exec_time": 0.000651434 }
+{ "type": "test", "event": "started", "name": "pps_range_extension_tools_are_accepted" }
+{ "type": "test", "name": "pps_multilayer_extension_is_refused_by_name", "event": "ok", "exec_time": 0.000507082 }
+{ "type": "test", "event": "started", "name": "pps_scc_extension_is_refused_by_name" }
+{ "type": "test", "name": "layer_one_nal_units_are_skipped_and_base_layer_decodes", "event": "ok", "exec_time": 0.002149058 }
+{ "type": "test", "event": "started", "name": "range_extension_formats_decode" }
+{ "type": "test", "name": "pps_range_extension_tools_are_accepted", "event": "ok", "exec_time": 0.002429536 }
+{ "type": "test", "event": "started", "name": "separate_colour_planes_are_refused_by_name" }
+{ "type": "test", "name": "pps_scc_extension_is_refused_by_name", "event": "ok", "exec_time": 0.002932662 }
+{ "type": "test", "event": "started", "name": "sixteen_bit_is_refused_by_name" }
+{ "type": "test", "name": "separate_colour_planes_are_refused_by_name", "event": "ok", "exec_time": 0.001022352 }
+{ "type": "test", "event": "started", "name": "sps_3d_extension_is_refused_by_name" }
+{ "type": "test", "name": "sixteen_bit_is_refused_by_name", "event": "ok", "exec_time": 0.000492345 }
+{ "type": "test", "event": "started", "name": "sps_cabac_bypass_alignment_is_refused_by_name" }
+{ "type": "test", "name": "sps_3d_extension_is_refused_by_name", "event": "ok", "exec_time": 0.000522612 }
+{ "type": "test", "event": "started", "name": "sps_extended_precision_is_refused_by_name" }
+{ "type": "test", "name": "sps_cabac_bypass_alignment_is_refused_by_name", "event": "ok", "exec_time": 0.000486153 }
+{ "type": "test", "event": "started", "name": "sps_multilayer_extension_is_refused_by_name" }
+{ "type": "test", "name": "range_extension_formats_decode", "event": "ok", "exec_time": 0.004848592 }
+{ "type": "test", "event": "started", "name": "sps_scc_extension_is_refused_by_name" }
+{ "type": "test", "name": "sps_extended_precision_is_refused_by_name", "event": "ok", "exec_time": 0.000536729 }
+{ "type": "test", "name": "sps_multilayer_extension_is_refused_by_name", "event": "ok", "exec_time": 0.000571553 }
+{ "type": "test", "name": "sps_scc_extension_is_refused_by_name", "event": "ok", "exec_time": 0.000270037 }
+{ "type": "test", "name": "control_streams_decode", "event": "ok", "exec_time": 0.014192981 }
+{ "type": "suite", "event": "ok", "passed": 14, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.014760578 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "generated_rext_streams_match_ffmpeg" }
+{ "type": "test", "name": "generated_rext_streams_match_ffmpeg", "event": "ok", "exec_time": 0.280930529 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.281420151 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "first_picture_of_each_scaling_list_stream_matches_ffmpeg" }
+{ "type": "test", "name": "first_picture_of_each_scaling_list_stream_matches_ffmpeg", "event": "ignored", "message": "intra path lacks the syntax these streams use (desync at the IDR's last CTB)" }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.000069711 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000049503 }

@@ -27,6 +27,7 @@
 #![warn(missing_docs)]
 
 pub mod decoder;
+mod dts;
 mod raw;
 pub mod tags;
 
@@ -69,12 +70,16 @@ pub enum Format {
     Adts,
     /// Ogg: Vorbis, Opus or FLAC inside it.
     Ogg,
+    /// Raw DTS core (with or without DTS-HD extension substreams).
+    Dts,
     /// ISO base media: mp4, m4a, mov.
     Mp4,
     /// RIFF/AVI.
     Avi,
     /// Matroska and WebM.
     Matroska,
+    /// Raw AMR storage format (`.amr` / `.awb`).
+    Amr,
 }
 
 impl Format {
@@ -85,10 +90,12 @@ impl Format {
             Format::Flac => "flac",
             Format::Mp3 => "mp3",
             Format::Adts => "adts",
+            Format::Dts => "dts",
             Format::Ogg => "ogg",
             Format::Mp4 => "mp4",
             Format::Matroska => "matroska",
             Format::Avi => "avi",
+            Format::Amr => "amr",
         }
     }
 
@@ -100,10 +107,12 @@ impl Format {
             Format::Flac => &["flac"],
             Format::Mp3 => &["mp3"],
             Format::Adts => &["aac", "adts"],
+            Format::Dts => &["dts", "dtshd"],
             Format::Ogg => &["ogg", "oga", "opus"],
             Format::Mp4 => &["mp4", "m4a", "m4v", "mov"],
             Format::Matroska => &["mkv", "mka", "mks", "mk3d", "webm"],
             Format::Avi => &["avi"],
+            Format::Amr => &["amr", "awb"],
         }
     }
 }
@@ -122,6 +131,9 @@ pub fn sniff(head: &[u8]) -> Option<Format> {
             _ => {}
         }
     }
+    if ec_amr::container::probe(data).is_some() {
+        return Some(Format::Amr);
+    }
     if data.starts_with(b"fLaC") {
         return Some(Format::Flac);
     }
@@ -133,6 +145,9 @@ pub fn sniff(head: &[u8]) -> Option<Format> {
     }
     if ec_mp4::is_mp4(data) {
         return Some(Format::Mp4);
+    }
+    if dts_chains(data) {
+        return Some(Format::Dts);
     }
     // Whichever of the two framed formats starts *first*, and only where three
     // frames chain: AAC payload bytes routinely parse as a lone MPEG audio
@@ -148,6 +163,22 @@ pub fn sniff(head: &[u8]) -> Option<Format> {
         }
     }
     None
+}
+
+/// True when `data` opens with DTS access units that chain (or run out of
+/// data first).
+fn dts_chains(data: &[u8]) -> bool {
+    let mut at = 0;
+    for _ in 0..SYNC_CHAIN {
+        match dts::access_unit(&data[at..]) {
+            Some((_, len)) => at += len,
+            None => return false,
+        }
+        if at >= data.len() {
+            return true;
+        }
+    }
+    true
 }
 
 /// Offsets a sync search looks through before giving up.
@@ -232,10 +263,12 @@ impl Reader {
                     Format::Flac,
                     Format::Mp3,
                     Format::Adts,
+                    Format::Dts,
                     Format::Ogg,
                     Format::Mp4,
                     Format::Matroska,
                     Format::Avi,
+                    Format::Amr,
                 ]
                 .into_iter()
                 .find(|f| f.extensions().contains(&hint.as_str()))
@@ -243,7 +276,7 @@ impl Reader {
             .ok_or_else(|| {
                 Error::unsupported(
                     "this file",
-                    "its first bytes match no format this build reads (wav, flac, mp3, adts, ogg, mp4, avi, matroska)",
+                    "its first bytes match no format this build reads (wav, flac, mp3, adts, ogg, mp4, avi, matroska, amr)",
                 )
             })?;
         src.rewind()?;
@@ -289,9 +322,14 @@ impl Reader {
             }
             Format::Wav => open_wav(src, end),
             Format::Avi => open_avi(src),
+            Format::Amr => {
+                let demuxer = ec_amr::container::AmrDemuxer::new(src)?;
+                Ok(Reader::wrap(format, Box::new(demuxer), Tags::default(), vec![0]))
+            }
             Format::Flac => open_flac(src, &head, end),
             Format::Mp3 => open_mp3(src, &head, end),
             Format::Adts => open_adts(src, &head, end),
+            Format::Dts => open_dts(src, end),
         }
     }
 
@@ -483,13 +521,97 @@ fn read_upto(r: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
     Ok(at)
 }
 
+/// The `data` chunk of a RIFF/WAVE file, as `(start, end)`, when it holds a
+/// DTS stream: 16-bit PCM stereo whose samples spell DTS frames, or the
+/// `0x2001` format tag that says so outright. The chunk walk is the file's
+/// own, so a `fmt ` chunk the PCM reader would refuse is no obstacle.
+fn wav_dts_span<R: Read + Seek>(src: &mut R, end: u64) -> Result<Option<(u64, u64)>> {
+    let mut at = 12u64;
+    while at + 8 <= end {
+        src.seek(SeekFrom::Start(at))?;
+        let mut h = [0u8; 8];
+        if read_upto(src, &mut h)? < 8 {
+            break;
+        }
+        let size = u64::from(u32::from_le_bytes([h[4], h[5], h[6], h[7]]));
+        let body = at + 8;
+        if &h[..4] == b"data" {
+            // A streamed writer's placeholder size means the file is the bound.
+            let stop = if size == 0 || size == 0xFFFF_FFFF || body + size > end {
+                end
+            } else {
+                body + size
+            };
+            let mut window = vec![0u8; HEAD.min((stop - body) as usize)];
+            src.seek(SeekFrom::Start(body))?;
+            let got = read_upto(src, &mut window)?;
+            window.truncate(got);
+            return Ok(dts_chains(&window).then_some((body, stop)));
+        }
+        at = body + size + (size & 1);
+    }
+    Ok(None)
+}
+
+fn open_dts_span<R: Read + Seek + Send + 'static>(
+    mut src: R,
+    format: Format,
+    start: u64,
+    end: u64,
+) -> Result<Reader> {
+    let mut window = vec![0u8; HEAD.min((end - start) as usize)];
+    src.seek(SeekFrom::Start(start))?;
+    let got = read_upto(&mut src, &mut window)?;
+    window.truncate(got);
+    let (core, _) = dts::access_unit(&window)
+        .ok_or_else(|| Error::corrupt("dts: no frame at the start of the stream"))?;
+    let total = dts_total(&window, end, start);
+    let demuxer = raw::RawDemuxer::new(
+        src,
+        raw::Kind::Dts,
+        raw::dts_parameters(&core),
+        start,
+        end,
+        total,
+        None,
+    )?;
+    Ok(Reader::wrap(
+        format,
+        Box::new(demuxer),
+        Tags::default(),
+        vec![0],
+    ))
+}
+
 fn open_wav<R: Read + Seek + Send + 'static>(mut src: R, end: u64) -> Result<Reader> {
+    if let Some((start, stop)) = wav_dts_span(&mut src, end)? {
+        return open_dts_span(src, Format::Wav, start, stop);
+    }
     src.rewind()?;
-    let (spec, frames) = {
+    let (spec, frames, compressed) = {
         let reader = ec_riff::WavReader::new(&mut src)?;
-        (reader.spec(), reader.duration())
+        (reader.spec(), reader.duration(), reader.compressed().cloned())
     };
     let start = src.stream_position()?;
+    if let Some(c) = compressed {
+        let (params, kind) = raw::wav_compressed_parameters(spec, &c)?;
+        let bytes_per = match kind {
+            raw::Kind::WavBlocks { block, samples } => (block as u64, samples),
+            _ => (u64::from(spec.channels.max(1)), 1),
+        };
+        let audio_end = frames
+            .map(|n| start + n / bytes_per.1 * bytes_per.0)
+            .unwrap_or(end)
+            .min(end);
+        let total = frames.or(Some((audio_end - start) / bytes_per.0 * bytes_per.1));
+        let demuxer = raw::RawDemuxer::new(src, kind, params, start, audio_end, total, None)?;
+        return Ok(Reader::wrap(
+            Format::Wav,
+            Box::new(demuxer),
+            Tags::default(),
+            vec![0],
+        ));
+    }
     let (params, block_align) = raw::wav_parameters(spec)?;
     // A `data` size the header did not state (a streamed writer's placeholder)
     // means the file itself is the bound.
@@ -649,6 +771,28 @@ fn open_adts<R: Read + Seek + Send + 'static>(mut src: R, head: &[u8], end: u64)
     Ok(Reader::wrap(Format::Adts, Box::new(demuxer), tags, vec![0]))
 }
 
+fn open_dts<R: Read + Seek + Send + 'static>(src: R, end: u64) -> Result<Reader> {
+    open_dts_span(src, Format::Dts, 0, end)
+}
+
+/// Duration estimate in samples: the span's size over the mean access unit
+/// of the head window.
+fn dts_total(window: &[u8], end: u64, start: u64) -> Option<u64> {
+    let (mut sum, mut samples, mut at) = (0u64, 0u64, 0usize);
+    while sum < (1 << 20) {
+        let Some((core, len)) = dts::access_unit(window.get(at..)?) else {
+            break;
+        };
+        if at + len > window.len() {
+            break;
+        }
+        sum += len as u64;
+        samples += u64::from(core.samples);
+        at += len;
+    }
+    (sum > 0).then(|| (end - start) * samples / sum)
+}
+
 fn open_avi<R: Read + Seek + Send + 'static>(src: R) -> Result<Reader> {
     let reader = ec_riff::AviReader::new(src)?;
     let demuxer = AviDemuxer::new(reader)?;
@@ -687,6 +831,9 @@ impl<R: Read + Seek> AviDemuxer<R> {
                 0x0055 => CodecId::Mp3,
                 0x00ff => CodecId::Aac,
                 0x2000 => CodecId::Ac3,
+                0x0011 | 0x0002 | 0x0006 | 0x0007 => {
+                    ec_riff::WavCompressed::codec_of(s.format_tag).unwrap_or(CodecId::PcmAlaw)
+                }
                 tag => {
                     return Err(Error::unsupported(
                         format!("AVI audio format tag {tag:#06x}"),
@@ -701,10 +848,18 @@ impl<R: Read + Seek> AviDemuxer<R> {
                 format: match codec {
                     CodecId::PcmU8 => Some(SampleFormat::U8),
                     CodecId::PcmS16Le => Some(SampleFormat::S16),
+                    CodecId::ImaAdpcmWav
+                    | CodecId::MsAdpcm
+                    | CodecId::PcmAlaw
+                    | CodecId::PcmMulaw => Some(SampleFormat::S16),
                     _ => None,
                 },
                 bits_per_sample: (s.bits_per_sample > 0).then_some(u32::from(s.bits_per_sample)),
             });
+            let extra = reader.audio_extradata(index);
+            if !extra.is_empty() && matches!(codec, CodecId::ImaAdpcmWav | CodecId::MsAdpcm) {
+                params.extradata = Some(Buf::copy_from_slice(extra));
+            }
             let mut info = StreamInfo::new(
                 index as u32,
                 TimeBase::from_rate(s.sample_rate.max(1)),
@@ -747,6 +902,37 @@ impl<R: Read + Seek> AviDemuxer<R> {
         match codec {
             CodecId::Ac3 | CodecId::EAc3 | CodecId::Mp3 | CodecId::Aac => {
                 self.queue_elementary_chunk(stream, chunk.data, codec)
+            }
+            CodecId::ImaAdpcmWav | CodecId::MsAdpcm => {
+                // One decodable block per packet.
+                let avi = self.reader.audio_streams().get(stream).copied();
+                let (ba, ch) = avi.map_or((0usize, 1u32), |s| {
+                    (usize::from(s.block_align), u32::from(s.channels.max(1)))
+                });
+                let spb = ec_riff::WavCompressed::new(
+                    avi.map_or(0, |s| s.format_tag),
+                    ch as u16,
+                    ba as u16,
+                    &[],
+                )
+                .map_or(0, |c| u64::from(c.samples_per_block));
+                if ba == 0 || spb == 0 {
+                    return Ok(());
+                }
+                for block in chunk.data.chunks(ba).filter(|b| b.len() == ba) {
+                    self.push_packet(stream, Buf::copy_from_slice(block), spb);
+                }
+                Ok(())
+            }
+            CodecId::PcmAlaw | CodecId::PcmMulaw => {
+                let ch = self
+                    .reader
+                    .audio_streams()
+                    .get(stream)
+                    .map_or(1usize, |s| usize::from(s.channels.max(1)));
+                let frames = (chunk.data.len() / ch) as u64;
+                self.push_packet(stream, Buf::from_vec(chunk.data), frames);
+                Ok(())
             }
             _ => {
                 let frames = match codec {

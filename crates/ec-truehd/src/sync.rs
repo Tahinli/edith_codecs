@@ -48,9 +48,12 @@
 //! substream convention — substream 0 always carries a 2-ch presentation,
 //! substream 1 (when present) adds a discrete 6-ch (5.1) presentation,
 //! substream 2 (when present) adds a discrete 8-ch (7.1) presentation, and a
-//! 4th substream carries an unrelated object-audio payload — rather than
-//! from the major sync's own channel-assignment bitfields, for the reason
-//! above.
+//! 4th substream (Atmos) carries an object-audio extension, which this build
+//! does not decode: it is located by its directory entry and skipped, so the
+//! PCM presentations are decoded exactly as they would be without it. That
+//! is the same backward-compatible shape ffmpeg's decoder uses. The count
+//! comes from the directory rather than the major sync's own channel-assignment
+//! bitfields, for the reason above.
 
 use ec_core::error::{Error, Result};
 use ec_core::frame::{AudioFrame, ChannelLayout, Frame};
@@ -66,6 +69,14 @@ pub const MAJOR_SYNC_MLP: u32 = 0xF872_6FBB;
 /// Bytes a major sync occupies, format id included, ending where the
 /// substream directory begins.
 const MAJOR_SYNC_LEN: usize = 28;
+
+/// Dolby's cap on substream directory entries per access unit: entries 0..=2
+/// are the 2-ch, 6-ch and 8-ch PCM presentations, entry 3 (when present) is
+/// the object-audio extension.
+const MAX_DIRECTORY_ENTRIES: usize = 4;
+/// How many leading directory entries are PCM presentations: the highest of
+/// them is the stream's output. Entries past this are not decoded.
+pub(crate) const PCM_SUBSTREAMS: usize = 3;
 
 /// Bytes the fixed part of an access unit's own header takes: the 16-bit
 /// length/check word and the 16-bit input timing.
@@ -225,6 +236,11 @@ impl AccessUnitHeader {
         let mut substreams = Vec::new();
         let mut pos = dir_start;
         loop {
+            if substreams.len() == MAX_DIRECTORY_ENTRIES {
+                return Err(Error::corrupt(
+                    "TrueHD: substream directory has more than 4 entries",
+                ));
+            }
             let word = au.get(pos..pos + 2).ok_or(Error::NeedMore)?;
             let word = u16::from_be_bytes([word[0], word[1]]);
             let flags = (word >> 12) as u8;
@@ -242,12 +258,6 @@ impl AccessUnitHeader {
                 end_offset_words,
                 extra,
             });
-            if substreams.len() >= 4 {
-                return Err(Error::unsupported(
-                    "TrueHD 4th (object/16-channel) substream",
-                    "only the 2/6/8-channel PCM presentations are implemented",
-                ));
-            }
             if pos + usize::from(end_offset_words) * 2 == length {
                 break;
             }
@@ -281,15 +291,16 @@ impl AccessUnitHeader {
         )
     }
 
-    /// The channel layout Dolby's substream convention implies: substream 0
-    /// is always a 2-ch presentation, substream 1 (when present) a discrete
-    /// 5.1, substream 2 (when present) a discrete 7.1. [`parse`](Self::parse)
-    /// already refuses a 4th substream, so this never sees one.
+    /// The channel layout of the highest PCM presentation this access unit
+    /// carries: substream 0 is always a 2-ch presentation, substream 1 (when
+    /// present) a discrete 5.1, substream 2 (when present) a discrete 7.1.
+    /// A 4th entry (object audio, not decoded) does not change the answer:
+    /// the 7.1 presentation is still the highest PCM one.
     pub fn channel_layout(&self) -> Result<ChannelLayout> {
         match self.substreams.len() {
             1 => Ok(ChannelLayout::Stereo),
             2 => Ok(ChannelLayout::Surround5_1),
-            3 => Ok(ChannelLayout::Surround7_1),
+            3 | 4 => Ok(ChannelLayout::Surround7_1),
             n => Err(Error::corrupt(format!("TrueHD: {n} substreams"))),
         }
     }
@@ -460,34 +471,37 @@ mod tests {
     }
 
     #[test]
-    fn a_fourth_substream_is_named_unsupported() {
+    fn a_directory_past_four_entries_is_corrupt() {
         // A 20-byte access unit, followed by five directory entries whose
         // end pointers never land on that length -- forces the walk past
-        // the 4-substream cap before it can terminate.
+        // the 4-entry cap before it can terminate.
         let mut au = vec![0x00, 0x0A, 0x00, 0x00]; // length 10 words = 20 bytes
         for _ in 0..5 {
             au.extend_from_slice(&[0x00, 0x01]);
         }
         au.resize(20, 0);
         let err = AccessUnitHeader::parse(&au).unwrap_err();
-        assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+        assert!(matches!(err, Error::Corrupt { .. }), "{err:?}");
     }
 
     #[test]
-    fn a_well_formed_4_entry_directory_is_still_named_unsupported() {
+    fn a_well_formed_4_entry_directory_parses_with_7_1_on_top() {
         // A 20-byte access unit whose directory has exactly 4 entries, the
-        // last of which lands squarely on the access unit's end (the
-        // well-formed object-audio shape, not a walk that overruns a
-        // malformed directory). This must be refused by name, not parsed as
-        // Ok(4) and only caught later in channel_layout().
+        // last of which lands squarely on the access unit's end: the Atmos
+        // shape. Entry 3 is the object-audio substream and is not decoded;
+        // the highest PCM presentation is still entry 2's 8-ch (7.1), and
+        // that is what channel_layout() reports.
         let mut au = vec![0x00, 0x0A, 0x00, 0x00]; // length 10 words = 20 bytes
         au.extend_from_slice(&[0x00, 0x01]); // substream 0: doesn't land on EOF yet
         au.extend_from_slice(&[0x00, 0x01]); // substream 1: doesn't land on EOF yet
         au.extend_from_slice(&[0x00, 0x01]); // substream 2: doesn't land on EOF yet
         au.extend_from_slice(&[0x00, 0x04]); // substream 3: pos(12) + 4*2 == 20, lands on EOF
         au.resize(20, 0);
-        let err = AccessUnitHeader::parse(&au).unwrap_err();
-        assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+        let parsed = AccessUnitHeader::parse(&au).unwrap();
+        assert_eq!(parsed.substreams.len(), 4);
+        // Entry 3's coded data is the object-audio span the decoder skips.
+        assert_eq!(parsed.substream_span(3), (14, 20));
+        assert_eq!(parsed.channel_layout().unwrap(), ChannelLayout::Surround7_1);
     }
 
     #[test]

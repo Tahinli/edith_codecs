@@ -104,8 +104,7 @@ fn unit_sse(
     }
     let per = h.div_ceil(unit).div_ceil(threads);
     let total = std::sync::atomic::AtomicU64::new(0);
-    {
-        let batch = crate::par::Batch::new("ec-av1-filter");
+    crate::par::scope("ec-av1-filter", |batch| {
         for (band, rows) in out.chunks_mut(per * sb_cols).enumerate() {
             let (r0, r1) = ((band * per * unit).min(h), ((band + 1) * per * unit).min(h));
             if r0 == r1 {
@@ -117,7 +116,7 @@ fn unit_sse(
                 total.fetch_add(sse, std::sync::atomic::Ordering::Relaxed);
             });
         }
-    }
+    });
     total.into_inner()
 }
 
@@ -207,6 +206,8 @@ struct Trial {
 /// # Errors
 /// Whatever `decode` returns: a stream this crate's own decoder refuses is
 /// a caller's cue to keep its unfiltered reconstruction.
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pick_filters(
     decode: impl Fn(&LoopFilterParams, &CdefParams) -> Result<Picture>,
     source: [&[u8]; 3],
@@ -369,6 +370,8 @@ pub(crate) fn pick_filters(
     };
     let mut counts = vec![0usize; pool.len()];
     let best_sse = sse_of(&best).clone();
+    // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+    #[allow(clippy::needless_range_loop)]
     for sb in 0..nsb {
         let mut winner = (best_sse[sb], usize::MAX);
         for (i, c) in pool.iter().enumerate() {
@@ -572,11 +575,12 @@ pub(crate) fn pick_restoration(
             return;
         }
         let per = vert.div_ceil(threads);
-        let batch = crate::par::Batch::new("ec-av1-filter");
-        for (band, slice) in best.chunks_mut(per * horz).enumerate() {
-            let rows_of = &rows_of;
-            batch.submit(move || rows_of(plane, band * per, slice, score));
-        }
+        crate::par::scope("ec-av1-filter", |batch| {
+            for (band, slice) in best.chunks_mut(per * horz).enumerate() {
+                let rows_of = &rows_of;
+                batch.submit(move || rows_of(plane, band * per, slice, score));
+            }
+        });
     };
     let mut best: Vec<(f64, Option<crate::restoration::WienerInfo>)> =
         vec![(0.0, None); horz * vert];

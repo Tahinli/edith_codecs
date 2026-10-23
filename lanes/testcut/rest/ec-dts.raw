@@ -1,0 +1,28 @@
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000076694 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "fate_vectors_are_bit_exact_against_ffmpeg" }
+{ "type": "test", "name": "fate_vectors_are_bit_exact_against_ffmpeg", "event": "ok", "exec_time": 1.5530342529999999 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 1.553318445 }
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "damaged_streams_never_panic" }
+{ "type": "test", "event": "started", "name": "dts_hd_substream_is_parsed_and_the_core_is_output" }
+{ "type": "test", "event": "started", "name": "fixtures_are_bit_exact_against_ffmpeg" }
+{ "type": "test", "event": "started", "name": "header_api_states_the_stream" }
+{ "type": "test", "name": "header_api_states_the_stream", "event": "ok", "exec_time": 0.000134232 }
+{ "type": "test", "event": "started", "name": "stream_layouts_decode_identically" }
+{ "type": "test", "name": "dts_hd_substream_is_parsed_and_the_core_is_output", "event": "ok", "exec_time": 0.00239035 }
+{ "type": "test", "name": "damaged_streams_never_panic", "event": "ok", "exec_time": 0.018664998 }
+{ "type": "test", "name": "fixtures_are_bit_exact_against_ffmpeg", "event": "ok", "exec_time": 0.759341867 }
+{ "type": "test", "name": "stream_layouts_decode_identically", "event": "ok", "exec_time": 2.071174878 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 2.07267657 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "float_and_fir_tables_match_spec" }
+{ "type": "test", "event": "started", "name": "huffman_books_match_spec" }
+{ "type": "test", "event": "started", "name": "integer_tables_match_spec" }
+{ "type": "test", "name": "float_and_fir_tables_match_spec", "event": "ok", "exec_time": 0.001223828 }
+{ "type": "test", "name": "integer_tables_match_spec", "event": "ok", "exec_time": 0.001454903 }
+{ "type": "test", "name": "huffman_books_match_spec", "event": "ok", "exec_time": 0.001617458 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00221939 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00003687 }

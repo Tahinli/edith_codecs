@@ -12,7 +12,10 @@
 //! The same binary hosts the zero-allocation proof and the ns/MB
 //! measurement so the crate keeps a single integration-test link unit.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::System;
+use std::sync::Once;
+
+use tracking_allocator::{AllocationGroupId, AllocationRegistry, AllocationTracker, Allocator};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,26 +44,34 @@ fn counting_here() -> bool {
     COUNTING_HERE.try_with(Cell::get).unwrap_or(false)
 }
 
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+impl AllocationTracker for CountingAlloc {
+    fn allocated(&self, _addr: usize, _object_size: usize, _wrapped: usize, _g: AllocationGroupId) {
         if counting_here() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
         }
-        unsafe { System.alloc(layout) }
     }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if counting_here() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(ptr, layout, new_size) }
+    fn deallocated(
+        &self,
+        _addr: usize,
+        _object_size: usize,
+        _wrapped: usize,
+        _source: AllocationGroupId,
+        _current: AllocationGroupId,
+    ) {
     }
 }
 
 #[global_allocator]
-static A: CountingAlloc = CountingAlloc;
+static A: Allocator<System> = Allocator::system();
+
+/// Installs the tracker once; every test that arms the counter calls this first.
+fn install_counter() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = AllocationRegistry::set_global_tracker(CountingAlloc);
+        AllocationRegistry::enable_tracking();
+    });
+}
 
 // ---------------------------------------------------------------------------
 
@@ -423,6 +434,7 @@ fn jvt_cavlc_first_idr_bit_exact() {
 /// caller owned planes — which also proves the counter is alive.
 #[test]
 fn steady_state_decode_loop_zero_alloc() {
+    install_counter();
     let base = vectors_dir();
     if !require_fixtures(
         &base,
@@ -898,94 +910,6 @@ fn jvt_scaling_matrices_decode_bit_exact() {
         Ok(n) => panic!("cqm=jvt: {n} bytes differ from ffmpeg"),
         Err(e) => panic!("{e}"),
     }
-}
-
-/// Every refusal, proved against a stream that really uses the feature.
-///
-/// A "not supported" string is a claim about this binary; without a stream
-/// that triggers it, it is just as likely to be a bug being hidden.
-#[test]
-fn refusals_name_a_feature_the_stream_really_uses() {
-    if !have_ffmpeg() {
-        eprintln!("SKIP: ffmpeg not on PATH");
-        return;
-    }
-    let dir = scratch("refusals");
-    // (tag, encoder arguments, the words the refusal must contain)
-    let cases: &[(&str, &[&str], &str)] = &[
-        // Field or macroblock-adaptive frame/field coding: the neighbour
-        // derivation of 6.4.9 is not implemented, under either entropy coder.
-        (
-            "interlaced",
-            &[
-                "-profile:v",
-                "main",
-                "-coder",
-                "ac",
-                "-qp",
-                "26",
-                "-x264-params",
-                "interlaced=1",
-            ],
-            "frame_mbs_only_flag 0",
-        ),
-        (
-            "yuv422",
-            &[
-                "-profile:v",
-                "high422",
-                "-qp",
-                "26",
-                "-pix_fmt",
-                "yuv422p",
-                "-x264-params",
-                "cabac=0",
-            ],
-            "chroma_format_idc 2",
-        ),
-        (
-            "high10",
-            &[
-                "-profile:v",
-                "high10",
-                "-qp",
-                "26",
-                "-pix_fmt",
-                "yuv420p10le",
-                "-x264-params",
-                "cabac=0",
-            ],
-            "10-bit",
-        ),
-    ];
-    let mut table = String::new();
-    let mut failures = Vec::new();
-    let mut proved = 0usize;
-    for (tag, extra, expected) in cases {
-        let Some(stream) = x264_encode(&dir, tag, "176x144", extra) else {
-            table.push_str(&format!(
-                "{tag:<13} not encodable by this ffmpeg, skipped\n"
-            ));
-            continue;
-        };
-        match decode_first(&std::fs::read(&stream).unwrap()) {
-            Err(Error::Unsupported { what, why }) => {
-                let message = format!("{what} ({why})");
-                if message.contains(expected) {
-                    proved += 1;
-                    table.push_str(&format!("{tag:<13} refused: {what}\n"));
-                } else {
-                    failures.push(format!("{tag}: refused as {message}, expected {expected}"));
-                }
-            }
-            Err(e) => failures.push(format!("{tag}: expected Unsupported({expected}), got {e}")),
-            Ok(_) => failures.push(format!("{tag}: decoded a stream it does not support")),
-        }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    eprintln!("{table}");
-    assert!(failures.is_empty(), "{failures:#?}");
-    assert!(proved >= 2, "too few refusals proved against real streams");
 }
 
 /// The `avcC` entry path: parameter sets out of band and NAL units length

@@ -32,9 +32,17 @@ pub(crate) enum Kind {
     Wav {
         block_align: usize,
     },
+    /// Block-coded audio (IMA/MS ADPCM): one packet is one `block` of bytes
+    /// decoding to `samples` frames.
+    WavBlocks {
+        block: usize,
+        samples: u64,
+    },
     Mp3,
     Flac,
     Adts,
+    /// DTS core frames, each with its extension substream when one follows.
+    Dts,
 }
 
 /// A frame's byte length and how many inter-channel samples it holds.
@@ -115,12 +123,14 @@ impl<R: Read + Seek> RawDemuxer<R> {
     fn frame_samples(&self) -> u64 {
         match self.kind {
             Kind::Wav { .. } => WAV_FRAMES as u64,
+            Kind::WavBlocks { samples, .. } => samples,
             Kind::Mp3 => 1152,
             Kind::Flac => self
                 .flac
                 .as_ref()
                 .map_or(4096, |i| u64::from(i.max_block_size)),
             Kind::Adts => 1024,
+            Kind::Dts => 512,
         }
     }
 
@@ -181,6 +191,7 @@ impl<R: Read + Seek> RawDemuxer<R> {
     fn framing(&mut self) -> Result<Framing> {
         let want = match self.kind {
             Kind::Wav { block_align } => block_align * WAV_FRAMES,
+            Kind::WavBlocks { block, .. } => block,
             // A FLAC frame is bounded by the *next* sync word, so the window
             // has to hold a whole one plus the head of its successor.
             Kind::Flac => 1 << 20,
@@ -255,6 +266,13 @@ fn frame_at(kind: Kind, data: &[u8], flac: Option<&ec_flac::StreamInfo>) -> Resu
                 }),
             }
         }
+        Kind::WavBlocks { block, samples } => match data.len() >= block && block > 0 {
+            true => Ok(Framing {
+                bytes: block,
+                samples,
+            }),
+            false => Err(Error::Eof),
+        },
         Kind::Mp3 => {
             let header = ec_mp3::FrameHeader::parse(data)?;
             let bytes = header
@@ -276,6 +294,22 @@ fn frame_at(kind: Kind, data: &[u8], flac: Option<&ec_flac::StreamInfo>) -> Resu
             Ok(Framing {
                 bytes: header.frame_length,
                 samples: 1024 * u64::from(header.raw_blocks),
+            })
+        }
+        Kind::Dts => {
+            let Some((core, len)) = crate::dts::access_unit(data) else {
+                return Err(if data.len() < 16 {
+                    Error::NeedMore
+                } else {
+                    Error::corrupt("dts: not a frame header")
+                });
+            };
+            if len > data.len() {
+                return Err(Error::NeedMore);
+            }
+            Ok(Framing {
+                bytes: len,
+                samples: u64::from(core.samples),
             })
         }
         Kind::Flac => {
@@ -333,6 +367,13 @@ impl<R: Read + Seek + Send> Demuxer for RawDemuxer<R> {
             self.sample = target;
             return Ok(());
         }
+        if let Kind::WavBlocks { block, samples } = self.kind {
+            let n = target / samples.max(1);
+            let at = self.start + n * block as u64;
+            self.jump(at.min(self.end))?;
+            self.sample = n * samples.max(1);
+            return Ok(());
+        }
         self.build_index()?;
         let found = self.index.partition_point(|(s, _)| *s <= target);
         let i = match mode {
@@ -352,6 +393,39 @@ impl<R: Read + Seek + Send> Demuxer for RawDemuxer<R> {
 
 /// Codec parameters for a WAVE stream, whose `fmt ` chunk names its codec
 /// outright.
+/// Codec parameters and packet geometry for a compressed WAVE stream
+/// (IMA/MS ADPCM, A-law, mu-law): the kind to read it with.
+pub(crate) fn wav_compressed_parameters(
+    spec: ec_riff::WavSpec,
+    c: &ec_riff::WavCompressed,
+) -> Result<(CodecParameters, Kind)> {
+    let codec = ec_riff::WavCompressed::codec_of(c.tag)
+        .ok_or_else(|| Error::unsupported("this WAVE format", "no decoder for it"))?;
+    let mut params = CodecParameters::new(codec);
+    params.media = MediaParameters::Audio(AudioParameters {
+        sample_rate: spec.sample_rate,
+        layout: spec.layout(),
+        format: Some(SampleFormat::S16),
+        bits_per_sample: Some(16),
+    });
+    if !c.extra.is_empty() {
+        params.extradata = Some(Buf::copy_from_slice(&c.extra));
+    }
+    let kind = match c.tag {
+        0x0006 | 0x0007 => Kind::Wav {
+            block_align: usize::from(spec.channels),
+        },
+        _ => Kind::WavBlocks {
+            block: usize::from(c.block_align),
+            samples: u64::from(c.samples_per_block),
+        },
+    };
+    if matches!(kind, Kind::WavBlocks { block, samples } if block == 0 || samples == 0) {
+        return Err(Error::corrupt("WAVE: a block-coded format with no block size"));
+    }
+    Ok((params, kind))
+}
+
 pub(crate) fn wav_parameters(spec: ec_riff::WavSpec) -> Result<(CodecParameters, usize)> {
     let format = spec.sample_format()?;
     let codec = match (format, spec.bits_per_sample) {
@@ -398,4 +472,16 @@ pub(crate) fn adts_parameters(header: &ec_aac::AdtsHeader) -> CodecParameters {
 /// Codec parameters for an MP3 stream, from its first frame header.
 pub(crate) fn mp3_parameters(header: &ec_mp3::FrameHeader) -> CodecParameters {
     ec_mp3::codec_parameters(header.sample_rate, header.channels())
+}
+
+/// Codec parameters for a DTS stream, from its first core frame header.
+pub(crate) fn dts_parameters(core: &crate::dts::Core) -> CodecParameters {
+    let mut params = CodecParameters::new(CodecId::Dts);
+    params.media = MediaParameters::Audio(AudioParameters {
+        sample_rate: core.rate,
+        layout: ChannelLayout::from_count(usize::from(core.channels)),
+        format: None,
+        bits_per_sample: None,
+    });
+    params
 }

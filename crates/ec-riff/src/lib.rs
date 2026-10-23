@@ -15,8 +15,14 @@
 //! distrust a plain `WAVE_FORMAT_PCM` header — and is read whatever the file
 //! declares.
 //!
-//! Not covered: RF64/BW64 (>4 GiB), ADPCM and other compressed WAVE tags,
-//! 64-bit float, AVI video frames, and non-audio AVI chunks. Each unsupported
+//! RF64 and BW64 (>4 GiB) are written when [`WavOptions::expected_frames`] says the
+//! data will not fit in 32 bits, and read whatever the size fields say.
+//!
+//! [`AviDemuxer`] is the full AVI audio+video demuxer (OpenDML, idx1 or linear scan, keyframes,
+//! field order); [`AviReader`] is the older audio-only reader.
+//!
+//! Not covered: ADPCM and other compressed WAVE tags,
+//! 64-bit float, and non-audio/video AVI chunks. Each unsupported
 //! WAVE tag is [`Error::Unsupported`] naming itself, never a silent misread.
 //!
 //! The crate stands alone — [`WavSpec`] is its own type — but converts into the
@@ -26,13 +32,17 @@
 #![warn(missing_docs)]
 
 mod avi;
+mod demux;
+mod rawvideo;
 mod read;
 mod write;
 
 pub use avi::{AviAudioStream, AviIndexPoint, AviPacket, AviReader};
+pub use demux::{AviDemuxer, AviIndexKind, AviTrackInfo, is_avi};
 pub use ec_core::{Error, Result};
+pub use rawvideo::{MOV_MARKER, RawVideoDecoder};
 pub use read::WavReader;
-pub use write::{Sample, WavWriter};
+pub use write::{RF64_THRESHOLD, Sample, WavOptions, WavWriter};
 
 /// Whether samples are stored as integers (`WAVE_FORMAT_PCM`) or as floats
 /// (`WAVE_FORMAT_IEEE_FLOAT`).
@@ -149,6 +159,69 @@ impl WavSpec {
         match self.sample_format {
             SampleType::Int => FORMAT_PCM,
             SampleType::Float => FORMAT_FLOAT,
+        }
+    }
+}
+
+
+/// A non-PCM WAVE/AVI audio format this family can decode: IMA ADPCM
+/// (`0x0011`), MS ADPCM (`0x0002`), A-law (`0x0006`) and mu-law (`0x0007`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WavCompressed {
+    /// The `wFormatTag`.
+    pub tag: u16,
+    /// Channel count.
+    pub channels: u16,
+    /// `nBlockAlign`: bytes per coded block (the packet size for ADPCM).
+    pub block_align: u16,
+    /// Decoded samples per channel in one full block.
+    pub samples_per_block: u32,
+    /// The `cbSize` tail of the `fmt ` chunk (samples per block, plus the MS
+    /// ADPCM coefficient table), passed to the decoder as extradata.
+    pub extra: Vec<u8>,
+}
+
+impl WavCompressed {
+    /// The codec a tag names, if it is one of the four.
+    pub fn codec_of(tag: u16) -> Option<ec_core::registry::CodecId> {
+        use ec_core::registry::CodecId;
+        match tag {
+            0x0011 => Some(CodecId::ImaAdpcmWav),
+            0x0002 => Some(CodecId::MsAdpcm),
+            0x0006 => Some(CodecId::PcmAlaw),
+            0x0007 => Some(CodecId::PcmMulaw),
+            _ => None,
+        }
+    }
+
+    /// Build from the fields of a `fmt ` chunk.
+    pub fn new(tag: u16, channels: u16, block_align: u16, extra: &[u8]) -> Option<WavCompressed> {
+        Self::codec_of(tag)?;
+        let ch = u32::from(channels.max(1));
+        let ba = u32::from(block_align);
+        let spb = match tag {
+            0x0011 => (ba.saturating_sub(4 * ch) / (4 * ch)) * 8 + 1,
+            0x0002 => ba.saturating_sub(6 * ch) * 2 / ch,
+            _ => 1,
+        };
+        Some(WavCompressed {
+            tag,
+            channels,
+            block_align,
+            samples_per_block: spb,
+            extra: extra.to_vec(),
+        })
+    }
+
+    /// Frames (samples per channel) in `bytes` bytes of coded data.
+    pub fn frames_in(&self, bytes: u64) -> u64 {
+        let ch = u64::from(self.channels.max(1));
+        match self.tag {
+            0x0006 | 0x0007 => bytes / ch,
+            _ => {
+                let ba = u64::from(self.block_align.max(1));
+                bytes / ba * u64::from(self.samples_per_block)
+            }
         }
     }
 }

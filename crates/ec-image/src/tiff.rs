@@ -168,7 +168,7 @@ struct Layout {
     orientation: Option<u8>,
 }
 
-fn tag<'e>(entries: &'e [Entry], tag: u16) -> Option<&'e Entry> {
+fn tag(entries: &[Entry], tag: u16) -> Option<&Entry> {
     entries.iter().find(|e| e.tag == tag)
 }
 
@@ -210,7 +210,7 @@ fn layout(data: &[u8]) -> Result<Layout> {
         | COMPRESSION_DEFLATE
         | COMPRESSION_PACKBITS
         | COMPRESSION_DEFLATE_OLD => {}
-        2 | 3 | 4 => {
+        2..=4 => {
             return Err(Error::unsupported(
                 format!("TIFF: CCITT compression {compression}"),
                 "the fax coders are a separate format with their own \
@@ -263,7 +263,7 @@ fn layout(data: &[u8]) -> Result<Layout> {
     }
 
     let photometric = first(&entries, TAG_PHOTOMETRIC, 1);
-    if !matches!(photometric, 0 | 1 | 2 | 3) {
+    if !matches!(photometric, 0..=3) {
         return Err(Error::unsupported(
             format!("TIFF: photometric interpretation {photometric}"),
             "white-is-zero, black-is-zero, RGB and palette are the colour \
@@ -340,6 +340,8 @@ pub fn info(data: &[u8]) -> Result<Info> {
         format: ImageFormat::Tiff,
         width: layout.width,
         height: layout.height,
+        // Not read: TIFF orientation lives in the first directory, which `layout` does not keep.
+        orientation: 1,
     })
 }
 
@@ -428,12 +430,12 @@ fn lzw(input: &[u8], hint: usize) -> Result<Vec<u8>> {
             return Err(Error::corrupt("TIFF: an LZW code past the dictionary"));
         };
         out.extend(stack.iter().rev());
-        if let Some(previous) = previous {
-            if next < 4096 {
-                prefix[next] = previous;
-                suffix[next] = first_byte;
-                next += 1;
-            }
+        if let Some(previous) = previous
+            && next < 4096
+        {
+            prefix[next] = previous;
+            suffix[next] = first_byte;
+            next += 1;
         }
         previous = Some(code);
         // One code early: 511, not 512, is where nine bits stop being enough.
@@ -532,7 +534,12 @@ fn unpack(bytes: &[u8], bits: u16, count: usize, out: &mut Vec<u16>, big_endian:
 /// Decode the first image in the file.
 pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
     let layout = layout(data)?;
-    limits.check(layout.width, layout.height)?;
+    // The decoded picture is refused by name before any raw sample is sized: a palette file
+    // comes out as RGB, anything else keeps its samples, and each sample is 16 bits only for a
+    // 16-bit file.
+    let out_samples = if layout.photometric == 3 { 3 } else { layout.samples };
+    let out_depth = if layout.bits.first() == Some(&16) { 2 } else { 1 };
+    limits.check_output(layout.width, layout.height, out_samples * out_depth)?;
     let (width, height) = (layout.width as usize, layout.height as usize);
     if width == 0 || height == 0 {
         return Err(Error::corrupt("TIFF: a zero-sized picture"));
@@ -735,11 +742,10 @@ fn build(layout: &Layout, raw: &[u16], count: usize, bits: u16, full: u16) -> Re
         for pixel in wide.chunks_mut(samples) {
             let a = u32::from(pixel[samples - 1]);
             for channel in &mut pixel[..samples - 1] {
-                *channel = if a == 0 {
-                    0
-                } else {
-                    (((u32::from(*channel) * 65535 + a / 2) / a).min(65535)) as u16
-                };
+                // a == 0 means the pixel is fully transparent: its colour is zero.
+                *channel = (u32::from(*channel) * 65535 + a / 2)
+                    .checked_div(a)
+                    .map_or(0, |v| v.min(65535)) as u16;
             }
         }
     }

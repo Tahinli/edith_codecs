@@ -249,6 +249,28 @@ mod tests {
         assert_eq!(nals[1], &[0x41, 0x02]);
     }
 
+    // Regression (edith engine-hw, cabac_zero_word): a slice NAL may end in
+    // cabac_zero_words, which are 00 00 03 on the wire. They belong to the NAL
+    // (7.4.1.2.3), must not be split off as a NAL of their own, and must not
+    // be trimmed as trailing zeros, since the last byte is the 03.
+    #[test]
+    fn cabac_zero_words_stay_inside_their_slice_nal() {
+        let data = [
+            0x00, 0x00, 0x01, 0x41, 0x88, 0x80, // slice header and data
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, // cabac_zero_word x3
+            0x00, 0x00, 0x01, 0x41, 0x02,
+        ];
+        let nals: Vec<&[u8]> = AnnexBIter::new(&data).collect();
+        assert_eq!(nals.len(), 2);
+        assert_eq!(
+            nals[0],
+            &[
+                0x41, 0x88, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03
+            ]
+        );
+        assert_eq!(nals[1], &[0x41, 0x02]);
+    }
+
     #[test]
     fn unescape_removes_only_emulation_bytes() {
         let mut out = Vec::new();

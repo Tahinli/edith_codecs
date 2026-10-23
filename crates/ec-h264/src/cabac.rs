@@ -1,11 +1,10 @@
 //! CABAC slice-data parsing (spec clause 9.3): arithmetic decoding engine,
 //! context variables, binarizations and context selection.
 //!
-//! Scope is what a frame-coded 4:2:0 8-bit stream needs, I, P and B, with or
-//! without the High-profile 8x8 transform; every other tool the decoder refuses
-//! by name before reaching this module, so the contexts, block categories and
-//! initialisation columns that only field or 4:4:4 coding reads are absent
-//! rather than transcribed untested.
+//! Covers every slice type, frame and field coding, 4:2:0, 4:2:2 and 4:4:4 (the
+//! Cb and Cr residual categories of Table 9-34, ctxIdx 460..1023, whose
+//! initialisation values repeat the luma ones), with or without the 8x8
+//! transform.
 //!
 //! The engine keeps codIRange and codIOffset in `u32` with the spec's exact
 //! integer steps — no probability floats, no shortcuts — and reads its bits
@@ -18,19 +17,42 @@ use ec_core::error::{Error, Result};
 
 use crate::bits::BitCursor;
 use crate::cabac_tables::{
-    INIT_11_59, INIT_60_69, INIT_70_275, INIT_399_401, INIT_402_435, INIT_MB_TYPE_I, LAST_8X8,
-    RANGE_LPS, SIG_8X8_FRAME, TRANS_LPS, TRANS_MPS,
+    INIT_11_59, INIT_60_69, INIT_70_275, INIT_277_398, INIT_399_401, INIT_402_435, INIT_436_459,
+    INIT_1012_1015, INIT_MB_TYPE_I, LAST_8X8, RANGE_LPS, SIG_8X8_FIELD, SIG_8X8_FRAME, TRANS_LPS,
+    TRANS_MPS,
 };
 use crate::entropy::{
     BlockCat, FLAG_CHROMA_PRED, FLAG_DIRECT, FLAG_I16, FLAG_INTER, FLAG_PCM, FLAG_TRANS8X8, MbCtx,
     MbInfo,
 };
 
-/// Highest ctxIdx this decoder can address, plus one (426..435 is
-/// coeff_abs_level_minus1 of the 8x8 luma category, the last range a
-/// frame-coded 4:2:0 slice reaches; 436 and up are the field-coded and 4:4:4
-/// categories this decoder refuses by name).
-pub(crate) const NUM_CTX: usize = 436;
+/// ctxIdx count of the 4:2:0/4:2:2 slices (451..459 is the field-coded
+/// last_significant_coeff_flag of the 8x8 luma category, the last range they
+/// reach); 460 and up are the 4:4:4 categories ([`NUM_CTX_FULL`]).
+pub(crate) const NUM_CTX: usize = 460;
+
+/// Every ctxIdx of Table 9-34 including the Cb and Cr residual categories of
+/// 4:4:4 coding (460..1023).
+pub(crate) const NUM_CTX_FULL: usize = 1024;
+
+/// Table 9-34 bases of the Cb (index 0) and Cr (index 1) residual syntax
+/// elements of 4:4:4 coding, ctxBlockCat 6..8 and 10..12 (the 4x4 classes);
+/// the luma-style block class k adds `CBF_CAT_OFF[k]` and friends.
+const CBF_444: [usize; 2] = [460, 472];
+const SIG_444: [usize; 2] = [484, 528];
+const SIG_444_FIELD: [usize; 2] = [776, 820];
+const LAST_444: [usize; 2] = [572, 616];
+const LAST_444_FIELD: [usize; 2] = [864, 908];
+const ABS_444: [usize; 2] = [952, 982];
+/// ctxBlockCat 5, 9 and 13 (the 8x8 classes of Y, Cb, Cr): coded_block_flag.
+const CBF_8X8: usize = 1012;
+/// Significance, last-significance and level contexts of the Cb / Cr 8x8 class
+/// (ctxBlockCat 9 and 13).
+const SIG_8X8_444: [usize; 2] = [660, 718];
+const SIG_8X8_444_FIELD: [usize; 2] = [675, 733];
+const LAST_8X8_444: [usize; 2] = [690, 748];
+const LAST_8X8_444_FIELD: [usize; 2] = [699, 757];
+const ABS_8X8_444: [usize; 2] = [708, 766];
 
 /// ctxIdx 276 (end_of_slice_flag and the I_PCM bin of mb_type) is decoded by
 /// DecodeTerminate and has no adapting state.
@@ -67,6 +89,11 @@ pub(crate) const OFF_TRANSFORM_8X8: usize = 399;
 pub(crate) const OFF_SIG_8X8: usize = 402;
 pub(crate) const OFF_LAST_8X8: usize = 417;
 pub(crate) const OFF_ABS_8X8: usize = 426;
+/// The same elements for field-coded macroblocks (Table 9-34).
+pub(crate) const OFF_SIG_FIELD: usize = 277;
+pub(crate) const OFF_LAST_FIELD: usize = 338;
+pub(crate) const OFF_SIG_8X8_FIELD: usize = 436;
+pub(crate) const OFF_LAST_8X8_FIELD: usize = 451;
 
 /// The ctxIdx values the Intra_16x16 part of an mb_type bin string uses, in
 /// bin order: `[b0, CodedBlockPatternLuma, chroma bin 0, chroma bin 1,
@@ -130,7 +157,7 @@ pub(crate) struct Cabac<'a> {
     /// codIOffset (9.3.3.2).
     offset: u32,
     /// Context variables: `pStateIdx << 1 | valMPS`, indexed by ctxIdx.
-    state: [u8; NUM_CTX],
+    state: [u8; NUM_CTX_FULL],
     /// Neighbourhood of the macroblock being parsed.
     ctx: MbCtx,
     /// CodedBlockPatternLuma bins decoded so far in this macroblock, for the
@@ -164,13 +191,13 @@ impl<'a> Cabac<'a> {
             r,
             range: 510,
             offset: 0,
-            state: [63 << 1; NUM_CTX],
+            state: [63 << 1; NUM_CTX_FULL],
             ctx: MbCtx::default(),
             cbp_luma_bins: 0,
             cur_intra: true,
             account: BitAccount::default(),
         };
-        c.state = init_contexts(slice_qp, init_column.min(3));
+        c.state = init_contexts_full(slice_qp, init_column.min(3));
         c.init_engine()?;
         Ok(c)
     }
@@ -250,6 +277,12 @@ impl<'a> Cabac<'a> {
             self.renorm();
             false
         }
+    }
+
+    /// `mb_field_decoding_flag` (ctxIdx 70..72); `inc` counts the field
+    /// macroblock pairs left of and above the current pair (9.3.3.1.1.2).
+    pub(crate) fn mb_field_decoding_flag(&mut self, inc: usize) -> bool {
+        self.decision(70 + inc)
     }
 
     pub(crate) fn begin_mb(&mut self, ctx: &MbCtx) {
@@ -333,9 +366,9 @@ impl<'a> Cabac<'a> {
         out
     }
 
-    pub(crate) fn coded_block_pattern(&mut self) -> Result<(u8, u8)> {
+    pub(crate) fn coded_block_pattern(&mut self, has_chroma: bool) -> Result<(u8, u8)> {
         let m = self.mark();
-        let out = self.coded_block_pattern_inner();
+        let out = self.coded_block_pattern_inner(has_chroma);
         self.account.cbp_qp += self.mark() - m;
         out
     }
@@ -365,14 +398,18 @@ impl<'a> Cabac<'a> {
         &mut self,
         coeff: &mut [i32; 16],
         cat: BlockCat,
+        comp: u8,
         na: Option<u8>,
         nb: Option<u8>,
     ) -> Result<u8> {
         let m = self.mark();
-        let out = self.residual_block_inner(coeff, cat, na, nb);
+        let out = self.residual_block_inner(coeff, cat, comp, na, nb);
         let spent = self.mark() - m;
         match cat {
-            BlockCat::ChromaDc(_) | BlockCat::ChromaAc => self.account.residual_chroma += spent,
+            BlockCat::ChromaDc(_) | BlockCat::ChromaDc422(_) | BlockCat::ChromaAc => {
+                self.account.residual_chroma += spent
+            }
+            _ if comp != 0 => self.account.residual_chroma += spent,
             _ => self.account.residual_luma += spent,
         }
         out
@@ -612,17 +649,24 @@ impl<'a> Cabac<'a> {
 
     /// coded_block_pattern (9.3.2.6): FL cMax=15 luma prefix, TU cMax=2 chroma
     /// suffix, both with the neighbour contexts of 9.3.3.1.1.4.
-    fn coded_block_pattern_inner(&mut self) -> Result<(u8, u8)> {
+    fn coded_block_pattern_inner(&mut self, has_chroma: bool) -> Result<(u8, u8)> {
+        let (a_lower, a_blk) = match self.ctx.mbaff_a {
+            None => (self.ctx.a, [1u8, 3]),
+            Some(m) => (m.lower, m.blk),
+        };
         for bin in 0..4u8 {
             // 6.4.11.2: the 8x8 block left of / above block `bin`, which for
             // blocks 1, 2 and 3 can be inside this macroblock.
             let (a, b) = match bin {
                 0 => (
-                    self.cbp_luma_neighbour(self.ctx.a, 1),
+                    self.cbp_luma_neighbour(self.ctx.a, a_blk[0]),
                     self.cbp_luma_neighbour(self.ctx.b, 2),
                 ),
                 1 => (self.cbp_luma_own(0), self.cbp_luma_neighbour(self.ctx.b, 3)),
-                2 => (self.cbp_luma_neighbour(self.ctx.a, 3), self.cbp_luma_own(0)),
+                2 => (
+                    self.cbp_luma_neighbour(a_lower, a_blk[1]),
+                    self.cbp_luma_own(0),
+                ),
                 _ => (self.cbp_luma_own(2), self.cbp_luma_own(1)),
             };
             if self.decision(OFF_CBP_LUMA + a + 2 * b) {
@@ -630,6 +674,10 @@ impl<'a> Cabac<'a> {
             }
         }
         let luma = self.cbp_luma_bins;
+        // ChromaArrayType 0 and 3 code no chroma part of the pattern.
+        if !has_chroma {
+            return Ok((luma, 0));
+        }
         let chroma_cond = |n: Option<MbInfo>, bin: u8| match n {
             None => 0,
             Some(i) if i.flags & FLAG_PCM != 0 => 1,
@@ -673,7 +721,7 @@ impl<'a> Cabac<'a> {
         let mut k = 0i32;
         while self.decision(OFF_QP_DELTA + qp_delta_inc(k, usize::from(self.ctx.qp_delta_inc))) {
             k += 1;
-            if k > 52 {
+            if k > 64 {
                 return Err(Error::corrupt("mb_qp_delta bin string too long"));
             }
         }
@@ -685,6 +733,7 @@ impl<'a> Cabac<'a> {
         &mut self,
         coeff: &mut [i32; 16],
         cat: BlockCat,
+        comp: u8,
         na: Option<u8>,
         nb: Option<u8>,
     ) -> Result<u8> {
@@ -703,21 +752,47 @@ impl<'a> Cabac<'a> {
         };
         let (a, b) = match cat {
             // The DC blocks' neighbours are per macroblock, not per 4x4 block.
-            BlockCat::LumaDc => (self.dc_cbf(self.ctx.a, 0), self.dc_cbf(self.ctx.b, 0)),
-            BlockCat::ChromaDc(c) => (
+            BlockCat::LumaDc => (self.dc_cbf(self.ctx.a, comp), self.dc_cbf(self.ctx.b, comp)),
+            BlockCat::ChromaDc(c) | BlockCat::ChromaDc422(c) => (
                 self.dc_cbf(self.ctx.a, 1 + c),
                 self.dc_cbf(self.ctx.b, 1 + c),
             ),
             _ => (cond(na), cond(nb)),
         };
-        if !self.decision(OFF_CBF + CBF_CAT_OFF[cat_i] + a + 2 * b) {
+        // The Cb and Cr residual of 4:4:4 coding (ctxBlockCat 6..8, 10..12)
+        // has context sets of its own, laid out like the luma ones.
+        let (cbf_base, sig_base, last_base, abs_base) = if comp == 0 {
+            let (sig_off, last_off) = if self.ctx.field {
+                (OFF_SIG_FIELD, OFF_LAST_FIELD)
+            } else {
+                (OFF_SIG, OFF_LAST)
+            };
+            (
+                OFF_CBF + CBF_CAT_OFF[cat_i],
+                sig_off + SIG_CAT_OFF[cat_i],
+                last_off + SIG_CAT_OFF[cat_i],
+                OFF_ABS + ABS_CAT_OFF[cat_i],
+            )
+        } else {
+            let c = usize::from(comp) - 1;
+            let (sig_off, last_off) = if self.ctx.field {
+                (SIG_444_FIELD[c], LAST_444_FIELD[c])
+            } else {
+                (SIG_444[c], LAST_444[c])
+            };
+            (
+                CBF_444[c] + CBF_CAT_OFF[cat_i],
+                sig_off + SIG_CAT_OFF[cat_i],
+                last_off + SIG_CAT_OFF[cat_i],
+                ABS_444[c] + ABS_CAT_OFF[cat_i],
+            )
+        };
+        if !self.decision(cbf_base + a + 2 * b) {
             return Ok(0);
         }
 
         // Significance map: significant_coeff_flag / last_significant_coeff_flag
         // over scanning positions 0..maxNumCoeff-1.
-        let sig_base = OFF_SIG + SIG_CAT_OFF[cat_i];
-        let last_base = OFF_LAST + SIG_CAT_OFF[cat_i];
         let mut sig = [false; 16];
         let mut num = max;
         let mut i = 0;
@@ -733,7 +808,7 @@ impl<'a> Cabac<'a> {
         }
         sig[num - 1] = true;
 
-        self.decode_levels(coeff, &sig, num, OFF_ABS + ABS_CAT_OFF[cat_i], cat_i == 3)
+        self.decode_levels(coeff, &sig, num, abs_base, cat_i == 3)
     }
 
     /// residual_block_cabac for a luma 8x8 block (ctxBlockCat 5).
@@ -742,29 +817,81 @@ impl<'a> Cabac<'a> {
     /// 7.3.5.3.3 sends the flag only when maxNumCoeff differs from 64, so the
     /// coded_block_pattern bit that selected this block is the whole signal and
     /// the flag is inferred to be 1.
-    pub(crate) fn residual_block_8x8(&mut self, coeff: &mut [i32; 64]) -> Result<u8> {
+    ///
+    /// `comp` is the colour component (0 Y; 1 Cb and 2 Cr under 4:4:4). With
+    /// 4:4:4 coding (`cbf` is `Some`) 7.3.5.3.3 does send coded_block_flag for
+    /// the 8x8 class; the pair holds the neighbouring 8x8 blocks' counts as
+    /// [`Cabac::residual_block`] takes them.
+    pub(crate) fn residual_block_8x8(
+        &mut self,
+        coeff: &mut [i32; 64],
+        comp: u8,
+        cbf: Option<(Option<u8>, Option<u8>)>,
+    ) -> Result<u8> {
         let m = self.mark();
-        let out = self.residual_block_8x8_inner(coeff);
-        self.account.residual_luma += self.mark() - m;
+        let out = self.residual_block_8x8_inner(coeff, comp, cbf);
+        if comp == 0 {
+            self.account.residual_luma += self.mark() - m;
+        } else {
+            self.account.residual_chroma += self.mark() - m;
+        }
         out
     }
 
-    fn residual_block_8x8_inner(&mut self, coeff: &mut [i32; 64]) -> Result<u8> {
+    fn residual_block_8x8_inner(
+        &mut self,
+        coeff: &mut [i32; 64],
+        comp: u8,
+        cbf: Option<(Option<u8>, Option<u8>)>,
+    ) -> Result<u8> {
         *coeff = [0; 64];
+        if let Some((na, nb)) = cbf {
+            let intra = self.cur_intra;
+            let cond = |n: Option<u8>| match n {
+                None => usize::from(intra),
+                Some(v) => usize::from(v != 0),
+            };
+            let base = CBF_8X8 + 4 * usize::from(comp);
+            if !self.decision(base + cond(na) + 2 * cond(nb)) {
+                return Ok(0);
+            }
+        }
         let mut sig = [false; 64];
         let mut num = 64;
         let mut i = 0;
+        let c = usize::from(comp).wrapping_sub(1);
+        let (sig_off, last_off, sig_tab, abs_base) = match (comp, self.ctx.field) {
+            (0, true) => (
+                OFF_SIG_8X8_FIELD,
+                OFF_LAST_8X8_FIELD,
+                &SIG_8X8_FIELD,
+                OFF_ABS_8X8,
+            ),
+            (0, false) => (OFF_SIG_8X8, OFF_LAST_8X8, &SIG_8X8_FRAME, OFF_ABS_8X8),
+            (_, true) => (
+                SIG_8X8_444_FIELD[c],
+                LAST_8X8_444_FIELD[c],
+                &SIG_8X8_FIELD,
+                ABS_8X8_444[c],
+            ),
+            (_, false) => (
+                SIG_8X8_444[c],
+                LAST_8X8_444[c],
+                &SIG_8X8_FRAME,
+                ABS_8X8_444[c],
+            ),
+        };
         while i + 1 < num {
-            if self.decision(OFF_SIG_8X8 + usize::from(SIG_8X8_FRAME[i])) {
+            if self.decision(sig_off + usize::from(sig_tab[i])) {
                 sig[i] = true;
-                if self.decision(OFF_LAST_8X8 + usize::from(LAST_8X8[i])) {
+                if self.decision(last_off + usize::from(LAST_8X8[i])) {
                     num = i + 1;
                 }
             }
             i += 1;
         }
         sig[num - 1] = true;
-        self.decode_levels(coeff, &sig, num, OFF_ABS_8X8, false)
+        self.decode_levels(coeff, &sig, num, abs_base, false)
     }
 
     /// coeff_abs_level_minus1 and coeff_sign_flag over a decoded significance
@@ -854,9 +981,10 @@ impl<'a> Cabac<'a> {
 
     /// The 384 raw bytes of an I_PCM macroblock. The arithmetic engine restarts
     /// afterwards (9.3.1.2); the context variables survive.
-    pub(crate) fn pcm_block(&mut self) -> Result<&'a [u8]> {
+    pub(crate) fn pcm_block(&mut self, bd: u32, samples: usize) -> Result<&'a [u8]> {
         self.r.align_to_byte();
-        let bytes = self.r.read_bytes(384)?;
+        // `samples` samples of `bd` bits (8 bits is a byte, so 8 * bd per 8).
+        let bytes = self.r.read_bytes(samples / 8 * bd as usize)?;
         self.init_engine()?;
         Ok(bytes)
     }
@@ -884,8 +1012,19 @@ impl<'a> Cabac<'a> {
 /// entries and SliceQPY. Shared with the encoder, which has to start from the
 /// same state or the two arithmetic coders diverge on the first bin.
 pub(crate) fn init_contexts(slice_qp: i32, column: usize) -> [u8; NUM_CTX] {
-    let qp = slice_qp.clamp(0, 51);
+    let full = init_contexts_full(slice_qp, column);
     let mut state = [63u8 << 1; NUM_CTX];
+    state.copy_from_slice(&full[..NUM_CTX]);
+    state
+}
+
+/// [`init_contexts`] over the whole of Table 9-34, including the Cb and Cr
+/// categories of 4:4:4 coding. Their (m, n) values are those of the matching
+/// luma categories (Tables 9-24 to 9-33 repeat them), except the 8x8
+/// coded_block_flag contexts 1012..1023, which are new.
+pub(crate) fn init_contexts_full(slice_qp: i32, column: usize) -> [u8; NUM_CTX_FULL] {
+    let qp = slice_qp.clamp(0, 51);
+    let mut state = [63u8 << 1; NUM_CTX_FULL];
     let mut set = |idx: usize, (m, n): (i8, i8)| {
         let pre = (((i32::from(m) * qp) >> 4) + i32::from(n)).clamp(1, 126);
         state[idx] = if pre <= 63 {
@@ -909,8 +1048,47 @@ pub(crate) fn init_contexts(slice_qp: i32, column: usize) -> [u8; NUM_CTX] {
     for (i, &mn) in INIT_399_401.iter().enumerate() {
         set(OFF_TRANSFORM_8X8 + i, mn[column]);
     }
+    for (i, &mn) in INIT_277_398.iter().enumerate() {
+        set(OFF_SIG_FIELD + i, mn[column]);
+    }
     for (i, &mn) in INIT_402_435.iter().enumerate() {
         set(OFF_SIG_8X8 + i, mn[column]);
+    }
+    for (i, &mn) in INIT_436_459.iter().enumerate() {
+        set(OFF_SIG_8X8_FIELD + i, mn[column]);
+    }
+    for (i, &mn) in INIT_1012_1015.iter().enumerate() {
+        for k in 0..3 {
+            set(CBF_8X8 + 4 * k + i, mn[column]);
+        }
+    }
+    // (destination, source, count): the Cb / Cr copies of the luma contexts.
+    const COPIES: [(usize, usize, usize); 22] = [
+        (460, 85, 12),
+        (472, 85, 12),
+        (484, 105, 44),
+        (528, 105, 44),
+        (572, 166, 44),
+        (616, 166, 44),
+        (952, 227, 30),
+        (982, 227, 30),
+        (660, 402, 15),
+        (718, 402, 15),
+        (690, 417, 9),
+        (748, 417, 9),
+        (708, 426, 10),
+        (766, 426, 10),
+        (776, 277, 44),
+        (820, 277, 44),
+        (864, 338, 44),
+        (908, 338, 44),
+        (675, 436, 15),
+        (733, 436, 15),
+        (699, 451, 9),
+        (757, 451, 9),
+    ];
+    for (dst, src, n) in COPIES {
+        state.copy_within(src..src + n, dst);
     }
     state
 }
@@ -932,6 +1110,8 @@ pub(crate) fn sig_inc(cat: BlockCat, i: usize) -> usize {
     match cat {
         // ChromaDC with ChromaArrayType 1: Min( levelListIdx / NumC8x8, 2 ).
         BlockCat::ChromaDc(_) => i.min(2),
+        // NumC8x8 is 2 for 4:2:2.
+        BlockCat::ChromaDc422(_) => (i / 2).min(2),
         _ => i,
     }
 }

@@ -105,7 +105,7 @@ fn load8(data: &[u8], at: usize) -> i16x8 {
 /// narrower than sixteen samples therefore costs half or a quarter as much
 /// here as it does in the sixteen-lane form, where the surplus lanes are
 /// computed and then discarded.
-#[inline]
+#[inline(never)]
 fn tap6_8(data: &[u8], at: usize, step: usize) -> i16x8 {
     let l = |k: isize| load8(data, (at as isize + k * step as isize) as usize);
     let five = i16x8::splat(5);
@@ -114,7 +114,7 @@ fn tap6_8(data: &[u8], at: usize, step: usize) -> i16x8 {
 }
 
 /// The same filter over sixteen positions, for a full-width partition.
-#[inline]
+#[inline(never)]
 fn tap6_16(data: &[u8], at: usize, step: usize) -> i16x16 {
     let l = |k: isize| load16(data, (at as isize + k * step as isize) as usize);
     let five = i16x16::splat(5);
@@ -555,6 +555,7 @@ pub(crate) fn mc_luma(
 /// blocks compile to a handful of scalar multiplies instead of a vector setup
 /// whose lanes are then thrown away.
 #[inline]
+#[allow(clippy::too_many_arguments)] // the plane geometry is passed flat so the caller can hand over raw slices
 fn chroma_rows<const W: usize>(
     data: &[u8],
     base: usize,
@@ -717,7 +718,7 @@ pub(crate) enum Put {
 #[inline]
 fn store_weighted(dst: &mut u8, v: u8, w0: i32, w1: i32, shift: u32, round: i32, off: i32) {
     let p0 = i32::from(*dst);
-    *dst = clip8((((p0 * w0 + i32::from(v) * w1 + round) >> shift) + off) as i32);
+    *dst = clip8(((p0 * w0 + i32::from(v) * w1 + round) >> shift) + off);
 }
 /// The weighted combining pass over a whole block: `h` rows of `w` samples
 /// from a `stride`-pitch source into an `os`-pitch destination.

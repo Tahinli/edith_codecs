@@ -1,0 +1,11 @@
+   Compiling syn v3.0.9
+   Compiling archmage-macros v0.9.31-beta.1
+   Compiling archmage v0.9.31-beta.1
+   Compiling ec-prores v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-prores)
+    Finished `release` profile [optimized] target(s) in 13.00s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_prores-3901b4159e3bfd6c)
+     Running tests/encode.rs (/home/user/.cache/tgt-testcut-rest/release/deps/encode-ce42f6d45a8551b9)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-589852d33468c2ff)
+     Running tests/perf.rs (/home/user/.cache/tgt-testcut-rest/release/deps/perf-6b6c53d4b1a4d36b)
+     Running tests/robust.rs (/home/user/.cache/tgt-testcut-rest/release/deps/robust-154a027f6113a9ea)
+   Doc-tests ec_prores

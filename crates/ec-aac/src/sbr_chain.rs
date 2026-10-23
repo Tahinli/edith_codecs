@@ -6,6 +6,8 @@
 
 use crate::sbr_env::{self, AdjustState};
 use crate::sbr_hf::{self, ChirpState, HfHistory};
+use crate::ps_data::PsCommon;
+use crate::ps_dsp::{IN_SLOTS, PsEngine, QMF_BANDS};
 use crate::sbr_payload::{SbrChannel, SbrData, SbrParser};
 use crate::sbr_qmf::{ANALYSIS_BANDS, Analysis, SYNTHESIS_BANDS, Synthesis};
 use ec_core::BitReader;
@@ -132,7 +134,7 @@ pub fn hold_call_count() -> usize {
 }
 
 fn sideinfo_enabled() -> bool {
-    std::env::var("EC_AAC_SBR_SIDEINFO_DEBUG").is_ok()
+    crate::knobs::sbr_sideinfo_debug()
 }
 
 /// Round-34 Task 1 diagnostic: per-AU per-QMF-band mean energy at a named
@@ -196,6 +198,9 @@ struct ChannelState {
 /// (`tHFAdj` + the 6-slot overlap, §4.6.18.7.6 / Figure 4.32).
 const HF_ADJ: usize = 6;
 
+/// Samples a bypass plane lags its raw analysis by: `HF_ADJ` slots at the doubled rate.
+const BYPASS_DELAY: usize = HF_ADJ * SYNTHESIS_BANDS;
+
 impl ChannelState {
     fn new(n_q: usize, _seed: u32) -> ChannelState {
         ChannelState {
@@ -226,13 +231,22 @@ struct Element {
     last_data: Option<SbrData>,
     /// Header of the previous applied frame: a change is the spec's reset.
     last_header: Option<crate::sbr_payload::SbrHeader>,
+    /// Parametric Stereo reconstruction state (hybrid filter, decorrelator,
+    /// mixing history), used when the element carries PS.
+    ps_engine: PsEngine,
 }
+
+/// QMF slots per SBR frame: the PS path runs only for the 32-slot frames
+/// that AAC-LC's 1024-sample frames produce.
+const PS_SLOTS: usize = 32;
 
 /// Every configured SBR element in a stream, keyed by
 /// `element_instance_tag` (assumed stable frame to frame, as every
 /// encoder in practice emits it).
 pub struct SbrChain {
     rate: u32,
+    /// PS is signalled by the config (explicit HE-AACv2).
+    ps_config: bool,
     // Keyed by (element_instance_tag, is_cpe): SCE/LFE and CPE instance
     // tags are independent namespaces per §4.4 (an encoder may legally
     // reuse tag 0 for both an SCE and a CPE in the same access unit), so
@@ -240,43 +254,139 @@ pub struct SbrChain {
     // together whenever that happened -- exactly the case in a 5.1
     // stream (SCE + two CPEs).
     elements: HashMap<(u8, bool), Element>,
+    /// Doubling state of each LFE element, keyed by its instance tag. The LFE
+    /// carries no SBR payload, but its plane still reaches the doubled rate.
+    bypass: HashMap<u8, (ChannelState, Vec<f32>)>,
 }
 
 impl SbrChain {
     pub fn new(rate: u32) -> SbrChain {
         SbrChain {
             rate,
+            ps_config: false,
             elements: HashMap::new(),
+            bypass: HashMap::new(),
+        }
+    }
+
+    /// Marks PS as signalled by the config: the element's output is stereo.
+    pub fn set_ps_config(&mut self, on: bool) {
+        self.ps_config = on;
+        for elem in self.elements.values_mut() {
+            elem.parser.set_ps_config(on);
         }
     }
 
     /// Parses one FIL element's `sbr_extension_data` (the reader
     /// positioned right past `bs_extension_type`) for element `tag`.
     pub fn parse(&mut self, r: &mut BitReader<'_>, tag: u8, is_cpe: bool) -> Option<SbrData> {
-        let elem = self.elements.entry((tag, is_cpe)).or_insert_with(|| Element {
-            parser: SbrParser::new(self.rate),
-            channels: Vec::new(),
-            last_data: None,
-            last_header: None,
+        let (rate, ps_config) = (self.rate, self.ps_config);
+        let elem = self.elements.entry((tag, is_cpe)).or_insert_with(|| {
+            let mut parser = SbrParser::new(rate);
+            parser.set_ps_config(ps_config);
+            Element {
+                parser,
+                channels: Vec::new(),
+                last_data: None,
+                last_header: None,
+                ps_engine: PsEngine::new(),
+            }
         });
         let data = elem.parser.parse(r, is_cpe).ok()?;
         let n_q = elem.parser.tables().map(|t| t.n_q).unwrap_or(1);
-        while elem.channels.len() < data.channels.len() {
+        // PS needs a second synthesis state: the right output channel.
+        let need = data.channels.len().max(if data.ps.is_some() { 2 } else { 1 });
+        while elem.channels.len() < need {
             let seed = 0x1234_5678u32.wrapping_add(elem.channels.len() as u32 * 0x9e37_79b9);
             elem.channels.push(ChannelState::new(n_q, seed));
         }
         Some(data)
     }
 
+    /// Doubles the rate of an LFE plane. The standard gives the LFE no SBR
+    /// payload, so its core plane (one frame of `FRAME_LEN` samples) would
+    /// otherwise stay at half length and misalign everything after it. It runs
+    /// through the same 32-band analysis and 64-band synthesis as the SBR
+    /// planes, with the high bands left empty, which is what ffmpeg's output
+    /// does for the LFE channel.
+    pub fn bypass_plane(&mut self, tag: u8, plane: &mut Vec<f32>) {
+        let (state, delay) = self
+            .bypass
+            .entry(tag)
+            .or_insert_with(|| (ChannelState::new(1, 0), vec![0.0; BYPASS_DELAY]));
+        let num_slots = plane.len() / ANALYSIS_BANDS;
+        let mut out = std::mem::take(delay);
+        out.reserve(num_slots * SYNTHESIS_BANDS);
+        for slot in 0..num_slots {
+            let mut chunk = [0f32; ANALYSIS_BANDS];
+            chunk.copy_from_slice(&plane[slot * ANALYSIS_BANDS..(slot + 1) * ANALYSIS_BANDS]);
+            // Same scale handling as `apply_data`: the QMF pair is calibrated to the
+            // un-normalised core PCM domain.
+            for s in &mut chunk {
+                *s /= crate::decode::OUTPUT_SCALE;
+            }
+            let sub = state.analysis.process_slot(&chunk);
+            let mut slots = [Complex::<f64>::ZERO; SYNTHESIS_BANDS];
+            slots[..ANALYSIS_BANDS].copy_from_slice(&sub);
+            out.extend(synth_slots(&mut state.synthesis, &[slots]));
+        }
+        // The reconstructed planes lag their raw analysis by `HF_ADJ` slots;
+        // hold the bypass output back by the same amount so they line up.
+        let produced = num_slots * SYNTHESIS_BANDS;
+        *plane = out[..produced].to_vec();
+        *delay = out[produced..].to_vec();
+    }
+
+    /// Like [`apply`], for an element whose output lives at `out[start..start + n]`
+    /// inside a whole access unit. A PS element gets its second output
+    /// plane inserted right after its first, so the access unit gains a
+    /// channel.
+    pub fn apply_planes(
+        &mut self,
+        tag: u8,
+        is_cpe: bool,
+        data: &SbrData,
+        out: &mut Vec<Vec<f32>>,
+        start: usize,
+        n: usize,
+    ) -> crate::Result<()> {
+        let n = expand_for_ps(out, start, n, is_cpe, data.ps.is_some());
+        self.apply(tag, is_cpe, data, &mut out[start..start + n])
+    }
+
+    /// [`apply_planes`] for the last parsed frame, as [`apply_last`].
+    pub fn apply_last_planes(
+        &mut self,
+        tag: u8,
+        is_cpe: bool,
+        out: &mut Vec<Vec<f32>>,
+        start: usize,
+        n: usize,
+    ) -> crate::Result<()> {
+        let has_ps = self
+            .elements
+            .get(&(tag, is_cpe))
+            .and_then(|e| e.last_data.as_ref())
+            .is_some_and(|d| d.ps.is_some());
+        let n = expand_for_ps(out, start, n, is_cpe, has_ps);
+        self.apply_last(tag, is_cpe, &mut out[start..start + n])
+    }
+
     /// Runs the chain over `planes` (element `tag`'s already-decoded core
     /// PCM, one plane per channel), replacing each in place with its
     /// SBR-reconstructed, double-rate PCM. A malformed/missing state is a
     /// silent no-op: `planes` is left at its core content.
-    pub fn apply(&mut self, tag: u8, is_cpe: bool, data: &SbrData, planes: &mut [Vec<f32>]) {
+    pub fn apply(
+        &mut self,
+        tag: u8,
+        is_cpe: bool,
+        data: &SbrData,
+        planes: &mut [Vec<f32>],
+    ) -> crate::Result<()> {
         if let Some(elem) = self.elements.get_mut(&(tag, is_cpe)) {
             elem.last_data = Some(data.clone());
         }
-        self.apply_data(tag, is_cpe, data, planes, "fresh");
+        self.apply_data(tag, is_cpe, data, planes, "fresh")
     }
 
     /// Re-runs the chain for `tag` using the last successfully parsed
@@ -284,15 +394,20 @@ impl SbrChain {
     /// fresh payload this frame. A no-op (planes left at core content, same
     /// as [`apply`]'s existing malformed/missing-state fallback) if no prior
     /// frame ever parsed successfully for this element.
-    pub fn apply_last(&mut self, tag: u8, is_cpe: bool, planes: &mut [Vec<f32>]) {
+    pub fn apply_last(
+        &mut self,
+        tag: u8,
+        is_cpe: bool,
+        planes: &mut [Vec<f32>],
+    ) -> crate::Result<()> {
         let Some(data) = self
             .elements
             .get(&(tag, is_cpe))
             .and_then(|e| e.last_data.clone())
         else {
-            return;
+            return Ok(());
         };
-        self.apply_data(tag, is_cpe, &data, planes, "hold");
+        self.apply_data(tag, is_cpe, &data, planes, "hold")
     }
 
     fn apply_data(
@@ -302,20 +417,20 @@ impl SbrChain {
         data: &SbrData,
         planes: &mut [Vec<f32>],
         source: &'static str,
-    ) {
+    ) -> crate::Result<()> {
         if source == "hold" {
             HOLD_CALLS.fetch_add(1, Ordering::Relaxed);
         }
         let Some(elem) = self.elements.get_mut(&(tag, is_cpe)) else {
-            return;
+            return Ok(());
         };
         let Some(tables) = elem.parser.tables().cloned() else {
-            return;
+            return Ok(());
         };
         let reset = elem.last_header.as_ref() != elem.parser.header();
         elem.last_header = elem.parser.header().cloned();
         let Some(header) = elem.parser.header().cloned() else {
-            return;
+            return Ok(());
         };
         let coupling = data.coupling;
         let sideinfo_on = sideinfo_enabled();
@@ -323,6 +438,15 @@ impl SbrChain {
             SIDEINFO_FRAME.fetch_add(1, Ordering::Relaxed)
         } else {
             0
+        };
+        // PS: the mono channel is synthesized twice, through its own state and
+        // through channel 1's (the right output), so both stay in step.
+        let ps_mode = !is_cpe && planes.len() >= 2 && data.ps.is_some();
+        let mut ps_planes: Option<(Vec<f32>, Vec<f32>)> = None;
+        let mut r_synth = if ps_mode && elem.channels.len() >= 2 {
+            Some(std::mem::take(&mut elem.channels[1].synthesis))
+        } else {
+            None
         };
         for (ch, plane) in planes.iter_mut().enumerate() {
             if ch >= data.channels.len() || ch >= elem.channels.len() {
@@ -454,7 +578,7 @@ impl SbrChain {
                 &tables,
                 &sbr_hf::build_patches(&tables),
                 header.limiter_bands,
-            );
+            )?;
             // Envelope slot i is raw slot i - HF_ADJ: prepend the previous
             // frame's raw HF tail so the grid (up to 2*t_E(L_E) <= 38) lines
             // up with the content it was measured on (§4.6.18.7.6).
@@ -514,26 +638,33 @@ impl SbrChain {
 
             let kx = (tables.kx as usize).min(ANALYSIS_BANDS);
             let k2 = (tables.k2 as usize).min(SYNTHESIS_BANDS);
-            let mut out = Vec::with_capacity(num_slots * SYNTHESIS_BANDS);
+            let mut vs: Vec<[Complex<f64>; SYNTHESIS_BANDS]> = Vec::with_capacity(num_slots);
             for slot in 0..num_slots {
                 let mut v = [Complex::ZERO; SYNTHESIS_BANDS];
                 v[0..kx].copy_from_slice(&raw[slot][0..kx]);
-                if std::env::var("EC_AAC_SBR_HF_BYPASS").is_err() {
+                if !crate::knobs::sbr_hf_bypass() {
                     for b in kx..k2 {
                         if b - kx < hf.len() {
                             v[b] = hf[b - kx][slot];
                         }
                     }
                 }
-                let mut pcm = state.synthesis.process_slot(&v);
-                for s in &mut pcm {
-                    // The spec 32-analysis/64-synthesis pair (4.6.18.4.1 +
-                    // 4.6.18.8.2, literal equations) reads back at half the
-                    // core's amplitude; the 2x is the upsampler's gain.
-                    *s *= 2.0 * crate::decode::OUTPUT_SCALE;
-                }
-                out.extend_from_slice(&pcm);
+                vs.push(v);
             }
+            let out = match (ps_mode && num_slots == PS_SLOTS, data.ps.as_ref()) {
+                (true, Some(ps)) => {
+                    let (left, right) =
+                        render_ps(&mut elem.ps_engine, ps, &vs, &state.low_tail, kx, k2);
+                    let left_pcm = synth_slots(&mut state.synthesis, &left);
+                    let right_pcm = match r_synth.as_mut() {
+                        Some(rs) => synth_slots(rs, &right),
+                        None => left_pcm.clone(),
+                    };
+                    ps_planes = Some((left_pcm, right_pcm));
+                    Vec::new()
+                }
+                _ => synth_slots(&mut state.synthesis, &vs),
+            };
             if std::env::var("EC_AAC_SBR_PREQMF_DUMP").is_ok() {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
@@ -548,9 +679,105 @@ impl SbrChain {
                     );
                 }
             }
-            *plane = out;
+            if ps_planes.is_none() {
+                *plane = out;
+            }
+        }
+        if let Some(rs) = r_synth {
+            elem.channels[1].synthesis = rs;
+        }
+        if let Some((left, right)) = ps_planes {
+            planes[0] = left;
+            planes[1] = right;
+        }
+        Ok(())
+    }
+}
+
+/// Inserts the second output plane a PS element needs, right after its first
+/// (a copy, which the PS path then overwrites). Returns the element's new
+/// plane count: 2 when a plane was inserted.
+fn expand_for_ps(out: &mut Vec<Vec<f32>>, start: usize, n: usize, is_cpe: bool, ps: bool) -> usize {
+    if ps && !is_cpe && n == 1 && start < out.len() {
+        let copy = out[start].clone();
+        out.insert(start + 1, copy);
+        2
+    } else {
+        n
+    }
+}
+
+/// Narrows a working-precision QMF sample to the PS engine's single precision.
+fn narrow32(v: Complex<f64>) -> Complex<f32> {
+    Complex { re: v.re as f32, im: v.im as f32 }
+}
+
+/// Widens a PS output slab row back to working precision.
+fn widen(row: &[Complex<f32>; QMF_BANDS]) -> [Complex<f64>; SYNTHESIS_BANDS] {
+    let mut out = [Complex::ZERO; SYNTHESIS_BANDS];
+    for (dst, src) in out.iter_mut().zip(row.iter()) {
+        *dst = Complex { re: f64::from(src.re), im: f64::from(src.im) };
+    }
+    out
+}
+
+/// Runs Parametric Stereo over one frame's synthesis input `vs` (32 slots of
+/// the mono channel's QMF bands). The hybrid filter reads 6 slots past the
+/// frame, for the low bands it splits: those come from `low_tail`, the raw
+/// analysis of the same frame, which holds the slots `vs` cannot.
+type PlaneVec = Vec<[Complex<f64>; SYNTHESIS_BANDS]>;
+
+fn render_ps(
+    engine: &mut PsEngine,
+    ps: &PsCommon,
+    vs: &[[Complex<f64>; SYNTHESIS_BANDS]],
+    low_tail: &[[Complex<f64>; ANALYSIS_BANDS]],
+    kx: usize,
+    top: usize,
+) -> (PlaneVec, PlaneVec) {
+    if !ps.start {
+        // No PS header yet: both channels carry the mono signal (FFmpeg's memcpy).
+        return (vs.to_vec(), vs.to_vec());
+    }
+    let mut x = [[Complex::<f32>::new(0.0, 0.0); QMF_BANDS]; IN_SLOTS];
+    for (j, v) in vs.iter().enumerate().take(IN_SLOTS) {
+        for (dst, src) in x[j].iter_mut().zip(v.iter()) {
+            *dst = narrow32(*src);
         }
     }
+    // Only bands below the SBR start hold raw analysis; the hybrid filter
+    // reads lookahead for bands 0..5 only, and those are raw below kx.
+    let lookahead_bands = kx.min(5);
+    for (j, row) in low_tail.iter().enumerate() {
+        let slot = PS_SLOTS + j;
+        if slot >= IN_SLOTS {
+            break;
+        }
+        for (b, sample) in row.iter().enumerate().take(lookahead_bands) {
+            x[slot][b] = narrow32(*sample);
+        }
+    }
+    let (left, right) = engine.apply(ps, &x, top);
+    (
+        left.iter().map(widen).collect(),
+        right.iter().map(widen).collect(),
+    )
+}
+
+/// Runs `slots` through a synthesis bank, at the SBR output scale.
+fn synth_slots(synth: &mut Synthesis, slots: &[[Complex<f64>; SYNTHESIS_BANDS]]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(slots.len() * SYNTHESIS_BANDS);
+    for v in slots {
+        let mut pcm = synth.process_slot(v);
+        for s in &mut pcm {
+            // The spec 32-analysis/64-synthesis pair (4.6.18.4.1 +
+            // 4.6.18.8.2, literal equations) reads back at half the
+            // core's amplitude; the 2x is the upsampler's gain.
+            *s *= 2.0 * crate::decode::OUTPUT_SCALE;
+        }
+        out.extend_from_slice(&pcm);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -616,6 +843,7 @@ mod tests {
                 channels: vec![ChannelState::new(n_q, 1), ChannelState::new(n_q, 2)],
                 last_data: None,
             last_header: None,
+            ps_engine: PsEngine::new(),
             },
         );
         chain
@@ -628,6 +856,7 @@ mod tests {
         let data = SbrData {
             coupling: false,
             channels: vec![one_channel(n_q, n_low), one_channel(n_q, n_low)],
+            ps: None,
         };
 
         // A steady tone, not silence: silence round-trips trivially (every
@@ -635,7 +864,7 @@ mod tests {
         // discontinuity this test exists to catch.
         let core_au = || -> Vec<f32> { (0..1024).map(|i| (i as f32 * 0.1).sin() * 0.2).collect() };
         let mut planes = vec![core_au(), core_au()];
-        chain.apply(tag, true, &data, &mut planes);
+        chain.apply(tag, true, &data, &mut planes).unwrap();
 
         let expected_len = 32 * SYNTHESIS_BANDS;
         for (ch, plane) in planes.iter().enumerate() {
@@ -651,7 +880,7 @@ mod tests {
         // generator continuity across the junction, not just each AU in
         // isolation.
         let mut planes2 = vec![core_au(), core_au()];
-        chain.apply(tag, true, &data, &mut planes2);
+        chain.apply(tag, true, &data, &mut planes2).unwrap();
         for (ch, plane) in planes2.iter().enumerate() {
             assert_eq!(
                 plane.len(),
@@ -716,6 +945,7 @@ mod tests {
                         .collect(),
                     last_data: None,
             last_header: None,
+            ps_engine: PsEngine::new(),
                 },
             );
             chain
@@ -729,19 +959,21 @@ mod tests {
         let sce_data = SbrData {
             coupling: false,
             channels: vec![one_channel(n_q, n_low)],
+            ps: None,
         };
         let cpe_data = SbrData {
             coupling: false,
             channels: vec![one_channel(n_q, n_low), one_channel(n_q, n_low)],
+            ps: None,
         };
 
         let sce_tone = || -> Vec<f32> { (0..1024).map(|i| (i as f32 * 0.05).sin() * 0.2).collect() };
         let cpe_tone = || -> Vec<f32> { (0..1024).map(|i| (i as f32 * 0.37).sin() * 0.2).collect() };
 
         let mut sce_planes = vec![sce_tone()];
-        chain.apply(tag, false, &sce_data, &mut sce_planes);
+        chain.apply(tag, false, &sce_data, &mut sce_planes).unwrap();
         let mut cpe_planes = vec![cpe_tone(), cpe_tone()];
-        chain.apply(tag, true, &cpe_data, &mut cpe_planes);
+        chain.apply(tag, true, &cpe_data, &mut cpe_planes).unwrap();
 
         // If state aliased, the CPE call above would have run through (and
         // mutated) the SCE's Analysis/Synthesis/chirp/noise state instead
@@ -749,7 +981,7 @@ mod tests {
         // the SAME output as the first call, proving its state was never
         // touched by the CPE call in between.
         let mut sce_planes2 = vec![sce_tone()];
-        chain.apply(tag, false, &sce_data, &mut sce_planes2);
+        chain.apply(tag, false, &sce_data, &mut sce_planes2).unwrap();
 
         // A fresh, never-driven SCE-only chain gives the reference: one AU
         // through tag/is_cpe=(0,false), nothing else touching its state.
@@ -761,6 +993,7 @@ mod tests {
                 channels: vec![ChannelState::new(n_q, 10)],
                 last_data: None,
             last_header: None,
+            ps_engine: PsEngine::new(),
             },
         );
         reference
@@ -770,9 +1003,9 @@ mod tests {
             .parser
             .set_for_test(header(), t.clone());
         let mut sce_ref1 = vec![sce_tone()];
-        reference.apply(tag, false, &sce_data, &mut sce_ref1);
+        reference.apply(tag, false, &sce_data, &mut sce_ref1).unwrap();
         let mut sce_ref2 = vec![sce_tone()];
-        reference.apply(tag, false, &sce_data, &mut sce_ref2);
+        reference.apply(tag, false, &sce_data, &mut sce_ref2).unwrap();
 
         assert_eq!(
             sce_planes[0], sce_ref1[0],
@@ -821,7 +1054,7 @@ mod tests {
         let mut synthesis_a = Synthesis::new();
         let mut per_au_out: Vec<f32> = Vec::new();
         for au in all_samples.chunks(1024) {
-            for slot in au.chunks_exact(ANALYSIS_BANDS) {
+            for slot in au.as_chunks::<ANALYSIS_BANDS>().0 {
                 let mut chunk = [0f32; ANALYSIS_BANDS];
                 chunk.copy_from_slice(slot);
                 let sub = analysis_a.process_slot(&chunk);
@@ -836,7 +1069,7 @@ mod tests {
         let mut analysis_b = Analysis::new();
         let mut synthesis_b = Synthesis::new();
         let mut continuous_out: Vec<f32> = Vec::new();
-        for slot in all_samples.chunks_exact(ANALYSIS_BANDS) {
+        for slot in all_samples.as_chunks::<ANALYSIS_BANDS>().0 {
             let mut chunk = [0f32; ANALYSIS_BANDS];
             chunk.copy_from_slice(slot);
             let sub = analysis_b.process_slot(&chunk);

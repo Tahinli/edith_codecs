@@ -1,0 +1,10 @@
+[package]
+name = "ec-dts"
+description = "DTS Coherent Acoustics (ETSI TS 102 114) core decoder with XCH, X96 and DTS-HD substream handling, built on the edith_codecs IR."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true

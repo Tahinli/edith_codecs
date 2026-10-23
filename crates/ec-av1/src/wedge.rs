@@ -183,7 +183,11 @@ fn init_wedge_master_masks() -> MasterMasks {
     let w = MASK_MASTER_SIZE;
     let stride = MASK_MASTER_SIZE;
     let mut obl: [[Vec<u8>; N_DIR]; 2] = Default::default();
+    // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+    #[allow(clippy::needless_range_loop)]
     for neg in 0..2 {
+        // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+        #[allow(clippy::needless_range_loop)]
         for d in 0..N_DIR {
             obl[neg][d] = vec![0u8; w * w];
         }
@@ -268,7 +272,11 @@ impl WedgeCodebook {
     fn build(master: &MasterMasks, bw: usize, bh: usize) -> Self {
         let stride = bw.max(bh);
         let mut masks: [[Vec<u8>; MAX_WEDGE_TYPES]; 2] = Default::default();
+        // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+        #[allow(clippy::needless_range_loop)]
         for sign in 0..2 {
+            // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+            #[allow(clippy::needless_range_loop)]
             for idx in 0..MAX_WEDGE_TYPES {
                 let (neg_idx, dir, off) = wedge_window(idx, sign, bw, bh);
                 let plane = &master.obl[neg_idx][dir];

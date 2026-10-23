@@ -1,0 +1,46 @@
+[package]
+name = "ec-subs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-subs]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "srt"
+path = "fuzz_targets/srt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webvtt"
+path = "fuzz_targets/webvtt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "markup"
+path = "fuzz_targets/markup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ir"
+path = "fuzz_targets/ir.rs"
+test = false
+doc = false
+bench = false

@@ -21,6 +21,9 @@ enum Inner {
     TrueHd(Box<ec_truehd::TrueHdDecoder>),
     Aac(Box<ec_aac::AacDecoder>),
     Alac(Box<ec_alac::AlacDecoder>),
+    PcmExt(Box<ec_pcm_ext::PcmExtDecoder>),
+    AmrNb(Box<ec_amr::nb::decoder::AmrNbDecoder>),
+    AmrWb(Box<ec_amr::wb::AmrWbDecoder>),
     Opus(Box<ec_opus::MultistreamDecoder>),
     /// PCM needs no decoder, only a reading of the bytes.
     Pcm(CodecId),
@@ -53,16 +56,6 @@ pub struct AudioDecoder {
     /// for the terminal packet's own trim: the flush call's packet (the
     /// reader's synthetic end-of-stream marker) carries no granule of its own.
     last_granule: Option<i64>,
-    /// The most recently decoded packet's own audio, held back one call
-    /// rather than handed to the caller straight away: Vorbis's terminal
-    /// packet routinely decodes real samples past the container's true final
-    /// granule (its own block reaches further than the stream actually
-    /// runs), and so does [`Self::flush`]'s un-overlapped tail on top of it.
-    /// Once a packet's audio has left this decoder there is nothing left to
-    /// trim it from, so the last packet's audio waits here — combined with
-    /// the flush tail — for [`Self::flush`] to cut both down to the file's
-    /// real length in one go.
-    held: Vec<f32>,
 }
 
 impl std::fmt::Debug for AudioDecoder {
@@ -91,7 +84,9 @@ impl AudioDecoder {
                     .map(ec_core::packet::Buf::copy_from_slice);
                 Inner::Flac(Box::new(ec_flac::FlacDecoder::new(params)?))
             }
-            CodecId::Mp3 => Inner::Mp3(Box::new(ec_mp3::Mp3Decoder::new(params.clone())?)),
+            CodecId::Mp3 | CodecId::Mp2 | CodecId::Mp1 => {
+                Inner::Mp3(Box::new(ec_mp3::Mp3Decoder::new(params.clone())?))
+            }
             CodecId::Vorbis => {
                 let data = extradata.ok_or_else(|| {
                     Error::corrupt("a Vorbis stream with no header triplet in its extradata")
@@ -112,6 +107,19 @@ impl AudioDecoder {
             CodecId::Alac => Inner::Alac(Box::new(ec_alac::AlacDecoder::from_parameters(
                 params.clone(),
             )?)),
+            CodecId::AmrNb => Inner::AmrNb(Box::new(
+                ec_amr::nb::decoder::AmrNbDecoder::from_parameters(params.clone())?,
+            )),
+            CodecId::AmrWb => Inner::AmrWb(Box::new(ec_amr::wb::AmrWbDecoder::from_parameters(
+                params.clone(),
+            )?)),
+            CodecId::ImaAdpcmWav
+            | CodecId::MsAdpcm
+            | CodecId::ImaAdpcmQt
+            | CodecId::PcmAlaw
+            | CodecId::PcmMulaw => Inner::PcmExt(Box::new(
+                ec_pcm_ext::PcmExtDecoder::from_parameters(params.clone())?,
+            )),
             CodecId::Opus => {
                 let head = extradata.unwrap_or_default();
                 let (streams, coupled, mapping) = opus_layout(head, channels)?;
@@ -146,7 +154,6 @@ impl AudioDecoder {
             emitted: 0,
             trim_offset: None,
             last_granule: None,
-            held: Vec::new(),
         })
     }
 
@@ -193,20 +200,26 @@ impl AudioDecoder {
                 };
                 out.extend(d.decode(&packet.data)?.iter().map(|&s| s as f32 * scale));
             }
+            Inner::AmrNb(d) => {
+                out.extend(d.decode(&packet.data)?.iter().map(|&s| f32::from(s) / 32768.0));
+            }
+            Inner::AmrWb(d) => {
+                out.extend(d.decode(&packet.data)?.iter().map(|&s| f32::from(s) / 32768.0));
+            }
+            Inner::PcmExt(d) => {
+                out.extend(d.decode(&packet.data)?.iter().map(|&s| f32::from(s) / 32768.0));
+            }
             Inner::Opus(d) => {
                 let samples = d.decode_packet(&packet.data)?;
                 out.extend_from_slice(&samples);
             }
             Inner::Pcm(codec) => pcm(*codec, &packet.data, out),
         }
-        self.trim(ec_ogg::granule_of(packet), out);
-        // Only Vorbis holds real, un-overlapped state across a packet
-        // boundary that a stream-final granule can still need to reach into
-        // (see `held`'s own doc); every other codec here releases its audio
-        // the moment it is decoded, exactly as before, so a caller that never
-        // calls `flush` still gets every packet's worth back.
-        if matches!(self.inner, Inner::Vorbis(_)) {
-            std::mem::swap(&mut self.held, out);
+        // Vorbis trims to its own page granules inside `ec-vorbis`, so its
+        // output is final as it arrives. Every other codec here is trimmed
+        // (or not) by the front and tail rules below.
+        if !matches!(self.inner, Inner::Vorbis(_)) {
+            self.trim(ec_ogg::granule_of(packet), out);
         }
         self.emitted += out.len() as i64 / self.channels.max(1) as i64;
         Ok(())
@@ -254,12 +267,9 @@ impl AudioDecoder {
     /// this told to it once the packets have run out, or the last hop never
     /// comes out at all. `out` is cleared first, same as [`Self::decode`].
     ///
-    /// [`Self::held`] (the last packet's own audio, never yet released) is
-    /// combined with whatever this call's own flush produces, and the pair
-    /// are cut down together to the stream's real final granule — the last
-    /// [`Self::decode`] call's packet is routinely the one this trim needs to
-    /// reach into, and once its audio had left this decoder that was no
-    /// longer possible.
+    /// Vorbis is cut to its final granule inside `ec-vorbis` and passes
+    /// through here unchanged; the other codecs' tail is trimmed by
+    /// [`Self::trim_tail`].
     pub fn flush(&mut self, out: &mut Vec<f32>) -> Result<()> {
         out.clear();
         match &mut self.inner {
@@ -270,20 +280,24 @@ impl AudioDecoder {
             Inner::TrueHd(d) => flush_drain(d.as_mut(), out)?,
             // AAC, ALAC, Opus and PCM decode a packet at a time with nothing
             // held back across the end of the file.
-            Inner::Aac(_) | Inner::Alac(_) | Inner::Opus(_) | Inner::Pcm(_) => {}
+            Inner::Aac(_) | Inner::Alac(_) | Inner::PcmExt(_) | Inner::AmrNb(_) | Inner::AmrWb(_) | Inner::Opus(_) | Inner::Pcm(_) => {}
         }
         let channels = self.channels.max(1) as i64;
+        if matches!(self.inner, Inner::Vorbis(_)) {
+            // Already cut to the stream's final granule by `ec-vorbis`.
+            self.emitted += out.len() as i64 / channels;
+            return Ok(());
+        }
         self.produced += out.len() as i64 / channels;
-        let mut combined = std::mem::take(&mut self.held);
-        combined.append(out);
+        let combined = std::mem::take(out);
         self.trim_tail(&combined, out);
         Ok(())
     }
 
     /// The terminal trim: the stream's last granule minus the front offset
     /// is the file's true total frame count, so whatever `combined` (the
-    /// held-back last packet plus the flush tail) still has past that is
-    /// dropped rather than handed to the caller.
+    /// flush tail) still has past that is dropped rather than handed to the
+    /// caller.
     fn trim_tail(&mut self, combined: &[f32], out: &mut Vec<f32>) {
         let channels = self.channels.max(1) as i64;
         let raw_frames = combined.len() as i64 / channels;
@@ -309,10 +323,12 @@ impl AudioDecoder {
             Inner::TrueHd(d) => d.reset(),
             Inner::Aac(d) => **d = ec_aac::AacDecoder::new(),
             Inner::Alac(d) => d.reset(),
+            Inner::PcmExt(d) => ec_core::Decoder::reset(d.as_mut()),
+            Inner::AmrNb(d) => ec_core::Decoder::reset(d.as_mut()),
+            Inner::AmrWb(d) => ec_core::Decoder::reset(d.as_mut()),
             Inner::Opus(d) => d.reset(),
             Inner::Pcm(_) => {}
         }
-        self.held.clear();
         self.produced = 0;
         self.emitted = 0;
         self.trim_offset = None;
@@ -429,24 +445,24 @@ fn pcm(codec: CodecId, data: &[u8], out: &mut Vec<f32>) {
     match codec {
         CodecId::PcmU8 => out.extend(data.iter().map(|&b| (f32::from(b) - 128.0) / 128.0)),
         CodecId::PcmS16Le => out.extend(
-            data.chunks_exact(2)
+            data.as_chunks::<2>().0.iter()
                 .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0),
         ),
         CodecId::PcmS16Be => out.extend(
-            data.chunks_exact(2)
+            data.as_chunks::<2>().0.iter()
                 .map(|c| f32::from(i16::from_be_bytes([c[0], c[1]])) / 32768.0),
         ),
         // 24-bit is stored packed, little-endian, and sign-extends from bit 23.
-        CodecId::PcmS24Le => out.extend(data.chunks_exact(3).map(|c| {
+        CodecId::PcmS24Le => out.extend(data.as_chunks::<3>().0.iter().map(|c| {
             let v = i32::from_le_bytes([0, c[0], c[1], c[2]]);
             v as f32 / 2147483648.0
         })),
         CodecId::PcmS32Le => out.extend(
-            data.chunks_exact(4)
+            data.as_chunks::<4>().0.iter()
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2147483648.0),
         ),
         CodecId::PcmF32Le => out.extend(
-            data.chunks_exact(4)
+            data.as_chunks::<4>().0.iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
         ),
         _ => {}

@@ -9,7 +9,7 @@
 //! ```no_run
 //! use ec_hw::{Codec, Decoder};
 //!
-//! let display = ec_va::Display::open()?;
+//! let display = ec_va::open()?;
 //! let mut decoder = Decoder::new(&display, Codec::H264)?;
 //! # let annex_b_access_unit: &[u8] = &[];
 //! decoder.decode(annex_b_access_unit, 0)?;
@@ -33,19 +33,18 @@
 //!
 //! # Shape
 //!
-//! * [`params`] — the `#[repr(C)]` codec parameter buffers, each checked
-//!   against the system headers by a `const` assertion.
-//! * [`dec`] — one stateless decoder per codec behind [`Decoder`].
-//! * [`enc`] — H.264, HEVC and AV1 encoders.
+//! * [`params`] — the codec parameter buffers, converted to cros-libva's typed
+//!   buffers.
+//! * [`dec`] — one stateless decoder per codec behind [`Decoder`]. H.264 is
+//!   ported; HEVC, VP9 and AV1 return [`Error::Unsupported`] for now.
+//! * [`enc`] — H.264, HEVC and AV1 encoders. Not ported yet: they return
+//!   [`Error::Unsupported`].
 //! * [`SurfacePool`] / [`Frame`] — surface recycling and pixel access.
 //!
 //! # Unsafe
 //!
-//! This crate is not `forbid(unsafe_code)`: handing a parameter struct to the
-//! driver and walking a coded-buffer segment list are both pointer work that
-//! `ec-va` cannot type for us. Both are confined to two functions —
-//! [`params::param_buffer`] and `enc::coded_bytes` — and everything else,
-//! including every codec's parameter derivation, is safe Rust.
+//! None. Every libva call goes through `ec-va`, which goes through cros-libva's
+//! safe wrappers, so this crate is `forbid(unsafe_code)`.
 //!
 //! # Panics
 //!
@@ -53,8 +52,8 @@
 //! edith loads this path as a `dlopen`ed plugin whose fall back to software is
 //! only as good as that promise.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
-#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod dec;
 pub mod enc;
@@ -62,11 +61,14 @@ pub mod error;
 pub mod frame;
 pub mod params;
 pub mod pool;
+pub mod reset;
 
 pub use dec::{Codec, Decoder, StreamInfo};
 pub use enc::{
-    CodedFrame, EncCodec, Encoder, EncoderConfig, FrameMetadata, RateControlMode, Tunings,
+    CodedFrame, EncCodec, Encoder, EncoderConfig, FrameMetadata, H264Profile, RateControlMode,
+    Tunings,
 };
 pub use error::{Error, Result};
 pub use frame::{Colour, Frame, I420, I420_16, i420_to_nv12, nv12_to_i420};
 pub use pool::{PooledSurface, SurfacePool};
+pub use reset::{gpu_recently_reset, gpu_reset_epoch, report_gpu_reset};

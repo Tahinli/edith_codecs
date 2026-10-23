@@ -119,12 +119,16 @@ fn ffmpeg_pcm(path: &Path, bits: u32) -> Vec<u8> {
 fn samples_from_pcm(pcm: &[u8], bits: u32) -> Vec<i32> {
     match bits <= 16 {
         true => pcm
-            .chunks_exact(2)
-            .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])) >> (16 - bits))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i32::from(i16::from_le_bytes(*c)) >> (16 - bits))
             .collect(),
         false => pcm
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) >> (32 - bits))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c) >> (32 - bits))
             .collect(),
     }
 }

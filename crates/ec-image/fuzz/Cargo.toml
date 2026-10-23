@@ -1,0 +1,95 @@
+[package]
+name = "ec-image-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-image]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_with_limits"
+path = "fuzz_targets/decode_with_limits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "info"
+path = "fuzz_targets/info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_animation"
+path = "fuzz_targets/decode_animation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bmp"
+path = "fuzz_targets/bmp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gif"
+path = "fuzz_targets/gif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jpeg"
+path = "fuzz_targets/jpeg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "png"
+path = "fuzz_targets/png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tiff"
+path = "fuzz_targets/tiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webp"
+path = "fuzz_targets/webp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "probe"
+path = "fuzz_targets/probe.rs"
+test = false
+doc = false
+bench = false

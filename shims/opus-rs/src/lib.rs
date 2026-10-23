@@ -357,7 +357,7 @@ mod tests {
         let mut out = vec![0u8; 1500];
         let mut back = vec![0.0f32; FRAME * 2];
         let mut total = 0;
-        for block in pcm.chunks_exact(FRAME * 2) {
+        for block in pcm.as_chunks::<{ FRAME * 2 }>().0.iter() {
             let len = enc.encode(block, FRAME, &mut out).unwrap();
             assert!(len > 1 && len <= 1276, "packet of {len} bytes");
             total += len;
@@ -422,7 +422,7 @@ mod tests {
         let mut out = vec![0u8; 1500];
         let mut dec = OpusDecoder::new(48_000, 1).unwrap();
         let mut back = vec![0.0f32; FRAME];
-        for block in pcm.chunks_exact(FRAME) {
+        for block in pcm.as_chunks::<FRAME>().0.iter() {
             let len = enc.encode_i16(block, FRAME, &mut out).unwrap();
             // TOC config 20..23 is wideband CELT (RFC 6716 Table 2).
             assert_eq!(out[0] >> 3, 23, "wideband CELT config");
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(e.mapping(), &[0, 4, 1, 2, 3, 5]);
         let pcm = tone(FRAME * 3, 6);
         let mut out = vec![0u8; 8 * 1500];
-        for block in pcm.chunks_exact(FRAME * 6) {
+        for block in pcm.as_chunks::<{ FRAME * 6 }>().0.iter() {
             assert!(e.encode(block, FRAME, &mut out).unwrap() > 8);
         }
         assert!(MultistreamEncoder::surround(48_000, 9, Application::Audio).is_err());

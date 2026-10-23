@@ -1,0 +1,28 @@
+[package]
+name = "ec-pcm-ext-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-pcm-ext]
+path = ".."
+
+[dependencies.ec-core]
+path = "../../ec-core"
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_blocks"
+path = "fuzz_targets/decode_blocks.rs"
+test = false
+doc = false
+bench = false

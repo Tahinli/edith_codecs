@@ -7,145 +7,229 @@
 //! frame crop, which is what makes 1916x1080 (or any width that is not a
 //! multiple of 32) come out the size it went in.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
-use ec_va::Buffer;
+use ec_va::va::{
+    BufferType, EncPictureParameter, EncPictureParameterBufferHEVC, EncSequenceParameter,
+    EncSequenceParameterBufferHEVC, EncSliceParameter, EncSliceParameterBufferHEVC,
+    HEVCEncPicFields, HEVCEncSeqFields, HevcEncPicSccFields, HevcEncSeqSccFields,
+    HevcEncSliceFields, HevcEncVuiFields, PictureHEVC, VABufferID,
+};
 
 use super::headers::hevc as hevc_headers;
 use super::{Encoder, RateControlMode};
 use crate::error::Result;
-use crate::params::enc::{
-    EncPictureParameterBufferHEVC, EncSequenceParameterBufferHEVC, EncSliceParameterBufferHEVC,
-};
-use crate::params::hevc::VAPictureHEVC;
-use crate::params::param_buffer;
+use crate::params::INVALID_SURFACE;
 use crate::pool::PooledSurface;
 
 /// `NAL_IDR_W_RADL`.
 const NAL_IDR_W_RADL: u8 = 19;
 /// `NAL_TRAIL_R`.
 const NAL_TRAIL_R: u8 = 1;
+/// `VA_PICTURE_HEVC_INVALID`: an unused entry of a reference list.
+const PICTURE_INVALID: u32 = 0x0000_0001;
+
+/// An unused entry of a reference list.
+fn invalid_picture() -> PictureHEVC {
+    PictureHEVC::new(INVALID_SURFACE, 0, PICTURE_INVALID)
+}
 
 pub(super) fn parameters(
     encoder: &Encoder,
-    recon: &Arc<PooledSurface>,
-    coded_buf: u32,
+    recon: &Rc<PooledSurface>,
+    coded_buf: VABufferID,
     keyframe: bool,
-    out: &mut Vec<Buffer>,
+    out: &mut Vec<BufferType>,
 ) -> Result<()> {
     let config = *encoder.config();
-    let context = encoder.context();
     let (coded_w, coded_h) = encoder.coded_size();
     let poc = if keyframe {
         0
     } else {
         encoder.gop_position() as i32
     };
-
-    let mut seq = EncSequenceParameterBufferHEVC {
-        general_profile_idc: 1, // Main
-        general_level_idc: level_idc(coded_w, coded_h, config.framerate),
-        general_tier_flag: 0,
-        intra_period: config.gop_size.max(1),
-        intra_idr_period: config.gop_size.max(1),
-        ip_period: 1,
-        bits_per_second: match config.rate_control {
-            RateControlMode::ConstantQp { .. } => 0,
-            _ => config.bitrate,
-        },
-        pic_width_in_luma_samples: coded_w as u16,
-        pic_height_in_luma_samples: coded_h as u16,
-        // 64x64 CTBs from 8x8 minimum CBs: log2_min = 0 (8), diff = 3 (64).
-        // Not a preference — this driver codes 64x64 CTBs whatever the sequence
-        // parameters say, and `num_ctu_in_slice` below has to count the same
-        // blocks the hardware does.
-        log2_min_luma_coding_block_size_minus3: 0,
-        log2_diff_max_min_luma_coding_block_size: 3,
-        log2_min_transform_block_size_minus2: 0,
-        log2_diff_max_min_transform_block_size: 3,
-        max_transform_hierarchy_depth_inter: 1,
-        max_transform_hierarchy_depth_intra: 1,
-        vui_parameters_present_flag: 1,
-        vui_num_units_in_tick: config.framerate.1.max(1),
-        vui_time_scale: config.framerate.0.max(1),
-        ..EncSequenceParameterBufferHEVC::default()
+    let general_level_idc = level_idc(coded_w, coded_h, config.framerate);
+    let intra_period = config.gop_size.max(1);
+    let bits_per_second = match config.rate_control {
+        RateControlMode::ConstantQp { .. } => 0,
+        _ => config.bitrate,
     };
-    seq.seq_fields = seq
-        .seq_fields
-        .chroma_format_idc(1)
-        .bit_depth_luma_minus8(0)
-        .bit_depth_chroma_minus8(0)
-        .strong_intra_smoothing_enabled_flag(1)
-        .amp_enabled_flag(1)
-        .sample_adaptive_offset_enabled_flag(1);
-    seq.vui_fields = seq.vui_fields.vui_timing_info_present_flag(1);
-    out.push(param_buffer(context, &seq)?);
+    let vui_num_units_in_tick = config.framerate.1.max(1);
+    let vui_time_scale = config.framerate.0.max(1);
 
-    let mut pic = EncPictureParameterBufferHEVC {
-        decoded_curr_pic: VAPictureHEVC::new(recon.id(), poc, 0),
-        coded_buf,
-        collocated_ref_pic_index: 0xff,
-        pic_init_qp: match config.rate_control {
-            RateControlMode::ConstantQp { qp } => qp.clamp(1, 51) as u8,
-            _ => 26,
-        },
-        nal_unit_type: if keyframe {
-            NAL_IDR_W_RADL
-        } else {
-            NAL_TRAIL_R
-        },
-        ..EncPictureParameterBufferHEVC::default()
+    // chroma_format_idc 1, bit depths 8, strong intra smoothing, AMP, SAO.
+    let seq_fields = HEVCEncSeqFields::new(1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0);
+    // vui_timing_info_present_flag.
+    let vui = HevcEncVuiFields::new(0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
+    let scc = HevcEncSeqSccFields::new(0);
+    // 64x64 CTBs from 8x8 minimum CBs: log2_min = 0 (8), diff = 3 (64).
+    // Not a preference — this driver codes 64x64 CTBs whatever the sequence
+    // parameters say, and `num_ctu_in_slice` below has to count the same
+    // blocks the hardware does.
+    let seq = EncSequenceParameterBufferHEVC::new(
+        1,
+        general_level_idc,
+        0,
+        intra_period,
+        intra_period,
+        1,
+        bits_per_second,
+        coded_w as u16,
+        coded_h as u16,
+        &seq_fields,
+        0,
+        3,
+        0,
+        3,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        Some(vui),
+        0,
+        0,
+        0,
+        vui_num_units_in_tick,
+        vui_time_scale,
+        0,
+        0,
+        0,
+        &scc,
+    );
+    out.push(BufferType::EncSequenceParameter(EncSequenceParameter::HEVC(seq)));
+
+    let pic_init_qp = match config.rate_control {
+        RateControlMode::ConstantQp { qp } => qp.clamp(1, 51) as u8,
+        _ => 26,
     };
-    if let Some(reference) = encoder.reference().filter(|_| !keyframe) {
-        pic.reference_frames[0] = VAPictureHEVC::new(reference.id(), poc - 1, 0);
-    }
-    pic.pic_fields = pic
-        .pic_fields
-        .idr_pic_flag(u32::from(keyframe))
+    let nal_unit_type = if keyframe {
+        NAL_IDR_W_RADL
+    } else {
+        NAL_TRAIL_R
+    };
+    // Off, and it has to be off: this driver omits
+    // `slice_loop_filter_across_slices_enabled_flag` from the slice header
+    // it writes, so a PPS that says the flag is present describes a header
+    // that is one bit longer than the one in the stream — every P picture
+    // then decodes as `alignment_bit_equal_to_one = 0` (measured).
+    let pic_fields = HEVCEncPicFields::new(
+        u32::from(keyframe),
         // 1 = I, 2 = P in this driver's coding_type numbering.
-        .coding_type(if keyframe { 1 } else { 2 })
-        .reference_pic_flag(1)
-        .transform_skip_enabled_flag(1)
-        // Off, and it has to be off: this driver omits
-        // `slice_loop_filter_across_slices_enabled_flag` from the slice header
-        // it writes, so a PPS that says the flag is present describes a header
-        // that is one bit longer than the one in the stream — every P picture
-        // then decodes as `alignment_bit_equal_to_one = 0` (measured).
-        .pps_loop_filter_across_slices_enabled_flag(0);
-    out.push(param_buffer(context, &pic)?);
+        if keyframe { 1 } else { 2 },
+        1,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    let pic_scc = HevcEncPicSccFields::new(0);
+    let mut reference_frames: [PictureHEVC; 15] = std::array::from_fn(|_| invalid_picture());
+    if let Some(reference) = encoder.reference().filter(|_| !keyframe) {
+        reference_frames[0] = PictureHEVC::new(reference.id(), poc - 1, 0);
+    }
+    let pic = EncPictureParameterBufferHEVC::new(
+        PictureHEVC::new(recon.id(), poc, 0),
+        reference_frames,
+        coded_buf,
+        0xff,
+        0,
+        pic_init_qp,
+        0,
+        0,
+        0,
+        0,
+        0,
+        [0; 19],
+        [0; 21],
+        0,
+        0,
+        0,
+        0,
+        0,
+        nal_unit_type,
+        &pic_fields,
+        0,
+        0,
+        &pic_scc,
+    );
+    out.push(BufferType::EncPictureParameter(EncPictureParameter::HEVC(pic)));
 
     // CTBs are 64x64 by the sequence parameters above.
     let ctbs = coded_w.div_ceil(64) * coded_h.div_ceil(64);
-    let mut slice = EncSliceParameterBufferHEVC {
-        slice_segment_address: 0,
-        num_ctu_in_slice: ctbs,
-        slice_type: if keyframe { 2 } else { 1 }, // 2 = I, 1 = P
-        num_ref_idx_l0_active_minus1: 0,
-        num_ref_idx_l1_active_minus1: 0,
-        max_num_merge_cand: 5,
-        ..EncSliceParameterBufferHEVC::default()
-    };
+    let mut ref_pic_list0: [PictureHEVC; 15] = std::array::from_fn(|_| invalid_picture());
+    let ref_pic_list1: [PictureHEVC; 15] = std::array::from_fn(|_| invalid_picture());
     if !keyframe && let Some(reference) = encoder.reference() {
-        slice.ref_pic_list0[0] = VAPictureHEVC::new(reference.id(), poc - 1, 0);
+        ref_pic_list0[0] = PictureHEVC::new(reference.id(), poc - 1, 0);
     }
-    slice.slice_fields = slice
-        .slice_fields
-        .last_slice_of_pic_flag(1)
-        .slice_sao_luma_flag(1)
-        .slice_sao_chroma_flag(1)
-        .cabac_init_flag(0)
-        .num_ref_idx_active_override_flag(u32::from(!keyframe))
-        .slice_loop_filter_across_slices_enabled_flag(0);
+    // last_slice_of_pic_flag, slice_sao_luma/chroma, and the reference override
+    // on P pictures. The loop filter across slices stays off, matching the PPS.
+    let slice_fields = HevcEncSliceFields::new(
+        1,
+        0,
+        0,
+        0,
+        1,
+        1,
+        u32::from(!keyframe),
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    let slice = EncSliceParameterBufferHEVC::new(
+        0,
+        ctbs,
+        if keyframe { 2 } else { 1 }, // 2 = I, 1 = P
+        0,
+        0,
+        0,
+        ref_pic_list0,
+        ref_pic_list1,
+        0,
+        0,
+        [0; 15],
+        [0; 15],
+        [[0; 2]; 15],
+        [[0; 2]; 15],
+        [0; 15],
+        [0; 15],
+        [[0; 2]; 15],
+        [[0; 2]; 15],
+        5,
+        0,
+        0,
+        0,
+        0,
+        0,
+        &slice_fields,
+        0,
+        0,
+    );
 
     let header_params = hevc_headers::Params {
         width: config.width,
         height: config.height,
         coded_width: coded_w,
         coded_height: coded_h,
-        level_idc: seq.general_level_idc,
-        num_units_in_tick: seq.vui_num_units_in_tick,
-        time_scale: seq.vui_time_scale,
-        init_qp: pic.pic_init_qp,
+        level_idc: general_level_idc,
+        num_units_in_tick: vui_num_units_in_tick,
+        time_scale: vui_time_scale,
+        init_qp: pic_init_qp,
         colour: config.colour,
     };
     let (vps, sps, pps) = hevc_headers::parameter_sets(&header_params);
@@ -159,7 +243,7 @@ pub(super) fn parameters(
     // only when a slice header accompanies them, so dropping it costs the
     // stream its VPS, SPS and PPS (measured 2026-08-14).
     encoder.push_packed(&hevc_headers::packed_slice(&sps, &pps, keyframe, poc), out)?;
-    out.push(param_buffer(context, &slice)?);
+    out.push(BufferType::EncSliceParameter(EncSliceParameter::HEVC(slice)));
     Ok(())
 }
 

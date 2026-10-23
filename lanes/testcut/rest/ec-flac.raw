@@ -1,0 +1,56 @@
+{ "type": "suite", "event": "started", "test_count": 16 }
+{ "type": "test", "event": "started", "name": "checksum::tests::crcs_match_known_values" }
+{ "type": "test", "event": "started", "name": "checksum::tests::md5_is_split_invariant" }
+{ "type": "test", "event": "started", "name": "checksum::tests::md5_matches_rfc1321_vectors" }
+{ "type": "test", "event": "started", "name": "decode::tests::container_shift_matches_reference_layout" }
+{ "type": "test", "name": "checksum::tests::crcs_match_known_values", "event": "ok", "exec_time": 0.00000048 }
+{ "type": "test", "event": "started", "name": "decode::tests::garbage_never_panics_and_never_opens" }
+{ "type": "test", "name": "checksum::tests::md5_matches_rfc1321_vectors", "event": "ok", "exec_time": 0.000017994 }
+{ "type": "test", "event": "started", "name": "decode::tests::mid_side_inverts_the_encoder_transform" }
+{ "type": "test", "name": "decode::tests::container_shift_matches_reference_layout", "event": "ok", "exec_time": 0.000000271 }
+{ "type": "test", "event": "started", "name": "decode::tests::seek_table_offset_overflow_does_not_panic" }
+{ "type": "test", "name": "checksum::tests::md5_is_split_invariant", "event": "ok", "exec_time": 0.000015329 }
+{ "type": "test", "event": "started", "name": "decode::tests::stream_info_round_trips" }
+{ "type": "test", "name": "decode::tests::garbage_never_panics_and_never_opens", "event": "ok", "exec_time": 0.000041298 }
+{ "type": "test", "event": "started", "name": "decode::tests::truncated_input_is_need_more_not_a_panic" }
+{ "type": "test", "name": "decode::tests::mid_side_inverts_the_encoder_transform", "event": "ok", "exec_time": 0.000001393 }
+{ "type": "test", "event": "started", "name": "encode::tests::a_short_last_block_still_decodes" }
+{ "type": "test", "name": "decode::tests::seek_table_offset_overflow_does_not_panic", "event": "ok", "exec_time": 0.000003166 }
+{ "type": "test", "event": "started", "name": "encode::tests::compresses_better_than_raw_pcm" }
+{ "type": "test", "name": "decode::tests::stream_info_round_trips", "event": "ok", "exec_time": 0.000000973 }
+{ "type": "test", "event": "started", "name": "encode::tests::refuses_input_it_cannot_encode_losslessly" }
+{ "type": "test", "name": "decode::tests::truncated_input_is_need_more_not_a_panic", "event": "ok", "exec_time": 0.000000812 }
+{ "type": "test", "event": "started", "name": "encode::tests::round_trips_every_shape_the_family_uses" }
+{ "type": "test", "name": "encode::tests::refuses_input_it_cannot_encode_losslessly", "event": "ok", "exec_time": 0.000006122 }
+{ "type": "test", "event": "started", "name": "encode::tests::round_trips_the_awkward_signals" }
+{ "type": "test", "name": "encode::tests::a_short_last_block_still_decodes", "event": "ok", "exec_time": 0.000623051 }
+{ "type": "test", "event": "started", "name": "encode::tests::utf8_coded_numbers_round_trip" }
+{ "type": "test", "name": "encode::tests::utf8_coded_numbers_round_trip", "event": "ok", "exec_time": 0.000002435 }
+{ "type": "test", "event": "started", "name": "tests::decoder_trait_round_trips_packet_by_packet" }
+{ "type": "test", "name": "tests::decoder_trait_round_trips_packet_by_packet", "event": "ok", "exec_time": 0.001536639 }
+{ "type": "test", "name": "encode::tests::round_trips_the_awkward_signals", "event": "ok", "exec_time": 0.003015378 }
+{ "type": "test", "name": "encode::tests::compresses_better_than_raw_pcm", "event": "ok", "exec_time": 0.013069747 }
+{ "type": "test", "name": "encode::tests::round_trips_every_shape_the_family_uses", "event": "ok", "exec_time": 0.023101965 }
+{ "type": "suite", "event": "ok", "passed": 16, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.024303442 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "encoded_streams_decode_back_bit_exact_through_ffmpeg" }
+{ "type": "test", "event": "started", "name": "our_streams_survive_a_probe_and_state_their_shape" }
+{ "type": "test", "name": "our_streams_survive_a_probe_and_state_their_shape", "event": "ok", "exec_time": 3.597020379 }
+{ "type": "test", "name": "encoded_streams_decode_back_bit_exact_through_ffmpeg", "event": "ok", "exec_time": 14.649352797 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 14.649720367 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "level_and_depth_parity_with_ffmpeg_flac" }
+{ "type": "test", "name": "level_and_depth_parity_with_ffmpeg_flac", "event": "ok", "exec_time": 9.455009039 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 9.455372663 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "faulty_vectors_error_and_never_panic" }
+{ "type": "test", "event": "started", "name": "seek_table_positions_the_reader_at_a_frame" }
+{ "type": "test", "event": "started", "name": "subset_vectors_decode_bit_exact_against_ffmpeg" }
+{ "type": "test", "event": "started", "name": "uncommon_vectors_decode_bit_exact_or_refuse_by_name" }
+{ "type": "test", "name": "seek_table_positions_the_reader_at_a_frame", "event": "ok", "exec_time": 0.00570273 }
+{ "type": "test", "name": "faulty_vectors_error_and_never_panic", "event": "ok", "exec_time": 0.036179463 }
+{ "type": "test", "name": "uncommon_vectors_decode_bit_exact_or_refuse_by_name", "event": "ok", "exec_time": 2.261872577 }
+{ "type": "test", "name": "subset_vectors_decode_bit_exact_against_ffmpeg", "event": "ok", "exec_time": 20.503324346 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 20.50399084 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000035456 }

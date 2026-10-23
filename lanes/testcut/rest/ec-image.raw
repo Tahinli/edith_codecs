@@ -1,0 +1,224 @@
+{ "type": "suite", "event": "started", "test_count": 45 }
+{ "type": "test", "event": "started", "name": "gif_encode::tests::a_changing_sequence_decodes_frame_for_frame" }
+{ "type": "test", "event": "started", "name": "gif_encode::tests::a_palette_that_fits_is_reproduced_exactly" }
+{ "type": "test", "event": "started", "name": "gif_encode::tests::a_static_frame_repeated_ten_times_costs_little_more_than_one" }
+{ "type": "test", "event": "started", "name": "gif_encode::tests::bad_arguments_are_refused" }
+{ "type": "test", "name": "gif_encode::tests::a_changing_sequence_decodes_frame_for_frame", "event": "ok", "exec_time": 0.000219081 }
+{ "type": "test", "event": "started", "name": "gif_encode::tests::ffprobe_reads_the_output_when_it_is_installed" }
+{ "type": "test", "name": "gif_encode::tests::bad_arguments_are_refused", "event": "ok", "exec_time": 0.000008175 }
+{ "type": "test", "event": "started", "name": "gif_encode::tests::photographic_content_stays_within_a_small_error" }
+{ "type": "test", "name": "gif_encode::tests::a_palette_that_fits_is_reproduced_exactly", "event": "ok", "exec_time": 0.000277852 }
+{ "type": "test", "event": "started", "name": "gif_encode::tests::the_loop_extension_is_written_only_when_asked" }
+{ "type": "test", "name": "gif_encode::tests::the_loop_extension_is_written_only_when_asked", "event": "ok", "exec_time": 0.000007194 }
+{ "type": "test", "event": "started", "name": "gif_encode::tests::transparent_pixels_stay_transparent_and_unchanged_ones_keep_the_canvas" }
+{ "type": "test", "name": "gif_encode::tests::transparent_pixels_stay_transparent_and_unchanged_ones_keep_the_canvas", "event": "ok", "exec_time": 0.000019517 }
+{ "type": "test", "event": "started", "name": "jpeg::tests::a_flat_block_inverts_to_its_dc_level" }
+{ "type": "test", "name": "jpeg::tests::a_flat_block_inverts_to_its_dc_level", "event": "ok", "exec_time": 0.000000661 }
+{ "type": "test", "event": "started", "name": "jpeg::tests::exif_orientation_is_read_from_either_byte_order" }
+{ "type": "test", "name": "jpeg::tests::exif_orientation_is_read_from_either_byte_order", "event": "ok", "exec_time": 0.000001282 }
+{ "type": "test", "event": "started", "name": "jpeg::tests::the_dc_only_shortcut_matches_the_full_transform" }
+{ "type": "test", "name": "jpeg::tests::the_dc_only_shortcut_matches_the_full_transform", "event": "ok", "exec_time": 0.00000526 }
+{ "type": "test", "event": "started", "name": "jpeg::tests::the_idct_basis_matches_the_cosine_it_stands_for" }
+{ "type": "test", "name": "jpeg::tests::the_idct_basis_matches_the_cosine_it_stands_for", "event": "ok", "exec_time": 0.000014999 }
+{ "type": "test", "event": "started", "name": "jpeg::tests::ycbcr_neutral_chroma_is_grey" }
+{ "type": "test", "name": "jpeg::tests::ycbcr_neutral_chroma_is_grey", "event": "ok", "exec_time": 0.00000018 }
+{ "type": "test", "event": "started", "name": "png::tests::a_one_pixel_png_decodes_and_a_bad_crc_does_not" }
+{ "type": "test", "name": "png::tests::a_one_pixel_png_decodes_and_a_bad_crc_does_not", "event": "ok", "exec_time": 0.0000156 }
+{ "type": "test", "event": "started", "name": "png::tests::adam7_pass_sizes_cover_every_pixel" }
+{ "type": "test", "name": "png::tests::adam7_pass_sizes_cover_every_pixel", "event": "ok", "exec_time": 0.000000842 }
+{ "type": "test", "event": "started", "name": "png::tests::crc_matches_the_known_iend_value" }
+{ "type": "test", "name": "png::tests::crc_matches_the_known_iend_value", "event": "ok", "exec_time": 0.00000029 }
+{ "type": "test", "event": "started", "name": "png::tests::paeth_prefers_the_nearest_predictor" }
+{ "type": "test", "name": "png::tests::paeth_prefers_the_nearest_predictor", "event": "ok", "exec_time": 0.000000371 }
+{ "type": "test", "event": "started", "name": "png_encode::tests::a_flat_image_round_trips" }
+{ "type": "test", "name": "png_encode::tests::a_flat_image_round_trips", "event": "ok", "exec_time": 0.000093916 }
+{ "type": "test", "event": "started", "name": "png_encode::tests::a_size_mismatch_is_refused" }
+{ "type": "test", "name": "png_encode::tests::a_size_mismatch_is_refused", "event": "ok", "exec_time": 0.000001943 }
+{ "type": "test", "event": "started", "name": "png_encode::tests::paeth_picks_the_nearest_neighbour_with_ties_to_a_then_b" }
+{ "type": "test", "name": "png_encode::tests::paeth_picks_the_nearest_neighbour_with_ties_to_a_then_b", "event": "ok", "exec_time": 0.000000211 }
+{ "type": "test", "event": "started", "name": "tests::alloc_budget_refuses_once_repeated_spends_cross_the_total" }
+{ "type": "test", "name": "tests::alloc_budget_refuses_once_repeated_spends_cross_the_total", "event": "ok", "exec_time": 0.000001573 }
+{ "type": "test", "event": "started", "name": "tests::check_bytes_refuses_past_max_alloc_before_a_frame_size_carries_it" }
+{ "type": "test", "name": "tests::check_bytes_refuses_past_max_alloc_before_a_frame_size_carries_it", "event": "ok", "exec_time": 0.000001984 }
+{ "type": "test", "event": "started", "name": "tests::check_output_names_the_picture_and_refuses_past_the_budget" }
+{ "type": "test", "name": "tests::check_output_names_the_picture_and_refuses_past_the_budget", "event": "ok", "exec_time": 0.000004608 }
+{ "type": "test", "event": "started", "name": "tests::guess_reads_signatures_not_extensions" }
+{ "type": "test", "name": "tests::guess_reads_signatures_not_extensions", "event": "ok", "exec_time": 0.000001423 }
+{ "type": "test", "event": "started", "name": "tests::limits_refuse_before_allocating" }
+{ "type": "test", "name": "tests::limits_refuse_before_allocating", "event": "ok", "exec_time": 0.000002505 }
+{ "type": "test", "event": "started", "name": "tests::sample_conversion_round_trips_through_eight_bits" }
+{ "type": "test", "name": "tests::sample_conversion_round_trips_through_eight_bits", "event": "ok", "exec_time": 0.000000271 }
+{ "type": "test", "event": "started", "name": "transform::tests::a_full_cycle_is_the_identity" }
+{ "type": "test", "name": "transform::tests::a_full_cycle_is_the_identity", "event": "ok", "exec_time": 0.000003387 }
+{ "type": "test", "event": "started", "name": "transform::tests::a_mismatched_buffer_is_refused" }
+{ "type": "test", "name": "transform::tests::a_mismatched_buffer_is_refused", "event": "ok", "exec_time": 0.000002214 }
+{ "type": "test", "event": "started", "name": "transform::tests::every_orientation_gives_the_right_size_and_is_refused_outside_1_to_8" }
+{ "type": "test", "name": "transform::tests::every_orientation_gives_the_right_size_and_is_refused_outside_1_to_8", "event": "ok", "exec_time": 0.000005661 }
+{ "type": "test", "event": "started", "name": "transform::tests::mirrors_keep_dimensions_and_are_involutions" }
+{ "type": "test", "name": "transform::tests::mirrors_keep_dimensions_and_are_involutions", "event": "ok", "exec_time": 0.000002094 }
+{ "type": "test", "event": "started", "name": "transform::tests::quarter_turn_moves_the_top_left_pixel_to_the_top_right" }
+{ "type": "test", "name": "transform::tests::quarter_turn_moves_the_top_left_pixel_to_the_top_right", "event": "ok", "exec_time": 0.000002265 }
+{ "type": "test", "event": "started", "name": "webp::tests::animation_is_refused_by_name" }
+{ "type": "test", "name": "webp::tests::animation_is_refused_by_name", "event": "ok", "exec_time": 0.000006572 }
+{ "type": "test", "event": "started", "name": "webp::tests::odd_sized_chunks_are_padded_and_still_walked" }
+{ "type": "test", "name": "webp::tests::odd_sized_chunks_are_padded_and_still_walked", "event": "ok", "exec_time": 0.000002104 }
+{ "type": "test", "event": "started", "name": "webp::tests::the_alpha_gradient_filter_inverts_its_prediction" }
+{ "type": "test", "name": "webp::tests::the_alpha_gradient_filter_inverts_its_prediction", "event": "ok", "exec_time": 0.000001263 }
+{ "type": "test", "event": "started", "name": "webp::tests::yuv_conversion_puts_studio_black_and_white_at_the_ends" }
+{ "type": "test", "name": "webp::tests::yuv_conversion_puts_studio_black_and_white_at_the_ends", "event": "ok", "exec_time": 0.00000039 }
+{ "type": "test", "event": "started", "name": "webp::vp8::tests::dequant_factors_follow_the_scaling_rules" }
+{ "type": "test", "name": "webp::vp8::tests::dequant_factors_follow_the_scaling_rules", "event": "ok", "exec_time": 0.000000681 }
+{ "type": "test", "event": "started", "name": "webp::vp8::tests::the_bool_decoder_inverts_the_specification_encoder" }
+{ "type": "test", "name": "webp::vp8::tests::the_bool_decoder_inverts_the_specification_encoder", "event": "ok", "exec_time": 0.000023324 }
+{ "type": "test", "event": "started", "name": "webp::vp8::tests::the_inverse_dct_of_a_dc_only_block_is_flat" }
+{ "type": "test", "name": "webp::vp8::tests::the_inverse_dct_of_a_dc_only_block_is_flat", "event": "ok", "exec_time": 0.000000842 }
+{ "type": "test", "event": "started", "name": "webp::vp8::tests::the_inverse_wht_matches_its_specification" }
+{ "type": "test", "name": "webp::vp8::tests::the_inverse_wht_matches_its_specification", "event": "ok", "exec_time": 0.00000043 }
+{ "type": "test", "event": "started", "name": "webp::vp8::tests::trees_decode_their_leaves" }
+{ "type": "test", "name": "webp::vp8::tests::trees_decode_their_leaves", "event": "ok", "exec_time": 0.000000241 }
+{ "type": "test", "event": "started", "name": "webp::vp8l::tests::a_canonical_code_decodes_its_own_symbols" }
+{ "type": "test", "name": "webp::vp8l::tests::a_canonical_code_decodes_its_own_symbols", "event": "ok", "exec_time": 0.000001202 }
+{ "type": "test", "event": "started", "name": "webp::vp8l::tests::an_incomplete_code_is_refused" }
+{ "type": "test", "name": "webp::vp8l::tests::an_incomplete_code_is_refused", "event": "ok", "exec_time": 0.000001553 }
+{ "type": "test", "event": "started", "name": "webp::vp8l::tests::bits_come_out_low_bit_first" }
+{ "type": "test", "name": "webp::vp8l::tests::bits_come_out_low_bit_first", "event": "ok", "exec_time": 0.000000171 }
+{ "type": "test", "event": "started", "name": "webp::vp8l::tests::distance_codes_map_into_the_neighbourhood" }
+{ "type": "test", "name": "webp::vp8l::tests::distance_codes_map_into_the_neighbourhood", "event": "ok", "exec_time": 0.00000018 }
+{ "type": "test", "event": "started", "name": "webp::vp8l::tests::the_predictors_agree_with_their_definitions" }
+{ "type": "test", "name": "webp::vp8l::tests::the_predictors_agree_with_their_definitions", "event": "ok", "exec_time": 0.000001111 }
+{ "type": "test", "name": "gif_encode::tests::a_static_frame_repeated_ten_times_costs_little_more_than_one", "event": "ok", "exec_time": 0.02083909 }
+{ "type": "test", "name": "gif_encode::tests::photographic_content_stays_within_a_small_error", "event": "ok", "exec_time": 0.042841667 }
+{ "type": "test", "name": "gif_encode::tests::ffprobe_reads_the_output_when_it_is_installed", "event": "ok", "exec_time": 0.281515887 }
+{ "type": "suite", "event": "ok", "passed": 45, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.283282386 }
+{ "type": "suite", "event": "started", "test_count": 19 }
+{ "type": "test", "event": "started", "name": "a_bmp_wrapping_another_format_decodes_to_that_format" }
+{ "type": "test", "event": "started", "name": "a_four_bit_tiff_palette_reads_as_ffmpeg_reads_it" }
+{ "type": "test", "event": "started", "name": "a_gif_animation_composites_frame_for_frame_like_the_incumbent" }
+{ "type": "test", "event": "started", "name": "a_still_of_any_format_is_one_frame_of_animation" }
+{ "type": "test", "name": "a_four_bit_tiff_palette_reads_as_ffmpeg_reads_it", "event": "ok", "exec_time": 0.000222248 }
+{ "type": "test", "event": "started", "name": "an_animated_webp_composites_frame_for_frame_like_the_incumbent" }
+{ "type": "test", "name": "a_bmp_wrapping_another_format_decodes_to_that_format", "event": "ok", "exec_time": 0.003207759 }
+{ "type": "test", "event": "started", "name": "an_animated_webp_is_refused_by_name" }
+{ "type": "test", "name": "an_animated_webp_is_refused_by_name", "event": "ok", "exec_time": 0.000034053 }
+{ "type": "test", "event": "started", "name": "an_associated_alpha_tiff_reads_unpremultiplied" }
+{ "type": "test", "name": "an_associated_alpha_tiff_reads_unpremultiplied", "event": "ok", "exec_time": 0.000482677 }
+{ "type": "test", "event": "started", "name": "an_os2_v2_header_reads_as_the_same_picture" }
+{ "type": "test", "name": "an_os2_v2_header_reads_as_the_same_picture", "event": "ok", "exec_time": 0.000096251 }
+{ "type": "test", "event": "started", "name": "bmp_decodes_pixel_exactly" }
+{ "type": "test", "name": "bmp_decodes_pixel_exactly", "event": "ok", "exec_time": 0.001480392 }
+{ "type": "test", "event": "started", "name": "every_fixture_decodes" }
+{ "type": "test", "name": "a_still_of_any_format_is_one_frame_of_animation", "event": "ok", "exec_time": 0.013390088 }
+{ "type": "test", "event": "started", "name": "exif_orientation_is_reported_and_not_applied" }
+{ "type": "test", "name": "a_gif_animation_composites_frame_for_frame_like_the_incumbent", "event": "ok", "exec_time": 0.016733132 }
+{ "type": "test", "event": "started", "name": "gif_decodes_pixel_exactly" }
+{ "type": "test", "name": "exif_orientation_is_reported_and_not_applied", "event": "ok", "exec_time": 0.008242292 }
+{ "type": "test", "event": "started", "name": "header_dimensions_match_the_incumbent" }
+{ "type": "test", "name": "an_animated_webp_composites_frame_for_frame_like_the_incumbent", "event": "ok", "exec_time": 0.020639546 }
+{ "type": "test", "event": "started", "name": "jpeg_matches_the_incumbent_within_rounding" }
+{ "type": "test", "name": "header_dimensions_match_the_incumbent", "event": "ok", "exec_time": 0.001141616 }
+{ "type": "test", "event": "started", "name": "png_decodes_pixel_exactly" }
+{ "type": "test", "name": "jpeg_matches_the_incumbent_within_rounding", "event": "ok", "exec_time": 0.026509918 }
+{ "type": "test", "event": "started", "name": "tiff_decodes_pixel_exactly" }
+{ "type": "test", "name": "gif_decodes_pixel_exactly", "event": "ok", "exec_time": 0.036888377 }
+{ "type": "test", "event": "started", "name": "webp_disposal_and_blending_match_libwebp" }
+{ "type": "test", "name": "tiff_decodes_pixel_exactly", "event": "ok", "exec_time": 0.00712381 }
+{ "type": "test", "event": "started", "name": "webp_lossless_decodes_pixel_exactly" }
+{ "type": "test", "name": "webp_disposal_and_blending_match_libwebp", "event": "ok", "exec_time": 0.004927001 }
+{ "type": "test", "event": "started", "name": "webp_lossy_reconstructs_at_least_as_well_as_the_incumbent" }
+{ "type": "test", "name": "webp_lossless_decodes_pixel_exactly", "event": "ok", "exec_time": 0.026114697 }
+{ "type": "test", "name": "webp_lossy_reconstructs_at_least_as_well_as_the_incumbent", "event": "ok", "exec_time": 0.040877786 }
+{ "type": "test", "name": "png_decodes_pixel_exactly", "event": "ok", "exec_time": 0.10549915 }
+{ "type": "test", "name": "every_fixture_decodes", "event": "ok", "exec_time": 0.131847214 }
+{ "type": "suite", "event": "ok", "passed": 19, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.139774024 }
+{ "type": "suite", "event": "started", "test_count": 19 }
+{ "type": "test", "event": "started", "name": "a_compressed_tiff_survives_mutation" }
+{ "type": "test", "event": "started", "name": "a_gif_animation_survives_mutation" }
+{ "type": "test", "event": "started", "name": "a_gif_frame_asking_for_more_pixels_than_the_limit_is_refused" }
+{ "type": "test", "event": "started", "name": "a_gif_lzw_bomb_does_not_expand_past_its_declared_frame" }
+{ "type": "test", "name": "a_gif_frame_asking_for_more_pixels_than_the_limit_is_refused", "event": "ok", "exec_time": 0.000008887 }
+{ "type": "test", "event": "started", "name": "a_gif_with_a_few_tiny_frames_over_a_huge_canvas_still_decodes" }
+{ "type": "test", "name": "a_gif_lzw_bomb_does_not_expand_past_its_declared_frame", "event": "ok", "exec_time": 0.00104289 }
+{ "type": "test", "event": "started", "name": "a_gif_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget" }
+{ "type": "test", "name": "a_gif_animation_survives_mutation", "event": "ok", "exec_time": 35.576839133 }
+{ "type": "test", "event": "started", "name": "a_header_asking_for_more_pixels_than_the_limit_is_refused" }
+{ "type": "test", "name": "a_header_asking_for_more_pixels_than_the_limit_is_refused", "event": "ok", "exec_time": 0.000012524 }
+{ "type": "test", "event": "started", "name": "a_run_length_bmp_survives_mutation" }
+{ "type": "test", "name": "a_compressed_tiff_survives_mutation", "event": "ok", "exec_time": 36.309018337 }
+{ "type": "test", "event": "started", "name": "a_webp_animation_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget" }
+{ "type": "test", "name": "a_gif_with_a_few_tiny_frames_over_a_huge_canvas_still_decodes", "event": "ok", "exec_time": 36.549078734 }
+{ "type": "test", "event": "started", "name": "an_animated_webp_survives_mutation" }
+{ "type": "test", "name": "a_gif_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget", "event": "ok", "exec_time": 37.619205541 }
+{ "type": "test", "event": "started", "name": "arbitrary_bytes_behind_a_signature_are_refused_not_believed" }
+{ "type": "test", "name": "a_run_length_bmp_survives_mutation", "event": "ok", "exec_time": 16.256990713 }
+{ "type": "test", "event": "started", "name": "bmp_survives_mutation" }
+{ "type": "test", "name": "a_webp_animation_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget", "event": "ok", "exec_time": 16.60070415 }
+{ "type": "test", "event": "started", "name": "decode_animation_applies_the_default_limits" }
+{ "type": "test", "name": "decode_animation_applies_the_default_limits", "event": "ok", "exec_time": 0.000014037 }
+{ "type": "test", "event": "started", "name": "gif_survives_mutation" }
+{ "type": "test", "name": "an_animated_webp_survives_mutation", "event": "ok", "exec_time": 26.504712719 }
+{ "type": "test", "event": "started", "name": "jpeg_survives_mutation" }
+{ "type": "test", "name": "arbitrary_bytes_behind_a_signature_are_refused_not_believed", "event": "ok", "exec_time": 25.44463592 }
+{ "type": "test", "event": "started", "name": "png_survives_mutation" }
+{ "type": "test", "name": "bmp_survives_mutation", "event": "ok", "exec_time": 15.085740106 }
+{ "type": "test", "event": "started", "name": "tiff_survives_mutation" }
+{ "type": "test", "name": "tiff_survives_mutation", "event": "ok", "exec_time": 0.221222861 }
+{ "type": "test", "event": "started", "name": "webp_lossless_survives_mutation" }
+{ "type": "test", "name": "jpeg_survives_mutation", "event": "ok", "exec_time": 4.185567782 }
+{ "type": "test", "event": "started", "name": "webp_lossy_survives_mutation" }
+{ "type": "test", "name": "png_survives_mutation", "event": "ok", "exec_time": 4.419193304 }
+{ "type": "test", "name": "gif_survives_mutation", "event": "ok", "exec_time": 16.229402874 }
+{ "type": "test", "name": "webp_lossless_survives_mutation", "event": "ok", "exec_time": 2.127764714 }
+{ "type": "test", "name": "webp_lossy_survives_mutation", "event": "ok", "exec_time": 2.267486005 }
+{ "type": "suite", "event": "ok", "passed": 19, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 69.511570491 }
+{ "type": "suite", "event": "started", "test_count": 10 }
+{ "type": "test", "event": "started", "name": "a_bmp_pixel_buffer_is_budgeted_against_the_caller_limit" }
+{ "type": "test", "event": "started", "name": "a_frame_with_no_scan_is_refused_without_building_the_picture" }
+{ "type": "test", "event": "started", "name": "a_jpeg_scan_naming_no_components_is_refused_not_indexed" }
+{ "type": "test", "event": "started", "name": "a_large_three_component_frame_with_no_scan_is_refused" }
+{ "type": "test", "name": "a_jpeg_scan_naming_no_components_is_refused_not_indexed", "event": "ok", "exec_time": 0.000032712 }
+{ "type": "test", "event": "started", "name": "a_png_expansion_buffer_is_budgeted_before_it_is_sized" }
+{ "type": "test", "name": "a_bmp_pixel_buffer_is_budgeted_against_the_caller_limit", "event": "ok", "exec_time": 0.00001119 }
+{ "type": "test", "event": "started", "name": "a_scan_that_runs_out_of_data_stops_and_returns" }
+{ "type": "test", "name": "a_frame_with_no_scan_is_refused_without_building_the_picture", "event": "ok", "exec_time": 0.000061605 }
+{ "type": "test", "event": "started", "name": "jpeg_coefficients_are_budgeted_across_components" }
+{ "type": "test", "name": "a_large_three_component_frame_with_no_scan_is_refused", "event": "ok", "exec_time": 0.000035076 }
+{ "type": "test", "event": "started", "name": "large_declared_bmp_pictures_are_refused_before_decoding" }
+{ "type": "test", "name": "a_png_expansion_buffer_is_budgeted_before_it_is_sized", "event": "ok", "exec_time": 0.000025387 }
+{ "type": "test", "event": "started", "name": "large_declared_jpeg_from_a_small_input_returns" }
+{ "type": "test", "name": "large_declared_bmp_pictures_are_refused_before_decoding", "event": "ok", "exec_time": 0.000021421 }
+{ "type": "test", "event": "started", "name": "vp8_idct_overflow_does_not_panic_under_any_entry_point" }
+{ "type": "test", "name": "vp8_idct_overflow_does_not_panic_under_any_entry_point", "event": "ok", "exec_time": 0.000593986 }
+{ "type": "test", "name": "jpeg_coefficients_are_budgeted_across_components", "event": "ok", "exec_time": 0.001216777 }
+{ "type": "test", "name": "large_declared_jpeg_from_a_small_input_returns", "event": "ok", "exec_time": 0.139295763 }
+{ "type": "test", "name": "a_scan_that_runs_out_of_data_stops_and_returns", "event": "ok", "exec_time": 0.200340865 }
+{ "type": "suite", "event": "ok", "passed": 10, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.201877894 }
+{ "type": "suite", "event": "started", "test_count": 10 }
+{ "type": "test", "event": "started", "name": "a_huge_declared_size_is_reported_without_allocating_it" }
+{ "type": "test", "event": "started", "name": "a_prefix_of_a_large_jpeg_probes_to_the_same_answer" }
+{ "type": "test", "event": "started", "name": "every_orientation_is_probed_and_applied_like_image_for_jpeg_png_and_webp" }
+{ "type": "test", "event": "started", "name": "gif_and_bmp_report_orientation_one" }
+{ "type": "test", "name": "a_huge_declared_size_is_reported_without_allocating_it", "event": "ok", "exec_time": 0.0000585 }
+{ "type": "test", "event": "started", "name": "png_encoder_round_trips_bit_exact_and_matches_image_decode" }
+{ "type": "test", "name": "gif_and_bmp_report_orientation_one", "event": "ok", "exec_time": 0.000042599 }
+{ "type": "test", "event": "started", "name": "png_encoder_size_against_image_on_the_still_fixture" }
+{ "type": "test", "name": "every_orientation_is_probed_and_applied_like_image_for_jpeg_png_and_webp", "event": "ok", "exec_time": 0.001314731 }
+{ "type": "test", "event": "started", "name": "probe_reader_stops_at_the_window" }
+{ "type": "test", "name": "png_encoder_round_trips_bit_exact_and_matches_image_decode", "event": "ok", "exec_time": 0.004796154 }
+{ "type": "test", "event": "started", "name": "probe_reads_the_header_and_never_the_pixels" }
+{ "type": "test", "name": "probe_reads_the_header_and_never_the_pixels", "event": "ok", "exec_time": 0.000017633 }
+{ "type": "test", "event": "started", "name": "probing_arbitrary_mutations_never_panics" }
+{ "type": "test", "name": "probing_arbitrary_mutations_never_panics", "event": "ok", "exec_time": 0.001031559 }
+{ "type": "test", "event": "started", "name": "transforms_match_image_on_random_rgba_for_all_orientations" }
+{ "type": "test", "name": "probe_reader_stops_at_the_window", "event": "ok", "exec_time": 0.004302636 }
+{ "type": "test", "name": "transforms_match_image_on_random_rgba_for_all_orientations", "event": "ok", "exec_time": 0.00001054 }
+{ "type": "test", "name": "a_prefix_of_a_large_jpeg_probes_to_the_same_answer", "event": "ok", "exec_time": 0.018823058 }
+{ "type": "test", "name": "png_encoder_size_against_image_on_the_still_fixture", "event": "ok", "exec_time": 0.026088403 }
+{ "type": "suite", "event": "ok", "passed": 10, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.027575026 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "real_gifs_animate_like_the_incumbent" }
+{ "type": "test", "event": "started", "name": "real_pictures_decode_like_the_incumbent" }
+{ "type": "test", "name": "real_pictures_decode_like_the_incumbent", "event": "ok", "exec_time": 0.00004234 }
+{ "type": "test", "name": "real_gifs_animate_like_the_incumbent", "event": "ok", "exec_time": 0.000044515 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000475864 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000081634 }

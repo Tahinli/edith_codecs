@@ -1,0 +1,14 @@
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "tests::g711_anchor_values" }
+{ "type": "test", "name": "tests::g711_anchor_values", "event": "ok", "exec_time": 0.000000751 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00050583 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "every_format_is_bit_exact_against_ffmpeg" }
+{ "type": "test", "event": "started", "name": "g711_tables_match_ffmpeg" }
+{ "type": "test", "event": "started", "name": "garbage_does_not_panic" }
+{ "type": "test", "name": "garbage_does_not_panic", "event": "ok", "exec_time": 0.00865045 }
+{ "type": "test", "name": "g711_tables_match_ffmpeg", "event": "ok", "exec_time": 0.412341502 }
+{ "type": "test", "name": "every_format_is_bit_exact_against_ffmpeg", "event": "ok", "exec_time": 20.560643692 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 20.561029206 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000033905 }

@@ -30,6 +30,10 @@ pub enum Error {
     /// The caller asked for something inconsistent, e.g. feeding H.264 to a
     /// decoder configured for AV1, or encoding a frame of the wrong size.
     Config(String),
+    /// The GPU was reset (a hung ring, a lost context) while this session was
+    /// alive, or a session was asked for during the grace period after one.
+    /// The session is dead; use software. See [`crate::reset`].
+    HwReset(String),
 }
 
 impl Error {
@@ -44,6 +48,21 @@ impl Error {
     /// Build an [`Error::Config`].
     pub fn config(what: impl Into<String>) -> Error {
         Error::Config(what.into())
+    }
+
+    /// The decoder was poisoned by a hung or lost GPU context.
+    pub fn poisoned(what: impl Into<String>) -> Error {
+        Error::Config(format!("hardware decoder poisoned: {}", what.into()))
+    }
+
+    /// Build an [`Error::HwReset`].
+    pub fn hw_reset(what: impl Into<String>) -> Error {
+        Error::HwReset(what.into())
+    }
+
+    /// Whether this is an [`Error::HwReset`].
+    pub fn is_hw_reset(&self) -> bool {
+        matches!(self, Error::HwReset(_))
     }
 
     /// The raw `VAStatus`, when this came from a libva call.
@@ -74,6 +93,7 @@ impl fmt::Display for Error {
             Error::Stream(e) => write!(f, "bitstream: {e}"),
             Error::Unsupported { what, why } => write!(f, "{what} is not supported: {why}"),
             Error::Config(what) => write!(f, "{what}"),
+            Error::HwReset(what) => write!(f, "GPU reset: {what}"),
         }
     }
 }

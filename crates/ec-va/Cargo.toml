@@ -1,12 +1,12 @@
 [package]
 name = "ec-va"
-description = "Minimal hand-written libva (VA-API) FFI and a safe RAII/typestate layer over it."
+description = "VA-API (libva) display, config, surface, context and picture layer over cros-libva."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# No dependencies, by design: the whole point of this crate is that the FFI
-# surface is small enough to be read end to end (see src/sys.rs). It links the
-# system libva/libva-drm shared objects; nothing is generated at build time.
+# The libva FFI lives in cros-libva (BSD-3, ChromeOS). It is pinned to a git
+# revision: the crates.io release does not build against libva 1.23.
 [dependencies]
+cros-libva = { git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf" }

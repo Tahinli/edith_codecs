@@ -1,0 +1,39 @@
+[package]
+name = "ec-pgs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-pgs]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "segments"
+path = "fuzz_targets/segments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rle"
+path = "fuzz_targets/rle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compose"
+path = "fuzz_targets/compose.rs"
+test = false
+doc = false
+bench = false

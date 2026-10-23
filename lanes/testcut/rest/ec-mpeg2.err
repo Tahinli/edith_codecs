@@ -1,0 +1,7 @@
+   Compiling ec-mpeg2 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-mpeg2)
+    Finished `release` profile [optimized] target(s) in 3.99s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_mpeg2-a03bcbdecd73d513)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-26d3c50f08b315b0)
+     Running tests/robust.rs (/home/user/.cache/tgt-testcut-rest/release/deps/robust-0604535d37510a67)
+     Running tests/synth_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/synth_parity-f112ecd5093489e1)
+   Doc-tests ec_mpeg2

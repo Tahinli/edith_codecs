@@ -1,0 +1,10 @@
+[package]
+name = "ec-mpeg2"
+description = "MPEG-1 and MPEG-2 video software decoder (ISO/IEC 11172-2, 13818-2): I, P, B, frame and field pictures, 4:2:0 and 4:2:2, display-order output."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }

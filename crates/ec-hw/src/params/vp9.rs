@@ -1,48 +1,105 @@
-//! VP9 decode parameter buffers (`va_dec_vp9.h`).
+//! VP9 decode parameter buffers (`va_dec_vp9.h`), as plain Rust values.
+//!
+//! Every struct here carries the fields of the libva buffer it becomes, under
+//! the same names. [`PictureParameterBufferVP9::to_buffer`] and friends hand
+//! them to cros-libva's typed constructors, which lay them out for the driver.
 
-use ec_va::sys::{VAPictureParameterBufferType, VASliceParameterBufferType, VASurfaceID};
+use ec_va::va::{
+    BufferType, PictureParameter, PictureParameterBufferVP9 as CrosPicture,
+    SegmentParameterVP9 as CrosSegment, SliceParameter, SliceParameterBufferVP9 as CrosSlice,
+    VP9PicFields, VP9SegmentFlags,
+};
 
-use super::{INVALID_SURFACE, VaParam};
-use crate::va_bits;
+use super::INVALID_SURFACE;
 
-va_bits! {
-    /// `VADecPictureParameterBufferVP9::pic_fields`.
-    PicFields: u32 {
-        subsampling_x: 1,
-        subsampling_y: 1,
-        frame_type: 1,
-        show_frame: 1,
-        error_resilient_mode: 1,
-        intra_only: 1,
-        allow_high_precision_mv: 1,
-        mcomp_filter_type: 3,
-        frame_parallel_decoding_mode: 1,
-        reset_frame_context: 2,
-        refresh_frame_context: 1,
-        frame_context_idx: 2,
-        segmentation_enabled: 1,
-        segmentation_temporal_update: 1,
-        segmentation_update_map: 1,
-        last_ref_frame: 3,
-        last_ref_frame_sign_bias: 1,
-        golden_ref_frame: 3,
-        golden_ref_frame_sign_bias: 1,
-        alt_ref_frame: 3,
-        alt_ref_frame_sign_bias: 1,
-        lossless_flag: 1,
+/// The picture-level flags of `VADecPictureParameterBufferVP9::pic_fields`,
+/// one field per bit as libva names them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PicFields {
+    /// `subsampling_x`.
+    pub subsampling_x: u32,
+    /// `subsampling_y`.
+    pub subsampling_y: u32,
+    /// `frame_type`.
+    pub frame_type: u32,
+    /// `show_frame`.
+    pub show_frame: u32,
+    /// `error_resilient_mode`.
+    pub error_resilient_mode: u32,
+    /// `intra_only`.
+    pub intra_only: u32,
+    /// `allow_high_precision_mv`.
+    pub allow_high_precision_mv: u32,
+    /// `mcomp_filter_type`.
+    pub mcomp_filter_type: u32,
+    /// `frame_parallel_decoding_mode`.
+    pub frame_parallel_decoding_mode: u32,
+    /// `reset_frame_context`.
+    pub reset_frame_context: u32,
+    /// `refresh_frame_context`.
+    pub refresh_frame_context: u32,
+    /// `frame_context_idx`.
+    pub frame_context_idx: u32,
+    /// `segmentation_enabled`.
+    pub segmentation_enabled: u32,
+    /// `segmentation_temporal_update`.
+    pub segmentation_temporal_update: u32,
+    /// `segmentation_update_map`.
+    pub segmentation_update_map: u32,
+    /// `last_ref_frame`.
+    pub last_ref_frame: u32,
+    /// `last_ref_frame_sign_bias`.
+    pub last_ref_frame_sign_bias: u32,
+    /// `golden_ref_frame`.
+    pub golden_ref_frame: u32,
+    /// `golden_ref_frame_sign_bias`.
+    pub golden_ref_frame_sign_bias: u32,
+    /// `alt_ref_frame`.
+    pub alt_ref_frame: u32,
+    /// `alt_ref_frame_sign_bias`.
+    pub alt_ref_frame_sign_bias: u32,
+    /// `lossless_flag`.
+    pub lossless_flag: u32,
+}
+
+impl PicFields {
+    fn to_cros(self) -> VP9PicFields {
+        VP9PicFields::new(
+            self.subsampling_x,
+            self.subsampling_y,
+            self.frame_type,
+            self.show_frame,
+            self.error_resilient_mode,
+            self.intra_only,
+            self.allow_high_precision_mv,
+            self.mcomp_filter_type,
+            self.frame_parallel_decoding_mode,
+            self.reset_frame_context,
+            self.refresh_frame_context,
+            self.frame_context_idx,
+            self.segmentation_enabled,
+            self.segmentation_temporal_update,
+            self.segmentation_update_map,
+            self.last_ref_frame,
+            self.last_ref_frame_sign_bias,
+            self.golden_ref_frame,
+            self.golden_ref_frame_sign_bias,
+            self.alt_ref_frame,
+            self.alt_ref_frame_sign_bias,
+            self.lossless_flag,
+        )
     }
 }
 
 /// `VADecPictureParameterBufferVP9`, `va_dec_vp9.h:56`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PictureParameterBufferVP9 {
     /// `FrameWidth`.
     pub frame_width: u16,
     /// `FrameHeight`.
     pub frame_height: u16,
     /// The eight reference slots, `VA_INVALID_SURFACE` where empty.
-    pub reference_frames: [VASurfaceID; 8],
+    pub reference_frames: [u32; 8],
     /// Picture flags.
     pub pic_fields: PicFields,
     /// `loop_filter_level`.
@@ -65,7 +122,6 @@ pub struct PictureParameterBufferVP9 {
     pub profile: u8,
     /// `BitDepth`.
     pub bit_depth: u8,
-    pub(crate) va_reserved: [u32; 8],
 }
 
 impl Default for PictureParameterBufferVP9 {
@@ -87,29 +143,45 @@ impl Default for PictureParameterBufferVP9 {
             segment_pred_probs: [255; 3],
             profile: 0,
             bit_depth: 8,
-            va_reserved: [0; 8],
         }
     }
 }
 
-// SAFETY: `#[repr(C)]` transcription of `VADecPictureParameterBufferVP9`,
-// checked by the assertion block below; integers and integer arrays only.
-unsafe impl VaParam for PictureParameterBufferVP9 {
-    const TYPE: i32 = VAPictureParameterBufferType;
-}
-
-va_bits! {
-    /// `VASegmentParameterVP9::segment_flags`.
-    SegmentFlags: u16 {
-        segment_reference_enabled: 1,
-        segment_reference: 2,
-        segment_reference_skipped: 1,
+impl PictureParameterBufferVP9 {
+    /// The typed cros-libva buffer for these picture parameters.
+    pub fn to_buffer(&self) -> BufferType {
+        BufferType::PictureParameter(PictureParameter::VP9(CrosPicture::new(
+            self.frame_width,
+            self.frame_height,
+            self.reference_frames,
+            &self.pic_fields.to_cros(),
+            self.filter_level,
+            self.sharpness_level,
+            self.log2_tile_rows,
+            self.log2_tile_columns,
+            self.frame_header_length_in_bytes,
+            self.first_partition_size,
+            self.mb_segment_tree_probs,
+            self.segment_pred_probs,
+            self.profile,
+            self.bit_depth,
+        )))
     }
 }
 
+/// `VASegmentParameterVP9::segment_flags`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentFlags {
+    /// `segment_reference_enabled`.
+    pub segment_reference_enabled: u16,
+    /// `segment_reference`.
+    pub segment_reference: u16,
+    /// `segment_reference_skipped`.
+    pub segment_reference_skipped: u16,
+}
+
 /// `VASegmentParameterVP9`, `va_dec_vp9.h:196`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentParameterVP9 {
     /// Segment feature flags.
     pub segment_flags: SegmentFlags,
@@ -123,12 +195,29 @@ pub struct SegmentParameterVP9 {
     pub chroma_ac_quant_scale: i16,
     /// Dequantised DC scale, chroma.
     pub chroma_dc_quant_scale: i16,
-    pub(crate) va_reserved: [u32; 4],
+}
+
+impl SegmentParameterVP9 {
+    fn to_cros(self) -> CrosSegment {
+        let flags = self.segment_flags;
+        let segment_flags = VP9SegmentFlags::new(
+            flags.segment_reference_enabled,
+            flags.segment_reference,
+            flags.segment_reference_skipped,
+        );
+        CrosSegment::new(
+            &segment_flags,
+            self.filter_level,
+            self.luma_ac_quant_scale,
+            self.luma_dc_quant_scale,
+            self.chroma_ac_quant_scale,
+            self.chroma_dc_quant_scale,
+        )
+    }
 }
 
 /// `VASliceParameterBufferVP9`, `va_dec_vp9.h:245`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SliceParameterBufferVP9 {
     /// Bytes of frame data.
     pub slice_data_size: u32,
@@ -138,45 +227,16 @@ pub struct SliceParameterBufferVP9 {
     pub slice_data_flag: u32,
     /// Per-segment parameters; all eight are always sent.
     pub seg_param: [SegmentParameterVP9; 8],
-    pub(crate) va_reserved: [u32; 4],
 }
 
-// SAFETY: as `PictureParameterBufferVP9`.
-unsafe impl VaParam for SliceParameterBufferVP9 {
-    const TYPE: i32 = VASliceParameterBufferType;
+impl SliceParameterBufferVP9 {
+    /// The typed cros-libva buffer for this frame's slice parameters.
+    pub fn to_buffer(&self) -> BufferType {
+        BufferType::SliceParameter(SliceParameter::VP9(CrosSlice::new(
+            self.slice_data_size,
+            self.slice_data_offset,
+            self.slice_data_flag,
+            self.seg_param.map(SegmentParameterVP9::to_cros),
+        )))
+    }
 }
-
-// ---------------------------------------------------------------------------
-// ABI transcription check — `crates/ec-hw/abi-probe.c`, libva 1.23.0, x86_64:
-//
-//   VADecPictureParameterBufferVP9 size=92  align=4 reference_frames=4
-//                                                   pic_fields=36 filter_level=40
-//                                                   first_partition_size=46
-//                                                   mb_segment_tree_probs=48
-//                                                   profile=58
-//   VASegmentParameterVP9          size=36  align=4 filter_level=2
-//                                                   luma_ac_quant_scale=10
-//   VASliceParameterBufferVP9      size=316 align=4 seg_param=12
-const _: () = {
-    use std::mem::{align_of, offset_of, size_of};
-
-    assert!(
-        size_of::<PictureParameterBufferVP9>() == 92
-            && align_of::<PictureParameterBufferVP9>() == 4
-    );
-    assert!(offset_of!(PictureParameterBufferVP9, reference_frames) == 4);
-    assert!(offset_of!(PictureParameterBufferVP9, pic_fields) == 36);
-    assert!(offset_of!(PictureParameterBufferVP9, filter_level) == 40);
-    assert!(offset_of!(PictureParameterBufferVP9, first_partition_size) == 46);
-    assert!(offset_of!(PictureParameterBufferVP9, mb_segment_tree_probs) == 48);
-    assert!(offset_of!(PictureParameterBufferVP9, profile) == 58);
-
-    assert!(size_of::<SegmentParameterVP9>() == 36 && align_of::<SegmentParameterVP9>() == 4);
-    assert!(offset_of!(SegmentParameterVP9, filter_level) == 2);
-    assert!(offset_of!(SegmentParameterVP9, luma_ac_quant_scale) == 10);
-
-    assert!(
-        size_of::<SliceParameterBufferVP9>() == 316 && align_of::<SliceParameterBufferVP9>() == 4
-    );
-    assert!(offset_of!(SliceParameterBufferVP9, seg_param) == 12);
-};

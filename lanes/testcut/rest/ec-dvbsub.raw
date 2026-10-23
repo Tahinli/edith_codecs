@@ -1,0 +1,16 @@
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "tests::four_and_eight_bit_strings_decode_runs" }
+{ "type": "test", "event": "started", "name": "tests::rubbish_never_panics" }
+{ "type": "test", "event": "started", "name": "tests::two_bit_runs_use_the_default_clut" }
+{ "type": "test", "name": "tests::rubbish_never_panics", "event": "ok", "exec_time": 0.000514747 }
+{ "type": "test", "name": "tests::two_bit_runs_use_the_default_clut", "event": "ok", "exec_time": 0.001239199 }
+{ "type": "test", "name": "tests::four_and_eight_bit_strings_decode_runs", "event": "ok", "exec_time": 0.003007413 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.003332784 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "mkv_dvbsub_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "ts_private_pes_matches_ffmpeg" }
+{ "type": "test", "name": "ts_private_pes_matches_ffmpeg", "event": "ok", "exec_time": 0.226740265 }
+{ "type": "test", "name": "mkv_dvbsub_matches_ffmpeg", "event": "ok", "exec_time": 0.234380196 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.236339539 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000039884 }

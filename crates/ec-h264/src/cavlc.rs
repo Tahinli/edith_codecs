@@ -4,8 +4,9 @@ use ec_core::error::{Error, Result};
 
 use crate::bits::BitCursor;
 use crate::tables::{
-    COEFF_TOKEN_CHROMA_DC, COEFF_TOKEN_NC0, COEFF_TOKEN_NC2, COEFF_TOKEN_NC4, CoeffTokenEntry,
-    RUN_BEFORE, TOTAL_ZEROS_4X4, TOTAL_ZEROS_CHROMA_DC, VlcEntry,
+    COEFF_TOKEN_CHROMA_DC, COEFF_TOKEN_CHROMA_DC_422, COEFF_TOKEN_NC0, COEFF_TOKEN_NC2,
+    COEFF_TOKEN_NC4, CoeffTokenEntry, RUN_BEFORE, TOTAL_ZEROS_4X4, TOTAL_ZEROS_CHROMA_DC,
+    TOTAL_ZEROS_CHROMA_DC_422, VlcEntry,
 };
 
 /// Decode one code from a `(len, code, value)` VLC list. The cursor's peek is
@@ -40,16 +41,11 @@ fn read_coeff_token(r: &mut BitCursor<'_>, nc: i32) -> Result<(u8, u8)> {
     }
     let table: &[CoeffTokenEntry] = match nc {
         -1 => COEFF_TOKEN_CHROMA_DC,
+        -2 => COEFF_TOKEN_CHROMA_DC_422,
         0..=1 => COEFF_TOKEN_NC0,
         2..=3 => COEFF_TOKEN_NC2,
         4..=7 => COEFF_TOKEN_NC4,
-        _ => {
-            return Err(Error::unsupported(
-                "CAVLC nC = -2",
-                "nC -2 is the 4:2:2 chroma DC coeff_token table (9.2.1); only \
-                 4:2:0 chroma DC (nC -1) is decoded",
-            ));
-        }
+        _ => return Err(Error::corrupt("nC outside the coeff_token tables")),
     };
     let peek = r.peek16();
     for &(len, code, tc, t1) in table {
@@ -75,7 +71,7 @@ fn read_level_prefix(r: &mut BitCursor<'_>) -> Result<u32> {
 /// Decode one CAVLC residual block (spec 9.2) into `coeff[0..max_num_coeff]`
 /// in scan order. Returns TotalCoeff. `nc` selects the coeff_token VLC:
 /// the averaged neighbour count for luma/chroma-AC blocks, -1 for 4:2:0
-/// chroma DC.
+/// chroma DC and -2 for 4:2:2 chroma DC.
 ///
 /// `coeff` is fully zeroed first; the caller hands the same stack array every
 /// time — no allocation.
@@ -149,6 +145,8 @@ pub fn residual_block(
     } else {
         let tz = if nc == -1 {
             read_vlc(r, TOTAL_ZEROS_CHROMA_DC[total_coeff - 1])?
+        } else if nc == -2 {
+            read_vlc(r, TOTAL_ZEROS_CHROMA_DC_422[total_coeff - 1])?
         } else {
             read_vlc(r, TOTAL_ZEROS_4X4[total_coeff - 1])?
         };

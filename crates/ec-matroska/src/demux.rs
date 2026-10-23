@@ -24,6 +24,14 @@ const UNKNOWN_CLUSTER_WINDOW: u64 = 8 << 20;
 /// A block that says it inflates to more than this is refused rather than
 /// allocated: a crafted zlib block must not become all the memory there is.
 const INFLATE_LIMIT: usize = 64 << 20;
+/// Unpacked bytes (zlib output or header-stripped frames) one cluster may hold. Every
+/// block of a cluster is queued before any is handed out, so without a cap a cluster of
+/// thousands of small crafted blocks would queue thousands of inflated frames at once.
+const UNPACKED_LIMIT: u64 = 256 << 20;
+/// The most channels an audio track may state. 255 is the largest count any
+/// channel mapping in use can carry (Opus and Vorbis family 255); a `Channels`
+/// past it is a corrupt field, and a layout is allocated one entry per channel.
+const MAX_CHANNELS: u64 = 255;
 
 /// What a track's `ContentEncodings` element did to every one of its frames,
 /// undone here on the way back out.
@@ -71,7 +79,7 @@ impl Unpack {
 }
 
 /// One `TrackEntry`, as far as the packet loop cares about it.
-struct Track {
+pub(crate) struct Track {
     number: u64,
     /// Index in [`MatroskaDemuxer::streams`], or [`None`] for a track this
     /// build has no codec id for — its blocks are walked past, not refused.
@@ -85,6 +93,8 @@ struct Track {
     /// What this track's `Colour` element *stated*, tier by tier — empty for a
     /// track that carries none and for one that is not a picture.
     color_tags: Tags,
+    /// `FlagInterlaced`/`FieldOrder`, where the track stated them.
+    field_order: Option<ec_core::Interlace>,
     /// What `TrackType` said, for the tracks with no `stream` of their own:
     /// "MPEG-2 *video* nothing here decodes" is an answer, "no video track" is
     /// not.
@@ -97,7 +107,7 @@ struct Track {
 
 /// One `CuePoint`: an instant, the track it indexes and where that cluster is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Cue {
+pub(crate) struct Cue {
     time: i64,
     track: u64,
     /// Absolute file offset of the `Cluster` element.
@@ -139,6 +149,8 @@ pub struct MatroskaDemuxer<R> {
     clusters: Vec<(i64, u64)>,
     indexed: bool,
     queue: VecDeque<Packet>,
+    /// Unpacked bytes queued from the cluster being read, against [`UNPACKED_LIMIT`].
+    unpacked: u64,
 }
 
 /// Positioned reads over one reader, which is what keeps a seek from ever
@@ -192,7 +204,7 @@ impl<R: Read + Seek> Src<R> {
     /// cluster runs to its parent's end, and reading that as a size would ask
     /// for the rest of the file in one allocation.
     fn elem_at(&mut self, at: u64, end: u64) -> Result<Option<(u32, u64, u64, bool)>> {
-        if at + 2 > end {
+        if at.saturating_add(2) > end {
             return Ok(None);
         }
         let mut head = [0u8; 12];
@@ -314,7 +326,8 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
                 .iter()
                 .find(|(id, _)| *id == ebml::CUES)
                 .map(|(_, p)| *p)
-            && let Some((ebml::CUES, body, stop, _)) = src.elem_at(segment.0 + pos, segment.1)?
+            && let Some(at) = segment.0.checked_add(pos)
+            && let Some((ebml::CUES, body, stop, _)) = src.elem_at(at, segment.1)?
         {
             cues_at = Some((body, stop));
         }
@@ -325,7 +338,8 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
                 .iter()
                 .find(|(id, _)| *id == ebml::TRACKS)
                 .map(|(_, p)| *p)
-            && let Some((ebml::TRACKS, body, stop, _)) = src.elem_at(segment.0 + pos, segment.1)?
+            && let Some(at) = segment.0.checked_add(pos)
+            && let Some((ebml::TRACKS, body, stop, _)) = src.elem_at(at, segment.1)?
         {
             tracks_body = Some(src.body(body, stop, CUES_LIMIT)?);
         }
@@ -339,7 +353,7 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
             scale_ns,
             time_base,
             duration,
-        );
+        )?;
         if streams.is_empty() {
             return Err(Error::corrupt("Matroska: no readable track in Tracks"));
         }
@@ -359,6 +373,7 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
             clusters: Vec::new(),
             indexed: false,
             queue: VecDeque::new(),
+            unpacked: 0,
         })
     }
 
@@ -443,6 +458,12 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
         self.track(stream).map_or(Tags::default(), |t| t.color_tags)
     }
 
+    /// The scan order `stream`'s `FlagInterlaced`/`FieldOrder` stated, or
+    /// [`None`] for unspecified, undetermined or absent.
+    pub fn field_order(&self, stream: u32) -> Option<ec_core::Interlace> {
+        self.track(stream).and_then(|t| t.field_order)
+    }
+
     /// Whether this track's frames arrive as the encoder wrote them — no
     /// `ContentEncodings` over them at all.
     ///
@@ -451,8 +472,7 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
     /// longer the ones the source file holds and copying them into another
     /// container is not a copy.
     pub fn track_is_plain(&self, stream: u32) -> bool {
-        self.track(stream)
-            .is_some_and(|t| t.unpack == Unpack::None)
+        self.track(stream).is_some_and(|t| t.unpack == Unpack::None)
     }
 
     fn track(&self, stream: u32) -> Option<&Track> {
@@ -486,20 +506,32 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
             // An unknown-length cluster — what a muxer writes while it is still
             // recording — is read a window at a time: its stated end is the end
             // of the file, and that is not a size to allocate.
-            let len = match known {
+            let mut len = match known {
                 true => stop.saturating_sub(body),
                 false => UNKNOWN_CLUSTER_WINDOW.min(stop.saturating_sub(body)),
             };
-            if len > CLUSTER_LIMIT {
-                return Err(Error::corrupt(format!("Matroska: a {len}-byte cluster")));
-            }
-            let mut bytes = vec![0u8; len as usize];
-            self.src.seek_to(body)?;
-            // A truncated last cluster is read as far as it goes: the file's
-            // prefix is what a damaged download has, and it plays.
-            let got = self.src.read_upto(&mut bytes)?;
-            bytes.truncate(got);
-            let buf = Buf::from_vec(bytes);
+            // A window that ends inside one of the cluster's children is not
+            // the end of the cluster: the window doubles until the children
+            // fit, or the file ends. Parsing the window as it stands would
+            // stop at the cut and lose every cluster after it.
+            let buf = loop {
+                if len > CLUSTER_LIMIT {
+                    return Err(Error::corrupt(format!("Matroska: a {len}-byte cluster")));
+                }
+                let mut bytes = vec![0u8; len as usize];
+                self.src.seek_to(body)?;
+                // A truncated last cluster is read as far as it goes: the file's
+                // prefix is what a damaged download has, and it plays.
+                let got = self.src.read_upto(&mut bytes)?;
+                bytes.truncate(got);
+                let buf = Buf::from_vec(bytes);
+                let (_, cut) = cluster_extent(&buf);
+                if known || !cut || len >= stop.saturating_sub(body) {
+                    break buf;
+                }
+                len = (len * 2).min(stop.saturating_sub(body));
+            };
+            self.unpacked = 0;
             let consumed = self.parse_cluster(&buf)?;
             // An unknown-length cluster ends where its children do, and their
             // bytes are where the next top-level element starts.
@@ -615,14 +647,29 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
             .params
             .audio()
             .map(|a| a.sample_rate);
-        let ts = cluster_ts + i64::from(head.rel);
-        let mut offset = 0i64;
+        let ts = cluster_ts
+            .checked_add(i64::from(head.rel))
+            .ok_or_else(|| Error::corrupt("Matroska: a block timestamp past the tick range"))?;
+        // `None` once the running offset overflows: only an error if a frame
+        // actually needs that timestamp.
+        let mut offset = Some(0i64);
         for frame in head.frames.iter() {
             // A lace writes one timestamp for all its frames; each one starts
             // a step after the one before it, which is the only statement the
             // file makes about where they sit.
-            let pts = ts + offset;
-            let data = self.tracks[track].unpack.frame(buf, frame.clone())?;
+            let pts = offset
+                .and_then(|o| ts.checked_add(o))
+                .ok_or_else(|| Error::corrupt("Matroska: a laced frame's timestamp overflows"))?;
+            let unpack = &self.tracks[track].unpack;
+            let data = unpack.frame(buf, frame.clone())?;
+            if *unpack != Unpack::None {
+                self.unpacked = self.unpacked.saturating_add(data.len() as u64);
+                if self.unpacked > UNPACKED_LIMIT {
+                    return Err(Error::corrupt(
+                        "Matroska: a cluster whose compressed blocks unpack past the cluster limit",
+                    ));
+                }
+            }
             // Neither the file's `DefaultDuration` nor its `BlockDuration`
             // said how long a frame lasts: the codec's own bytes are the last
             // place left to ask, so a lace landed on mid-scan still steps by
@@ -631,7 +678,7 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
                 .or(split_step)
                 .or_else(|| codec_frame_ticks(codec_id, &data, self.scale_ns, sample_rate))
                 .unwrap_or(0);
-            offset += step;
+            offset = offset.and_then(|o| o.checked_add(step));
             self.queue.push_back(Packet {
                 stream,
                 time_base: self.time_base,
@@ -737,7 +784,12 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
 /// A laced frame's own duration, in `time_base` (`scale_ns`-per-tick) ticks,
 /// for the codecs whose bitstream states it — the last place left to ask once
 /// a file has written neither `DefaultDuration` nor a usable `BlockDuration`.
-fn codec_frame_ticks(codec_id: &str, data: &[u8], scale_ns: u64, sample_rate: Option<u32>) -> Option<i64> {
+fn codec_frame_ticks(
+    codec_id: &str,
+    data: &[u8],
+    scale_ns: u64,
+    sample_rate: Option<u32>,
+) -> Option<i64> {
     let ns = match codec_id {
         "A_OPUS" => opus_packet_duration_ns(data)?,
         // AAC's core is always a 1024-sample frame (SBR's are 1024 of the
@@ -866,7 +918,7 @@ impl<R: Read + Seek + Send> Demuxer for MatroskaDemuxer<R> {
 /// `(SeekID, SeekPosition)` of every entry of one `SeekHead`. Only the one
 /// level: a `SeekHead` pointing at another (what a muxer writes when it appends
 /// an index later) is not followed, and that file falls back to the walk.
-fn seek_positions(buf: &[u8]) -> Vec<(u32, u64)> {
+pub(crate) fn seek_positions(buf: &[u8]) -> Vec<(u32, u64)> {
     let mut out = Vec::new();
     for (id, range) in Elements::new(buf) {
         if id != ebml::SEEK {
@@ -894,7 +946,7 @@ fn seek_positions(buf: &[u8]) -> Vec<(u32, u64)> {
 /// Every `CuePoint` of a `Cues` element, one per `(time, track)`: a film's
 /// picture and its sound are cued at the same instant, each with a position of
 /// its own.
-fn parse_cues(buf: &[u8], segment: u64) -> Vec<Cue> {
+pub(crate) fn parse_cues(buf: &[u8], segment: u64) -> Vec<Cue> {
     let mut cues = Vec::new();
     for (id, range) in Elements::new(buf) {
         if id != ebml::CUE_POINT {
@@ -917,11 +969,14 @@ fn parse_cues(buf: &[u8], segment: u64) -> Vec<Cue> {
                             _ => {}
                         }
                     }
-                    if let (Some(time), Some(track), Some(pos)) = (time, track, pos) {
+                    // A position past the file's range names no cluster; the entry is dropped.
+                    if let (Some(time), Some(track), Some(cluster)) =
+                        (time, track, pos.and_then(|p| segment.checked_add(p)))
+                    {
                         cues.push(Cue {
                             time,
                             track,
-                            cluster: segment + pos,
+                            cluster,
                         });
                     }
                 }
@@ -934,14 +989,14 @@ fn parse_cues(buf: &[u8], segment: u64) -> Vec<Cue> {
 
 /// A `SimpleBlock`/`Block` header and where each of its frames sits in the
 /// cluster buffer.
-struct BlockHeader {
-    track: u64,
-    rel: i16,
-    flags: u8,
-    frames: Vec<Range<usize>>,
+pub(crate) struct BlockHeader {
+    pub(crate) track: u64,
+    pub(crate) rel: i16,
+    pub(crate) flags: u8,
+    pub(crate) frames: Vec<Range<usize>>,
 }
 
-fn parse_block(buf: &[u8], range: Range<usize>) -> Result<BlockHeader> {
+pub(crate) fn parse_block(buf: &[u8], range: Range<usize>) -> Result<BlockHeader> {
     let body = buf
         .get(range.clone())
         .ok_or_else(|| Error::corrupt("Matroska: block past its cluster"))?;
@@ -971,7 +1026,7 @@ fn parse_block(buf: &[u8], range: Range<usize>) -> Result<BlockHeader> {
 /// streaming service's audio is laced by the thousand: every E-AC-3 block of a
 /// WEB remux is fixed-laced, and a reader that refuses those is a film that
 /// plays silent.
-fn lace(buf: &[u8], start: usize, end: usize, lacing: u8) -> Result<Vec<Range<usize>>> {
+pub(crate) fn lace(buf: &[u8], start: usize, end: usize, lacing: u8) -> Result<Vec<Range<usize>>> {
     let head = buf
         .get(start..end)
         .ok_or_else(|| Error::corrupt("Matroska: lace header past its block"))?;
@@ -1019,7 +1074,11 @@ fn lace(buf: &[u8], start: usize, end: usize, lacing: u8) -> Result<Vec<Range<us
                 at += len;
                 size = match i {
                     1 => raw as i64,
-                    _ => size + raw as i64 - ((1i64 << (7 * len - 1)) - 1),
+                    _ => size
+                        .checked_add(raw as i64 - ((1i64 << (7 * len - 1)) - 1))
+                        .ok_or_else(|| {
+                            Error::corrupt("Matroska: a lace size past the tick range")
+                        })?,
                 };
                 sizes.push(
                     usize::try_from(size)
@@ -1111,9 +1170,12 @@ pub(crate) fn codec_of(id: &str, bit_depth: u32) -> Option<CodecId> {
     Some(match id {
         "V_MPEG4/ISO/AVC" => CodecId::H264,
         "V_MPEGH/ISO/HEVC" => CodecId::H265,
+        // MPEG-4 Part 2 Visual; CodecPrivate holds the VOL header.
+        "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/AP" => CodecId::Mpeg4Part2,
         "V_VP8" => CodecId::Vp8,
         "V_VP9" => CodecId::Vp9,
         "V_AV1" => CodecId::Av1,
+        "V_MJPEG" => CodecId::Mjpeg,
         "A_OPUS" => CodecId::Opus,
         "A_VORBIS" => CodecId::Vorbis,
         "A_AC3" => CodecId::Ac3,
@@ -1126,6 +1188,8 @@ pub(crate) fn codec_of(id: &str, bit_depth: u32) -> Option<CodecId> {
         "S_TEXT/WEBVTT" => CodecId::WebVtt,
         "S_TEXT/ASS" | "S_TEXT/SSA" => CodecId::Ass,
         "S_HDMV/PGS" => CodecId::Pgs,
+        "S_VOBSUB" => CodecId::DvdSub,
+        "S_DVBSUB" => CodecId::DvbSub,
         "A_PCM/FLOAT/IEEE" => CodecId::PcmF32Le,
         "A_PCM/INT/BIG" => CodecId::PcmS16Be,
         "A_PCM/INT/LIT" => match bit_depth {
@@ -1138,19 +1202,43 @@ pub(crate) fn codec_of(id: &str, bit_depth: u32) -> Option<CodecId> {
         // `A_MPEG/L3` is the only MPEG layer this carries.
         id if id.starts_with("A_AAC") => CodecId::Aac,
         "A_MPEG/L3" => CodecId::Mp3,
+        // MPEG-1/2 Layer II (MP2) and Layer I (MP1): the same decoder as Layer III reads them.
+        "A_MPEG/L2" => CodecId::Mp2,
+        "A_MPEG/L1" => CodecId::Mp1,
         _ => return None,
     })
+}
+
+/// Codecs Matroska carries under a generic id and names only in `CodecPrivate`:
+/// Avid DNxHD/DNxHR in a `V_QUICKTIME` track (the QuickTime sample description,
+/// four-character code after its size) or a `V_MS/VFW/FOURCC` track (the
+/// BITMAPINFOHEADER's `biCompression`).
+fn video_codec_from_private(id: &str, private: Option<&[u8]>) -> Option<CodecId> {
+    let private = private?;
+    let tag = match id {
+        "V_QUICKTIME" => private.get(4..8)?,
+        "V_MS/VFW/FOURCC" => private.get(16..20)?,
+        _ => return None,
+    };
+    if matches!(tag, b"AVdn" | b"AVdh") {
+        return Some(CodecId::Dnxhd);
+    }
+    // VfW tracks of the XviD / DivX 4-5 / FMP4 family (not MS-MPEG4 DIV3).
+    let up: Vec<u8> = tag.iter().map(u8::to_ascii_uppercase).collect();
+    (id == "V_MS/VFW/FOURCC"
+        && matches!(&up[..], b"XVID" | b"XVIX" | b"DIVX" | b"DX50" | b"FMP4" | b"MP4V" | b"M4S2" | b"RMP4"))
+    .then_some(CodecId::Mpeg4Part2)
 }
 
 /// Every `TrackEntry` of the `Tracks` element, in the order the file lists
 /// them: that order *is* the stream numbering, so a careless filter here plays
 /// the wrong language.
-fn parse_tracks(
+pub(crate) fn parse_tracks(
     buf: &[u8],
     scale_ns: u64,
     time_base: TimeBase,
     duration: Option<i64>,
-) -> (Vec<StreamInfo>, Vec<Track>) {
+) -> Result<(Vec<StreamInfo>, Vec<Track>)> {
     let (mut streams, mut tracks) = (Vec::new(), Vec::new());
     for (id, range) in Elements::new(buf) {
         if id != ebml::TRACK_ENTRY {
@@ -1170,6 +1258,7 @@ fn parse_tracks(
         // one, which is not the same claim as "limited" and must not become it.
         let mut range_code = 0u64;
         let mut display = (0u64, 0u64);
+        let (mut interlaced, mut field_code) = (0u64, 2u64);
         let mut light = ContentLight::default();
         let (mut rate, mut channels, mut bits) = (0f64, 0u64, 0u64);
         // `CodecDelay`, nanoseconds: an AAC/Opus encoder's priming, the same
@@ -1200,6 +1289,8 @@ fn parse_tracks(
                     for (id, leaf) in Elements::new(&buf[child]) {
                         let leaf = start + leaf.start..start + leaf.end;
                         match id {
+                            ebml::FLAG_INTERLACED => interlaced = ebml::uint_of(&buf[leaf]),
+                            ebml::FIELD_ORDER => field_code = ebml::uint_of(&buf[leaf]),
                             ebml::PIXEL_WIDTH => width = ebml::uint_of(&buf[leaf]) as u32,
                             ebml::PIXEL_HEIGHT => height = ebml::uint_of(&buf[leaf]) as u32,
                             // Anamorphic content states the size it is *shown*
@@ -1244,9 +1335,16 @@ fn parse_tracks(
         let step = default_duration.map(|ns| (ns / scale_ns.max(1)).max(1) as i64);
         let codec_id = media
             .filter(|_| kind != 0)
-            .and_then(|_| codec_of(&codec, bits as u32));
+            .and_then(|_| {
+                codec_of(&codec, bits as u32).or_else(|| video_codec_from_private(&codec, private.as_deref()))
+            });
         let stream = match (codec_id, media) {
             (Some(codec_id), Some(media)) => {
+                if media == MediaType::Audio && channels > MAX_CHANNELS {
+                    return Err(Error::corrupt(format!(
+                        "Matroska: an audio track stating {channels} channels"
+                    )));
+                }
                 let mut params = CodecParameters::new(codec_id);
                 params.extradata = private;
                 params.media = match media {
@@ -1261,12 +1359,13 @@ fn parse_tracks(
                             .and_then(|ns| TimeBase::try_new(1_000_000_000, ns as i64).ok()),
                         sample_aspect_ratio: match display {
                             (dw, dh) if dw > 0 && dh > 0 && width > 0 && height > 0 => {
-                                TimeBase::try_new(
-                                    dw as i64 * i64::from(height),
-                                    dh as i64 * i64::from(width),
-                                )
-                                .ok()
-                                .filter(|sar| sar.num() != sar.den())
+                                // Widened first: two u64 sizes times a u32 overflow i64.
+                                let num = i64::try_from(u128::from(dw) * u128::from(height));
+                                let den = i64::try_from(u128::from(dh) * u128::from(width));
+                                num.ok()
+                                    .zip(den.ok())
+                                    .and_then(|(n, d)| TimeBase::try_new(n, d).ok())
+                                    .filter(|sar| sar.num() != sar.den())
                             }
                             _ => None,
                         },
@@ -1292,9 +1391,12 @@ fn parse_tracks(
                 info.language = Some(language_of(&language, &bcp47));
                 info.default = flag_default;
                 if media == MediaType::Audio && delay_ns > 0 {
-                    let sample_rate = u64::from(info.params.audio().map_or(8_000, |a| a.sample_rate));
-                    info.initial_padding =
-                        ((delay_ns * sample_rate + 500_000_000) / 1_000_000_000) as u32;
+                    let sample_rate =
+                        u64::from(info.params.audio().map_or(8_000, |a| a.sample_rate));
+                    // Widened: a CodecDelay near u64::MAX times a rate overflows u64.
+                    let samples = (u128::from(delay_ns) * u128::from(sample_rate) + 500_000_000)
+                        / 1_000_000_000;
+                    info.initial_padding = u32::try_from(samples).unwrap_or(u32::MAX);
                 }
                 streams.push(info);
                 Some(index)
@@ -1306,6 +1408,12 @@ fn parse_tracks(
             stream,
             codec_id: codec,
             name,
+            field_order: match (interlaced, field_code) {
+                (2, _) => Some(ec_core::Interlace::Progressive),
+                (1, 1) => Some(ec_core::Interlace::TopFieldFirst),
+                (1, 6) => Some(ec_core::Interlace::BottomFieldFirst),
+                _ => None,
+            },
             color_tags: Tags::from_codes(
                 u64::from(color.matrix),
                 u64::from(color.transfer),
@@ -1316,7 +1424,7 @@ fn parse_tracks(
             default_duration: step,
         });
     }
-    (streams, tracks)
+    Ok((streams, tracks))
 }
 
 fn parse_colour(
@@ -1345,6 +1453,8 @@ fn parse_colour(
             ebml::MAX_FALL => light.max_fall = nits(ebml::uint_of(&buf[child]) as f64),
             ebml::MASTERING_METADATA => {
                 let start = child.start;
+                // r.x r.y g.x g.y b.x b.y wp.x wp.y; all zero is "not stated".
+                let mut xy = [0u16; 8];
                 for (id, leaf) in Elements::new(&buf[child]) {
                     let leaf = start + leaf.start..start + leaf.end;
                     match id {
@@ -1354,15 +1464,37 @@ fn parse_colour(
                         ebml::LUMINANCE_MIN => {
                             light.mastering_min = nits(ebml::float_of(&buf[leaf]))
                         }
-                        // The eight chromaticities: the display's gamut, which
-                        // nothing downstream acts on. Walked past, never refused.
+                        // The eight chromaticities, kept for a remux: the
+                        // 0.00002 integers an `mdcv` states.
+                        ebml::PRIMARY_R_X => xy[0] = chroma(&buf[leaf]),
+                        ebml::PRIMARY_R_Y => xy[1] = chroma(&buf[leaf]),
+                        ebml::PRIMARY_G_X => xy[2] = chroma(&buf[leaf]),
+                        ebml::PRIMARY_G_Y => xy[3] = chroma(&buf[leaf]),
+                        ebml::PRIMARY_B_X => xy[4] = chroma(&buf[leaf]),
+                        ebml::PRIMARY_B_Y => xy[5] = chroma(&buf[leaf]),
+                        ebml::WHITE_POINT_X => xy[6] = chroma(&buf[leaf]),
+                        ebml::WHITE_POINT_Y => xy[7] = chroma(&buf[leaf]),
                         _ => {}
                     }
+                }
+                if xy != [0; 8] {
+                    // Stored here in Matroska's R, G, B order; `mdcv` is G, B, R.
+                    light.mastering_primaries = Some(ec_core::color::MasteringPrimaries {
+                        red: (xy[0], xy[1]),
+                        green: (xy[2], xy[3]),
+                        blue: (xy[4], xy[5]),
+                        white: (xy[6], xy[7]),
+                    });
                 }
             }
             _ => {}
         }
     }
+}
+
+/// A chromaticity element as the 0.00002 integer an `mdcv` states it in.
+fn chroma(bytes: &[u8]) -> u16 {
+    (ebml::float_of(bytes) * 50_000.0).round().clamp(0.0, 65_535.0) as u16
 }
 
 /// A brightness a container stated, or [`None`] when it stated zero — which is
@@ -1502,6 +1634,27 @@ const ISO_639_1_TO_2: &[(&str, &str)] = &[
     ("zh", "zho"),
     ("zu", "zul"),
 ];
+
+/// Where an unknown-length cluster's children end in `buf`, and whether the last
+/// child runs past the end of `buf`, which is a window cut inside it that the
+/// caller must read further for. The children end at the first parent-level
+/// element, as in `parse_cluster`.
+fn cluster_extent(buf: &[u8]) -> (usize, bool) {
+    let mut walk = Elements::new(buf);
+    loop {
+        let before = walk.offset();
+        match walk.next() {
+            None => return (walk.offset(), walk.offset() < buf.len()),
+            Some((
+                ebml::CLUSTER | ebml::CUES | ebml::TRACKS | ebml::SEGMENT | ebml::SEEK_HEAD,
+                _,
+            )) => {
+                return (before, false);
+            }
+            Some(_) => {}
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1731,8 +1884,8 @@ mod tests {
             elem(&mut entry, ebml::VIDEO, &video);
             let mut tracks = Vec::new();
             elem(&mut tracks, ebml::TRACK_ENTRY, &entry);
-            let (streams, parsed) =
-                parse_tracks(&tracks, 1_000_000, TimeBase::new(1, 1_000), None);
+            let (streams, parsed) = parse_tracks(&tracks, 1_000_000, TimeBase::new(1, 1_000), None)
+                .expect("a valid video track");
             let info = streams[0].params.video().expect("a picture").clone();
             (info, parsed[0].color_tags)
         };
@@ -1742,7 +1895,10 @@ mod tests {
             tags.full_range, None,
             "a Colour element with no Range child states no range"
         );
-        assert!(!info.color.full_range, "the ColorInfo still has to answer one");
+        assert!(
+            !info.color.full_range,
+            "the ColorInfo still has to answer one"
+        );
         assert_eq!(tags.matrix, Some(ec_core::color::Matrix::Bt709));
 
         assert_eq!(colour(Some(1)).1.full_range, Some(false), "1 is limited");
@@ -1757,6 +1913,11 @@ mod tests {
         assert_eq!(codec_of("A_PCM/INT/LIT", 24), Some(CodecId::PcmS24Le));
         assert_eq!(codec_of("A_PCM/INT/LIT", 16), Some(CodecId::PcmS16Le));
         assert_eq!(codec_of("S_HDMV/PGS", 0), Some(CodecId::Pgs));
+        assert_eq!(codec_of("S_VOBSUB", 0), Some(CodecId::DvdSub));
+        assert_eq!(codec_of("S_DVBSUB", 0), Some(CodecId::DvbSub));
+        assert_eq!(codec_of("V_MJPEG", 0), Some(CodecId::Mjpeg));
+        assert_eq!(codec_of("V_MPEG4/ISO/ASP", 0), Some(CodecId::Mpeg4Part2));
+        assert_eq!(codec_of("V_MPEG4/ISO/SP", 0), Some(CodecId::Mpeg4Part2));
         assert_eq!(codec_of("V_MS/VFW/FOURCC", 0), None);
     }
 
@@ -1775,5 +1936,43 @@ mod tests {
         );
         // A block that is not zlib at all is an error, never a panic.
         assert!(Unpack::Zlib.frame(&buf, 0..4).is_err());
+    }
+
+    #[test]
+    fn a_track_stating_an_absurd_channel_count_is_refused_not_allocated() {
+        // Found by fuzzing: `Channels` read as a usize went straight into a
+        // one-entry-per-channel layout and aborted the process.
+        let mut entry = Vec::new();
+        uint(&mut entry, ebml::TRACK_NUMBER, 1);
+        uint(&mut entry, ebml::TRACK_TYPE, 2);
+        elem(&mut entry, ebml::CODEC_ID, b"A_OPUS");
+        let mut audio = Vec::new();
+        elem(
+            &mut audio,
+            ebml::SAMPLING_FREQUENCY,
+            &48_000f64.to_be_bytes(),
+        );
+        uint(&mut audio, ebml::CHANNELS, u64::MAX / 2);
+        elem(&mut entry, ebml::AUDIO, &audio);
+        let mut tracks = Vec::new();
+        elem(&mut tracks, ebml::TRACK_ENTRY, &entry);
+
+        let mut header = Vec::new();
+        elem(&mut header, ebml::DOC_TYPE, b"matroska");
+        let mut info = Vec::new();
+        uint(&mut info, ebml::TIMESTAMP_SCALE, 1_000_000);
+        let mut segment = Vec::new();
+        elem(&mut segment, ebml::INFO, &info);
+        elem(&mut segment, ebml::TRACKS, &tracks);
+        let mut out = Vec::new();
+        elem(&mut out, ebml::EBML_HEADER, &header);
+        put_id(&mut out, ebml::SEGMENT);
+        put_size(&mut out, segment.len() as u64);
+        out.extend_from_slice(&segment);
+
+        let err = MatroskaDemuxer::new(Cursor::new(out))
+            .err()
+            .expect("an absurd channel count is refused");
+        assert!(err.to_string().contains("channels"), "{err}");
     }
 }

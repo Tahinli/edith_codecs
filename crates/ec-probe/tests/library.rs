@@ -115,7 +115,7 @@ fn reference_seek_window(path: &Path, at: f64) -> Vec<f32> {
         String::from_utf8_lossy(&out.stderr)
     );
     out.stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -663,7 +663,7 @@ fn avi_ac3_matches_reference_decoder_on_real_sample() {
     );
     let theirs: Vec<f32> = out
         .stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let score = corr(&ours, &theirs);
@@ -817,7 +817,7 @@ fn a_cover_art_tagged_mp3_opens() {
     );
     let theirs: Vec<f32> = out
         .stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 

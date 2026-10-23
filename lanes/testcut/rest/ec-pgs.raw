@@ -1,0 +1,24 @@
+{ "type": "suite", "event": "started", "test_count": 7 }
+{ "type": "test", "event": "started", "name": "tests::a_display_set_decodes_to_the_canvas_it_composes" }
+{ "type": "test", "event": "started", "name": "tests::a_full_queue_holds_the_last_end_until_a_frame_is_taken" }
+{ "type": "test", "event": "started", "name": "tests::a_long_stream_in_one_push_keeps_the_queue_bounded" }
+{ "type": "test", "event": "started", "name": "tests::a_stream_split_anywhere_decodes_the_same" }
+{ "type": "test", "name": "tests::a_stream_split_anywhere_decodes_the_same", "event": "ok", "exec_time": 0.000052398 }
+{ "type": "test", "event": "started", "name": "tests::palette_entries_convert_at_their_own_luma_scale" }
+{ "type": "test", "name": "tests::a_full_queue_holds_the_last_end_until_a_frame_is_taken", "event": "ok", "exec_time": 0.000059893 }
+{ "type": "test", "event": "started", "name": "tests::rubbish_never_panics" }
+{ "type": "test", "name": "tests::a_display_set_decodes_to_the_canvas_it_composes", "event": "ok", "exec_time": 0.000013465 }
+{ "type": "test", "event": "started", "name": "tests::run_length_shapes_and_their_refusals" }
+{ "type": "test", "name": "tests::palette_entries_convert_at_their_own_luma_scale", "event": "ok", "exec_time": 0.000000291 }
+{ "type": "test", "name": "tests::run_length_shapes_and_their_refusals", "event": "ok", "exec_time": 0.000000912 }
+{ "type": "test", "name": "tests::rubbish_never_panics", "event": "ok", "exec_time": 0.000012664 }
+{ "type": "test", "name": "tests::a_long_stream_in_one_push_keeps_the_queue_bounded", "event": "ok", "exec_time": 0.004891384 }
+{ "type": "suite", "event": "ok", "passed": 7, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.005989077 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "a_canvas_past_the_dimension_limit_is_refused" }
+{ "type": "test", "event": "started", "name": "an_object_past_the_dimension_limit_is_refused_and_the_stream_goes_on" }
+{ "type": "test", "name": "a_canvas_past_the_dimension_limit_is_refused", "event": "ok", "exec_time": 0.000019988 }
+{ "type": "test", "name": "an_object_past_the_dimension_limit_is_refused_and_the_stream_goes_on", "event": "ok", "exec_time": 0.004217567 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.004502223 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000037691 }

@@ -12,7 +12,8 @@
 //! reduces to *where* the transform-block boundaries are, which is what
 //! [`TuMap`] carries.
 
-use crate::transform::chroma_qp;
+use crate::ctu::Pel;
+use crate::transform::chroma_qp_bd;
 
 /// beta' by Q (table 8-12, first column).
 const BETA: [i32; 52] = [
@@ -94,20 +95,20 @@ struct Line {
 }
 
 impl Line {
-    fn p(&self, plane: &[u8], i: usize) -> i32 {
+    fn p(&self, plane: &[Pel], i: usize) -> i32 {
         i32::from(plane[self.at - (i + 1) * self.step])
     }
 
-    fn q(&self, plane: &[u8], i: usize) -> i32 {
+    fn q(&self, plane: &[Pel], i: usize) -> i32 {
         i32::from(plane[self.at + i * self.step])
     }
 
-    fn set_p(&self, plane: &mut [u8], i: usize, value: i32) {
-        plane[self.at - (i + 1) * self.step] = value.clamp(0, 255) as u8;
+    fn set_p(&self, plane: &mut [Pel], i: usize, value: i32, max: i32) {
+        plane[self.at - (i + 1) * self.step] = value.clamp(0, max) as Pel;
     }
 
-    fn set_q(&self, plane: &mut [u8], i: usize, value: i32) {
-        plane[self.at + i * self.step] = value.clamp(0, 255) as u8;
+    fn set_q(&self, plane: &mut [Pel], i: usize, value: i32, max: i32) {
+        plane[self.at + i * self.step] = value.clamp(0, max) as Pel;
     }
 }
 
@@ -116,8 +117,8 @@ fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
 }
 
 /// Filter one four-line luma edge segment (8.7.2.5.3).
-fn luma_segment(plane: &mut [u8], lines: [Line; 4], beta: i32, tc: i32) {
-    let d_of = |line: &Line, plane: &[u8]| {
+fn luma_segment(plane: &mut [Pel], lines: [Line; 4], beta: i32, tc: i32, max: i32) {
+    let d_of = |line: &Line, plane: &[Pel]| {
         (
             (line.p(plane, 2) - 2 * line.p(plane, 1) + line.p(plane, 0)).abs(),
             (line.q(plane, 2) - 2 * line.q(plane, 1) + line.q(plane, 0)).abs(),
@@ -133,7 +134,7 @@ fn luma_segment(plane: &mut [u8], lines: [Line; 4], beta: i32, tc: i32) {
     let (dp, dq) = (dp0 + dp3, dq0 + dq3);
 
     // 8.7.2.5.6: both outer lines have to want the strong filter.
-    let strong_on = |line: &Line, dpq: i32, plane: &[u8]| {
+    let strong_on = |line: &Line, dpq: i32, plane: &[Pel]| {
         2 * dpq < (beta >> 2)
             && (line.p(plane, 3) - line.p(plane, 0)).abs()
                 + (line.q(plane, 0) - line.q(plane, 3)).abs()
@@ -156,12 +157,19 @@ fn luma_segment(plane: &mut [u8], lines: [Line; 4], beta: i32, tc: i32) {
                     p[0],
                     (p[2] + 2 * p[1] + 2 * p[0] + 2 * q[0] + q[1] + 4) >> 3,
                 ),
+                max,
             );
-            line.set_p(plane, 1, clip(p[1], (p[2] + p[1] + p[0] + q[0] + 2) >> 2));
+            line.set_p(
+                plane,
+                1,
+                clip(p[1], (p[2] + p[1] + p[0] + q[0] + 2) >> 2),
+                max,
+            );
             line.set_p(
                 plane,
                 2,
                 clip(p[2], (2 * p[3] + 3 * p[2] + p[1] + p[0] + q[0] + 4) >> 3),
+                max,
             );
             line.set_q(
                 plane,
@@ -170,12 +178,19 @@ fn luma_segment(plane: &mut [u8], lines: [Line; 4], beta: i32, tc: i32) {
                     q[0],
                     (p[1] + 2 * p[0] + 2 * q[0] + 2 * q[1] + q[2] + 4) >> 3,
                 ),
+                max,
             );
-            line.set_q(plane, 1, clip(q[1], (p[0] + q[0] + q[1] + q[2] + 2) >> 2));
+            line.set_q(
+                plane,
+                1,
+                clip(q[1], (p[0] + q[0] + q[1] + q[2] + 2) >> 2),
+                max,
+            );
             line.set_q(
                 plane,
                 2,
                 clip(q[2], (p[0] + q[0] + q[1] + 3 * q[2] + 2 * q[3] + 4) >> 3),
+                max,
             );
         } else {
             let delta = (9 * (q[0] - p[0]) - 3 * (q[1] - p[1]) + 8) >> 4;
@@ -183,15 +198,15 @@ fn luma_segment(plane: &mut [u8], lines: [Line; 4], beta: i32, tc: i32) {
                 continue;
             }
             let delta = clip3(-tc, tc, delta);
-            line.set_p(plane, 0, p[0] + delta);
-            line.set_q(plane, 0, q[0] - delta);
+            line.set_p(plane, 0, p[0] + delta, max);
+            line.set_q(plane, 0, q[0] - delta, max);
             if filter_p1 {
                 let dp = clip3(
                     -(tc >> 1),
                     tc >> 1,
                     (((p[2] + p[0] + 1) >> 1) - p[1] + delta) >> 1,
                 );
-                line.set_p(plane, 1, p[1] + dp);
+                line.set_p(plane, 1, p[1] + dp, max);
             }
             if filter_q1 {
                 let dq = clip3(
@@ -199,19 +214,19 @@ fn luma_segment(plane: &mut [u8], lines: [Line; 4], beta: i32, tc: i32) {
                     tc >> 1,
                     (((q[2] + q[0] + 1) >> 1) - q[1] - delta) >> 1,
                 );
-                line.set_q(plane, 1, q[1] + dq);
+                line.set_q(plane, 1, q[1] + dq, max);
             }
         }
     }
 }
 
 /// Filter one chroma line across an edge (8.7.2.5.5).
-fn chroma_line(plane: &mut [u8], line: &Line, tc: i32) {
+fn chroma_line(plane: &mut [Pel], line: &Line, tc: i32, max: i32) {
     let (p0, p1) = (line.p(plane, 0), line.p(plane, 1));
     let (q0, q1) = (line.q(plane, 0), line.q(plane, 1));
     let delta = clip3(-tc, tc, (((q0 - p0) << 2) + p1 - q1 + 4) >> 3);
-    line.set_p(plane, 0, p0 + delta);
-    line.set_q(plane, 0, q0 - delta);
+    line.set_p(plane, 0, p0 + delta, max);
+    line.set_q(plane, 0, q0 - delta, max);
 }
 
 /// Run the filter over a whole picture: every vertical edge first, then every
@@ -219,19 +234,24 @@ fn chroma_line(plane: &mut [u8], line: &Line, tc: i32) {
 ///
 /// `qp` is the picture's quantisation parameter, which is every block's here --
 /// nothing in this encoder writes `cu_qp_delta`.
+#[allow(clippy::too_many_arguments)]
 pub fn deblock(
-    rec_y: &mut [u8],
-    rec_cb: &mut [u8],
-    rec_cr: &mut [u8],
+    rec_y: &mut [Pel],
+    rec_cb: &mut [Pel],
+    rec_cr: &mut [Pel],
     width: usize,
     height: usize,
     qp: i32,
+    bit_depth: u32,
     tus: &TuMap,
 ) {
+    // beta and tC scale with the sample range (8.7.2.5.3, 8.7.2.5.5).
+    let scale = 1i32 << (bit_depth - 8);
+    let max = (1i32 << bit_depth) - 1;
     // bS is 2 on every edge of an intra picture, so both look-ups are constant.
-    let beta = BETA[clip3(0, 51, qp) as usize];
-    let tc_luma = TC[clip3(0, 53, qp + 2) as usize];
-    let tc_chroma = TC[clip3(0, 53, chroma_qp(qp, 0) + 2) as usize];
+    let beta = BETA[clip3(0, 51, qp) as usize] * scale;
+    let tc_luma = TC[clip3(0, 53, qp + 2) as usize] * scale;
+    let tc_chroma = TC[clip3(0, 53, chroma_qp_bd(qp, 0, bit_depth) + 2) as usize] * scale;
     if beta == 0 && tc_luma == 0 && tc_chroma == 0 {
         return;
     }
@@ -244,7 +264,7 @@ pub fn deblock(
                     at: (y + i) * width + x,
                     step: 1,
                 });
-                luma_segment(rec_y, lines, beta, tc_luma);
+                luma_segment(rec_y, lines, beta, tc_luma, max);
             }
         }
     }
@@ -256,8 +276,8 @@ pub fn deblock(
                         at: (y_c + row) * cw + x_c,
                         step: 1,
                     };
-                    chroma_line(rec_cb, &line, tc_chroma);
-                    chroma_line(rec_cr, &line, tc_chroma);
+                    chroma_line(rec_cb, &line, tc_chroma, max);
+                    chroma_line(rec_cr, &line, tc_chroma, max);
                 }
             }
         }
@@ -270,7 +290,7 @@ pub fn deblock(
                     at: y * width + x + i,
                     step: width,
                 });
-                luma_segment(rec_y, lines, beta, tc_luma);
+                luma_segment(rec_y, lines, beta, tc_luma, max);
             }
         }
     }
@@ -282,8 +302,8 @@ pub fn deblock(
                         at: y_c * cw + x_c + col,
                         step: cw,
                     };
-                    chroma_line(rec_cb, &line, tc_chroma);
-                    chroma_line(rec_cr, &line, tc_chroma);
+                    chroma_line(rec_cb, &line, tc_chroma, max);
+                    chroma_line(rec_cr, &line, tc_chroma, max);
                 }
             }
         }
@@ -295,14 +315,14 @@ mod tests {
     use super::*;
 
     /// A step across an 8x8 transform boundary, the case the filter exists for.
-    fn step_picture(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let mut y = vec![0u8; w * h];
+    fn step_picture(w: usize, h: usize) -> (Vec<Pel>, Vec<Pel>, Vec<Pel>) {
+        let mut y = vec![0 as Pel; w * h];
         for row in 0..h {
             for col in 0..w {
                 y[row * w + col] = if col < 8 { 100 } else { 130 };
             }
         }
-        let c = vec![128u8; w / 2 * h / 2];
+        let c = vec![128 as Pel; w / 2 * h / 2];
         (y, c.clone(), c)
     }
 
@@ -320,7 +340,7 @@ mod tests {
                 tus.mark(bx, by, 3);
             }
         }
-        deblock(&mut y, &mut cb, &mut cr, w, h, 32, &tus);
+        deblock(&mut y, &mut cb, &mut cr, w, h, 32, 8, &tus);
         assert_ne!(y, before, "the edge at x=8 was left alone");
         assert!(y[7] > before[7], "p0 should be pulled up toward q0");
         assert!(y[8] < before[8], "q0 should be pulled down toward p0");
@@ -335,7 +355,7 @@ mod tests {
         let before = y.clone();
         let mut tus = TuMap::new(w, h);
         tus.mark(0, 0, 4);
-        deblock(&mut y, &mut cb, &mut cr, w, h, 32, &tus);
+        deblock(&mut y, &mut cb, &mut cr, w, h, 32, 8, &tus);
         assert_eq!(y, before);
     }
 }

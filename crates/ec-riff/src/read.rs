@@ -6,7 +6,7 @@ use std::path::Path;
 
 use ec_core::{Error, Result};
 
-use crate::{FORMAT_EXTENSIBLE, FORMAT_FLOAT, FORMAT_PCM, SampleType, WavSpec};
+use crate::{FORMAT_EXTENSIBLE, FORMAT_FLOAT, FORMAT_PCM, SampleType, WavCompressed, WavSpec};
 
 /// Reads the header of a WAVE stream, then its samples.
 ///
@@ -16,6 +16,7 @@ use crate::{FORMAT_EXTENSIBLE, FORMAT_FLOAT, FORMAT_PCM, SampleType, WavSpec};
 pub struct WavReader<R: Read> {
     inner: R,
     spec: WavSpec,
+    compressed: Option<WavCompressed>,
     /// Bytes the `data` header claimed, or `None` when it claimed a streaming
     /// placeholder and the file itself is the bound.
     data_bytes: Option<u64>,
@@ -32,34 +33,49 @@ impl<R: Read> WavReader<R> {
     /// Parse the header of an already-open stream, leaving it at the samples.
     pub fn new(mut inner: R) -> Result<Self> {
         let riff = read_exact::<12, _>(&mut inner)?;
-        if &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
-            if &riff[0..4] == b"RF64" {
-                return Err(Error::unsupported(
-                    "an RF64/BW64 file",
-                    "the 64-bit RIFF extension is not implemented",
-                ));
-            }
+        let is_rf64 = &riff[0..4] == b"RF64" || &riff[0..4] == b"BW64";
+        if !(is_rf64 || &riff[0..4] == b"RIFF") || &riff[8..12] != b"WAVE" {
             return Err(Error::corrupt("not a RIFF/WAVE file"));
         }
 
-        let mut spec = None;
+        let mut spec: Option<(WavSpec, Option<WavCompressed>)> = None;
+        // The `ds64` chunk's data size, which an RF64 `data` chunk defers to.
+        let mut ds64_data: Option<u64> = None;
         loop {
             let head = read_exact::<8, _>(&mut inner)?;
             let id = [head[0], head[1], head[2], head[3]];
             let size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as u64;
             match &id {
                 b"fmt " => spec = Some(parse_fmt(&mut inner, size)?),
+                b"ds64" if is_rf64 => {
+                    // riffSize, dataSize, sampleCount, then a table we do not need.
+                    if size < 24 {
+                        return Err(Error::corrupt(format!("RF64 ds64 chunk is {size} bytes")));
+                    }
+                    let body = read_exact::<24, _>(&mut inner)?;
+                    ds64_data = Some(u64::from_le_bytes(body[8..16].try_into().unwrap_or([0; 8])));
+                    skip(&mut inner, size - 24 + size % 2)?;
+                }
                 b"data" => {
-                    let spec = spec.ok_or_else(|| {
+                    let (spec, compressed) = spec.ok_or_else(|| {
                         Error::corrupt("WAVE data chunk arrived before any fmt chunk")
                     })?;
                     // 0 and 0xFFFFFFFF are both used by streamed writers that
-                    // never came back to patch the size.
-                    let data_bytes = (size != 0 && size != u64::from(u32::MAX)).then_some(size);
+                    // never came back to patch the size. In RF64 the 0xFFFFFFFF
+                    // is a sentinel for the ds64 value; without one it is
+                    // the same placeholder as in RIFF.
+                    let data_bytes = if size == u64::from(u32::MAX) && is_rf64 {
+                        ds64_data
+                    } else if size == 0 || size == u64::from(u32::MAX) {
+                        None
+                    } else {
+                        Some(size)
+                    };
                     return Ok(WavReader {
                         inner,
                         spec,
-                        data_bytes,
+                        compressed,
+                        data_bytes: data_bytes.filter(|&n| n != 0),
                     });
                 }
                 _ => skip(&mut inner, size + size % 2)?,
@@ -75,7 +91,22 @@ impl<R: Read> WavReader<R> {
     /// Frames (one sample per channel) the `data` header claims, when it claims
     /// one. A truncated file reports fewer from [`Self::read_all_i32`].
     pub fn duration(&self) -> Option<u64> {
-        self.data_bytes.map(|b| b / self.spec.block_align() as u64)
+        match &self.compressed {
+            Some(c) => self.data_bytes.map(|b| c.frames_in(b)),
+            None => self.data_bytes.map(|b| b / self.spec.block_align() as u64),
+        }
+    }
+
+    /// The format, when it is one of the compressed tags (IMA/MS ADPCM,
+    /// A-law, mu-law) rather than PCM. [`Self::spec`] then describes the
+    /// decoded 16-bit output.
+    pub fn compressed(&self) -> Option<&WavCompressed> {
+        self.compressed.as_ref()
+    }
+
+    /// The `data` chunk's raw bytes, whatever the format.
+    pub fn read_data_bytes(&mut self) -> Result<Vec<u8>> {
+        self.read_data()
     }
 
     /// Read the whole `data` chunk as interleaved bytes, stopping at whichever
@@ -92,7 +123,11 @@ impl<R: Read> WavReader<R> {
                 self.inner.read_to_end(&mut buf)?;
             }
         }
-        let align = self.spec.block_align();
+        let align = match &self.compressed {
+            Some(c) if c.tag == 0x0006 || c.tag == 0x0007 => usize::from(c.channels.max(1)),
+            Some(_) => 1,
+            None => self.spec.block_align(),
+        };
         buf.truncate(buf.len() / align * align);
         Ok(buf)
     }
@@ -131,7 +166,7 @@ impl<R: Read> WavReader<R> {
         if self.spec.sample_format == SampleType::Float {
             let buf = self.read_data()?;
             return Ok(buf
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect());
         }
@@ -167,7 +202,7 @@ fn skip<R: Read>(r: &mut R, n: u64) -> Result<()> {
 }
 
 /// Parse a `fmt ` chunk body of `size` bytes, extensible or not.
-fn parse_fmt<R: Read>(r: &mut R, size: u64) -> Result<WavSpec> {
+fn parse_fmt<R: Read>(r: &mut R, size: u64) -> Result<(WavSpec, Option<WavCompressed>)> {
     if size < 16 {
         return Err(Error::corrupt(format!("WAVE fmt chunk is {size} bytes")));
     }
@@ -178,6 +213,7 @@ fn parse_fmt<R: Read>(r: &mut R, size: u64) -> Result<WavSpec> {
     let block_align = u16::from_le_bytes([f[12], f[13]]);
     let bits_per_sample = u16::from_le_bytes([f[14], f[15]]);
     let mut rest = size - 16;
+    let was_extensible = tag == FORMAT_EXTENSIBLE;
 
     if tag == FORMAT_EXTENSIBLE {
         if rest < 24 {
@@ -192,7 +228,27 @@ fn parse_fmt<R: Read>(r: &mut R, size: u64) -> Result<WavSpec> {
         // enough that rejecting on it would refuse valid files.
         tag = u16::from_le_bytes([ext[8], ext[9]]);
     }
+    let mut extra = Vec::new();
+    if !was_extensible && matches!(tag, 0x0011 | 0x0002 | 0x0006 | 0x0007) && rest >= 2 {
+        // cbSize then its payload.
+        let cb = read_exact::<2, _>(r)?;
+        rest -= 2;
+        let cb = u64::from(u16::from_le_bytes(cb)).min(rest);
+        extra.resize(cb as usize, 0);
+        r.read_exact(&mut extra)?;
+        rest -= cb;
+    }
     skip(r, rest + size % 2)?;
+    if let Some(c) = WavCompressed::new(tag, channels, block_align, &extra) {
+        let spec = WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: SampleType::Int,
+        };
+        spec.validate()?;
+        return Ok((spec, Some(c)));
+    }
 
     let sample_format = match tag {
         FORMAT_PCM => SampleType::Int,
@@ -228,5 +284,5 @@ fn parse_fmt<R: Read>(r: &mut R, size: u64) -> Result<WavSpec> {
             "ec-riff reads samples packed at their declared depth, without container padding",
         ));
     }
-    Ok(spec)
+    Ok((spec, None))
 }

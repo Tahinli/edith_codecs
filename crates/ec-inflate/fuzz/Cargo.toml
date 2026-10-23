@@ -1,0 +1,49 @@
+[package]
+name = "ec-inflate-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Only the differential target uses it. Cargo ignores [dev-dependencies] for [[bin]]
+# targets, so it lives here, in the fuzz crate alone; ec-inflate never sees it.
+miniz_oxide = "0.8.9"
+
+[dependencies.ec-inflate]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "inflate_raw"
+path = "fuzz_targets/inflate_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate_zlib"
+path = "fuzz_targets/inflate_zlib.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate_into"
+path = "fuzz_targets/inflate_into.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate_diff"
+path = "fuzz_targets/inflate_diff.rs"
+test = false
+doc = false
+bench = false

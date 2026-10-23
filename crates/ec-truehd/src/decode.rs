@@ -57,10 +57,10 @@ use ec_core::error::{Error, Result};
 use ec_core::frame::{AudioFrame, ChannelLayout, SampleFormat};
 use ec_core::packet::Buf;
 
-use crate::sync::AccessUnitHeader;
+use crate::sync::{AccessUnitHeader, PCM_SUBSTREAMS};
 
 /// Highest matrix/output channel index the 2/6/8-channel presentations use;
-/// anything above is the 16-channel object substream, refused.
+/// a PCM substream asking for more is refused (none of them has more than 8).
 const MAX_MATRIX_CHANNEL: usize = 7;
 /// Sample-buffer width: 8 PCM channels plus the 2 noise channels noise type 0
 /// appends after the last matrix channel.
@@ -320,9 +320,20 @@ impl Substream {
         }
     }
 
-    fn recompute_sign_offset(&mut self, ch: usize) {
+    fn recompute_sign_offset(&mut self, ch: usize) -> Result<()> {
         let cp = &mut self.channels[ch];
         let lsb_bits = i32::from(cp.huff_lsbs) - self.quant_step_size[ch] as i32;
+        // A quant step above huff_lsbs is refused in read_block before this offset is used. It
+        // is called before huff_lsbs is re-read, so this must not shift by a negative amount.
+        if lsb_bits < 0 {
+            cp.sign_huff_offset = 0;
+            return Ok(());
+        }
+        // huff_lsbs is checked against 24 after it is read, but this call can run first, on the
+        // value a refused access unit left behind. Above 24, `7 << lsb_bits` overflows i32.
+        if lsb_bits > 24 {
+            return Err(Error::corrupt("TrueHD: huff_lsbs above 24"));
+        }
         let sign_shift = lsb_bits
             + if cp.codebook > 0 {
                 2 - i32::from(cp.codebook)
@@ -337,6 +348,7 @@ impl Substream {
             off -= 1 << sign_shift;
         }
         cp.sign_huff_offset = off;
+        Ok(())
     }
 }
 
@@ -358,6 +370,13 @@ pub struct CheckStats {
     pub length_mismatches: u64,
 }
 
+/// How many of an access unit's directory entries are PCM presentations this
+/// decoder reconstructs: all of them up to [`PCM_SUBSTREAMS`]; any entry past
+/// that (Atmos object audio) is skipped via its end pointer, never decoded.
+fn decoded_substreams(header: &AccessUnitHeader) -> usize {
+    header.substreams.len().min(PCM_SUBSTREAMS)
+}
+
 /// Decoder state shared across the substreams of one stream.
 #[derive(Debug, Clone)]
 pub(crate) struct Core {
@@ -374,6 +393,16 @@ pub(crate) struct Core {
     noise_buffer: Vec<i8>,
     /// Self-check tallies.
     pub stats: CheckStats,
+}
+
+/// [`Core`] state saved before an access unit, restored if the unit is refused.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    substreams: Vec<Substream>,
+    access_unit_size: usize,
+    access_unit_size_pow2: usize,
+    sample_rate: u32,
+    ch8_assignment: u16,
 }
 
 struct HuffLutBox(HuffLut);
@@ -407,20 +436,61 @@ impl Core {
 
     /// Decodes one access unit whose header already parsed; `None` until the
     /// first major sync and every substream's first restart header are seen.
+    ///
+    /// A refused unit leaves no trace: the stream state is restored to what it was before the
+    /// unit, so later units decode as if the refused one had never been sent. Without this, a
+    /// unit refused part-way through a parameter block leaves a stale `huff_lsbs`, codebook or
+    /// filter history behind, and every following unit is refused or decoded wrongly.
     pub(crate) fn decode(
         &mut self,
         header: &AccessUnitHeader,
         data: &[u8],
     ) -> Result<Option<AudioFrame>> {
+        let saved = self.snapshot();
+        let result = self.decode_unit(header, data);
+        if result.is_err() {
+            self.restore(saved);
+        }
+        result
+    }
+
+    fn decode_unit(&mut self, header: &AccessUnitHeader, data: &[u8]) -> Result<Option<AudioFrame>> {
         if !self.prepare(header)? || !self.decode_substreams(header, data)? {
             return Ok(None);
         }
         self.finish()
     }
 
+    /// The state a refused access unit may have changed: the substreams (parameters, filter
+    /// history, noise generator, check data) and the stream format from the major sync.
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            substreams: self.substreams.clone(),
+            access_unit_size: self.access_unit_size,
+            access_unit_size_pow2: self.access_unit_size_pow2,
+            sample_rate: self.sample_rate,
+            ch8_assignment: self.ch8_assignment,
+        }
+    }
+
+    fn restore(&mut self, saved: Snapshot) {
+        self.substreams = saved.substreams;
+        self.access_unit_size = saved.access_unit_size;
+        self.access_unit_size_pow2 = saved.access_unit_size_pow2;
+        self.sample_rate = saved.sample_rate;
+        self.ch8_assignment = saved.ch8_assignment;
+        // The scratch buffers follow the restored unit size; their contents are rebuilt per unit.
+        if self.sample_buffer.len() != self.access_unit_size {
+            self.sample_buffer = vec![[0; MAX_CHANNELS]; self.access_unit_size];
+            self.bypassed_lsbs = vec![[0; MAX_MATRICES]; self.access_unit_size];
+            self.noise_buffer = vec![0; self.access_unit_size_pow2];
+        }
+    }
+
     /// Takes a major sync's stream parameters on board; `Ok(false)` while no
     /// major sync has been seen yet.
     fn prepare(&mut self, header: &AccessUnitHeader) -> Result<bool> {
+        let pcm = decoded_substreams(header);
         if let Some(sync) = &header.major_sync {
             let shift = sync.rate_code & 7;
             if shift > 2 {
@@ -432,22 +502,23 @@ impl Core {
             self.access_unit_size = 40 << shift;
             self.access_unit_size_pow2 = 64 << shift;
             self.sample_rate = sync.sample_rate;
-            if self.substreams.len() != header.substreams.len() {
-                self.substreams = vec![Substream::new(); header.substreams.len()];
+            if self.substreams.len() != pcm {
+                self.substreams = vec![Substream::new(); pcm];
             }
             self.sample_buffer = vec![[0; MAX_CHANNELS]; self.access_unit_size];
             self.bypassed_lsbs = vec![[0; MAX_MATRICES]; self.access_unit_size];
             self.noise_buffer = vec![0; self.access_unit_size_pow2];
             self.ch8_assignment = sync.ch8_assignment;
         }
-        Ok(self.access_unit_size != 0 && self.substreams.len() == header.substreams.len())
+        Ok(self.access_unit_size != 0 && self.substreams.len() == pcm)
     }
 
-    /// Every substream's blocks into `sample_buffer`; `Ok(false)` while some
-    /// substream still awaits its first restart header.
+    /// Every PCM substream's blocks into `sample_buffer`; `Ok(false)` while
+    /// some substream still awaits its first restart header. Substreams past
+    /// the PCM presentations (an Atmos object substream) are not decoded.
     fn decode_substreams(&mut self, header: &AccessUnitHeader, data: &[u8]) -> Result<bool> {
         let mut all_seen = true;
-        for (i, info) in header.substreams.iter().enumerate() {
+        for (i, info) in header.substreams.iter().enumerate().take(PCM_SUBSTREAMS) {
             let (start, end) = header.substream_span(i);
             let seg = data.get(start..end).ok_or(Error::NeedMore)?;
             let seen = self.decode_substream(i, seg, info.flags & 0x2 != 0)?;
@@ -548,7 +619,7 @@ impl Core {
         if max_matrix_channel > MAX_MATRIX_CHANNEL || max_channel > MAX_MATRIX_CHANNEL {
             return Err(Error::unsupported(
                 "TrueHD substream with more than 8 matrix channels",
-                "the 16-channel object substream is not implemented",
+                "no PCM presentation carries more than 8 channels",
             ));
         }
         if min_channel > max_channel {
@@ -669,7 +740,7 @@ impl Core {
         if flags & PARAM_QUANTSTEP != 0 && br.read_bit()? {
             for ch in 0..=s.max_channel {
                 s.quant_step_size[ch] = br.read_bits(4)?;
-                s.recompute_sign_offset(ch);
+                s.recompute_sign_offset(ch)?;
             }
         }
         for ch in s.min_channel..=s.max_channel {
@@ -690,12 +761,15 @@ impl Core {
                 if flags & PARAM_HUFFOFFSET != 0 && br.read_bit()? {
                     s.channels[ch].huff_offset = br.read_signed(15)?;
                 }
-                s.channels[ch].codebook = br.read_bits(2)? as u8;
-                s.channels[ch].huff_lsbs = br.read_bits(5)? as u8;
-                if s.channels[ch].huff_lsbs > 24 {
+                let codebook = br.read_bits(2)? as u8;
+                let huff_lsbs = br.read_bits(5)? as u8;
+                // Validated before either field is stored.
+                if huff_lsbs > 24 {
                     return Err(Error::corrupt("TrueHD: huff_lsbs above 24"));
                 }
-                s.recompute_sign_offset(ch);
+                s.channels[ch].codebook = codebook;
+                s.channels[ch].huff_lsbs = huff_lsbs;
+                s.recompute_sign_offset(ch)?;
             }
         }
         Ok(())
@@ -827,10 +901,13 @@ impl Core {
 /// New coefficients for `f`; its history carries over unless the stream
 /// sends an explicit (IIR-only) state.
 fn read_filter(br: &mut BitReader, f: &mut Filter, iir: bool) -> Result<()> {
-    f.order = br.read_bits(4)? as usize;
-    if f.order > MAX_FILTER_ORDER || (!iir && f.order > 8) || (iir && f.order > 4) {
+    // Validate before storing: the decode loop keeps going after an error, so an out-of-range
+    // order left in `f` would index past the state arrays on a later access unit.
+    let order = br.read_bits(4)? as usize;
+    if order > MAX_FILTER_ORDER || (!iir && order > 8) || (iir && order > 4) {
         return Err(Error::corrupt("TrueHD: filter order out of range"));
     }
+    f.order = order;
     if f.order > 0 {
         f.shift = br.read_bits(4)?;
         let coeff_bits = br.read_bits(5)?;
@@ -891,6 +968,50 @@ fn filter_channel(cp: &mut ChannelParams, qss: u32, rows: &mut [[i32; MAX_CHANNE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An out-of-range filter order is refused and not stored: the decode loop
+    /// continues after an error, and a stored order above the state array's
+    /// length would index out of bounds on a later access unit (fuzz finding).
+    #[test]
+    fn out_of_range_filter_order_is_refused_and_not_stored() {
+        // 4-bit order field = 9 (above the FIR limit of 8), then padding.
+        let data = [0x90u8, 0, 0, 0];
+        let mut br = BitReader::new(&data);
+        let mut f = Filter::default();
+        assert!(matches!(read_filter(&mut br, &mut f, false), Err(Error::Corrupt { .. })));
+        assert_eq!(f.order, 0);
+
+        // 4-bit order field = 5: refused for IIR (limit 4), and not stored.
+        let data = [0x50u8, 0, 0, 0];
+        let mut br = BitReader::new(&data);
+        let mut f = Filter::default();
+        assert!(read_filter(&mut br, &mut f, true).is_err());
+        assert_eq!(f.order, 0);
+    }
+
+    /// A quant step above huff_lsbs (set before huff_lsbs is re-read) leaves the sign offset
+    /// at zero instead of shifting by a negative amount (fuzz finding; debug builds panic).
+    #[test]
+    fn quant_step_above_huff_lsbs_does_not_shift_negatively() {
+        let mut s = Substream::new();
+        s.channels[0].huff_lsbs = 2;
+        s.channels[0].huff_offset = 100;
+        s.quant_step_size[0] = 5;
+        s.recompute_sign_offset(0).unwrap();
+        assert_eq!(s.channels[0].sign_huff_offset, 0);
+    }
+
+    /// A stale huff_lsbs above 24 (left by a refused access unit) is corrupt, not an i32
+    /// overflow in `7 << lsb_bits` (fuzz finding crash-3c28...; debug and fuzz builds panic).
+    #[test]
+    fn stale_huff_lsbs_above_24_is_corrupt_not_an_overflow() {
+        let mut s = Substream::new();
+        s.channels[0].huff_lsbs = 31;
+        s.channels[0].codebook = 1;
+        s.channels[0].huff_offset = 100;
+        let err = s.recompute_sign_offset(0).expect_err("lsb_bits above 24 is corrupt");
+        assert!(err.to_string().contains("huff_lsbs"), "wrong refusal: {err}");
+    }
 
     /// Every code in the public tables decodes back to its own index when
     /// written bit-exactly, with and without trailing garbage.

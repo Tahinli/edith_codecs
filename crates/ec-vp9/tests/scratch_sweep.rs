@@ -1,3 +1,4 @@
+#[path = "it/ivf.rs"]
 mod ivf;
 use ec_vp9::decode::Decoder;
 #[test]
@@ -14,13 +15,12 @@ fn sweep() {
     let ylen = w as usize * h as usize;
     let mut best = (0usize, 0usize);
     for t in (100..260).step_by(1) {
-        unsafe { std::env::set_var("EC_VP9_FORCE_TAIL", t.to_string()); }
+        let _tail = ec_vp9::knobs::set_force_tail(Some(t));
         let mut d = Decoder::new();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.decode(&frames[0].data)));
         let Ok(Ok(Some(pic))) = r else { continue };
         let m = (0..ylen).filter(|&i| pic.y[i] as u8 == refout[i]).count();
         if m > best.0 { best = (m, t); }
     }
-    unsafe { std::env::remove_var("EC_VP9_FORCE_TAIL"); }
     println!("BEST matches {} at tail_start {}", best.0, best.1);
 }

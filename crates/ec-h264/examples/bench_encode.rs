@@ -7,7 +7,10 @@ use std::time::Instant;
 
 fn main() {
     let path = std::env::args().nth(1).expect("path to raw yuv420p");
-    let reps: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let reps: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let (w, h) = (640u32, 360u32);
     let data = std::fs::read(&path).expect("read raw yuv");
     let frame_len = (w * h + 2 * (w.div_ceil(2) * h.div_ceil(2))) as usize;

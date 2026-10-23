@@ -35,8 +35,10 @@ fn decode_ac3(decoder: &mut Box<dyn Decoder>, bytes: &[u8]) -> Option<(Vec<f32>,
     match decoder.receive_frame() {
         Ok(Frame::Audio(audio)) => Some((
             audio.data[0]
-                .chunks_exact(2)
-                .map(|s| f32::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| f32::from(i16::from_le_bytes(*s)) / 32768.0)
                 .collect(),
             u64::from(audio.samples),
         )),
@@ -99,6 +101,50 @@ fn the_replicas_open_path_lands_on_audible_pcm() {
         if let Some(next) = data.get(size..).filter(|rest| rest.len() > size) {
             let (pcm, samples) = decode_ac3(&mut decoder, next).expect("the second syncframe");
             assert_eq!((pcm.len() as u64 / samples.max(1)) as u16, channels_want);
+        }
+    }
+    assert!(ran > 0, "no AC-3 fixtures: run scripts/gen-fixtures.sh");
+}
+
+/// A packet holding two or three syncframes, handed over the registry's
+/// decoder the way the replica hands it packets: one call, one output frame.
+/// The samples are the frames decoded one at a time, back to back.
+#[test]
+fn a_packet_of_two_and_three_syncframes_decodes_to_its_frames() {
+    let cases = [
+        ("ac3-5.1-48000.ac3", "ac3", Some(2)),
+        ("eac3-5.1-48000.eac3", "eac3", Some(2)),
+    ];
+    let mut ran = 0;
+    for (name, codec, requested) in cases {
+        let Some(data) = fixture(name) else { continue };
+        ran += 1;
+        let mut frames = Vec::new();
+        let mut pos = 0;
+        while let Ok(len) = ec_ac3::frame_size(&data[pos..]) {
+            frames.push(&data[pos..pos + len]);
+            pos += len;
+            if frames.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(frames.len(), 3, "{name}: three syncframes");
+
+        let mut single = ac3_decoder(codec, requested);
+        let mut reference = Vec::new();
+        let mut reference_samples = 0;
+        for frame in &frames {
+            let (pcm, samples) = decode_ac3(&mut single, frame).expect("one frame");
+            reference.extend(pcm);
+            reference_samples += samples;
+        }
+
+        for n in [2usize, 3] {
+            let mut decoder = ac3_decoder(codec, requested);
+            let packet: Vec<u8> = frames[..n].concat();
+            let (pcm, samples) = decode_ac3(&mut decoder, &packet).expect("the packet decodes");
+            assert_eq!(samples, reference_samples / 3 * n as u64, "{name}: {n} frames, samples");
+            assert_eq!(pcm, reference[..pcm.len()], "{name}: {n} frames, PCM");
         }
     }
     assert!(ran > 0, "no AC-3 fixtures: run scripts/gen-fixtures.sh");

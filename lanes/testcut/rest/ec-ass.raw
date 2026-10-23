@@ -1,0 +1,36 @@
+{ "type": "suite", "event": "started", "test_count": 6 }
+{ "type": "test", "event": "started", "name": "tests::a_script_parses_header_styles_and_events" }
+{ "type": "test", "event": "started", "name": "tests::karaoke_drawings_and_unknown_tags" }
+{ "type": "test", "event": "started", "name": "tests::karaoke_modes_timing_and_colours" }
+{ "type": "test", "event": "started", "name": "tests::other_overrides_survive_for_a_renderer" }
+{ "type": "test", "name": "tests::other_overrides_survive_for_a_renderer", "event": "ok", "exec_time": 0.000078898 }
+{ "type": "test", "event": "started", "name": "tests::positioning_overrides_reach_the_cue" }
+{ "type": "test", "name": "tests::karaoke_drawings_and_unknown_tags", "event": "ok", "exec_time": 0.000019968 }
+{ "type": "test", "event": "started", "name": "tests::tolerances_and_the_refusal" }
+{ "type": "test", "name": "tests::a_script_parses_header_styles_and_events", "event": "ok", "exec_time": 0.000075082 }
+{ "type": "test", "name": "tests::karaoke_modes_timing_and_colours", "event": "ok", "exec_time": 0.000035067 }
+{ "type": "test", "name": "tests::positioning_overrides_reach_the_cue", "event": "ok", "exec_time": 0.000052969 }
+{ "type": "test", "name": "tests::tolerances_and_the_refusal", "event": "ok", "exec_time": 0.000031278 }
+{ "type": "suite", "event": "ok", "passed": 6, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.001201218 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "cues_match_ffmpeg_timing_order_and_text" }
+{ "type": "test", "event": "started", "name": "matroska_style_blocks_rebuild_to_the_same_cues" }
+{ "type": "test", "event": "started", "name": "reordered_format_is_read_by_column_name" }
+{ "type": "test", "event": "started", "name": "unmodelled_override_tags_survive_as_verbatim_raw" }
+{ "type": "test", "name": "reordered_format_is_read_by_column_name", "event": "ok", "exec_time": 0.000085892 }
+{ "type": "test", "name": "unmodelled_override_tags_survive_as_verbatim_raw", "event": "ok", "exec_time": 0.000050975 }
+{ "type": "test", "name": "matroska_style_blocks_rebuild_to_the_same_cues", "event": "ok", "exec_time": 0.000667575 }
+{ "type": "test", "name": "cues_match_ffmpeg_timing_order_and_text", "event": "ok", "exec_time": 2.540111934 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 2.540838893 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "a_dialogue_clock_too_large_is_skipped" }
+{ "type": "test", "event": "started", "name": "a_long_header_and_many_rows_parse_whole" }
+{ "type": "test", "event": "started", "name": "an_alignment_code_at_i32_min_does_not_overflow" }
+{ "type": "test", "event": "started", "name": "the_first_wrap_style_line_governs_soft_breaks" }
+{ "type": "test", "name": "the_first_wrap_style_line_governs_soft_breaks", "event": "ok", "exec_time": 0.000023194 }
+{ "type": "test", "name": "a_dialogue_clock_too_large_is_skipped", "event": "ok", "exec_time": 0.0000153 }
+{ "type": "test", "name": "an_alignment_code_at_i32_min_does_not_overflow", "event": "ok", "exec_time": 0.000070993 }
+{ "type": "test", "name": "a_long_header_and_many_rows_parse_whole", "event": "ok", "exec_time": 0.03285054 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.033885796 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000034294 }

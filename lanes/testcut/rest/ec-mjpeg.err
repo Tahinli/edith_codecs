@@ -1,0 +1,5 @@
+   Compiling ec-mjpeg v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-mjpeg)
+    Finished `release` profile [optimized] target(s) in 2.70s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_mjpeg-f021ebdc6070ca3b)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-cea9f28879bf485b)
+   Doc-tests ec_mjpeg

@@ -1,0 +1,202 @@
+{ "type": "suite", "event": "started", "test_count": 42 }
+{ "type": "test", "event": "started", "name": "celt::tests::fft15_matches_a_direct_transform" }
+{ "type": "test", "event": "started", "name": "celt::tests::imdct_overlap_add_reconstructs_the_signal" }
+{ "type": "test", "event": "started", "name": "celt::tests::pvq_index_round_trips_within_v" }
+{ "type": "test", "event": "started", "name": "celt::tests::window_is_power_complementary" }
+{ "type": "test", "name": "celt::tests::window_is_power_complementary", "event": "ok", "exec_time": 0.00001556 }
+{ "type": "test", "event": "started", "name": "celt_enc::tests::allocation_encoder_and_decoder_match_on_grid" }
+{ "type": "test", "name": "celt::tests::pvq_index_round_trips_within_v", "event": "ok", "exec_time": 0.000842583 }
+{ "type": "test", "event": "started", "name": "celt_enc::tests::forward_mdct_matches_the_definition" }
+{ "type": "test", "name": "celt_enc::tests::allocation_encoder_and_decoder_match_on_grid", "event": "ok", "exec_time": 0.000242896 }
+{ "type": "test", "event": "started", "name": "celt_enc::tests::laplace_round_trips" }
+{ "type": "test", "name": "celt_enc::tests::laplace_round_trips", "event": "ok", "exec_time": 0.000315763 }
+{ "type": "test", "event": "started", "name": "celt_enc::tests::pulse_enumeration_round_trips" }
+{ "type": "test", "name": "celt_enc::tests::pulse_enumeration_round_trips", "event": "ok", "exec_time": 0.000143571 }
+{ "type": "test", "event": "started", "name": "encoder::tests::bandwidth_follows_the_bitrate_the_application_and_the_input_rate" }
+{ "type": "test", "name": "encoder::tests::bandwidth_follows_the_bitrate_the_application_and_the_input_rate", "event": "ok", "exec_time": 0.000367742 }
+{ "type": "test", "event": "started", "name": "encoder::tests::detected_bandwidth_lowers_the_coded_bandwidth_but_not_below_its_floor" }
+{ "type": "test", "name": "encoder::tests::detected_bandwidth_lowers_the_coded_bandwidth_but_not_below_its_floor", "event": "ok", "exec_time": 0.000069631 }
+{ "type": "test", "event": "started", "name": "encoder::tests::look_ahead_matches_the_frame_size_dispatch_actually_uses" }
+{ "type": "test", "name": "encoder::tests::look_ahead_matches_the_frame_size_dispatch_actually_uses", "event": "ok", "exec_time": 0.000135195 }
+{ "type": "test", "event": "started", "name": "encoder::tests::voip_auto_mode_is_monotonic_per_channel" }
+{ "type": "test", "name": "celt::tests::fft15_matches_a_direct_transform", "event": "ok", "exec_time": 0.009765885 }
+{ "type": "test", "event": "started", "name": "multistream::tests::layouts_are_checked" }
+{ "type": "test", "name": "encoder::tests::voip_auto_mode_is_monotonic_per_channel", "event": "ok", "exec_time": 0.003726495 }
+{ "type": "test", "event": "started", "name": "multistream::tests::truncated_packets_are_errors_not_panics" }
+{ "type": "test", "name": "multistream::tests::layouts_are_checked", "event": "ok", "exec_time": 0.000629774 }
+{ "type": "test", "event": "started", "name": "ogg::tests::the_head_is_what_the_rfc_describes" }
+{ "type": "test", "name": "ogg::tests::the_head_is_what_the_rfc_describes", "event": "ok", "exec_time": 0.000000641 }
+{ "type": "test", "event": "started", "name": "packet::tests::code0_to_code3" }
+{ "type": "test", "name": "multistream::tests::truncated_packets_are_errors_not_panics", "event": "ok", "exec_time": 0.000974191 }
+{ "type": "test", "event": "started", "name": "packet::tests::malformed_input_is_an_error_not_a_panic" }
+{ "type": "test", "name": "packet::tests::malformed_input_is_an_error_not_a_panic", "event": "ok", "exec_time": 0.000169279 }
+{ "type": "test", "event": "started", "name": "packet::tests::self_delimited_leaves_the_rest_for_the_next_stream" }
+{ "type": "test", "name": "packet::tests::self_delimited_leaves_the_rest_for_the_next_stream", "event": "ok", "exec_time": 0.000001272 }
+{ "type": "test", "event": "started", "name": "packet::tests::toc_table_2" }
+{ "type": "test", "name": "packet::tests::toc_table_2", "event": "ok", "exec_time": 0.0000002 }
+{ "type": "test", "event": "started", "name": "range::tests::empty_frame_never_panics" }
+{ "type": "test", "name": "packet::tests::code0_to_code3", "event": "ok", "exec_time": 0.000004939 }
+{ "type": "test", "event": "started", "name": "range::tests::encoder_and_decoder_tell_identically" }
+{ "type": "test", "name": "range::tests::empty_frame_never_panics", "event": "ok", "exec_time": 0.000001663 }
+{ "type": "test", "event": "started", "name": "range::tests::fixed_size_frame_decodes_past_the_coded_symbols" }
+{ "type": "test", "name": "range::tests::encoder_and_decoder_tell_identically", "event": "ok", "exec_time": 0.000014958 }
+{ "type": "test", "event": "started", "name": "range::tests::roundtrip_mixed_symbols" }
+{ "type": "test", "name": "range::tests::fixed_size_frame_decodes_past_the_coded_symbols", "event": "ok", "exec_time": 0.000000251 }
+{ "type": "test", "event": "started", "name": "range::tests::shrink_preserves_both_streams" }
+{ "type": "test", "name": "range::tests::roundtrip_mixed_symbols", "event": "ok", "exec_time": 0.000007985 }
+{ "type": "test", "event": "started", "name": "range::tests::tell_agrees_with_tell_frac" }
+{ "type": "test", "name": "range::tests::shrink_preserves_both_streams", "event": "ok", "exec_time": 0.000000961 }
+{ "type": "test", "event": "started", "name": "silk::tests::fixed_point_helpers_match_their_definitions" }
+{ "type": "test", "name": "range::tests::tell_agrees_with_tell_frac", "event": "ok", "exec_time": 0.000000902 }
+{ "type": "test", "event": "started", "name": "silk::tests::gains_are_monotonic_in_the_index" }
+{ "type": "test", "name": "silk::tests::fixed_point_helpers_match_their_definitions", "event": "ok", "exec_time": 0.0000004 }
+{ "type": "test", "event": "started", "name": "silk::tests::nlsf_stabilize_enforces_the_minimum_spacing" }
+{ "type": "test", "name": "silk::tests::gains_are_monotonic_in_the_index", "event": "ok", "exec_time": 0.000001051 }
+{ "type": "test", "event": "started", "name": "silk_enc::tests::debug_lpc_to_nlsf_is_inverse_of_nlsf2a" }
+{ "type": "test", "name": "silk::tests::nlsf_stabilize_enforces_the_minimum_spacing", "event": "ok", "exec_time": 0.000000993 }
+{ "type": "test", "event": "started", "name": "silk_enc::tests::gain_indices_round_trip_within_1db" }
+{ "type": "test", "name": "silk_enc::tests::debug_lpc_to_nlsf_is_inverse_of_nlsf2a", "event": "ok", "exec_time": 0.000414159 }
+{ "type": "test", "event": "started", "name": "silk_enc::tests::lpc_nlsf_vq_round_trip_within_1db" }
+{ "type": "test", "name": "silk_enc::tests::gain_indices_round_trip_within_1db", "event": "ok", "exec_time": 0.000011451 }
+{ "type": "test", "event": "started", "name": "silk_enc::tests::pitch_estimator_on_pulse_train_and_noise" }
+{ "type": "test", "name": "silk_enc::tests::lpc_nlsf_vq_round_trip_within_1db", "event": "ok", "exec_time": 0.000503385 }
+{ "type": "test", "event": "started", "name": "silk_enc::tests::resampler_delay_is_pinned" }
+{ "type": "test", "name": "silk_enc::tests::pitch_estimator_on_pulse_train_and_noise", "event": "ok", "exec_time": 0.000508336 }
+{ "type": "test", "event": "started", "name": "silk_enc::tests::resampler_downsamples_a_tone_without_blowing_up" }
+{ "type": "test", "name": "silk_enc::tests::resampler_delay_is_pinned", "event": "ok", "exec_time": 0.000004269 }
+{ "type": "test", "event": "started", "name": "silk_enc_write::tests::pulses_roundtrip_through_the_decoder" }
+{ "type": "test", "name": "silk_enc::tests::resampler_downsamples_a_tone_without_blowing_up", "event": "ok", "exec_time": 0.00323916 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::every_by_value_module_is_scanned" }
+{ "type": "test", "name": "stack_budget::tests::every_by_value_module_is_scanned", "event": "ok", "exec_time": 0.000085099 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::every_by_value_public_return_is_in_the_inventory" }
+{ "type": "test", "name": "stack_budget::tests::every_by_value_public_return_is_in_the_inventory", "event": "ok", "exec_time": 0.000970644 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::every_by_value_type_fits_the_stack_budget" }
+{ "type": "test", "name": "stack_budget::tests::every_by_value_type_fits_the_stack_budget", "event": "ok", "exec_time": 0.000004449 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::the_crate_private_silk_encoders_stay_behind_a_box" }
+{ "type": "test", "name": "stack_budget::tests::the_crate_private_silk_encoders_stay_behind_a_box", "event": "ok", "exec_time": 0.000087424 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::the_deepest_by_value_constructors_fit_on_a_tight_stack" }
+{ "type": "test", "name": "stack_budget::tests::the_deepest_by_value_constructors_fit_on_a_tight_stack", "event": "ok", "exec_time": 0.000374954 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::the_inventory_scan_is_not_vacuous" }
+{ "type": "test", "name": "stack_budget::tests::the_inventory_scan_is_not_vacuous", "event": "ok", "exec_time": 0.000003537 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::the_measured_inventory_is_accurate" }
+{ "type": "test", "name": "stack_budget::tests::the_measured_inventory_is_accurate", "event": "ok", "exec_time": 0.000015529 }
+{ "type": "test", "name": "silk_enc_write::tests::pulses_roundtrip_through_the_decoder", "event": "ok", "exec_time": 0.025976718 }
+{ "type": "test", "name": "celt::tests::imdct_overlap_add_reconstructs_the_signal", "event": "ok", "exec_time": 0.04904054 }
+{ "type": "test", "name": "celt_enc::tests::forward_mdct_matches_the_definition", "event": "ok", "exec_time": 0.060428516 }
+{ "type": "suite", "event": "ok", "passed": 42, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.062378933 }
+{ "type": "suite", "event": "started", "test_count": 46 }
+{ "type": "test", "event": "started", "name": "analysis_music_prob_separates_speech_from_music" }
+{ "type": "test", "event": "started", "name": "celt_click_peak_offset" }
+{ "type": "test", "event": "started", "name": "celt_silence_then_attack_decodes_bounded" }
+{ "type": "test", "event": "started", "name": "decode_speed" }
+{ "type": "test", "name": "analysis_music_prob_separates_speech_from_music", "event": "ignored", "message": "needs the local library sources; run with --ignored" }
+{ "type": "test", "event": "started", "name": "encode_speed" }
+{ "type": "test", "name": "celt_click_peak_offset", "event": "ignored", "message": "probe: self-contained, but prints where a synthetic click lands after a CELT-only roundtrip and asserts nothing; unblocks when that offset is turned into a tolerance assert" }
+{ "type": "test", "event": "started", "name": "encoder_frame_sizes_and_vbr" }
+{ "type": "test", "name": "encoder_frame_sizes_and_vbr", "event": "ok", "exec_time": 0.084971691 }
+{ "type": "test", "event": "started", "name": "encoder_library_gate_vs_libopus" }
+{ "type": "test", "name": "encoder_library_gate_vs_libopus", "event": "ignored", "message": "library gate: hand-run 14-row sweep, 120s per source, needs ffmpeg libopus and the local ~/Music corpus (~12 min); the reelm@64k dropout that first failed it is fixed per lanes/opus-drop-r2.report.md, so only the corpus dependency keeps it out of the default suite" }
+{ "type": "test", "event": "started", "name": "encoder_mode_follows_application_bitrate_channels_and_frame_size" }
+{ "type": "test", "name": "celt_silence_then_attack_decodes_bounded", "event": "ok", "exec_time": 0.1690551 }
+{ "type": "test", "event": "started", "name": "encoder_rate_target_gate" }
+{ "type": "test", "name": "encoder_rate_target_gate", "event": "ignored", "message": "corpus gate: needs ffmpeg and the ~/Music, ~/Downloads sources (about 3 min)" }
+{ "type": "test", "event": "started", "name": "encoder_roundtrips_at_every_rate" }
+{ "type": "test", "name": "decode_speed", "event": "ok", "exec_time": 3.0293724380000002 }
+{ "type": "test", "event": "started", "name": "err_map_vs_libopus" }
+{ "type": "test", "name": "err_map_vs_libopus", "event": "ignored", "message": "probe: EC_ERRMAP_SRC-driven per-window error map; returns silently when the named source is missing, so it can never be a suite gate" }
+{ "type": "test", "event": "started", "name": "five_one_channels_land_in_the_right_places" }
+{ "type": "test", "name": "encode_speed", "event": "ok", "exec_time": 5.769865654 }
+{ "type": "test", "event": "started", "name": "five_one_encode_end_to_end" }
+{ "type": "test", "name": "encoder_mode_follows_application_bitrate_channels_and_frame_size", "event": "ok", "exec_time": 5.707350096 }
+{ "type": "test", "event": "started", "name": "frame_decisions_vs_libopus" }
+{ "type": "test", "name": "frame_decisions_vs_libopus", "event": "ignored", "message": "probe: FRAME_SRC/FRAME_FROM/FRAME_TO-driven per-frame decision dump; returns silently when FRAME_SRC is missing, so it can never be a suite gate" }
+{ "type": "test", "event": "started", "name": "garbage_payloads_never_panic" }
+{ "type": "test", "name": "five_one_encode_end_to_end", "event": "ok", "exec_time": 0.351856548 }
+{ "type": "test", "event": "started", "name": "hybrid_fb_roundtrip" }
+{ "type": "test", "name": "five_one_channels_land_in_the_right_places", "event": "ok", "exec_time": 3.208919799 }
+{ "type": "test", "event": "started", "name": "hybrid_layers_align" }
+{ "type": "test", "name": "encoder_roundtrips_at_every_rate", "event": "ok", "exec_time": 6.116201056 }
+{ "type": "test", "event": "started", "name": "hybrid_shapes_roundtrip" }
+{ "type": "test", "name": "hybrid_layers_align", "event": "ok", "exec_time": 0.133698702 }
+{ "type": "test", "event": "started", "name": "libopus_input_alignment_delays_and_still_decodes" }
+{ "type": "test", "name": "libopus_input_alignment_delays_and_still_decodes", "event": "ok", "exec_time": 0.041031867 }
+{ "type": "test", "event": "started", "name": "reell_startup_hop_energies" }
+{ "type": "test", "name": "reell_startup_hop_energies", "event": "ignored", "message": "probe: HOP_SRC/HOP_MS-driven hop-energy dump around the reell startup attack; returns silently when HOP_SRC is absent, so it can never be a suite gate" }
+{ "type": "test", "event": "started", "name": "ogg_opus_fixtures_match_ffmpeg" }
+{ "type": "test", "name": "garbage_payloads_never_panic", "event": "ok", "exec_time": 1.053098361 }
+{ "type": "test", "event": "started", "name": "ogg_opus_round_trip_duration_is_exact" }
+{ "type": "test", "name": "ogg_opus_fixtures_match_ffmpeg", "event": "ok", "exec_time": 0.840011395 }
+{ "type": "test", "event": "started", "name": "opus_compare_err_pinned_against_c" }
+{ "type": "test", "name": "ogg_opus_round_trip_duration_is_exact", "event": "ok", "exec_time": 0.454142424 }
+{ "type": "test", "event": "started", "name": "opus_compare_harness" }
+{ "type": "test", "name": "opus_compare_harness", "event": "ignored", "message": "probe: needs hand-supplied SW_REF/SW_TEST .sw files to cross-check our opus_compare against the C tool; asserts nothing without those env vars" }
+{ "type": "test", "event": "started", "name": "opus_compare_harness_ours" }
+{ "type": "test", "name": "opus_compare_harness_ours", "event": "ignored", "message": "probe: needs hand-supplied SW_SRC/SW_KBPS/SW_OUT_SRC/SW_OUT_DEC to round-trip a .sw through our encoder; only writes .sw dumps, asserts nothing" }
+{ "type": "test", "event": "started", "name": "opus_demo_decodes_our_bit_stream" }
+{ "type": "test", "name": "opus_demo_decodes_our_bit_stream", "event": "ok", "exec_time": 0.000007283 }
+{ "type": "test", "event": "started", "name": "oracle_decodes_our_packets_across_the_rate_table" }
+{ "type": "test", "name": "hybrid_fb_roundtrip", "event": "ok", "exec_time": 2.842732193 }
+{ "type": "test", "event": "started", "name": "real_library_sweep" }
+{ "type": "test", "name": "real_library_sweep", "event": "ignored", "message": "probe: report harness with no asserts; unblocks by setting EC_OPUS_FILES to committed .opus fixtures -- unset, it decodes nothing" }
+{ "type": "test", "event": "started", "name": "rfc6716_test_vectors" }
+{ "type": "test", "name": "hybrid_shapes_roundtrip", "event": "ok", "exec_time": 3.803816607 }
+{ "type": "test", "event": "started", "name": "rfc8251_test_vectors" }
+{ "type": "test", "name": "opus_compare_err_pinned_against_c", "event": "ok", "exec_time": 5.443126549 }
+{ "type": "test", "event": "started", "name": "reelm64_persecond_diag" }
+{ "type": "test", "name": "reelm64_persecond_diag", "event": "ignored", "message": "probe: per-second correlation dump for the 64k lane; unblocks when ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists)" }
+{ "type": "test", "event": "started", "name": "short_block_bits_vs_libopus" }
+{ "type": "test", "name": "short_block_bits_vs_libopus", "event": "ignored", "message": "probe: per-frame short-block allocation dump over the local corpus; a multi-minute ffmpeg report run, not a suite gate" }
+{ "type": "test", "event": "started", "name": "silk_compares_to_celt_on_speech_at_speech_rates" }
+{ "type": "test", "name": "silk_compares_to_celt_on_speech_at_speech_rates", "event": "ok", "exec_time": 0.696966426 }
+{ "type": "test", "event": "started", "name": "silk_library_gate_vs_libopus" }
+{ "type": "test", "name": "silk_library_gate_vs_libopus", "event": "ignored", "message": "library gate: hand-run mono VoIP sweep; blocked until ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists) and it is a multi-minute ffmpeg run, not a suite test" }
+{ "type": "test", "event": "started", "name": "silk_mediumband_and_10ms_roundtrip" }
+{ "type": "test", "name": "silk_mediumband_and_10ms_roundtrip", "event": "ok", "exec_time": 4.325944993 }
+{ "type": "test", "event": "started", "name": "silk_mono_nb_wb_roundtrip" }
+{ "type": "test", "name": "silk_mono_nb_wb_roundtrip", "event": "ok", "exec_time": 3.131681958 }
+{ "type": "test", "event": "started", "name": "silk_multiframe_packets_roundtrip" }
+{ "type": "test", "name": "silk_multiframe_packets_roundtrip", "event": "ok", "exec_time": 4.536629073 }
+{ "type": "test", "event": "started", "name": "silk_nsq_improves_quality_at_equal_rate" }
+{ "type": "test", "name": "oracle_decodes_our_packets_across_the_rate_table", "event": "ok", "exec_time": 20.06294671 }
+{ "type": "test", "event": "started", "name": "silk_packets_track_encoder_bitrate" }
+{ "type": "test", "name": "silk_packets_track_encoder_bitrate", "event": "ok", "exec_time": 0.652528897 }
+{ "type": "test", "event": "started", "name": "silk_rate_control_tracks_target" }
+{ "type": "test", "name": "silk_nsq_improves_quality_at_equal_rate", "event": "ok", "exec_time": 2.654342352 }
+{ "type": "test", "event": "started", "name": "silk_silkq_oracle" }
+{ "type": "test", "name": "silk_silkq_oracle", "event": "ignored", "message": "probe: per-frame SILK Indices side-by-side oracle dump; unblocks when ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists)" }
+{ "type": "test", "event": "started", "name": "silk_silkq_persecond_diag" }
+{ "type": "test", "name": "silk_silkq_persecond_diag", "event": "ignored", "message": "probe: per-second SILK 12k bit-allocation dump; unblocks when ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists)" }
+{ "type": "test", "event": "started", "name": "silk_spectral_divergence_12k" }
+{ "type": "test", "name": "silk_spectral_divergence_12k", "event": "ignored", "message": "probe: per-band spectral divergence dump at 12k; unblocks when ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists)" }
+{ "type": "test", "event": "started", "name": "silk_stereo_speech_roundtrip" }
+{ "type": "test", "name": "silk_rate_control_tracks_target", "event": "ok", "exec_time": 5.231590779 }
+{ "type": "test", "event": "started", "name": "spectral_divergence_vs_libopus" }
+{ "type": "test", "name": "spectral_divergence_vs_libopus", "event": "ignored", "message": "probe: per-window CELT band divergence sweep over the local corpus; a multi-minute ffmpeg report run, not a suite gate" }
+{ "type": "test", "event": "started", "name": "steady_state_encode_loop_zero_alloc" }
+{ "type": "test", "name": "steady_state_encode_loop_zero_alloc", "event": "ok", "exec_time": 0.048099272 }
+{ "type": "test", "name": "silk_stereo_speech_roundtrip", "event": "ok", "exec_time": 7.5834909249999995 }
+{ "type": "test", "event": "timeout", "name": "rfc6716_test_vectors" }
+{ "type": "test", "event": "timeout", "name": "rfc8251_test_vectors" }
+{ "type": "test", "name": "rfc6716_test_vectors", "event": "ok", "exec_time": 90.547023713 }
+{ "type": "test", "name": "rfc8251_test_vectors", "event": "ok", "exec_time": 176.255087919 }
+{ "type": "suite", "event": "ok", "passed": 29, "failed": 0, "ignored": 17, "measured": 0, "filtered_out": 0, "exec_time": 186.354312606 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "silent_celt_frame_tell_frac_does_not_underflow" }
+{ "type": "test", "name": "silent_celt_frame_tell_frac_does_not_underflow", "event": "ok", "exec_time": 0.000414729 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000789404 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "empty_and_single_byte_packets_never_panic" }
+{ "type": "test", "event": "started", "name": "random_packets_never_panic" }
+{ "type": "test", "event": "started", "name": "truncated_packets_never_panic" }
+{ "type": "test", "name": "empty_and_single_byte_packets_never_panic", "event": "ok", "exec_time": 0.024888111 }
+{ "type": "test", "name": "random_packets_never_panic", "event": "ok", "exec_time": 0.094109938 }
+{ "type": "test", "name": "truncated_packets_never_panic", "event": "ok", "exec_time": 0.171562542 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.172359041 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "stereo_snr_floor" }
+{ "type": "test", "event": "started", "name": "surround_5_1_snr_floor" }
+{ "type": "test", "name": "surround_5_1_snr_floor", "event": "ok", "exec_time": 0.111682918 }
+{ "type": "test", "name": "stereo_snr_floor", "event": "ok", "exec_time": 0.398292052 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.398718374 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000045436 }

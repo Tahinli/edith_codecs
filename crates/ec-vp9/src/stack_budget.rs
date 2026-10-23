@@ -149,10 +149,19 @@ const DEEPEST_PUBLIC_CHAIN: usize = 3;
 /// The third column names the return path, so a reader can see why a type is
 /// here rather than a coincidence of the type system.
 pub(crate) const BY_VALUE_TYPES: &[(&str, Option<usize>, bool, &str)] = &[
+    // -- knobs.rs ---------------------------------------------------------
+    (
+        "Override",
+        Some(16),
+        true,
+        "knobs::set_skip_lf / set_force_tail -> test-only guard that puts an \
+         EC_VP9 debug switch back on drop. A boxed restore closure, so one \
+         type covers every knob.",
+    ),
     // -- decode.rs --------------------------------------------------------
     (
         "Decoder",
-        Some(768),
+        Some(800),
         true,
         "Decoder::new -> Self (and `Default::default`), the crate's whole \
          public surface. Was 10944 with five inline FrameContext slots \
@@ -203,6 +212,7 @@ fn measured_by_name() -> Vec<(&'static str, usize)> {
     vec![
         ("Decoder", std::mem::size_of::<Decoder>()),
         ("Picture", std::mem::size_of::<Picture>()),
+        ("Override", std::mem::size_of::<crate::knobs::Override>()),
         ("BoolDecoder", std::mem::size_of::<BoolDecoder<'static>>()),
         (
             "FrameContext",
@@ -302,14 +312,17 @@ mod tests {
     /// The label is the path relative to `src/`, so a directory module is
     /// `tables/mod.rs` rather than `tables.rs`.
     const FILES: &[(&str, &str)] = &[
+        ("adapt.rs", include_str!("adapt.rs")),
         ("bool.rs", include_str!("bool.rs")),
         ("decode.rs", include_str!("decode.rs")),
         ("header.rs", include_str!("header.rs")),
         ("inter.rs", include_str!("inter.rs")),
         ("intra.rs", include_str!("intra.rs")),
         ("loopfilter.rs", include_str!("loopfilter.rs")),
+        ("knobs.rs", include_str!("knobs.rs")),
         ("mc.rs", include_str!("mc.rs")),
         ("modes.rs", include_str!("modes.rs")),
+        ("prof.rs", include_str!("prof.rs")),
         ("stream.rs", include_str!("stream.rs")),
         ("tables/mod.rs", include_str!("tables/mod.rs")),
         ("tokens.rs", include_str!("tokens.rs")),
@@ -407,7 +420,7 @@ mod tests {
             rows.len(),
             STACK_BUDGET / 1024
         );
-        eprintln!("{:>8}  {:>7}  {}", "BYTES", "%BUDGET", "TYPE");
+        eprintln!("{:>8}  {:>7}  TYPE", "BYTES", "%BUDGET");
         for (name, size) in &rows {
             eprintln!(
                 "{size:>8}  {:>6.1}%  {name}",
@@ -456,17 +469,19 @@ mod tests {
                 size as f64 / STACK_BUDGET as f64
             );
         }
-        // ec-av1's floor is 10. THIS CRATE HAS 3, and that is a measurement,
-        // not a gap to pad: every module but `bool`, `decode` and `stream`
-        // exposes zero `pub fn` (its API is `pub(crate)`, reached through
-        // `Decoder`). Inventing rows to reach ec-av1's number would make
-        // the gate theatre -- it would count types no caller can reach.
+        // ec-av1's floor is 10. THIS CRATE HAS 4, and that is a measurement,
+        // not a gap to pad: every module but `bool`, `decode`, `knobs` and
+        // `stream` exposes zero `pub fn` (its API is `pub(crate)`, reached
+        // through `Decoder`). Inventing rows to reach ec-av1's number would
+        // make the gate theatre -- it would count types no caller can reach.
+        // `knobs::Override` is the fourth: the test-only guard the knob
+        // setters return.
         assert!(
-            checked == 3,
+            checked == 4,
             "{checked} public rows were bound-checked, and this crate has \
-             exactly 3 types a caller can hold by value (Decoder, Picture, \
-             BoolDecoder). If a fourth appeared, measure it, add it to \
-             BY_VALUE_TYPES, and raise this floor with it; if a row was \
+             exactly 4 types a caller can hold by value (Decoder, Picture, \
+             BoolDecoder, knobs::Override). If a fifth appeared, measure it, \
+             add it to BY_VALUE_TYPES, and raise this floor with it; if a row was \
              removed, the count is wrong here and in the inventory."
         );
         // The other half of the derivation, asserted so it cannot rot: the

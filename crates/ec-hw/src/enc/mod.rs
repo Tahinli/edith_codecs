@@ -1,4 +1,8 @@
-//! Hardware encoding: H.264, HEVC and AV1.
+//! Hardware encoding: H.264 (ported to cros-libva), HEVC and AV1 (refused
+//! with [`Error::Unsupported`] until their parameter buffers are ported).
+//!
+//! The bitstream writers in [`headers`] are pure. The parameter buffers are
+//! built from cros-libva's typed constructors in each codec module.
 //!
 //! One frame in, one coded frame out. The GOP is IDR-then-P with a single
 //! reference, which is what this GPU advertises (`VAConfigAttribEncMaxRefFrames`
@@ -31,21 +35,23 @@
 //! are all measured by `gpu.rs`'s `av1_encode_rate_control_lands`, which
 //! prints what each mode delivered against what it was asked for.
 
-use std::sync::Arc;
+#![allow(dead_code)] // the header writers wait for the encoder port
+
+use std::rc::Rc;
 
 use ec_va::caps::{Entrypoint, Profile};
-use ec_va::{
-    Buffer, CapReport, Config, ConfigAttrib, Context, Display, Image, MappedBuffer, Picture,
-    Surface, SurfaceSpec, Vpp, sys,
+use ec_va::va::{
+    BufferType, EncMiscParameter, EncMiscParameterFrameRate, EncMiscParameterHRD,
+    EncMiscParameterRateControl, EncPackedHeaderParameter, EncPackedHeaderType, RcFlags,
+    VAConfigAttribType, VAImage, VA_ENC_PACKED_HEADER_PICTURE, VA_ENC_PACKED_HEADER_SEQUENCE,
+    VA_ENC_PACKED_HEADER_SLICE, VA_FOURCC_NV12, VA_FOURCC_P010, VA_RT_FORMAT_YUV420,
+    VA_RT_FORMAT_YUV420_10, VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER,
 };
+use ec_va::va::SurfaceMemoryDescriptor;
+use ec_va::{CapReport, Config, ConfigAttrib, Context, Display, Surface, SurfaceSpec, Vpp};
 
 use crate::error::{Error, Result};
-use crate::frame::{I420, I420_16};
-use crate::params::enc::{
-    MISC_FRAME_RATE, MISC_HRD, MISC_RATE_CONTROL, PackedHeaderParameterBuffer, RateControl,
-    VA_RC_QVBR, misc_bytes,
-};
-use crate::params::param_buffer;
+use crate::frame::{Frame, I420, I420_16};
 use crate::pool::{PooledSurface, SurfacePool};
 
 mod av1;
@@ -53,15 +59,82 @@ mod h264;
 mod headers;
 mod hevc;
 
+/// `VA_RC_QVBR`, `va.h:1652`. radeonsi advertises it in
+/// `VAConfigAttribRateControl` (probed 0x416 = CQP|CBR|VBR|QVBR on mesa 26.1.8).
+const VA_RC_QVBR: u32 = 0x0000_0400;
+
 /// The codecs this crate encodes in hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncCodec {
-    /// H.264 / AVC, High profile.
+    /// H.264 / AVC; the profile is [`EncoderConfig::h264_profile`].
     H264,
     /// H.265 / HEVC, Main profile.
     H265,
     /// AV1 Profile 0.
     Av1,
+}
+
+/// The H.264 profile an [`Encoder`] writes.
+///
+/// Each profile is a strict subset of the next in what a decoder must accept:
+/// [`H264Profile::ConstrainedBaseline`] is CAVLC with no B slices, [`H264Profile::Main`]
+/// adds CABAC, and [`H264Profile::High`] adds the High-only SPS tail
+/// (chroma format, bit depth, scaling lists). This encoder codes no B slices and no
+/// 8x8 transform, so the three differ only in what the SPS and PPS say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H264Profile {
+    /// `profile_idc` 66 with `constraint_set1_flag`; CAVLC entropy coding.
+    ConstrainedBaseline,
+    /// `profile_idc` 77; CABAC entropy coding, no High-only syntax.
+    Main,
+    /// `profile_idc` 100; CABAC, with the High SPS tail. The default, and what
+    /// this encoder wrote before the profile was selectable.
+    #[default]
+    High,
+}
+
+impl H264Profile {
+    /// The VA profile the driver is asked for.
+    fn va_profile(self) -> Profile {
+        match self {
+            H264Profile::ConstrainedBaseline => Profile::H264ConstrainedBaseline,
+            H264Profile::Main => Profile::H264Main,
+            H264Profile::High => Profile::H264High,
+        }
+    }
+
+    /// True when the slice data is CABAC (`entropy_coding_mode_flag` = 1).
+    pub(crate) fn cabac(self) -> bool {
+        !matches!(self, H264Profile::ConstrainedBaseline)
+    }
+}
+
+/// The rate window the request is spread over, in milliseconds (`window_size`).
+const RATE_WINDOW_MS: u32 = 1000;
+
+/// The HRD buffer for a GOP of `gop_size` pictures, in milliseconds of the
+/// requested bitrate.
+///
+/// The buffer is what radeonsi's constant-bitrate loop works against, and it
+/// must be short when pictures are mostly key frames. Measured at 720p,
+/// testsrc2, 240 pictures, HEVC, requested 1, 3 and 8 Mb/s:
+///
+/// | GOP | buffer | delivered (3 Mb/s request) |
+/// |---|---|---|
+/// | 1 | 1000 ms | 7.63 Mb/s (+154%) |
+/// | 1 | 33 ms | 3.29 Mb/s (+9.5%) |
+/// | 1 | 20 ms | 3.02 Mb/s (+0.7%) |
+/// | 2 | 1000 ms | +9.4% |
+/// | 5 | 1000 ms | +4.3% |
+/// | 10 | 1000 ms | +1.8% |
+/// | 30 | 1000 ms | +1.0%, 43.5 dB |
+/// | 30 | 20 ms | +0.0%, 40.1 dB |
+///
+/// So a GOP shorter than ten pictures gets a 20 ms buffer. A GOP of thirty keeps
+/// the full rate window: the short buffer lands on the request there too, but
+/// costs 3.4 dB at the same rate.
+fn hrd_buffer_ms(gop_size: u32) -> u32 {
+    if gop_size < 10 { 20 } else { RATE_WINDOW_MS }
 }
 
 /// How the driver should spend bits.
@@ -94,9 +167,9 @@ impl RateControlMode {
     /// (which is how the AV1 path measured CQP-only until 2026-09-07).
     fn va_mode(self) -> u32 {
         match self {
-            RateControlMode::ConstantQp { .. } => sys::VA_RC_CQP,
-            RateControlMode::ConstantBitrate => sys::VA_RC_CBR,
-            RateControlMode::VariableBitrate => sys::VA_RC_VBR,
+            RateControlMode::ConstantQp { .. } => ec_va::va::VA_RC_CQP,
+            RateControlMode::ConstantBitrate => ec_va::va::VA_RC_CBR,
+            RateControlMode::VariableBitrate => ec_va::va::VA_RC_VBR,
             RateControlMode::Qvbr { .. } => VA_RC_QVBR,
         }
     }
@@ -141,6 +214,8 @@ pub struct EncoderConfig {
     pub bitrate: u32,
     /// Pictures per GOP; the first of each is an IDR / key frame.
     pub gop_size: u32,
+    /// The H.264 profile to write (ignored by HEVC and AV1).
+    pub h264_profile: H264Profile,
     /// Rate control mode.
     pub rate_control: RateControlMode,
     /// Driver quality/speed level, 1 (best quality) upwards; 0 = driver default.
@@ -182,6 +257,7 @@ impl EncoderConfig {
             framerate: (30, 1),
             bitrate: 8_000_000,
             gop_size: 60,
+            h264_profile: H264Profile::High,
             rate_control: RateControlMode::ConstantBitrate,
             quality: 0,
             colour: None,
@@ -192,6 +268,12 @@ impl EncoderConfig {
     /// Encode at 10 bits (AV1 only); see [`EncoderConfig::bit_depth`].
     pub fn ten_bit(mut self) -> EncoderConfig {
         self.bit_depth = 10;
+        self
+    }
+
+    /// Choose the H.264 profile written into the SPS and PPS.
+    pub fn h264_profile(mut self, profile: H264Profile) -> EncoderConfig {
+        self.h264_profile = profile;
         self
     }
 
@@ -226,37 +308,49 @@ pub struct CodedFrame {
 }
 
 /// A hardware encoder.
+/// A hardware encoder.
 pub struct Encoder {
+    /// The GPU reset epoch this encoder was created in.
+    born_epoch: u64,
     config: EncoderConfig,
-    context: Arc<Context>,
+    context: Rc<Context>,
     pool: SurfacePool,
     coded_size: (u32, u32),
     /// The reconstruction of the previous picture, the single reference.
-    reference: Option<Arc<PooledSurface>>,
+    reference: Option<Rc<PooledSurface>>,
     /// Pictures coded since the last key frame.
     gop_position: u32,
-    /// Pictures coded in total, which drives frame_num and order hints.
-    coded: u64,
+    /// Key frames coded so far. Consecutive IDR pictures must differ in
+    /// `idr_pic_id` (7.4.3), so this alternates the id even at GOP 1.
+    idr_count: u32,
     tunings: Tunings,
     /// Set when the rate control parameters have to be resent.
     tunings_dirty: bool,
     profile: Profile,
-    /// An upload image, reused across frames.
-    upload: Option<Image>,
     /// P010 -> NV12 GPU-resident conversion pipeline for [`Encoder::encode_frame`]
-    /// on a 10-bit source; built lazily, since most encoders never see one.
+    /// on a source that is not the encoder's own format or size; built lazily,
+    /// since most encoders never see one.
     vpp: Option<Vpp>,
     /// The small pool [`Encoder::vpp`] converts into, round-robined rather
     /// than pool-acquired: each conversion is fully synced before this
     /// encoder's own picture submission returns, so two surfaces are enough
     /// to never hand out one still in flight.
-    vpp_surfaces: Vec<Arc<Surface>>,
+    vpp_surfaces: Vec<Rc<Surface>>,
     vpp_next: usize,
 }
 
 impl Encoder {
     /// Build an encoder for `config` on `display`.
-    pub fn new(display: &Arc<Display>, config: EncoderConfig) -> Result<Encoder> {
+    ///
+    /// H.264 and HEVC are ported to cros-libva; AV1 is refused with
+    /// [`Error::Unsupported`].
+    pub fn new(display: &Rc<Display>, config: EncoderConfig) -> Result<Encoder> {
+        let born_epoch = crate::reset::gpu_reset_epoch();
+        if crate::reset::gpu_recently_reset() {
+            return Err(Error::hw_reset(
+                "the GPU was reset moments ago; new hardware sessions wait out the grace period",
+            ));
+        }
         if config.bit_depth != 8 && config.bit_depth != 10 {
             return Err(Error::config(format!(
                 "encoder bit depth {} : this crate encodes 8-bit, or 10-bit AV1",
@@ -264,34 +358,23 @@ impl Encoder {
             )));
         }
         if config.bit_depth == 10 && config.codec != EncCodec::Av1 {
-            // Not a driver refusal: H264High and HEVCMain are 8-bit profiles
-            // by definition, and this crate configures no other.
+            // Not a driver refusal: H264High and HEVCMain are 8-bit profiles by
+            // definition, and this crate configures no other.
             return Err(Error::config(
-                "10-bit encode is AV1 only here: the H.264 and H.265 profiles this crate                  configures (High, Main) are 8-bit",
+                "10-bit encode is AV1 only here: the H.264 and H.265 profiles this crate \
+                 configures are 8-bit",
             ));
         }
-        let profile = match config.codec {
-            // High is the profile every H.264 encoder on this driver reports and
-            // the one a High-profile decoder expects; Main is a strict subset.
-            EncCodec::H264 => Profile::H264High,
-            EncCodec::H265 => Profile::HEVCMain,
-            EncCodec::Av1 => Profile::AV1Profile0,
-        };
-        let block = match config.codec {
-            EncCodec::H264 => 16,
-            EncCodec::H265 => 32,
-            EncCodec::Av1 => 64,
+        let (profile, block) = match config.codec {
+            EncCodec::H264 => (config.h264_profile.va_profile(), 16),
+            EncCodec::H265 => (Profile::HEVCMain, 32),
+            EncCodec::Av1 => (Profile::AV1Profile0, 64),
         };
         let coded_size = (
             config.width.next_multiple_of(block),
             config.height.next_multiple_of(block),
         );
 
-        let rt_format = if config.bit_depth == 10 {
-            sys::VA_RT_FORMAT_YUV420_10
-        } else {
-            sys::VA_RT_FORMAT_YUV420
-        };
         let caps = CapReport::probe(display)?;
         let entry = caps.entry(profile, Entrypoint::EncSlice).ok_or_else(|| {
             Error::unsupported(
@@ -303,7 +386,7 @@ impl Encoder {
             && !surfaces.allows(coded_size.0, coded_size.1)
         {
             // The minimum encode size is a driver fact, not a guess: radeonsi
-            // refuses anything under 96x32 for H.264 and 384x128 for HEVC.
+            // refuses anything under 96x32 for H.264.
             return Err(Error::unsupported(
                 format!("{}x{} {profile:?} encode", coded_size.0, coded_size.1),
                 format!(
@@ -322,21 +405,25 @@ impl Encoder {
         // went in, the slice header did not, and every P picture came back
         // missing its `byte_alignment()`).
         let packed = entry.packed_headers
-            & (sys::VA_ENC_PACKED_HEADER_SEQUENCE
-                | sys::VA_ENC_PACKED_HEADER_PICTURE
-                | sys::VA_ENC_PACKED_HEADER_SLICE);
+            & (VA_ENC_PACKED_HEADER_SEQUENCE
+                | VA_ENC_PACKED_HEADER_PICTURE
+                | VA_ENC_PACKED_HEADER_SLICE);
         let config_id = Config::new(
             display,
             profile,
             Entrypoint::EncSlice,
             &[
-                ConfigAttrib::rt_format(rt_format),
+                ConfigAttrib::rt_format(if config.bit_depth == 10 {
+                    VA_RT_FORMAT_YUV420_10
+                } else {
+                    VA_RT_FORMAT_YUV420
+                }),
                 ConfigAttrib {
-                    type_: sys::VAConfigAttribRateControl,
+                    type_: VAConfigAttribType::VAConfigAttribRateControl,
                     value: config.rate_control.va_mode(),
                 },
                 ConfigAttrib {
-                    type_: sys::VAConfigAttribEncPackedHeaders,
+                    type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
                     value: packed,
                 },
             ],
@@ -344,16 +431,19 @@ impl Encoder {
         let spec = surface_spec(config.bit_depth, coded_size);
         // Input, reconstruction, one reference, and slack for the driver to
         // keep a submission in flight.
-        let pool = SurfacePool::new(display, &spec, 8)?;
-        let context = Context::new(
+        let surfaces = ec_va::create_pool(display, &spec, 8)?;
+        let context = ec_va::picture::create_context(
+            display,
             &config_id,
             coded_size.0,
             coded_size.1,
-            sys::VA_PROGRESSIVE,
-            pool.targets(),
+            Some(&surfaces),
+            true,
         )?;
+        let pool = SurfacePool::from_surfaces(surfaces, &spec);
 
         Ok(Encoder {
+            born_epoch,
             tunings: Tunings {
                 bitrate: config.bitrate,
                 framerate: config.framerate,
@@ -364,10 +454,9 @@ impl Encoder {
             coded_size,
             reference: None,
             gop_position: 0,
-            coded: 0,
+            idr_count: 0,
             tunings_dirty: true,
             profile,
-            upload: None,
             vpp: None,
             vpp_surfaces: Vec::new(),
             vpp_next: 0,
@@ -393,25 +482,19 @@ impl Encoder {
                 self.config.bit_depth
             )));
         }
-        if frame.width != self.config.width || frame.height != self.config.height {
-            return Err(Error::config(format!(
-                "encoder configured for {}x{} was given a {}x{} frame",
-                self.config.width, self.config.height, frame.width, frame.height
-            )));
-        }
+        self.check_size(frame.width, frame.height)?;
         let input = self
             .pool
             .acquire()
             .ok_or_else(|| Error::config("encode: every surface is still in use"))?;
-        self.upload(frame, &input)?;
-        self.encode_surface(Arc::clone(input.surface()), meta)
+        upload(&self.context, frame, input.surface(), self.coded_size)?;
+        self.encode_settled(Rc::clone(input.surface()), meta)
     }
 
     /// Encode one 10-bit frame; the [`Encoder::encode`] of a 10-bit encoder.
     ///
-    /// Samples are 0..1023 in the low ten bits of each `u16`, as
-    /// [`crate::Frame::to_i420_16`] returns them, and are shifted into P010's
-    /// top ten bits on upload.
+    /// Samples are 0..1023 in the low ten bits of each `u16`, shifted into
+    /// P010's top ten bits on upload. Only a 10-bit (AV1) encoder takes this path.
     pub fn encode_16(&mut self, frame: &I420_16, meta: FrameMetadata) -> Result<CodedFrame> {
         if self.config.bit_depth != 10 {
             return Err(Error::config(format!(
@@ -419,18 +502,13 @@ impl Encoder {
                 self.config.bit_depth
             )));
         }
-        if frame.width != self.config.width || frame.height != self.config.height {
-            return Err(Error::config(format!(
-                "encoder configured for {}x{} was given a {}x{} frame",
-                self.config.width, self.config.height, frame.width, frame.height
-            )));
-        }
+        self.check_size(frame.width, frame.height)?;
         let input = self
             .pool
             .acquire()
             .ok_or_else(|| Error::config("encode: every surface is still in use"))?;
-        self.upload_16(frame, &input)?;
-        self.encode_surface(Arc::clone(input.surface()), meta)
+        upload_16(&self.context, frame, input.surface(), self.coded_size)?;
+        self.encode_settled(Rc::clone(input.surface()), meta)
     }
 
     /// Encode a decoded frame's GPU surface directly: no `to_i420` read-back,
@@ -439,91 +517,94 @@ impl Encoder {
     /// (e.g. a transcode) wants — the alternative is a full frame through
     /// system memory and back for no reason.
     ///
-    /// A 10-bit (P010) source is also zero-copy through the driver's own
-    /// video-processing pipeline: [`Encoder`] keeps a small VPP-owned NV12
-    /// surface pool (built lazily, on the first 10-bit frame) and converts
-    /// into it on the GPU (`VAProfileNone`/`VAEntrypointVideoProc`) before
-    /// submitting exactly as for an 8-bit source — still no read-back to
-    /// system memory. Every profile this crate encodes (`H264High`,
-    /// `HEVCMain`) is itself 8-bit, so the low two bits are truncated the
-    /// same way [`Frame::to_i420`]'s CPU path truncates them (VPP's rounding
-    /// may differ by a code point; see `gpu.rs`'s PSNR comparison of the two
-    /// paths for the measured difference) — call [`Frame::to_i420_16`]
-    /// instead if the extra precision must survive encoding.
+    /// A source whose size differs from the encoder's coded size, or whose
+    /// depth differs from the encoder's, goes through the GPU video-processing
+    /// pipeline into an NV12 surface of the encoder's size first.
     ///
     /// Refused, rather than silently working around, when:
     /// - `frame` was decoded on a different [`ec_va::Display`]: a surface id
     ///   only means anything on the display that created it.
-    /// - `frame`'s bit depth is neither 8 nor 10: no profile this crate
-    ///   encodes, and no VPP conversion this crate builds, has a destination
-    ///   for a 12-bit source.
-    ///
-    /// A `frame` whose coded size does not match this encoder's (a common
-    /// case: HEVC block-rounds to 32, so a 3840x2160 source's 2160 stays
-    /// unrounded while the encoder's coded height becomes 2176) is not
-    /// refused — it goes through the same VPP pool a 10-bit source uses,
-    /// placed by explicit region rather than a whole-surface convert: only
-    /// `frame.display_size` is read from the source and written into the
-    /// destination at `(0, 0)`, so the padding rows/columns beyond it are
-    /// never touched by the copy. Those padding pixels are still fed to the
-    /// encoder as part of the coded surface, so the pool is painted black
-    /// once, on creation, rather than left as whatever the driver's fresh
-    /// allocation happened to contain.
-    pub fn encode_frame(
-        &mut self,
-        frame: &crate::frame::Frame,
-        meta: FrameMetadata,
-    ) -> Result<CodedFrame> {
+    /// - `frame`'s bit depth is neither 8 nor 10.
+    pub fn encode_frame(&mut self, frame: &Frame, meta: FrameMetadata) -> Result<CodedFrame> {
         if frame.bit_depth != 8 && frame.bit_depth != 10 {
             return Err(Error::unsupported(
                 format!("encode_frame of a {}-bit source", frame.bit_depth),
-                "H264High and HEVCMain, the only profiles this crate encodes, are 8-bit, and \
-                 the VPP conversion this crate builds only reads P010 (10-bit); decode to I420 \
-                 with Frame::to_i420 and call Encoder::encode instead",
+                "the VPP conversion this crate builds reads 8-bit NV12 and 10-bit P010 only",
             ));
         }
-        if !Arc::ptr_eq(frame.surface().display(), self.context.display()) {
+        if !Rc::ptr_eq(frame.display(), self.context.display()) {
             return Err(Error::config(
                 "encode_frame: the frame was decoded on a different Display than this encoder",
             ));
         }
-        let source = if frame.bit_depth != self.config.bit_depth
-            || frame.coded_size != self.coded_size
-        {
-            self.vpp_into_pool(frame.surface(), frame.display_size)?
+        let source =
+            if frame.bit_depth != self.config.bit_depth || frame.coded_size != self.coded_size {
+                self.vpp_into_pool(frame.surface(), frame.display_size)?
+            } else {
+                Rc::clone(frame.surface())
+            };
+        self.encode_settled(source, meta)
+    }
+
+    /// Encode a surface imported with [`ec_va::Surface::import_prime`] or
+    /// decoded elsewhere on this encoder's display: read by the GPU in place.
+    ///
+    /// The surface must be NV12, since H.264 is 8-bit only. A surface of another
+    /// size goes through the same GPU conversion as [`Encoder::encode_frame`];
+    /// `display_size` is the picture's visible size (its cropped size, when the
+    /// surface is padded to the codec's block size).
+    pub fn encode_surface<D: SurfaceMemoryDescriptor>(
+        &mut self,
+        surface: &Rc<ec_va::va::Surface<D>>,
+        display_size: (u32, u32),
+        meta: FrameMetadata,
+    ) -> Result<CodedFrame> {
+        if surface.size() != self.coded_size {
+            let converted = self.vpp_into_pool(surface, display_size)?;
+            self.encode_settled(converted, meta)
         } else {
-            Arc::clone(frame.surface())
-        };
-        self.encode_surface(source, meta)
+            self.encode_settled(Rc::clone(surface), meta)
+        }
+    }
+
+    fn check_size(&self, width: u32, height: u32) -> Result<()> {
+        if width != self.config.width || height != self.config.height {
+            return Err(Error::config(format!(
+                "encoder configured for {}x{} was given a {}x{} frame",
+                self.config.width, self.config.height, width, height
+            )));
+        }
+        Ok(())
     }
 
     /// Place a source surface's visible rect into this encoder's coded size,
     /// in NV12, on the GPU: a whole-surface convert when the source is
-    /// already the encoder's coded size (the common 10-bit case), a region
-    /// copy/convert otherwise. Builds the VPP pipeline and its two-surface
-    /// pool on first use, painting the pool black so any padding beyond
-    /// `display_size` a region copy never touches is deterministic.
-    fn vpp_into_pool(
+    /// already the encoder's coded size, a region copy/convert otherwise.
+    /// Builds the VPP pipeline and its two-surface pool on first use, painting
+    /// the pool black so any padding beyond `display_size` a region copy never
+    /// touches is deterministic.
+    fn vpp_into_pool<D: SurfaceMemoryDescriptor>(
         &mut self,
-        source: &Arc<Surface>,
+        source: &ec_va::va::Surface<D>,
         display_size: (u32, u32),
-    ) -> Result<Arc<Surface>> {
+    ) -> Result<Rc<Surface>> {
         if self.vpp.is_none() {
             let spec = surface_spec(self.config.bit_depth, self.coded_size);
-            let display = self.context.display();
-            let surfaces = Surface::create_pool(display, &spec, 2)?;
+            let display = Rc::clone(self.context.display());
+            let surfaces = ec_va::create_pool(&display, &spec, 2)?;
             for s in &surfaces {
-                Self::fill_black(s, self.coded_size, self.config.bit_depth)?;
+                fill_black(&display, s, self.coded_size, self.config.bit_depth)?;
             }
             let vpp = Vpp::new(
-                display,
-                sys::VA_RT_FORMAT_YUV420 | sys::VA_RT_FORMAT_YUV420_10,
-                &surfaces,
+                &display,
+                VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10,
+                self.coded_size.0,
+                self.coded_size.1,
             )?;
-            self.vpp_surfaces = surfaces;
+            self.vpp_surfaces = surfaces.into_iter().map(Rc::new).collect();
             self.vpp = Some(vpp);
         }
-        let dest = Arc::clone(&self.vpp_surfaces[self.vpp_next]);
+        let dest = Rc::clone(&self.vpp_surfaces[self.vpp_next]);
         self.vpp_next = (self.vpp_next + 1) % self.vpp_surfaces.len();
         let vpp = self.vpp.as_ref().expect("just built above if it was None");
         if display_size == self.coded_size {
@@ -534,39 +615,19 @@ impl Encoder {
         }
     }
 
-    /// Paint an NV12 surface black (Y=16, chroma=128, TV-range neutral): the
-    /// one-time initialisation [`Encoder::vpp_into_pool`] gives its pool so a
-    /// region copy's untouched padding reads the same deterministic value on
-    /// every driver instead of whatever the fresh allocation contained.
-    fn fill_black(surface: &Arc<Surface>, size: (u32, u32), bit_depth: u8) -> Result<()> {
-        let mut image = Image::create(surface.display(), fourcc(bit_depth), size.0, size.1)?;
-        {
-            let mut mapped = image.map()?;
-            // P010 carries the sample in the top ten bits, so black is the
-            // 8-bit value shifted up by six, little endian.
-            let (luma, chroma) = (16u16 << 6, 128u16 << 6);
-            let mut plane = |index: usize, eight: u8, ten: u16| {
-                if let Some(p) = mapped.plane_mut(index) {
-                    if bit_depth == 8 {
-                        p.fill(eight);
-                    } else {
-                        for sample in p.chunks_exact_mut(2) {
-                            sample.copy_from_slice(&ten.to_le_bytes());
-                        }
-                    }
-                }
-            };
-            plane(0, 16, luma);
-            plane(1, 128, chroma);
-        }
-        surface.write_from(&image, size.0, size.1)?;
-        Ok(())
-    }
-
-    /// Shared submission path for [`Encoder::encode`] and
-    /// [`Encoder::encode_frame`]: everything after the source surface is
+    /// Shared submission path for [`Encoder::encode`], [`Encoder::encode_frame`]
+    /// and [`Encoder::encode_surface`]: everything after the source surface is
     /// settled.
-    fn encode_surface(&mut self, source: Arc<Surface>, meta: FrameMetadata) -> Result<CodedFrame> {
+    fn encode_settled<D: SurfaceMemoryDescriptor>(
+        &mut self,
+        source: Rc<ec_va::va::Surface<D>>,
+        meta: FrameMetadata,
+    ) -> Result<CodedFrame> {
+        if crate::reset::gpu_reset_epoch() != self.born_epoch {
+            return Err(Error::hw_reset(
+                "the GPU was reset after this encoder was created; its context is lost",
+            ));
+        }
         let keyframe = meta.force_keyframe
             || self.reference.is_none()
             || self.gop_position >= self.config.gop_size.max(1);
@@ -578,35 +639,42 @@ impl Encoder {
 
         // 6 bits per pixel of headroom: an intra frame at a low quantiser is the
         // worst case, and a coded buffer that overflows loses the picture.
-        let coded_size = (self.coded_size.0 * self.coded_size.1 * 3 / 4).max(1 << 20);
-        let coded_buf = Buffer::allocate(&self.context, sys::VAEncCodedBufferType, coded_size)?;
-        let coded_id = coded_buf.id();
+        let coded_bytes_len = (self.coded_size.0 * self.coded_size.1 * 3 / 4).max(1 << 20);
+        let coded = ec_va::error::va_ok(
+            "vaCreateBuffer",
+            self.context.create_enc_coded(coded_bytes_len as usize),
+        )?;
 
-        let mut buffers = Vec::new();
+        let mut params = Vec::new();
         match self.config.codec {
-            EncCodec::H264 => h264::parameters(self, &recon, coded_id, keyframe, &mut buffers)?,
-            EncCodec::H265 => hevc::parameters(self, &recon, coded_id, keyframe, &mut buffers)?,
-            EncCodec::Av1 => av1::parameters(self, &recon, coded_id, keyframe, &mut buffers)?,
+            EncCodec::H264 => h264::parameters(self, &recon, coded.id(), keyframe, &mut params)?,
+            EncCodec::H265 => hevc::parameters(self, &recon, coded.id(), keyframe, &mut params)?,
+            EncCodec::Av1 => av1::parameters(self, &recon, coded.id(), keyframe, &mut params)?,
         }
-        buffers.extend(self.rate_control_buffers()?);
-        buffers.push(coded_buf);
+        params.extend(self.rate_control_buffers()?);
+        let mut buffers = Vec::with_capacity(params.len());
+        for ty in params {
+            buffers.push(ec_va::picture::buffer(&self.context, ty)?);
+        }
 
-        let mut picture = Picture::new(&self.context, source)
-            .begin()?
-            .render_all(buffers)?
-            .end()?
-            .sync()?;
+        let picture = ec_va::picture::submit(&self.context, Rc::clone(&source), buffers)?;
+        crate::reset::sync_watched(&source)?;
+        drop(picture);
 
         let mut data = {
-            let coded = picture
-                .buffers_mut()
-                .iter_mut()
-                .find(|b| b.buffer_type() == sys::VAEncCodedBufferType)
-                .ok_or_else(|| Error::config("the coded buffer vanished from the picture"))?;
-            let mapped = coded.map()?;
-            coded_bytes(&mapped)?
+            let mapped = ec_va::error::va_ok(
+                "vaMapBuffer",
+                ec_va::picture::MappedCodedBuffer::new(&coded),
+            )?;
+            let mut out = Vec::new();
+            for segment in mapped.segments() {
+                out.extend_from_slice(segment.buf);
+            }
+            out
         };
-
+        if data.is_empty() {
+            return Err(Error::config("the encoder produced an empty coded buffer"));
+        }
         if self.config.codec == EncCodec::Av1 {
             // Every AV1 temporal unit begins with a temporal delimiter (5.6),
             // and this driver emits none: its coded buffer starts at the
@@ -615,9 +683,13 @@ impl Encoder {
             // here rather than left to the caller.
             data.splice(0..0, [0x12u8, 0x00]);
         }
+        // The coded buffer is no longer read once it is copied out.
+        drop(coded);
 
         self.reference = Some(recon);
-        self.coded += 1;
+        if keyframe {
+            self.idr_count = self.idr_count.wrapping_add(1);
+        }
         self.gop_position = if keyframe { 1 } else { self.gop_position + 1 };
         Ok(CodedFrame {
             data,
@@ -626,116 +698,8 @@ impl Encoder {
         })
     }
 
-    /// Upload one frame into a surface as NV12.
-    ///
-    /// One image is created per encoder and reused: `vaCreateImage` per frame
-    /// would be an allocation per frame, which is exactly the shape of the
-    /// per-frame cost this crate exists to remove.
-    fn upload(&mut self, frame: &I420, surface: &Arc<Surface>) -> Result<()> {
-        if self.upload.is_none() {
-            self.upload = Some(Image::create(
-                surface.display(),
-                fourcc(self.config.bit_depth),
-                self.coded_size.0,
-                self.coded_size.1,
-            )?);
-        }
-        let image = self
-            .upload
-            .as_mut()
-            .ok_or_else(|| Error::config("no upload image"))?;
-        let (w, h) = (frame.width as usize, frame.height as usize);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        {
-            let mut mapped = image.map()?;
-            let y_pitch = mapped.pitch(0).unwrap_or(0) as usize;
-            let uv_pitch = mapped.pitch(1).unwrap_or(0) as usize;
-            // The two planes are written in turn because a mapping hands out one
-            // mutable plane at a time; the loops are the interleave `i420_to_nv12`
-            // does for callers that own both buffers.
-            if let Some(dst) = mapped.plane_mut(0) {
-                for row in 0..h {
-                    let (s, d) = (row * w, row * y_pitch);
-                    if d + w > dst.len() {
-                        break;
-                    }
-                    dst[d..d + w].copy_from_slice(&frame.y[s..s + w]);
-                }
-            }
-            if let Some(dst) = mapped.plane_mut(1) {
-                for row in 0..ch {
-                    let d = row * uv_pitch;
-                    if d + cw * 2 > dst.len() {
-                        break;
-                    }
-                    for col in 0..cw {
-                        dst[d + col * 2] = frame.u[row * cw + col];
-                        dst[d + col * 2 + 1] = frame.v[row * cw + col];
-                    }
-                }
-            }
-        }
-        surface.write_from(image, self.coded_size.0, self.coded_size.1)?;
-        Ok(())
-    }
-
-    /// Upload one 10-bit frame into a surface as P010.
-    ///
-    /// The same reused image as [`Encoder::upload`], created P010 because the
-    /// encoder's surfaces are; samples move from the low ten bits of the
-    /// caller's `u16` into P010's top ten.
-    fn upload_16(&mut self, frame: &I420_16, surface: &Arc<Surface>) -> Result<()> {
-        if self.upload.is_none() {
-            self.upload = Some(Image::create(
-                surface.display(),
-                fourcc(self.config.bit_depth),
-                self.coded_size.0,
-                self.coded_size.1,
-            )?);
-        }
-        let image = self
-            .upload
-            .as_mut()
-            .ok_or_else(|| Error::config("no upload image"))?;
-        let (w, h) = (frame.width as usize, frame.height as usize);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        {
-            let mut mapped = image.map()?;
-            let y_pitch = mapped.pitch(0).unwrap_or(0) as usize;
-            let uv_pitch = mapped.pitch(1).unwrap_or(0) as usize;
-            if let Some(dst) = mapped.plane_mut(0) {
-                for row in 0..h {
-                    let d = row * y_pitch;
-                    if d + w * 2 > dst.len() {
-                        break;
-                    }
-                    for col in 0..w {
-                        let v = (frame.y[row * w + col] & 0x3ff) << 6;
-                        dst[d + col * 2..d + col * 2 + 2].copy_from_slice(&v.to_le_bytes());
-                    }
-                }
-            }
-            if let Some(dst) = mapped.plane_mut(1) {
-                for row in 0..ch {
-                    let d = row * uv_pitch;
-                    if d + cw * 4 > dst.len() {
-                        break;
-                    }
-                    for col in 0..cw {
-                        let u = (frame.u[row * cw + col] & 0x3ff) << 6;
-                        let v = (frame.v[row * cw + col] & 0x3ff) << 6;
-                        dst[d + col * 4..d + col * 4 + 2].copy_from_slice(&u.to_le_bytes());
-                        dst[d + col * 4 + 2..d + col * 4 + 4].copy_from_slice(&v.to_le_bytes());
-                    }
-                }
-            }
-        }
-        surface.write_from(image, self.coded_size.0, self.coded_size.1)?;
-        Ok(())
-    }
-
     /// The misc parameter buffers that carry rate control, resent when tuned.
-    fn rate_control_buffers(&mut self) -> Result<Vec<Buffer>> {
+    fn rate_control_buffers(&mut self) -> Result<Vec<BufferType>> {
         if !self.tunings_dirty {
             return Ok(Vec::new());
         }
@@ -751,72 +715,73 @@ impl Encoder {
             }
             RateControlMode::Qvbr { quality } => (0, 0, 0, self.tunings.bitrate, 100, quality),
         };
-        let rc = RateControl {
-            bits_per_second: bits,
-            target_percentage: target,
-            window_size: 1000,
-            initial_qp,
-            min_qp,
-            max_qp,
-            quality_factor: quality,
+        let rc_flags = RcFlags::new(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let mut out = vec![BufferType::EncMiscParameter(EncMiscParameter::RateControl(
+            EncMiscParameterRateControl::new(
+                bits,
+                target,
+                RATE_WINDOW_MS,
+                initial_qp,
+                min_qp,
+                0,
+                rc_flags,
+                0,
+                max_qp,
+                quality,
+                0,
+            ),
+        ))];
+        // libva packs a fractional rate as `den << 16 | num`, and a whole one
+        // as the plain numerator.
+        let num = self.tunings.framerate.0.max(1);
+        let den = self.tunings.framerate.1.max(1);
+        let packed = if den <= 1 {
+            num
+        } else {
+            (den << 16) | (num & 0xffff)
         };
-        let mut out = vec![Buffer::from_bytes(
-            &self.context,
-            sys::VAEncMiscParameterBufferType,
-            &misc_bytes(MISC_RATE_CONTROL, &rc.words()),
-        )?];
-        let fr = crate::params::enc::FrameRate {
-            num: self.tunings.framerate.0.max(1),
-            den: self.tunings.framerate.1.max(1),
-        };
-        out.push(Buffer::from_bytes(
-            &self.context,
-            sys::VAEncMiscParameterBufferType,
-            &misc_bytes(MISC_FRAME_RATE, &fr.words()),
-        )?);
+        out.push(BufferType::EncMiscParameter(EncMiscParameter::FrameRate(
+            EncMiscParameterFrameRate::new(packed, 0),
+        )));
         if bits > 0 {
-            // One rate window of buffer, three quarters full to start, which
-            // is what ffmpeg's vaapi encoder asks for: a two-window buffer
-            // let radeonsi's AV1 CBR undershoot the ask by 20% where ffmpeg's
-            // own av1_vaapi undershot by 8% on the same clip (measured).
-            let hrd = crate::params::enc::Hrd {
-                initial_buffer_fullness: bits / 4 * 3,
-                buffer_size: bits,
-            };
-            out.push(Buffer::from_bytes(
-                &self.context,
-                sys::VAEncMiscParameterBufferType,
-                &misc_bytes(MISC_HRD, &hrd.words()),
-            )?);
+            // The buffer starts full. Starting at three quarters full cost a
+            // quarter of a window of budget: radeonsi then spent 12.5% under the
+            // ask on a 2 s clip, and the gap is exactly that quarter over the
+            // clip length (measured, 2026-10-16). Its size: see `hrd_buffer_ms`.
+            let buffer_ms = u64::from(hrd_buffer_ms(self.config.gop_size));
+            let hrd_bits = (u64::from(bits) * buffer_ms / 1000) as u32;
+            out.push(BufferType::EncMiscParameter(EncMiscParameter::HRD(
+                EncMiscParameterHRD::new(hrd_bits, hrd_bits),
+            )));
         }
         Ok(out)
     }
 
-    /// Submit one packed header: its parameter buffer, then its bytes.
+    /// Append one packed header: its parameter buffer, then its bytes.
     ///
     /// Both go in the same picture, in this order, which is what the driver
     /// reads them in (`va.h:2446`).
     pub(crate) fn push_packed(
         &self,
         packed: &headers::Packed,
-        out: &mut Vec<Buffer>,
+        out: &mut Vec<BufferType>,
     ) -> Result<()> {
-        let param = PackedHeaderParameterBuffer {
-            type_: packed.kind,
-            bit_length: packed.bits,
-            has_emulation_bytes: 1,
-            ..PackedHeaderParameterBuffer::default()
+        let kind = match packed.kind {
+            headers::PACKED_HEADER_SEQUENCE => EncPackedHeaderType::Sequence,
+            headers::PACKED_HEADER_PICTURE => EncPackedHeaderType::Picture,
+            headers::PACKED_HEADER_SLICE => EncPackedHeaderType::Slice,
+            other => {
+                return Err(Error::config(format!("unknown packed header kind {other}")));
+            }
         };
-        out.push(param_buffer(&self.context, &param)?);
-        out.push(Buffer::from_bytes(
-            &self.context,
-            sys::VAEncPackedHeaderDataBufferType,
-            &packed.bytes,
-        )?);
+        out.push(BufferType::EncPackedHeaderParameter(
+            EncPackedHeaderParameter::new(kind, packed.bits, true),
+        ));
+        out.push(BufferType::EncPackedHeaderData(packed.bytes.clone()));
         Ok(())
     }
 
-    pub(crate) fn context(&self) -> &Arc<Context> {
+    pub(crate) fn context(&self) -> &Rc<Context> {
         &self.context
     }
 
@@ -824,16 +789,18 @@ impl Encoder {
         &self.config
     }
 
-    pub(crate) fn reference(&self) -> Option<&Arc<PooledSurface>> {
+    pub(crate) fn reference(&self) -> Option<&Rc<PooledSurface>> {
         self.reference.as_ref()
-    }
-
-    pub(crate) fn coded_count(&self) -> u64 {
-        self.coded
     }
 
     pub(crate) fn gop_position(&self) -> u32 {
         self.gop_position
+    }
+
+    /// Key frames submitted before the picture now being coded (the count is
+    /// bumped once a picture is submitted), so the first IDR reads 0.
+    pub(crate) fn idr_count(&self) -> u32 {
+        self.idr_count
     }
 
     /// The VA profile this encoder was configured with.
@@ -849,58 +816,154 @@ fn surface_spec(bit_depth: u8, size: (u32, u32)) -> SurfaceSpec {
     } else {
         SurfaceSpec::nv12(size.0, size.1)
     };
-    spec.with_usage_hint(sys::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER)
+    spec.with_usage_hint(VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER)
 }
 
 /// The image fourcc matching `bit_depth`.
 fn fourcc(bit_depth: u8) -> u32 {
     if bit_depth == 10 {
-        sys::VA_FOURCC_P010
+        VA_FOURCC_P010
     } else {
-        sys::VA_FOURCC_NV12
+        VA_FOURCC_NV12
     }
 }
 
-/// Collect the bytes of a coded buffer's segment list.
+/// Copy `surface`'s image through `fill`, then write it back.
 ///
-/// `VACodedBufferSegment` is a linked list in driver memory: `size`, `bit_offset`,
-/// `status`, a `buf` pointer to that segment's bytes and a `next` pointer. There
-/// is no safe way to express that in `ec-va`, so this is one of the crate's two
-/// unsafe functions.
-fn coded_bytes(mapped: &MappedBuffer<'_>) -> Result<Vec<u8>> {
-    // Field offsets from `crates/ec-hw/abi-probe.c`: size=0 bit_offset=4
-    // status=8 reserved=12 buf=16 next=24, total 48 bytes, align 8.
-    const BUF_OFFSET: usize = 16;
-    const NEXT_OFFSET: usize = 24;
-    let mut out = Vec::new();
-    // SAFETY: the mapping is a VACodedBufferSegment as libva defines it
-    // (va.h:3940); the pointer is valid for the guard's lifetime.
-    let mut segment = unsafe { mapped.as_ptr() };
-    // A driver returning a cyclic list would otherwise hang the export; 4096
-    // segments is far beyond any real picture.
-    for _ in 0..4096 {
-        if segment.is_null() {
-            break;
+/// cros-libva writes a mutated image back to the surface when the image is
+/// dropped (`vaPutImage`), so `fill` runs against the image's own bytes and
+/// the write-back happens at the end of this function.
+fn write_surface(
+    display: &Display,
+    surface: &Surface,
+    fourcc: u32,
+    size: (u32, u32),
+    fill: impl FnOnce(&VAImage, &mut [u8]),
+) -> Result<()> {
+    let format = ec_va::surface::image_format(display, fourcc)?;
+    let mut image = ec_va::surface::create_image(surface, format, size, size)?;
+    let layout = *image.image();
+    fill(&layout, AsMut::<[u8]>::as_mut(&mut image));
+    Ok(())
+}
+
+/// Upload one frame into a surface as NV12.
+fn upload(
+    context: &Rc<Context>,
+    frame: &I420,
+    surface: &Surface,
+    coded: (u32, u32),
+) -> Result<()> {
+    let display: &Display = context.display();
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    write_surface(display, surface, VA_FOURCC_NV12, coded, |layout, data| {
+        let y_pitch = layout.pitches[0] as usize;
+        let uv_pitch = layout.pitches[1] as usize;
+        let y_base = layout.offsets[0] as usize;
+        let uv_base = layout.offsets[1] as usize;
+        // The two planes are written in turn; the loops are the interleave
+        // `i420_to_nv12` does for callers that own both buffers.
+        for row in 0..h {
+            let d = y_base + row * y_pitch;
+            if let Some(dst) = data.get_mut(d..d + w) {
+                dst.copy_from_slice(&frame.y[row * w..row * w + w]);
+            } else {
+                break;
+            }
         }
-        // SAFETY: `segment` points at a 48-byte segment header the driver
-        // wrote; every field is read at its probed offset with an unaligned
-        // read, and `buf` points at `size` bytes of coded data that stay valid
-        // until the buffer is unmapped (i.e. for this guard's lifetime).
-        let (size, data, next) = unsafe {
-            let size = segment.cast::<u32>().read_unaligned() as usize;
-            let data = segment.add(BUF_OFFSET).cast::<*const u8>().read_unaligned();
-            let next = segment.add(NEXT_OFFSET).cast::<*mut u8>().read_unaligned();
-            (size, data, next)
+        for row in 0..ch {
+            let d = uv_base + row * uv_pitch;
+            let Some(dst) = data.get_mut(d..d + cw * 2) else {
+                break;
+            };
+            for col in 0..cw {
+                dst[col * 2] = frame.u[row * cw + col];
+                dst[col * 2 + 1] = frame.v[row * cw + col];
+            }
+        }
+    })
+}
+
+/// Paint an NV12 surface black (Y=16, chroma=128, TV-range neutral): the
+/// one-time initialisation [`Encoder::vpp_into_pool`] gives its pool so a
+/// region copy's untouched padding reads the same deterministic value on
+/// every driver instead of whatever the fresh allocation contained.
+fn fill_black(display: &Display, surface: &Surface, size: (u32, u32), bit_depth: u8) -> Result<()> {
+    write_surface(display, surface, fourcc(bit_depth), size, |layout, data| {
+        // P010 carries the sample in the top ten bits, so black is the 8-bit
+        // value shifted up by six, little endian.
+        let samples = |eight: u8| -> Vec<u8> {
+            if bit_depth == 8 {
+                vec![eight]
+            } else {
+                (u16::from(eight) << 6).to_le_bytes().to_vec()
+            }
         };
-        if data.is_null() || size == 0 {
-            break;
+        for (plane, value, rows) in [(0usize, 16u8, size.1 as usize), (1, 128, size.1 as usize / 2)] {
+            let pitch = layout.pitches[plane] as usize;
+            let base = layout.offsets[plane] as usize;
+            let unit = samples(value);
+            let width = size.0 as usize * unit.len();
+            for row in 0..rows {
+                let start = base + row * pitch;
+                if let Some(line) = data.get_mut(start..start + width) {
+                    for px in line.chunks_exact_mut(unit.len()) {
+                        px.copy_from_slice(&unit);
+                    }
+                }
+            }
         }
-        // SAFETY: as above — `data` is valid for `size` bytes.
-        out.extend_from_slice(unsafe { std::slice::from_raw_parts(data, size) });
-        segment = next;
+    })
+}
+
+/// Upload one 10-bit frame into a surface as P010: samples move from the low
+/// ten bits of the caller's `u16` into P010's top ten.
+fn upload_16(
+    context: &Rc<Context>,
+    frame: &I420_16,
+    surface: &Surface,
+    coded: (u32, u32),
+) -> Result<()> {
+    let display: &Display = context.display();
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    write_surface(display, surface, VA_FOURCC_P010, coded, |layout, data| {
+        let y_pitch = layout.pitches[0] as usize;
+        let uv_pitch = layout.pitches[1] as usize;
+        let y_base = layout.offsets[0] as usize;
+        let uv_base = layout.offsets[1] as usize;
+        for row in 0..h {
+            let d = y_base + row * y_pitch;
+            let Some(dst) = data.get_mut(d..d + w * 2) else {
+                break;
+            };
+            for col in 0..w {
+                let v = (frame.y[row * w + col] & 0x3ff) << 6;
+                dst[col * 2..col * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        for row in 0..ch {
+            let d = uv_base + row * uv_pitch;
+            let Some(dst) = data.get_mut(d..d + cw * 4) else {
+                break;
+            };
+            for col in 0..cw {
+                let u = (frame.u[row * cw + col] & 0x3ff) << 6;
+                let v = (frame.v[row * cw + col] & 0x3ff) << 6;
+                dst[col * 4..col * 4 + 2].copy_from_slice(&u.to_le_bytes());
+                dst[col * 4 + 2..col * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_profile_is_high() {
+        assert_eq!(H264Profile::default(), H264Profile::High);
     }
-    if out.is_empty() {
-        return Err(Error::config("the encoder produced an empty coded buffer"));
-    }
-    Ok(out)
 }

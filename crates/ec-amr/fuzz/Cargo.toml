@@ -1,0 +1,42 @@
+[package]
+name = "ec-amr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-amr]
+path = ".."
+
+[dependencies.ec-core]
+path = "../../ec-core"
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_nb_decode"
+path = "fuzz_targets/fuzz_nb_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_container"
+path = "fuzz_targets/fuzz_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wb"
+path = "fuzz_targets/wb.rs"
+test = false
+doc = false
+bench = false

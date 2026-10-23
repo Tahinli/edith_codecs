@@ -1,0 +1,1009 @@
+//! Conformance: every access unit this encoder writes must decode in ffmpeg,
+//! and the picture ffmpeg produces must be *bit-identical* to the encoder's own
+//! reconstruction. That equality is the whole point of coding with the in-loop
+//! filters off: it turns "the file plays" into "the decoder and the encoder
+//! agree on every sample".
+
+use crate::common::{natural_frame, pin_or_panic, test_frame};
+use ec_core::frame::VideoFrame;
+use ec_h265::encoder::{EncodedPicture, Encoder, EncoderConfig, RateControl, TransformSkip};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn scratch_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("ec-h265-tests");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+fn have_ffmpeg() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Decode an Annex-B file with ffmpeg into planar 8-bit 4:2:0.
+fn ffmpeg_decode(path: &Path) -> Result<Vec<u8>, String> {
+    let out = path.with_extension("yuv");
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(path)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&out)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !status.status.success() {
+        return Err(String::from_utf8_lossy(&status.stderr).to_string());
+    }
+    let stderr = String::from_utf8_lossy(&status.stderr).to_string();
+    if !stderr.trim().is_empty() {
+        return Err(format!("ffmpeg complained: {stderr}"));
+    }
+    std::fs::read(&out).map_err(|e| e.to_string())
+}
+
+/// Pin one access unit as an Annex-B file for [`ffmpeg_decode`].
+///
+/// lane-h26xpinloud: this used `File::create(..).expect(..)` +
+/// `write_all(..).expect("write bitstream")`, which closes only the ERROR path.
+/// A write that reports success and leaves a short file put a truncated stream
+/// at exactly the path ffmpeg then decoded, so the shortfall now carries the
+/// path, both counts, and the OS error. Panic semantics kept: this caller
+/// panicked before and still does, with the failure line as the message.
+fn write_au(name: &str, picture: &EncodedPicture) -> PathBuf {
+    let path = scratch_dir().join(format!("{name}.265"));
+    pin_or_panic("write_au", &path, &picture.au);
+    path
+}
+
+fn planes_of(frame: &VideoFrame) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    for (i, plane) in frame.planes.iter().enumerate() {
+        let (pw, ph) = if i == 0 {
+            (w, h)
+        } else {
+            (w.div_ceil(2), h.div_ceil(2))
+        };
+        for row in 0..ph {
+            out.extend_from_slice(&plane.data[row * plane.stride..row * plane.stride + pw]);
+        }
+    }
+    out
+}
+
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mse: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| {
+            let d = f64::from(*x) - f64::from(*y);
+            d * d
+        })
+        .sum::<f64>()
+        / a.len() as f64;
+    if mse == 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+}
+
+/// Encode one picture; `ctb` of `None` takes the configured default.
+fn encode(width: u32, height: u32, qp: i32, ctb: Option<usize>) -> (VideoFrame, EncodedPicture) {
+    encode_with(width, height, qp, ctb, false, false)
+}
+
+fn encode_with(
+    width: u32,
+    height: u32,
+    qp: i32,
+    ctb: Option<usize>,
+    chroma_mode_search: bool,
+    intra_nxn: bool,
+) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.chroma_mode_search = chroma_mode_search;
+    cfg.intra_nxn = intra_nxn;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    if let Some(ctb) = ctb {
+        cfg.ctb_size = ctb;
+    }
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = test_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// Same as `encode_with`, but on the grainy natural frame and with no chroma
+/// mode search — the synthetic test frame is flat enough that the quadtree
+/// never keeps an 8x8 coding unit, which is the only size PART_NxN applies to.
+fn encode_natural(
+    width: u32,
+    height: u32,
+    qp: i32,
+    intra_nxn: bool,
+) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.intra_nxn = intra_nxn;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// The chroma mode search is off by default (it loses on screen content, see
+/// `EncoderConfig::chroma_mode_search`), so the shapes above never code an
+/// `intra_chroma_pred_mode` other than the derived one. This exercises the four
+/// explicit modes: the stream has to differ from the derived-only one — proving
+/// the search actually fired — and still decode bit-exactly.
+#[test]
+fn chroma_mode_search_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_with(w, h, 27, None, true, false);
+        let (_, derived) = encode_with(w, h, 27, None, false, false);
+        let name = format!("chroma-rd-{w}x{h}");
+        assert_ne!(
+            coded.au, derived.au,
+            "{name}: the search never picked a mode other than the derived one, so this decode proves nothing"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 27");
+    }
+}
+
+/// PART_NxN is off by default, so nothing else here codes a four-partition
+/// coding unit. This does: the stream has to differ from the 2Nx2N-only one —
+/// proving the partition actually fired — and still decode bit-exactly, which
+/// is the only check that the inferred transform split, the four `cbf_luma`
+/// flags at transform depth 1 and the chroma residual riding on the last
+/// partition are all where the decoder looks for them.
+#[test]
+fn intra_nxn_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_natural(w, h, 22, true);
+        let (_, square) = encode_natural(w, h, 22, false);
+        let name = format!("intra-nxn-{w}x{h}");
+        assert_ne!(
+            coded.au, square.au,
+            "{name}: no coding unit ever chose PART_NxN, so this decode proves nothing"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
+    }
+}
+
+/// Sign data hiding drops one bypass bin per qualifying sub-block and pays for
+/// it by nudging a level, so the encoder and the decoder only agree if the
+/// parity the encoder wrote is the parity the decoder reads. The stream has to
+/// differ from the hiding-off one, and ffmpeg's decode has to match the
+/// encoder's reconstruction sample for sample.
+///
+/// Size is deliberately not asserted here: hiding is not optional per
+/// sub-block, so a single small picture can come out a few bytes longer when
+/// the nudges cost more than the signs saved. Whether it pays is what the
+/// `EC_H265_SDH` arm of the clip gate measures.
+#[test]
+fn sign_hiding_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_sdh(w, h, 22, true);
+        let (_, plain) = encode_sdh(w, h, 22, false);
+        let name = format!("sign-hiding-{w}x{h}");
+        assert_ne!(
+            coded.au, plain.au,
+            "{name}: no sub-block ever qualified, so this decode proves nothing"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
+    }
+}
+
+/// The natural frame coded with sign data hiding on or off, everything else
+/// left at its default.
+fn encode_sdh(width: u32, height: u32, qp: i32, sign_hiding: bool) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.sign_hiding = sign_hiding;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// The natural frame coded with transform skip on or off, everything else
+/// left at its default.
+fn encode_tskip(
+    width: u32,
+    height: u32,
+    qp: i32,
+    tskip: TransformSkip,
+) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.transform_skip = tskip;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// Transform skip bypasses the integer transform on 4x4 TUs, coding residual
+/// samples directly with a fixed shift. The encoder and decoder agree only if
+/// the shift matches on both sides; the stream has to differ from the
+/// skip-off one, and ffmpeg's decode has to match the encoder's reconstruction
+/// sample for sample.
+#[test]
+fn transform_skip_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_tskip(w, h, 22, TransformSkip::AlwaysFor4x4);
+        let (_, plain) = encode_tskip(w, h, 22, TransformSkip::Off);
+        let name = format!("transform-skip-{w}x{h}");
+        assert_ne!(
+            coded.au, plain.au,
+            "{name}: no TU ever skipped, so this decode proves nothing"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
+    }
+}
+#[test]
+fn ffmpeg_decodes_bit_exactly_at_every_shape() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    // 1920x1080 needs the conformance window on the bottom (1088 coded rows are
+    // not used: 1080 is a multiple of 8, but 64x64 CTBs still overhang), 1916
+    // needs it on the right, 130x66 exercises a partial CTB in both directions.
+    // Both tree sizes are coded: the default is 32, and 64 is still offered.
+    for &(w, h, ctb) in &[
+        (64u32, 64u32, None),
+        (130, 66, None),
+        (1916, 1080, None),
+        (352, 288, None),
+        (1916, 1080, Some(64)),
+        (130, 66, Some(64)),
+    ] {
+        let (source, coded) = encode(w, h, 27, ctb);
+        let name = format!(
+            "shape-{w}x{h}-ctb{}",
+            ctb.map_or("default".to_string(), |c| c.to_string())
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(
+            decoded.len(),
+            recon.len(),
+            "{name}: decoded {} bytes, reconstruction {} bytes",
+            decoded.len(),
+            recon.len()
+        );
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
+        // And the encode is worth something: PSNR against the source.
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 27");
+    }
+}
+
+/// A 64x64 coding unit predicts and transforms in four 32x32 blocks under one
+/// luma mode, with the transform split inferred rather than signalled
+/// (`log2TrafoSize > MaxTbLog2SizeY`, 7.4.9.8). That inference is the part a
+/// decoder disagrees with loudly, so it is gated against ffmpeg -- and the
+/// stream has to differ from the same encode with `cu64` off, or the test would
+/// pass without a single 64x64 coding unit ever being kept.
+#[test]
+fn cu64_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    // 130x66 is here for the partial coding tree blocks, not for the decision:
+    // at that size only two tree blocks are whole and the search keeps neither,
+    // so its stream is allowed to come out identical.
+    for &(w, h, qp, fires) in &[
+        (352u32, 288u32, 32i32, true),
+        (256, 256, 37, true),
+        (130, 66, 32, false),
+    ] {
+        let (source, off) = encode_cu64(w, h, qp, false);
+        let (_, on) = encode_cu64(w, h, qp, true);
+        let name = format!("cu64-{w}x{h}-qp{qp}");
+        if fires {
+            assert_ne!(off.au, on.au, "{name}: no 64x64 coding unit was ever kept");
+        }
+
+        let path = write_au(&name, &on);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(on.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let luma = (w * h) as usize;
+            panic!(
+                "{name}: {mismatches} samples differ, first at {first} ({}, {}), {} of them luma",
+                first % w as usize,
+                first / w as usize,
+                decoded[..luma]
+                    .iter()
+                    .zip(&recon[..luma])
+                    .filter(|(a, b)| a != b)
+                    .count(),
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 28.0, "{name}: PSNR {quality:.2} dB at QP {qp}");
+    }
+}
+
+fn encode_cu64(width: u32, height: u32, qp: i32, cu64: bool) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.ctb_size = 64;
+    cfg.cu64 = cu64;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// The 32x32 default buys wavefront rows (see `perf.rs`) by coding a shallower
+/// tree; that trade is only worth taking if the bits it costs are noise.
+#[test]
+fn the_default_tree_costs_almost_nothing_against_64() {
+    let source = natural_frame(1920, 1080, 0);
+    let mut coded = Vec::new();
+    for ctb in [32usize, 64] {
+        let mut cfg = EncoderConfig::new(1920, 1080);
+        cfg.rate_control = RateControl::ConstantQp(27);
+        cfg.ctb_size = ctb;
+        cfg.keep_recon = true;
+        let encoder = Encoder::new(cfg).expect("encoder");
+        let picture = encoder.encode_idr(&source).expect("encode");
+        let quality = psnr(
+            &planes_of(&source),
+            &planes_of(picture.recon.as_ref().unwrap()),
+        );
+        coded.push((picture.au.len(), quality));
+    }
+    let ((bits32, psnr32), (bits64, psnr64)) = (coded[0], coded[1]);
+    println!(
+        "1080p at QP 27: CTB 32 {bits32} bytes / {psnr32:.2} dB, CTB 64 {bits64} bytes / {psnr64:.2} dB \
+         ({:+.1}% bits, {:+.2} dB)",
+        (bits32 as f64 / bits64 as f64 - 1.0) * 100.0,
+        psnr32 - psnr64
+    );
+    assert!(
+        // Measured 1.0% on this fixture; the bound leaves room for the shape of
+        // the picture, not for a change of coding behaviour.
+        (bits32 as f64) < bits64 as f64 * 1.03,
+        "CTB 32 spent {bits32} bytes against 64's {bits64}"
+    );
+    assert!(
+        (psnr32 - psnr64).abs() < 0.1,
+        "CTB 32 landed {psnr32:.2} dB against 64's {psnr64:.2} dB"
+    );
+}
+
+#[test]
+fn ffmpeg_verifies_the_decoded_picture_hash() {
+    // The MD5 SEI is the encoder's claim about its own reconstruction; ffmpeg's
+    // decoder checks that claim against what it decoded when asked to. This is
+    // the one oracle that does not depend on this crate being right about
+    // anything except the hash itself.
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    let (_, coded) = encode(352, 288, 30, None);
+    let path = write_au("hash-352x288", &coded);
+    let output = Command::new("ffmpeg")
+        .args(["-v", "debug", "-err_detect", "crccheck", "-y", "-i"])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output()
+        .expect("run ffmpeg");
+    let log = String::from_utf8_lossy(&output.stderr).to_string();
+    let checks: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("Verifying checksum"))
+        .collect();
+    assert!(!checks.is_empty(), "ffmpeg checked no picture hash: {log}");
+    for line in checks {
+        assert_eq!(line.matches("correct").count(), 3, "hash mismatch: {line}");
+    }
+}
+
+#[test]
+fn vaapi_hardware_decodes_the_stream() {
+    // The other half of "it decodes": a GPU decoder is a different
+    // implementation with different tolerances, and it is what edith's HEVC
+    // path actually uses. Skipped where there is no render node.
+    if !have_ffmpeg() || !Path::new("/dev/dri/renderD128").exists() {
+        eprintln!("skipping: no ffmpeg or no VA-API render node");
+        return;
+    }
+    let (_, coded) = encode(1920, 1080, 27, None);
+    let path = write_au("vaapi-1080p", &coded);
+    let output = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_device",
+            "/dev/dri/renderD128",
+            "-i",
+        ])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output()
+        .expect("run ffmpeg");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if stderr.contains("Failed to initialise VAAPI")
+        || stderr.contains("No VA display found")
+        || stderr.contains("Device creation failed")
+    {
+        eprintln!("skipping: VA-API unavailable here ({})", stderr.trim());
+        return;
+    }
+    assert!(
+        output.status.success() && stderr.trim().is_empty(),
+        "VA-API decode failed: {stderr}"
+    );
+}
+
+#[test]
+fn quality_rises_as_qp_falls() {
+    let mut previous = 0.0;
+    for &qp in &[40i32, 32, 27, 22] {
+        let (source, coded) = encode(256, 144, qp, None);
+        let recon = planes_of(coded.recon.as_ref().expect("recon"));
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(
+            quality > previous,
+            "QP {qp}: PSNR {quality:.2} dB is not above {previous:.2}"
+        );
+        previous = quality;
+    }
+    assert!(
+        previous > 40.0,
+        "QP 22 should clear 40 dB, got {previous:.2}"
+    );
+}
+
+#[test]
+fn threads_do_not_change_the_bitstream() {
+    let mut cfg = EncoderConfig::new(320, 192);
+    cfg.rate_control = RateControl::ConstantQp(30);
+    cfg.threads = 1;
+    let single = Encoder::new(cfg.clone()).unwrap();
+    cfg.threads = 8;
+    let many = Encoder::new(cfg).unwrap();
+    let frame = test_frame(320, 192, 3);
+    let a = single.encode_idr(&frame).unwrap();
+    let b = many.encode_idr(&frame).unwrap();
+    assert_eq!(a.au, b.au, "wavefront changed the bitstream");
+}
+
+#[test]
+fn a_bit_target_lands_near_its_target() {
+    // The model picks a QP from bits-per-pixel; a picture that comes out more
+    // than a quarter off is coded once more at a corrected QP. What is asserted
+    // is the contract that mode offers — near the target, monotonic in it — not
+    // a bitrate to the byte, which no single-picture encoder can promise.
+    let mut previous = 0usize;
+    for target in [400_000u64, 1_200_000, 3_000_000] {
+        let mut cfg = EncoderConfig::new(640, 360);
+        cfg.rate_control = RateControl::TargetBits(target);
+        let encoder = Encoder::new(cfg).expect("encoder");
+        let frame = test_frame(640, 360, 5);
+        let coded = encoder.encode_idr(&frame).expect("encode");
+        let bits = coded.au.len() * 8;
+        assert!(
+            bits > previous,
+            "target {target}: {bits} bits did not grow with the target"
+        );
+        previous = bits;
+        let ratio = bits as f64 / target as f64;
+        assert!(
+            (0.4..2.5).contains(&ratio),
+            "target {target}: got {bits} bits (x{ratio:.2}) at QP {}",
+            coded.qp
+        );
+    }
+}
+
+#[test]
+fn the_batch_helper_codes_every_picture_as_its_own_access_unit() {
+    let cfg = EncoderConfig::new(128, 96);
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frames: Vec<VideoFrame> = (0..3).map(|i| test_frame(128, 96, i * 11)).collect();
+    let coded = encoder.encode_batch(frames.iter()).expect("batch encode");
+    assert_eq!(coded.len(), 3);
+    for picture in &coded {
+        // Every access unit stands alone: parameter sets, then an IDR slice.
+        let nals = ec_h265_syntax::split_annex_b(&picture.au);
+        let types: Vec<_> = nals.iter().map(|n| n.header.nal_type).collect();
+        assert_eq!(
+            &types[..4],
+            &[
+                ec_h265_syntax::NalUnitType::Vps,
+                ec_h265_syntax::NalUnitType::Sps,
+                ec_h265_syntax::NalUnitType::Pps,
+                ec_h265_syntax::NalUnitType::IdrWRadl,
+            ],
+            "access unit is not self-contained"
+        );
+    }
+    // Different pictures, different bitstreams.
+    assert_ne!(coded[0].au, coded[1].au);
+}
+
+/// Rate-distortion quantisation changes which levels are coded, so the streams
+/// it produces are a different set of bins from the plain quantiser's; ffmpeg
+/// has to read them back to the same samples the encoder reconstructed.
+#[test]
+fn rdoq_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_rdoq(w, h, 27, true);
+        let (_, plain) = encode_rdoq(w, h, 27, false);
+        let name = format!("rdoq-{w}x{h}");
+        assert_ne!(
+            coded.au, plain.au,
+            "{name}: the level search changed no byte, so it is not running"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 28.0, "{name}: PSNR {quality:.2} dB at QP 27");
+    }
+}
+
+/// The natural frame coded with the level search on or off, everything else
+/// left at its default.
+fn encode_rdoq(width: u32, height: u32, qp: i32, rdoq: bool) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.rdoq = rdoq;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// RQT must produce a bitstream a conformant decoder reads back to the exact
+/// samples the encoder reconstructed.
+#[test]
+fn rqt_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_rqt(w, h, 27, true);
+        let (_, plain) = encode_rqt(w, h, 27, false);
+        let name = format!("rqt-{w}x{h}");
+        assert_ne!(
+            coded.au, plain.au,
+            "{name}: RQT changed no byte, so the split path is not running"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 28.0, "{name}: PSNR {quality:.2} dB at QP 27");
+    }
+}
+
+/// The natural frame coded with RQT on or off, everything else left at its
+/// default.
+fn encode_rqt(width: u32, height: u32, qp: i32, rqt: bool) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.rqt = rqt;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}

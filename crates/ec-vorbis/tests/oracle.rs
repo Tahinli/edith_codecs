@@ -48,8 +48,10 @@ fn ffmpeg_decode(path: &Path) -> Option<(Vec<Vec<f32>>, u32)> {
     }
     let interleaved: Vec<f32> = out
         .stdout
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     let mut planes = vec![Vec::with_capacity(interleaved.len() / channels); channels];
     for (i, value) in interleaved.into_iter().enumerate() {
@@ -483,8 +485,8 @@ fn flush_delivers_the_terminal_hop() {
         }
         for (channel, plane) in planes.iter_mut().enumerate() {
             let bytes = &frame.data[channel];
-            for chunk in bytes.chunks_exact(4).take(frame.samples) {
-                plane.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in bytes.as_chunks::<4>().0.iter().take(frame.samples) {
+                plane.push(f32::from_le_bytes(*chunk));
             }
         }
         frame.samples as i64
@@ -1032,7 +1034,7 @@ fn residue_histogram_vs_reference() {
                 },
             ));
         }
-        report.push_str("\n");
+        report.push('\n');
     }
 
     // The seven sources are the user's own library, so each may be absent on a
@@ -1053,6 +1055,9 @@ fn residue_histogram_vs_reference() {
 }
 
 /// Encode PCM with our encoder, capturing per-block quantised residue, and mux
+/// Per-block residue of one stream: (block size, one residue vector per channel).
+type ResidueCapture = Vec<(usize, Vec<Vec<i32>>)>;
+
 /// the result to `out` so it can be decoded back (sanity check + rate).
 fn encode_and_capture(
     source: &[Vec<f32>],
@@ -1060,7 +1065,7 @@ fn encode_and_capture(
     channels: u16,
     bitrate: i32,
     out: &Path,
-) -> (Vec<(usize, Vec<Vec<i32>>)>, u64) {
+) -> (ResidueCapture, u64) {
     let mut encoder = VorbisEncoder::new(EncoderConfig {
         sample_rate: rate,
         channels,
@@ -1083,13 +1088,6 @@ fn encode_and_capture(
     mux(out, &encoder, &packets, rate, channels);
     let bytes = std::fs::metadata(out).expect("muxed file").len();
     (encoder.take_residue_capture(), bytes)
-}
-
-/// Decode with ours, capturing per-block residue (after inverse coupling,
-/// before floor multiply) — the decoder-side view of the same domain the
-/// encoder captures.
-fn decode_capture(path: &Path) -> Vec<(usize, Vec<Vec<i32>>)> {
-    decode_capture_with_bits(path).0
 }
 
 /// Bit split summed over the stream: (floor bits, residue bits, packet bits,
@@ -1115,7 +1113,7 @@ fn bit_split_summary(
     (f, r, p, nz)
 }
 
-fn decode_capture_with_bits(path: &Path) -> (Vec<(usize, Vec<Vec<i32>>)>, Vec<(u64, u64, u64)>) {
+fn decode_capture_with_bits(path: &Path) -> (ResidueCapture, Vec<(u64, u64, u64)>) {
     let mut demuxer = OggDemuxer::open(File::open(path).expect("open")).expect("ogg");
     let stream = demuxer
         .streams()
@@ -1221,12 +1219,14 @@ fn ffmpeg_decode_limited(
     let channels = 2usize;
     let interleaved: Vec<f32> = out
         .stdout
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     let n = interleaved.len() / channels;
     let n = n.min(max_samples);
-    let mut planes = vec![Vec::with_capacity(n); channels];
+    let mut planes: Vec<Vec<f32>> = (0..channels).map(|_| Vec::with_capacity(n)).collect();
     for (i, value) in interleaved.into_iter().enumerate().take(n * channels) {
         planes[i % channels].push(value);
     }
@@ -1659,8 +1659,8 @@ fn band_error_vs_reference() {
                         }
                         fft(&mut s.0, &mut s.1);
                     }
-                    for k in 0..=FRAME / 2 {
-                        let Some(b) = band_of[k] else { continue };
+                    for (k, band) in band_of.iter().enumerate().take(FRAME / 2 + 1) {
+                        let Some(b) = *band else { continue };
                         let (sr, si) = (spec[0].0[k], spec[0].1[k]);
                         e_src[b] += sr * sr + si * si;
                         let (ur, ui) = (spec[1].0[k], spec[1].1[k]);

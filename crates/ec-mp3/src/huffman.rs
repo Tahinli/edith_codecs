@@ -445,7 +445,7 @@ mod tests {
                 byte = 0;
             }
         }
-        if bits.len() % 8 != 0 {
+        if !bits.len().is_multiple_of(8) {
             want.push(byte << (8 - bits.len() % 8));
         }
         assert_eq!(writer.into_bytes(), want);

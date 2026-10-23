@@ -100,15 +100,15 @@ impl Pps {
         } else {
             None
         };
-        let num_ref_idx_l0_default_active = r.read_ue()? + 1;
-        let num_ref_idx_l1_default_active = r.read_ue()? + 1;
+        let num_ref_idx_l0_default_active = r.read_ue()?.saturating_add(1);
+        let num_ref_idx_l1_default_active = r.read_ue()?.saturating_add(1);
         if num_ref_idx_l0_default_active > 32 || num_ref_idx_l1_default_active > 32 {
             return Err(Error::corrupt("num_ref_idx_default_active > 32"));
         }
         let weighted_pred = r.read_bit()?;
         let weighted_bipred_idc = r.read_bits(2)? as u8;
-        let pic_init_qp = 26 + r.read_se()?;
-        let pic_init_qs = 26 + r.read_se()?;
+        let pic_init_qp = 26i32.saturating_add(r.read_se()?);
+        let pic_init_qs = 26i32.saturating_add(r.read_se()?);
         let chroma_qp_index_offset = r.read_se()?;
         if !(-12..=12).contains(&chroma_qp_index_offset) {
             return Err(Error::corrupt("chroma_qp_index_offset outside [-12, 12]"));

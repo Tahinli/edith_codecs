@@ -31,18 +31,21 @@
 //! - **Dialogue normalisation is surfaced, never applied.** §7.6 puts
 //!   `dialnorm` in the volume control, which is not in this crate.
 //! - **The noise this format asks for is on by default**: dither for zero-bit
-//!   mantissas (§7.3.4) and the spectral extension blend (§E3.6.4.2.4). Neither
-//!   sequence is specified, so two conformant decoders differ by exactly that
-//!   noise; [`Options::dither`] turns both off when a comparison needs to
-//!   isolate everything else.
+//!   mantissas (§7.3.4) and the spectral extension blend (§E3.6.4.2.4). The
+//!   sequence is not specified, so this crate uses the lagged-Fibonacci
+//!   generator ffmpeg's AC-3 decoder uses, seeded and drawn in the same order;
+//!   a decode then matches ffmpeg's noise sample for sample. [`Options::dither`]
+//!   turns both off when a comparison needs to isolate everything else.
 //!
 //! Annex E coverage: the adaptive hybrid transform (with its vector and
 //! gain-adaptive quantizers) and spectral extension are decoded; enhanced
-//! coupling and dependent substreams above 5.1 are refused by name rather than
-//! decoded wrongly. On a real Dolby Digital Plus stream that uses both, the
+//! coupling is refused by name rather than decoded wrongly. E-AC-3 dependent
+//! substreams are decoded and placed by their custom channel map, as ffmpeg
+//! places them: a position the independent substream already has is replaced,
+//! any other is added (see the `dependent` module); independent substreams past
+//! the first in a packet are refused. On a real Dolby Digital Plus stream that uses both, the
 //! coded bins land within 0.01% of the oracle's energy and the whole channel within
-//! 0.999 correlation once the two decoders' independent noise is taken out of
-//! the comparison ([`Options::dither`]).
+//! 0.999 correlation.
 //!
 //! No unsafe, no allocation on the block path beyond the output buffer, and no
 //! dependencies beyond the family IR and DSP crates.
@@ -68,6 +71,7 @@ pub mod tables;
 pub mod transform;
 
 mod decode;
+mod dependent;
 mod decoder;
 pub mod encode;
 

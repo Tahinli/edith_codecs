@@ -494,7 +494,7 @@ fn main() {
                 let mut off = 0;
                 for p in planes {
                     let end = off + 2 * p.len();
-                    for (d, &s) in buf[off..end].chunks_exact_mut(2).zip(p.iter()) {
+                    for (d, &s) in buf[off..end].as_chunks_mut::<2>().0.iter_mut().zip(p.iter()) {
                         d.copy_from_slice(&s.to_le_bytes());
                     }
                     off = end;

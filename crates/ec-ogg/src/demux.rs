@@ -174,7 +174,9 @@ impl<R: Read + Seek> OggDemuxer<R> {
         for (i, granule) in last.into_iter().enumerate() {
             if let Some(granule) = granule {
                 let start = self.streams[i].start_time.unwrap_or(0);
-                self.streams[i].duration = Some((granule - start).max(0));
+                // A granule too close to i64::MIN to subtract the pre-skip from states no
+                // duration, rather than wrapping into a bogus one.
+                self.streams[i].duration = granule.checked_sub(start).map(|d| d.max(0));
             }
         }
         self.inner.seek(SeekFrom::Start(resume))?;
@@ -276,7 +278,12 @@ impl<R: Read + Seek> OggDemuxer<R> {
                     // block needs its predecessor to overlap) is the decoder's.
                     out.flags.keyframe = true;
                     match duration {
-                        Some(d) if pos_known => pos += d,
+                        // Past i64::MAX the position is no longer known, like an
+                        // unknown duration: the next page granule re-anchors it.
+                        Some(d) if pos_known => match pos.checked_add(d) {
+                            Some(next) => pos = next,
+                            None => pos_known = false,
+                        },
                         Some(_) => {}
                         None => pos_known = false,
                     }

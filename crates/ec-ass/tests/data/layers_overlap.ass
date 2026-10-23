@@ -1,0 +1,23 @@
+[Script Info]
+Title: Layers and overlapping events
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Main,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: Sign,Arial,30,&H0000FF00,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 1,0:00:05.00,0:00:09.00,Sign,,0,0,0,,Sign on layer one, starts late
+Dialogue: 0,0:00:02.00,0:00:06.00,Main,,0,0,0,,Main line A, starts early
+Dialogue: 0,0:00:04.00,0:00:08.00,Main,,0,0,0,,Main line B overlaps A
+Dialogue: 2,0:00:04.50,0:00:05.50,Sign,,0,0,0,,Top layer flash
+Dialogue: 0,0:00:08.00,0:00:08.00,Main,,0,0,0,,Zero length
+Dialogue: 0,0:00:08.00,0:00:10.00,Main,,0,0,0,,Back to back after zero
+Dialogue: 1,0:00:02.00,0:00:03.00,Sign,,0,0,0,,Same start as main A, layer one
+Dialogue: 0,0:00:02.00,0:00:03.00,Main,,0,0,0,,Same start, layer zero, later in file
+Dialogue: 0,0:00:10.00,0:00:12.00,Main,,0,0,0,,Gap then a line

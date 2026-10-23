@@ -1070,6 +1070,8 @@ pub(crate) fn has_top_right(mi_row: usize, mi_col: usize, bw4: usize, bh4: usize
 /// as the block's neighbours above), which is what makes the row and column
 /// scans asymmetric under transposing a grid — spec has no matching
 /// bottom-left probe.
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 fn scan_top_right(
     grid: &MiGrid,
     mi_row: usize,
@@ -1193,6 +1195,8 @@ fn clamp_mv_ref(
 /// traced path keeps the exact same reads in the exact same order.
 #[cold]
 #[inline(never)]
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 fn tpl_trace_sample(
     field: &crate::motion_field::TplField,
     mi_row: usize,
@@ -1220,6 +1224,8 @@ fn tpl_trace_sample(
 /// reference offsets and discards the values.
 #[cold]
 #[inline(never)]
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 fn tpl_trace_sample_compound(
     field: &crate::motion_field::TplField,
     mi_row: usize,
@@ -1252,6 +1258,8 @@ fn tpl_trace_sample_compound(
 /// thread -- and every one of the up-to-19 probes per inter block paid a
 /// call plus the argument shuffle. Same reads, same order.
 #[inline(always)]
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 fn tpl_sample(
     probe: &crate::motion_field::TplProbe<'_>,
     trace_tpl: bool,
@@ -1337,6 +1345,8 @@ fn tpl_sample_compound(
 /// block at `(mi_row, mi_col)`, predicting against `ref_frame`, in a frame
 /// that is `mi_cols`-by-`mi_rows` 4x4 units (used only to clamp the
 /// predictors to the frame, spec 7.10.2.14).
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn find_mv_stack(
     grid: &MiGrid,
     mi_row: usize,
@@ -2254,7 +2264,6 @@ fn combine_compound_candidates(
 /// ports of libaom's real behaviour as of r5 — see the inline comments at
 /// each site.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn find_mv_stack_compound(
     grid: &MiGrid,
     mi_row: usize,
@@ -2924,9 +2933,7 @@ pub(crate) fn comp_reference_type_ctx(
             }
         },
         (Some(e), None) | (None, Some(e)) => {
-            if !e.is_inter {
-                2
-            } else if e.ref1.is_none() {
+            if !e.is_inter || e.ref1.is_none() {
                 2
             } else {
                 4 * usize::from(e.uni)

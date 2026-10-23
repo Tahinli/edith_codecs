@@ -7,7 +7,7 @@
 //! told the whole buffer on every picture, so these lists are the parameter
 //! buffer's contents rather than an internal detail.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ec_h264_syntax::{DecRefPicMarking, RefPicListMod, SliceType, Sps};
 
@@ -34,7 +34,7 @@ pub(crate) struct Picture {
     /// Identity, so "the picture just stored" survives reordering.
     pub id: i32,
     /// The surface it decoded into.
-    pub surface: Arc<PooledSurface>,
+    pub surface: Rc<PooledSurface>,
     /// Presentation timestamp of the access unit it came from.
     pub timestamp: i64,
     /// `frame_num`.
@@ -94,7 +94,7 @@ impl RefList {
         (idx < self.len).then(|| usize::from(self.entries[idx]))
     }
 
-    fn push(&mut self, idx: usize) {
+    pub(crate) fn push(&mut self, idx: usize) {
         if self.len < self.entries.len() {
             self.entries[self.len] = idx as u8;
             self.len += 1;
@@ -328,16 +328,13 @@ impl Dpb {
     /// with `operation failed` (measured on radeonsi with a two-picture gap).
     pub(crate) fn fill_frame_num_gap(&mut self, sps: &Sps, frame_num: u32) -> Result<usize> {
         let max = 1u32 << sps.log2_max_frame_num;
-        let mut unused = (self.prev_ref_frame_num + 1) % max;
-        let mut budget = MAX_STORED;
         let mut filled = 0;
-        while unused != frame_num && budget > 0 {
-            budget -= 1;
+        for unused in gap_frame_nums(self.prev_ref_frame_num, frame_num, max).take(MAX_STORED) {
             let Some(surface) = self
                 .frames
                 .iter()
                 .max_by_key(|p| p.frame_num_wrap)
-                .map(|p| Arc::clone(&p.surface))
+                .map(|p| Rc::clone(&p.surface))
             else {
                 // Nothing decoded yet: there is no picture to stand in for the
                 // missing ones, and the next IDR will resynchronise anyway.
@@ -382,7 +379,6 @@ impl Dpb {
             self.prev_frame_num_offset = poc.frame_num_offset;
             self.prev_has_mmco5 = false;
             self.prev_ref_frame_num = unused;
-            unused = (unused + 1) % max;
             filled += 1;
         }
         Ok(filled)
@@ -860,6 +856,23 @@ fn max_dpb_frames(sps: &Sps) -> usize {
     ((max_dpb_mbs / mbs) as usize).clamp(1, 16)
 }
 
+/// The `frame_num` values 8.2.5.2 infers for a gap after `prev_ref`, in decode
+/// order: `prev_ref + 1` up to, not including, `frame_num`, wrapping at `max`.
+/// Empty when there is no gap. Bounded by `max` so a `frame_num` out of range
+/// cannot spin.
+pub(crate) fn gap_frame_nums(prev_ref: u32, frame_num: u32, max: u32) -> impl Iterator<Item = u32> {
+    let mut next = (prev_ref + 1) % max;
+    std::iter::from_fn(move || {
+        if next == frame_num {
+            return None;
+        }
+        let value = next;
+        next = (next + 1) % max;
+        Some(value)
+    })
+    .take(max as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,6 +965,33 @@ mod tests {
         dpb.prev_ref_frame_num = 15;
         assert!(!dpb.frame_num_gap(&sps, 0));
         assert!(dpb.frame_num_gap(&sps, 1));
+    }
+
+    // Regression: an open-GOP seek used to be refused outright when the SPS did
+    // not declare gaps (edith cros-codecs h264.rs patch). The gap is ours, so it
+    // must be detected and filled whatever the flag says.
+    #[test]
+    fn frame_num_gap_fill_ignores_the_sps_flag_and_wraps() {
+        let sps = Sps {
+            gaps_in_frame_num_allowed: false,
+            ..sps_for(0)
+        };
+        let dpb = Dpb {
+            started: true,
+            prev_ref_frame_num: 3,
+            ..Dpb::default()
+        };
+        assert!(dpb.frame_num_gap(&sps, 6));
+        assert_eq!(gap_frame_nums(3, 6, 16).collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(
+            gap_frame_nums(14, 2, 16).collect::<Vec<_>>(),
+            vec![15, 0, 1]
+        );
+        assert_eq!(gap_frame_nums(15, 1, 16).collect::<Vec<_>>(), vec![0]);
+        assert!(gap_frame_nums(15, 0, 16).next().is_none());
+        assert!(gap_frame_nums(4, 5, 16).next().is_none());
+        // An out-of-range frame_num terminates instead of looping.
+        assert_eq!(gap_frame_nums(0, 99, 16).count(), 16);
     }
 
     #[test]

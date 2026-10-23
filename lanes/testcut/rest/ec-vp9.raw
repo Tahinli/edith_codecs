@@ -1,0 +1,177 @@
+{ "type": "suite", "event": "started", "test_count": 17 }
+{ "type": "test", "event": "started", "name": "bool::tests::overreads_are_counted_not_panicked" }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_bools_at_every_extreme" }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_literals" }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_long_random_streams" }
+{ "type": "test", "name": "bool::tests::roundtrips_literals", "event": "ok", "exec_time": 0.000013014 }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_signed_literals" }
+{ "type": "test", "name": "bool::tests::roundtrips_bools_at_every_extreme", "event": "ok", "exec_time": 0.000006363 }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_tree_values" }
+{ "type": "test", "name": "bool::tests::roundtrips_long_random_streams", "event": "ok", "exec_time": 0.000070202 }
+{ "type": "test", "event": "started", "name": "bool::tests::short_partitions_zero_extend" }
+{ "type": "test", "name": "bool::tests::overreads_are_counted_not_panicked", "event": "ok", "exec_time": 0.000003748 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::luma_int4_h_edge_is_filtered_on_the_last_mi_row" }
+{ "type": "test", "name": "bool::tests::roundtrips_signed_literals", "event": "ok", "exec_time": 0.000007474 }
+{ "type": "test", "event": "started", "name": "mc::tests::unscaled_fast_path_matches_per_sample_reference" }
+{ "type": "test", "name": "bool::tests::roundtrips_tree_values", "event": "ok", "exec_time": 0.000006583 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::every_by_value_module_is_scanned" }
+{ "type": "test", "name": "bool::tests::short_partitions_zero_extend", "event": "ok", "exec_time": 0.000001303 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::every_by_value_public_return_is_in_the_inventory" }
+{ "type": "test", "name": "loopfilter::tests::luma_int4_h_edge_is_filtered_on_the_last_mi_row", "event": "ok", "exec_time": 0.000254118 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::every_by_value_type_fits_the_stack_budget" }
+{ "type": "test", "name": "stack_budget::tests::every_by_value_module_is_scanned", "event": "ok", "exec_time": 0.00003183 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::the_deepest_by_value_constructors_fit_on_a_tight_stack" }
+{ "type": "test", "name": "stack_budget::tests::every_by_value_type_fits_the_stack_budget", "event": "ok", "exec_time": 0.000001502 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::the_frame_contexts_stay_behind_a_box" }
+{ "type": "test", "name": "stack_budget::tests::the_deepest_by_value_constructors_fit_on_a_tight_stack", "event": "ok", "exec_time": 0.000211217 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::the_inventory_scan_is_not_vacuous" }
+{ "type": "test", "name": "stack_budget::tests::every_by_value_public_return_is_in_the_inventory", "event": "ok", "exec_time": 0.001469513 }
+{ "type": "test", "event": "started", "name": "stack_budget::tests::the_measured_inventory_is_accurate" }
+{ "type": "test", "name": "stack_budget::tests::the_inventory_scan_is_not_vacuous", "event": "ok", "exec_time": 0.000007003 }
+{ "type": "test", "event": "started", "name": "transform::scratch_probe::probe_dc38" }
+{ "type": "test", "name": "stack_budget::tests::the_frame_contexts_stay_behind_a_box", "event": "ok", "exec_time": 0.000062358 }
+{ "type": "test", "name": "stack_budget::tests::the_measured_inventory_is_accurate", "event": "ok", "exec_time": 0.000012032 }
+{ "type": "test", "name": "transform::scratch_probe::probe_dc38", "event": "ok", "exec_time": 0.000017152 }
+{ "type": "test", "name": "mc::tests::unscaled_fast_path_matches_per_sample_reference", "event": "ok", "exec_time": 0.071298637 }
+{ "type": "suite", "event": "ok", "passed": 17, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.072905456 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "diff_stats" }
+{ "type": "test", "name": "diff_stats", "event": "ok", "exec_time": 0.19734802 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.198034659 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "frame_area_product_does_not_overflow" }
+{ "type": "test", "event": "started", "name": "oversized_keyframe_header_is_refused_before_allocation" }
+{ "type": "test", "name": "frame_area_product_does_not_overflow", "event": "ok", "exec_time": 0.000276439 }
+{ "type": "test", "name": "oversized_keyframe_header_is_refused_before_allocation", "event": "ok", "exec_time": 0.000207349 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.0007287 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "profile2_10bit_is_byte_exact" }
+{ "type": "test", "name": "profile2_10bit_is_byte_exact", "event": "ok", "exec_time": 1.9941712169999999 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 1.9946939989999999 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "corpus_1080p_60fps_matches_ffmpeg_past_frame_72" }
+{ "type": "test", "event": "started", "name": "inter_gop_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "inter_gop_with_tile_columns_matches_ffmpeg" }
+{ "type": "test", "name": "inter_gop_with_tile_columns_matches_ffmpeg", "event": "ok", "exec_time": 0.483131996 }
+{ "type": "test", "name": "inter_gop_matches_ffmpeg", "event": "ok", "exec_time": 0.509396992 }
+{ "type": "test", "name": "corpus_1080p_60fps_matches_ffmpeg_past_frame_72", "event": "ok", "exec_time": 4.159587371 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 4.162243221 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "intra_only_frame_and_its_successors_match_ffmpeg" }
+{ "type": "test", "name": "intra_only_frame_and_its_successors_match_ffmpeg", "event": "ok", "exec_time": 0.187204985 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.187652106 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00003231 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "inter_stream_decodes_and_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "keyframes_match_ffmpeg" }
+{ "type": "test", "event": "started", "name": "lossless_64_matches_ffmpeg" }
+{ "type": "test", "name": "lossless_64_matches_ffmpeg", "event": "ok", "exec_time": 0.148360346 }
+{ "type": "test", "name": "keyframes_match_ffmpeg", "event": "ok", "exec_time": 0.157730046 }
+{ "type": "test", "name": "inter_stream_decodes_and_matches_ffmpeg", "event": "ok", "exec_time": 0.240004944 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.240569555 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "libvpx_vectors_match_per_frame_md5" }
+{ "type": "test", "event": "started", "name": "md5_known_answers" }
+{ "type": "test", "name": "md5_known_answers", "event": "ok", "exec_time": 0.000050415 }
+{ "type": "test", "event": "timeout", "name": "libvpx_vectors_match_per_frame_md5" }
+{ "type": "test", "name": "libvpx_vectors_match_per_frame_md5", "event": "ok", "exec_time": 92.682508814 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 92.683131042 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "truncated_and_corrupted_streams_never_panic" }
+{ "type": "test", "name": "truncated_and_corrupted_streams_never_panic", "event": "ok", "exec_time": 9.978908775 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 9.979411471 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "odd_height_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "odd_width_and_height_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "odd_width_matches_ffmpeg" }
+{ "type": "test", "name": "odd_height_matches_ffmpeg", "event": "ok", "exec_time": 0.519493509 }
+{ "type": "test", "name": "odd_width_and_height_matches_ffmpeg", "event": "ok", "exec_time": 0.556085043 }
+{ "type": "test", "name": "odd_width_matches_ffmpeg", "event": "ok", "exec_time": 0.571605605 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.572468607 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "size_changing_odd_reference_decodes_byte_exact" }
+{ "type": "test", "event": "started", "name": "size_changing_reference_decodes_byte_exact" }
+{ "type": "test", "name": "size_changing_reference_decodes_byte_exact", "event": "ok", "exec_time": 0.405603411 }
+{ "type": "test", "name": "size_changing_odd_reference_decodes_byte_exact", "event": "ok", "exec_time": 0.40888587 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.409180693 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "probe_first_bools" }
+{ "type": "test", "name": "probe_first_bools", "event": "ok", "exec_time": 0.000070883 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000559031 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "show_err" }
+{ "type": "test", "name": "show_err", "event": "ok", "exec_time": 0.004651382 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00507059 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "hdr_probe" }
+{ "type": "test", "name": "hdr_probe", "event": "ok", "exec_time": 0.000093676 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000502746 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "dump_hdr" }
+{ "type": "test", "name": "dump_hdr", "event": "ok", "exec_time": 0.000061966 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00049971 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "dump_hdr" }
+{ "type": "test", "name": "dump_hdr", "event": "ok", "exec_time": 0.000147656 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000490742 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "dump_lf_diff_map" }
+{ "type": "test", "name": "dump_lf_diff_map", "event": "ok", "exec_time": 0.149352621 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.149701457 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "lossless_matches" }
+{ "type": "test", "name": "lossless_matches", "event": "ok", "exec_time": 0.172556383 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.172911601 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "pixdump" }
+{ "type": "test", "name": "pixdump", "event": "ok", "exec_time": 0.000004549 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000269376 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "pixdump10" }
+{ "type": "test", "name": "pixdump10", "event": "ok", "exec_time": 0.000006823 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000312748 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "real_content_sweep" }
+{ "type": "test", "name": "real_content_sweep", "event": "ok", "exec_time": 0.000017453 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000529766 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "sweep" }
+{ "type": "test", "name": "sweep", "event": "ok", "exec_time": 0.202797583 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.203478872 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "synth" }
+{ "type": "test", "name": "synth", "event": "ok", "exec_time": 0.000021311 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000379934 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "tile_dbg" }
+{ "type": "test", "name": "tile_dbg", "event": "ok", "exec_time": 0.00000569 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000403278 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "dump_tok_trace" }
+{ "type": "test", "name": "dump_tok_trace", "event": "ok", "exec_time": 0.006791775 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.007235509 }
+{ "type": "suite", "event": "started", "test_count": 10 }
+{ "type": "test", "event": "started", "name": "corpus_profile1_444_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "corpus_profile3_444_10bit_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "profile1_422_8bit_is_byte_exact" }
+{ "type": "test", "event": "started", "name": "profile1_440_8bit_is_byte_exact" }
+{ "type": "test", "name": "profile1_422_8bit_is_byte_exact", "event": "ok", "exec_time": 0.278350095 }
+{ "type": "test", "event": "started", "name": "profile1_444_8bit_is_byte_exact" }
+{ "type": "test", "name": "profile1_440_8bit_is_byte_exact", "event": "ok", "exec_time": 0.280191977 }
+{ "type": "test", "event": "started", "name": "profile2_420_12bit_is_byte_exact" }
+{ "type": "test", "name": "corpus_profile1_444_matches_ffmpeg", "event": "ok", "exec_time": 0.363449651 }
+{ "type": "test", "event": "started", "name": "profile3_422_10bit_is_byte_exact" }
+{ "type": "test", "name": "corpus_profile3_444_10bit_matches_ffmpeg", "event": "ok", "exec_time": 0.397341201 }
+{ "type": "test", "event": "started", "name": "profile3_440_10bit_is_byte_exact" }
+{ "type": "test", "name": "profile2_420_12bit_is_byte_exact", "event": "ok", "exec_time": 0.228295536 }
+{ "type": "test", "event": "started", "name": "profile3_444_10bit_is_byte_exact" }
+{ "type": "test", "name": "profile1_444_8bit_is_byte_exact", "event": "ok", "exec_time": 0.291173456 }
+{ "type": "test", "event": "started", "name": "profile3_444_12bit_is_byte_exact" }
+{ "type": "test", "name": "profile3_422_10bit_is_byte_exact", "event": "ok", "exec_time": 0.244524449 }
+{ "type": "test", "name": "profile3_440_10bit_is_byte_exact", "event": "ok", "exec_time": 0.237878698 }
+{ "type": "test", "name": "profile3_444_10bit_is_byte_exact", "event": "ok", "exec_time": 0.253752463 }
+{ "type": "test", "name": "profile3_444_12bit_is_byte_exact", "event": "ok", "exec_time": 0.249093747 }
+{ "type": "suite", "event": "ok", "passed": 10, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.820530743 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00005333 }

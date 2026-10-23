@@ -278,7 +278,9 @@ impl<'a> FlacReader<'a> {
                 0 => self.stream_info = Some(StreamInfo::parse(body)?),
                 3 => {
                     self.seek_table = body
-                        .chunks_exact(18)
+                        .as_chunks::<18>()
+                        .0
+                        .iter()
                         .map(|p| SeekPoint {
                             sample: u64::from_be_bytes(p[0..8].try_into().expect("8 bytes")),
                             offset: u64::from_be_bytes(p[8..16].try_into().expect("8 bytes")),
@@ -331,12 +333,20 @@ impl<'a> FlacReader<'a> {
             .iter()
             .filter(|p| p.sample <= sample)
             .max_by_key(|p| p.sample);
-        match point {
-            Some(p) if self.first_frame + p.offset as usize <= self.data.len() => {
-                self.pos = self.first_frame + p.offset as usize;
-                p.sample
+        // The offset comes from the file: a hostile one must not overflow the sum
+        // or truncate on a 32-bit target, so it is checked as a whole.
+        let target = point.and_then(|p| {
+            let at = usize::try_from(p.offset)
+                .ok()?
+                .checked_add(self.first_frame)?;
+            (at <= self.data.len()).then_some((at, p.sample))
+        });
+        match target {
+            Some((at, sample)) => {
+                self.pos = at;
+                sample
             }
-            _ => {
+            None => {
                 self.pos = self.first_frame;
                 0
             }
@@ -964,5 +974,35 @@ mod tests {
         assert_eq!(container_shift(20), 12);
         assert_eq!(container_shift(24), 8);
         assert_eq!(container_shift(32), 0);
+    }
+
+    /// Fuzzer find (parse_metadata): a seek-table offset of u64::MAX overflowed
+    /// `first_frame + offset`. It must now be treated as "no such point".
+    #[test]
+    fn seek_table_offset_overflow_does_not_panic() {
+        let info = StreamInfo {
+            min_block_size: 4096,
+            max_block_size: 4096,
+            min_frame_size: 0,
+            max_frame_size: 0,
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+            total_samples: 0,
+            md5: [0; 16],
+        };
+        let mut data = MAGIC.to_vec();
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 34]);
+        data.extend_from_slice(&info.to_bytes());
+        // SEEKTABLE, last block: one point at sample 0, offset u64::MAX.
+        data.extend_from_slice(&[0x83, 0x00, 0x00, 18]);
+        data.extend_from_slice(&0u64.to_be_bytes());
+        data.extend_from_slice(&u64::MAX.to_be_bytes());
+        data.extend_from_slice(&16u16.to_be_bytes());
+
+        let mut reader = FlacReader::new(&data).expect("open");
+        assert_eq!(reader.seek_table().len(), 1);
+        assert_eq!(reader.seek_to_sample(0), 0);
+        assert_eq!(reader.position(), reader.first_frame);
     }
 }

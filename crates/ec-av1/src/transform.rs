@@ -111,26 +111,37 @@ fn clamp_range(x: i32, r: usize) -> i32 {
 /// output share the whole network). The two impls are elementwise-identical
 /// integer arithmetic, so the eight-wide pass is byte-exact with the scalar
 /// one by construction -- the network itself is written once, above.
-// `unsafe fn` only so the AVX2 impl can carry `#[target_feature]` (rustc
-// rejects it on a SAFE trait method); the two scalar impls below require
-// nothing of their caller.
-#[allow(unsafe_code)]
 trait Lane: Copy {
     /// One butterfly rotation's two outputs, at pre-multiplied `cos`/`sin`.
-    ///
-    /// # Safety
-    /// An impl may require CPU features: `M256`'s is `#[target_feature]` AVX2,
-    /// which is the only way its intrinsics compile INLINE -- as plain safe
-    /// methods every `_mm256_*` stayed an out-of-line call (13% of the 4K
-    /// segment's profile). `M256` values exist only inside
-    /// [`simd::column_pass_dct`], which its caller has feature-detected; the
-    /// scalar impls require nothing.
-    unsafe fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self);
+    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self);
     /// One Hadamard rotation's two outputs, clamped to `r` bits.
-    ///
-    /// # Safety
-    /// As [`Lane::btf`].
-    unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self);
+    fn had(a: Self, b: Self, r: usize) -> (Self, Self);
+}
+
+/// The butterfly and Hadamard rotations a DCT network runs; the clamp width of
+/// the Hadamards lives in the kernel. The network is written once over this
+/// trait. [`Scalar`] forwards to [`Lane`]; the AVX2 kernel is a pair of
+/// closures built inside a `#[target_feature(enable = "avx2")]` function,
+/// which inherit the feature -- the only way its intrinsics compile INLINE (as
+/// plain trait methods every `_mm256_*` stayed an out-of-line call, 13% of the
+/// 4K segment's profile).
+trait Kern<T> {
+    fn btf(&self, a: T, b: T, c: i64, s: i64) -> (T, T);
+    fn had(&self, a: T, b: T) -> (T, T);
+}
+
+/// The scalar kernel, clamping its Hadamards to `.0` bits.
+struct Scalar(usize);
+
+impl<T: Lane> Kern<T> for Scalar {
+    #[inline(always)]
+    fn btf(&self, a: T, b: T, c: i64, s: i64) -> (T, T) {
+        T::btf(a, b, c, s)
+    }
+    #[inline(always)]
+    fn had(&self, a: T, b: T) -> (T, T) {
+        T::had(a, b, self.0)
+    }
 }
 
 /// `Round2(x, COS_BITS)` on a butterfly's 64-bit product sum.
@@ -138,14 +149,13 @@ fn round_cos(x: i64) -> i32 {
     ((x + (1 << (COS_BITS - 1))) >> COS_BITS) as i32
 }
 
-#[allow(unsafe_code)]
 impl Lane for i32 {
-    unsafe fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
         let (ta, tb) = (i64::from(a), i64::from(b));
         (round_cos(ta * c - tb * s), round_cos(ta * s + tb * c))
     }
 
-    unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
+    fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
         (
             clamp_range(a.wrapping_add(b), r),
             clamp_range(a.wrapping_sub(b), r),
@@ -155,9 +165,8 @@ impl Lane for i32 {
 
 /// Eight columns at once. Every operation is the [`i32`] impl's, lane by lane,
 /// which is what the optimiser turns into one vector op per line.
-#[allow(unsafe_code)]
 impl Lane for [i32; 8] {
-    unsafe fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
         let mut x = [0i32; 8];
         let mut y = [0i32; 8];
         for l in 0..8 {
@@ -168,7 +177,7 @@ impl Lane for [i32; 8] {
         (x, y)
     }
 
-    unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
+    fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
         let mut x = [0i32; 8];
         let mut y = [0i32; 8];
         for l in 0..8 {
@@ -184,26 +193,48 @@ impl Lane for [i32; 8] {
 /// byte-exact with the scalar network on every input, not only on conformant
 /// ones (`the_avx2_dct_matches_the_scalar_one_over_the_full_range`).
 #[cfg(target_arch = "x86_64")]
-#[allow(unsafe_code)]
 mod simd {
-    use super::{COS_BITS, Lane, inverse_dct_n};
+    use super::{COS_BITS, Kern, inverse_dct_n};
     use std::arch::x86_64::*;
 
     /// Eight `i32` lanes in one AVX2 register.
     #[derive(Clone, Copy)]
     pub(super) struct M256(pub(super) __m256i);
 
-    impl Lane for M256 {
-        /// `round_cos(a*c - b*s)`, `round_cos(a*s + b*c)`.
-        ///
-        /// `_mm256_mul_epi32` multiplies the sign-extended low `i32` of each
-        /// 64-bit lane, so the four even lanes go through directly and the four
-        /// odd ones after a shuffle; the products and their sum are exact in 64
-        /// bits (`|a| < 2^31`, `|c| <= 2^12`), and only the low 32 bits of the
-        /// shifted sum are kept -- which is what the scalar `as i32` keeps, so
-        /// the logical shift below stands in for the arithmetic one exactly.
-        #[target_feature(enable = "avx2")]
-        unsafe fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+    /// The AVX2 kernel: closures made inside a `#[target_feature]` function.
+    struct Avx<F, G> {
+        btf: F,
+        had: G,
+    }
+
+    impl<F, G> Kern<M256> for Avx<F, G>
+    where
+        F: Fn(M256, M256, i64, i64) -> (M256, M256),
+        G: Fn(M256, M256) -> (M256, M256),
+    {
+        #[inline(always)]
+        fn btf(&self, a: M256, b: M256, c: i64, s: i64) -> (M256, M256) {
+            (self.btf)(a, b, c, s)
+        }
+        #[inline(always)]
+        fn had(&self, a: M256, b: M256) -> (M256, M256) {
+            (self.had)(a, b)
+        }
+    }
+
+    /// [`super::inverse_dct_fixed`] over eight AVX2 lanes -- the network the
+    /// column pass below runs, reachable on its own for the equivalence gate.
+    ///
+    /// The butterfly is `round_cos(a*c - b*s)`, `round_cos(a*s + b*c)`.
+    /// `_mm256_mul_epi32` multiplies the sign-extended low `i32` of each
+    /// 64-bit lane, so the four even lanes go through directly and the four
+    /// odd ones after a shuffle; the products and their sum are exact in 64
+    /// bits (`|a| < 2^31`, `|c| <= 2^12`), and only the low 32 bits of the
+    /// shifted sum are kept -- which is what the scalar `as i32` keeps, so
+    /// the logical shift stands in for the arithmetic one exactly.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn dct_x8_avx2(t: &mut [M256; 64], n: u32, r: usize) {
+        let btf = |a: M256, b: M256, c: i64, s: i64| {
             let cv = _mm256_set1_epi32(c as i32);
             let sv = _mm256_set1_epi32(s as i32);
             let rnd = _mm256_set1_epi64x(1 << (COS_BITS - 1));
@@ -226,44 +257,43 @@ mod simd {
                 M256(_mm256_blend_epi32::<0xAA>(xe, _mm256_slli_epi64::<32>(xo))),
                 M256(_mm256_blend_epi32::<0xAA>(ye, _mm256_slli_epi64::<32>(yo))),
             )
-        }
-
-        #[target_feature(enable = "avx2")]
-        unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
-            let hi = _mm256_set1_epi32(((1i64 << (r - 1)) - 1) as i32);
-            let lo = _mm256_set1_epi32((-(1i64 << (r - 1))) as i32);
+        };
+        let hi = _mm256_set1_epi32(((1i64 << (r - 1)) - 1) as i32);
+        let lo = _mm256_set1_epi32((-(1i64 << (r - 1))) as i32);
+        let had = |a: M256, b: M256| {
             let clamp = |v| _mm256_min_epi32(_mm256_max_epi32(v, lo), hi);
             (
                 M256(clamp(_mm256_add_epi32(a.0, b.0))),
                 M256(clamp(_mm256_sub_epi32(a.0, b.0))),
             )
-        }
-    }
-
-    /// [`super::inverse_dct_fixed`] over eight AVX2 lanes -- the network the
-    /// column pass below runs, reachable on its own for the equivalence gate.
-    ///
-    /// # Safety
-    /// The caller has checked for AVX2 ([`crate::mc::simd_level`]).
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn dct_x8_avx2(t: &mut [M256; 64], n: u32, r: usize) {
+        };
+        let k = Avx { btf, had };
         match n {
-            2 => inverse_dct_n::<M256, 2>(t, r),
-            3 => inverse_dct_n::<M256, 3>(t, r),
-            4 => inverse_dct_n::<M256, 4>(t, r),
-            5 => inverse_dct_n::<M256, 5>(t, r),
-            6 => inverse_dct_n::<M256, 6>(t, r),
+            2 => inverse_dct_n::<M256, _, 2>(t, &k),
+            3 => inverse_dct_n::<M256, _, 3>(t, &k),
+            4 => inverse_dct_n::<M256, _, 4>(t, &k),
+            5 => inverse_dct_n::<M256, _, 5>(t, &k),
+            6 => inverse_dct_n::<M256, _, 6>(t, &k),
             _ => unreachable!("the inverse DCT is defined for 4..64"),
         }
     }
 
+    /// The eight `i32`s at `s[at..at + 8]` as one register.
+    #[inline(always)]
+    fn load(s: &[i32], at: usize) -> __m256i {
+        bytemuck::pod_read_unaligned(bytemuck::cast_slice(&s[at..at + 8]))
+    }
+
+    /// Store `v` to `s[at..at + 8]`.
+    #[inline(always)]
+    fn store(s: &mut [i32], at: usize, v: __m256i) {
+        s[at..at + 8].copy_from_slice(&bytemuck::cast::<__m256i, [i32; 8]>(v));
+    }
+
     /// The whole DCT column pass of one transform unit: `residual` is the
     /// row-pass output (`h` rows of `w`), `out` the residual it writes.
-    ///
-    /// # Safety
-    /// The caller has checked for AVX2 ([`crate::mc::simd_level`]).
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn column_pass_dct(
+    pub(super) fn column_pass_dct(
         residual: &[i32],
         out: &mut [i32],
         w: usize,
@@ -275,8 +305,10 @@ mod simd {
         let mut t = [M256(_mm256_setzero_si256()); 64];
         for j in (0..w).step_by(8) {
             let mut any = _mm256_setzero_si256();
+            // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..h {
-                let v = unsafe { _mm256_loadu_si256(residual[i * w + j..].as_ptr().cast()) };
+                let v = load(residual, i * w + j);
                 t[i] = M256(v);
                 any = _mm256_or_si256(any, v);
             }
@@ -284,43 +316,87 @@ mod simd {
             if _mm256_testz_si256(any, any) == 1 {
                 continue;
             }
-            // SAFETY: this function's own AVX2 contract.
-            unsafe { dct_x8_avx2(&mut t, log2h, r) };
+            dct_x8_avx2(&mut t, log2h, r);
             // `round2(v, 4)` on eight lanes: the shift is arithmetic here
             // because the value stays in its own 32-bit lane.
             let rnd = _mm256_set1_epi32(8);
+            // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..h {
                 let dst_row = if ud_flip { h - 1 - i } else { i };
                 let v = _mm256_srai_epi32::<4>(_mm256_add_epi32(t[i].0, rnd));
-                unsafe { _mm256_storeu_si256(out[dst_row * w + j..].as_mut_ptr().cast(), v) };
+                store(out, dst_row * w + j, v);
             }
+        }
+    }
+
+    /// [`column_pass_dct`] when this CPU has AVX2 (the multiversion AVX2
+    /// clone), or `false` with nothing done.
+    #[multiversion::multiversion(targets("x86_64+avx2"))]
+    pub(super) fn column_pass_dct_dispatch(
+        residual: &[i32],
+        out: &mut [i32],
+        w: usize,
+        h: usize,
+        log2h: u32,
+        r: usize,
+        ud_flip: bool,
+    ) -> bool {
+        multiversion::target::match_target! {
+            "x86_64+avx2" => {
+                column_pass_dct(residual, out, w, h, log2h, r, ud_flip);
+                true
+            },
+            _ => {
+                let _ = (residual, out, w, h, log2h, r, ud_flip);
+                false
+            },
         }
     }
 
     /// The eight scalar lanes of `v`, for the equivalence gate.
     #[cfg(test)]
     pub(super) fn lanes(v: M256) -> [i32; 8] {
-        let mut o = [0i32; 8];
-        unsafe { _mm256_storeu_si256(o.as_mut_ptr().cast(), v.0) };
-        o
+        bytemuck::cast(v.0)
     }
 
     /// `M256` from eight lanes, for the equivalence gate.
     #[cfg(test)]
     pub(super) fn splat(v: [i32; 8]) -> M256 {
-        unsafe { M256(_mm256_loadu_si256(v.as_ptr().cast())) }
+        M256(bytemuck::cast(v))
+    }
+
+    /// [`dct_x8_avx2`] when this CPU has AVX2; `false` with nothing done
+    /// otherwise. For the equivalence gate.
+    #[cfg(test)]
+    #[multiversion::multiversion(targets("x86_64+avx2"))]
+    pub(super) fn dct_x8_dispatch(t: &mut [M256; 64], n: u32, r: usize) -> bool {
+        multiversion::target::match_target! {
+            "x86_64+avx2" => {
+                dct_x8_avx2(t, n, r);
+                true
+            },
+            _ => {
+                let _ = (t, n, r);
+                false
+            },
+        }
     }
 }
 
 /// `B(a, b, angle, flip, r)` (spec 7.13.2.1): a butterfly rotation, and an
 /// exchange of the two entries when `flip` is set.
 #[inline(always)]
-fn butterfly<T: Lane>(t: &mut [T; 64], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
+fn butterfly<T: Copy, K: Kern<T>>(
+    t: &mut [T; 64],
+    a: usize,
+    b: usize,
+    angle: i32,
+    flip: bool,
+    k: &K,
+) {
     let (c, s) = (i64::from(cos128(angle)), i64::from(sin128(angle)));
-    // SAFETY: [`Lane::btf`] -- an `M256` reaches here only from the
-    // feature-detected [`simd::column_pass_dct`].
-    #[allow(unsafe_code)]
-    let (x, y) = unsafe { T::btf(t[a], t[b], c, s) };
+    let (x, y) = k.btf(t[a], t[b], c, s);
     t[a] = x;
     t[b] = y;
     if flip {
@@ -331,11 +407,9 @@ fn butterfly<T: Lane>(t: &mut [T; 64], a: usize, b: usize, angle: i32, flip: boo
 /// `H(a, b, flip, r)` (spec 7.13.2.1): a Hadamard rotation, with the indices
 /// exchanged when `flip` is set.
 #[inline(always)]
-fn hadamard<T: Lane>(t: &mut [T; 64], a: usize, b: usize, flip: bool, r: usize) {
+fn hadamard<T: Copy, K: Kern<T>>(t: &mut [T; 64], a: usize, b: usize, flip: bool, k: &K) {
     let (a, b) = if flip { (b, a) } else { (a, b) };
-    // SAFETY: as [`butterfly`]'s.
-    #[allow(unsafe_code)]
-    let (x, y) = unsafe { T::had(t[a], t[b], r) };
+    let (x, y) = k.had(t[a], t[b]);
     t[a] = x;
     t[b] = y;
 }
@@ -343,12 +417,14 @@ fn hadamard<T: Lane>(t: &mut [T; 64], a: usize, b: usize, flip: bool, r: usize) 
 /// The inverse DCT array permutation (spec 7.13.2.2): an in-place bit-reversal
 /// of the first `1 << n` entries.
 #[inline(always)]
-fn permute<T: Lane>(t: &mut [T; 64], n: u32) {
+fn permute<T: Copy>(t: &mut [T; 64], n: u32) {
     let n0 = 1usize << n;
     // In place: a bit reversal is an involution, so swapping every `i` with
     // `brev(i) > i` visits each transposed pair once. The scratch copy this
     // replaces was a `[T; 64]` fill -- 2 KB per call at `T = M256`.
     let tab = &BREV_TAB[n as usize];
+    // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n0 {
         let j = tab[i] as usize;
         if j > i {
@@ -382,11 +458,11 @@ pub fn inverse_dct(t: &mut [i32], n: u32, r: usize) {
 /// compile-time constants instead of per-call work.
 fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
     match n {
-        2 => inverse_dct_n::<i32, 2>(t, r),
-        3 => inverse_dct_n::<i32, 3>(t, r),
-        4 => inverse_dct_n::<i32, 4>(t, r),
-        5 => inverse_dct_n::<i32, 5>(t, r),
-        6 => inverse_dct_n::<i32, 6>(t, r),
+        2 => inverse_dct_n::<i32, _, 2>(t, &Scalar(r)),
+        3 => inverse_dct_n::<i32, _, 3>(t, &Scalar(r)),
+        4 => inverse_dct_n::<i32, _, 4>(t, &Scalar(r)),
+        5 => inverse_dct_n::<i32, _, 5>(t, &Scalar(r)),
+        6 => inverse_dct_n::<i32, _, 6>(t, &Scalar(r)),
         _ => unreachable!("the inverse DCT is defined for 4..64"),
     }
 }
@@ -394,11 +470,11 @@ fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
 /// [`inverse_dct_fixed`] over eight columns at once (the column pass).
 fn inverse_dct_x8(t: &mut [[i32; 8]; 64], n: u32, r: usize) {
     match n {
-        2 => inverse_dct_n::<[i32; 8], 2>(t, r),
-        3 => inverse_dct_n::<[i32; 8], 3>(t, r),
-        4 => inverse_dct_n::<[i32; 8], 4>(t, r),
-        5 => inverse_dct_n::<[i32; 8], 5>(t, r),
-        6 => inverse_dct_n::<[i32; 8], 6>(t, r),
+        2 => inverse_dct_n::<[i32; 8], _, 2>(t, &Scalar(r)),
+        3 => inverse_dct_n::<[i32; 8], _, 3>(t, &Scalar(r)),
+        4 => inverse_dct_n::<[i32; 8], _, 4>(t, &Scalar(r)),
+        5 => inverse_dct_n::<[i32; 8], _, 5>(t, &Scalar(r)),
+        6 => inverse_dct_n::<[i32; 8], _, 6>(t, &Scalar(r)),
         _ => unreachable!("the inverse DCT is defined for 4..64"),
     }
 }
@@ -409,12 +485,12 @@ fn inverse_dct_x8(t: &mut [[i32; 8]; 64], n: u32, r: usize) {
 // call (measured: +5.6% instructions on the 4K segment). Every other
 // instantiation has exactly one caller, so this costs no extra copy.
 #[inline(always)]
-fn inverse_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
+fn inverse_dct_n<T: Copy, K: Kern<T>, const N: u32>(t: &mut [T; 64], k: &K) {
     permute(t, N);
 
     if N == 6 {
         for i in 0..16 {
-            butterfly(t, 32 + i, 63 - i, 63 - 4 * brev(4, i) as i32, false, r);
+            butterfly(t, 32 + i, 63 - i, 63 - 4 * brev(4, i) as i32, false, k);
         }
     }
     if N >= 5 {
@@ -425,13 +501,13 @@ fn inverse_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
                 31 - i,
                 6 + ((brev(3, 7 - i) as i32) << 3),
                 false,
-                r,
+                k,
             );
         }
     }
     if N == 6 {
         for i in 0..16 {
-            hadamard(t, 32 + i * 2, 33 + i * 2, i & 1 == 1, r);
+            hadamard(t, 32 + i * 2, 33 + i * 2, i & 1 == 1, k);
         }
     }
     if N >= 4 {
@@ -442,65 +518,65 @@ fn inverse_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
                 15 - i,
                 12 + ((brev(2, 3 - i) as i32) << 4),
                 false,
-                r,
+                k,
             );
         }
     }
     if N >= 5 {
         for i in 0..8 {
-            hadamard(t, 16 + 2 * i, 17 + 2 * i, i & 1 == 1, r);
+            hadamard(t, 16 + 2 * i, 17 + 2 * i, i & 1 == 1, k);
         }
     }
     if N == 6 {
         for i in 0..4 {
             for j in 0..2 {
                 let angle = 60 - 16 * brev(2, i) as i32 + 64 * j as i32;
-                butterfly(t, 62 - i * 4 - j, 33 + i * 4 + j, angle, true, r);
+                butterfly(t, 62 - i * 4 - j, 33 + i * 4 + j, angle, true, k);
             }
         }
     }
     if N >= 3 {
         for i in 0..2 {
-            butterfly(t, 4 + i, 7 - i, 56 - 32 * i as i32, false, r);
+            butterfly(t, 4 + i, 7 - i, 56 - 32 * i as i32, false, k);
         }
     }
     if N >= 4 {
         for i in 0..4 {
-            hadamard(t, 8 + 2 * i, 9 + 2 * i, i & 1 == 1, r);
+            hadamard(t, 8 + 2 * i, 9 + 2 * i, i & 1 == 1, k);
         }
     }
     if N >= 5 {
         for i in 0..2 {
             for j in 0..2 {
                 let angle = 24 + ((j as i32) << 6) + ((1 - i as i32) << 5);
-                butterfly(t, 30 - 4 * i - j, 17 + 4 * i + j, angle, true, r);
+                butterfly(t, 30 - 4 * i - j, 17 + 4 * i + j, angle, true, k);
             }
         }
     }
     if N == 6 {
         for i in 0..8 {
             for j in 0..2 {
-                hadamard(t, 32 + i * 4 + j, 35 + i * 4 - j, i & 1 == 1, r);
+                hadamard(t, 32 + i * 4 + j, 35 + i * 4 - j, i & 1 == 1, k);
             }
         }
     }
     for i in 0..2 {
-        butterfly(t, 2 * i, 2 * i + 1, 32 + 16 * i as i32, i == 0, r);
+        butterfly(t, 2 * i, 2 * i + 1, 32 + 16 * i as i32, i == 0, k);
     }
     if N >= 3 {
         for i in 0..2 {
-            hadamard(t, 4 + 2 * i, 5 + 2 * i, i == 1, r);
+            hadamard(t, 4 + 2 * i, 5 + 2 * i, i == 1, k);
         }
     }
     if N >= 4 {
         for i in 0..2 {
-            butterfly(t, 14 - i, 9 + i, 48 + 64 * i as i32, true, r);
+            butterfly(t, 14 - i, 9 + i, 48 + 64 * i as i32, true, k);
         }
     }
     if N >= 5 {
         for i in 0..4 {
             for j in 0..2 {
-                hadamard(t, 16 + 4 * i + j, 19 + 4 * i - j, i & 1 == 1, r);
+                hadamard(t, 16 + 4 * i + j, 19 + 4 * i - j, i & 1 == 1, k);
             }
         }
     }
@@ -508,86 +584,86 @@ fn inverse_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
         for i in 0..2 {
             for j in 0..4 {
                 let angle = 56 - (i as i32) * 32 + ((j as i32) >> 1) * 64;
-                butterfly(t, 61 - i * 8 - j, 34 + i * 8 + j, angle, true, r);
+                butterfly(t, 61 - i * 8 - j, 34 + i * 8 + j, angle, true, k);
             }
         }
     }
     for i in 0..2 {
-        hadamard(t, i, 3 - i, false, r);
+        hadamard(t, i, 3 - i, false, k);
     }
     if N >= 3 {
-        butterfly(t, 6, 5, 32, true, r);
+        butterfly(t, 6, 5, 32, true, k);
     }
     if N >= 4 {
         for i in 0..2 {
             for j in 0..2 {
-                hadamard(t, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, r);
+                hadamard(t, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, k);
             }
         }
     }
     if N >= 5 {
         for i in 0..4 {
-            butterfly(t, 29 - i, 18 + i, 48 + ((i as i32) >> 1) * 64, true, r);
+            butterfly(t, 29 - i, 18 + i, 48 + ((i as i32) >> 1) * 64, true, k);
         }
     }
     if N == 6 {
         for i in 0..4 {
             for j in 0..4 {
-                hadamard(t, 32 + 8 * i + j, 39 + 8 * i - j, i & 1 == 1, r);
+                hadamard(t, 32 + 8 * i + j, 39 + 8 * i - j, i & 1 == 1, k);
             }
         }
     }
     if N >= 3 {
         for i in 0..4 {
-            hadamard(t, i, 7 - i, false, r);
+            hadamard(t, i, 7 - i, false, k);
         }
     }
     if N >= 4 {
         for i in 0..2 {
-            butterfly(t, 13 - i, 10 + i, 32, true, r);
+            butterfly(t, 13 - i, 10 + i, 32, true, k);
         }
     }
     if N >= 5 {
         for i in 0..2 {
             for j in 0..4 {
-                hadamard(t, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, r);
+                hadamard(t, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, k);
             }
         }
     }
     if N == 6 {
         for i in 0..8 {
-            butterfly(t, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true, r);
+            butterfly(t, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true, k);
         }
     }
     if N >= 4 {
         for i in 0..8 {
-            hadamard(t, i, 15 - i, false, r);
+            hadamard(t, i, 15 - i, false, k);
         }
     }
     if N >= 5 {
         for i in 0..4 {
-            butterfly(t, 27 - i, 20 + i, 32, true, r);
+            butterfly(t, 27 - i, 20 + i, 32, true, k);
         }
     }
     if N == 6 {
         for i in 0..8 {
-            hadamard(t, 32 + i, 47 - i, false, r);
-            hadamard(t, 48 + i, 63 - i, true, r);
+            hadamard(t, 32 + i, 47 - i, false, k);
+            hadamard(t, 48 + i, 63 - i, true, k);
         }
     }
     if N >= 5 {
         for i in 0..16 {
-            hadamard(t, i, 31 - i, false, r);
+            hadamard(t, i, 31 - i, false, k);
         }
     }
     if N == 6 {
         for i in 0..8 {
-            butterfly(t, 55 - i, 40 + i, 32, true, r);
+            butterfly(t, 55 - i, 40 + i, 32, true, k);
         }
     }
     if N == 6 {
         for i in 0..32 {
-            hadamard(t, i, 63 - i, false, r);
+            hadamard(t, i, 63 - i, false, k);
         }
     }
 }
@@ -1225,6 +1301,8 @@ pub fn inverse_transform_2d_typed_wh(
             t[..h].fill(0);
             t[nz_row] = residual[nz_row * w];
             inverse_1d(&mut t, log2h, col_clamp, col_kind);
+            // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..h {
                 let dst_row = if ud_flip { h - 1 - i } else { i };
                 out[dst_row * w..dst_row * w + w].fill(round2(t[i], 4));
@@ -1240,12 +1318,7 @@ pub fn inverse_transform_2d_typed_wh(
         // is not a contiguous chunk, so it stays on the scalar path below.
         if col_kind == TxType1d::Dct && w >= 8 && !lr_flip {
             #[cfg(target_arch = "x86_64")]
-            if matches!(crate::mc::simd_level(), crate::mc::SimdLevel::Avx2) {
-                // SAFETY: the branch above is the AVX2 feature detection.
-                #[allow(unsafe_code)]
-                unsafe {
-                    simd::column_pass_dct(residual, &mut out, w, h, log2h, col_clamp, ud_flip);
-                }
+            if simd::column_pass_dct_dispatch(residual, &mut out, w, h, log2h, col_clamp, ud_flip) {
                 return;
             }
             let mut t8 = [[0i32; 8]; 64];
@@ -1262,6 +1335,8 @@ pub fn inverse_transform_2d_typed_wh(
                     continue;
                 }
                 inverse_dct_x8(&mut t8, log2h, col_clamp);
+                // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..h {
                     let dst_row = if ud_flip { h - 1 - i } else { i };
                     let dst = &mut out[dst_row * w + j..][..8];
@@ -1287,6 +1362,8 @@ pub fn inverse_transform_2d_typed_wh(
                 continue;
             }
             inverse_1d(&mut t, log2h, col_clamp, col_kind);
+            // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..h {
                 let dst_row = if ud_flip { h - 1 - i } else { i };
                 out[dst_row * w + j] = round2(t[i], 4);
@@ -1698,108 +1775,108 @@ const INVERSE_GAIN_RECIPROCAL: f64 = 8.0;
 /// The gain is the inverse network's, since a transpose preserves it;
 /// [`forward_gain`] measures it from this network rather than asserting it.
 #[inline(always)]
-fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
+fn forward_dct_n<T: Copy, K: Kern<T>, const N: u32>(t: &mut [T; 64], k: &K) {
     if N == 6 {
         for i in 0..32 {
-            hadamard(t, i, 63 - i, false, r);
+            hadamard(t, i, 63 - i, false, k);
         }
     }
     if N == 6 {
         for i in 0..8 {
-            butterfly(t, 55 - i, 40 + i, 32, true, r);
+            butterfly(t, 55 - i, 40 + i, 32, true, k);
         }
     }
     if N >= 5 {
         for i in 0..16 {
-            hadamard(t, i, 31 - i, false, r);
+            hadamard(t, i, 31 - i, false, k);
         }
     }
     if N == 6 {
         for i in 0..8 {
-            hadamard(t, 32 + i, 47 - i, false, r);
-            hadamard(t, 48 + i, 63 - i, true, r);
+            hadamard(t, 32 + i, 47 - i, false, k);
+            hadamard(t, 48 + i, 63 - i, true, k);
         }
     }
     if N >= 5 {
         for i in 0..4 {
-            butterfly(t, 27 - i, 20 + i, 32, true, r);
+            butterfly(t, 27 - i, 20 + i, 32, true, k);
         }
     }
     if N >= 4 {
         for i in 0..8 {
-            hadamard(t, i, 15 - i, false, r);
+            hadamard(t, i, 15 - i, false, k);
         }
     }
     if N == 6 {
         for i in 0..8 {
-            butterfly(t, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true, r);
+            butterfly(t, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true, k);
         }
     }
     if N >= 5 {
         for i in 0..2 {
             for j in 0..4 {
-                hadamard(t, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, r);
+                hadamard(t, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, k);
             }
         }
     }
     if N >= 4 {
         for i in 0..2 {
-            butterfly(t, 13 - i, 10 + i, 32, true, r);
+            butterfly(t, 13 - i, 10 + i, 32, true, k);
         }
     }
     if N >= 3 {
         for i in 0..4 {
-            hadamard(t, i, 7 - i, false, r);
+            hadamard(t, i, 7 - i, false, k);
         }
     }
     if N == 6 {
         for i in 0..4 {
             for j in 0..4 {
-                hadamard(t, 32 + 8 * i + j, 39 + 8 * i - j, i & 1 == 1, r);
+                hadamard(t, 32 + 8 * i + j, 39 + 8 * i - j, i & 1 == 1, k);
             }
         }
     }
     if N >= 5 {
         for i in 0..4 {
-            butterfly(t, 29 - i, 18 + i, 48 + ((i as i32) >> 1) * 64, true, r);
+            butterfly(t, 29 - i, 18 + i, 48 + ((i as i32) >> 1) * 64, true, k);
         }
     }
     if N >= 4 {
         for i in 0..2 {
             for j in 0..2 {
-                hadamard(t, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, r);
+                hadamard(t, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, k);
             }
         }
     }
     if N >= 3 {
-        butterfly(t, 6, 5, 32, true, r);
+        butterfly(t, 6, 5, 32, true, k);
     }
     for i in 0..2 {
-        hadamard(t, i, 3 - i, false, r);
+        hadamard(t, i, 3 - i, false, k);
     }
     if N == 6 {
         for i in 0..2 {
             for j in 0..4 {
                 let angle = 56 - (i as i32) * 32 + ((j as i32) >> 1) * 64;
-                butterfly(t, 61 - i * 8 - j, 34 + i * 8 + j, angle, true, r);
+                butterfly(t, 61 - i * 8 - j, 34 + i * 8 + j, angle, true, k);
             }
         }
     }
     if N >= 5 {
         for i in 0..4 {
             for j in 0..2 {
-                hadamard(t, 16 + 4 * i + j, 19 + 4 * i - j, i & 1 == 1, r);
+                hadamard(t, 16 + 4 * i + j, 19 + 4 * i - j, i & 1 == 1, k);
             }
         }
     }
     if N >= 4 {
         for i in 0..2 {
-            butterfly(t, 14 - i, 9 + i, 48 + 64 * i as i32, true, r);
+            butterfly(t, 14 - i, 9 + i, 48 + 64 * i as i32, true, k);
         }
     }
     if N >= 3 {
         for i in 0..2 {
-            hadamard(t, 4 + 2 * i, 5 + 2 * i, i == 1, r);
+            hadamard(t, 4 + 2 * i, 5 + 2 * i, i == 1, k);
         }
     }
     for i in 0..2 {
@@ -1813,13 +1890,13 @@ fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
                 -(32 + 16 * i as i32)
             },
             i == 0,
-            r,
+            k,
         );
     }
     if N == 6 {
         for i in 0..8 {
             for j in 0..2 {
-                hadamard(t, 32 + i * 4 + j, 35 + i * 4 - j, i & 1 == 1, r);
+                hadamard(t, 32 + i * 4 + j, 35 + i * 4 - j, i & 1 == 1, k);
             }
         }
     }
@@ -1827,31 +1904,31 @@ fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
         for i in 0..2 {
             for j in 0..2 {
                 let angle = 24 + ((j as i32) << 6) + ((1 - i as i32) << 5);
-                butterfly(t, 30 - 4 * i - j, 17 + 4 * i + j, angle, true, r);
+                butterfly(t, 30 - 4 * i - j, 17 + 4 * i + j, angle, true, k);
             }
         }
     }
     if N >= 4 {
         for i in 0..4 {
-            hadamard(t, 8 + 2 * i, 9 + 2 * i, i & 1 == 1, r);
+            hadamard(t, 8 + 2 * i, 9 + 2 * i, i & 1 == 1, k);
         }
     }
     if N >= 3 {
         for i in 0..2 {
-            butterfly(t, 4 + i, 7 - i, -(56 - 32 * i as i32), false, r);
+            butterfly(t, 4 + i, 7 - i, -(56 - 32 * i as i32), false, k);
         }
     }
     if N == 6 {
         for i in 0..4 {
             for j in 0..2 {
                 let angle = 60 - 16 * brev(2, i) as i32 + 64 * j as i32;
-                butterfly(t, 62 - i * 4 - j, 33 + i * 4 + j, angle, true, r);
+                butterfly(t, 62 - i * 4 - j, 33 + i * 4 + j, angle, true, k);
             }
         }
     }
     if N >= 5 {
         for i in 0..8 {
-            hadamard(t, 16 + 2 * i, 17 + 2 * i, i & 1 == 1, r);
+            hadamard(t, 16 + 2 * i, 17 + 2 * i, i & 1 == 1, k);
         }
     }
     if N >= 4 {
@@ -1862,13 +1939,13 @@ fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
                 15 - i,
                 -(12 + ((brev(2, 3 - i) as i32) << 4)),
                 false,
-                r,
+                k,
             );
         }
     }
     if N == 6 {
         for i in 0..16 {
-            hadamard(t, 32 + i * 2, 33 + i * 2, i & 1 == 1, r);
+            hadamard(t, 32 + i * 2, 33 + i * 2, i & 1 == 1, k);
         }
     }
     if N >= 5 {
@@ -1879,13 +1956,13 @@ fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
                 31 - i,
                 -(6 + ((brev(3, 7 - i) as i32) << 3)),
                 false,
-                r,
+                k,
             );
         }
     }
     if N == 6 {
         for i in 0..16 {
-            butterfly(t, 32 + i, 63 - i, -(63 - 4 * brev(4, i) as i32), false, r);
+            butterfly(t, 32 + i, 63 - i, -(63 - 4 * brev(4, i) as i32), false, k);
         }
     }
 
@@ -1895,11 +1972,11 @@ fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
 /// [`forward_dct_n`] dispatched on the size, as [`inverse_dct_fixed`] is.
 fn forward_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
     match n {
-        2 => forward_dct_n::<i32, 2>(t, r),
-        3 => forward_dct_n::<i32, 3>(t, r),
-        4 => forward_dct_n::<i32, 4>(t, r),
-        5 => forward_dct_n::<i32, 5>(t, r),
-        6 => forward_dct_n::<i32, 6>(t, r),
+        2 => forward_dct_n::<i32, _, 2>(t, &Scalar(r)),
+        3 => forward_dct_n::<i32, _, 3>(t, &Scalar(r)),
+        4 => forward_dct_n::<i32, _, 4>(t, &Scalar(r)),
+        5 => forward_dct_n::<i32, _, 5>(t, &Scalar(r)),
+        6 => forward_dct_n::<i32, _, 6>(t, &Scalar(r)),
         _ => unreachable!("the forward DCT is defined for 4..64"),
     }
 }
@@ -3034,11 +3111,7 @@ mod tests {
                     for i in 0..(1usize << n) {
                         avx[i] = simd::splat(wide[i]);
                     }
-                    // SAFETY: guarded by the feature detection above.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        simd::dct_x8_avx2(&mut avx, n, r);
-                    }
+                    assert!(simd::dct_x8_dispatch(&mut avx, n, r));
                     for (l, col) in cols.iter_mut().enumerate() {
                         inverse_dct_fixed(col, n, r);
                         for i in 0..(1usize << n) {
@@ -3237,6 +3310,8 @@ pub fn dequant_and_inverse_wht4x4(
 /// `w`/`h` need not be multiples of four: a partial tile is zero-filled, so
 /// no shape panics and no shape returns a buffer the caller cannot index.
 /// Returns the same empty-grid marker as [`dequant_and_inverse_wht4x4`].
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn dequant_and_inverse_wht(
     levels: &[i32],
     plane: usize,

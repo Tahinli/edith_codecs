@@ -127,6 +127,12 @@ impl Decoder {
         self.debug_mute = (celt, silk);
     }
 
+    /// Decodes with the RFC 6716 reconstruction instead of the RFC 8251 one
+    /// (the default). Needed only to reproduce the RFC 6716 reference vectors.
+    pub fn set_legacy_rfc6716(&mut self, on: bool) {
+        self.celt.set_legacy_rfc6716(on);
+    }
+
     /// Facts from the last decoded frame's CELT layer (diagnostic).
     pub fn last_celt_diag(&self) -> &crate::celt::CeltDecDiag {
         self.celt.last_diag()

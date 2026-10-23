@@ -38,6 +38,9 @@ mod demux;
 mod ebml;
 mod mux;
 
+#[doc(hidden)]
+pub mod fuzz_api;
+
 pub use demux::MatroskaDemuxer;
 pub use mux::{MAX_TRACKS, MUX_TIME_BASE, MatroskaMuxer};
 

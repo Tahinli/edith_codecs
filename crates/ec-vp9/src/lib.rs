@@ -22,17 +22,32 @@
 //!
 //! This crate contains no `unsafe` code.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Spec-transcription lints: the DSP, loop-filter and mode-info kernels mirror
+// libvpx argument lists and index-driven pseudo-code, kept as written so each
+// line stays checkable against the spec. Byte-exact paths are not restructured.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::needless_range_loop,
+    clippy::neg_multiply,
+    clippy::collapsible_if,
+    clippy::ptr_arg
+)]
 
+pub(crate) mod adapt;
 pub mod bool;
 pub mod decode;
 pub mod header;
 pub(crate) mod inter;
 pub mod intra;
+#[doc(hidden)]
+pub mod knobs;
 pub mod loopfilter;
 pub(crate) mod mc;
 pub mod modes;
+pub mod prof;
 mod stack_budget;
 pub mod stream;
 pub mod tables;

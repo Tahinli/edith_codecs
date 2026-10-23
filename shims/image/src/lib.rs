@@ -282,7 +282,7 @@ impl DynamicImage {
             DynamicImage::ImageLuma8(b) => b.data.iter().flat_map(|&l| [l, l, l]).collect(),
             DynamicImage::ImageRgba8(b) => b
                 .data
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .flat_map(|p| p[..3].to_vec())
                 .collect(),
         };
@@ -297,7 +297,7 @@ impl DynamicImage {
             DynamicImage::ImageLuma8(b) => b.data.iter().flat_map(|&l| [l, l, l, 255]).collect(),
             DynamicImage::ImageRgb8(b) => b
                 .data
-                .chunks_exact(3)
+                .as_chunks::<3>().0.iter()
                 .flat_map(|p| [p[0], p[1], p[2], 255])
                 .collect(),
         };
@@ -312,7 +312,7 @@ impl DynamicImage {
             _ => self
                 .to_rgb8()
                 .data
-                .chunks_exact(3)
+                .as_chunks::<3>().0.iter()
                 .map(|p| {
                     let luma =
                         2126 * u32::from(p[0]) + 7152 * u32::from(p[1]) + 722 * u32::from(p[2]);

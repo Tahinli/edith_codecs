@@ -101,8 +101,8 @@ fn ffmpeg_decode(path: &Path) -> Vec<f32> {
         String::from_utf8_lossy(&out.stderr)
     );
     out.stdout
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>().0.iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -194,7 +194,7 @@ fn packet_prefix(reader: &mut dyn FormatReader, track_id: u32, n: usize) -> Vec<
         if packet.track_id == track_id && !packet.data.is_empty() {
             out.push(PacketTiming {
                 data: packet.data.as_ref().to_vec(),
-                ts: packet.pts.value() as i64,
+                ts: packet.pts.value(),
                 granule: packet.granule,
             });
         }

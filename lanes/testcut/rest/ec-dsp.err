@@ -1,0 +1,5 @@
+   Compiling ec-dsp v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dsp)
+    Finished `release` profile [optimized] target(s) in 2.11s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_dsp-99d8226fe09e90cc)
+   Doc-tests ec_dsp
+WARNING: No rustdoc doctest environment variable provided so doctests will be run in the same process

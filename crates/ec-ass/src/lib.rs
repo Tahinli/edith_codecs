@@ -20,7 +20,8 @@
 
 use ec_core::{Error, Result};
 use ec_subs::ir::{
-    CuePosition, Segment, SourceFormat, SubtitleCue, SubtitleStyle, SubtitleTrack, TextAlign,
+    CuePosition, KaraokeMode, Segment, SourceFormat, SubtitleCue, SubtitleStyle, SubtitleTrack,
+    TextAlign,
 };
 use ec_subs::{decode, parse_clock};
 
@@ -39,6 +40,10 @@ pub fn parse(bytes: &[u8]) -> Result<SubtitleTrack> {
     let mut header_end = 0;
     let mut in_events = false;
     let mut saw_events = false;
+    // `WrapStyle` is read once, when its line is seen; scanning the metadata for
+    // every Dialogue line instead made a long script quadratic.
+    let mut wrap_style = 0u8;
+    let mut wrap_seen = false;
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim();
         // Everything up to the first event row is the script header — what a
@@ -62,7 +67,13 @@ pub fn parse(bytes: &[u8]) -> Result<SubtitleTrack> {
         let value = value.trim();
         match (section, key.trim()) {
             (Section::ScriptInfo, key) => {
-                track.metadata.push((snake_case(key), value.to_owned()));
+                let key = snake_case(key);
+                // The first `WrapStyle` line counts, as it always did.
+                if key == "wrap_style" && !wrap_seen {
+                    wrap_style = value.parse::<u8>().unwrap_or(0);
+                    wrap_seen = true;
+                }
+                track.metadata.push((key, value.to_owned()));
             }
             (Section::Styles { .. }, "Format") => style_format = fields(value),
             (Section::Styles { v4 }, "Style") => match style(&style_format, value, v4) {
@@ -70,18 +81,10 @@ pub fn parse(bytes: &[u8]) -> Result<SubtitleTrack> {
                 None => track.skipped += 1,
             },
             (Section::Events, "Format") => event_format = fields(value),
-            (Section::Events, "Dialogue") => {
-                let wrap_style = track
-                    .metadata
-                    .iter()
-                    .find(|(k, _)| k == "wrap_style")
-                    .and_then(|(_, v)| v.parse::<u8>().ok())
-                    .unwrap_or(0);
-                match dialogue(&event_format, value, wrap_style) {
-                    Some(cue) => track.cues.push(cue),
-                    None => track.skipped += 1,
-                }
-            }
+            (Section::Events, "Dialogue") => match dialogue(&event_format, value, wrap_style) {
+                Some(cue) => track.cues.push(cue),
+                None => track.skipped += 1,
+            },
             // `Comment:` events are the script's own scratch lines: real rows
             // of the events table, never on screen.
             _ => {}
@@ -169,6 +172,7 @@ fn style(format: &[String], row: &str, v4: bool) -> Option<SubtitleStyle> {
         font_family: column(format, &values, "Fontname").map(str::to_owned),
         font_size: number("Fontsize"),
         primary_color: column(format, &values, "PrimaryColour").and_then(parse_color),
+        secondary_color: column(format, &values, "SecondaryColour").and_then(parse_color),
         outline_color: column(format, &values, "OutlineColour")
             .or_else(|| column(format, &values, "TertiaryColour"))
             .and_then(parse_color),
@@ -195,7 +199,8 @@ fn style(format: &[String], row: &str, v4: bool) -> Option<SubtitleStyle> {
 fn alignment(code: i32, v4: bool) -> TextAlign {
     let column = match v4 {
         true => code & 0b11,
-        false => (code - 1) % 3 + 1,
+        // `wrapping_sub`: `code - 1` panics at i32::MIN, and that code is a number a file can state.
+        false => code.wrapping_sub(1) % 3 + 1,
     };
     match column {
         1 => TextAlign::Left,
@@ -255,7 +260,14 @@ struct Overrides {
     color: Option<(u8, u8, u8)>,
     family: Option<String>,
     size: Option<f32>,
-    karaoke: Option<u32>,
+    /// The syllable the next runs belong to: `(cs, start_cs, mode)`.
+    karaoke: Option<(u32, u32, KaraokeMode)>,
+    /// Where the previous syllable ended; the next `\k` starts here.
+    karaoke_end: u32,
+    /// `\kt`: the absolute start the next `\k` takes instead.
+    karaoke_at: Option<u32>,
+    /// `\2c`: the not-yet-sung colour.
+    secondary: Option<(u8, u8, u8)>,
     /// `\p1` and up: the text is a drawing, not words.
     drawing: bool,
 }
@@ -298,7 +310,7 @@ fn overrides(
     positioned: &mut bool,
 ) -> Option<String> {
     let mut unknown = String::new();
-    for tag in block.split('\\').skip(1) {
+    for tag in tags(block) {
         let tag = tag.trim_end();
         if tag.is_empty() {
             continue;
@@ -316,7 +328,41 @@ fn overrides(
             "c" | "1c" => state.color = parse_color(arg).map(|(r, g, b, _)| (r, g, b)),
             "fn" => state.family = Some(arg.trim().to_owned()).filter(|f| !f.is_empty()),
             "fs" => state.size = arg.trim().parse().ok(),
-            "k" | "K" | "kf" | "ko" => state.karaoke = arg.trim().parse().ok(),
+            "k" | "K" | "kf" | "ko" => {
+                // libass: a bare or unreadable duration is zero; negatives clamp to zero.
+                let cs = arg
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap_or(0)
+                    .clamp(0, u32::MAX as i64 / 2) as u32;
+                let start = state.karaoke_at.take().unwrap_or(state.karaoke_end);
+                let mode = match name {
+                    "k" => KaraokeMode::Fill,
+                    "ko" => KaraokeMode::Outline,
+                    _ => KaraokeMode::Sweep,
+                };
+                state.karaoke = Some((cs, start, mode));
+                state.karaoke_end = start.saturating_add(cs);
+            }
+            "kt" => {
+                state.karaoke_at = arg
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .map(|v| v.clamp(0, u32::MAX as i64 / 2) as u32);
+            }
+            "2c" => state.secondary = parse_color(arg).map(|(r, g, b, _)| (r, g, b)),
+            "r" => {
+                // Back to the style. Which style `\rName` names is for the renderer, so it stays.
+                let (end, name) = (state.karaoke_end, arg.trim());
+                *state = Overrides {
+                    karaoke_end: end,
+                    ..Overrides::default()
+                };
+                if !name.is_empty() {
+                    unknown.push_str(&format!("\\{tag}"));
+                }
+            }
             "p" => state.drawing = flag(),
             "an" => {
                 if let Ok(code) = arg.trim().parse::<i32>() {
@@ -349,6 +395,31 @@ fn overrides(
     (!unknown.is_empty()).then(|| format!("{{{unknown}}}"))
 }
 
+/// The `\`-separated tags of one brace block. A backslash inside parentheses belongs to the
+/// enclosing tag: in `\t(0,500,\fs20)` the `\fs20` is an argument of `\t`, not a tag of its own.
+fn tags(block: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = None;
+    for (at, c) in block.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '\\' if depth == 0 => {
+                if let Some(from) = start {
+                    out.push(&block[from..at]);
+                }
+                start = Some(at + 1);
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        out.push(&block[from..]);
+    }
+    out
+}
+
 /// An override into its name and its argument.
 ///
 /// The names overlap — `\b` is bold and `\blur` is a blur — so a one-letter
@@ -356,13 +427,14 @@ fn overrides(
 /// number, a `&H` colour, a bracketed list, or nothing at all. Everything else
 /// falls through to [`Segment::Raw`] rather than being half-read.
 fn split_tag(tag: &str) -> Option<(&str, &str)> {
-    const NAMES: [&str; 16] = [
-        "move", "pos", "fn", "fs", "kf", "ko", "an", "1c", "c", "b", "i", "u", "s", "k", "p", "a",
+    const NAMES: [&str; 20] = [
+        "move", "pos", "fn", "fs", "kf", "ko", "kt", "an", "1c", "2c", "c", "b", "i", "u", "s",
+        "k", "K", "p", "a", "r",
     ];
     NAMES.iter().find_map(|name| {
         let arg = tag.strip_prefix(name)?;
         // A font name is letters, so `\fn` takes whatever follows it.
-        let plausible = *name == "fn"
+        let plausible = matches!(*name, "fn" | "r")
             || arg.is_empty()
             || arg.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '-' | '&' | '(' | '.'));
         plausible.then_some((*name, arg))
@@ -419,9 +491,12 @@ fn flush(out: &mut Vec<Segment>, run: &mut String, state: &Overrides) {
         return;
     }
     let mut segment = vec![Segment::Text(text)];
-    if let Some(cs) = state.karaoke {
+    if let Some((cs, start_cs, mode)) = state.karaoke {
         segment = vec![Segment::Karaoke {
             cs,
+            start_cs,
+            mode,
+            secondary: state.secondary,
             children: segment,
         }];
     }
@@ -525,7 +600,20 @@ mod tests {
         assert_eq!(plain_text(&track.cues[0].segments), "kara");
         assert!(matches!(
             track.cues[0].segments[0],
-            Segment::Karaoke { cs: 30, .. }
+            Segment::Karaoke {
+                cs: 30,
+                start_cs: 0,
+                mode: KaraokeMode::Fill,
+                ..
+            }
+        ));
+        assert!(matches!(
+            track.cues[0].segments[1],
+            Segment::Karaoke {
+                cs: 25,
+                start_cs: 30,
+                ..
+            }
         ));
         // Drawing commands are not words.
         assert_eq!(plain_text(&track.cues[1].segments), "words");
@@ -558,5 +646,112 @@ mod tests {
         assert_eq!(plain_text(&track.cues[0].segments), "a\u{a0}b\nc");
 
         assert!(parse(b"just some prose").is_err());
+    }
+
+    type Syl = (String, u32, u32, KaraokeMode, Option<(u8, u8, u8)>);
+
+    fn syllables(text: &str) -> Vec<Syl> {
+        let doc = format!(
+            "[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n\
+             Dialogue: 0,0:00:00.00,0:00:09.00,,,0,0,0,,{text}\n"
+        );
+        let track = parse(doc.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        fn walk(segs: &[Segment], out: &mut Vec<Syl>) {
+            for s in segs {
+                match s {
+                    Segment::Karaoke {
+                        cs,
+                        start_cs,
+                        mode,
+                        secondary,
+                        children,
+                    } => out.push((plain_text(children), *cs, *start_cs, *mode, *secondary)),
+                    Segment::Bold(c) | Segment::Italic(c) | Segment::Color { children: c, .. } => {
+                        walk(c, out)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        walk(&track.cues[0].segments, &mut out);
+        out
+    }
+
+    #[test]
+    fn karaoke_modes_timing_and_colours() {
+        use KaraokeMode::*;
+        let got = syllables("{\\2c&H0000FF&\\k10}a{\\kf20}b{\\K30}c{\\ko40}d{\\k0}e");
+        let red = Some((255, 0, 0));
+        assert_eq!(
+            got,
+            vec![
+                ("a".into(), 10, 0, Fill, red),
+                ("b".into(), 20, 10, Sweep, red),
+                ("c".into(), 30, 30, Sweep, red),
+                ("d".into(), 40, 60, Outline, red),
+                ("e".into(), 0, 100, Fill, red),
+            ]
+        );
+        // `\kt` is absolute, and the next `\k` begins there.
+        let got = syllables("{\\k10}a{\\kt200\\k5}b{\\k5}c");
+        assert_eq!((got[1].2, got[2].2), (200, 205));
+        // Two tags with no text between add up: the empty syllable still takes its time.
+        let got = syllables("{\\k10}{\\k20}x");
+        assert_eq!((got[0].1, got[0].2), (20, 10));
+        // A style block inside a syllable does not start a new one; `\r` ends the effect.
+        let got = syllables("{\\k10}a{\\b1}b{\\r}c");
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].1, got[0].2, got[1].1, got[1].2), (10, 0, 10, 0));
+    }
+
+    #[test]
+    fn other_overrides_survive_for_a_renderer() {
+        let tags = [
+            "\\t(0,500,0.5,\\fscx120\\c&H0000FF&)",
+            "\\fad(200,300)",
+            "\\fade(0,255,0,0,100,900,1000)",
+            "\\clip(0,0,100,100)",
+            "\\iclip(m 0 0 l 50 0 50 50)",
+            "\\org(960,540)",
+            "\\frx10\\fry20\\frz30\\fax0.1\\fay0.2",
+            "\\be2\\blur1.5",
+            "\\q2",
+            "\\fsp3",
+            "\\bord2\\shad1",
+        ];
+        for tag in tags {
+            let doc =
+                format!("[Events]\nDialogue: 0,0:00:00.00,0:00:01.00,,,0,0,0,,{{{tag}}}word\n");
+            let track = parse(doc.as_bytes()).unwrap();
+            let segs = &track.cues[0].segments;
+            assert_eq!(plain_text(segs), "word", "{tag}");
+            let raw: String = segs
+                .iter()
+                .filter_map(|s| {
+                    if let Segment::Raw(r) = s {
+                        Some(r.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(raw, format!("{{{tag}}}"), "{tag}");
+            assert!(!segs.iter().any(|s| matches!(s, Segment::Bold(_))), "{tag}");
+        }
+        // `\move` keeps its start as the position and its full form as Raw.
+        let doc = "[Events]\nDialogue: 0,0:00:00.00,0:00:01.00,,,0,0,0,,{\\an8\\move(10,20,30,40,100,500)}m\n";
+        let track = parse(doc.as_bytes()).unwrap();
+        let p = track.cues[0].positioning.unwrap();
+        assert_eq!(
+            (p.x, p.y, p.align),
+            (Some(10.0), Some(20.0), TextAlign::Center)
+        );
+        assert!(
+            matches!(&track.cues[0].segments[0], Segment::Raw(r) if r == "{\\move(10,20,30,40,100,500)}")
+        );
+        // `\r` clears the overrides before it.
+        let got = syllables("{\\b1\\k5}a{\\r}b");
+        assert_eq!(got.len(), 1);
     }
 }

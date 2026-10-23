@@ -7,8 +7,11 @@
 //! `Err` — a decoder reached by a file picker is reached by every broken file
 //! on the disk.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::System;
 use std::cell::Cell;
+use std::sync::Once;
+
+use tracking_allocator::{AllocationGroupId, AllocationRegistry, AllocationTracker, Allocator};
 use std::path::{Path, PathBuf};
 
 /// Counting allocator: the "refused without doing unbounded work" tests
@@ -33,30 +36,79 @@ fn count_alloc(size: usize) {
     let _ = ALLOC_BYTES.try_with(|b| b.set(b.get() + size as u64));
 }
 
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count_alloc(layout.size());
-        unsafe { System.alloc(layout) }
+impl AllocationTracker for CountingAlloc {
+    fn allocated(&self, _addr: usize, object_size: usize, _wrapped: usize, _g: AllocationGroupId) {
+        count_alloc(object_size);
     }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        count_alloc(new_size);
-        unsafe { System.realloc(ptr, layout, new_size) }
+    fn deallocated(
+        &self,
+        _addr: usize,
+        _object_size: usize,
+        _wrapped: usize,
+        _source: AllocationGroupId,
+        _current: AllocationGroupId,
+    ) {
     }
 }
 
 #[global_allocator]
-static ALLOC: CountingAlloc = CountingAlloc;
+static ALLOC: Allocator<System> = Allocator::system();
+
+/// Installs the tracker once. Realloc reaches the tracker as an allocation of
+/// the new size, which is the accounting this file has always used.
+fn install_counter() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = AllocationRegistry::set_global_tracker(CountingAlloc);
+        AllocationRegistry::enable_tracking();
+    });
+}
 
 /// Runs `f` on this thread and returns its value together with every byte
 /// that thread allocated while it ran. That count is the decoder's own
 /// work, independent of how fast the host is at moving those bytes around.
 fn counting_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    install_counter();
     ALLOC_BYTES.with(|b| b.set(0));
     let out = f();
     (out, ALLOC_BYTES.with(Cell::get))
+}
+
+/// Serializes the tests that allocate up to the decoder's whole budget.
+///
+/// Those tests each decode a near-limit canvas, so run together they need
+/// several GiB at once and the per-scope memory cap (`scripts/memguard-runner.sh`)
+/// SIGKILLs the test binary. One at a time they fit. The lock covers only
+/// those tests; the cheap ones stay parallel. A poisoned lock (a failed
+/// assertion in another heavy test) is recovered, so one failure does not
+/// cascade into spurious failures in the rest.
+///
+/// The counting allocator needs no lock for its numbers: its tally is
+/// per-thread, so serializing does not change what any test measures.
+static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Limits for the tests that run up to the total budget: 1 GiB total and 512 MiB per buffer.
+///
+/// The default total (4 GiB) would need about 4 GiB resident before the refusal, which is past
+/// the 3500M memory cap on the lane servers. These limits keep the same behaviour (a total
+/// budget, a per-buffer cap) at a size the cap can hold.
+///
+/// Also used by the mutation sweeps, which test robustness rather than the default limit values.
+///
+/// The tests' canvases are 4000x2000 RGBA (32,000,000 bytes), which does not divide the 1 GiB
+/// total evenly. A canvas that did (say 4096x2048, 2^25 bytes) lets the last clone that fits
+/// land exactly on the budget, and the test's own small allocations then push the measured
+/// total a few kilobytes past it.
+fn budget_limits() -> ec_image::Limits {
+    ec_image::Limits {
+        max_total_alloc: 1 << 30,
+        max_alloc: 1 << 29,
+        ..ec_image::Limits::default()
+    }
 }
 
 const ROUNDS: usize = 10_000;
@@ -136,6 +188,8 @@ fn repair_png_crcs(data: &mut [u8]) {
 }
 
 fn sweep(name: &str, seed_file: &str) {
+    // Mutated headers can claim canvases up to the budget, so a sweep is heavy too.
+    let _heavy = heavy();
     let Ok(seed) = std::fs::read(fixtures().join(seed_file)) else {
         eprintln!("skipped: fixtures/stills not generated; run scripts/gen-still-fixtures.sh");
         return;
@@ -151,7 +205,7 @@ fn sweep(name: &str, seed_file: &str) {
         }
         // The call is the assertion: a panic here fails the test with the
         // round number, and the round number plus the fixed seed reproduces it.
-        if let Ok(image) = ec_image::decode(&data) {
+        if let Ok(image) = ec_image::decode_with_limits(&data, budget_limits()) {
             decoded += 1;
             let pixels = image.to_rgba8();
             assert_eq!(
@@ -166,29 +220,43 @@ fn sweep(name: &str, seed_file: &str) {
     eprintln!("{name}: {ROUNDS} mutations, {decoded} still decoded");
 }
 
-#[test]
-fn png_survives_mutation() {
-    sweep("png", "tiny.png");
-}
+/// Single-seed sweeps: (old test name, format label, seed fixture). Each was a #[test]
+/// of its own; they run as one table so the mutation loop is written once.
+const SWEEPS: &[(&str, &str, &str)] = &[
+    ("png_survives_mutation", "png", "tiny.png"),
+    ("jpeg_survives_mutation", "jpeg", "tiny.jpg"),
+    ("webp_lossy_survives_mutation", "webp-lossy", "tiny-lossy.webp"),
+    ("webp_lossless_survives_mutation", "webp-lossless", "tiny-lossless.webp"),
+    ("gif_survives_mutation", "gif", "tiny.gif"),
+    // BMP sizes three separate things from header fields -- a palette, a row
+    // stride and, for the run-length compressions, a decoded row buffer -- so a
+    // mutation can put any two of them in disagreement.
+    ("bmp_survives_mutation", "bmp", "tiny.bmp"),
+    // The run-length path is the one that writes at a position the *file* chooses
+    // (delta codes move the cursor), so it gets its own seed.
+    ("a_run_length_bmp_survives_mutation", "bmp-rle", "rle8.bmp"),
+    // TIFF is a directory of offsets into itself: a mutation can point a strip,
+    // a palette or the directory's own continuation anywhere in the file.
+    ("tiff_survives_mutation", "tiff", "tiny.tiff"),
+    // The compressed, predicted path decodes into a row buffer whose length comes
+    // from tags the mutation is free to disagree about, so it gets its own seed.
+    ("a_compressed_tiff_survives_mutation", "tiff-lzw", "rgb8-lzw-pred.tiff"),
+];
 
 #[test]
-fn jpeg_survives_mutation() {
-    sweep("jpeg", "tiny.jpg");
-}
-
-#[test]
-fn webp_lossy_survives_mutation() {
-    sweep("webp-lossy", "tiny-lossy.webp");
-}
-
-#[test]
-fn webp_lossless_survives_mutation() {
-    sweep("webp-lossless", "tiny-lossless.webp");
-}
-
-#[test]
-fn gif_survives_mutation() {
-    sweep("gif", "tiny.gif");
+fn single_seed_sweeps_survive_mutation() {
+    // Scoped threads, as the separate #[test]s ran in parallel. `heavy()` still serializes the sweeps.
+    let failures: Vec<&str> = std::thread::scope(|s| {
+        let handles: Vec<_> = SWEEPS
+            .iter()
+            .map(|&(test, name, seed)| (test, s.spawn(move || sweep(name, seed))))
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|(test, h)| h.join().is_err().then_some(test))
+            .collect()
+    });
+    assert!(failures.is_empty(), "failed cases: {failures:?}");
 }
 
 /// The animation path has its own frame loop, its own canvas and its own
@@ -199,12 +267,13 @@ fn a_gif_animation_survives_mutation() {
         eprintln!("skipped: fixtures/stills not generated; run scripts/gen-still-fixtures.sh");
         return;
     };
+    let _heavy = heavy();
     let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ 0x9e37);
     let mut decoded = 0usize;
     for round in 0..ROUNDS {
         let head = if round % 2 == 0 { Some(48) } else { None };
         let data = mutate(&mut rng, &seed, head);
-        if let Ok(frames) = ec_image::decode_animation(&data) {
+        if let Ok(frames) = ec_image::decode_animation_with_limits(&data, budget_limits()) {
             decoded += 1;
             for frame in &frames {
                 let image = &frame.image;
@@ -227,12 +296,13 @@ fn an_animated_webp_survives_mutation() {
         eprintln!("skipped: fixtures/stills not generated; run scripts/gen-still-fixtures.sh");
         return;
     };
+    let _heavy = heavy();
     let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ 0x5eed);
     let mut decoded = 0usize;
     for round in 0..ROUNDS {
         let head = if round % 2 == 0 { Some(48) } else { None };
         let data = mutate(&mut rng, &seed, head);
-        if let Ok(frames) = ec_image::decode_animation(&data) {
+        if let Ok(frames) = ec_image::decode_animation_with_limits(&data, budget_limits()) {
             decoded += 1;
             for frame in &frames {
                 let image = &frame.image;
@@ -245,35 +315,6 @@ fn an_animated_webp_survives_mutation() {
         }
     }
     eprintln!("webp-animation: {ROUNDS} mutations, {decoded} still decoded");
-}
-
-/// BMP sizes three separate things from header fields -- a palette, a row
-/// stride and, for the run-length compressions, a decoded row buffer -- so a
-/// mutation can put any two of them in disagreement.
-#[test]
-fn bmp_survives_mutation() {
-    sweep("bmp", "tiny.bmp");
-}
-
-/// The run-length path is the one that writes at a position the *file* chooses
-/// (delta codes move the cursor), so it gets its own seed.
-#[test]
-fn a_run_length_bmp_survives_mutation() {
-    sweep("bmp-rle", "rle8.bmp");
-}
-
-/// TIFF is a directory of offsets into itself: a mutation can point a strip,
-/// a palette or the directory's own continuation anywhere in the file.
-#[test]
-fn tiff_survives_mutation() {
-    sweep("tiff", "tiny.tiff");
-}
-
-/// The compressed, predicted path decodes into a row buffer whose length comes
-/// from tags the mutation is free to disagree about, so it gets its own seed.
-#[test]
-fn a_compressed_tiff_survives_mutation() {
-    sweep("tiff-lzw", "rgb8-lzw-pred.tiff");
 }
 
 #[test]
@@ -291,6 +332,7 @@ fn arbitrary_bytes_behind_a_signature_are_refused_not_believed() {
         // behind it reach the decoder at all.
         b"BM\x00\x10\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00",
     ];
+    let _heavy = heavy();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for signature in signatures {
         for _ in 0..ROUNDS / 4 {
@@ -298,7 +340,7 @@ fn arbitrary_bytes_behind_a_signature_are_refused_not_believed() {
             for _ in 0..rng.below(200) {
                 data.push((rng.next() & 0xff) as u8);
             }
-            let _ = ec_image::decode(&data);
+            let _ = ec_image::decode_with_limits(&data, budget_limits());
             let _ = ec_image::info(&data);
         }
     }
@@ -430,20 +472,22 @@ fn a_gif_frame_asking_for_more_pixels_than_the_limit_is_refused() {
 
 #[test]
 fn a_gif_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget() {
+    let _heavy = heavy();
     // Each frame is 1x1 -- cheap to encode, cheap to check on its own -- but
     // `composite` clones the *whole* canvas onto the result once per frame.
     // A canvas near the single-buffer limit, repeated a few dozen times,
     // must be caught by the decode-wide budget even though no single frame
     // or single buffer ever looks large by itself.
-    let data = one_pixel_gif(16000, 16000, 64);
+    let data = one_pixel_gif(4000, 2000, 64);
     // A few real canvas clones run before the budget catches up (the budget
     // is spent per frame, so it can't refuse before at least one clone), so
     // this bounds "the decoder's own total budget, not a byte more", not "no
     // allocation at all". Bytes, not a clock -- see the counting allocator
     // above.
-    let budget = ec_image::Limits::default().max_total_alloc as u64;
+    let limits = budget_limits();
+    let budget = limits.max_total_alloc as u64;
     let (err, allocated) = counting_allocations(|| {
-        ec_image::decode_animation(&data)
+        ec_image::decode_animation_with_limits(&data, limits)
             .expect_err("64 clones of a near-limit canvas is past the total budget")
     });
     assert!(format!("{err}").contains("limit"), "{err}");
@@ -456,9 +500,9 @@ fn a_gif_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget
     // file must not buy 64x the work. A budget spent per *input* frame, or
     // after the clone instead of before it, refuses later or not at all as
     // the frame count grows.
-    let bomb = one_pixel_gif(16000, 16000, 4096);
+    let bomb = one_pixel_gif(4000, 2000, 4096);
     let (err, allocated) = counting_allocations(|| {
-        ec_image::decode_animation(&bomb)
+        ec_image::decode_animation_with_limits(&bomb, limits)
             .expect_err("4096 clones of a near-limit canvas is past the total budget")
     });
     assert!(format!("{err}").contains("limit"), "{err}");
@@ -470,11 +514,13 @@ fn a_gif_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget
 
 #[test]
 fn a_gif_with_a_few_tiny_frames_over_a_huge_canvas_still_decodes() {
+    let _heavy = heavy();
     // The other side of the same budget: a handful of frames over a large
     // canvas is exactly what a real animation looks like, and must not be
     // refused just because the guard above exists.
     let data = one_pixel_gif(4000, 4000, 3);
-    let frames = ec_image::decode_animation(&data).expect("well within every limit");
+    let frames = ec_image::decode_animation_with_limits(&data, budget_limits())
+        .expect("well within every limit");
     assert_eq!(frames.len(), 3);
 }
 
@@ -554,6 +600,7 @@ fn one_pixel_animated_webp(canvas_w: u32, canvas_h: u32, frames: usize) -> Vec<u
 
 #[test]
 fn a_webp_animation_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_total_budget() {
+    let _heavy = heavy();
     // The WebP analogue of the GIF test above: `decode_frames` clones the
     // whole composited canvas into the result once per ANMF chunk.
     //
@@ -575,10 +622,11 @@ fn a_webp_animation_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_t
     // and this test's red proof (one clone moved past the spend -> 5.12e9
     // bytes against the 4.29e9 budget) is exactly the check that the two
     // stay close enough for the budget to be a meaningful ceiling.
-    let budget = ec_image::Limits::default().max_total_alloc as u64;
-    let data = one_pixel_animated_webp(16000, 16000, 64);
+    let limits = budget_limits();
+    let budget = limits.max_total_alloc as u64;
+    let data = one_pixel_animated_webp(4000, 2000, 64);
     let (err, allocated) = counting_allocations(|| {
-        ec_image::decode_animation(&data)
+        ec_image::decode_animation_with_limits(&data, limits)
             .expect_err("64 clones of a near-limit canvas is past the total budget")
     });
     assert!(format!("{err}").contains("limit"), "{err}");
@@ -592,7 +640,7 @@ fn a_webp_animation_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_t
     // or after the clone instead of before it, refuses later or not at all
     // as the frame count grows -- and no clock can tell those apart, since
     // the work is the same order either way.
-    let bomb = one_pixel_animated_webp(16000, 16000, 4096);
+    let bomb = one_pixel_animated_webp(4000, 2000, 4096);
     assert!(
         bomb.len() > data.len() * 16,
         "the second input is meant to be far larger: {} vs {} bytes",
@@ -600,7 +648,7 @@ fn a_webp_animation_with_many_tiny_frames_over_a_huge_canvas_is_refused_by_the_t
         data.len()
     );
     let (err, allocated) = counting_allocations(|| {
-        ec_image::decode_animation(&bomb)
+        ec_image::decode_animation_with_limits(&bomb, limits)
             .expect_err("4096 clones of a near-limit canvas is past the total budget")
     });
     assert!(format!("{err}").contains("limit"), "{err}");
@@ -658,6 +706,7 @@ fn lzw_bomb() -> Vec<u8> {
 /// `expected` bytes, rather than only checking after the loop.
 #[test]
 fn a_gif_lzw_bomb_does_not_expand_past_its_declared_frame() {
+    let _heavy = heavy();
     let lzw = lzw_bomb();
     eprintln!("gif-lzw-bomb: {} bytes of LZW data", lzw.len());
 
@@ -688,10 +737,33 @@ fn a_gif_lzw_bomb_does_not_expand_past_its_declared_frame() {
     // hundreds of megabytes. Bytes, not a clock: the same clock-versus-bytes
     // split as the budget tests above, and here the signal is much larger
     // than any host's speed difference.
-    let (_out, allocated) = counting_allocations(|| ec_image::decode(&data));
+    let (_out, allocated) =
+        counting_allocations(|| ec_image::decode_with_limits(&data, budget_limits()));
     assert!(
         allocated <= 1 << 20,
         "a 4x4 GIF frame allocated {allocated} bytes; the LZW stream expanded past its frame"
+    );
+}
+
+/// The plain entry point must apply `Limits::default()`, and the limits must bind.
+///
+/// A canvas just over the default `max_alloc` cannot be built: `max_pixels` caps the canvas at
+/// exactly `max_alloc` bytes, so the total budget is the first limit a GIF canvas can cross.
+#[test]
+fn decode_animation_applies_the_default_limits() {
+    let data = one_pixel_gif(2, 2, 2);
+    let plain = ec_image::decode_animation(&data).expect("two frames within the default limits");
+    let explicit = ec_image::decode_animation_with_limits(&data, ec_image::Limits::default())
+        .expect("the same two frames");
+    assert_eq!(plain, explicit);
+
+    let tiny = ec_image::Limits {
+        max_total_alloc: 1,
+        ..ec_image::Limits::default()
+    };
+    assert!(
+        ec_image::decode_animation_with_limits(&data, tiny).is_err(),
+        "a one-byte total budget must refuse the same file"
     );
 }
 

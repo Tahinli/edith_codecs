@@ -172,7 +172,7 @@ impl H264Decoder {
         if let MediaParameters::Video(video) = &mut self.params.media {
             video.width = width;
             video.height = height;
-            video.format = Some(PixelFormat::I420);
+            video.format = Some(self.inner.picture_format().unwrap_or(PixelFormat::I420));
         }
     }
 }

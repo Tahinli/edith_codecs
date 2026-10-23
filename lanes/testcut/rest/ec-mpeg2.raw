@@ -1,0 +1,56 @@
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "bits::tests::reads_across_bytes_and_pads_with_zeros" }
+{ "type": "test", "event": "started", "name": "idct::tests::dc_shortcut_matches_full_transform" }
+{ "type": "test", "event": "started", "name": "tables::tests::all_codes_are_prefix_free" }
+{ "type": "test", "event": "started", "name": "tables::tests::mba_and_cbp_are_complete_enough" }
+{ "type": "test", "name": "idct::tests::dc_shortcut_matches_full_transform", "event": "ok", "exec_time": 0.000001522 }
+{ "type": "test", "event": "started", "name": "tables::tests::scans_are_permutations" }
+{ "type": "test", "name": "tables::tests::all_codes_are_prefix_free", "event": "ok", "exec_time": 0.000088527 }
+{ "type": "test", "name": "bits::tests::reads_across_bytes_and_pads_with_zeros", "event": "ok", "exec_time": 0.000000231 }
+{ "type": "test", "name": "tables::tests::mba_and_cbp_are_complete_enough", "event": "ok", "exec_time": 0.000001612 }
+{ "type": "test", "name": "tables::tests::scans_are_permutations", "event": "ok", "exec_time": 0.000000501 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000850038 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::all_codes_are_prefix_free" }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::mba_and_cbp_are_complete_enough" }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::scans_are_permutations" }
+{ "type": "test", "event": "started", "name": "parity_matrix" }
+{ "type": "test", "name": "common::synth::tables::tests::mba_and_cbp_are_complete_enough", "event": "ok", "exec_time": 0.000001964 }
+{ "type": "test", "name": "common::synth::tables::tests::scans_are_permutations", "event": "ok", "exec_time": 0.000000681 }
+{ "type": "test", "name": "common::synth::tables::tests::all_codes_are_prefix_free", "event": "ok", "exec_time": 0.000078657 }
+{ "type": "test", "name": "parity_matrix", "event": "ok", "exec_time": 10.40411696 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 10.404822726999999 }
+{ "type": "suite", "event": "started", "test_count": 10 }
+{ "type": "test", "event": "started", "name": "chunking_is_invariant" }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::all_codes_are_prefix_free" }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::mba_and_cbp_are_complete_enough" }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::scans_are_permutations" }
+{ "type": "test", "name": "common::synth::tables::tests::scans_are_permutations", "event": "ok", "exec_time": 0.000000461 }
+{ "type": "test", "event": "started", "name": "dump_seeds" }
+{ "type": "test", "name": "common::synth::tables::tests::mba_and_cbp_are_complete_enough", "event": "ok", "exec_time": 0.000001623 }
+{ "type": "test", "event": "started", "name": "garbage_is_refused" }
+{ "type": "test", "name": "common::synth::tables::tests::all_codes_are_prefix_free", "event": "ok", "exec_time": 0.000088437 }
+{ "type": "test", "event": "started", "name": "huge_dimensions_are_bounded" }
+{ "type": "test", "name": "dump_seeds", "event": "ignored" }
+{ "type": "test", "event": "started", "name": "mb_height_change_without_resize_is_concealed" }
+{ "type": "test", "name": "garbage_is_refused", "event": "ok", "exec_time": 0.001095902 }
+{ "type": "test", "event": "started", "name": "random_corruptions" }
+{ "type": "test", "name": "mb_height_change_without_resize_is_concealed", "event": "ok", "exec_time": 0.001368163 }
+{ "type": "test", "event": "started", "name": "truncation_prefixes" }
+{ "type": "test", "name": "chunking_is_invariant", "event": "ok", "exec_time": 0.003274059 }
+{ "type": "test", "name": "truncation_prefixes", "event": "ok", "exec_time": 0.010583718 }
+{ "type": "test", "name": "random_corruptions", "event": "ok", "exec_time": 0.042333111 }
+{ "type": "test", "name": "huge_dimensions_are_bounded", "event": "ok", "exec_time": 0.071939901 }
+{ "type": "suite", "event": "ok", "passed": 9, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.07353406 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::all_codes_are_prefix_free" }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::mba_and_cbp_are_complete_enough" }
+{ "type": "test", "event": "started", "name": "common::synth::tables::tests::scans_are_permutations" }
+{ "type": "test", "event": "started", "name": "synthetic_streams_match_ffmpeg" }
+{ "type": "test", "name": "common::synth::tables::tests::all_codes_are_prefix_free", "event": "ok", "exec_time": 0.000073939 }
+{ "type": "test", "name": "common::synth::tables::tests::scans_are_permutations", "event": "ok", "exec_time": 0.000000361 }
+{ "type": "test", "name": "common::synth::tables::tests::mba_and_cbp_are_complete_enough", "event": "ok", "exec_time": 0.000001383 }
+{ "type": "test", "name": "synthetic_streams_match_ffmpeg", "event": "ok", "exec_time": 3.8805153470000002 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 3.8810140239999997 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000038903 }

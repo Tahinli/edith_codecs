@@ -9,6 +9,8 @@ authors.workspace = true
 [dependencies]
 ec-core.workspace = true
 ec-av1-syntax.workspace = true
+bytemuck = "1"
+multiversion = "0.9"
 
 [features]
 default = ["gate-counters"]
@@ -17,3 +19,8 @@ default = ["gate-counters"]
 # a shipped decoder can build `--no-default-features` to drop the TLS bump on
 # each counted path -- the `*_hits()` accessors still compile and return 0.
 gate-counters = []
+
+[dev-dependencies]
+# `nightly` only makes StatsAlloc::new const, so it can be a #[global_allocator] static.
+stats_alloc = { version = "0.1.10", features = ["nightly"] }
+tracking-allocator = "0.4.0"

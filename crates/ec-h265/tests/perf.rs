@@ -9,6 +9,7 @@
 //! Run under `--release`; in a debug build this prints the numbers and skips the
 //! assertion, because a debug build measures the compiler, not the encoder.
 
+#[path = "it/common.rs"]
 mod common;
 
 use common::{natural_frame, test_frame};

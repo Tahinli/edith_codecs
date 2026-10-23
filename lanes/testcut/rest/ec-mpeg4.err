@@ -1,0 +1,7 @@
+   Compiling ec-mpeg4 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-mpeg4)
+    Finished `release` profile [optimized] target(s) in 7.88s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_mpeg4-bc9b80684fe60c10)
+     Running tests/containers.rs (/home/user/.cache/tgt-testcut-rest/release/deps/containers-697e594f7892cee8)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-124f583e0547c9a6)
+     Running tests/msmpeg4.rs (/home/user/.cache/tgt-testcut-rest/release/deps/msmpeg4-625137724984bfa9)
+   Doc-tests ec_mpeg4

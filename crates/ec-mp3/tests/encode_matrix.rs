@@ -88,7 +88,7 @@ fn read_wav(path: &Path) -> Option<(Vec<f32>, u32, usize)> {
     }
     let samples = out
         .stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     let probe = Command::new("ffprobe")
@@ -255,7 +255,7 @@ fn decode(file: &Path) -> Vec<f32> {
         String::from_utf8_lossy(&out.stderr)
     );
     out.stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
@@ -332,7 +332,7 @@ fn vbr_frames_vary_their_bitrate_index() {
     );
     let decoded: Vec<f32> = out
         .stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     let corr = correlation(&decoded, &pcm);
@@ -446,7 +446,7 @@ fn encodes_above_the_incumbent_bar() {
             }
             let decoded: Vec<f32> = out
                 .stdout
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
             // With the Info tag's delay and padding honoured, ffmpeg hands
@@ -576,7 +576,7 @@ fn decode_source(path: &Path, seconds: u32) -> Option<Vec<f32>> {
     }
     Some(
         out.stdout
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
     )

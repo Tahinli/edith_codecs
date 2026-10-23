@@ -42,6 +42,28 @@ const BITRATES_V1: [u32; 15] = [
     0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
 ];
 const BITRATES_V2: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+const BITRATES_L1_V1: [u32; 15] = [
+    0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+];
+const BITRATES_L1_V2: [u32; 15] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+];
+const BITRATES_L2_V1: [u32; 15] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+];
+
+/// The bitrate table for a layer of a version: Layer III and Layer II of the
+/// low sampling frequencies share one, the other four combinations each have
+/// their own.
+fn bitrate_table(version: Version, layer: u8) -> &'static [u32; 15] {
+    match (version == Version::Mpeg1, layer) {
+        (true, 1) => &BITRATES_L1_V1,
+        (true, 2) => &BITRATES_L2_V1,
+        (true, _) => &BITRATES_V1,
+        (false, 1) => &BITRATES_L1_V2,
+        (false, _) => &BITRATES_V2,
+    }
+}
 const RATES_V1: [u32; 3] = [44100, 48000, 32000];
 
 /// Everything the header declares, decoded into usable units.
@@ -49,7 +71,7 @@ const RATES_V1: [u32; 3] = [44100, 48000, 32000];
 pub struct FrameHeader {
     /// MPEG generation.
     pub version: Version,
-    /// Layer number, 1..=3. Only Layer III is decodable here.
+    /// Layer number, 1..=3.
     pub layer: u8,
     /// True when a 16-bit CRC follows the header.
     pub crc: bool,
@@ -104,12 +126,7 @@ impl FrameHeader {
         if bitrate_index == 15 {
             return Err(Error::corrupt("mp3: bitrate index 15"));
         }
-        let table = if version == Version::Mpeg1 {
-            &BITRATES_V1
-        } else {
-            &BITRATES_V2
-        };
-        let bitrate_kbps = table[bitrate_index];
+        let bitrate_kbps = bitrate_table(version, layer)[bitrate_index];
         let rate_index = ((b[2] >> 2) & 3) as usize;
         if rate_index == 3 {
             return Err(Error::corrupt("mp3: reserved sampling frequency"));
@@ -153,12 +170,7 @@ impl FrameHeader {
             2 => 2,
             _ => 3,
         };
-        let table = if self.version == Version::Mpeg1 {
-            &BITRATES_V1
-        } else {
-            &BITRATES_V2
-        };
-        let bitrate_index = table
+        let bitrate_index = bitrate_table(self.version, self.layer)
             .iter()
             .position(|&k| k == self.bitrate_kbps)
             .unwrap_or(0) as u8;
@@ -202,7 +214,11 @@ impl FrameHeader {
 
     /// PCM samples per channel produced by this frame.
     pub fn samples_per_frame(&self) -> usize {
-        self.granules() * 576
+        match self.layer {
+            1 => 384,
+            2 => 1152,
+            _ => self.granules() * 576,
+        }
     }
 
     /// Side-information bytes between the header (plus CRC) and the main data.
@@ -249,6 +265,29 @@ impl FrameHeader {
             && self.sample_rate == other.sample_rate
             && self.mode.channels() == other.mode.channels()
     }
+}
+
+/// CRC-16 over a header and a run of protected *bits*, as Layers I and II
+/// specify it: the same polynomial and seed as [`crc16`], but the protected
+/// span (allocation and scalefactor-select bits) does not end on a byte.
+pub fn crc16_bits(header: &[u8; 4], data: &[u8], bits: usize) -> u16 {
+    let mut crc = 0xFFFFu16;
+    let mut feed = |bit: bool| {
+        let top = crc & 0x8000 != 0;
+        crc <<= 1;
+        if top != bit {
+            crc ^= 0x8005;
+        }
+    };
+    for &byte in &header[2..] {
+        for i in (0..8).rev() {
+            feed((byte >> i) & 1 == 1);
+        }
+    }
+    for i in 0..bits {
+        feed((data[i / 8] >> (7 - i % 8)) & 1 == 1);
+    }
+    crc
 }
 
 /// CRC-16 as Layer III specifies it: polynomial 0x8005, seeded with all ones,

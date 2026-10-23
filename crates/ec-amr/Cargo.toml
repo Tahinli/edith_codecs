@@ -1,0 +1,14 @@
+[package]
+name = "ec-amr"
+description = "AMR-NB and AMR-WB decoders (3GPP TS 26.073 / 26.173) and the .amr/.awb storage format."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+
+[dev-dependencies]
+ec-mp4 = { workspace = true }
+ec-riff = { workspace = true }

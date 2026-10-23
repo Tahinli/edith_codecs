@@ -1,0 +1,10 @@
+tiny_h264_aac.ts 0 15 24744 9eda05dd98ad23c4
+tiny_h264_aac.ts 1 30 5736 167beca03cc46869
+tiny_h264_ac3.m2ts 0 15 24744 9eda05dd98ad23c4
+tiny_h264_ac3.m2ts 1 19 7296 bd63247660f00805
+tiny_h264_eac3.ts 0 15 24744 9eda05dd98ad23c4
+tiny_h264_eac3.ts 1 19 7296 fd7efa0092110c3f
+tiny_h264_lpcm.m2ts 0 8 13487 fcf99b6b41fcec56
+tiny_h264_lpcm.m2ts 1 60 28800 f96121f1bef75e9d
+tiny_hevc_aac.ts 0 15 17577 45c5482a84fa6e31
+tiny_hevc_aac.ts 1 30 5736 167beca03cc46869

@@ -1,0 +1,16 @@
+[package]
+name = "ec-prores"
+description = "Apple ProRes video software decoder (SMPTE RDD 36): 422 Proxy/LT/Standard/HQ and 4444/4444 XQ, progressive and interlaced, optional alpha, slice-parallel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+archmage = "=0.9.31-beta.1"
+bytemuck = "1"
+wide = { workspace = true }
+
+[dev-dependencies]
+ec-mp4 = { workspace = true }

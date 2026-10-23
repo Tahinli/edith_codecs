@@ -470,8 +470,8 @@ mod tests {
         assert_eq!(QMF_WINDOW.len(), PROTO_LEN);
         let sum: f64 = QMF_WINDOW.iter().sum();
         let sum_sq: f64 = QMF_WINDOW.iter().map(|v| v * v).sum();
-        assert!((sum - 8.14630094365516442e+01).abs() < 1e-9, "sum={sum}");
-        assert!((sum_sq - 6.40000000000000284e+01).abs() < 1e-9, "sum_sq={sum_sq}");
+        assert!((sum - 81.46300943655164).abs() < 1e-9, "sum={sum}");
+        assert!((sum_sq - 64.00000000000003).abs() < 1e-9, "sum_sq={sum_sq}");
     }
 
 

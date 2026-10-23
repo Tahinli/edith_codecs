@@ -1,0 +1,9 @@
+   Compiling ec-matroska v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-matroska)
+    Finished `release` profile [optimized] target(s) in 8.68s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_matroska-3a286c05954d5eb7)
+     Running tests/dts.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dts-aba3162ac649f67c)
+     Running tests/field_order.rs (/home/user/.cache/tgt-testcut-rest/release/deps/field_order-dc3e96e97ea972b4)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-cfee81b72e5dfc7d)
+     Running tests/hdr_metadata.rs (/home/user/.cache/tgt-testcut-rest/release/deps/hdr_metadata-223483d8b654c05f)
+     Running tests/matroska.rs (/home/user/.cache/tgt-testcut-rest/release/deps/matroska-cc7b9835dd2ab275)
+   Doc-tests ec_matroska

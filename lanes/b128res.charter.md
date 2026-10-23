@@ -55,8 +55,7 @@ open filter bug. Mismatch remains → OFF, report.
 ## 3. Witness / pins / suite (only if you change the default)
 
 Pins at default and `EC_AV1_SPEED=6`. Existing residual witnesses
-(`a_128_root_block_with_a_real_residual_decodes_exact_through_both_decoders`
-and the CDEF-covered-units one) `--ignored`. Workspace check
+(folded into `superblock_size_global_suite`, `--ignored`). Workspace check
 `timeout 900 cargo check --workspace --all-targets -j4` (0 ec-av1
 warnings). Do NOT run the full lib suite unless you change the default;
 if you do, three lanes: `--skip stream::` / `stream:: --skip 10bit` /

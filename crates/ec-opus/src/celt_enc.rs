@@ -43,6 +43,12 @@ use crate::celt::{
 };
 use crate::range::RangeEncoder;
 
+/// `EC_OPUS_TRIM13` override of the continuous allocation trim.
+fn trim13_env() -> Option<bool> {
+    static P: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("EC_OPUS_TRIM13").ok().map(|v| v != "0"))
+}
+
 /// TF-boost sweep knobs (lane opustr2): `k * (tf_estimate - off) * target`,
 /// optionally applied only on frames the transient analysis flagged (other
 /// frames keep the shipped k=1). Read once from the environment;
@@ -110,14 +116,14 @@ pub(crate) fn analysis_params() -> (bool, bool, bool, bool, bool, bool) {
         let b = |name: &str, dflt: bool| {
             std::env::var(name).map(|v| v != "0").unwrap_or(dflt)
         };
-        let trim = b("EC_OPUS_TRIM_TONAL", false);
+        let trim = b("EC_OPUS_TRIM_TONAL", true);
         let vbr_tonal = b("EC_OPUS_VBR_TONAL", false);
         let vbr_act = b("EC_OPUS_VBR_ACT", false);
         // The analysis costs ~25% of the encoder (5.1 384k: 126x -> 100x
         // realtime), so it only runs when something reads it: any consumer
         // switch, an explicit `EC_OPUS_ANALYSIS=1`, or
         // `Encoder::set_analysis(true)` for the diagnostics.
-        let leak = b("EC_OPUS_LEAK", false);
+        let leak = b("EC_OPUS_LEAK", true);
         let bw = b("EC_OPUS_BW_DETECT", false);
         let any = trim || vbr_tonal || vbr_act || leak || bw;
         (b("EC_OPUS_ANALYSIS", any), trim, vbr_tonal, vbr_act, leak, bw)
@@ -348,8 +354,8 @@ fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
 /// In float mode `MAC16_32_Q15(c, a*b) = c + a*b`, so this is `L1*(1 + LM*bias)`.
 fn l1_metric(tmp: &[f32], n: usize, lm: usize, bias: f32) -> f32 {
     let mut l1 = 0.0f32;
-    for i in 0..n {
-        l1 += tmp[i].abs();
+    for v in &tmp[..n] {
+        l1 += v.abs();
     }
     l1 * (1.0 + lm as f32 * bias)
 }
@@ -639,6 +645,8 @@ impl CeltEncoder {
     /// postfilter bit, allocation over the coded span only. With
     /// `vbr_rate_bps` set, the frame may be shrunk below that budget
     /// (constrained VBR); the return value is the final frame size in bytes.
+    // The encoder entry point takes the per-frame knobs the caller owns, one argument each.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode(
         &mut self,
         enc: &mut RangeEncoder,
@@ -1421,6 +1429,8 @@ impl CeltEncoder {
     /// `self.offsets[i]` in boost units (the loop that codes them converts to
     /// bits via the band's quanta). Also computes `importance[]` for
     /// `tf_analysis()` (libopus celt_encoder.c:1176-1189).
+    // Mirrors libopus's dynalloc_analysis() signature; the inputs stay separate.
+    #[allow(clippy::too_many_arguments)]
     fn dynalloc_analysis(
         &mut self,
         start: usize,
@@ -1441,6 +1451,8 @@ impl CeltEncoder {
         // maxDepth = max(bandLogE - noise_floor) across channels (libopus 995-999).
         let mut max_depth = -31.9f32;
         for ch in 0..c {
+            // Parallel arrays are indexed by band or bin, as in libopus.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..end {
                 max_depth = max_depth.max(self.band_log_e[ch * NB_BANDS + i] - noise_floor[i]);
             }
@@ -1472,6 +1484,8 @@ impl CeltEncoder {
         }
         // Dynamic allocation can't make us bust the budget (libopus 1036-1037).
         if !(effective_bytes > 50 && lm >= 1) {
+            // Parallel arrays are indexed by band or bin, as in libopus.
+            #[allow(clippy::needless_range_loop)]
             for i in start..end {
                 importance[i] = 13;
             }
@@ -1527,6 +1541,8 @@ impl CeltEncoder {
                         + (self.band_log_e[NB_BANDS + i] - follower[NB_BANDS + i]).max(0.0));
             }
         } else {
+            // Parallel arrays are indexed by band or bin, as in libopus.
+            #[allow(clippy::needless_range_loop)]
             for i in start..end {
                 follower[i] = (self.band_log_e[i] - follower[i]).max(0.0);
             }
@@ -1542,6 +1558,8 @@ impl CeltEncoder {
                 *f *= 0.5;
             }
         }
+        // Parallel arrays are indexed by band or bin, as in libopus.
+        #[allow(clippy::needless_range_loop)]
         for i in start..end {
             if i < 8 {
                 follower[i] *= 2.0;
@@ -1553,6 +1571,8 @@ impl CeltEncoder {
         // libopus `celt_encoder.c:1226-1230`: the analysis's per-band
         // leakage boost, in 1/64 dB units, on top of the follower.
         if analysis_params().4 && self.info.valid {
+            // Parallel arrays are indexed by band or bin, as in libopus.
+            #[allow(clippy::needless_range_loop)]
             for i in start..crate::analysis::LEAK_BANDS.min(end) {
                 follower[i] += f32::from(self.info.leak_boost[i]) / 64.0;
             }
@@ -1617,6 +1637,8 @@ impl CeltEncoder {
                 let base = ch * n0 + m * E_BANDS[i];
                 let x = &self.x[base..base + n];
                 let mut tcount = [0i32; 3];
+                // Parallel arrays are indexed by band or bin, as in libopus.
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..n {
                     // Float-mode: x2N = x[j]^2 * N; thresholds are the literal
                     // QCONST16 values (0.25, 0.0625, 0.015625).
@@ -1715,7 +1737,8 @@ impl CeltEncoder {
         n0: usize,
         tf_estimate: f32,
     ) -> i32 {
-        let cont = std::env::var_os("EC_OPUS_TRIM13").is_some();
+        // Continuous (libopus 1.3+) trim; `EC_OPUS_TRIM13=0` restores the old discrete ladder.
+        let cont = !matches!(trim13_env(), Some(false));
         let mut trim_f = 5.0f32;
         let mut trim = 5i32;
         if c == 2 {
@@ -2676,6 +2699,34 @@ impl CeltEncoder {
     }
 }
 
+
+const INTENSITY_THRESHOLDS: [f32; 21] = [
+    1., 2., 3., 4., 5., 6., 7., 8., 16., 24., 36., 44., 50., 56., 62., 67., 72., 79., 88., 106.,
+    134.,
+];
+const INTENSITY_HYSTERESIS: [f32; 21] =
+    [1., 1., 1., 1., 1., 1., 1., 2., 2., 2., 2., 2., 2., 2., 3., 3., 4., 5., 6., 8., 8.];
+
+/// libopus `hysteresis_decision()`: the largest `i` with `val >= thresholds[i]`,
+/// sticky around the previous decision by `hysteresis`.
+fn hysteresis_decision(val: f32, thresholds: &[f32], hysteresis: &[f32], prev: usize) -> usize {
+    let n = thresholds.len();
+    let mut i = 0;
+    while i < n {
+        if val < thresholds[i] {
+            break;
+        }
+        i += 1;
+    }
+    if i > prev && val < thresholds[prev] + hysteresis[prev] {
+        i = prev;
+    }
+    if i < prev && val > thresholds[prev - 1] - hysteresis[prev - 1] {
+        i = prev;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2921,31 +2972,4 @@ mod tests {
             }
         }
     }
-}
-
-const INTENSITY_THRESHOLDS: [f32; 21] = [
-    1., 2., 3., 4., 5., 6., 7., 8., 16., 24., 36., 44., 50., 56., 62., 67., 72., 79., 88., 106.,
-    134.,
-];
-const INTENSITY_HYSTERESIS: [f32; 21] =
-    [1., 1., 1., 1., 1., 1., 1., 2., 2., 2., 2., 2., 2., 2., 3., 3., 4., 5., 6., 8., 8.];
-
-/// libopus `hysteresis_decision()`: the largest `i` with `val >= thresholds[i]`,
-/// sticky around the previous decision by `hysteresis`.
-fn hysteresis_decision(val: f32, thresholds: &[f32], hysteresis: &[f32], prev: usize) -> usize {
-    let n = thresholds.len();
-    let mut i = 0;
-    while i < n {
-        if val < thresholds[i] {
-            break;
-        }
-        i += 1;
-    }
-    if i > prev && val < thresholds[prev] + hysteresis[prev] {
-        i = prev;
-    }
-    if i < prev && val > thresholds[prev - 1] - hysteresis[prev - 1] {
-        i = prev;
-    }
-    i
 }

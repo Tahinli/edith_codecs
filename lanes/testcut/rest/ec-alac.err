@@ -1,0 +1,8 @@
+   Compiling ec-dv v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dv)
+   Compiling ec-alac v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-alac)
+   Compiling ec-riff v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-riff)
+    Finished `release` profile [optimized] target(s) in 4.77s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_alac-737231f686cbe2b2)
+     Running tests/encode.rs (/home/user/.cache/tgt-testcut-rest/release/deps/encode-e83d84512058df64)
+     Running tests/oracle.rs (/home/user/.cache/tgt-testcut-rest/release/deps/oracle-b6eed5bdd7e39c38)
+   Doc-tests ec_alac

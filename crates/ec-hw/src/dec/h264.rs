@@ -1,6 +1,6 @@
 //! Stateless H.264 decoding.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ec_core::color::{ColorDescription, ContentLight, Tags};
 use ec_h264_syntax::{
@@ -8,26 +8,58 @@ use ec_h264_syntax::{
     SliceType, Sps, unescape_rbsp,
 };
 use ec_va::caps::Profile;
-use ec_va::{Buffer, Display, sys};
+use ec_va::{Buffer, Display};
 
 use super::dpb264::{Dpb, Mark, PicInfo, Picture, Poc, RefList};
 use super::{ReadyFrames, Session, StreamInfo};
 use crate::error::{Error, Result};
 use crate::frame::{Colour, Frame};
 use crate::params::h264::{
-    IQMatrixBufferH264, PICTURE_LONG_TERM_REFERENCE, PICTURE_SHORT_TERM_REFERENCE,
-    PictureParameterBufferH264, SliceParameterBufferH264, VAPictureH264,
+    IQMatrixBufferH264, PICTURE_LONG_TERM_REFERENCE, PICTURE_SHORT_TERM_REFERENCE, PicFields,
+    PictureParameterBufferH264, SeqFields, SliceParameterBufferH264, VAPictureH264,
 };
-use crate::params::param_buffer;
 use crate::pool::PooledSurface;
 
 /// Extra surfaces beyond the DPB: one being decoded, one or two in the caller's
 /// hands, plus slack so a `frame_num` gap fill never starves the decoder.
 const EXTRA_SURFACES: usize = 6;
 
+/// One stored picture as the parameter builders read it: its surface id and the
+/// numbers its reference entry carries. Plain values, so the builders run with no
+/// display; the fuzz target calls them the same way.
+#[derive(Clone, Copy, Debug)]
+struct RefView {
+    id: u32,
+    frame_num: u32,
+    long_term_frame_idx: u32,
+    poc: i32,
+    mark: Mark,
+}
+
+impl RefView {
+    fn of(pic: &Picture) -> RefView {
+        RefView {
+            id: pic.surface.id(),
+            frame_num: pic.frame_num,
+            long_term_frame_idx: pic.long_term_frame_idx,
+            poc: pic.poc,
+            mark: pic.mark,
+        }
+    }
+}
+
+/// The picture being decoded, as the parameter builders read it.
+#[derive(Clone, Copy, Debug)]
+struct CurrentView {
+    id: u32,
+    frame_num: u32,
+    poc: i32,
+    is_reference: bool,
+}
+
 /// The picture currently being assembled from its slices.
 struct Current {
-    surface: Arc<PooledSurface>,
+    surface: Rc<PooledSurface>,
     id: i32,
     sps_id: u8,
     info: PicInfo,
@@ -45,7 +77,7 @@ struct Current {
 
 /// A stateless H.264 decoder.
 pub struct H264Decoder {
-    display: Arc<Display>,
+    display: Rc<Display>,
     sps_map: [Option<Sps>; 32],
     pps_map: Vec<Option<Pps>>,
     session: Option<Session>,
@@ -70,9 +102,9 @@ pub struct H264Decoder {
 impl H264Decoder {
     /// A decoder with no stream state. The GPU context is created when the
     /// first SPS arrives, because only then is the size and bit depth known.
-    pub fn new(display: &Arc<Display>) -> H264Decoder {
+    pub fn new(display: &Rc<Display>) -> H264Decoder {
         H264Decoder {
-            display: Arc::clone(display),
+            display: Rc::clone(display),
             sps_map: [const { None }; 32],
             pps_map: (0..256).map(|_| None).collect(),
             session: None,
@@ -311,10 +343,18 @@ impl H264Decoder {
         // describes the picture, and the DPB it names must not change under the
         // driver between slices.
         if current.slices == 0 {
-            let pic_param = picture_parameters(sps, pps, sh, header, current, &self.dpb);
-            current
-                .buffers
-                .push(param_buffer(&session.context, &pic_param)?);
+            let curr = CurrentView {
+                id: current.surface.id(),
+                frame_num: current.info.frame_num,
+                poc: current.poc.value,
+                is_reference: current.info.is_reference,
+            };
+            let refs: Vec<RefView> = self.dpb.frames.iter().map(RefView::of).collect();
+            let pic_param = picture_parameters(sps, pps, sh, header, curr, &refs);
+            current.buffers.push(ec_va::picture::buffer(
+                &session.context,
+                pic_param.to_buffer(),
+            )?);
             // The matrices are sent for every picture, flat or not: a driver
             // that never receives them dequantises with a zero matrix and
             // hands back a uniformly grey surface (radeonsi does exactly this).
@@ -323,11 +363,12 @@ impl H264Decoder {
                 Some(lists) => IQMatrixBufferH264 {
                     scaling_list_4x4: lists.list_4x4,
                     scaling_list_8x8: [lists.list_8x8[0], lists.list_8x8[1]],
-                    ..IQMatrixBufferH264::default()
                 },
                 None => IQMatrixBufferH264::default(),
             };
-            current.buffers.push(param_buffer(&session.context, &iq)?);
+            current
+                .buffers
+                .push(ec_va::picture::buffer(&session.context, iq.to_buffer())?);
         }
 
         let max_pic_num = 1i32 << sps.log2_max_frame_num;
@@ -348,14 +389,15 @@ impl H264Decoder {
             lists
         };
 
-        let slice_param = slice_parameters(sh, pps, nal, &lists, &self.dpb);
-        current
-            .buffers
-            .push(param_buffer(&session.context, &slice_param)?);
-        current.buffers.push(Buffer::from_bytes(
+        let refs: Vec<RefView> = self.dpb.frames.iter().map(RefView::of).collect();
+        let slice_param = slice_parameters(sh, pps, nal, &lists, &refs);
+        current.buffers.push(ec_va::picture::buffer(
             &session.context,
-            sys::VASliceDataBufferType,
-            nal,
+            slice_param.to_buffer(),
+        )?);
+        current.buffers.push(ec_va::picture::buffer(
+            &session.context,
+            ec_va::va::BufferType::SliceData(nal.to_vec()),
         )?);
         current.slices += 1;
         Ok(())
@@ -385,7 +427,7 @@ impl H264Decoder {
 
         let picture = Picture {
             id: current.id,
-            surface: Arc::clone(&current.surface),
+            surface: Rc::clone(&current.surface),
             timestamp: current.timestamp,
             frame_num: current.info.frame_num,
             frame_num_wrap: current.info.frame_num as i32,
@@ -399,8 +441,13 @@ impl H264Decoder {
             non_existing: false,
             output: true,
         };
-        self.dpb
-            .store(picture, &sps, &current.info, current.marking.as_ref(), output_ok)?;
+        self.dpb.store(
+            picture,
+            &sps,
+            &current.info,
+            current.marking.as_ref(),
+            output_ok,
+        )?;
         self.bump(false);
         Ok(())
     }
@@ -413,8 +460,8 @@ impl H264Decoder {
         while let Some(idx) = self.dpb.next_output(flush) {
             let pic = &self.dpb.frames[idx];
             let frame = Frame::new(
-                Arc::clone(&pic.surface),
-                Arc::clone(&session.images),
+                Rc::clone(&pic.surface),
+                Rc::clone(&self.display),
                 pic.timestamp,
                 session.display_size,
                 session.coded_size,
@@ -502,7 +549,7 @@ fn slice_type_code(slice_type: SliceType) -> u8 {
 }
 
 /// The VA reference entry for a stored picture.
-fn reference_entry(pic: &Picture) -> VAPictureH264 {
+fn reference_entry(pic: &RefView) -> VAPictureH264 {
     let flags = match pic.mark {
         Mark::Long => PICTURE_LONG_TERM_REFERENCE,
         _ => PICTURE_SHORT_TERM_REFERENCE,
@@ -512,7 +559,7 @@ fn reference_entry(pic: &Picture) -> VAPictureH264 {
     } else {
         pic.frame_num
     };
-    VAPictureH264::frame(pic.surface.id(), frame_idx, pic.poc, flags)
+    VAPictureH264::frame(pic.id, frame_idx, pic.poc, flags)
 }
 
 fn picture_parameters(
@@ -520,15 +567,15 @@ fn picture_parameters(
     pps: &Pps,
     sh: &SliceHeader,
     header: NalHeader,
-    current: &Current,
-    dpb: &Dpb,
+    curr: CurrentView,
+    dpb: &[RefView],
 ) -> PictureParameterBufferH264 {
     let mut p = PictureParameterBufferH264 {
         curr_pic: VAPictureH264::frame(
-            current.surface.id(),
-            current.info.frame_num,
-            current.poc.value,
-            if current.info.is_reference {
+            curr.id,
+            curr.frame_num,
+            curr.poc,
+            if curr.is_reference {
                 PICTURE_SHORT_TERM_REFERENCE
             } else {
                 0
@@ -548,7 +595,6 @@ fn picture_parameters(
     };
 
     for (n, pic) in dpb
-        .frames
         .iter()
         .filter(|p| p.mark != Mark::Unused)
         .take(p.reference_frames.len())
@@ -557,35 +603,35 @@ fn picture_parameters(
         p.reference_frames[n] = reference_entry(pic);
     }
 
-    p.seq_fields = p
-        .seq_fields
-        .chroma_format_idc(u32::from(sps.chroma_format_idc))
-        .residual_colour_transform_flag(u32::from(sps.separate_colour_plane))
-        .gaps_in_frame_num_value_allowed_flag(u32::from(sps.gaps_in_frame_num_allowed))
-        .frame_mbs_only_flag(u32::from(sps.frame_mbs_only))
-        .mb_adaptive_frame_field_flag(u32::from(sps.mb_adaptive_frame_field))
-        .direct_8x8_inference_flag(u32::from(sps.direct_8x8_inference))
+    p.seq_fields = SeqFields {
+        chroma_format_idc: u32::from(sps.chroma_format_idc),
+        residual_colour_transform_flag: u32::from(sps.separate_colour_plane),
+        gaps_in_frame_num_value_allowed_flag: u32::from(sps.gaps_in_frame_num_allowed),
+        frame_mbs_only_flag: u32::from(sps.frame_mbs_only),
+        mb_adaptive_frame_field_flag: u32::from(sps.mb_adaptive_frame_field),
+        direct_8x8_inference_flag: u32::from(sps.direct_8x8_inference),
         // A.3.3.2: 8x8 bi-prediction is restricted from level 3.1 up.
-        .min_luma_bipred_size8x8(u32::from(sps.level_idc >= 31))
-        .log2_max_frame_num_minus4(u32::from(sps.log2_max_frame_num.saturating_sub(4)))
-        .pic_order_cnt_type(u32::from(sps.pic_order_cnt_type))
-        .log2_max_pic_order_cnt_lsb_minus4(u32::from(
+        min_luma_bipred_size8x8: u32::from(sps.level_idc >= 31),
+        log2_max_frame_num_minus4: u32::from(sps.log2_max_frame_num.saturating_sub(4)),
+        pic_order_cnt_type: u32::from(sps.pic_order_cnt_type),
+        log2_max_pic_order_cnt_lsb_minus4: u32::from(
             sps.log2_max_pic_order_cnt_lsb.saturating_sub(4),
-        ))
-        .delta_pic_order_always_zero_flag(u32::from(sps.delta_pic_order_always_zero));
+        ),
+        delta_pic_order_always_zero_flag: u32::from(sps.delta_pic_order_always_zero),
+    };
 
-    p.pic_fields = p
-        .pic_fields
-        .entropy_coding_mode_flag(u32::from(pps.entropy_coding_mode))
-        .weighted_pred_flag(u32::from(pps.weighted_pred))
-        .weighted_bipred_idc(u32::from(pps.weighted_bipred_idc))
-        .transform_8x8_mode_flag(u32::from(pps.transform_8x8_mode))
-        .field_pic_flag(u32::from(sh.field_pic))
-        .constrained_intra_pred_flag(u32::from(pps.constrained_intra_pred))
-        .pic_order_present_flag(u32::from(pps.bottom_field_pic_order_in_frame_present))
-        .deblocking_filter_control_present_flag(u32::from(pps.deblocking_filter_control_present))
-        .redundant_pic_cnt_present_flag(u32::from(pps.redundant_pic_cnt_present))
-        .reference_pic_flag(u32::from(header.ref_idc != 0));
+    p.pic_fields = PicFields {
+        entropy_coding_mode_flag: u32::from(pps.entropy_coding_mode),
+        weighted_pred_flag: u32::from(pps.weighted_pred),
+        weighted_bipred_idc: u32::from(pps.weighted_bipred_idc),
+        transform_8x8_mode_flag: u32::from(pps.transform_8x8_mode),
+        field_pic_flag: u32::from(sh.field_pic),
+        constrained_intra_pred_flag: u32::from(pps.constrained_intra_pred),
+        pic_order_present_flag: u32::from(pps.bottom_field_pic_order_in_frame_present),
+        deblocking_filter_control_present_flag: u32::from(pps.deblocking_filter_control_present),
+        redundant_pic_cnt_present_flag: u32::from(pps.redundant_pic_cnt_present),
+        reference_pic_flag: u32::from(header.ref_idc != 0),
+    };
     p
 }
 
@@ -594,7 +640,7 @@ fn slice_parameters(
     pps: &Pps,
     nal: &[u8],
     lists: &[RefList; 2],
-    dpb: &Dpb,
+    dpb: &[RefView],
 ) -> SliceParameterBufferH264 {
     let mut s = SliceParameterBufferH264 {
         slice_data_size: nal.len() as u32,
@@ -626,7 +672,7 @@ fn slice_parameters(
         };
         for i in 0..list.len().min(out.len()) {
             if let Some(idx) = list.get(i)
-                && let Some(pic) = dpb.frames.get(idx)
+                && let Some(pic) = dpb.get(idx)
             {
                 out[i] = reference_entry(pic);
             }
@@ -699,6 +745,97 @@ fn write_weights(s: &mut SliceParameterBufferH264, w: &PredWeightTable) {
             }
         }
     }
+}
+
+/// Feeds an Annex B stream through the H.264 parameter builders, with the SPS,
+/// PPS and slice headers the real parser produces and a synthetic DPB of up to 15
+/// slots. No GPU: surface ids are plain numbers. Returns the number of slices built.
+#[doc(hidden)]
+pub fn fuzz_build_parameters(data: &[u8]) -> usize {
+    let mut sps_map: Vec<Option<Sps>> = std::iter::repeat_with(|| None).take(32).collect();
+    let mut pps_map: Vec<Option<Pps>> = std::iter::repeat_with(|| None).take(256).collect();
+    let mut built = 0usize;
+    for nal in AnnexBIter::new(data) {
+        let Some((&first, payload)) = nal.split_first() else {
+            continue;
+        };
+        let Ok(header) = NalHeader::parse(first) else {
+            continue;
+        };
+        let mut rbsp = Vec::new();
+        unescape_rbsp(payload, &mut rbsp);
+        match header.unit_type {
+            NalUnitType::Sps => {
+                if let Ok(sps) = Sps::parse(&rbsp)
+                    && let Some(slot) = sps_map.get_mut(usize::from(sps.id))
+                {
+                    *slot = Some(sps);
+                }
+            }
+            NalUnitType::Pps => {
+                let pps = Pps::parse(&rbsp, |id| {
+                    sps_map.get(usize::from(id)).and_then(Option::as_ref)
+                });
+                if let Ok(pps) = pps
+                    && let Some(slot) = pps_map.get_mut(pps.id as usize)
+                {
+                    *slot = Some(pps);
+                }
+            }
+            NalUnitType::Slice | NalUnitType::SliceIdr => {
+                let Ok(pps_id) = peek_pps_id(&rbsp) else {
+                    continue;
+                };
+                let Some(pps) = pps_map.get(pps_id as usize).and_then(Option::as_ref) else {
+                    continue;
+                };
+                let Some(sps) = sps_map
+                    .get(usize::from(pps.sps_id))
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                let Ok(sh) = SliceHeader::parse(&rbsp, header, sps, pps) else {
+                    continue;
+                };
+                let n = (data.len() % 16).max(1);
+                let refs: Vec<RefView> = (0..n)
+                    .map(|i| RefView {
+                        id: 0x100 + i as u32,
+                        frame_num: i as u32,
+                        long_term_frame_idx: (i % 4) as u32,
+                        poc: i as i32 - (n as i32 / 2),
+                        mark: match i % 3 {
+                            0 => Mark::Short,
+                            1 => Mark::Long,
+                            _ => Mark::Unused,
+                        },
+                    })
+                    .collect();
+                let curr = CurrentView {
+                    id: 0x200,
+                    frame_num: sh.frame_num,
+                    poc: data.len() as i32,
+                    is_reference: header.ref_idc != 0,
+                };
+                let mut lists = [RefList::default(), RefList::default()];
+                if !sh.slice_type.is_intra() {
+                    for i in (0..n).step_by(2) {
+                        lists[0].push(i);
+                    }
+                    for i in (1..n).step_by(3) {
+                        lists[1].push(i);
+                    }
+                }
+                let pic = picture_parameters(sps, pps, &sh, header, curr, &refs);
+                let slice = slice_parameters(&sh, pps, nal, &lists, &refs);
+                std::hint::black_box((pic, slice));
+                built += 1;
+            }
+            _ => {}
+        }
+    }
+    built
 }
 
 #[cfg(test)]

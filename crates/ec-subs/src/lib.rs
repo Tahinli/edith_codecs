@@ -25,8 +25,8 @@ pub mod srt;
 pub mod webvtt;
 
 pub use ir::{
-    CuePosition, Segment, SourceFormat, SubtitleCue, SubtitleStyle, SubtitleTrack, TextAlign,
-    plain_text,
+    CuePosition, KaraokeMode, Segment, SourceFormat, SubtitleCue, SubtitleStyle, SubtitleTrack,
+    TextAlign, plain_text,
 };
 /// The byte-level tolerances every subtitle format needs, shared with `ec-ass`:
 /// BOM and line-ending normalisation, and the clock every one of them writes.

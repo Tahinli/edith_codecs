@@ -3,7 +3,7 @@
 //! This module implements the spatial predictors a VP8 decoder applies to
 //! intra-coded macroblocks: the 16x16 luma predictors and 8x8 (per-plane)
 //! chroma predictors of Section 12.2/12.3, and the ten 4x4 subblock
-//! predictors of Section 12.3. All functions are dependency-free, `unsafe`-free,
+//! predictors of Section 12.3. All functions are dependency-free,
 //! allocate nothing, and are bit-exact against the normative integer math of
 //! the RFC code listings (which are in turn identical to the libvpx oracle in
 //! `vp8/common/reconintra.c`, `vp8/common/reconintra4x4.c` and
@@ -30,7 +30,6 @@
 //! row); on the top frame row they are 127. [`predict4`] only consumes
 //! `A[0..8]` as given.
 
-#![deny(unsafe_code)]
 
 /// Weighted average of three adjacent pixels centered at `y`
 /// (RFC 6386 Section 12.3 `avg3`: `(x + 2y + z + 2) >> 2`; libvpx `AVG3`).
@@ -71,7 +70,7 @@ fn predict_block<const N: usize>(
     left: &[u8; N],
     above_left: u8,
     out: &mut [u8],
-) {
+) -> crate::Result<()> {
     match mode {
         // DC_PRED: fill the block with the average of the genuinely visible
         // edge pixels; availability flags alone decide which edges count
@@ -92,27 +91,32 @@ fn predict_block<const N: usize>(
         }
         // V_PRED: every row is a copy of the above row A (RFC Section 12.2).
         1 => {
-            for row in out.chunks_exact_mut(N) {
+            for row in out.as_chunks_mut::<N>().0.iter_mut() {
                 row.copy_from_slice(above);
             }
         }
         // H_PRED: every column is a copy of the left column L (RFC Section 12.2).
         2 => {
-            for (row, &l) in out.chunks_exact_mut(N).zip(left.iter()) {
+            for (row, &l) in out.as_chunks_mut::<N>().0.iter_mut().zip(left.iter()) {
                 row.fill(l);
             }
         }
         // TM_PRED: X_ij = clamp255(L_i + A_j - P) (RFC Section 12.2 `TMpred`).
         // Unlike DC_PRED this mode does use the 127/129 out-of-bounds fills.
         3 => {
-            for (row, &l) in out.chunks_exact_mut(N).zip(left.iter()) {
+            for (row, &l) in out.as_chunks_mut::<N>().0.iter_mut().zip(left.iter()) {
                 for (o, &a) in row.iter_mut().zip(above.iter()) {
                     *o = clamp255(i32::from(l) + i32::from(a) - i32::from(above_left));
                 }
             }
         }
-        _ => panic!("predict_block: invalid intra mode {mode} (expected 0..=3)"),
+        _ => {
+            return Err(crate::Error::corrupt(format!(
+                "intra: predict_block mode {mode} (expected 0..=3)"
+            )));
+        }
     }
+    Ok(())
 }
 
 /// 16x16 luma prediction (RFC 6386 Section 12.3; predictor math per
@@ -138,8 +142,8 @@ pub fn predict16(
     left: &[u8; 16],
     above_left: u8,
     out: &mut [u8; 256],
-) {
-    predict_block::<16>(mode, have_above, have_left, above, left, above_left, out);
+) -> crate::Result<()> {
+    predict_block::<16>(mode, have_above, have_left, above, left, above_left, out)
 }
 
 /// 8x8 chroma prediction for one plane (RFC 6386 Section 12.2).
@@ -158,8 +162,8 @@ pub fn predict8(
     left: &[u8; 8],
     above_left: u8,
     out: &mut [u8; 64],
-) {
-    predict_block::<8>(mode, have_above, have_left, above, left, above_left, out);
+) -> crate::Result<()> {
+    predict_block::<8>(mode, have_above, have_left, above, left, above_left, out)
 }
 
 /// 4x4 subblock prediction (RFC 6386 Section 12.3 `subblock_intra_predict`).
@@ -181,7 +185,13 @@ pub fn predict8(
 /// `B[2][0] = B[3][2] = svg2p(E + 1)`; `svg2p` is a typo for `avg2p` (there
 /// is no `svg2p` definition; libvpx's `d153_predictor` computes `AVG2(K, J)`
 /// there, confirming the correction implemented here).
-pub fn predict4(mode: u8, above: &[u8; 8], left: &[u8; 4], above_left: u8, out: &mut [u8; 16]) {
+pub fn predict4(
+    mode: u8,
+    above: &[u8; 8],
+    left: &[u8; 4],
+    above_left: u8,
+    out: &mut [u8; 16],
+) -> crate::Result<()> {
     // The 9 already-constructed edge pixels in RFC scan order:
     // E[0..4] = L[3], L[2], L[1], L[0]; E[4] = P; E[5..9] = A[0..4].
     let e: [u8; 9] = [
@@ -362,9 +372,14 @@ pub fn predict4(mode: u8, above: &[u8; 8], left: &[u8; 4], above_left: u8, out: 
             b[14] = v;
             b[15] = v;
         }
-        _ => panic!("predict4: invalid intra 4x4 mode {mode} (expected 0..=9)"),
+        _ => {
+            return Err(crate::Error::corrupt(format!(
+                "intra: predict4 mode {mode} (expected 0..=9)"
+            )));
+        }
     }
     out.copy_from_slice(&b);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -425,7 +440,7 @@ mod tests {
 
     fn assert_pred4(mode: u8, expected: [u8; 16]) {
         let mut out = [0u8; 16];
-        predict4(mode, &EDGE_A, &EDGE_L, EDGE_P, &mut out);
+        predict4(mode, &EDGE_A, &EDGE_L, EDGE_P, &mut out).unwrap();
         assert_eq!(out, expected, "predict4 mode {mode}");
     }
 
@@ -569,7 +584,7 @@ mod tests {
         );
         // Directly pin the corrected-typo cells.
         let mut out = [0u8; 16];
-        predict4(8, &EDGE_A, &EDGE_L, EDGE_P, &mut out);
+        predict4(8, &EDGE_A, &EDGE_L, EDGE_P, &mut out).unwrap();
         assert_eq!(
             (out[8], out[14]),
             (30, 30),
@@ -602,20 +617,20 @@ mod tests {
         let mut out = [0u8; 256];
 
         // Both edges: (160 + 320 + 16) >> 5 = 15.
-        predict16(0, true, true, &above, &left, 5, &mut out);
+        predict16(0, true, true, &above, &left, 5, &mut out).unwrap();
         assert_eq!(out, [15; 256]);
 
         // Neither edge (top-left macroblock): constant 128. The array
         // contents are irrelevant here; availability flags decide.
-        predict16(0, false, false, &above, &left, 5, &mut out);
+        predict16(0, false, false, &above, &left, 5, &mut out).unwrap();
         assert_eq!(out, [128; 256]);
 
         // Above only (left frame column): (160 + 8) >> 4 = 10.
-        predict16(0, true, false, &above, &left, 5, &mut out);
+        predict16(0, true, false, &above, &left, 5, &mut out).unwrap();
         assert_eq!(out, [10; 256]);
 
         // Left only (top frame row): (320 + 8) >> 4 = 20.
-        predict16(0, false, true, &above, &left, 5, &mut out);
+        predict16(0, false, true, &above, &left, 5, &mut out).unwrap();
         assert_eq!(out, [20; 256]);
     }
 
@@ -627,19 +642,19 @@ mod tests {
         let mut out = [0u8; 64];
 
         // Both: (80 + 160 + 8) >> 4 = 15.
-        predict8(0, true, true, &above, &left, 5, &mut out);
+        predict8(0, true, true, &above, &left, 5, &mut out).unwrap();
         assert_eq!(out, [15; 64]);
 
         // Neither: 128.
-        predict8(0, false, false, &above, &left, 5, &mut out);
+        predict8(0, false, false, &above, &left, 5, &mut out).unwrap();
         assert_eq!(out, [128; 64]);
 
         // Above only: (80 + 4) >> 3 = 10.
-        predict8(0, true, false, &above, &left, 5, &mut out);
+        predict8(0, true, false, &above, &left, 5, &mut out).unwrap();
         assert_eq!(out, [10; 64]);
 
         // Left only: (160 + 4) >> 3 = 20.
-        predict8(0, false, true, &above, &left, 5, &mut out);
+        predict8(0, false, true, &above, &left, 5, &mut out).unwrap();
         assert_eq!(out, [20; 64]);
     }
 
@@ -649,17 +664,17 @@ mod tests {
 
         // Negative difference clamps to 0: P high (250), L and A low (0)
         // gives L + A - P = -250 everywhere.
-        predict16(3, true, true, &[0u8; 16], &[0u8; 16], 250, &mut out);
+        predict16(3, true, true, &[0u8; 16], &[0u8; 16], 250, &mut out).unwrap();
         assert_eq!(out, [0; 256]);
 
         // Overflow clamps to 255: P = 0, L = A = 255 gives 510 everywhere.
-        predict16(3, true, true, &[255u8; 16], &[255u8; 16], 0, &mut out);
+        predict16(3, true, true, &[255u8; 16], &[255u8; 16], 0, &mut out).unwrap();
         assert_eq!(out, [255; 256]);
 
         // Exact in-range gradient: out[r][c] = 200 + c - 50 = 150 + c,
         // no clamping, verifies arithmetic (not just the clamps).
         let above: [u8; 16] = core::array::from_fn(|i| i as u8);
-        predict16(3, true, true, &above, &[200u8; 16], 50, &mut out);
+        predict16(3, true, true, &above, &[200u8; 16], 50, &mut out).unwrap();
         for r in 0..16 {
             let row: [u8; 16] = core::array::from_fn(|c| (150 + c) as u8);
             assert_eq!(out[r * 16..r * 16 + 16], row, "TM16 row {r}");
@@ -670,9 +685,9 @@ mod tests {
     fn tm4_clamps_via_predict4() {
         // Same clamp contract at 4x4 (RFC B_TM_PRED == clamp255(L + A - P)).
         let mut out = [0u8; 16];
-        predict4(1, &[0u8; 8], &[0u8; 4], 250, &mut out);
+        predict4(1, &[0u8; 8], &[0u8; 4], 250, &mut out).unwrap();
         assert_eq!(out, [0; 16]);
-        predict4(1, &[255u8; 8], &[255u8; 4], 0, &mut out);
+        predict4(1, &[255u8; 8], &[255u8; 4], 0, &mut out).unwrap();
         assert_eq!(out, [255; 16]);
     }
 
@@ -681,31 +696,29 @@ mod tests {
         // V_PRED: every 16x16 row equals the above row.
         let above: [u8; 16] = core::array::from_fn(|i| (i * 7 + 3) as u8);
         let mut out = [0u8; 256];
-        predict16(1, true, true, &above, &[0u8; 16], 0, &mut out);
-        for row in out.chunks_exact(16) {
-            assert_eq!(row, above);
+        predict16(1, true, true, &above, &[0u8; 16], 0, &mut out).unwrap();
+        for row in out.as_chunks::<16>().0.iter() {
+            assert_eq!(*row, above);
         }
 
         // H_PRED: every 8x8 row is the constant left[r].
         let left: [u8; 8] = core::array::from_fn(|i| (i * 11 + 1) as u8);
         let mut out8 = [0u8; 64];
-        predict8(2, true, true, &[0u8; 8], &left, 0, &mut out8);
-        for (r, row) in out8.chunks_exact(8).enumerate() {
-            assert_eq!(row, [left[r]; 8]);
+        predict8(2, true, true, &[0u8; 8], &left, 0, &mut out8).unwrap();
+        for (r, row) in out8.as_chunks::<8>().0.iter().enumerate() {
+            assert_eq!(*row, [left[r]; 8]);
         }
     }
 
     #[test]
-    #[should_panic(expected = "invalid intra mode")]
     fn predict16_rejects_invalid_mode() {
         let mut out = [0u8; 256];
-        predict16(4, true, true, &[0u8; 16], &[0u8; 16], 0, &mut out);
+        assert!(predict16(4, true, true, &[0u8; 16], &[0u8; 16], 0, &mut out).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "invalid intra 4x4 mode")]
     fn predict4_rejects_invalid_mode() {
         let mut out = [0u8; 16];
-        predict4(10, &[0u8; 8], &[0u8; 4], 0, &mut out);
+        assert!(predict4(10, &[0u8; 8], &[0u8; 4], 0, &mut out).is_err());
     }
 }

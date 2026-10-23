@@ -15,6 +15,7 @@
 //! `sbrtables.py` never needed them for the codebook derivation.
 #![allow(dead_code)]
 
+use crate::ps_data::PsCommon;
 use crate::sbr_bands::{BandTables, freq_tables};
 use crate::sbr_tables::*;
 use ec_core::{BitReader, Error, Result};
@@ -78,6 +79,10 @@ pub struct SbrData {
     /// slice's job).
     pub coupling: bool,
     pub channels: Vec<SbrChannel>,
+    /// The element's Parametric Stereo state, present when this element
+    /// carries PS (signalled in the config, or a PS extension seen earlier).
+    /// `ps.start` tells whether a PS header has been decoded yet.
+    pub ps: Option<PsCommon>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,10 +107,10 @@ impl Grid {
         } else {
             let middle = match frame_class {
                 0 => num_env >> 1,
-                1 | 3 => num_env - pointer.saturating_sub(1).max(1),
+                1 | 3 => num_env.saturating_sub(pointer.saturating_sub(1).max(1)),
                 _ => match pointer {
                     0 => 1,
-                    1 => num_env - 1,
+                    1 => num_env.saturating_sub(1),
                     p => p - 1,
                 },
             };
@@ -149,7 +154,16 @@ pub struct SbrParser {
     header: Option<SbrHeader>,
     tables: Option<BandTables>,
     state: [ChannelState; 2],
+    /// Parametric Stereo state, persistent across frames (FFmpeg's
+    /// `sbr->ps.common`).
+    ps: PsCommon,
+    /// PS is in use for this element: signalled in the config, or a PS
+    /// extension has been read.
+    ps_enabled: bool,
 }
+
+/// `bs_extension_id` of Parametric Stereo.
+const EXTENSION_ID_PS: u32 = 2;
 
 fn env_book(dt: bool, balance: bool, amp_res: u8) -> &'static [(u8, u32, i32)] {
     match (balance, amp_res != 0, dt) {
@@ -253,7 +267,15 @@ impl SbrParser {
             header: None,
             tables: None,
             state: Default::default(),
+            ps: PsCommon::default(),
+            ps_enabled: false,
         }
+    }
+
+    /// Marks PS as signalled by the config (explicit HE-AACv2), so every
+    /// frame of this element reconstructs stereo.
+    pub fn set_ps_config(&mut self, on: bool) {
+        self.ps_enabled |= on;
     }
 
     /// The header this parser is currently using, if any frame has carried one.
@@ -518,8 +540,14 @@ impl SbrParser {
         } else if self.header.is_none() {
             return Err(Error::corrupt("sbr: headerless frame with no prior header"));
         }
-        let header = self.header.clone().expect("checked above");
-        let tables = self.tables.clone().expect("set with header");
+        let header = self
+            .header
+            .clone()
+            .ok_or_else(|| Error::corrupt("sbr: header missing for SBR payload"))?;
+        let tables = self
+            .tables
+            .clone()
+            .ok_or_else(|| Error::corrupt("sbr: band tables missing for SBR payload"))?;
 
         let data_extra = r.read_bit()?;
         if data_extra {
@@ -701,16 +729,35 @@ impl SbrParser {
             }
         }
 
+        // sbr_extension_data() extensions, as FFmpeg's `read_sbr_extension`
+        // loop: a 4-bit size (plus an 8-bit escape at 15), in bits; each
+        // extension is a 2-bit id. PS is parsed, anything else is skipped.
         let extended = r.read_bit()?;
         if extended {
-            let mut size = r.read_bits(4)? as u64;
-            if size == 15 {
-                size += u64::from(r.read_bits(8)?);
+            let mut left = u64::from(r.read_bits(4)?);
+            if left == 15 {
+                left += u64::from(r.read_bits(8)?);
             }
-            r.skip_bits(size * 8)?;
+            left <<= 3;
+            while left > 7 {
+                left -= 2;
+                let ext_id = r.read_bits(2)?;
+                if ext_id == EXTENSION_ID_PS {
+                    self.ps_enabled = true;
+                    let used = self.ps.read_data(r, left);
+                    left = left.saturating_sub(used);
+                } else {
+                    r.skip_bits(left)?;
+                    left = 0;
+                }
+            }
+            if left > 0 {
+                r.skip_bits(left)?;
+            }
         }
 
-        Ok(SbrData { coupling, channels })
+        let ps = self.ps_enabled.then(|| self.ps.clone());
+        Ok(SbrData { coupling, channels, ps })
     }
 }
 

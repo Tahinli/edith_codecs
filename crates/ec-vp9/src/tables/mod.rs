@@ -13,7 +13,6 @@ pub(crate) const ALLOW_32X32: u8 = 3;
 
 // spec 5.3 (PREDICTION_MODE)
 pub(crate) const DC_PRED: u8 = 0;
-pub(crate) const TM_PRED: u8 = 9;
 pub(crate) const INTRA_MODES: usize = 10;
 
 // spec 5.2 (TX_SIZE)

@@ -7,4 +7,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+bytemuck = "1"
 ec-core.workspace = true
+multiversion = "0.9"

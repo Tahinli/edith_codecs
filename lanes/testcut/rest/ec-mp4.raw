@@ -1,0 +1,198 @@
+{ "type": "suite", "event": "started", "test_count": 33 }
+{ "type": "test", "event": "started", "name": "asc::tests::a_plain_lc_config_states_its_own_rate_and_layout" }
+{ "type": "test", "event": "started", "name": "asc::tests::a_program_config_or_a_truncated_config_states_no_layout" }
+{ "type": "test", "event": "started", "name": "asc::tests::ac3_channels_follow_the_coding_mode_and_the_lfe_bit" }
+{ "type": "test", "event": "started", "name": "asc::tests::dts_config_counts_the_speaker_mask" }
+{ "type": "test", "name": "asc::tests::a_plain_lc_config_states_its_own_rate_and_layout", "event": "ok", "exec_time": 0.000001343 }
+{ "type": "test", "event": "started", "name": "asc::tests::he_aac_states_its_extension_rate_as_the_output" }
+{ "type": "test", "name": "asc::tests::ac3_channels_follow_the_coding_mode_and_the_lfe_bit", "event": "ok", "exec_time": 0.00000019 }
+{ "type": "test", "event": "started", "name": "boxes::tests::a_size_that_does_not_fit_is_corrupt_not_a_panic" }
+{ "type": "test", "name": "asc::tests::a_program_config_or_a_truncated_config_states_no_layout", "event": "ok", "exec_time": 0.000000481 }
+{ "type": "test", "event": "started", "name": "boxes::tests::fields_past_the_end_are_errors" }
+{ "type": "test", "name": "asc::tests::dts_config_counts_the_speaker_mask", "event": "ok", "exec_time": 0.00000012 }
+{ "type": "test", "event": "started", "name": "boxes::tests::walks_32_and_64_bit_sizes" }
+{ "type": "test", "name": "asc::tests::he_aac_states_its_extension_rate_as_the_output", "event": "ok", "exec_time": 0.000000341 }
+{ "type": "test", "event": "started", "name": "demux::display_matrix_tests::a_mirror_a_shear_or_a_no_matrix_is_refused_by_name" }
+{ "type": "test", "name": "boxes::tests::a_size_that_does_not_fit_is_corrupt_not_a_panic", "event": "ok", "exec_time": 0.000028966 }
+{ "type": "test", "event": "started", "name": "demux::display_matrix_tests::a_quarter_turn_reads_as_one_at_any_scale_and_with_rounding" }
+{ "type": "test", "name": "boxes::tests::fields_past_the_end_are_errors", "event": "ok", "exec_time": 0.000000672 }
+{ "type": "test", "event": "started", "name": "demux::tests::a_colr_box_is_the_h273_triplet" }
+{ "type": "test", "name": "boxes::tests::walks_32_and_64_bit_sizes", "event": "ok", "exec_time": 0.000003256 }
+{ "type": "test", "event": "started", "name": "demux::tests::a_dops_box_becomes_an_opus_head" }
+{ "type": "test", "name": "demux::display_matrix_tests::a_mirror_a_shear_or_a_no_matrix_is_refused_by_name", "event": "ok", "exec_time": 0.000000902 }
+{ "type": "test", "event": "started", "name": "demux::tests::a_sound_description_stating_billions_of_channels_is_refused" }
+{ "type": "test", "name": "demux::tests::a_colr_box_is_the_h273_triplet", "event": "ok", "exec_time": 0.000001323 }
+{ "type": "test", "event": "started", "name": "demux::tests::an_nclc_states_no_range_at_all" }
+{ "type": "test", "name": "demux::display_matrix_tests::a_quarter_turn_reads_as_one_at_any_scale_and_with_rounding", "event": "ok", "exec_time": 0.000001062 }
+{ "type": "test", "event": "started", "name": "demux::tests::avid_dnxhd_and_dnxhr_entries_map_to_dnxhd" }
+{ "type": "test", "name": "demux::tests::a_dops_box_becomes_an_opus_head", "event": "ok", "exec_time": 0.000001974 }
+{ "type": "test", "event": "started", "name": "demux::tests::crafted_table_counts_are_refused_before_they_are_allocated" }
+{ "type": "test", "name": "demux::tests::a_sound_description_stating_billions_of_channels_is_refused", "event": "ok", "exec_time": 0.000006563 }
+{ "type": "test", "event": "started", "name": "demux::tests::languages_and_names_come_out_of_their_packings" }
+{ "type": "test", "name": "demux::tests::an_nclc_states_no_range_at_all", "event": "ok", "exec_time": 0.000001513 }
+{ "type": "test", "event": "started", "name": "demux::tests::ntsc_frame_rates_stay_rational" }
+{ "type": "test", "name": "demux::tests::avid_dnxhd_and_dnxhr_entries_map_to_dnxhd", "event": "ok", "exec_time": 0.000004097 }
+{ "type": "test", "event": "started", "name": "demux::tests::quicktime_version_2_sound_entry_reads_its_rate_and_its_wave_esds" }
+{ "type": "test", "name": "demux::tests::crafted_table_counts_are_refused_before_they_are_allocated", "event": "ok", "exec_time": 0.000001933 }
+{ "type": "test", "event": "started", "name": "esds::tests::a_trailing_padding_byte_is_not_a_broken_descriptor" }
+{ "type": "test", "name": "demux::tests::ntsc_frame_rates_stay_rational", "event": "ok", "exec_time": 0.000001082 }
+{ "type": "test", "event": "started", "name": "esds::tests::an_aac_config_survives_the_round_trip_as_bytes" }
+{ "type": "test", "name": "esds::tests::a_trailing_padding_byte_is_not_a_broken_descriptor", "event": "ok", "exec_time": 0.000001423 }
+{ "type": "test", "event": "started", "name": "esds::tests::an_mp3_descriptor_carries_no_config_and_is_not_aac" }
+{ "type": "test", "name": "demux::tests::quicktime_version_2_sound_entry_reads_its_rate_and_its_wave_esds", "event": "ok", "exec_time": 0.00001043 }
+{ "type": "test", "event": "started", "name": "esds::tests::long_descriptors_use_the_multi_byte_length" }
+{ "type": "test", "name": "esds::tests::an_aac_config_survives_the_round_trip_as_bytes", "event": "ok", "exec_time": 0.000001883 }
+{ "type": "test", "event": "started", "name": "esds::tests::truncated_descriptors_are_errors" }
+{ "type": "test", "name": "demux::tests::languages_and_names_come_out_of_their_packings", "event": "ok", "exec_time": 0.000001783 }
+{ "type": "test", "event": "started", "name": "mux::tests::an_audio_only_m4a_states_its_brand_and_holds_one_aac_track" }
+{ "type": "test", "name": "esds::tests::an_mp3_descriptor_carries_no_config_and_is_not_aac", "event": "ok", "exec_time": 0.000001864 }
+{ "type": "test", "event": "started", "name": "mux::tests::an_opus_head_round_trips_through_dops" }
+{ "type": "test", "name": "esds::tests::long_descriptors_use_the_multi_byte_length", "event": "ok", "exec_time": 0.000002915 }
+{ "type": "test", "event": "started", "name": "mux::tests::chapters_are_referenced_from_the_audio_track_and_run_to_the_end" }
+{ "type": "test", "name": "esds::tests::truncated_descriptors_are_errors", "event": "ok", "exec_time": 0.000003938 }
+{ "type": "test", "event": "started", "name": "mux::tests::chpl_is_version_one_in_hundred_nanoseconds_with_byte_counted_titles" }
+{ "type": "test", "name": "mux::tests::an_opus_head_round_trips_through_dops", "event": "ok", "exec_time": 0.000001282 }
+{ "type": "test", "event": "started", "name": "mux::tests::clipped_titles_keep_their_characters_whole" }
+{ "type": "test", "name": "mux::tests::an_audio_only_m4a_states_its_brand_and_holds_one_aac_track", "event": "ok", "exec_time": 0.000044053 }
+{ "type": "test", "event": "started", "name": "mux::tests::language_packing_is_the_demuxers_inverse" }
+{ "type": "test", "name": "mux::tests::chapters_are_referenced_from_the_audio_track_and_run_to_the_end", "event": "ok", "exec_time": 0.000037601 }
+{ "type": "test", "event": "started", "name": "mux::tests::more_than_255_chapters_omit_the_chpl_box_and_keep_the_track" }
+{ "type": "test", "name": "mux::tests::clipped_titles_keep_their_characters_whole", "event": "ok", "exec_time": 0.00000012 }
+{ "type": "test", "event": "started", "name": "mux::tests::no_chapters_writes_no_chapter_boxes_or_track" }
+{ "type": "test", "name": "mux::tests::language_packing_is_the_demuxers_inverse", "event": "ok", "exec_time": 0.000000581 }
+{ "type": "test", "event": "started", "name": "tests::recognises_the_shapes_a_file_starts_with" }
+{ "type": "test", "name": "mux::tests::chpl_is_version_one_in_hundred_nanoseconds_with_byte_counted_titles", "event": "ok", "exec_time": 0.000024596 }
+{ "type": "test", "name": "mux::tests::no_chapters_writes_no_chapter_boxes_or_track", "event": "ok", "exec_time": 0.000033173 }
+{ "type": "test", "name": "tests::recognises_the_shapes_a_file_starts_with", "event": "ok", "exec_time": 0.000000491 }
+{ "type": "test", "name": "mux::tests::more_than_255_chapters_omit_the_chpl_box_and_keep_the_track", "event": "ok", "exec_time": 0.00012205 }
+{ "type": "suite", "event": "ok", "passed": 33, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.002720884 }
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "a_file_without_chapters_has_none_for_ffprobe" }
+{ "type": "test", "event": "started", "name": "a_first_chapter_that_is_not_at_zero_keeps_its_start" }
+{ "type": "test", "event": "started", "name": "ffprobe_lists_all_300_chapters_when_chpl_cannot_hold_them" }
+{ "type": "test", "event": "started", "name": "ffprobe_reads_the_chapters_back_with_their_starts_and_titles" }
+{ "type": "test", "name": "a_file_without_chapters_has_none_for_ffprobe", "event": "ok", "exec_time": 0.151894219 }
+{ "type": "test", "event": "started", "name": "the_demuxer_reads_a_chaptered_file_as_it_always_did" }
+{ "type": "test", "name": "the_demuxer_reads_a_chaptered_file_as_it_always_did", "event": "ok", "exec_time": 0.000056847 }
+{ "type": "test", "name": "a_first_chapter_that_is_not_at_zero_keeps_its_start", "event": "ok", "exec_time": 0.169432475 }
+{ "type": "test", "name": "ffprobe_lists_all_300_chapters_when_chpl_cannot_hold_them", "event": "ok", "exec_time": 0.172754959 }
+{ "type": "test", "name": "ffprobe_reads_the_chapters_back_with_their_starts_and_titles", "event": "ok", "exec_time": 0.230358355 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.23331907 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "dtsc_entry_round_trips_with_ddts_rate_and_channels" }
+{ "type": "test", "event": "started", "name": "ffmpeg_dts_in_mp4a_is_dts" }
+{ "type": "test", "name": "ffmpeg_dts_in_mp4a_is_dts", "event": "ok", "exec_time": 0.157769422 }
+{ "type": "test", "name": "dtsc_entry_round_trips_with_ddts_rate_and_channels", "event": "ok", "exec_time": 0.171917446 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.172345511 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "default_aac_priming_output_is_byte_identical" }
+{ "type": "test", "event": "started", "name": "set_edit_trims_the_audio_edit_to_its_stated_length" }
+{ "type": "test", "name": "default_aac_priming_output_is_byte_identical", "event": "ok", "exec_time": 0.002036528 }
+{ "type": "test", "name": "set_edit_trims_the_audio_edit_to_its_stated_length", "event": "ok", "exec_time": 0.144592986 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.145012523 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "edith_trim_and_display_order_read_the_known_fixtures" }
+{ "type": "test", "event": "started", "name": "every_corpus_file_matches_ffprobe_sample_for_sample" }
+{ "type": "test", "name": "edith_trim_and_display_order_read_the_known_fixtures", "event": "ok", "exec_time": 0.000092504 }
+{ "type": "test", "name": "every_corpus_file_matches_ffprobe_sample_for_sample", "event": "ok", "exec_time": 19.640963352 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 19.641412216 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "stts_tick_sum_overflow_is_refused" }
+{ "type": "test", "name": "stts_tick_sum_overflow_is_refused", "event": "ok", "exec_time": 0.000023594 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000255491 }
+{ "type": "suite", "event": "started", "test_count": 17 }
+{ "type": "test", "event": "started", "name": "a_fragmented_file_demuxes_to_the_same_packets_as_a_plain_one" }
+{ "type": "test", "event": "started", "name": "a_non_aac_mp4a_entry_is_not_dropped" }
+{ "type": "test", "event": "started", "name": "a_trun_claiming_more_samples_than_the_file_is_refused_not_allocated" }
+{ "type": "test", "event": "started", "name": "a_truncated_file_is_need_more" }
+{ "type": "test", "name": "a_trun_claiming_more_samples_than_the_file_is_refused_not_allocated", "event": "ok", "exec_time": 0.000093375 }
+{ "type": "test", "event": "started", "name": "aac_priming_round_trips_through_an_elst" }
+{ "type": "test", "name": "a_truncated_file_is_need_more", "event": "ok", "exec_time": 0.000041968 }
+{ "type": "test", "event": "started", "name": "an_aac_tracks_audio_specific_config_survives_as_bytes" }
+{ "type": "test", "name": "an_aac_tracks_audio_specific_config_survives_as_bytes", "event": "ok", "exec_time": 0.000236264 }
+{ "type": "test", "event": "started", "name": "every_fixture_demuxes_into_the_streams_ffprobe_reports" }
+{ "type": "test", "name": "aac_priming_round_trips_through_an_elst", "event": "ok", "exec_time": 0.000025307 }
+{ "type": "test", "event": "started", "name": "every_fixture_remuxes_into_a_file_ffprobe_and_ffmpeg_agree_with" }
+{ "type": "test", "name": "a_non_aac_mp4a_entry_is_not_dropped", "event": "ok", "exec_time": 0.297365205 }
+{ "type": "test", "event": "started", "name": "ntsc_timing_survives_a_round_trip_exactly" }
+{ "type": "test", "name": "ntsc_timing_survives_a_round_trip_exactly", "event": "ok", "exec_time": 0.000036558 }
+{ "type": "test", "event": "started", "name": "quicktime_sound_description_states_its_esds_inside_wave" }
+{ "type": "test", "name": "a_fragmented_file_demuxes_to_the_same_packets_as_a_plain_one", "event": "ok", "exec_time": 0.468363261 }
+{ "type": "test", "event": "started", "name": "real_quicktime_exports_demux_like_ffprobe_says" }
+{ "type": "test", "name": "real_quicktime_exports_demux_like_ffprobe_says", "event": "ok", "exec_time": 0.000006402 }
+{ "type": "test", "event": "started", "name": "riff_avi_is_not_reported_as_a_truncated_mp4" }
+{ "type": "test", "name": "riff_avi_is_not_reported_as_a_truncated_mp4", "event": "ok", "exec_time": 0.000006392 }
+{ "type": "test", "event": "started", "name": "seeks_land_on_a_sync_sample_at_or_before_their_target" }
+{ "type": "test", "name": "seeks_land_on_a_sync_sample_at_or_before_their_target", "event": "ok", "exec_time": 0.017878335 }
+{ "type": "test", "event": "started", "name": "ten_thousand_mutations_never_panic" }
+{ "type": "test", "name": "quicktime_sound_description_states_its_esds_inside_wave", "event": "ok", "exec_time": 0.348002214 }
+{ "type": "test", "event": "started", "name": "the_hand_written_extensions_come_out_as_ffprobe_reads_them" }
+{ "type": "test", "name": "ten_thousand_mutations_never_panic", "event": "ok", "exec_time": 0.205072956 }
+{ "type": "test", "event": "started", "name": "the_real_library_demuxes_to_eof" }
+{ "type": "test", "name": "the_real_library_demuxes_to_eof", "event": "ignored", "message": "reads the real library end to end" }
+{ "type": "test", "event": "started", "name": "truncated_prefixes_are_need_more_or_eof" }
+{ "type": "test", "name": "truncated_prefixes_are_need_more_or_eof", "event": "ok", "exec_time": 0.00016484 }
+{ "type": "test", "name": "the_hand_written_extensions_come_out_as_ffprobe_reads_them", "event": "ok", "exec_time": 1.255606709 }
+{ "type": "test", "name": "every_fixture_demuxes_into_the_streams_ffprobe_reports", "event": "ok", "exec_time": 48.730024658 }
+{ "type": "test", "name": "every_fixture_remuxes_into_a_file_ffprobe_and_ffmpeg_agree_with", "event": "ok", "exec_time": 57.197561531 }
+{ "type": "suite", "event": "ok", "passed": 16, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 57.199183419 }
+{ "type": "suite", "event": "started", "test_count": 10 }
+{ "type": "test", "event": "started", "name": "ac3_entry_is_ffprobe_clean_decodes_equal_and_round_trips" }
+{ "type": "test", "event": "started", "name": "alac_bare_cookie_is_written_inside_an_alac_box" }
+{ "type": "test", "event": "started", "name": "alac_entry_is_ffprobe_clean_decodes_equal_and_round_trips" }
+{ "type": "test", "event": "started", "name": "av01_entry_is_ffprobe_clean_decodes_equal_and_round_trips" }
+{ "type": "test", "name": "alac_bare_cookie_is_written_inside_an_alac_box", "event": "ok", "exec_time": 1.156289038 }
+{ "type": "test", "event": "started", "name": "avc1_entry_is_ffprobe_clean_decodes_equal_and_round_trips" }
+{ "type": "test", "name": "alac_entry_is_ffprobe_clean_decodes_equal_and_round_trips", "event": "ok", "exec_time": 2.515527014 }
+{ "type": "test", "event": "started", "name": "ec3_entry_is_ffprobe_clean_decodes_equal_and_round_trips" }
+{ "type": "test", "name": "ac3_entry_is_ffprobe_clean_decodes_equal_and_round_trips", "event": "ok", "exec_time": 2.616002709 }
+{ "type": "test", "event": "started", "name": "hvc1_entry_is_ffprobe_clean_decodes_equal_and_round_trips" }
+{ "type": "test", "name": "avc1_entry_is_ffprobe_clean_decodes_equal_and_round_trips", "event": "ok", "exec_time": 2.781228841 }
+{ "type": "test", "event": "started", "name": "mp4a_entry_is_ffprobe_clean_decodes_equal_and_round_trips" }
+{ "type": "test", "name": "av01_entry_is_ffprobe_clean_decodes_equal_and_round_trips", "event": "ok", "exec_time": 4.256105943 }
+{ "type": "test", "event": "started", "name": "opus_entry_is_ffprobe_clean_decodes_equal_and_round_trips" }
+{ "type": "test", "name": "ec3_entry_is_ffprobe_clean_decodes_equal_and_round_trips", "event": "ok", "exec_time": 3.107023871 }
+{ "type": "test", "event": "started", "name": "opus_pre_skip_is_written_without_a_caller_asking" }
+{ "type": "test", "name": "hvc1_entry_is_ffprobe_clean_decodes_equal_and_round_trips", "event": "ok", "exec_time": 3.20696366 }
+{ "type": "test", "name": "mp4a_entry_is_ffprobe_clean_decodes_equal_and_round_trips", "event": "ok", "exec_time": 2.585088673 }
+{ "type": "test", "name": "opus_pre_skip_is_written_without_a_caller_asking", "event": "ok", "exec_time": 0.93414395 }
+{ "type": "test", "name": "opus_entry_is_ffprobe_clean_decodes_equal_and_round_trips", "event": "ok", "exec_time": 2.469925692 }
+{ "type": "suite", "event": "ok", "passed": 10, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 6.726850142 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "prores_fourccs_are_recognised" }
+{ "type": "test", "name": "prores_fourccs_are_recognised", "event": "ok", "exec_time": 1.146294392 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 1.146684005 }
+{ "type": "suite", "event": "started", "test_count": 11 }
+{ "type": "test", "event": "started", "name": "hevc_main10_mdcv_clli_in_mp4" }
+{ "type": "test", "event": "started", "name": "pcm_f32be_stereo_mov" }
+{ "type": "test", "event": "started", "name": "pcm_f32le_stereo_mov" }
+{ "type": "test", "event": "started", "name": "pcm_s24be_5_1_mov" }
+{ "type": "test", "name": "hevc_main10_mdcv_clli_in_mp4", "event": "ok", "exec_time": 1.529757987 }
+{ "type": "test", "event": "started", "name": "pcm_s24be_stereo_mov" }
+{ "type": "test", "name": "pcm_f32be_stereo_mov", "event": "ok", "exec_time": 1.6500830419999999 }
+{ "type": "test", "event": "started", "name": "pcm_s24le_5_1_mov" }
+{ "type": "test", "name": "pcm_s24be_5_1_mov", "event": "ok", "exec_time": 1.7670525590000001 }
+{ "type": "test", "event": "started", "name": "pcm_s24le_mono_mov" }
+{ "type": "test", "name": "pcm_f32le_stereo_mov", "event": "ok", "exec_time": 1.900466546 }
+{ "type": "test", "event": "started", "name": "pcm_s24le_stereo_mov" }
+{ "type": "test", "name": "pcm_s24le_5_1_mov", "event": "ok", "exec_time": 1.783220499 }
+{ "type": "test", "event": "started", "name": "pcm_s32be_stereo_mov" }
+{ "type": "test", "name": "pcm_s24be_stereo_mov", "event": "ok", "exec_time": 2.023527124 }
+{ "type": "test", "event": "started", "name": "pcm_s32le_stereo_mov" }
+{ "type": "test", "name": "pcm_s24le_stereo_mov", "event": "ok", "exec_time": 1.751330818 }
+{ "type": "test", "event": "started", "name": "sowt_gets_chan_only_when_asked" }
+{ "type": "test", "name": "pcm_s24le_mono_mov", "event": "ok", "exec_time": 1.925337775 }
+{ "type": "test", "name": "sowt_gets_chan_only_when_asked", "event": "ok", "exec_time": 0.520407615 }
+{ "type": "test", "name": "pcm_s32be_stereo_mov", "event": "ok", "exec_time": 1.2792199819999999 }
+{ "type": "test", "name": "pcm_s32le_stereo_mov", "event": "ok", "exec_time": 1.376498668 }
+{ "type": "suite", "event": "ok", "passed": 11, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 4.933062671 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "a_file_with_no_turn_surfaces_no_rotation" }
+{ "type": "test", "event": "started", "name": "a_matrix_that_is_not_a_quarter_turn_is_representable" }
+{ "type": "test", "event": "started", "name": "a_tkhd_matrix_surfaces_as_a_typed_quarter_turn" }
+{ "type": "test", "name": "a_matrix_that_is_not_a_quarter_turn_is_representable", "event": "ok", "exec_time": 0.000130114 }
+{ "type": "test", "name": "a_file_with_no_turn_surfaces_no_rotation", "event": "ok", "exec_time": 0.000047589 }
+{ "type": "test", "name": "a_tkhd_matrix_surfaces_as_a_typed_quarter_turn", "event": "ok", "exec_time": 0.000123783 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000636236 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000048701 }

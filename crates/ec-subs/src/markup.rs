@@ -32,7 +32,8 @@ pub fn decode(bytes: &[u8]) -> String {
 }
 
 fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs.iter().map(|&c| unit(c)).collect();
     String::from_utf16_lossy(&units)
 }
 
@@ -70,8 +71,20 @@ pub fn parse_clock(field: &str) -> Option<i64> {
         let value: i64 = digits.parse().ok()?;
         value * 10i64.pow(6 - digits.len() as u32)
     };
-    Some(sign * ((hours * 3600 + minutes * 60 + seconds) * 1_000_000 + micros))
+    // A field can be any integer the parser accepts, so the sums are checked: a
+    // clock too large for an i64 of microseconds is not a clock.
+    let whole = hours
+        .checked_mul(3600)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)?;
+    let total = whole.checked_mul(1_000_000)?.checked_add(micros)?;
+    Some(sign * total)
 }
+
+/// How deep open tags may nest. Real markup nests a handful deep; past this an
+/// open tag is dropped, so a cue of a million `<i>` cannot make the stack
+/// quadratic to close or the tree too deep to walk.
+const MAX_NEST: usize = 64;
 
 /// One cue body's markup as runs. `webvtt` turns on the two tags only WebVTT
 /// has — `<v>` and `<c>` — and the inline timestamps that go with them.
@@ -108,7 +121,9 @@ pub(crate) fn parse_inline(body: &str, webvtt: bool) -> Vec<Segment> {
             }
             Tag::Open(open) => {
                 flush(&mut text, &mut stack);
-                stack.push((Some(open), Vec::new()));
+                if stack.len() <= MAX_NEST {
+                    stack.push((Some(open), Vec::new()));
+                }
             }
             Tag::Close(name) => {
                 flush(&mut text, &mut stack);
@@ -293,7 +308,10 @@ fn unescape(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         let after = &rest[at + 1..];
-        let end = after.find(';').filter(|&e| e <= 10);
+        // An entity name is at most ten bytes, so the search stops there; an
+        // unbounded search made a run of bare `&` quadratic.
+        let window = &after.as_bytes()[..after.len().min(11)];
+        let end = window.iter().position(|&b| b == b';');
         let Some(end) = end else {
             out.push('&');
             rest = after;

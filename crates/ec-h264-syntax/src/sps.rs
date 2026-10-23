@@ -83,6 +83,13 @@ fn parse_scaling_list<const N: usize>(
     for j in 0..N {
         if next_scale != 0 {
             let delta = r.read_se()?;
+            // delta_scale is -128..=127 (7.4.2.1.1). Refusing anything else also
+            // keeps the sum below from overflowing.
+            if !(-128..=127).contains(&delta) {
+                return Err(Error::corrupt(format!(
+                    "delta_scale {delta} outside -128..=127 (7.4.2.1.1)"
+                )));
+            }
             next_scale = (last_scale + delta + 256) % 256;
             if j == 0 && next_scale == 0 {
                 return Ok(None); // use_default_scaling_matrix_flag
@@ -398,6 +405,16 @@ pub struct Sps {
 }
 
 impl Sps {
+    /// `ChromaArrayType` (7.4.2.1.1): `chroma_format_idc`, or 0 when the three
+    /// colour planes are coded separately as monochrome pictures.
+    pub fn chroma_array_type(&self) -> u8 {
+        if self.separate_colour_plane {
+            0
+        } else {
+            self.chroma_format_idc
+        }
+    }
+
     /// Parse an SPS RBSP (header byte already consumed, emulation stripped).
     pub fn parse(rbsp: &[u8]) -> Result<Sps> {
         let mut r = BitReader::new(rbsp);
@@ -494,9 +511,9 @@ impl Sps {
         };
         let direct_8x8_inference = r.read_bit()?;
 
-        let mb_width = pic_width_in_mbs_minus1 + 1;
-        let map_height = pic_height_in_map_units_minus1 + 1;
-        let mb_height = map_height * if frame_mbs_only { 1 } else { 2 };
+        let mb_width = pic_width_in_mbs_minus1.saturating_add(1);
+        let map_height = pic_height_in_map_units_minus1.saturating_add(1);
+        let mb_height = map_height.saturating_mul(if frame_mbs_only { 1 } else { 2 });
         if mb_width > 1024 || mb_height > 1024 {
             return Err(Error::corrupt("picture larger than 16384x16384"));
         }
@@ -516,16 +533,30 @@ impl Sps {
             let rr = r.read_ue()?;
             let t = r.read_ue()?;
             let b = r.read_ue()?;
-            (crop_x * l, crop_x * rr, crop_y * t, crop_y * b)
+            // Crop offsets come from unbounded ue(v) codes: scale and add with checks.
+            let scale = |offset: u32, unit: u32| {
+                offset
+                    .checked_mul(unit)
+                    .ok_or_else(|| Error::corrupt("frame cropping overflows"))
+            };
+            (scale(l, crop_x)?, scale(rr, crop_x)?, scale(t, crop_y)?, scale(b, crop_y)?)
         } else {
             (0, 0, 0, 0)
         };
+        let horizontal = crop
+            .0
+            .checked_add(crop.1)
+            .ok_or_else(|| Error::corrupt("frame cropping overflows"))?;
+        let vertical = crop
+            .2
+            .checked_add(crop.3)
+            .ok_or_else(|| Error::corrupt("frame cropping overflows"))?;
         let width = coded_width
-            .checked_sub(crop.0 + crop.1)
+            .checked_sub(horizontal)
             .filter(|&w| w > 0)
             .ok_or_else(|| Error::corrupt("frame cropping wider than the picture"))?;
         let height = coded_height
-            .checked_sub(crop.2 + crop.3)
+            .checked_sub(vertical)
             .filter(|&h| h > 0)
             .ok_or_else(|| Error::corrupt("frame cropping taller than the picture"))?;
 

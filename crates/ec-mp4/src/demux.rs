@@ -8,6 +8,7 @@ use ec_core::{
     StreamInfo, TimeBase, Timestamp, VideoParameters, color, color::Tags,
 };
 
+use crate::asc;
 use crate::boxes::{Boxes, FourCc, Src, be16, be32, be64, full};
 use crate::esds::{Esds, object_type};
 
@@ -50,6 +51,8 @@ struct Trak {
     /// What this track's `colr` box stated, tier by tier — empty for a track
     /// with no such box and for one that is not a picture.
     color_tags: Tags,
+    /// The `fiel` box, where the sample entry carried one.
+    field_order: Option<ec_core::Interlace>,
     /// Index in [`Mp4Demuxer::streams`], or [`None`] for a track whose sample
     /// entry this build has no [`CodecId`] for — its samples are walked past,
     /// never handed out as some other codec's.
@@ -58,6 +61,38 @@ struct Trak {
     samples: Vec<Sample>,
     cursor: usize,
     title: Option<String>,
+    /// [`presentation_trim`](Mp4Demuxer::presentation_trim): the media ticks the
+    /// edit list trims off the front, or [`None`] with no edit list.
+    trim: Option<u64>,
+    /// True for a track with both a `ctts` and an `stss` table, the only tracks
+    /// whose samples are stored out of display order and whose sync points need
+    /// the display-order table ([`Mp4Demuxer::sync_in_display_order`]).
+    reorders: bool,
+}
+
+/// One entry of an `elst` edit list, as the file states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edit {
+    /// How long the edit plays, in movie-timescale ticks.
+    pub segment_duration: u64,
+    /// Where in the media the edit starts, in track ticks. `-1` (see
+    /// [`Edit::is_empty`]) is an empty edit: a gap with no media in it.
+    pub media_time: i64,
+    /// The playback rate, 16.16 fixed point; `0x0001_0000` is normal speed.
+    pub media_rate: u32,
+}
+
+impl Edit {
+    /// An empty edit: `media_time` of `-1`, a delay with no media in it.
+    pub fn is_empty(&self) -> bool {
+        self.media_time < 0
+    }
+
+    /// The playback rate as a float: the integer and fraction halves of the
+    /// 16.16 field, `1.0` for normal speed.
+    pub fn rate(&self) -> f64 {
+        f64::from(self.media_rate) / 65536.0
+    }
 }
 
 /// What the container says about one track, whether or not this build has a
@@ -87,6 +122,13 @@ pub struct TrackInfo {
     /// encoder delay. [`None`] where the track carries no edit list, which is
     /// not the same claim as an edit list stating zero.
     pub media_time: Option<i64>,
+    /// Every `elst` entry in file order, empty edits included. Empty for a track
+    /// with no edit list.
+    pub edits: Vec<Edit>,
+    /// The quarter turn the `tkhd` display matrix asks for, as
+    /// [`Rotation::Other`] for a matrix that is not one. Reported for every
+    /// track, a stream or not.
+    pub rotation: Rotation,
 }
 
 /// `trex` defaults: what a fragment leaves unsaid.
@@ -190,6 +232,24 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
                 }
             }
         }
+        // An `mp4a` entry whose object type says MPEG audio is named MP3 above, and ffmpeg
+        // writes MP2 under the same object type (0x6B). The first frame's header states the
+        // layer, so a layer II or I track is relabelled: the decoder reads any layer, but the
+        // name a warning or a stream listing gives must be the codec's own.
+        for stream in 0..me.streams.len() as u32 {
+            if me.streams[stream as usize].params.codec != CodecId::Mp3 {
+                continue;
+            }
+            let Ok(first) = me.read_sample(stream, 0) else {
+                continue;
+            };
+            let codec = match mpeg_audio_layer(&first.data) {
+                Some(1) => CodecId::Mp1,
+                Some(2) => CodecId::Mp2,
+                _ => continue,
+            };
+            me.streams[stream as usize].params.codec = codec;
+        }
         Ok(me)
     }
 
@@ -243,6 +303,15 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
             .map_or(Tags::default(), |t| t.color_tags)
     }
 
+    /// The scan order the `fiel` box of `stream`'s sample entry stated, or
+    /// [`None`] where there was no box (or an unrecognised one).
+    pub fn field_order(&self, stream: u32) -> Option<ec_core::Interlace> {
+        self.traks
+            .iter()
+            .find(|t| t.stream == Some(stream))
+            .and_then(|t| t.field_order)
+    }
+
     /// Every sample of `stream`, in decode order: the index the file carries of
     /// itself. Empty for a stream that does not exist.
     pub fn samples(&self, stream: u32) -> &[Sample] {
@@ -250,6 +319,66 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
             .iter()
             .find(|t| t.stream == Some(stream))
             .map_or(&[], |t| &t.samples[..])
+    }
+
+    /// The media ticks the edit list trims off the front of `stream`, as the
+    /// engine above this crate computes it: the first real edit's `media_time`
+    /// less the first composition offset (a `ctts` delay is not a trim). [`None`]
+    /// with no edit list. Empty edits are not counted, so this differs from the
+    /// shift [`Sample::dts`] and [`Sample::cts`] apply; see [`crate`] for why both
+    /// exist.
+    pub fn presentation_trim(&self, stream: u32) -> Option<u64> {
+        self.trak_of(stream).and_then(|t| t.trim)
+    }
+
+    /// The 1-based sample id of the sample the presentation starts on: the one
+    /// whose decode interval holds [`Mp4Demuxer::presentation_trim`]. `1` with no
+    /// trim, and the last sample when the trim runs past the end of the track.
+    pub fn first_frame_sample(&self, stream: u32) -> u32 {
+        let Some(trak) = self.trak_of(stream) else {
+            return 1;
+        };
+        let Some(trim) = trak.trim else {
+            return 1;
+        };
+        // Decode time from zero, so the first sample's own start is subtracted
+        // back out of the shifted clock the samples carry.
+        let base = trak.samples.first().map_or(0, |s| s.dts);
+        let target = i64::try_from(trim).unwrap_or(i64::MAX);
+        match trak.samples.iter().position(|s| {
+            let start = s.dts.saturating_sub(base);
+            target < start.saturating_add(i64::from(s.duration))
+        }) {
+            Some(index) => index as u32 + 1,
+            None => (trak.samples.len() as u32).max(1),
+        }
+    }
+
+    /// Every sync sample of `stream` paired with the display index it really
+    /// occupies, `(display index, decode position)`, ascending. Non-empty only
+    /// for a track with both `ctts` and `stss`, the case where decode order and
+    /// display order differ; an open-GOP stream's keyframes land on a different
+    /// display rank than their decode rank without this.
+    pub fn sync_in_display_order(&self, stream: u32) -> Vec<(u32, u32)> {
+        let Some(trak) = self.trak_of(stream) else {
+            return Vec::new();
+        };
+        if !trak.reorders {
+            return Vec::new();
+        }
+        let mut order: Vec<usize> = (0..trak.samples.len()).collect();
+        // Stable, so samples sharing a composition time keep decode order.
+        order.sort_by_key(|&i| trak.samples[i].cts);
+        order
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, decode)| trak.samples[decode].sync)
+            .map(|(display, decode)| (display as u32, decode as u32))
+            .collect()
+    }
+
+    fn trak_of(&self, stream: u32) -> Option<&Trak> {
+        self.traks.iter().find(|t| t.stream == Some(stream))
     }
 
     /// One sample of one stream by its index in [`Mp4Demuxer::samples`], read
@@ -340,7 +469,7 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
                         be32(rest, matrix + 12)? as i32,
                         be32(rest, matrix + 16)? as i32,
                     );
-                    rotation = Rotation::from_matrix(a, b, c, d);
+                    rotation = display_rotation(a, b, c, d);
                     display = (be32(rest, end)? >> 16, be32(rest, end + 4)? >> 16);
                 }
                 b"edts" => {
@@ -408,6 +537,7 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         // the first ctts delay, and reading that as a trim throws away real
         // pictures).
         let mut shift = 0i64;
+        let edit_list: Vec<(u64, i64, u32)> = edit.clone().unwrap_or_default();
         let media_time = edit
             .iter()
             .flatten()
@@ -427,19 +557,51 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
             shift = shift.saturating_add(movie.rescale(empty, time_base, Rounding::Nearest));
         }
 
-        let table = SampleTable::read(stbl, self.src.len)?;
-        let samples = table.build(shift)?;
+        let table = SampleTable::read(stbl, self.src.len, &handler == b"vide")?;
+        let mut samples = table.build(shift)?;
+        if let Some(entry) = &table.entry
+            && let Some(audio) = &entry.audio
+            && is_wide_pcm(entry.codec)
+        {
+            let bytes = if matches!(entry.codec, CodecId::PcmS24Le | CodecId::PcmS24Be) {
+                3
+            } else {
+                4
+            };
+            group_pcm(&mut samples, bytes * audio.layout.channel_count() as u32);
+        }
+        // What the edit list trims, as the engine above this crate reads it: the
+        // first real edit's media time less the first composition offset, which
+        // a muxer writes as exactly that delay and which is not a trim at all.
+        let first_offset = table.ctts.first().map_or(0, |&(_, o)| i64::from(o).max(0));
+        let trim = media_time.map(|t| (t.max(0) as u64).saturating_sub(first_offset as u64));
+        let reorders = !table.ctts.is_empty() && !table.stss.is_empty();
+        let edits: Vec<Edit> = edit_list
+            .iter()
+            .map(|&(segment_duration, media_time, media_rate)| Edit {
+                segment_duration,
+                media_time,
+                media_rate,
+            })
+            .collect();
         let track_language = language.clone();
         let color_tags = table
             .entry
             .as_ref()
             .map_or(Tags::default(), |e| e.color_tags);
+        let field_order = table.entry.as_ref().and_then(|e| e.field_order);
         let stream = match table.entry {
             Some(entry) => {
                 let media = match entry.codec.media_type() {
                     MediaType::Video => {
                         let mut video = entry.video.unwrap_or_default();
-                        if video.width == 0 {
+                        // The coded size is the sample entry's for H.264 and the
+                        // `tkhd` display size for every other codec -- what the
+                        // mp4 crate edith read these through answers (`Mp4Track::width`
+                        // reads `avc1` and falls back to `tkhd`). A VP8 entry that
+                        // is eight bytes short reads 72 wide here, and 1280 from
+                        // `tkhd`, which is also what ffprobe reports for it.
+                        if (entry.codec != CodecId::H264 || video.width == 0) && display.0 != 0 {
                             video.width = display.0;
                             video.height = display.1;
                         }
@@ -490,15 +652,20 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
             stream,
             language: track_language,
             media_time,
+            edits,
+            rotation,
         });
         self.traks.push(Trak {
             track_id,
             color_tags,
+            field_order,
             stream,
             time_base,
             samples,
             cursor: 0,
             title,
+            trim,
+            reorders,
         });
         Ok(())
     }
@@ -557,6 +724,7 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
                 default_flags = be32(rest, at)?;
             }
 
+            let file_len = self.src.len;
             let Some(trak) = self.traks.iter_mut().find(|t| t.track_id == track_id) else {
                 continue;
             };
@@ -588,6 +756,15 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
                     return Err(Error::corrupt(format!(
                         "mp4: a trun of {count} samples inside {} bytes",
                         rest.len() - at
+                    )));
+                }
+                // A run with no per-sample fields states its samples in its count
+                // alone, so the box cannot bound it: the file's length does, as it
+                // does for `stsz`. Without this a 16-byte `trun` claiming four
+                // billion samples allocates the machine.
+                if trak.samples.len() as u64 + u64::from(count) > file_len {
+                    return Err(Error::corrupt(format!(
+                        "mp4: a trun of {count} samples past the {file_len}-byte file"
                     )));
                 }
                 for i in 0..count {
@@ -749,7 +926,7 @@ struct SampleTable<'a> {
 }
 
 impl<'a> SampleTable<'a> {
-    fn read(stbl: &'a [u8], file_len: u64) -> Result<SampleTable<'a>> {
+    fn read(stbl: &'a [u8], file_len: u64, video_track: bool) -> Result<SampleTable<'a>> {
         let mut me = SampleTable {
             entry: None,
             entry_kind: [0; 4],
@@ -772,7 +949,7 @@ impl<'a> SampleTable<'a> {
                     if let Some(child) = Boxes::new(rest.get(4..).unwrap_or(&[])).next() {
                         let (kind, payload) = child?;
                         me.entry_kind = kind;
-                        me.entry = sample_entry(&kind, payload)?;
+                        me.entry = sample_entry(&kind, payload, video_track)?;
                     }
                 }
                 b"stts" => me.stts = pairs(payload, |a, b| (a, b))?,
@@ -943,15 +1120,47 @@ struct Entry {
     /// What the `colr` box *stated*, which is not what
     /// [`VideoParameters::color`] answers: see [`colr`].
     color_tags: Tags,
+    field_order: Option<ec_core::Interlace>,
 }
 
 /// What one `stsd` entry says its samples are, or [`None`] for a codec this
 /// build has no id for — which is a track walked past, never one decoded as
 /// something else.
-fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
+/// The most channels a sample entry may state. The widest real layouts are a few
+/// dozen (a 22.2 bed, an Atmos object bed); past this the count is a crafted
+/// field, and building a layout from it allocates per channel.
+const MAX_CHANNELS: u32 = 64;
+
+/// The layout a sample entry's channel count names, refused past [`MAX_CHANNELS`].
+/// QuickTime's version-2 count is a 32-bit field, so without the bound a single
+/// sound description can ask for four billion channel positions.
+fn channel_layout(count: u32) -> Result<ChannelLayout> {
+    if count > MAX_CHANNELS {
+        return Err(Error::corrupt(format!(
+            "mp4: a sample entry stating {count} channels, past {MAX_CHANNELS}"
+        )));
+    }
+    Ok(ChannelLayout::from_count(count.max(1) as usize))
+}
+
+/// The MPEG audio layer (1, 2 or 3) of the frame `data` starts with, from its sync word and
+/// layer bits; [`None`] when `data` does not start with a frame header.
+fn mpeg_audio_layer(data: &[u8]) -> Option<u8> {
+    match data {
+        [0xFF, b1, ..] if b1 & 0xE0 == 0xE0 => match (b1 >> 1) & 0x3 {
+            3 => Some(1),
+            2 => Some(2),
+            1 => Some(3),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn sample_entry(kind: &FourCc, payload: &[u8], video_track: bool) -> Result<Option<Entry>> {
     // Visual and audio entries have different fixed prefixes; the child boxes
     // (the codec configuration, `colr`, the HDR pair) start after them.
-    if let Some((codec, config)) = video_codec(kind) {
+    if let Some((codec, config)) = video_codec(kind, video_track) {
         let mut video = VideoParameters {
             width: u32::from(be16(payload, 24)?),
             height: u32::from(be16(payload, 26)?),
@@ -959,8 +1168,16 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
         };
         let mut extradata = None;
         let mut color_tags = Tags::default();
-        for child in Boxes::new(payload.get(78..).unwrap_or(&[])) {
-            let (kind, body) = child?;
+        let mut field_order = None;
+        let children = payload.get(78..).unwrap_or(&[]);
+        for child in Boxes::new(children) {
+            let (kind, body) = match child {
+                Ok(c) => c,
+                // QuickTime ends a sample description with a 32-bit zero
+                // (ffmpeg's mov muxer writes it after the Avid boxes).
+                Err(_) if children.ends_with(&[0; 4]) => break,
+                Err(e) => return Err(e),
+            };
             if &kind == config {
                 extradata = Some(Buf::copy_from_slice(body));
             } else if &kind == b"colr" {
@@ -972,10 +1189,52 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
                 video.light = color::mdcv(body).over(video.light);
             } else if &kind == b"clli" {
                 video.light = color::clli(body).over(video.light);
+            } else if &kind == b"fiel" {
+                // field_count 1 is progressive; 2 fields name their order in
+                // field_detail: 1/9 top first, 6/14 bottom first.
+                field_order = match (body.first(), body.get(1)) {
+                    (Some(1), _) => Some(ec_core::Interlace::Progressive),
+                    (Some(2), Some(1 | 9)) => Some(ec_core::Interlace::TopFieldFirst),
+                    (Some(2), Some(6 | 14)) => Some(ec_core::Interlace::BottomFieldFirst),
+                    _ => None,
+                };
             } else if &kind == b"pasp" {
                 let (num, den) = (be32(body, 0)?, be32(body, 4)?);
                 video.sample_aspect_ratio = TimeBase::try_new(num.into(), den.into()).ok();
             }
+        }
+        if codec == CodecId::RawVideo {
+            // A 40-byte BITMAPINFOHEADER look-alike that `RawVideoDecoder` reads: "mov " in the
+            // biSize slot, width, height, planes, depth and the entry's FourCC.
+            let depth = be16(payload, 74)?;
+            let ok = match kind {
+                b"raw " => matches!(depth, 16 | 24 | 32),
+                _ => true,
+            };
+            if !ok || video.width == 0 || video.height == 0 {
+                return Ok(None);
+            }
+            let mut h = vec![0u8; 40];
+            h[..4].copy_from_slice(b"mov ");
+            h[4..8].copy_from_slice(&video.width.to_le_bytes());
+            h[8..12].copy_from_slice(&video.height.to_le_bytes());
+            h[12..14].copy_from_slice(&1u16.to_le_bytes());
+            h[14..16].copy_from_slice(&depth.to_le_bytes());
+            h[16..20].copy_from_slice(kind);
+            extradata = Some(Buf::from_vec(h));
+        }
+        if kind == b"mp4v" {
+            // objectTypeIndication 0x20 is Visual ISO/IEC 14496-2; any other value
+            // in an `mp4v` entry (MPEG-2 video, JPEG, ...) is not this codec.
+            let Some(body) = extradata.take() else {
+                return Ok(None);
+            };
+            let (_, _, rest) = full(&body)?;
+            let esds = Esds::parse(rest)?;
+            if esds.object_type != object_type::MPEG4_VISUAL {
+                return Ok(None);
+            }
+            extradata = esds.decoder_specific;
         }
         return Ok(Some(Entry {
             codec,
@@ -983,11 +1242,35 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
             video: Some(video),
             audio: None,
             color_tags,
+            field_order,
         }));
+    }
+    if kind == b"mp4s" {
+        // MPEG-4 systems stream: only the DVD subpicture object type (0xE0) is a codec here.
+        // Its decoder-specific info is the `.idx` text (`size:`, `palette:`).
+        for child in Boxes::new(payload.get(8..).unwrap_or(&[])) {
+            let (child_kind, body) = child?;
+            if child_kind == *b"esds" {
+                let (_, _, rest) = full(body)?;
+                let esds = Esds::parse(rest)?;
+                if esds.object_type == object_type::VOBSUB {
+                    return Ok(Some(Entry {
+                        color_tags: Tags::default(),
+                        field_order: None,
+                        codec: CodecId::DvdSub,
+                        extradata: esds.decoder_specific,
+                        video: None,
+                        audio: None,
+                    }));
+                }
+            }
+        }
+        return Ok(None);
     }
     if kind == b"tx3g" {
         return Ok(Some(Entry {
             color_tags: Tags::default(),
+            field_order: None,
             codec: CodecId::Tx3g,
             // The sample entry past its 8-byte header: the justification,
             // background colour and default style a renderer needs, which is
@@ -1001,7 +1284,7 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
     let version = be16(payload, 8).unwrap_or(0);
     let mut audio = AudioParameters {
         sample_rate: u32::from(be16(payload, 24).unwrap_or(0)),
-        layout: ChannelLayout::from_count(be16(payload, 16).unwrap_or(2).max(1) as usize),
+        layout: channel_layout(u32::from(be16(payload, 16).unwrap_or(2).max(1)))?,
         ..AudioParameters::default()
     };
     let children = match version {
@@ -1012,8 +1295,7 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
             // with a block of its own: the channel count is a 32-bit field and
             // the sample rate a double, and the fixed 16-bit rate the classic
             // layout holds reads as 65536 for every one of them.
-            audio.layout =
-                ChannelLayout::from_count(be32(payload, 28 + 4 + 8).unwrap_or(2).max(1) as usize);
+            audio.layout = channel_layout(be32(payload, 28 + 4 + 8).unwrap_or(2).max(1))?;
             audio.sample_rate = be64(payload, 28 + 4)
                 .map(|bits| f64::from_bits(bits).round())
                 .unwrap_or(0.0)
@@ -1022,12 +1304,20 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
         }
     };
     let mut config = None;
+    // `wave/enda`: QuickTime's byte order for `in24`, `in32` and `fl32`, whose
+    // default without the atom is big-endian.
+    let mut little = false;
     for child in Boxes::new(payload.get(children..).unwrap_or(&[])) {
         let (child_kind, body) = child?;
         // QuickTime keeps the codec configuration one level down, in a `wave`
         // box beside the `frma` naming the format again: a reader that walks
         // past `wave` finds no `esds` at all and calls the track silent.
         if &child_kind == b"wave" {
+            for inner in Boxes::new(body).map_while(|b| b.ok()) {
+                if &inner.0 == b"enda" {
+                    little = inner.1.get(1).copied().unwrap_or(0) != 0;
+                }
+            }
             if let Some(found) = wave_config(kind, body) {
                 config = Some(found);
                 break;
@@ -1039,6 +1329,24 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
             break;
         }
     }
+    // The channel count and output rate of an AAC or AC-3 track are the codec
+    // configuration's, which is what edith and ffprobe both read; the entry's own
+    // fields are fixed at two channels and carry the core's rate for HE-AAC.
+    if kind == b"ac-3"
+        && let Some((k, body)) = config
+        && &k == b"dac3"
+        && let Some(channels) = asc::ac3_channels(body)
+    {
+        audio.layout = channel_layout(u32::from(channels))?;
+    }
+    if matches!(kind, b"dtsc" | b"dtsh" | b"dtsl" | b"dtse")
+        && let Some((k, body)) = config
+        && &k == b"ddts"
+        && let Some((rate, channels)) = asc::dts_config(body)
+    {
+        audio.sample_rate = rate;
+        audio.layout = channel_layout(u32::from(channels))?;
+    }
     let (codec, extradata) = match kind {
         b"mp4a" => {
             let esds = match config {
@@ -1048,6 +1356,14 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
                 }
                 _ => None,
             };
+            if let Some(esds) = &esds
+                && esds.is_aac()
+                && let Some((rate, channels)) =
+                    esds.decoder_specific.as_deref().and_then(asc::aac_output)
+            {
+                audio.sample_rate = rate;
+                audio.layout = channel_layout(u32::from(channels))?;
+            }
             match esds {
                 // An mp4a entry is not automatically AAC: MP3 lives in one too,
                 // and a track whose object type says so is kept as MP3 rather
@@ -1061,6 +1377,18 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
                 {
                     (CodecId::Mp3, None)
                 }
+                // ffmpeg stores DTS in an `mp4a` entry, the object type naming it.
+                Some(esds)
+                    if matches!(
+                        esds.object_type,
+                        object_type::DTS
+                            | object_type::DTS_HD_HRA
+                            | object_type::DTS_HD_MA
+                            | object_type::DTS_EXPRESS
+                    ) =>
+                {
+                    (CodecId::Dts, None)
+                }
                 // No esds at all, or one naming something else: AAC is what an
                 // `mp4a` entry means by default and the extradata says the rest.
                 Some(esds) => (CodecId::Aac, esds.decoder_specific),
@@ -1073,7 +1401,7 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
         // Named rather than dropped: see `codec_of` in ec-matroska. A track
         // listed as unsupported beats a track that vanished.
         b"mlpa" => (CodecId::TrueHd, None),
-        b"dtsc" | b"dtse" | b"dtsh" | b"dtsl" => (CodecId::Dts, None),
+        b"dtsc" | b"dtse" | b"dtsh" | b"dtsl" => (CodecId::Dts, config_bytes(config, b"ddts")),
         b"alac" => (
             CodecId::Alac,
             // ALAC's magic cookie is taken with its box header, which is the
@@ -1086,6 +1414,18 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
                 Buf::from_vec(out)
             }),
         ),
+        // AMR-NB: always 8 kHz mono whatever the entry says; `damr` body is the extradata.
+        b"samr" => {
+            audio.sample_rate = 8000;
+            audio.layout = ChannelLayout::Mono;
+            (CodecId::AmrNb, config_bytes(config, b"damr"))
+        }
+        // AMR-WB: always 16 kHz mono whatever the entry says.
+        b"sawb" => {
+            audio.sample_rate = 16000;
+            audio.layout = ChannelLayout::Mono;
+            (CodecId::AmrWb, config_bytes(config, b"damr"))
+        }
         b"fLaC" => (CodecId::Flac, config_bytes(config, b"dfLa")),
         b"Opus" => (
             CodecId::Opus,
@@ -1093,18 +1433,108 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
                 .filter(|(k, _)| k == b"dOps")
                 .map(|(_, body)| opus_head(body)),
         ),
+        b"ima4" => (CodecId::ImaAdpcmQt, None),
+        b"alaw" => (CodecId::PcmAlaw, None),
+        b"ulaw" => (CodecId::PcmMulaw, None),
         b"sowt" => (CodecId::PcmS16Le, None),
         b"twos" => (CodecId::PcmS16Be, None),
         b"raw " => (CodecId::PcmU8, None),
+        b"in24" => (
+            if little {
+                CodecId::PcmS24Le
+            } else {
+                CodecId::PcmS24Be
+            },
+            None,
+        ),
+        b"in32" => (
+            if little {
+                CodecId::PcmS32Le
+            } else {
+                CodecId::PcmS32Be
+            },
+            None,
+        ),
+        b"fl32" => (
+            if little {
+                CodecId::PcmF32Le
+            } else {
+                CodecId::PcmF32Be
+            },
+            None,
+        ),
+        // QuickTime's version 2 linear PCM: the format flags and the bit depth
+        // are in the description itself (bit 0 float, bit 1 big-endian).
+        b"lpcm" if version == 2 => {
+            let bits = be32(payload, 28 + 20).unwrap_or(0);
+            let flags = be32(payload, 28 + 24).unwrap_or(0);
+            let (float, big) = (flags & 1 != 0, flags & 2 != 0);
+            let codec = match (float, bits, big) {
+                (false, 16, false) => CodecId::PcmS16Le,
+                (false, 16, true) => CodecId::PcmS16Be,
+                (false, 24, false) => CodecId::PcmS24Le,
+                (false, 24, true) => CodecId::PcmS24Be,
+                (false, 32, false) => CodecId::PcmS32Le,
+                (false, 32, true) => CodecId::PcmS32Be,
+                (true, 32, false) => CodecId::PcmF32Le,
+                (true, 32, true) => CodecId::PcmF32Be,
+                _ => return Ok(None),
+            };
+            (codec, None)
+        }
         _ => return Ok(None),
     };
+    if is_wide_pcm(codec) {
+        audio.bits_per_sample = Some(match codec {
+            CodecId::PcmS24Le | CodecId::PcmS24Be => 24,
+            _ => 32,
+        });
+    }
     Ok(Some(Entry {
         codec,
         extradata,
         video: None,
         audio: Some(audio),
         color_tags: Tags::default(),
+        field_order: None,
     }))
+}
+
+/// The PCM codecs QuickTime writes a frame a sample for (`in24`, `in32`, `fl32`
+/// and the version 2 `lpcm` carrying them).
+fn is_wide_pcm(codec: CodecId) -> bool {
+    matches!(
+        codec,
+        CodecId::PcmS24Le
+            | CodecId::PcmS24Be
+            | CodecId::PcmS32Le
+            | CodecId::PcmS32Be
+            | CodecId::PcmF32Le
+            | CodecId::PcmF32Be
+    )
+}
+
+/// Merge PCM stored a frame to a sample into packets of up to 4096 frames, so a
+/// minute of sound is a few dozen packets and not three million. Only runs of
+/// single-frame samples that follow each other in the file are merged.
+fn group_pcm(samples: &mut Vec<Sample>, frame_bytes: u32) {
+    const FRAMES: u32 = 4096;
+    if frame_bytes == 0 || samples.iter().any(|s| s.size != frame_bytes) {
+        return;
+    }
+    let mut out: Vec<Sample> = Vec::with_capacity(samples.len() / FRAMES as usize + 1);
+    for s in samples.drain(..) {
+        if let Some(last) = out.last_mut()
+            && last.size + s.size <= FRAMES * frame_bytes
+            && last.offset + u64::from(last.size) == s.offset
+        {
+            last.size += s.size;
+            last.duration = last.duration.saturating_add(s.duration);
+            continue;
+        }
+        out.push(s);
+    }
+    *samples = out;
 }
 
 /// The configuration box a `wave` holds for the sample entry `kind`, or
@@ -1171,13 +1601,39 @@ pub(crate) fn opus_head(dops: &[u8]) -> Buf {
     Buf::from_vec(out)
 }
 
-fn video_codec(kind: &FourCc) -> Option<(CodecId, &'static FourCc)> {
+fn video_codec(kind: &FourCc, video_track: bool) -> Option<(CodecId, &'static FourCc)> {
     Some(match kind {
         b"avc1" | b"avc3" => (CodecId::H264, b"avcC"),
         b"hvc1" | b"hev1" => (CodecId::H265, b"hvcC"),
         b"vp08" => (CodecId::Vp8, b"vpcC"),
         b"vp09" => (CodecId::Vp9, b"vpcC"),
         b"av01" => (CodecId::Av1, b"av1C"),
+        // Motion JPEG: QuickTime `jpeg` (Photo JPEG) and `mjpa` (MJPEG-A) carry whole JFIF
+        // frames and no configuration box. `mjpb` (MJPEG-B) packets have a different layout
+        // (no SOI, marker-less blocks at header offsets); ec-mjpeg detects and rewraps them.
+        // Uncompressed video; `raw ` is also the 8-bit PCM audio entry, so it needs a `vide` track.
+        // The decoder (ec-riff `RawVideoDecoder`) reads the layout from the synthesized header.
+        b"raw " | b"yuvs" if !video_track => return None,
+        b"raw " | b"yuvs" | b"2vuy" | b"yuv2" | b"v210" | b"v410" | b"b16g" => {
+            (CodecId::RawVideo, b"\0\0\0\0")
+        }
+        b"jpeg" | b"mjpa" | b"mjpb" => (CodecId::Mjpeg, b"\0\0\0\0"),
+        // ProRes entries carry no configuration box: the frame header is self-describing.
+        b"apco" | b"apcs" | b"apcn" | b"apch" | b"ap4h" | b"ap4x" => (CodecId::ProRes, b"\0\0\0\0"),
+        // Avid DNxHD (`AVdn`) and DNxHR (`AVdh`); the optional `DNxD` box is
+        // the only child worth keeping as extradata.
+        b"AVdn" | b"AVdh" => (CodecId::Dnxhd, b"DNxD"),
+        // MPEG-4 Part 2 Visual: `mp4v` carries the VOL header in the `esds`
+        // DecoderSpecificInfo; the 3GPP/QuickTime H.263 entries (`s263`, `h263`)
+        // carry no configuration the baseline decoder needs (`d263` is ignored).
+        b"mp4v" => (CodecId::Mpeg4Part2, b"esds"),
+        b"s263" | b"h263" => (CodecId::Mpeg4Part2, b"\0\0\0\0"),
+        // DV: QuickTime sample entries for DV25/DVCPRO25 (`dvc `/`dvcp`/`dvpp`), DVCPRO50
+        // (`dv5n`/`dv5p`) and DVCPRO HD (`dvhq`/`dvh3`/`dvh5`/`dvh6`/`dvhp`...). The frame is
+        // self-describing: no configuration box.
+        b"dvc " | b"dvcp" | b"dvpp" | b"dvcs" | b"dvis" | b"dv5n" | b"dv5p" | b"dv5q" | b"dvhq"
+        | b"dvh1" | b"dvh2" | b"dvh3" | b"dvh4" | b"dvh5" | b"dvh6" | b"dvhp" | b"dvhs"
+        | b"dvhn" | b"dvhr" => (CodecId::DvVideo, b"\0\0\0\0"),
         _ => return None,
     })
 }
@@ -1228,10 +1684,12 @@ fn colr(body: &[u8]) -> Option<(ColorInfo, Tags)> {
 /// comes out as exactly 24000/1001 rather than as the 23.0 a truncating
 /// millisecond division answers.
 fn frame_rate(stts: &[(u32, u32)], timescale: u32) -> Option<TimeBase> {
+    // Saturating: untrusted entries can sum past u64. A saturated total fails the
+    // `try_into` below, so the rate comes out as None rather than a panic.
     let (samples, ticks) = stts.iter().fold((0u64, 0u64), |(n, t), &(count, delta)| {
         (
-            n + u64::from(count),
-            t + u64::from(count) * u64::from(delta),
+            n.saturating_add(u64::from(count)),
+            t.saturating_add(u64::from(count).saturating_mul(u64::from(delta))),
         )
     });
     if ticks == 0 || samples == 0 {
@@ -1304,6 +1762,38 @@ fn count_of(rest: &[u8], width: usize, _file_len: u64) -> Result<usize> {
     Ok(count)
 }
 
+/// The quarter turn a `tkhd` display matrix asks for, read the way the engine
+/// above this crate reads it: the four linear 16.16 terms are normalised by the
+/// matrix's own scale, so a copy of a quarter turn at another scale still reads
+/// as one, and a column length or a shear past 1e-3 -- a mirror, an anisotropic
+/// scale, a 45-degree quirk -- is [`Rotation::Other`] carrying the raw terms.
+/// The angle is taken to half a degree, which is where a matrix a muxer rounded
+/// to 16.16 lands.
+fn display_rotation(a: i32, b: i32, c: i32, d: i32) -> Rotation {
+    let fixed = |raw: i32| f64::from(raw) / 65536.0;
+    let (fa, fb, fc, fd) = (fixed(a), fixed(b), fixed(c), fixed(d));
+    let scale = fa.hypot(fb);
+    let other = Rotation::Other { a, b, c, d };
+    if scale == 0.0
+        || (scale - fc.hypot(fd)).abs() > 1e-3
+        || ((fa - fd) / scale).abs() > 1e-3
+        || ((fb + fc) / scale).abs() > 1e-3
+    {
+        return other;
+    }
+    let degrees = fb.atan2(fa).to_degrees();
+    let steps = (degrees / 90.0).round();
+    if (degrees - steps * 90.0).abs() > 0.5 {
+        return other;
+    }
+    match steps.rem_euclid(4.0) as u8 {
+        0 => Rotation::None,
+        1 => Rotation::Cw90,
+        2 => Rotation::Cw180,
+        _ => Rotation::Cw270,
+    }
+}
+
 /// The `elst` entries: `(segment duration, media time, media rate)`.
 fn elst(payload: &[u8]) -> Result<Vec<(u64, i64, u32)>> {
     let (version, _, rest) = full(payload)?;
@@ -1332,6 +1822,32 @@ fn elst(payload: &[u8]) -> Result<Vec<(u64, i64, u32)>> {
 mod tests {
     use super::*;
     use crate::boxes;
+
+    #[test]
+    fn avid_dnxhd_and_dnxhr_entries_map_to_dnxhd() {
+        let mut payload = vec![0u8; 78];
+        payload[24..26].copy_from_slice(&1920u16.to_be_bytes());
+        payload[26..28].copy_from_slice(&1080u16.to_be_bytes());
+        for kind in [b"AVdn", b"AVdh"] {
+            let e = sample_entry(kind, &payload, false).unwrap().unwrap();
+            assert_eq!(e.codec, CodecId::Dnxhd);
+            let v = e.video.unwrap();
+            assert_eq!((v.width, v.height), (1920, 1080));
+        }
+    }
+
+    #[test]
+    fn a_sound_description_stating_billions_of_channels_is_refused() {
+        // Found by fuzz/demux_mp4: a version-2 entry's 32-bit channel count went
+        // straight into a layout, one channel position allocated per count.
+        let mut payload = vec![0u8; 72];
+        payload[8..10].copy_from_slice(&2u16.to_be_bytes());
+        payload[40..44].copy_from_slice(&0xFFFF_FFF0u32.to_be_bytes());
+        assert!(sample_entry(b"mp4a", &payload, false).is_err());
+        payload[40..44].copy_from_slice(&6u32.to_be_bytes());
+        let entry = sample_entry(b"mp4a", &payload, false).unwrap().unwrap();
+        assert_eq!(entry.audio.unwrap().layout.channel_count(), 6);
+    }
 
     /// A QuickTime version-2 sound description, which no ffmpeg-written
     /// fixture in this corpus has: its 36-byte block states the sample rate as
@@ -1378,7 +1894,7 @@ mod tests {
         entry.extend_from_slice(&[0; 16]); // the four constant LPCM fields
         entry.extend_from_slice(&boxed(b"wave", &wave));
 
-        let read = sample_entry(b"mp4a", &entry)
+        let read = sample_entry(b"mp4a", &entry, false)
             .expect("entry parses")
             .expect("mp4a is a codec this build has an id for");
         let audio = read.audio.expect("a sound entry");
@@ -1520,5 +2036,38 @@ mod tests {
             48_000
         );
         assert_eq!(head[18], 0, "channel mapping family");
+    }
+}
+
+#[cfg(test)]
+mod display_matrix_tests {
+    use super::*;
+
+    const ONE: i32 = 65_536;
+
+    #[test]
+    fn a_quarter_turn_reads_as_one_at_any_scale_and_with_rounding() {
+        // `-display_rotation 90`'s matrix, as written, and at twice the scale.
+        assert_eq!(display_rotation(0, -ONE, ONE, 0), Rotation::Cw270);
+        assert_eq!(display_rotation(0, -2 * ONE, 2 * ONE, 0), Rotation::Cw270);
+        // One 16.16 ulp of rounding on the terms: still the same quarter turn,
+        // where the exact integer test in `ec_core` would call it `Other`.
+        assert_eq!(display_rotation(1, -ONE, ONE - 1, 0), Rotation::Cw270);
+        assert_eq!(display_rotation(ONE, 0, 0, ONE), Rotation::None);
+        assert_eq!(display_rotation(-ONE, 0, 0, -ONE), Rotation::Cw180);
+    }
+
+    #[test]
+    fn a_mirror_a_shear_or_a_no_matrix_is_refused_by_name() {
+        let other = |a, b, c, d| Rotation::Other { a, b, c, d };
+        // A horizontal mirror: negative determinant.
+        assert_eq!(display_rotation(ONE, 0, 0, -ONE), other(ONE, 0, 0, -ONE));
+        // A shear.
+        assert_eq!(
+            display_rotation(ONE, 0, ONE / 2, ONE),
+            other(ONE, 0, ONE / 2, ONE)
+        );
+        // The zero matrix has no angle at all.
+        assert_eq!(display_rotation(0, 0, 0, 0), other(0, 0, 0, 0));
     }
 }

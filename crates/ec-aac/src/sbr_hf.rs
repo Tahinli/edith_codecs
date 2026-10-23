@@ -193,14 +193,18 @@ pub fn build_patches(tables: &BandTables) -> Vec<Patch> {
 /// borders closer than `0.49/limBands` octaves collapse (`bs_limiter_bands`
 /// 1/2/3 => 1.2/2/3 bands per octave), keeping patch borders over
 /// envelope borders when one of the pair must go. `0` => one band.
-pub fn limiter_band_table(tables: &BandTables, patches: &[Patch], limiter_bands: u8) -> Vec<i64> {
+pub fn limiter_band_table(
+    tables: &BandTables,
+    patches: &[Patch],
+    limiter_bands: u8,
+) -> crate::Result<Vec<i64>> {
     let kx = tables.kx;
     let k2 = tables.k2;
     if kx >= k2 {
-        return vec![kx, k2.max(kx)];
+        return Ok(vec![kx, k2.max(kx)]);
     }
     if limiter_bands == 0 {
-        return vec![kx, k2];
+        return Ok(vec![kx, k2]);
     }
     let warped = match limiter_bands {
         1 => 2f64.powf(0.49 / 1.2),
@@ -209,26 +213,35 @@ pub fn limiter_band_table(tables: &BandTables, patches: &[Patch], limiter_bands:
     };
     let mut patch_borders: Vec<i64> = vec![kx];
     for p in patches {
-        patch_borders.push(patch_borders.last().unwrap() + p.width as i64);
+        let last = patch_borders.last().copied().unwrap_or(kx);
+        patch_borders.push(last.saturating_add(p.width as i64));
     }
     let mut table: Vec<i64> = tables.f_low.clone();
     table.extend(patch_borders.iter().skip(1).take(patches.len().saturating_sub(1)));
     table.sort_unstable();
     let is_patch = |b: i64| patch_borders.contains(&b);
-    let mut out: Vec<i64> = vec![table[0]];
-    for &b in &table[1..] {
-        let last = *out.last().unwrap();
+    let Some((&first, rest)) = table.split_first() else {
+        return Err(crate::Error::corrupt("sbr: empty limiter border set"));
+    };
+    let mut out: Vec<i64> = vec![first];
+    for &b in rest {
+        let last = out
+            .last()
+            .copied()
+            .ok_or_else(|| crate::Error::corrupt("sbr: limiter table lost its first border"))?;
         if (b as f64) >= (last as f64) * warped {
             out.push(b);
         } else if b == last || !is_patch(b) {
             // drop the incoming border
         } else if !is_patch(last) {
-            *out.last_mut().unwrap() = b;
+            if let Some(slot) = out.last_mut() {
+                *slot = b;
+            }
         } else {
             out.push(b);
         }
     }
-    out
+    Ok(out)
 }
 
 /// `bs_invf_mode` chirp targets per ISO 14496-3 4.6.18.6.3 (Table 4.163):

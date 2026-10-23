@@ -1,0 +1,5 @@
+   Compiling ec-h264-syntax v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-h264-syntax)
+    Finished `release` profile [optimized] target(s) in 0.98s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_h264_syntax-8cbb94b2f7dd1805)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-8420fe23819ebcaf)
+   Doc-tests ec_h264_syntax

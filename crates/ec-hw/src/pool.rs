@@ -4,48 +4,43 @@
 //! as [`PooledSurface`]s that return themselves to the free list on drop.
 //! Two things hold a surface at the same time — the reference picture buffer
 //! and a frame the caller has not finished with — so ownership is an
-//! `Arc<PooledSurface>` and the recycle happens when the last of them goes.
+//! `Rc<PooledSurface>` and the recycle happens when the last of them goes.
 //!
 //! Reallocating per frame would be the alternative, and it is precisely what
 //! makes a VA-API pipeline stutter: every `vaCreateSurfaces` is a kernel
 //! allocation plus a driver-side tiling decision.
 
+use ec_va::{Surface, SurfaceSpec};
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, Weak};
-
-use ec_va::{Display, Surface, SurfaceSpec};
-
-use crate::error::Result;
+use std::rc::{Rc, Weak};
+use std::sync::Mutex;
 
 struct PoolInner {
-    /// Every surface, in allocation order. Also the context's render targets.
-    all: Vec<Arc<Surface>>,
-    free: Mutex<Vec<Arc<Surface>>>,
+    /// Every surface, in allocation order.
+    all: Vec<Rc<Surface>>,
+    free: Mutex<Vec<Rc<Surface>>>,
 }
 
 /// A fixed-size pool of identically specified surfaces.
 #[derive(Clone)]
 pub struct SurfacePool {
-    inner: Arc<PoolInner>,
+    inner: Rc<PoolInner>,
     spec: SurfaceSpec,
 }
 
 impl SurfacePool {
-    /// Allocate `count` surfaces matching `spec`.
-    pub fn new(display: &Arc<Display>, spec: &SurfaceSpec, count: usize) -> Result<SurfacePool> {
-        let all = Surface::create_pool(display, spec, count)?;
-        Ok(SurfacePool {
-            inner: Arc::new(PoolInner {
+    /// Wrap surfaces that were allocated with `spec`. The caller creates them
+    /// with [`ec_va::create_pool`] first, because a decode context needs them as
+    /// its render targets before the pool can own them.
+    pub fn from_surfaces(surfaces: Vec<Surface>, spec: &SurfaceSpec) -> SurfacePool {
+        let all: Vec<Rc<Surface>> = surfaces.into_iter().map(Rc::new).collect();
+        SurfacePool {
+            inner: Rc::new(PoolInner {
                 free: Mutex::new(all.clone()),
                 all,
             }),
             spec: *spec,
-        })
-    }
-
-    /// Every surface in the pool — what a `Context` wants as its render targets.
-    pub fn targets(&self) -> &[Arc<Surface>] {
-        &self.inner.all
+        }
     }
 
     /// The spec every surface in this pool was allocated with.
@@ -72,39 +67,38 @@ impl SurfacePool {
     ///
     /// A `None` is the caller's cue to release output frames, not an error: a
     /// decoder that has handed out its whole pool is waiting on the consumer.
-    pub fn acquire(&self) -> Option<Arc<PooledSurface>> {
+    pub fn acquire(&self) -> Option<Rc<PooledSurface>> {
         // A poisoned lock means another thread panicked while holding it; the
-        // free list is a plain Vec, so its contents are still consistent and
-        // there is nothing to recover from.
+        // free list is a plain Vec, so its contents are still consistent.
         let mut free = match self.inner.free.lock() {
             Ok(free) => free,
             Err(poisoned) => poisoned.into_inner(),
         };
         let surface = free.pop()?;
-        Some(Arc::new(PooledSurface {
+        Some(Rc::new(PooledSurface {
             surface,
-            pool: Arc::downgrade(&self.inner),
+            pool: Rc::downgrade(&self.inner),
         }))
     }
 }
 
 /// A surface on loan from a [`SurfacePool`]; returns to it on drop.
 pub struct PooledSurface {
-    surface: Arc<Surface>,
+    surface: Rc<Surface>,
     pool: Weak<PoolInner>,
 }
 
 impl PooledSurface {
-    /// The surface itself, for the calls that want an owned `Arc<Surface>`.
-    pub fn surface(&self) -> &Arc<Surface> {
+    /// The surface itself, for the calls that want an owned `Rc<Surface>`.
+    pub fn surface(&self) -> &Rc<Surface> {
         &self.surface
     }
 }
 
 impl Deref for PooledSurface {
-    type Target = Arc<Surface>;
+    type Target = Rc<Surface>;
 
-    fn deref(&self) -> &Arc<Surface> {
+    fn deref(&self) -> &Rc<Surface> {
         &self.surface
     }
 }
@@ -127,6 +121,6 @@ impl Drop for PooledSurface {
             Ok(free) => free,
             Err(poisoned) => poisoned.into_inner(),
         };
-        free.push(Arc::clone(&self.surface));
+        free.push(Rc::clone(&self.surface));
     }
 }

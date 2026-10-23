@@ -1,0 +1,362 @@
+{ "type": "suite", "event": "started", "test_count": 82 }
+{ "type": "test", "event": "started", "name": "bits::tests::agrees_with_core_bitreader" }
+{ "type": "test", "event": "started", "name": "bits::tests::long_zero_runs_are_corrupt_or_need_more" }
+{ "type": "test", "event": "started", "name": "bits::tests::pcm_bytes_and_alignment" }
+{ "type": "test", "event": "started", "name": "bits::tests::peek16_pads_and_skip_tracks_position" }
+{ "type": "test", "name": "bits::tests::long_zero_runs_are_corrupt_or_need_more", "event": "ok", "exec_time": 0.000007354 }
+{ "type": "test", "event": "started", "name": "cabac::tests::context_initialisation_matches_equation_9_5" }
+{ "type": "test", "name": "cabac::tests::context_initialisation_matches_equation_9_5", "event": "ok", "exec_time": 0.00001019 }
+{ "type": "test", "event": "started", "name": "cabac::tests::engine_initialisation_reads_nine_bits" }
+{ "type": "test", "name": "cabac::tests::engine_initialisation_reads_nine_bits", "event": "ok", "exec_time": 0.000007404 }
+{ "type": "test", "event": "started", "name": "cabac::tests::engine_tables_have_their_stated_shape" }
+{ "type": "test", "name": "cabac::tests::engine_tables_have_their_stated_shape", "event": "ok", "exec_time": 0.000000922 }
+{ "type": "test", "event": "started", "name": "cavlc::tests::chroma_dc_block" }
+{ "type": "test", "name": "cavlc::tests::chroma_dc_block", "event": "ok", "exec_time": 0.000003877 }
+{ "type": "test", "event": "started", "name": "cavlc::tests::full_block_skips_total_zeros" }
+{ "type": "test", "name": "bits::tests::peek16_pads_and_skip_tracks_position", "event": "ok", "exec_time": 0.000001884 }
+{ "type": "test", "event": "started", "name": "cavlc::tests::runs_spread_levels" }
+{ "type": "test", "name": "bits::tests::pcm_bytes_and_alignment", "event": "ok", "exec_time": 0.000002034 }
+{ "type": "test", "event": "started", "name": "cavlc::tests::trailing_ones_and_one_level" }
+{ "type": "test", "name": "cavlc::tests::full_block_skips_total_zeros", "event": "ok", "exec_time": 0.000004268 }
+{ "type": "test", "event": "started", "name": "cavlc::tests::truncated_is_need_more" }
+{ "type": "test", "name": "bits::tests::agrees_with_core_bitreader", "event": "ok", "exec_time": 0.000004449 }
+{ "type": "test", "event": "started", "name": "cavlc::tests::zero_coefficients_single_bit" }
+{ "type": "test", "name": "cavlc::tests::runs_spread_levels", "event": "ok", "exec_time": 0.000001373 }
+{ "type": "test", "event": "started", "name": "codec::tests::a_packet_without_parameter_sets_is_corrupt_not_a_panic" }
+{ "type": "test", "name": "cavlc::tests::trailing_ones_and_one_level", "event": "ok", "exec_time": 0.000002775 }
+{ "type": "test", "event": "started", "name": "codec::tests::a_truncated_avcc_is_an_error" }
+{ "type": "test", "name": "cavlc::tests::truncated_is_need_more", "event": "ok", "exec_time": 0.000000821 }
+{ "type": "test", "event": "started", "name": "codec::tests::flush_then_drain_reports_end_of_stream" }
+{ "type": "test", "name": "cavlc::tests::zero_coefficients_single_bit", "event": "ok", "exec_time": 0.000003638 }
+{ "type": "test", "event": "started", "name": "codec::tests::only_h264_parameters_are_accepted" }
+{ "type": "test", "name": "codec::tests::a_packet_without_parameter_sets_is_corrupt_not_a_panic", "event": "ok", "exec_time": 0.001629363 }
+{ "type": "test", "event": "started", "name": "deblock::tests::chroma_filter_touches_only_p0_q0" }
+{ "type": "test", "name": "deblock::tests::chroma_filter_touches_only_p0_q0", "event": "ok", "exec_time": 0.000000972 }
+{ "type": "test", "event": "started", "name": "deblock::tests::large_step_is_preserved" }
+{ "type": "test", "name": "codec::tests::a_truncated_avcc_is_an_error", "event": "ok", "exec_time": 0.001731144 }
+{ "type": "test", "event": "started", "name": "deblock::tests::strong_filter_smooths_step" }
+{ "type": "test", "name": "codec::tests::only_h264_parameters_are_accepted", "event": "ok", "exec_time": 0.001659288 }
+{ "type": "test", "event": "started", "name": "deblock::tests::thresholds_clamp_and_lookup" }
+{ "type": "test", "name": "codec::tests::flush_then_drain_reports_end_of_stream", "event": "ok", "exec_time": 0.003344547 }
+{ "type": "test", "event": "started", "name": "decoder::tests::weighted_bipred_combines_per_component" }
+{ "type": "test", "name": "deblock::tests::large_step_is_preserved", "event": "ok", "exec_time": 0.000001783 }
+{ "type": "test", "event": "started", "name": "dpb::tests::b_list_initialisation_splits_around_the_current_poc" }
+{ "type": "test", "name": "deblock::tests::strong_filter_smooths_step", "event": "ok", "exec_time": 0.000000561 }
+{ "type": "test", "event": "started", "name": "dpb::tests::extend_borders_replicates_edges" }
+{ "type": "test", "name": "deblock::tests::thresholds_clamp_and_lookup", "event": "ok", "exec_time": 0.000000792 }
+{ "type": "test", "event": "started", "name": "dpb::tests::identical_b_lists_swap_the_first_two_entries" }
+{ "type": "test", "name": "decoder::tests::weighted_bipred_combines_per_component", "event": "ok", "exec_time": 0.000043561 }
+{ "type": "test", "event": "started", "name": "dpb::tests::p_list_initialisation_orders_by_pic_num" }
+{ "type": "test", "name": "dpb::tests::b_list_initialisation_splits_around_the_current_poc", "event": "ok", "exec_time": 0.000018675 }
+{ "type": "test", "event": "started", "name": "dpb::tests::poc_type_0_tracks_the_msb_across_a_wrap" }
+{ "type": "test", "name": "dpb::tests::extend_borders_replicates_edges", "event": "ok", "exec_time": 0.000001724 }
+{ "type": "test", "event": "started", "name": "dpb::tests::poc_type_1_follows_the_offset_cycle" }
+{ "type": "test", "name": "dpb::tests::identical_b_lists_swap_the_first_two_entries", "event": "ok", "exec_time": 0.000004218 }
+{ "type": "test", "event": "started", "name": "dpb::tests::poc_type_2_is_twice_the_frame_number" }
+{ "type": "test", "name": "dpb::tests::p_list_initialisation_orders_by_pic_num", "event": "ok", "exec_time": 0.000004919 }
+{ "type": "test", "event": "started", "name": "dpb::tests::reference_picture_without_marking_is_corrupt_not_a_panic" }
+{ "type": "test", "name": "dpb::tests::poc_type_0_tracks_the_msb_across_a_wrap", "event": "ok", "exec_time": 0.000007985 }
+{ "type": "test", "event": "started", "name": "dpb::tests::short_term_modification_reorders_the_list" }
+{ "type": "test", "name": "dpb::tests::poc_type_1_follows_the_offset_cycle", "event": "ok", "exec_time": 0.000004639 }
+{ "type": "test", "event": "started", "name": "enc::cabac_enc::tests::cat5_blocks_and_transform_flag_round_trip" }
+{ "type": "test", "name": "dpb::tests::poc_type_2_is_twice_the_frame_number", "event": "ok", "exec_time": 0.00000536 }
+{ "type": "test", "event": "started", "name": "enc::cabac_enc::tests::engine_round_trips" }
+{ "type": "test", "name": "dpb::tests::reference_picture_without_marking_is_corrupt_not_a_panic", "event": "ok", "exec_time": 0.0000053 }
+{ "type": "test", "event": "started", "name": "enc::cabac_enc::tests::residual_8x8_cost_predicts_the_bits_spent" }
+{ "type": "test", "name": "dpb::tests::short_term_modification_reorders_the_list", "event": "ok", "exec_time": 0.000004999 }
+{ "type": "test", "event": "started", "name": "enc::cabac_enc::tests::residual_cost_predicts_the_bits_spent" }
+{ "type": "test", "name": "enc::cabac_enc::tests::engine_round_trips", "event": "ok", "exec_time": 0.00033002 }
+{ "type": "test", "event": "started", "name": "enc::headers::tests::level_follows_the_load" }
+{ "type": "test", "name": "enc::headers::tests::level_follows_the_load", "event": "ok", "exec_time": 0.000002224 }
+{ "type": "test", "event": "started", "name": "enc::headers::tests::parameter_sets_parse_back" }
+{ "type": "test", "name": "enc::headers::tests::parameter_sets_parse_back", "event": "ok", "exec_time": 0.000028394 }
+{ "type": "test", "event": "started", "name": "enc::headers::tests::slice_header_parses_back" }
+{ "type": "test", "name": "enc::headers::tests::slice_header_parses_back", "event": "ok", "exec_time": 0.000016461 }
+{ "type": "test", "event": "started", "name": "enc::quant::tests::ac_round_trip_within_a_quantiser_step" }
+{ "type": "test", "name": "enc::quant::tests::ac_round_trip_within_a_quantiser_step", "event": "ok", "exec_time": 0.000068528 }
+{ "type": "test", "event": "started", "name": "enc::quant::tests::chroma_dc_round_trip" }
+{ "type": "test", "name": "enc::quant::tests::chroma_dc_round_trip", "event": "ok", "exec_time": 0.000001323 }
+{ "type": "test", "event": "started", "name": "enc::quant::tests::luma_dc_round_trip" }
+{ "type": "test", "name": "enc::quant::tests::luma_dc_round_trip", "event": "ok", "exec_time": 0.000008606 }
+{ "type": "test", "event": "started", "name": "enc::quant::tests::round_trip_8x8_identity_within_one_sample" }
+{ "type": "test", "name": "enc::cabac_enc::tests::residual_cost_predicts_the_bits_spent", "event": "ok", "exec_time": 0.000551057 }
+{ "type": "test", "event": "started", "name": "enc::quant::tests::round_trip_8x8_within_a_quantiser_step" }
+{ "type": "test", "name": "enc::quant::tests::round_trip_8x8_identity_within_one_sample", "event": "ok", "exec_time": 0.000004057 }
+{ "type": "test", "event": "started", "name": "enc::rc::tests::converges_to_the_target" }
+{ "type": "test", "name": "enc::cabac_enc::tests::residual_8x8_cost_predicts_the_bits_spent", "event": "ok", "exec_time": 0.000821955 }
+{ "type": "test", "event": "started", "name": "enc::rc::tests::zero_bitrate_is_constant_qp" }
+{ "type": "test", "name": "enc::quant::tests::round_trip_8x8_within_a_quantiser_step", "event": "ok", "exec_time": 0.000795545 }
+{ "type": "test", "event": "started", "name": "enc::tests::bands_cover_every_row_once" }
+{ "type": "test", "name": "enc::rc::tests::converges_to_the_target", "event": "ok", "exec_time": 0.00003207 }
+{ "type": "test", "event": "started", "name": "enc::tests::chroma_offset_follows_the_source" }
+{ "type": "test", "name": "enc::rc::tests::zero_bitrate_is_constant_qp", "event": "ok", "exec_time": 0.000001563 }
+{ "type": "test", "event": "started", "name": "enc::tests::odd_dimensions_are_refused" }
+{ "type": "test", "name": "enc::tests::odd_dimensions_are_refused", "event": "ok", "exec_time": 0.000164059 }
+{ "type": "test", "event": "started", "name": "enc::tests::production_lambda_tracks_transform_mode" }
+{ "type": "test", "name": "enc::tests::production_lambda_tracks_transform_mode", "event": "ok", "exec_time": 0.00000014 }
+{ "type": "test", "event": "started", "name": "enc::tests::timing_is_exact_for_broadcast_rates" }
+{ "type": "test", "name": "enc::tests::timing_is_exact_for_broadcast_rates", "event": "ok", "exec_time": 0.00000014 }
+{ "type": "test", "event": "started", "name": "enc::vlc::tests::boundary_blocks_round_trip" }
+{ "type": "test", "name": "enc::vlc::tests::boundary_blocks_round_trip", "event": "ok", "exec_time": 0.000009898 }
+{ "type": "test", "event": "started", "name": "enc::vlc::tests::cbp_codes_invert" }
+{ "type": "test", "name": "enc::vlc::tests::cbp_codes_invert", "event": "ok", "exec_time": 0.000002495 }
+{ "type": "test", "event": "started", "name": "enc::vlc::tests::interleaved_8x8_round_trips" }
+{ "type": "test", "name": "enc::cabac_enc::tests::cat5_blocks_and_transform_flag_round_trip", "event": "ok", "exec_time": 0.00393771 }
+{ "type": "test", "event": "started", "name": "enc::vlc::tests::residual_blocks_round_trip" }
+{ "type": "test", "name": "enc::tests::bands_cover_every_row_once", "event": "ok", "exec_time": 0.000005751 }
+{ "type": "test", "event": "started", "name": "inter::tests::avg_mode_matches_the_combining_pass" }
+{ "type": "test", "name": "inter::tests::avg_mode_matches_the_combining_pass", "event": "ok", "exec_time": 0.000099537 }
+{ "type": "test", "event": "started", "name": "inter::tests::chroma_interpolation_matches_equation_8_270" }
+{ "type": "test", "name": "enc::vlc::tests::interleaved_8x8_round_trips", "event": "ok", "exec_time": 0.002792438 }
+{ "type": "test", "event": "started", "name": "inter::tests::luma_interpolation_matches_the_clipped_definition" }
+{ "type": "test", "name": "enc::tests::chroma_offset_follows_the_source", "event": "ok", "exec_time": 0.005295644 }
+{ "type": "test", "event": "started", "name": "inter::tests::weighted_combination_follows_8_4_2_3" }
+{ "type": "test", "name": "inter::tests::weighted_combination_follows_8_4_2_3", "event": "ok", "exec_time": 0.000001543 }
+{ "type": "test", "event": "started", "name": "mv::tests::b_shapes_match_table_7_14" }
+{ "type": "test", "name": "inter::tests::chroma_interpolation_matches_equation_8_270", "event": "ok", "exec_time": 0.000151333 }
+{ "type": "test", "event": "started", "name": "mv::tests::directional_segmentation_shortcuts" }
+{ "type": "test", "name": "mv::tests::b_shapes_match_table_7_14", "event": "ok", "exec_time": 0.000001122 }
+{ "type": "test", "event": "started", "name": "mv::tests::median_of_three_when_several_match" }
+{ "type": "test", "name": "mv::tests::directional_segmentation_shortcuts", "event": "ok", "exec_time": 0.000000109 }
+{ "type": "test", "event": "started", "name": "mv::tests::min_positive_prefers_the_non_negative" }
+{ "type": "test", "name": "mv::tests::median_of_three_when_several_match", "event": "ok", "exec_time": 0.000000561 }
+{ "type": "test", "event": "started", "name": "mv::tests::single_matching_reference_wins" }
+{ "type": "test", "name": "mv::tests::min_positive_prefers_the_non_negative", "event": "ok", "exec_time": 0.00000009 }
+{ "type": "test", "event": "started", "name": "mv::tests::unavailable_b_and_c_fall_back_to_a" }
+{ "type": "test", "name": "mv::tests::single_matching_reference_wins", "event": "ok", "exec_time": 0.00000017 }
+{ "type": "test", "event": "started", "name": "pred::tests::add_residual_clamps" }
+{ "type": "test", "name": "pred::tests::add_residual_clamps", "event": "ok", "exec_time": 0.000000141 }
+{ "type": "test", "event": "started", "name": "pred::tests::chroma_dc_corner_preferences" }
+{ "type": "test", "name": "pred::tests::chroma_dc_corner_preferences", "event": "ok", "exec_time": 0.000001263 }
+{ "type": "test", "event": "started", "name": "pred::tests::constant_neighbourhood_is_a_fixed_point" }
+{ "type": "test", "name": "pred::tests::constant_neighbourhood_is_a_fixed_point", "event": "ok", "exec_time": 0.000003086 }
+{ "type": "test", "event": "started", "name": "pred::tests::dc_4x4_fallbacks" }
+{ "type": "test", "name": "pred::tests::dc_4x4_fallbacks", "event": "ok", "exec_time": 0.000000922 }
+{ "type": "test", "event": "started", "name": "pred::tests::ddl_constant_edge" }
+{ "type": "test", "name": "enc::vlc::tests::residual_blocks_round_trip", "event": "ok", "exec_time": 0.007631625 }
+{ "type": "test", "event": "started", "name": "pred::tests::plane_16x16_ramp" }
+{ "type": "test", "name": "pred::tests::ddl_constant_edge", "event": "ok", "exec_time": 0.000000632 }
+{ "type": "test", "event": "started", "name": "pred::tests::reference_filter_edges" }
+{ "type": "test", "name": "mv::tests::unavailable_b_and_c_fall_back_to_a", "event": "ok", "exec_time": 0.000000802 }
+{ "type": "test", "event": "started", "name": "pred::tests::vertical_and_horizontal_4x4" }
+{ "type": "test", "name": "inter::tests::luma_interpolation_matches_the_clipped_definition", "event": "ok", "exec_time": 0.003364956 }
+{ "type": "test", "event": "started", "name": "pred::tests::vertical_horizontal_8x8" }
+{ "type": "test", "name": "pred::tests::plane_16x16_ramp", "event": "ok", "exec_time": 0.000002715 }
+{ "type": "test", "event": "started", "name": "tables::tests::cbp_tables_are_permutations" }
+{ "type": "test", "name": "pred::tests::reference_filter_edges", "event": "ok", "exec_time": 0.000000852 }
+{ "type": "test", "event": "started", "name": "tables::tests::coeff_token_tables_prefix_free_and_complete" }
+{ "type": "test", "name": "pred::tests::vertical_and_horizontal_4x4", "event": "ok", "exec_time": 0.000001072 }
+{ "type": "test", "event": "started", "name": "tables::tests::total_zeros_and_run_before_prefix_free_and_complete" }
+{ "type": "test", "name": "pred::tests::vertical_horizontal_8x8", "event": "ok", "exec_time": 0.000000942 }
+{ "type": "test", "event": "started", "name": "tables::tests::zigzag_is_permutation_and_deblock_tables_sized" }
+{ "type": "test", "name": "tables::tests::coeff_token_tables_prefix_free_and_complete", "event": "ok", "exec_time": 0.000043882 }
+{ "type": "test", "event": "started", "name": "transform::tests::chroma_dc_422_hadamard" }
+{ "type": "test", "name": "tables::tests::cbp_tables_are_permutations", "event": "ok", "exec_time": 0.000004599 }
+{ "type": "test", "event": "started", "name": "transform::tests::chroma_dc_hadamard" }
+{ "type": "test", "name": "tables::tests::total_zeros_and_run_before_prefix_free_and_complete", "event": "ok", "exec_time": 0.000009348 }
+{ "type": "test", "event": "started", "name": "transform::tests::dc_only_block_flat_and_qp_ladder" }
+{ "type": "test", "name": "tables::tests::zigzag_is_permutation_and_deblock_tables_sized", "event": "ok", "exec_time": 0.000000922 }
+{ "type": "test", "event": "started", "name": "transform::tests::luma_dc_spread" }
+{ "type": "test", "name": "transform::tests::chroma_dc_hadamard", "event": "ok", "exec_time": 0.000000691 }
+{ "type": "test", "event": "started", "name": "transform::tests::zero_in_zero_out_and_unzigzag" }
+{ "type": "test", "name": "transform::tests::chroma_dc_422_hadamard", "event": "ok", "exec_time": 0.000000932 }
+{ "type": "test", "name": "transform::tests::dc_only_block_flat_and_qp_ladder", "event": "ok", "exec_time": 0.000000652 }
+{ "type": "test", "name": "transform::tests::zero_in_zero_out_and_unzigzag", "event": "ok", "exec_time": 0.000000681 }
+{ "type": "test", "name": "transform::tests::luma_dc_spread", "event": "ok", "exec_time": 0.000001462 }
+{ "type": "suite", "event": "ok", "passed": 82, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.023156566 }
+{ "type": "suite", "event": "started", "test_count": 22 }
+{ "type": "test", "event": "started", "name": "a_frame_num_gap_keeps_decoding" }
+{ "type": "test", "event": "started", "name": "avcc_extradata_and_length_prefixed_packets" }
+{ "type": "test", "event": "started", "name": "b_pictures_match_ffmpeg_every_frame" }
+{ "type": "test", "event": "started", "name": "corrupt_streams_never_panic" }
+{ "type": "test", "name": "avcc_extradata_and_length_prefixed_packets", "event": "ok", "exec_time": 0.635773297 }
+{ "type": "test", "event": "started", "name": "every_quantiser_matches_ffmpeg" }
+{ "type": "test", "name": "a_frame_num_gap_keeps_decoding", "event": "ok", "exec_time": 0.694651237 }
+{ "type": "test", "event": "started", "name": "every_quantiser_with_motion_matches_ffmpeg" }
+{ "type": "test", "name": "b_pictures_match_ffmpeg_every_frame", "event": "ok", "exec_time": 6.453374834 }
+{ "type": "test", "event": "started", "name": "geometry_and_slice_structure_match_ffmpeg" }
+{ "type": "test", "name": "geometry_and_slice_structure_match_ffmpeg", "event": "ok", "exec_time": 9.630590002 }
+{ "type": "test", "event": "started", "name": "geometry_with_motion_matches_ffmpeg" }
+{ "type": "test", "name": "corrupt_streams_never_panic", "event": "ok", "exec_time": 24.240675505 }
+{ "type": "test", "event": "started", "name": "h264_seek_matches_linear_open_gop" }
+{ "type": "test", "name": "h264_seek_matches_linear_open_gop", "event": "ok", "exec_time": 1.016947379 }
+{ "type": "test", "event": "started", "name": "high_profile_8x8_inter_sequences_match_ffmpeg" }
+{ "type": "test", "name": "high_profile_8x8_inter_sequences_match_ffmpeg", "event": "ok", "exec_time": 3.9367652890000002 }
+{ "type": "test", "event": "started", "name": "high_profile_8x8_matches_ffmpeg" }
+{ "type": "test", "name": "geometry_with_motion_matches_ffmpeg", "event": "ok", "exec_time": 13.173656972 }
+{ "type": "test", "event": "started", "name": "jvt_cavlc_first_idr_bit_exact" }
+{ "type": "test", "name": "jvt_cavlc_first_idr_bit_exact", "event": "ok", "exec_time": 14.809947596 }
+{ "type": "test", "event": "started", "name": "jvt_full_sequence_bit_exact" }
+{ "type": "test", "name": "jvt_full_sequence_bit_exact", "event": "ok", "exec_time": 3.239809722 }
+{ "type": "test", "event": "started", "name": "jvt_scaling_matrices_decode_bit_exact" }
+{ "type": "test", "name": "jvt_scaling_matrices_decode_bit_exact", "event": "ok", "exec_time": 1.008119315 }
+{ "type": "test", "event": "started", "name": "ns_per_macroblock_measurement" }
+{ "type": "test", "name": "ns_per_macroblock_measurement", "event": "ok", "exec_time": 2.6526262430000003 }
+{ "type": "test", "event": "started", "name": "output_is_display_order_and_the_reorder_is_real" }
+{ "type": "test", "name": "output_is_display_order_and_the_reorder_is_real", "event": "ok", "exec_time": 0.900532044 }
+{ "type": "test", "event": "started", "name": "p_only_gop_matches_ffmpeg_every_frame" }
+{ "type": "test", "name": "p_only_gop_matches_ffmpeg_every_frame", "event": "ok", "exec_time": 1.813985362 }
+{ "type": "test", "event": "started", "name": "packet_entry_surface_reorders_and_carries_timestamps" }
+{ "type": "test", "name": "packet_entry_surface_reorders_and_carries_timestamps", "event": "ok", "exec_time": 0.909766069 }
+{ "type": "test", "event": "started", "name": "real_library_streams_match_ffmpeg" }
+{ "type": "test", "name": "real_library_streams_match_ffmpeg", "event": "ignored", "message": "sweeps the PERSONAL media library (~/Videos, ~/Downloads, ~/Music) through the gitignored fixtures/real-library-manifest.tsv; MINUTES of wall time (measured past 840 s on the workstation), so workstation only -- budget an hour, it is not wedged. A runner host has no such library, so the test is either a silent green or a red for the wrong reason. Run it on the workstation with --ignored." }
+{ "type": "test", "event": "started", "name": "spatial_direct_over_a_b_reference_matches_ffmpeg" }
+{ "type": "test", "name": "spatial_direct_over_a_b_reference_matches_ffmpeg", "event": "ok", "exec_time": 2.307520028 }
+{ "type": "test", "event": "started", "name": "steady_state_decode_loop_zero_alloc" }
+{ "type": "test", "name": "steady_state_decode_loop_zero_alloc", "event": "ok", "exec_time": 0.172339091 }
+{ "type": "test", "event": "started", "name": "switching_slices_are_refused_by_name" }
+{ "type": "test", "name": "switching_slices_are_refused_by_name", "event": "ok", "exec_time": 0.000237657 }
+{ "type": "test", "event": "timeout", "name": "every_quantiser_matches_ffmpeg" }
+{ "type": "test", "event": "timeout", "name": "every_quantiser_with_motion_matches_ffmpeg" }
+{ "type": "test", "name": "every_quantiser_matches_ffmpeg", "event": "ok", "exec_time": 70.338477226 }
+{ "type": "test", "name": "every_quantiser_with_motion_matches_ffmpeg", "event": "ok", "exec_time": 70.89978459 }
+{ "type": "test", "name": "high_profile_8x8_matches_ffmpeg", "event": "ok", "exec_time": 56.824798167 }
+{ "type": "suite", "event": "ok", "passed": 21, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 86.027663085 }
+{ "type": "suite", "event": "started", "test_count": 16 }
+{ "type": "test", "event": "started", "name": "all_intra_when_the_gop_is_one" }
+{ "type": "test", "event": "started", "name": "balanced_partitions_decode_bit_exactly" }
+{ "type": "test", "event": "started", "name": "bd_psnr_vs_x264" }
+{ "type": "test", "event": "started", "name": "bit_account_vs_x264" }
+{ "type": "test", "name": "all_intra_when_the_gop_is_one", "event": "ok", "exec_time": 0.017305065 }
+{ "type": "test", "event": "started", "name": "eight_by_eight_gains_on_flat_and_text" }
+{ "type": "test", "name": "eight_by_eight_gains_on_flat_and_text", "event": "ok", "exec_time": 1.105068163 }
+{ "type": "test", "event": "started", "name": "ffmpeg_decodes_a_cbr_stream_bit_exactly" }
+{ "type": "test", "name": "bit_account_vs_x264", "event": "ok", "exec_time": 2.753071816 }
+{ "type": "test", "event": "started", "name": "ffmpeg_decodes_bit_exactly" }
+{ "type": "test", "name": "ffmpeg_decodes_a_cbr_stream_bit_exactly", "event": "ok", "exec_time": 1.7772690789999999 }
+{ "type": "test", "event": "started", "name": "pin_loud_cap_child" }
+{ "type": "test", "name": "pin_loud_cap_child", "event": "ok", "exec_time": 0.000003277 }
+{ "type": "test", "event": "started", "name": "pin_loud_reds_on_an_ok_but_short_write" }
+{ "type": "test", "name": "pin_loud_reds_on_an_ok_but_short_write", "event": "ok", "exec_time": 0.00029256 }
+{ "type": "test", "event": "started", "name": "pin_loud_reports_what_landed_under_a_size_cap" }
+{ "type": "test", "name": "pin_loud_reports_what_landed_under_a_size_cap", "event": "ok", "exec_time": 0.019455527 }
+{ "type": "test", "event": "started", "name": "quality_follows_the_quantiser" }
+{ "type": "test", "name": "quality_follows_the_quantiser", "event": "ok", "exec_time": 0.267917622 }
+{ "type": "test", "event": "started", "name": "rate_control_hits_its_target" }
+{ "type": "test", "name": "balanced_partitions_decode_bit_exactly", "event": "ok", "exec_time": 4.437142359 }
+{ "type": "test", "event": "started", "name": "real_clip_t8x8_bd_psnr" }
+{ "type": "test", "name": "real_clip_t8x8_bd_psnr", "event": "ignored", "message": "set EC_H264_CLIP to a media file of yours" }
+{ "type": "test", "event": "started", "name": "real_library_frames_encode_and_decode_exactly" }
+{ "type": "test", "name": "real_library_frames_encode_and_decode_exactly", "event": "failed", "exec_time": 0.407917383, "stdout": "\nthread 'real_library_frames_encode_and_decode_exactly' (3850729) panicked at crates/ec-h264/tests/encode.rs:917:9:\nEC_REQUIRE_FIXTURES=1 but /home/user/lanes/testcut-rest/edith_codecs/crates/ec-h264/../../fixtures/real-library-manifest.tsv lists no H.264 4:2:0 mp4 of at least 720p -- regenerate with: scripts/scan-real-library.sh\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n" }
+{ "type": "test", "event": "started", "name": "reconstruction_matches_the_decoder" }
+{ "type": "test", "name": "rate_control_hits_its_target", "event": "ok", "exec_time": 2.366288285 }
+{ "type": "test", "event": "started", "name": "vaapi_decodes_our_stream" }
+{ "type": "test", "name": "vaapi_decodes_our_stream", "event": "ok", "exec_time": 1.021330607 }
+{ "type": "test", "name": "ffmpeg_decodes_bit_exactly", "event": "ok", "exec_time": 5.148219463 }
+{ "type": "test", "name": "bd_psnr_vs_x264", "event": "ok", "exec_time": 9.025354394 }
+{ "type": "test", "name": "reconstruction_matches_the_decoder", "event": "ok", "exec_time": 9.92713137 }
+{ "type": "suite", "event": "failed", "passed": 14, "failed": 1, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 14.784275925 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "avcc_coefficient_scaling_does_not_overflow" }
+{ "type": "test", "event": "started", "name": "pps_parameter_arithmetic_does_not_overflow" }
+{ "type": "test", "event": "started", "name": "sps_crop_offset_overflow_is_refused" }
+{ "type": "test", "event": "started", "name": "sps_height_arithmetic_does_not_overflow" }
+{ "type": "test", "name": "sps_crop_offset_overflow_is_refused", "event": "ok", "exec_time": 0.000006984 }
+{ "type": "test", "name": "pps_parameter_arithmetic_does_not_overflow", "event": "ok", "exec_time": 0.001202461 }
+{ "type": "test", "name": "sps_height_arithmetic_does_not_overflow", "event": "ok", "exec_time": 0.001762654 }
+{ "type": "test", "name": "avcc_coefficient_scaling_does_not_overflow", "event": "ok", "exec_time": 0.002419818 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.002695456 }
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "committed_streams_match_ffmpeg_md5" }
+{ "type": "test", "event": "started", "name": "inter_cavlc_and_cabac" }
+{ "type": "test", "event": "started", "name": "intra_cavlc_and_cabac" }
+{ "type": "test", "event": "started", "name": "larger_pictures" }
+{ "type": "test", "name": "committed_streams_match_ffmpeg_md5", "event": "ok", "exec_time": 0.016381299 }
+{ "type": "test", "event": "started", "name": "registry_decoder_emits_i010" }
+{ "type": "test", "name": "registry_decoder_emits_i010", "event": "ok", "exec_time": 0.003175358 }
+{ "type": "test", "name": "larger_pictures", "event": "ok", "exec_time": 2.00645202 }
+{ "type": "test", "name": "intra_cavlc_and_cabac", "event": "ok", "exec_time": 4.972627607 }
+{ "type": "test", "name": "inter_cavlc_and_cabac", "event": "ok", "exec_time": 6.045023152 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 6.04552287 }
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "hi422_pcm_macroblocks_round_trip" }
+{ "type": "test", "event": "started", "name": "x264_hi422_hd" }
+{ "type": "test", "event": "started", "name": "x264_hi422_mbaff" }
+{ "type": "test", "event": "started", "name": "x264_hi422_progressive_10bit" }
+{ "type": "test", "name": "x264_hi422_hd", "event": "ok", "exec_time": 0.000002044 }
+{ "type": "test", "event": "started", "name": "x264_hi422_progressive_8bit" }
+{ "type": "test", "name": "hi422_pcm_macroblocks_round_trip", "event": "ok", "exec_time": 0.003726974 }
+{ "type": "test", "name": "x264_hi422_mbaff", "event": "ok", "exec_time": 13.715951673 }
+{ "type": "test", "name": "x264_hi422_progressive_8bit", "event": "ok", "exec_time": 14.105964374 }
+{ "type": "test", "name": "x264_hi422_progressive_10bit", "event": "ok", "exec_time": 14.363032827 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 14.363917028 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "jvt_hi422_vectors_bit_exact" }
+{ "type": "test", "name": "jvt_hi422_vectors_bit_exact", "event": "ok", "exec_time": 9.597239637 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 9.606960895 }
+{ "type": "suite", "event": "started", "test_count": 11 }
+{ "type": "test", "event": "started", "name": "x264_hi444_10bit" }
+{ "type": "test", "event": "started", "name": "x264_hi444_8bit" }
+{ "type": "test", "event": "started", "name": "x264_hi444_hd" }
+{ "type": "test", "event": "started", "name": "x264_hi444_mbaff" }
+{ "type": "test", "name": "x264_hi444_hd", "event": "ok", "exec_time": 0.000003427 }
+{ "type": "test", "event": "started", "name": "x264_lossless_420_422" }
+{ "type": "test", "name": "x264_lossless_420_422", "event": "ok", "exec_time": 13.720358275 }
+{ "type": "test", "event": "started", "name": "x264_lossless_444_10bit" }
+{ "type": "test", "name": "x264_hi444_mbaff", "event": "ok", "exec_time": 18.24876186 }
+{ "type": "test", "event": "started", "name": "x264_lossless_444_8bit" }
+{ "type": "test", "name": "x264_hi444_8bit", "event": "ok", "exec_time": 23.011501004 }
+{ "type": "test", "event": "started", "name": "x264_lossless_mbaff" }
+{ "type": "test", "name": "x264_hi444_10bit", "event": "ok", "exec_time": 24.176617892 }
+{ "type": "test", "event": "started", "name": "x264_monochrome_10bit" }
+{ "type": "test", "name": "x264_lossless_444_10bit", "event": "ok", "exec_time": 10.758583119 }
+{ "type": "test", "event": "started", "name": "x264_monochrome_8bit" }
+{ "type": "test", "name": "x264_lossless_mbaff", "event": "ok", "exec_time": 3.045896666 }
+{ "type": "test", "event": "started", "name": "x264_monochrome_mbaff_and_lossless" }
+{ "type": "test", "name": "x264_lossless_444_8bit", "event": "ok", "exec_time": 9.993890347 }
+{ "type": "test", "name": "x264_monochrome_mbaff_and_lossless", "event": "ok", "exec_time": 5.596149109 }
+{ "type": "test", "name": "x264_monochrome_10bit", "event": "ok", "exec_time": 9.157459084 }
+{ "type": "test", "name": "x264_monochrome_8bit", "event": "ok", "exec_time": 14.590241927 }
+{ "type": "suite", "event": "ok", "passed": 11, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 39.07655196 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "jvt_hi444_vectors_bit_exact" }
+{ "type": "test", "event": "timeout", "name": "jvt_hi444_vectors_bit_exact" }
+{ "type": "test", "name": "jvt_hi444_vectors_bit_exact", "event": "ok", "exec_time": 464.602818006 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 464.611979687 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "jvt_frext_field_vectors_bit_exact" }
+{ "type": "test", "event": "started", "name": "jvt_mbaff_vectors_bit_exact" }
+{ "type": "test", "event": "started", "name": "jvt_paff_vectors_bit_exact" }
+{ "type": "test", "name": "jvt_frext_field_vectors_bit_exact", "event": "ok", "exec_time": 0.0282574 }
+{ "type": "test", "name": "jvt_paff_vectors_bit_exact", "event": "ok", "exec_time": 1.9194809350000002 }
+{ "type": "test", "name": "jvt_mbaff_vectors_bit_exact", "event": "ok", "exec_time": 5.521841894 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 5.52595726 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "x264_mbaff_hd" }
+{ "type": "test", "event": "started", "name": "x264_mbaff_high10" }
+{ "type": "test", "event": "started", "name": "x264_mbaff_sd" }
+{ "type": "test", "event": "started", "name": "x264_mbaff_small" }
+{ "type": "test", "name": "x264_mbaff_hd", "event": "ok", "exec_time": 0.000003697 }
+{ "type": "test", "name": "x264_mbaff_high10", "event": "ok", "exec_time": 1.858480535 }
+{ "type": "test", "name": "x264_mbaff_sd", "event": "ok", "exec_time": 3.167072284 }
+{ "type": "test", "name": "x264_mbaff_small", "event": "ok", "exec_time": 9.48857747 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 9.489059045 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "truncated_and_corrupted_conformance_streams_never_panic" }
+{ "type": "test", "name": "truncated_and_corrupted_conformance_streams_never_panic", "event": "ok", "exec_time": 20.876272625 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 20.877009952 }
+{ "type": "suite", "event": "started", "test_count": 9 }
+{ "type": "test", "event": "started", "name": "arbitrary_slice_order_decodes" }
+{ "type": "test", "event": "started", "name": "bit_depth_above_ten_is_refused_by_name" }
+{ "type": "test", "event": "started", "name": "data_partitioning_is_refused_by_name" }
+{ "type": "test", "event": "started", "name": "different_luma_and_chroma_bit_depth_is_refused_by_name" }
+{ "type": "test", "name": "bit_depth_above_ten_is_refused_by_name", "event": "ok", "exec_time": 0.000880545 }
+{ "type": "test", "event": "started", "name": "fmo_dispersed_map_decodes" }
+{ "type": "test", "name": "different_luma_and_chroma_bit_depth_is_refused_by_name", "event": "ok", "exec_time": 0.000642067 }
+{ "type": "test", "event": "started", "name": "fmo_with_interlaced_coding_is_refused_by_name" }
+{ "type": "test", "name": "fmo_dispersed_map_decodes", "event": "ok", "exec_time": 0.000987647 }
+{ "type": "test", "event": "started", "name": "jvt_refused_vectors_refuse_for_their_feature" }
+{ "type": "test", "name": "jvt_refused_vectors_refuse_for_their_feature", "event": "ok", "exec_time": 0.000017433 }
+{ "type": "test", "event": "started", "name": "si_slices_are_refused_by_name" }
+{ "type": "test", "name": "data_partitioning_is_refused_by_name", "event": "ok", "exec_time": 0.000501001 }
+{ "type": "test", "event": "started", "name": "sp_slices_are_refused_by_name" }
+{ "type": "test", "name": "fmo_with_interlaced_coding_is_refused_by_name", "event": "ok", "exec_time": 0.00090448 }
+{ "type": "test", "name": "arbitrary_slice_order_decodes", "event": "ok", "exec_time": 0.002944715 }
+{ "type": "test", "name": "si_slices_are_refused_by_name", "event": "ok", "exec_time": 0.000878881 }
+{ "type": "test", "name": "sp_slices_are_refused_by_name", "event": "ok", "exec_time": 0.000825311 }
+{ "type": "suite", "event": "ok", "passed": 9, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.004978669 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "crates/ec-h264/src/lib.rs - (line 22)" }
+{ "type": "test", "name": "crates/ec-h264/src/lib.rs - (line 22)", "event": "ok", "exec_time": 0.000000521 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000227047 }
+{ "type": "report", "total_time": 0.278175327, "compilation_time": 0.213635922 }

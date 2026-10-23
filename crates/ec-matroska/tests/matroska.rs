@@ -187,21 +187,48 @@ fn derived_fixtures() -> Vec<PathBuf> {
     ];
     let mut made = Vec::new();
     for (path, args) in jobs {
-        if !path.exists() {
-            let ok = Command::new("ffmpeg")
-                .args(["-v", "error", "-y"])
-                .args(&args)
-                .arg(path)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !ok {
-                continue;
-            }
+        if make_derived(path, &args) {
+            made.push(path.clone());
         }
-        made.push(path.clone());
     }
     made
+}
+
+/// Makes `dst` with ffmpeg `args` (the input and codec options, without the
+/// output path), at most once, race-free. Test threads and other test processes
+/// that want the same file queue on an exclusive lock beside it; ffmpeg writes a
+/// unique temp file in the same directory (same extension, so the muxer is
+/// still inferred), and only a finished file is renamed into place, so no
+/// reader ever opens a partly written fixture. `false` means ffmpeg failed and
+/// nothing is left at `dst`.
+fn make_derived(dst: &Path, args: &[&str]) -> bool {
+    let name = dst
+        .file_name()
+        .expect("fixture file name")
+        .to_string_lossy()
+        .into_owned();
+    let Ok(lock) = File::create(dst.with_file_name(format!("{name}.lock"))) else {
+        return false;
+    };
+    if lock.lock().is_err() {
+        return false;
+    }
+    if dst.exists() {
+        return true;
+    }
+    let tmp = dst.with_file_name(format!("tmp-{}-{name}", std::process::id()));
+    let ok = Command::new("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(args)
+        .arg(&tmp)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok && std::fs::rename(&tmp, dst).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    false
 }
 
 /// The fields a remux must not change, as ffprobe reads them back.
@@ -1133,7 +1160,10 @@ fn open_any(path: &Path) -> Box<dyn Demuxer> {
 /// The first stream of `codec`'s extradata plus its packets, `(pts, data)`,
 /// in the order the container's own demuxer hands them back — capped so a
 /// multi-gigabyte recording does not have to be decoded whole.
-fn audio_track(path: &Path, codec: CodecId) -> Option<(Option<Vec<u8>>, u32, Vec<(i64, Vec<u8>)>)> {
+/// The track's CodecPrivate, sample rate, and its (timestamp, payload) packets.
+type AudioTrack = (Option<Vec<u8>>, u32, Vec<(i64, Vec<u8>)>);
+
+fn audio_track(path: &Path, codec: CodecId) -> Option<AudioTrack> {
     let mut d = open_any(path);
     let s = d.streams().iter().find(|s| s.params.codec == codec)?;
     let idx = s.index;
@@ -1193,8 +1223,10 @@ fn decode_ac3(pkts: &[(i64, Vec<u8>)]) -> Vec<Vec<f32>> {
             planes = vec![Vec::new(); ch];
         }
         let samples: Vec<f32> = frame.data[0]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         for (i, v) in samples.iter().enumerate() {
             planes[i % ch].push(*v);
@@ -1235,8 +1267,10 @@ fn ffmpeg_decode_planar(path: &Path, channels: usize) -> Vec<Vec<f32>> {
     );
     let samples: Vec<f32> = out
         .stdout
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     let mut planes = vec![Vec::with_capacity(samples.len() / channels.max(1)); channels];
     for (i, v) in samples.iter().enumerate() {
@@ -1431,4 +1465,95 @@ fn mkv_51_channel_order() {
         }
     }
     assert!(any, "no 5.1 mkv fixtures present");
+}
+
+/// An EBML element with its size written in eight bytes.
+fn ebml_el(id: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut out = id.to_vec();
+    out.push(0x01);
+    out.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+    out.extend_from_slice(body);
+    out
+}
+
+/// An EBML element whose size was never written: the all-ones size a live
+/// recorder leaves on the Segment and on each Cluster while it is still open.
+fn ebml_unknown(id: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut out = id.to_vec();
+    out.extend_from_slice(&[0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    out.extend_from_slice(body);
+    out
+}
+
+/// A WebM whose first Cluster has no stated length and holds more than the
+/// eight-megabyte window the demuxer reads an unknown-length cluster in, as a
+/// live recording does: every block of it must come out, and the Cluster after
+/// it too. The first Cluster's blocks are 150 x 64 KiB, about 9.4 MiB.
+#[test]
+fn an_unknown_length_cluster_larger_than_its_read_window_loses_no_blocks() {
+    const BLOCKS: usize = 150;
+    const PAYLOAD: usize = 64 << 10;
+    let block = |payload: &[u8]| {
+        let mut body = vec![0x81, 0x00, 0x00, 0x80];
+        body.extend_from_slice(payload);
+        ebml_el(&[0xA3], &body)
+    };
+    let header = ebml_el(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_el(&[0x42, 0x82], b"webm"));
+    let info = ebml_el(
+        &[0x15, 0x49, 0xA9, 0x66],
+        &ebml_el(&[0x2A, 0xD7, 0xB1], &[0x0F, 0x42, 0x40]),
+    );
+    let video = [
+        ebml_el(&[0xB0], &[0x01, 0x40]),
+        ebml_el(&[0xBA], &[0x00, 0xF0]),
+    ]
+    .concat();
+    let track = ebml_el(
+        &[0xAE],
+        &[
+            ebml_el(&[0xD7], &[1]),
+            ebml_el(&[0x83], &[1]),
+            ebml_el(&[0x86], b"V_VP8"),
+            ebml_el(&[0xE0], &video),
+        ]
+        .concat(),
+    );
+    let tracks = ebml_el(&[0x16, 0x54, 0xAE, 0x6B], &track);
+    let mut open = ebml_el(&[0xE7], &[0]);
+    for _ in 0..BLOCKS {
+        open.extend(block(&vec![0x5A; PAYLOAD]));
+    }
+    let closed = [ebml_el(&[0xE7], &[BLOCKS as u8]), block(&[1, 2, 3])].concat();
+    let segment = ebml_unknown(
+        &[0x18, 0x53, 0x80, 0x67],
+        &[
+            info,
+            tracks,
+            ebml_unknown(&[0x1F, 0x43, 0xB6, 0x75], &open),
+            ebml_el(&[0x1F, 0x43, 0xB6, 0x75], &closed),
+        ]
+        .concat(),
+    );
+    let file = [header, segment].concat();
+
+    let mut demuxer = MatroskaDemuxer::new(Cursor::new(file)).expect("demuxes");
+    let mut packets = Vec::new();
+    loop {
+        match demuxer.next_packet() {
+            Ok(p) => packets.push(p),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("packet read failed: {e}"),
+        }
+    }
+    assert_eq!(
+        packets.len(),
+        BLOCKS + 1,
+        "every block of both clusters comes out"
+    );
+    assert!(packets[..BLOCKS].iter().all(|p| p.data.len() == PAYLOAD));
+    assert_eq!(
+        &packets[BLOCKS].data[..],
+        &[1, 2, 3][..],
+        "the Cluster after the open one"
+    );
 }

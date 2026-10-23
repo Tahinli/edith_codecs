@@ -383,6 +383,9 @@ pub(crate) struct LfGrids {
     /// masks. Keyframes never set it (`is_inter_block` is false); `false` is
     /// the correct value there.
     pub skip_inter: Vec<bool>,
+    /// Per-8x8 segment id as read (intra frames store it as the next frame's
+    /// `last_frame_seg_map`).
+    pub seg: Vec<u8>,
     pub mi_cols: usize,
     pub mi_rows: usize,
 }
@@ -554,7 +557,7 @@ impl LfGrids {
         above[TX_4X4] &= !LUMA_ABOVE_BORDER;
         if sbr + 8 > self.mi_rows {
             let rows = self.mi_rows - sbr;
-            let mask_y = ((1u64 << (rows * 8)) as u64).wrapping_sub(1);
+            let mask_y = (1u64 << (rows * 8)).wrapping_sub(1);
             for i in 0..3 {
                 left[i] &= mask_y;
                 above[i] &= mask_y;
@@ -563,7 +566,7 @@ impl LfGrids {
         }
         if sbc + 8 > self.mi_cols {
             let columns = self.mi_cols - sbc;
-            let mask_y = ((1u64 << columns) as u64)
+            let mask_y = (1u64 << columns)
                 .wrapping_sub(1)
                 .wrapping_mul(0x0101010101010101);
             for i in 0..3 {
@@ -635,8 +638,8 @@ impl LfGrids {
         // Luma masks, ported from vp9_setup_mask/build_masks and
         // vp9_adjust_mask (bit i = MI row i>>3, MI col i&7; each bit
         // covers an 8x8 cell). Edges are emitted from the masks.
-        let sb_rows = (self.mi_rows + 7) / 8;
-        let sb_cols = (self.mi_cols + 7) / 8;
+        let sb_rows = self.mi_rows.div_ceil(8);
+        let sb_cols = self.mi_cols.div_ceil(8);
         for sbr_i in 0..sb_rows {
             let sbr = sbr_i * 8;
             for sbc_i in 0..sb_cols {
@@ -778,8 +781,8 @@ impl LfGrids {
         // by vp9_adjust_mask; edges are emitted from the masks. Mask bit i
         // covers row group i>>2 (8 chroma rows) and column group i&3
         // (8 chroma px).
-        let sb_rows = (self.mi_rows + 7) / 8;
-        let sb_cols = (self.mi_cols + 7) / 8;
+        let sb_rows = self.mi_rows.div_ceil(8);
+        let sb_cols = self.mi_cols.div_ceil(8);
         for sbr_i in 0..sb_rows {
             let sbr = sbr_i * 8;
             for sbc_i in 0..sb_cols {
@@ -1024,8 +1027,8 @@ impl LfGrids {
         let row_step = 1usize << ss_y;
         let col_step = 1usize << ss_x;
         let groups = 8usize >> ss_x;
-        let sb_rows = (self.mi_rows + 7) / 8;
-        let sb_cols = (self.mi_cols + 7) / 8;
+        let sb_rows = self.mi_rows.div_ceil(8);
+        let sb_cols = self.mi_cols.div_ceil(8);
         for sbr_i in 0..sb_rows {
             let sbr = sbr_i * 8;
             for sbc_i in 0..sb_cols {
@@ -1268,22 +1271,26 @@ impl LfGrids {
         sharpness: u8,
         bd: u8,
     ) {
-        self.filter_ss00_plane(y, stride, y_w, y_h, sharpness, bd, true);
-        if ss_x == 0 && ss_y == 0 {
-            for data in [&mut *u, &mut *v] {
-                self.filter_ss00_plane(data, uv_stride, uv_w, uv_h, sharpness, bd, false);
+        // The three planes are filtered from the same read-only grids and touch
+        // disjoint buffers, so they run concurrently: luma on one thread, both
+        // chroma planes on another. Each plane's edge order is unchanged, so the
+        // output is identical to the serial order.
+        let chroma = |data_u: &mut [Sample], data_v: &mut [Sample]| {
+            if ss_x == 0 && ss_y == 0 {
+                self.filter_ss00_plane(data_u, uv_stride, uv_w, uv_h, sharpness, bd, false);
+                self.filter_ss00_plane(data_v, uv_stride, uv_w, uv_h, sharpness, bd, false);
+            } else if ss_x == 1 && ss_y == 1 {
+                self.filter_ss11_plane(data_u, uv_stride, uv_h, sharpness, bd);
+                self.filter_ss11_plane(data_v, uv_stride, uv_h, sharpness, bd);
+            } else {
+                self.filter_non420_plane(data_u, uv_stride, uv_w, uv_h, ss_x, ss_y, sharpness, bd);
+                self.filter_non420_plane(data_v, uv_stride, uv_w, uv_h, ss_x, ss_y, sharpness, bd);
             }
-            return;
-        }
-        if ss_x == 1 && ss_y == 1 {
-            for data in [&mut *u, &mut *v] {
-                self.filter_ss11_plane(data, uv_stride, uv_h, sharpness, bd);
-            }
-            return;
-        }
-        for data in [&mut *u, &mut *v] {
-            self.filter_non420_plane(data, uv_stride, uv_w, uv_h, ss_x, ss_y, sharpness, bd);
-        }
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| chroma(u, v));
+            self.filter_ss00_plane(y, stride, y_w, y_h, sharpness, bd, true);
+        });
     }
 }
 
@@ -1301,6 +1308,7 @@ mod tests {
             otx: vec![TX_4X4 as u8; mi_cols * mi_rows],
             // Keyframe-shaped fixture: no inter block, so no skip promotion.
             skip_inter: vec![false; mi_cols * mi_rows],
+            seg: vec![0; mi_cols * mi_rows],
             mi_cols,
             mi_rows,
         }

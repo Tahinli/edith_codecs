@@ -80,7 +80,7 @@ static TOOL_SIDEINFO_LOG: std::sync::OnceLock<std::sync::Mutex<Vec<ToolSideInfoR
 static TOOL_SIDEINFO_AU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn tool_sideinfo_enabled() -> bool {
-    std::env::var("EC_AAC_TOOL_SIDEINFO_DEBUG").is_ok()
+    crate::knobs::tool_sideinfo_debug()
 }
 
 fn log_tool_sideinfo(row: ToolSideInfoRow) {
@@ -500,8 +500,28 @@ pub struct BlockDecoder {
     noise: Noise,
     sf_index: u8,
     sbr: Option<crate::sbr_chain::SbrChain>,
+    /// Core rate an implicit SBR payload may double (ISO/IEC 14496-3 1.6.5.2),
+    /// or `None` when implicit SBR is off: no core rate known yet, the stream's
+    /// config already signals SBR (`sbr` is set), or the core is above 24 kHz.
+    implicit_core: Option<u32>,
+    /// Set once an SBR extension payload has armed `sbr` with no explicit signalling.
+    implicit_on: bool,
+    /// Set by `disable_implicit_sbr`: implicit SBR never arms, whatever the headers say.
+    implicit_off: bool,
+    /// Set once a PS extension has been decoded in a stream whose SBR was
+    /// switched on implicitly (see `implicit_on`).
+    implicit_ps: bool,
     pns_aus: usize,
+    /// The elements of the last program_config_element seen in the stream, if any.
+    pce: Option<Vec<crate::config::PceElement>>,
+    /// Speaker of each channel of the last raw_data_block, in bitstream order, when every
+    /// element of the block is named by its PCE. `None` keeps the bitstream order.
+    plane_speakers: Option<Vec<crate::config::Speaker>>,
 }
+
+/// Highest core rate at which an implicit SBR payload doubles the output (so the
+/// doubled rate stays at or below 48 kHz). ffmpeg makes the same cut.
+const IMPLICIT_SBR_MAX_CORE_RATE: u32 = 24_000;
 
 impl BlockDecoder {
     pub fn new(sf_index: u8) -> BlockDecoder {
@@ -512,8 +532,41 @@ impl BlockDecoder {
             noise: Noise(0x1f2e_3d4c),
             sf_index,
             sbr: None,
+            implicit_core: None,
+            implicit_on: false,
+            implicit_off: false,
+            implicit_ps: false,
             pns_aus: 0,
+            pce: None,
+            plane_speakers: None,
         }
+    }
+
+    /// The output order of the last block's planes, as the plane index each output
+    /// channel takes, in FFmpeg's channel-mask order. `None` when no PCE named them.
+    pub fn plane_order(&self, channels: usize) -> Option<Vec<usize>> {
+        let speakers = self.plane_speakers.as_ref()?;
+        if speakers.len() != channels {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..channels).collect();
+        order.sort_by_key(|&i| (speakers[i], i));
+        Some(order)
+    }
+
+    /// Sets the program config element a config carries, for raw blocks that omit it.
+    pub fn set_pce(&mut self, pce: Vec<crate::config::PceElement>) {
+        self.pce = (!pce.is_empty()).then_some(pce);
+    }
+
+    /// The speakers of the channels one element of kind `kind` (`0` SCE, `1` CPE, `3` LFE)
+    /// and instance `tag` carries, per the last PCE. `None` when no PCE names it.
+    fn pce_speakers(&self, kind: u8, tag: u8) -> Option<&[crate::config::Speaker]> {
+        self.pce
+            .as_ref()?
+            .iter()
+            .find(|e| e.kind == kind && e.tag == tag && !e.speakers.is_empty())
+            .map(|e| e.speakers.as_slice())
     }
 
     pub fn pns_aus(&self) -> usize {
@@ -527,6 +580,41 @@ impl BlockDecoder {
     /// given extension (doubled) sample rate.
     pub fn set_sbr_rate(&mut self, rate: Option<u32>) {
         self.sbr = rate.map(crate::sbr_chain::SbrChain::new);
+    }
+
+    /// Marks Parametric Stereo as signalled by the config, for the SBR chain
+    /// (if one is armed): its elements then decode to two channels.
+    pub fn set_sbr_ps(&mut self, on: bool) {
+        if let Some(sbr) = self.sbr.as_mut() {
+            sbr.set_ps_config(on);
+        }
+    }
+
+    /// Arms implicit SBR for a stream whose config does not signal it, at the
+    /// given core rate. Above 24 kHz (or once SBR is already set) it is a no-op:
+    /// an SBR payload there is skipped, and the output stays at the core rate.
+    pub fn set_implicit_core(&mut self, core_rate: u32) {
+        if self.sbr.is_none() && !self.implicit_off {
+            self.implicit_core = (core_rate <= IMPLICIT_SBR_MAX_CORE_RATE).then_some(core_rate);
+        }
+    }
+
+    /// Keeps implicit SBR off for good: an SBR payload is skipped and the output
+    /// stays at the core rate. For core-only decoding of a stream that carries SBR.
+    pub fn disable_implicit_sbr(&mut self) {
+        self.implicit_off = true;
+        self.implicit_core = None;
+    }
+
+    /// Whether SBR was switched on by an implicit payload, not by the config.
+    pub fn implicit_sbr(&self) -> bool {
+        self.implicit_on
+    }
+
+    /// Whether a Parametric Stereo extension was decoded in a stream whose SBR
+    /// is implicit (see [`BlockDecoder::implicit_sbr`]).
+    pub fn implicit_ps(&self) -> bool {
+        self.implicit_ps
     }
 
     fn section_data(&self, r: &mut BitReader<'_>, ics: &IcsInfo) -> Result<Vec<Vec<u8>>> {
@@ -758,6 +846,9 @@ impl BlockDecoder {
             0
         };
         let mut pns = false;
+        // Speaker per plane so far; `named` drops to false at the first element a PCE does not name.
+        let mut speakers: Vec<crate::config::Speaker> = Vec::new();
+        let mut named = self.pce.is_some();
         loop {
             if r.bits_remaining() < 3 {
                 break;
@@ -776,6 +867,10 @@ impl BlockDecoder {
                         log_tool_sideinfo(tool_row(au, tag, false, &ch[0], None));
                     }
                     self.finish(&mut ch, None, &mut out);
+                    if let (3, Some(sbr), Some(plane)) = (id, self.sbr.as_mut(), out.get_mut(start)) {
+                        sbr.bypass_plane(tag, plane);
+                    }
+                    named &= self.note_speakers(id, tag, 1, &mut speakers);
                     // §4.6.18.1: SBR is never applied to the LFE channel (no
                     // FIL/SBR payload follows it), so it must not become a
                     // pending SBR target -- otherwise a later fallback
@@ -822,6 +917,7 @@ impl BlockDecoder {
                         log_tool_sideinfo(tool_row(au, tag, true, &pair[0], Some(&mask)));
                     }
                     self.finish(&mut pair, Some(&mask), &mut out);
+                    named &= self.note_speakers(1, tag, 2, &mut speakers);
                     pending = Some((tag, start, 2, true));
                 }
                 2 => return Err(Error::unsupported("aac", "coupling channel element")),
@@ -839,22 +935,41 @@ impl BlockDecoder {
                     pending = None;
                 }
                 5 => {
-                    crate::config::skip_program_config(r)?;
+                    let pce = crate::config::parse_program_config(r)?;
+                    self.pce = Some(pce.elements);
+                    named = self.pce.is_some();
+                    speakers.clear();
                     pending = None;
                 }
                 6 => {
                     let mut count = r.read_bits(4)? as u64;
                     if count == 15 {
-                        count += r.read_bits(8)? as u64 - 1;
+                        // 15 + esc - 1, written so an escape of 0 cannot underflow.
+                        count = 14 + r.read_bits(8)? as u64;
                     }
                     let end_bit = r.bit_position() + count * 8;
+                    // Implicit SBR: no SBR in the config, but this FIL is the first
+                    // to carry an SBR extension right after an element. Arm the
+                    // chain for it; if its payload does not parse, disarm again.
+                    let arming = match self.implicit_core {
+                        Some(core)
+                            if self.sbr.is_none()
+                                && pending.is_some()
+                                && r.bits_remaining() >= 4
+                                && matches!(r.peek_bits(4)?, 13 | 14) =>
+                        {
+                            self.sbr = Some(crate::sbr_chain::SbrChain::new(core * 2));
+                            true
+                        }
+                        _ => false,
+                    };
+                    let mut applied = false;
                     if let (Some(sbr), Some((tag, start, n, is_cpe))) =
                         (self.sbr.as_mut(), pending.take())
                     {
                         // extension_payload(): bs_extension_type(4), then
                         // (for SBR) an optional 10-bit CRC, then
                         // sbr_extension_data() itself.
-                        let mut applied = false;
                         if r.bits_remaining() >= 4 {
                             let ext_type = r.peek_bits(4)?;
                             if ext_type == 13 || ext_type == 14 {
@@ -863,7 +978,10 @@ impl BlockDecoder {
                                     r.skip_bits(10)?; // bs_sbr_crc_bits
                                 }
                                 if let Some(data) = sbr.parse(r, tag, is_cpe) {
-                                    sbr.apply(tag, is_cpe, &data, &mut out[start..start + n]);
+                                    if data.ps.is_some() && (arming || self.implicit_on) {
+                                        self.implicit_ps = true;
+                                    }
+                                    sbr.apply_planes(tag, is_cpe, &data, &mut out, start, n)?;
                                     applied = true;
                                 }
                             }
@@ -874,7 +992,16 @@ impl BlockDecoder {
                             // SBR, or a parse failure): §4.6.18 still
                             // requires doubled-rate reconstruction, using
                             // the last successfully parsed frame's data.
-                            sbr.apply_last(tag, is_cpe, &mut out[start..start + n]);
+                            sbr.apply_last_planes(tag, is_cpe, &mut out, start, n)?;
+                        }
+                    }
+                    if arming {
+                        if applied {
+                            self.implicit_on = true;
+                            self.implicit_core = None;
+                        } else {
+                            // The payload did not parse: this was not SBR after all.
+                            self.sbr = None;
                         }
                     }
                     // Resync to the FIL's declared byte boundary regardless
@@ -895,7 +1022,7 @@ impl BlockDecoder {
                     // the last known SBR data the same way.
                     if let (Some(sbr), Some((tag, start, n, is_cpe))) = (self.sbr.as_mut(), pending)
                     {
-                        sbr.apply_last(tag, is_cpe, &mut out[start..start + n]);
+                        sbr.apply_last_planes(tag, is_cpe, &mut out, start, n)?;
                     }
                     break;
                 }
@@ -904,8 +1031,32 @@ impl BlockDecoder {
         if pns {
             self.pns_aus += 1;
         }
+        self.plane_speakers = (named && speakers.len() == out.len()).then_some(speakers);
         r.align_to_byte();
         Ok(out)
+    }
+
+    /// Records the speakers of `count` planes that element `(id, tag)` adds. Returns whether
+    /// the PCE named them, which keeps the block's ordering known.
+    fn note_speakers(
+        &self,
+        id: u32,
+        tag: u8,
+        count: usize,
+        speakers: &mut Vec<crate::config::Speaker>,
+    ) -> bool {
+        let kind = match id {
+            0 => 0,
+            1 => 1,
+            _ => 3,
+        };
+        match self.pce_speakers(kind, tag) {
+            Some(named) if named.len() == count => {
+                speakers.extend_from_slice(named);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1042,7 +1193,7 @@ fn apply_ms(left: &mut Ics, right: &mut Ics, mask: &MsMask) {
 fn has_pns(ch: &Ics) -> bool {
     ch.cb
         .iter()
-        .any(|group| group.iter().any(|&codebook| codebook == NOISE_HCB))
+        .any(|group| group.contains(&NOISE_HCB))
 }
 
 fn tool_row(au: usize, tag: u8, is_cpe: bool, ch: &Ics, mask: Option<&MsMask>) -> ToolSideInfoRow {

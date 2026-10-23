@@ -1,0 +1,14 @@
+   Compiling ec-mp4 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-mp4)
+    Finished `release` profile [optimized] target(s) in 13.03s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_mp4-45adecf35ff790a4)
+     Running tests/chapters.rs (/home/user/.cache/tgt-testcut-rest/release/deps/chapters-9c27483b8978440f)
+     Running tests/dts.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dts-c0ff5fc827fa39aa)
+     Running tests/edit_trim.rs (/home/user/.cache/tgt-testcut-rest/release/deps/edit_trim-7e20be0a3c41a14e)
+     Running tests/edith_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/edith_parity-f4e7dc0875acf49d)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-2778ac9809c2cff6)
+     Running tests/mp4.rs (/home/user/.cache/tgt-testcut-rest/release/deps/mp4-956cd779255522c3)
+     Running tests/mux_entries.rs (/home/user/.cache/tgt-testcut-rest/release/deps/mux_entries-012b50f57a691ad8)
+     Running tests/prores_entries.rs (/home/user/.cache/tgt-testcut-rest/release/deps/prores_entries-903f628b94c88d74)
+     Running tests/qt_pcm_hdr.rs (/home/user/.cache/tgt-testcut-rest/release/deps/qt_pcm_hdr-0b3a3feb5299e834)
+     Running tests/rotation.rs (/home/user/.cache/tgt-testcut-rest/release/deps/rotation-45dabe01e45c5c0c)
+   Doc-tests ec_mp4

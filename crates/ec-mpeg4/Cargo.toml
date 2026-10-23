@@ -1,0 +1,15 @@
+[package]
+name = "ec-mpeg4"
+description = "MPEG-4 Part 2 Visual software decoder (ISO/IEC 14496-2 Simple and Advanced Simple Profile, H.263 baseline): I/P/B-VOPs, qpel, 4MV, GMC, interlace, data partitioning, packed B-frames."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+
+[dev-dependencies]
+ec-mp4 = { workspace = true }
+ec-riff = { workspace = true }
+ec-matroska = { workspace = true }

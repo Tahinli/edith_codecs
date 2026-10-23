@@ -1,0 +1,7 @@
+   Compiling ec-dts v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dts)
+    Finished `release` profile [optimized] target(s) in 4.06s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_dts-c8470a4a3545fb1f)
+     Running tests/fate_vectors.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fate_vectors-bfcafcf95cbfe8a2)
+     Running tests/ffmpeg_exact.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_exact-4c7e0083abd09bed)
+     Running tests/spec_tables.rs (/home/user/.cache/tgt-testcut-rest/release/deps/spec_tables-43da4d47dd731766)
+   Doc-tests ec_dts

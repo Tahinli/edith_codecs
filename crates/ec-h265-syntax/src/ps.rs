@@ -7,6 +7,7 @@
 //! not model (scaling lists, HRD, the multilayer and 3D extensions) is a thing
 //! no consumer in this family reads, and each such skip says so where it happens.
 
+use crate::scaling::ScalingList;
 use crate::vui::VuiParameters;
 use ec_core::bitio::{BitReader, BitWriter};
 use ec_core::error::{Error, Result};
@@ -56,6 +57,17 @@ impl ProfileTierLevel {
             frame_only_constraint: true,
             constraint_bits: 0,
             level_idc,
+        }
+    }
+
+    /// Main 10 profile at `level_idc`: 10-bit 4:2:0 with the same flags as
+    /// [`ProfileTierLevel::main`]. Main 10 decoders also decode Main, so both
+    /// compatibility bits are set.
+    pub fn main10(level_idc: u8) -> ProfileTierLevel {
+        ProfileTierLevel {
+            profile_idc: 2,
+            profile_compatibility: (1 << 1) | (1 << 2),
+            ..ProfileTierLevel::main(level_idc)
         }
     }
 
@@ -208,6 +220,13 @@ impl Vps {
         r.read_bit()?;
         r.read_bits(6)?; // vps_max_layers_minus1
         let max_sub_layers_minus1 = r.read_bits(3)?;
+        check_range(
+            "HEVC VPS",
+            "vps_max_sub_layers_minus1",
+            i64::from(max_sub_layers_minus1),
+            0,
+            MAX_SUB_LAYERS_MINUS1,
+        )?;
         r.read_bit()?;
         r.read_bits(16)?;
         let ptl = ProfileTierLevel::parse(&mut r, max_sub_layers_minus1)?;
@@ -221,6 +240,13 @@ impl Vps {
         let mut max_num_reorder_pics = 0;
         for _ in first..=max_sub_layers_minus1 {
             max_dec_pic_buffering_minus1 = r.read_ue()?;
+            check_range(
+                "HEVC VPS",
+                "vps_max_dec_pic_buffering_minus1",
+                i64::from(max_dec_pic_buffering_minus1),
+                0,
+                MAX_DPB_PICTURES_MINUS1,
+            )?;
             max_num_reorder_pics = r.read_ue()?;
             r.read_ue()?;
         }
@@ -297,8 +323,12 @@ pub struct Sps {
     pub max_transform_hierarchy_depth_inter: u32,
     /// `max_transform_hierarchy_depth_intra`.
     pub max_transform_hierarchy_depth_intra: u32,
-    /// `scaling_list_enabled_flag`; this family never writes scaling lists.
+    /// `scaling_list_enabled_flag`.
     pub scaling_list_enabled: bool,
+    /// The lists `sps_scaling_list_data_present_flag` sends. `None` with scaling
+    /// lists enabled means the defaults of Tables 7-5 and 7-6. Meaningful only
+    /// when `scaling_list_enabled`.
+    pub scaling_list: Option<ScalingList>,
     /// `amp_enabled_flag`.
     pub amp_enabled: bool,
     /// `sample_adaptive_offset_enabled_flag`.
@@ -330,6 +360,13 @@ pub struct Sps {
     pub ptl: ProfileTierLevel,
     /// VUI, when present.
     pub vui: Option<VuiParameters>,
+    /// `sps_max_latency_increase_plus1[HighestTid]`; 0 when there is no latency limit.
+    pub max_latency_increase_plus1: u32,
+    /// The extension flags of 7.3.2.2.1, one byte: bit 7 range, 6 multilayer, 5 3D, 4 SCC,
+    /// bits 0..3 `sps_extension_4bits`. Zero when the SPS carries no extension.
+    pub extension_flags: u8,
+    /// The `sps_range_extension()` flags (7.3.2.2.2); all false when absent.
+    pub range: SpsRangeExt,
 }
 
 impl Sps {
@@ -410,7 +447,13 @@ impl Sps {
         w.write_ue(self.max_transform_hierarchy_depth_intra);
         w.write_bit(self.scaling_list_enabled);
         if self.scaling_list_enabled {
-            w.write_bit(false); // sps_scaling_list_data_present_flag
+            match &self.scaling_list {
+                Some(list) => {
+                    w.write_bit(true); // sps_scaling_list_data_present_flag
+                    list.write(&mut w);
+                }
+                None => w.write_bit(false),
+            }
         }
         w.write_bit(self.amp_enabled);
         w.write_bit(self.sao_enabled);
@@ -443,7 +486,23 @@ impl Sps {
             }
             None => w.write_bit(false),
         }
-        w.write_bit(false); // sps_extension_present_flag
+        write_extension_flags(&mut w, self.extension_flags);
+        if self.extension_flags & 0x80 != 0 {
+            let r = &self.range;
+            for flag in [
+                r.transform_skip_rotation_enabled,
+                r.transform_skip_context_enabled,
+                r.implicit_rdpcm_enabled,
+                r.explicit_rdpcm_enabled,
+                r.extended_precision_processing,
+                r.intra_smoothing_disabled,
+                r.high_precision_offsets_enabled,
+                r.persistent_rice_adaptation_enabled,
+                r.cabac_bypass_alignment_enabled,
+            ] {
+                w.write_bit(flag);
+            }
+        }
         rbsp_trailing_bits(&mut w);
         w.into_bytes()
     }
@@ -452,14 +511,22 @@ impl Sps {
     ///
     /// Short-term reference picture sets are walked but not kept: a decoder
     /// resolves them from the slice header, and this family's own streams have
-    /// none. A stream with scaling lists is refused rather than mis-decoded.
+    /// none.
     pub fn parse(rbsp: &[u8]) -> Result<Sps> {
         let mut r = BitReader::new(rbsp);
         let vps_id = r.read_bits(4)? as u8;
         let max_sub_layers_minus1 = r.read_bits(3)?;
+        check_range(
+            "HEVC SPS",
+            "sps_max_sub_layers_minus1",
+            i64::from(max_sub_layers_minus1),
+            0,
+            MAX_SUB_LAYERS_MINUS1,
+        )?;
         r.read_bit()?; // sps_temporal_id_nesting_flag
         let ptl = ProfileTierLevel::parse(&mut r, max_sub_layers_minus1)?;
         let id = r.read_ue()?;
+        check_range("HEVC SPS", "sps_seq_parameter_set_id", i64::from(id), 0, 15)?;
         let chroma_format_idc = r.read_ue()?;
         if chroma_format_idc > 3 {
             return Err(Error::corrupt(format!(
@@ -494,6 +561,21 @@ impl Sps {
                 bottom: r.read_ue()?,
             };
         }
+        // The window is in chroma units (7-18 to 7-21) and must leave a picture.
+        let (sub_w, sub_h) = match chroma_format_idc {
+            1 => (2u64, 2u64),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        let crop_w = sub_w * (u64::from(conf_win.left) + u64::from(conf_win.right));
+        let crop_h = sub_h * (u64::from(conf_win.top) + u64::from(conf_win.bottom));
+        if crop_w >= u64::from(pic_width_in_luma_samples)
+            || crop_h >= u64::from(pic_height_in_luma_samples)
+        {
+            return Err(Error::corrupt(format!(
+                "HEVC SPS: conformance window {conf_win:?} leaves no picture"
+            )));
+        }
         let bit_depth_luma_minus8 = r.read_ue()?;
         let bit_depth_chroma_minus8 = r.read_ue()?;
         if bit_depth_luma_minus8 > 8 || bit_depth_chroma_minus8 > 8 {
@@ -513,34 +595,87 @@ impl Sps {
         };
         let mut max_dec_pic_buffering_minus1 = 0;
         let mut max_num_reorder_pics = 0;
+        let mut max_latency_increase_plus1 = 0;
         for _ in first..=max_sub_layers_minus1 {
             max_dec_pic_buffering_minus1 = r.read_ue()?;
+            check_range(
+                "HEVC SPS",
+                "sps_max_dec_pic_buffering_minus1",
+                i64::from(max_dec_pic_buffering_minus1),
+                0,
+                MAX_DPB_PICTURES_MINUS1,
+            )?;
             max_num_reorder_pics = r.read_ue()?;
-            r.read_ue()?;
+            max_latency_increase_plus1 = r.read_ue()?;
         }
         let log2_min_cb_size_minus3 = r.read_ue()?;
         let log2_diff_max_min_cb_size = r.read_ue()?;
         let log2_min_tb_size_minus2 = r.read_ue()?;
         let log2_diff_max_min_tb_size = r.read_ue()?;
-        if log2_min_cb_size_minus3 + log2_diff_max_min_cb_size > 3 {
-            return Err(Error::corrupt("HEVC SPS: CTB larger than 64x64"));
+        // Block sizes as log2 values, widened so that no sum below can wrap. The
+        // CTB is 16 to 64 samples (7-10), the minimum TB is below the minimum CB,
+        // and the largest TB is at most 32 samples and at most the CTB (7-11).
+        let min_cb_log2 = i64::from(log2_min_cb_size_minus3) + 3;
+        let ctb_log2 = min_cb_log2 + i64::from(log2_diff_max_min_cb_size);
+        check_range("HEVC SPS", "CtbLog2SizeY", ctb_log2, 4, 6)?;
+        let min_tb_log2 = i64::from(log2_min_tb_size_minus2) + 2;
+        if min_tb_log2 >= min_cb_log2 {
+            return Err(Error::corrupt(format!(
+                "HEVC SPS: MinTbLog2SizeY = {min_tb_log2} not below MinCbLog2SizeY = {min_cb_log2}"
+            )));
+        }
+        let max_tb_log2 = min_tb_log2 + i64::from(log2_diff_max_min_tb_size);
+        check_range(
+            "HEVC SPS",
+            "MaxTbLog2SizeY",
+            max_tb_log2,
+            min_tb_log2,
+            ctb_log2.min(5),
+        )?;
+        // 7.4.3.2.1: the coded size is a whole number of minimum coding blocks. A
+        // coding block at the edge would otherwise run past the picture buffer.
+        let min_cb = 1u32 << min_cb_log2;
+        if pic_width_in_luma_samples % min_cb != 0 || pic_height_in_luma_samples % min_cb != 0 {
+            return Err(Error::corrupt(format!(
+                "HEVC SPS: picture size {pic_width_in_luma_samples}x{pic_height_in_luma_samples} is not a multiple of the minimum coding block {min_cb}"
+            )));
         }
         let max_transform_hierarchy_depth_inter = r.read_ue()?;
         let max_transform_hierarchy_depth_intra = r.read_ue()?;
+        // 7-12: at most CtbLog2SizeY - MinTbLog2SizeY, which is at most 4.
+        let max_depth = ctb_log2 - min_tb_log2;
+        check_range(
+            "HEVC SPS",
+            "max_transform_hierarchy_depth_inter",
+            i64::from(max_transform_hierarchy_depth_inter),
+            0,
+            max_depth,
+        )?;
+        check_range(
+            "HEVC SPS",
+            "max_transform_hierarchy_depth_intra",
+            i64::from(max_transform_hierarchy_depth_intra),
+            0,
+            max_depth,
+        )?;
         let scaling_list_enabled = r.read_bit()?;
+        let mut scaling_list = None;
         if scaling_list_enabled && r.read_bit()? {
-            return Err(Error::unsupported(
-                "HEVC SPS scaling lists",
-                "this family codes with the flat 16 matrix only",
-            ));
+            scaling_list = Some(ScalingList::parse(&mut r)?);
         }
         let amp_enabled = r.read_bit()?;
         let sao_enabled = r.read_bit()?;
         let pcm_enabled = r.read_bit()?;
         let pcm = if pcm_enabled {
+            let luma = r.read_bits(4)?;
+            let chroma = r.read_bits(4)?;
+            // 7.4.3.2.1: PcmBitDepthY <= BitDepthY, and likewise for chroma.
+            if luma >= bit_depth_luma_minus8 + 8 || chroma >= bit_depth_chroma_minus8 + 8 {
+                return Err(Error::corrupt("HEVC SPS: PCM bit depth above the coded bit depth"));
+            }
             Some((
-                r.read_bits(4)?,
-                r.read_bits(4)?,
+                luma,
+                chroma,
                 r.read_ue()?,
                 r.read_ue()?,
                 r.read_bit()?,
@@ -554,7 +689,7 @@ impl Sps {
         }
         let mut sets = Vec::new();
         for i in 0..num_short_term_ref_pic_sets {
-            let set = ShortTermRefPicSet::parse(&mut r, i, &sets)?;
+            let set = ShortTermRefPicSet::parse(&mut r, i, num_short_term_ref_pic_sets, &sets)?;
             sets.push(set);
         }
         let long_term_ref_pics_present = r.read_bit()?;
@@ -580,6 +715,12 @@ impl Sps {
         } else {
             None
         };
+        let extension_flags = parse_extension_flags(&mut r);
+        let range = if extension_flags & 0x80 != 0 {
+            SpsRangeExt::parse(&mut r)?
+        } else {
+            SpsRangeExt::default()
+        };
         Ok(Sps {
             vps_id,
             id,
@@ -600,6 +741,7 @@ impl Sps {
             max_transform_hierarchy_depth_inter,
             max_transform_hierarchy_depth_intra,
             scaling_list_enabled,
+            scaling_list,
             amp_enabled,
             sao_enabled,
             pcm_enabled,
@@ -613,6 +755,9 @@ impl Sps {
             strong_intra_smoothing,
             ptl,
             vui,
+            max_latency_increase_plus1,
+            extension_flags,
+            range,
         })
     }
 }
@@ -662,27 +807,40 @@ impl Default for ShortTermRefPicSet {
 }
 
 impl ShortTermRefPicSet {
-    /// Parse one set; `prev` holds the sets already parsed for inter-set prediction.
+    /// Parse one set. `idx` is `stRpsIdx`; `num_sets` is `num_short_term_ref_pic_sets`
+    /// (the slice header's set sits at `idx == num_sets`, and only there does 7.3.7
+    /// carry `delta_idx_minus1`). `prev` holds the SPS sets already parsed for
+    /// inter-set prediction.
     pub fn parse(
         r: &mut BitReader,
         idx: u32,
+        num_sets: u32,
         prev: &[ShortTermRefPicSet],
     ) -> Result<ShortTermRefPicSet> {
         let inter_ref_pic_set_prediction = if idx != 0 { r.read_bit()? } else { false };
         if inter_ref_pic_set_prediction {
-            let delta_idx_minus1 = if idx == prev.len() as u32 {
+            let delta_idx_minus1 = if idx == num_sets {
                 r.read_ue()?
             } else {
                 0
             };
-            let ref_idx = idx
-                .checked_sub(delta_idx_minus1 + 1)
-                .ok_or_else(|| Error::corrupt("HEVC st_ref_pic_set: delta_idx out of range"))?;
+            // 7-61: RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1), so delta_idx_minus1 < stRpsIdx.
+            if delta_idx_minus1 >= idx {
+                return Err(Error::corrupt("HEVC st_ref_pic_set: delta_idx out of range"));
+            }
+            let ref_idx = idx - (delta_idx_minus1 + 1);
             let reference = *prev
                 .get(ref_idx as usize)
                 .ok_or_else(|| Error::corrupt("HEVC st_ref_pic_set: unknown reference set"))?;
             let delta_rps_sign = r.read_bit()?;
             let abs_delta_rps_minus1 = r.read_ue()?;
+            check_range(
+                "HEVC st_ref_pic_set",
+                "abs_delta_rps_minus1",
+                i64::from(abs_delta_rps_minus1),
+                0,
+                MAX_DELTA_POC_MINUS1,
+            )?;
             let delta_rps = if delta_rps_sign {
                 -((abs_delta_rps_minus1 + 1) as i32)
             } else {
@@ -716,7 +874,7 @@ impl ShortTermRefPicSet {
             };
             let mut poc = 0i32;
             for i in 0..num_negative as usize {
-                let delta = r.read_ue()? as i32 + 1;
+                let delta = read_delta_poc(r)?;
                 poc -= delta;
                 set.delta_poc_s0[i] = poc;
                 set.used_s0[i] = r.read_bit()?;
@@ -726,7 +884,7 @@ impl ShortTermRefPicSet {
             }
             let mut poc = 0i32;
             for i in 0..num_positive as usize {
-                let delta = r.read_ue()? as i32 + 1;
+                let delta = read_delta_poc(r)?;
                 poc += delta;
                 set.delta_poc_s1[i] = poc;
                 set.used_s1[i] = r.read_bit()?;
@@ -904,17 +1062,25 @@ pub struct Pps {
     pub beta_offset_div2: i32,
     /// `pps_tc_offset_div2`.
     pub tc_offset_div2: i32,
+    /// The lists `pps_scaling_list_data_present_flag` sends, which override the SPS
+    /// lists. `None` when the PPS sends none.
+    pub scaling_list: Option<ScalingList>,
     /// `lists_modification_present_flag`.
     pub lists_modification_present: bool,
     /// `log2_parallel_merge_level_minus2`.
     pub log2_parallel_merge_level_minus2: u32,
     /// `slice_segment_header_extension_present_flag`.
     pub slice_segment_header_extension_present: bool,
+    /// The PPS extension flags, same layout as [`Sps::extension_flags`].
+    pub extension_flags: u8,
+    /// The `pps_range_extension()` fields (7.3.2.3.2); defaults when absent.
+    pub range: PpsRangeExt,
 }
 
 impl Default for Pps {
     fn default() -> Self {
         Pps {
+            scaling_list: None,
             id: 0,
             sps_id: 0,
             dependent_slice_segments_enabled: false,
@@ -952,6 +1118,8 @@ impl Default for Pps {
             lists_modification_present: false,
             log2_parallel_merge_level_minus2: 0,
             slice_segment_header_extension_present: false,
+            extension_flags: 0,
+            range: Default::default(),
         }
     }
 }
@@ -1008,11 +1176,35 @@ impl Pps {
                 w.write_se(self.tc_offset_div2);
             }
         }
-        w.write_bit(false); // pps_scaling_list_data_present_flag
+        match &self.scaling_list {
+            Some(list) => {
+                w.write_bit(true); // pps_scaling_list_data_present_flag
+                list.write(&mut w);
+            }
+            None => w.write_bit(false),
+        }
         w.write_bit(self.lists_modification_present);
         w.write_ue(self.log2_parallel_merge_level_minus2);
         w.write_bit(self.slice_segment_header_extension_present);
-        w.write_bit(false); // pps_extension_present_flag
+        write_extension_flags(&mut w, self.extension_flags);
+        if self.extension_flags & 0x80 != 0 {
+            let r = &self.range;
+            if self.transform_skip_enabled {
+                w.write_ue(r.log2_max_transform_skip_block_size_minus2);
+            }
+            w.write_bit(r.cross_component_prediction_enabled);
+            w.write_bit(r.chroma_qp_offset_list_enabled);
+            if r.chroma_qp_offset_list_enabled {
+                w.write_ue(r.diff_cu_chroma_qp_offset_depth);
+                w.write_ue(r.cb_qp_offset_list.len() as u32 - 1);
+                for (cb, cr) in r.cb_qp_offset_list.iter().zip(&r.cr_qp_offset_list) {
+                    w.write_se(*cb);
+                    w.write_se(*cr);
+                }
+            }
+            w.write_ue(r.log2_sao_offset_scale_luma);
+            w.write_ue(r.log2_sao_offset_scale_chroma);
+        }
         rbsp_trailing_bits(&mut w);
         w.into_bytes()
     }
@@ -1025,22 +1217,57 @@ impl Pps {
             sps_id: r.read_ue()?,
             ..Pps::default()
         };
+        check_range("HEVC PPS", "pps_pic_parameter_set_id", i64::from(pps.id), 0, 63)?;
+        check_range("HEVC PPS", "pps_seq_parameter_set_id", i64::from(pps.sps_id), 0, 15)?;
         pps.dependent_slice_segments_enabled = r.read_bit()?;
         pps.output_flag_present = r.read_bit()?;
         pps.num_extra_slice_header_bits = r.read_bits(3)?;
         pps.sign_data_hiding_enabled = r.read_bit()?;
         pps.cabac_init_present = r.read_bit()?;
         pps.num_ref_idx_l0_default_active_minus1 = r.read_ue()?;
+        check_range(
+            "HEVC PPS",
+            "num_ref_idx_l0_default_active_minus1",
+            i64::from(pps.num_ref_idx_l0_default_active_minus1),
+            0,
+            14,
+        )?;
         pps.num_ref_idx_l1_default_active_minus1 = r.read_ue()?;
+        check_range(
+            "HEVC PPS",
+            "num_ref_idx_l1_default_active_minus1",
+            i64::from(pps.num_ref_idx_l1_default_active_minus1),
+            0,
+            14,
+        )?;
         pps.init_qp_minus26 = r.read_se()?;
+        // 7-6: -(26 + QpBdOffsetY) to +25. The offset is at most 48 (8 bits of depth
+        // above 8 is refused by the SPS), and this PPS parser cannot see the SPS.
+        check_range(
+            "HEVC PPS",
+            "init_qp_minus26",
+            i64::from(pps.init_qp_minus26),
+            -74,
+            25,
+        )?;
         pps.constrained_intra_pred = r.read_bit()?;
         pps.transform_skip_enabled = r.read_bit()?;
         pps.cu_qp_delta_enabled = r.read_bit()?;
         if pps.cu_qp_delta_enabled {
             pps.diff_cu_qp_delta_depth = r.read_ue()?;
+            // 7-7: at most log2_diff_max_min_luma_coding_block_size, which is at most 3.
+            check_range(
+                "HEVC PPS",
+                "diff_cu_qp_delta_depth",
+                i64::from(pps.diff_cu_qp_delta_depth),
+                0,
+                3,
+            )?;
         }
         pps.cb_qp_offset = r.read_se()?;
+        check_range("HEVC PPS", "pps_cb_qp_offset", i64::from(pps.cb_qp_offset), -12, 12)?;
         pps.cr_qp_offset = r.read_se()?;
+        check_range("HEVC PPS", "pps_cr_qp_offset", i64::from(pps.cr_qp_offset), -12, 12)?;
         pps.slice_chroma_qp_offsets_present = r.read_bit()?;
         pps.weighted_pred = r.read_bit()?;
         pps.weighted_bipred = r.read_bit()?;
@@ -1051,10 +1278,12 @@ impl Pps {
             pps.num_tile_columns_minus1 = r.read_ue()?;
             pps.num_tile_rows_minus1 = r.read_ue()?;
             pps.uniform_spacing = r.read_bit()?;
+            // The tile count is capped for both spacings: a uniform split would
+            // otherwise size its tile arrays from any count the stream names.
+            if pps.num_tile_columns_minus1 > 20 || pps.num_tile_rows_minus1 > 22 {
+                return Err(Error::corrupt("HEVC PPS: tile count beyond any level"));
+            }
             if !pps.uniform_spacing {
-                if pps.num_tile_columns_minus1 > 20 || pps.num_tile_rows_minus1 > 22 {
-                    return Err(Error::corrupt("HEVC PPS: tile count beyond any level"));
-                }
                 for _ in 0..pps.num_tile_columns_minus1 {
                     let value = r.read_ue()?;
                     pps.column_width_minus1.push(value);
@@ -1073,26 +1302,111 @@ impl Pps {
             pps.deblocking_filter_disabled = r.read_bit()?;
             if !pps.deblocking_filter_disabled {
                 pps.beta_offset_div2 = r.read_se()?;
+                check_range(
+                    "HEVC PPS",
+                    "pps_beta_offset_div2",
+                    i64::from(pps.beta_offset_div2),
+                    -6,
+                    6,
+                )?;
                 pps.tc_offset_div2 = r.read_se()?;
+                check_range(
+                    "HEVC PPS",
+                    "pps_tc_offset_div2",
+                    i64::from(pps.tc_offset_div2),
+                    -6,
+                    6,
+                )?;
             }
         }
         if r.read_bit()? {
-            return Err(Error::unsupported(
-                "HEVC PPS scaling lists",
-                "this family codes with the flat 16 matrix only",
-            ));
+            pps.scaling_list = Some(ScalingList::parse(&mut r)?);
         }
         pps.lists_modification_present = r.read_bit()?;
         pps.log2_parallel_merge_level_minus2 = r.read_ue()?;
+        // 7-37: Log2ParMrgLevelY is at most CtbLog2SizeY, which is at most 6.
+        check_range(
+            "HEVC PPS",
+            "log2_parallel_merge_level_minus2",
+            i64::from(pps.log2_parallel_merge_level_minus2),
+            0,
+            4,
+        )?;
         pps.slice_segment_header_extension_present = r.read_bit()?;
+        pps.extension_flags = parse_extension_flags(&mut r);
+        if pps.extension_flags & 0x80 != 0 {
+            pps.range = PpsRangeExt::parse(&mut r, pps.transform_skip_enabled)?;
+        }
         Ok(pps)
     }
+}
+
+/// Writes the `*_extension_present_flag` block packed as [`Sps::extension_flags`]. Only the
+/// flags are written, not the extension bodies that follow them: the decoder never reads an
+/// extension body, and the refusal fixtures need only the flags.
+fn write_extension_flags(w: &mut BitWriter, flags: u8) {
+    let present = flags != 0;
+    w.write_bit(present);
+    if present {
+        for bit in 0..4 {
+            w.write_bit(flags & (0x80 >> bit) != 0);
+        }
+        w.write_bits(u32::from(flags & 0x0f), 4);
+    }
+}
+
+/// The `*_extension_present_flag` block at the end of an SPS or PPS (7.3.2.2.1, 7.3.2.3.1),
+/// packed as [`Sps::extension_flags`]. A truncated tail reads as no extension.
+fn parse_extension_flags(r: &mut BitReader) -> u8 {
+    if !matches!(r.read_bit(), Ok(true)) {
+        return 0;
+    }
+    let mut flags = 0u8;
+    for bit in 0..4 {
+        if matches!(r.read_bit(), Ok(true)) {
+            flags |= 0x80 >> bit;
+        }
+    }
+    flags | r.read_bits(4).unwrap_or(0) as u8
 }
 
 /// `rbsp_trailing_bits()`: a one bit then zeros to the byte boundary.
 pub fn rbsp_trailing_bits(w: &mut BitWriter) {
     w.write_bit(true);
     w.align_to_byte();
+}
+
+/// `vps_max_sub_layers_minus1` and `sps_max_sub_layers_minus1` (7.4.3.1, 7.4.3.2.1): 0 to 6.
+const MAX_SUB_LAYERS_MINUS1: i64 = 6;
+
+/// `sps_max_dec_pic_buffering_minus1` (7.4.3.2.1): MaxDpbSize - 1, at most 15.
+const MAX_DPB_PICTURES_MINUS1: i64 = 15;
+
+/// `delta_poc_sX_minus1` and `abs_delta_rps_minus1` (7-53, 7-54, 7-61): 0 to 2^15 - 1.
+const MAX_DELTA_POC_MINUS1: i64 = 32_767;
+
+/// Refuse `value` unless `lo <= value <= hi`. The message names the syntax element.
+pub(crate) fn check_range(what: &str, field: &str, value: i64, lo: i64, hi: i64) -> Result<()> {
+    if (lo..=hi).contains(&value) {
+        Ok(())
+    } else {
+        Err(Error::corrupt(format!(
+            "{what}: {field} = {value}, outside {lo}..={hi}"
+        )))
+    }
+}
+
+/// Read a `delta_poc_sX_minus1` and return the delta it stands for, `minus1 + 1`.
+fn read_delta_poc(r: &mut BitReader) -> Result<i32> {
+    let minus1 = r.read_ue()?;
+    check_range(
+        "HEVC st_ref_pic_set",
+        "delta_poc_sX_minus1",
+        i64::from(minus1),
+        0,
+        MAX_DELTA_POC_MINUS1,
+    )?;
+    Ok(minus1 as i32 + 1)
 }
 
 /// `Ceil( Log2( v ) )`, the width of a `u(v)` field counting `v` values.
@@ -1104,6 +1418,8 @@ pub fn ceil_log2(v: u32) -> u32 {
     bits
 }
 
+/// `delta_poc_s0_minus1` / `delta_poc_s1_minus1` (7-53, 7-54): in range 0..=2^15 - 1.
+/// Checked here so the running POC sums in `ShortTermRefPicSet` cannot overflow.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,6 +1427,9 @@ mod tests {
 
     fn sample_sps() -> Sps {
         Sps {
+            max_latency_increase_plus1: 0,
+            extension_flags: 0,
+            range: Default::default(),
             vps_id: 0,
             id: 0,
             chroma_format_idc: 1,
@@ -1135,6 +1454,7 @@ mod tests {
             max_transform_hierarchy_depth_inter: 0,
             max_transform_hierarchy_depth_intra: 0,
             scaling_list_enabled: false,
+            scaling_list: None,
             amp_enabled: false,
             sao_enabled: false,
             pcm_enabled: false,
@@ -1158,6 +1478,7 @@ mod tests {
                         matrix_coeffs: 1,
                     }),
                 }),
+                chroma_sample_loc: None,
                 timing: Some((1, 30)),
             }),
         }
@@ -1218,6 +1539,294 @@ mod tests {
         assert_eq!(Sps::parse(&pcm.to_rbsp()).unwrap(), pcm);
     }
 
+    /// Assert `result` is refused with `Error::Corrupt` and that the message names `field`.
+    fn refused_naming<T: std::fmt::Debug>(result: Result<T>, field: &str) {
+        match result {
+            Ok(v) => panic!("accepted, expected {field} to be refused: {v:?}"),
+            Err(e) => {
+                assert!(matches!(e, Error::Corrupt { .. }), "not Corrupt: {e:?}");
+                assert!(e.to_string().contains(field), "message does not name {field}: {e}");
+            }
+        }
+    }
+
+    /// Bits written by `build`, padded to a byte.
+    fn bits(build: impl FnOnce(&mut BitWriter)) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        build(&mut w);
+        w.align_to_byte();
+        w.into_bytes()
+    }
+
+    fn sps_with(edit: impl FnOnce(&mut Sps)) -> Vec<u8> {
+        let mut sps = sample_sps();
+        edit(&mut sps);
+        sps.to_rbsp()
+    }
+
+    #[test]
+    fn seven_sub_layers_is_refused_by_name_and_six_is_not() {
+        // vps_max_sub_layers_minus1 is bits 12..15 of the VPS RBSP; sps_ is bits 4..7 of the SPS.
+        let mut vps = Vps {
+            id: 0,
+            ptl: ProfileTierLevel::main(120),
+            max_dec_pic_buffering_minus1: 0,
+            max_num_reorder_pics: 0,
+        }
+        .to_rbsp();
+        vps[1] |= 0x0e;
+        refused_naming(Vps::parse(&vps), "vps_max_sub_layers_minus1");
+
+        let mut sps = sample_sps().to_rbsp();
+        sps[0] |= 0x0e;
+        refused_naming(Sps::parse(&sps), "sps_max_sub_layers_minus1");
+
+        // Six is legal, so the guard must let it through. The rest of this RBSP
+        // is then read at the wrong offsets, so the parse may fail later, but not
+        // on the sub-layer count.
+        let mut sps = sample_sps().to_rbsp();
+        sps[0] |= 0x0c;
+        if let Err(e) = Sps::parse(&sps) {
+            assert!(!e.to_string().contains("max_sub_layers"), "{e}");
+        }
+    }
+
+    #[test]
+    fn sps_block_sizes_and_depths_are_range_checked() {
+        // CtbLog2SizeY outside 4..=6: a 128 CTB, and an 8 CTB.
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.log2_diff_max_min_cb_size = 4)),
+            "CtbLog2SizeY",
+        );
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.log2_diff_max_min_cb_size = 0)),
+            "CtbLog2SizeY",
+        );
+        // An absurd minimum CB is refused by name, not by a wrapped sum.
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.log2_min_cb_size_minus3 = 40)),
+            "CtbLog2SizeY",
+        );
+        // MinTbLog2SizeY must stay below MinCbLog2SizeY (8): a 8x8 minimum TB is not.
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.log2_min_tb_size_minus2 = 1)),
+            "MinTbLog2SizeY",
+        );
+        // MaxTbLog2SizeY is at most 5 (32 samples): a 64 largest TB is not.
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.log2_diff_max_min_tb_size = 4)),
+            "MaxTbLog2SizeY",
+        );
+        // max_transform_hierarchy_depth is at most CtbLog2SizeY - MinTbLog2SizeY = 4.
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.max_transform_hierarchy_depth_inter = 5)),
+            "max_transform_hierarchy_depth_inter",
+        );
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.max_transform_hierarchy_depth_intra = 5)),
+            "max_transform_hierarchy_depth_intra",
+        );
+        // The depth at its bound is still legal.
+        assert!(Sps::parse(&sps_with(|s| s.max_transform_hierarchy_depth_intra = 4)).is_ok());
+    }
+
+    #[test]
+    fn sps_dpb_size_and_ids_are_range_checked() {
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.max_dec_pic_buffering_minus1 = 16)),
+            "sps_max_dec_pic_buffering_minus1",
+        );
+        assert!(Sps::parse(&sps_with(|s| s.max_dec_pic_buffering_minus1 = 15)).is_ok());
+        refused_naming(
+            Sps::parse(&sps_with(|s| s.id = 16)),
+            "sps_seq_parameter_set_id",
+        );
+    }
+
+    #[test]
+    fn conformance_window_must_leave_a_picture() {
+        // 4:2:0 crops two luma rows per chroma-unit offset: 2 * 544 = 1088 leaves nothing.
+        refused_naming(
+            Sps::parse(&sps_with(|s| {
+                s.conf_win = ConformanceWindow {
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    bottom: 544,
+                }
+            })),
+            "conformance window",
+        );
+        // A huge offset must not wrap the sum either.
+        refused_naming(
+            Sps::parse(&sps_with(|s| {
+                s.conf_win = ConformanceWindow {
+                    left: 0x7fff_ffff,
+                    right: 0x7fff_ffff,
+                    top: 0,
+                    bottom: 0,
+                }
+            })),
+            "conformance window",
+        );
+    }
+
+    #[test]
+    fn vps_dpb_size_is_range_checked() {
+        let vps = Vps {
+            id: 0,
+            ptl: ProfileTierLevel::main(120),
+            max_dec_pic_buffering_minus1: 16,
+            max_num_reorder_pics: 0,
+        };
+        refused_naming(Vps::parse(&vps.to_rbsp()), "vps_max_dec_pic_buffering_minus1");
+    }
+
+    #[test]
+    fn pps_reference_counts_and_qp_are_range_checked() {
+        let pps = |edit: fn(&mut Pps)| {
+            let mut p = Pps::default();
+            edit(&mut p);
+            p.to_rbsp()
+        };
+        refused_naming(
+            Pps::parse(&pps(|p| p.num_ref_idx_l0_default_active_minus1 = 15)),
+            "num_ref_idx_l0_default_active_minus1",
+        );
+        refused_naming(
+            Pps::parse(&pps(|p| p.num_ref_idx_l1_default_active_minus1 = 15)),
+            "num_ref_idx_l1_default_active_minus1",
+        );
+        refused_naming(
+            Pps::parse(&pps(|p| p.init_qp_minus26 = 26)),
+            "init_qp_minus26",
+        );
+        refused_naming(
+            Pps::parse(&pps(|p| p.init_qp_minus26 = -75)),
+            "init_qp_minus26",
+        );
+        refused_naming(
+            Pps::parse(&pps(|p| p.cb_qp_offset = 13)),
+            "pps_cb_qp_offset",
+        );
+        refused_naming(
+            Pps::parse(&pps(|p| p.cr_qp_offset = -13)),
+            "pps_cr_qp_offset",
+        );
+        refused_naming(
+            Pps::parse(&pps(|p| {
+                p.cu_qp_delta_enabled = true;
+                p.diff_cu_qp_delta_depth = 4;
+            })),
+            "diff_cu_qp_delta_depth",
+        );
+        refused_naming(
+            Pps::parse(&pps(|p| p.log2_parallel_merge_level_minus2 = 5)),
+            "log2_parallel_merge_level_minus2",
+        );
+        refused_naming(Pps::parse(&pps(|p| p.id = 64)), "pps_pic_parameter_set_id");
+        refused_naming(
+            Pps::parse(&pps(|p| p.sps_id = 16)),
+            "pps_seq_parameter_set_id",
+        );
+
+        // The bounds themselves are legal.
+        let edge = Pps {
+            num_ref_idx_l0_default_active_minus1: 14,
+            num_ref_idx_l1_default_active_minus1: 14,
+            init_qp_minus26: -74,
+            cb_qp_offset: -12,
+            cr_qp_offset: 12,
+            cu_qp_delta_enabled: true,
+            diff_cu_qp_delta_depth: 3,
+            log2_parallel_merge_level_minus2: 4,
+            ..Pps::default()
+        };
+        assert_eq!(Pps::parse(&edge.to_rbsp()).unwrap(), edge);
+    }
+
+    #[test]
+    fn pps_loop_filter_offsets_are_range_checked() {
+        let deblock = |beta: i32, tc: i32| {
+            Pps {
+                deblocking_filter_control_present: true,
+                deblocking_filter_disabled: false,
+                beta_offset_div2: beta,
+                tc_offset_div2: tc,
+                ..Pps::default()
+            }
+            .to_rbsp()
+        };
+        refused_naming(Pps::parse(&deblock(7, 0)), "pps_beta_offset_div2");
+        refused_naming(Pps::parse(&deblock(0, -7)), "pps_tc_offset_div2");
+        assert!(Pps::parse(&deblock(-6, 6)).is_ok());
+    }
+
+    #[test]
+    fn pps_tile_count_is_capped_for_uniform_spacing_too() {
+        let tiled = Pps {
+            tiles_enabled: true,
+            uniform_spacing: true,
+            num_tile_columns_minus1: 21,
+            num_tile_rows_minus1: 0,
+            ..Pps::default()
+        };
+        refused_naming(Pps::parse(&tiled.to_rbsp()), "tile count beyond any level");
+    }
+
+    #[test]
+    fn st_ref_pic_set_fields_are_range_checked() {
+        // Set 0 explicit, one negative picture with delta_poc_s0_minus1 = 32768.
+        let too_far = bits(|w| {
+            w.write_ue(1); // num_negative_pics
+            w.write_ue(0); // num_positive_pics
+            w.write_ue(32_768);
+            w.write_bit(true);
+        });
+        refused_naming(
+            ShortTermRefPicSet::parse(&mut BitReader::new(&too_far), 0, 1, &[]),
+            "delta_poc_sX_minus1",
+        );
+        // The largest legal delta is accepted.
+        let largest = bits(|w| {
+            w.write_ue(1);
+            w.write_ue(0);
+            w.write_ue(32_767);
+            w.write_bit(true);
+        });
+        assert_eq!(
+            ShortTermRefPicSet::parse(&mut BitReader::new(&largest), 0, 1, &[])
+                .unwrap()
+                .delta_poc_s0[0],
+            -32_768
+        );
+
+        // Set 1 predicted from set 0 with delta_idx_minus1 = 1 names a set before set 0.
+        // delta_idx_minus1 is only read in the slice header (idx == num_sets), so
+        // here num_sets is 1.
+        let set0 = ShortTermRefPicSet::default();
+        let bad_idx = bits(|w| {
+            w.write_bit(true); // inter_ref_pic_set_prediction_flag
+            w.write_ue(1); // delta_idx_minus1
+        });
+        refused_naming(
+            ShortTermRefPicSet::parse(&mut BitReader::new(&bad_idx), 1, 1, &[set0]),
+            "delta_idx out of range",
+        );
+
+        // abs_delta_rps_minus1 = 32768 is past 2^15 - 1.
+        let bad_rps = bits(|w| {
+            w.write_bit(true); // inter_ref_pic_set_prediction_flag
+            w.write_ue(0); // delta_idx_minus1
+            w.write_bit(false); // delta_rps_sign
+            w.write_ue(32_768); // abs_delta_rps_minus1
+        });
+        refused_naming(
+            ShortTermRefPicSet::parse(&mut BitReader::new(&bad_rps), 1, 2, &[set0]),
+            "abs_delta_rps_minus1",
+        );
+    }
+
     #[test]
     fn levels_round_up_with_size_and_rate() {
         assert_eq!(ProfileTierLevel::level_for(1920, 1080, 30.0), 120); // 4
@@ -1233,5 +1842,90 @@ mod tests {
         assert_eq!(ceil_log2(510), 9);
         assert_eq!(ceil_log2(512), 9);
         assert_eq!(ceil_log2(513), 10);
+    }
+}
+
+/// The `sps_range_extension()` flags of 7.3.2.2.2, in bitstream order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpsRangeExt {
+    /// `transform_skip_rotation_enabled`.
+    pub transform_skip_rotation_enabled: bool,
+    /// `transform_skip_context_enabled`.
+    pub transform_skip_context_enabled: bool,
+    /// `implicit_rdpcm_enabled`.
+    pub implicit_rdpcm_enabled: bool,
+    /// `explicit_rdpcm_enabled`.
+    pub explicit_rdpcm_enabled: bool,
+    /// `extended_precision_processing`.
+    pub extended_precision_processing: bool,
+    /// `intra_smoothing_disabled`.
+    pub intra_smoothing_disabled: bool,
+    /// `high_precision_offsets_enabled`.
+    pub high_precision_offsets_enabled: bool,
+    /// `persistent_rice_adaptation_enabled`.
+    pub persistent_rice_adaptation_enabled: bool,
+    /// `cabac_bypass_alignment_enabled`.
+    pub cabac_bypass_alignment_enabled: bool,
+}
+
+impl SpsRangeExt {
+    fn parse(r: &mut BitReader) -> Result<Self> {
+        Ok(SpsRangeExt {
+            transform_skip_rotation_enabled: r.read_bit()?,
+            transform_skip_context_enabled: r.read_bit()?,
+            implicit_rdpcm_enabled: r.read_bit()?,
+            explicit_rdpcm_enabled: r.read_bit()?,
+            extended_precision_processing: r.read_bit()?,
+            intra_smoothing_disabled: r.read_bit()?,
+            high_precision_offsets_enabled: r.read_bit()?,
+            persistent_rice_adaptation_enabled: r.read_bit()?,
+            cabac_bypass_alignment_enabled: r.read_bit()?,
+        })
+    }
+}
+
+/// The `pps_range_extension()` fields of 7.3.2.3.2. The defaults are the inferred values.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsRangeExt {
+    /// `log2_max_transform_skip_block_size_minus2` (0 when transform skip is off).
+    pub log2_max_transform_skip_block_size_minus2: u32,
+    /// `cross_component_prediction_enabled`.
+    pub cross_component_prediction_enabled: bool,
+    /// `chroma_qp_offset_list_enabled`.
+    pub chroma_qp_offset_list_enabled: bool,
+    /// `diff_cu_chroma_qp_offset_depth`.
+    pub diff_cu_chroma_qp_offset_depth: u32,
+    /// `cb_qp_offset_list[i]` for `i` in `0..=chroma_qp_offset_list_len_minus1`.
+    pub cb_qp_offset_list: Vec<i32>,
+    /// `cr_qp_offset_list[i]`, same length as `cb_qp_offset_list`.
+    pub cr_qp_offset_list: Vec<i32>,
+    /// `log2_sao_offset_scale_luma`.
+    pub log2_sao_offset_scale_luma: u32,
+    /// `log2_sao_offset_scale_chroma`.
+    pub log2_sao_offset_scale_chroma: u32,
+}
+
+impl PpsRangeExt {
+    fn parse(r: &mut BitReader, transform_skip_enabled: bool) -> Result<Self> {
+        let mut e = PpsRangeExt::default();
+        if transform_skip_enabled {
+            e.log2_max_transform_skip_block_size_minus2 = r.read_ue()?;
+        }
+        e.cross_component_prediction_enabled = r.read_bit()?;
+        e.chroma_qp_offset_list_enabled = r.read_bit()?;
+        if e.chroma_qp_offset_list_enabled {
+            e.diff_cu_chroma_qp_offset_depth = r.read_ue()?;
+            let len = r.read_ue()? + 1;
+            if len > 6 {
+                return Err(Error::corrupt("HEVC PPS: chroma_qp_offset_list_len_minus1"));
+            }
+            for _ in 0..len {
+                e.cb_qp_offset_list.push(r.read_se()?);
+                e.cr_qp_offset_list.push(r.read_se()?);
+            }
+        }
+        e.log2_sao_offset_scale_luma = r.read_ue()?;
+        e.log2_sao_offset_scale_chroma = r.read_ue()?;
+        Ok(e)
     }
 }

@@ -1,3 +1,4 @@
+> SUPERSEDED 2026-10-15 by lanes/vp9f72.report.md (1080p frames identical to libvpx 1.15.0).
 # lane-vp9-hbd — profile 2 (10-bit 4:2:0) decode, byte-exact vs libvpx 1.15
 
 Base: `79984549` (main). Branch: `lane-vp9-hbd`. Worktree:

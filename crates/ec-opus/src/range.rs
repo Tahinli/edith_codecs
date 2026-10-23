@@ -256,7 +256,10 @@ impl<'a> RangeDecoder<'a> {
             lg = 2 * lg + bit;
             r_q15 >>= bit;
         }
-        self.nbits_total * 8 - lg
+        // libopus returns a signed value that can dip below zero after `skip_to_end` on a
+        // frame of a few bytes. Clamp at 0: the plain subtraction panicked in debug builds
+        // and wrapped in release (fuzz finding, ec-opus decode_packet).
+        self.nbits_total.saturating_mul(8).saturating_sub(lg)
     }
 }
 
@@ -587,7 +590,10 @@ impl RangeEncoder {
             lg = 2 * lg + bit;
             r_q15 >>= bit;
         }
-        self.nbits_total * 8 - lg
+        // libopus returns a signed value that can dip below zero after `skip_to_end` on a
+        // frame of a few bytes. Clamp at 0: the plain subtraction panicked in debug builds
+        // and wrapped in release (fuzz finding, ec-opus decode_packet).
+        self.nbits_total.saturating_mul(8).saturating_sub(lg)
     }
 
     /// Declares the rest of the frame used, so [`RangeEncoder::tell`] reports

@@ -1,0 +1,34 @@
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "tests::a_magic_cookie_is_read_in_every_shape_a_container_states_it" }
+{ "type": "test", "event": "started", "name": "tests::film_order_is_a_permutation_at_every_width" }
+{ "type": "test", "name": "tests::a_magic_cookie_is_read_in_every_shape_a_container_states_it", "event": "ok", "exec_time": 0.000002464 }
+{ "type": "test", "name": "tests::film_order_is_a_permutation_at_every_width", "event": "ok", "exec_time": 0.000002295 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000572196 }
+{ "type": "suite", "event": "started", "test_count": 8 }
+{ "type": "test", "event": "started", "name": "escape_frames_round_trip_random_data" }
+{ "type": "test", "event": "started", "name": "fuzz_round_trips_bit_exactly" }
+{ "type": "test", "event": "started", "name": "mono_24_bit_full_scale_alternating_round_trips" }
+{ "type": "test", "event": "started", "name": "mono_24_bit_ramp_round_trips_bit_exactly" }
+{ "type": "test", "name": "escape_frames_round_trip_random_data", "event": "ok", "exec_time": 0.037418486 }
+{ "type": "test", "event": "started", "name": "muxed_stream_is_alac_at_the_right_rate_and_ffmpeg_agrees" }
+{ "type": "test", "name": "fuzz_round_trips_bit_exactly", "event": "ok", "exec_time": 0.244522584 }
+{ "type": "test", "event": "started", "name": "real_audio_round_trips_and_compresses" }
+{ "type": "test", "name": "mono_24_bit_full_scale_alternating_round_trips", "event": "ok", "exec_time": 0.388898807 }
+{ "type": "test", "event": "started", "name": "twenty_four_bit_tonal_content_round_trips_bit_exactly" }
+{ "type": "test", "name": "real_audio_round_trips_and_compresses", "event": "ok", "exec_time": 0.229955904 }
+{ "type": "test", "event": "started", "name": "twenty_four_bit_uses_byte_shift_when_cheaper" }
+{ "type": "test", "name": "muxed_stream_is_alac_at_the_right_rate_and_ffmpeg_agrees", "event": "ok", "exec_time": 0.613640088 }
+{ "type": "test", "name": "twenty_four_bit_uses_byte_shift_when_cheaper", "event": "ok", "exec_time": 0.503359133 }
+{ "type": "test", "name": "mono_24_bit_ramp_round_trips_bit_exactly", "event": "ok", "exec_time": 1.685515706 }
+{ "type": "test", "name": "twenty_four_bit_tonal_content_round_trips_bit_exactly", "event": "ok", "exec_time": 1.333642504 }
+{ "type": "suite", "event": "ok", "passed": 8, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 1.723732542 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "every_alac_fixture_decodes_bit_exactly" }
+{ "type": "test", "event": "started", "name": "reference_encoded_24_bit_tone_decodes_bit_exactly" }
+{ "type": "test", "event": "started", "name": "truncated_frames_are_refused_without_panicking" }
+{ "type": "test", "name": "truncated_frames_are_refused_without_panicking", "event": "ok", "exec_time": 0.001634994 }
+{ "type": "test", "name": "reference_encoded_24_bit_tone_decodes_bit_exactly", "event": "ok", "exec_time": 0.444346654 }
+{ "type": "test", "name": "every_alac_fixture_decodes_bit_exactly", "event": "ok", "exec_time": 1.7021522359999999 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 1.702573588 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000045085 }

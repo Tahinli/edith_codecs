@@ -56,7 +56,7 @@ const TRANS_MATRIX_HALF: [[i32; 16]; 32] = [
 /// `transMatrix` for `trType = 1`: the 4x4 DST used for luma intra 4x4 blocks
 /// (8-316).
 #[rustfmt::skip]
-const DST_MATRIX: [[i32; 4]; 4] = [
+pub(crate) const DST_MATRIX: [[i32; 4]; 4] = [
     [29, 55, 74, 84],
     [74, 74, 0, -74],
     [84, -29, -74, 55],
@@ -68,7 +68,7 @@ const DST_MATRIX: [[i32; 4]; 4] = [
 const fn m32(row: usize, col: usize) -> i32 {
     if col < 16 {
         TRANS_MATRIX_HALF[row][col]
-    } else if row % 2 == 0 {
+    } else if row.is_multiple_of(2) {
         TRANS_MATRIX_HALF[row][31 - col]
     } else {
         -TRANS_MATRIX_HALF[row][31 - col]
@@ -92,7 +92,7 @@ const fn build_full_matrix() -> [[i32; 32]; 32] {
     }
     out
 }
-const FULL_MATRIX: [[i32; 32]; 32] = build_full_matrix();
+pub(crate) const FULL_MATRIX: [[i32; 32]; 32] = build_full_matrix();
 
 /// [`FULL_MATRIX`] transposed: `FULL_MATRIX_T[col][row] == FULL_MATRIX[row][col]`.
 /// [`inverse_1d`]'s odd sum walks a fixed column across varying rows, which
@@ -110,10 +110,10 @@ const fn transpose(m: &[[i32; 32]; 32]) -> [[i32; 32]; 32] {
     }
     out
 }
-const FULL_MATRIX_T: [[i32; 32]; 32] = transpose(&FULL_MATRIX);
+pub(crate) const FULL_MATRIX_T: [[i32; 32]; 32] = transpose(&FULL_MATRIX);
 
 /// `levelScale[k]`, 8.6.3.
-const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
+pub(crate) const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
 
 /// The quantizer's reciprocal of [`LEVEL_SCALE`], `round(2^20 / levelScale)`.
 ///
@@ -124,8 +124,8 @@ const QUANT_SCALE: [i32; 6] = [26_214, 23_302, 20_560, 18_396, 16_384, 14_564];
 
 /// Largest and smallest coefficient a Main-profile decoder may hold (`CoeffMin`,
 /// `CoeffMax` for `extended_precision_processing_flag = 0`).
-const COEFF_MIN: i32 = -32_768;
-const COEFF_MAX: i32 = 32_767;
+pub(crate) const COEFF_MIN: i32 = -32_768;
+pub(crate) const COEFF_MAX: i32 = 32_767;
 
 /// Dot product of two equal-length slices, SIMD in 8-wide chunks with a
 /// scalar tail.
@@ -217,6 +217,97 @@ fn forward_1d(n: usize, src: &[i32], dst: &mut [i32]) {
     }
 }
 
+/// Forward 1-D transform of `lines` independent vectors at once. `src[x * lines + l]`
+/// is sample `x` of line `l`; `dst[k * lines + l]` is coefficient `k`. The
+/// butterfly is the one in [`forward_1d`], but every operation runs across
+/// the lines, which the compiler turns into SIMD.
+fn forward_lines(n: usize, lines: usize, src: &[i32], dst: &mut [i32], scratch: &mut [i32]) {
+    if n == 1 {
+        for l in 0..lines {
+            dst[l] = 64 * src[l];
+        }
+        return;
+    }
+    let half = n / 2;
+    let stride = 32 / n;
+    let span = half * lines;
+    let (sums, rest) = scratch.split_at_mut(span);
+    let (diffs, rest) = rest.split_at_mut(span);
+    let (even, rest) = rest.split_at_mut(span);
+    for x in 0..half {
+        let a = &src[x * lines..x * lines + lines];
+        let b = &src[(n - 1 - x) * lines..(n - 1 - x) * lines + lines];
+        let s = &mut sums[x * lines..x * lines + lines];
+        let d = &mut diffs[x * lines..x * lines + lines];
+        for l in 0..lines {
+            s[l] = a[l] + b[l];
+            d[l] = a[l] - b[l];
+        }
+    }
+    forward_lines(half, lines, sums, even, rest);
+    for j in 0..half {
+        dst[2 * j * lines..(2 * j + 1) * lines].copy_from_slice(&even[j * lines..(j + 1) * lines]);
+        let matrix_row = &FULL_MATRIX[(2 * j + 1) * stride];
+        let out = &mut dst[(2 * j + 1) * lines..(2 * j + 2) * lines];
+        out.fill(0);
+        for x in 0..half {
+            let m = matrix_row[x];
+            let d = &diffs[x * lines..x * lines + lines];
+            for l in 0..lines {
+                out[l] += m * d[l];
+            }
+        }
+    }
+}
+
+/// [`forward_transform`] for the plain DCT, computed across rows and columns
+/// at once. Bit-identical to the line-at-a-time version. `SQ` is `n * n` and
+/// `SC` the scratch the butterfly needs (`3 * n * n`); they are const so a 4x4
+/// block does not zero 4 KiB buffers it will not use.
+fn forward_dct_gen<const SQ: usize, const SC: usize>(
+    residual: &[i32],
+    coeffs: &mut [i32],
+    n: usize,
+) {
+    let log2n = n.trailing_zeros() as i32;
+    let shift1 = log2n - 1;
+    let shift2 = log2n + 6;
+    let round1 = 1 << (shift1 - 1);
+    let round2 = 1 << (shift2 - 1);
+    let mut xt = [0i32; SQ];
+    let mut a = [0i32; SQ];
+    let mut b = [0i32; SQ];
+    let mut scratch = [0i32; SC];
+    // xt[x][y] = residual[y][x]
+    for y in 0..n {
+        for x in 0..n {
+            xt[x * n + y] = residual[y * n + x];
+        }
+    }
+    // a[k][y]: first pass over rows.
+    forward_lines(n, n, &xt, &mut a, &mut scratch);
+    // b[y][k] = shifted a[k][y]
+    for k in 0..n {
+        for y in 0..n {
+            b[y * n + k] = (a[k * n + y] + round1) >> shift1;
+        }
+    }
+    // Second pass over columns k: coefficient v of line k.
+    forward_lines(n, n, &b, &mut a, &mut scratch);
+    for (c, &v) in coeffs[..n * n].iter_mut().zip(&a) {
+        *c = (v + round2) >> shift2;
+    }
+}
+
+fn forward_dct_fast(residual: &[i32], coeffs: &mut [i32], n: usize) {
+    match n {
+        4 => forward_dct_gen::<16, 48>(residual, coeffs, n),
+        8 => forward_dct_gen::<64, 192>(residual, coeffs, n),
+        16 => forward_dct_gen::<256, 768>(residual, coeffs, n),
+        _ => forward_dct_gen::<1024, 3072>(residual, coeffs, n),
+    }
+}
+
 /// Forward 4x4 DST (the inverse of the normative `trType = 1` transform).
 fn forward_dst4(src: &[i32; 4], dst: &mut [i32; 4]) {
     for (k, out) in dst.iter_mut().enumerate() {
@@ -242,6 +333,32 @@ pub fn uses_dst(size: usize, is_luma: bool) -> bool {
 /// vertical frequency `v`, horizontal frequency `k`, which is the order the
 /// scans and the residual coder index.
 pub fn forward_transform(residual: &[i32], coeffs: &mut [i32], n: usize, dst_type: bool) {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(n, 4 | 8 | 16 | 32)
+        && (!dst_type || n == 4)
+        && crate::simd_tx::forward_transform_avx2(residual, coeffs, n, dst_type)
+    {
+        return;
+    }
+    forward_transform_scalar(residual, coeffs, n, dst_type);
+}
+
+/// [`forward_transform`] without the vector kernels.
+pub(crate) fn forward_transform_scalar(
+    residual: &[i32],
+    coeffs: &mut [i32],
+    n: usize,
+    dst_type: bool,
+) {
+    if !dst_type && n >= 4 {
+        forward_dct_fast(residual, coeffs, n);
+        return;
+    }
+    forward_transform_ref(residual, coeffs, n, dst_type);
+}
+
+/// Line-at-a-time forward transform: the reference the fast path is tested against.
+fn forward_transform_ref(residual: &[i32], coeffs: &mut [i32], n: usize, dst_type: bool) {
     let log2n = n.trailing_zeros() as i32;
     // 8-bit input: shift1 = log2N + bitDepth - 9, shift2 = log2N + 6. Together
     // they leave the DC at 128 x the mean residual whatever the block size,
@@ -290,56 +407,123 @@ pub fn forward_transform(residual: &[i32], coeffs: &mut [i32], n: usize, dst_typ
 const BD_SHIFT: i32 = 12;
 
 /// Inverse transform of scaled coefficients into residual samples, exactly as
-/// clause 8.6.4 specifies including its intermediate clipping.
+/// clause 8.6.4 specifies including its intermediate clipping. 8-bit samples.
 pub fn inverse_transform(scaled: &[i32], residual: &mut [i32], n: usize, dst_type: bool) {
-    let mut e = [0i32; 32 * 32];
+    inverse_transform_bd(scaled, residual, n, dst_type, 8);
+}
+
+/// [`inverse_transform`] at any bit depth: the final shift is `20 - BitDepth`.
+pub fn inverse_transform_bd(
+    scaled: &[i32],
+    residual: &mut [i32],
+    n: usize,
+    dst_type: bool,
+    bit_depth: u32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(n, 4 | 8 | 16 | 32)
+        && (!dst_type || n == 4)
+        && crate::simd_tx::inverse_transform_avx2(
+            scaled,
+            residual,
+            n,
+            dst_type,
+            20 - bit_depth as i32,
+        )
+    {
+        return;
+    }
+    inverse_transform_scalar(scaled, residual, n, dst_type, bit_depth);
+}
+
+/// [`inverse_transform_bd`] without the vector kernels.
+pub(crate) fn inverse_transform_scalar(
+    scaled: &[i32],
+    residual: &mut [i32],
+    n: usize,
+    dst_type: bool,
+    bit_depth: u32,
+) {
+    let bd_shift = 20 - bit_depth as i32;
     let mut col = [0i32; 32];
     let mut out = [0i32; 32];
-    // Stage 1: every column, i.e. along the vertical frequency index.
+    // Stage 1: every column, i.e. along the vertical frequency index. The
+    // intermediate `e` lives in `residual` itself: stage 2 reads a row before it
+    // writes that row and touches no other, so no second buffer is needed.
+    // `max_k` is one past the last column with a non-zero coefficient.
+    let mut max_k = 0;
     for k in 0..n {
-        let mut any = false;
+        let mut nz = 0;
         for y in 0..n {
             col[y] = scaled[y * n + k];
-            any |= col[y] != 0;
+            if col[y] != 0 {
+                nz = y + 1;
+            }
         }
-        if !any {
+        if nz == 0 {
             // A column of zeros transforms to zeros; most columns of a coded
             // block are zeros, which is what quantisation is for.
             for y in 0..n {
-                e[y * n + k] = 0;
+                residual[y * n + k] = 0;
             }
             continue;
         }
-        if dst_type {
-            let mut src4 = [0i32; 4];
-            src4.copy_from_slice(&col[..4]);
-            let mut dst4 = [0i32; 4];
-            inverse_dst4(&src4, &mut dst4);
-            out[..4].copy_from_slice(&dst4);
-        } else {
-            inverse_1d(n, &col[..n], &mut out[..n]);
-        }
+        max_k = k + 1;
+        transform_1d(n, dst_type, &col[..n], nz, &mut out[..n]);
         for y in 0..n {
-            e[y * n + k] = ((out[y] + 64) >> 7).clamp(COEFF_MIN, COEFF_MAX);
+            residual[y * n + k] = ((out[y] + 64) >> 7).clamp(COEFF_MIN, COEFF_MAX);
         }
     }
-    // Stage 2: every row, then the bit-depth shift (8-299).
-    let round = 1 << (BD_SHIFT - 1);
+    // Stage 2: every row, then the bit-depth shift (8-299). Columns past
+    // `max_k` are zero after stage 1, so the row transform stops there.
+    let round = 1 << (bd_shift - 1);
     for y in 0..n {
-        col[..n].copy_from_slice(&e[y * n..y * n + n]);
-        if dst_type {
-            let mut src4 = [0i32; 4];
-            src4.copy_from_slice(&col[..4]);
-            let mut dst4 = [0i32; 4];
-            inverse_dst4(&src4, &mut dst4);
-            out[..4].copy_from_slice(&dst4);
-        } else {
-            inverse_1d(n, &col[..n], &mut out[..n]);
-        }
+        col[..n].copy_from_slice(&residual[y * n..y * n + n]);
+        transform_1d(n, dst_type, &col[..n], max_k, &mut out[..n]);
         for x in 0..n {
-            residual[y * n + x] = (out[x] + round) >> BD_SHIFT;
+            residual[y * n + x] = (out[x] + round) >> bd_shift;
         }
     }
+}
+
+/// One 1-D inverse transform of `src` into `out` (`n` samples each). `nz` bounds
+/// the non-zero inputs: `src[nz..]` are all zero, so the direct sum can stop there.
+/// The DST is only used for 4x4 blocks, where `nz` does not matter.
+fn transform_1d(n: usize, dst_type: bool, src: &[i32], nz: usize, out: &mut [i32]) {
+    if dst_type {
+        let mut src4 = [0i32; 4];
+        src4.copy_from_slice(&src[..4]);
+        let mut dst4 = [0i32; 4];
+        inverse_dst4(&src4, &mut dst4);
+        out[..4].copy_from_slice(&dst4);
+    } else if nz <= DIRECT_MAX_NZ {
+        inverse_1d_direct(n, &src[..nz], &mut out[..n]);
+    } else {
+        inverse_1d(n, &src[..n], &mut out[..n]);
+    }
+}
+
+/// Up to this many non-zero inputs, [`inverse_1d_direct`] beats the butterfly.
+const DIRECT_MAX_NZ: usize = 16;
+
+/// The plain product `out[i] = sum_k M_n[k][i] * src[k]` over the first `src.len()`
+/// rows of the size-`n` matrix, which is the 32-point matrix's rows `k * (32 / n)`
+/// and its first `n` columns. The inner loop runs over outputs, so it is a
+/// contiguous multiply-add.
+fn inverse_1d_direct(n: usize, src: &[i32], out: &mut [i32]) {
+    let stride = 32 / n;
+    let mut acc = [0i32; 32];
+    let acc = &mut acc[..n];
+    for (k, &c) in src.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let row = &FULL_MATRIX[k * stride][..n];
+        for (a, &m) in acc.iter_mut().zip(row) {
+            *a += m * c;
+        }
+    }
+    out[..n].copy_from_slice(acc);
 }
 
 /// Forward transform skip (8.6.2): no transform at all, the residual samples
@@ -361,10 +545,16 @@ pub fn forward_transform_skip(residual: &[i32], coeffs: &mut [i32], n: usize) {
 /// `tsShift` and then down by the bit-depth shift, exactly as the decoder
 /// does it, so the encoder reconstructs the samples the decoder will.
 pub fn inverse_transform_skip(scaled: &[i32], residual: &mut [i32], n: usize) {
+    inverse_transform_skip_bd(scaled, residual, n, 8);
+}
+
+/// [`inverse_transform_skip`] at any bit depth (8.6.4.2 with `bdShift = 20 - BitDepth`).
+pub fn inverse_transform_skip_bd(scaled: &[i32], residual: &mut [i32], n: usize, bit_depth: u32) {
     let ts_shift = 5 + n.trailing_zeros() as i32;
-    let round = 1i32 << (BD_SHIFT - 1);
+    let bd_shift = 20 - bit_depth as i32;
+    let round = 1i32 << (bd_shift - 1);
     for (i, &d) in scaled[..n * n].iter().enumerate() {
-        residual[i] = ((d.clamp(COEFF_MIN, COEFF_MAX) << ts_shift) + round) >> BD_SHIFT;
+        residual[i] = ((d.clamp(COEFF_MIN, COEFF_MAX) << ts_shift) + round) >> bd_shift;
     }
 }
 
@@ -392,8 +582,9 @@ pub fn quantize_offset(
     dead_zone: i64,
 ) -> usize {
     let log2n = n.trailing_zeros() as i32;
-    let qbits = 21 + qp / 6 - log2n;
-    let scale = QUANT_SCALE[(qp % 6) as usize] as i64;
+    // QpY may be negative at 10 bits (down to -12), so the split is Euclidean.
+    let qbits = 21 + qp.div_euclid(6) - log2n;
+    let scale = QUANT_SCALE[qp.rem_euclid(6) as usize] as i64;
     let offset = (1i64 << qbits) / dead_zone;
     // `scale` <= 26_214 and `|coeffs[i]|` <= 32_768 (COEFF_MIN/MAX), and qp is
     // clamped to 0..=51 (crates/ec-h265/src/encoder.rs), so
@@ -404,6 +595,13 @@ pub fn quantize_offset(
     let scale32 = scale as i32;
     let offset32 = offset as i32;
     let mut nonzero = 0;
+    #[cfg(target_arch = "x86_64")]
+    if (n * n).is_multiple_of(8)
+        && let Some(nonzero) =
+            crate::simd_tx::quantize_avx2(coeffs, levels, n * n, scale32, offset32, qbits)
+    {
+        return nonzero;
+    }
     let coeffs = &coeffs[..n * n];
     let mut i = 0;
     while i + 8 <= coeffs.len() {
@@ -431,20 +629,87 @@ pub fn quantize_offset(
     nonzero
 }
 
+/// The smallest coefficient magnitude [`quantize_offset`] turns into a non-zero level for an
+/// `n` x `n` block at `qp` with the given `dead_zone` divisor.
+pub fn min_nonzero_coeff(n: usize, qp: i32, dead_zone: i64) -> i64 {
+    let log2n = n.trailing_zeros() as i32;
+    let qbits = 21 + qp.div_euclid(6) - log2n;
+    let scale = QUANT_SCALE[qp.rem_euclid(6) as usize] as i64;
+    let step = 1i64 << qbits;
+    let offset = step / dead_zone;
+    (step - offset + scale - 1) / scale
+}
+
 /// The unrounded level a coefficient would quantise to: the quantiser divides
 /// by a step, and this is that division carried out in full precision. Sign
 /// data hiding needs it to tell which coefficient is cheapest to nudge.
 pub fn ideal_level(coeff: i32, n: usize, qp: i32) -> f64 {
     let log2n = n.trailing_zeros() as i32;
-    let qbits = 21 + qp / 6 - log2n;
-    let scale = QUANT_SCALE[(qp % 6) as usize] as f64;
+    let qbits = 21 + qp.div_euclid(6) - log2n;
+    let scale = QUANT_SCALE[qp.rem_euclid(6) as usize] as f64;
     (coeff.unsigned_abs() as f64 * scale) / (1u64 << qbits) as f64
 }
 
-/// Scale levels back into coefficients, exactly as clause 8.6.3 specifies.
+/// Scale levels back into coefficients, exactly as clause 8.6.3 specifies, with
+/// the flat matrix of 16.
 pub fn dequantize(levels: &[i32], scaled: &mut [i32], n: usize, qp: i32) {
+    dequantize_weighted(levels, scaled, n, qp, 8, None);
+}
+
+/// The QP the quantizer works on, given the dequantizer's qP.
+///
+/// [`dequantize_bd`] at qP' (QpY + QpBdOffset) with the `bd - 8` extra shift gives the same
+/// coefficient step as the 8-bit dequantizer at QpY, so the quantizer runs at QpY.
+pub fn quant_qp(qp: i32, bit_depth: u32) -> i32 {
+    qp - 6 * (bit_depth as i32 - 8)
+}
+
+/// Bring a forward transform's output to the 16-bit coefficient range at `bit_depth`.
+///
+/// The forward transform gives coefficients 4^(bd-8) times the 8-bit ones for the same
+/// content, and the spec's `CoeffMin`/`CoeffMax` (-32768..=32767 without extended
+/// precision) are what a 10-bit stream must stay inside. The division is the forward half
+/// of the `20 - BitDepth` inverse shift, rounded.
+pub fn scale_forward_bd(coeffs: &mut [i32], n: usize, bit_depth: u32) {
+    let s = bit_depth.saturating_sub(8);
+    if s == 0 {
+        return;
+    }
+    let round = 1i32 << (s - 1);
+    for c in coeffs[..n * n].iter_mut() {
+        *c = (*c + round) >> s;
+    }
+}
+
+/// [`dequantize`] at any bit depth; `qp` is qP (QpBdOffset included).
+pub fn dequantize_bd(levels: &[i32], scaled: &mut [i32], n: usize, qp: i32, bit_depth: u32) {
+    dequantize_weighted(levels, scaled, n, qp, bit_depth, None);
+}
+
+/// [`dequantize`] with a scaling matrix (8.6.4.2): `m` is the block's
+/// `ScalingFactor` in raster order, or `None` for the flat 16 that a stream
+/// without scaling lists (or a transform-skipped block larger than 4x4) uses.
+pub fn dequantize_with(levels: &[i32], scaled: &mut [i32], n: usize, qp: i32, m: Option<&[u8]>) {
+    dequantize_weighted(levels, scaled, n, qp, 8, m);
+}
+
+/// The loop behind every dequantize entry point: one block at `bit_depth`, with
+/// the weight matrix `m` (or flat 16 for `None`).
+pub fn dequantize_weighted(
+    levels: &[i32],
+    scaled: &mut [i32],
+    n: usize,
+    qp: i32,
+    bit_depth: u32,
+    m: Option<&[u8]>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if m.is_none() && crate::simd_tx::dequantize_avx2(levels, scaled, n, qp, bit_depth) {
+        return;
+    }
     for (i, &level) in levels[..n * n].iter().enumerate() {
-        scaled[i] = dequant_level(level, n, qp);
+        let weight = m.map_or(16, |m| i64::from(m[i]));
+        scaled[i] = dequant_weighted(level, n, qp, bit_depth, weight);
     }
 }
 
@@ -452,10 +717,21 @@ pub fn dequantize(levels: &[i32], scaled: &mut [i32], n: usize, qp: i32) {
 /// [`dequantize`]. A rate-distortion search over the levels prices one
 /// coefficient at a time and has no use for the whole block.
 pub fn dequant_level(level: i32, n: usize, qp: i32) -> i32 {
+    dequant_level_bd(level, n, qp, 8)
+}
+
+/// [`dequant_level`] at any bit depth: `bdShift = BitDepth + Log2(nTbS) - 5`
+/// (8-300 with no scaling list, m = 16). `qp` is qP, which includes QpBdOffset.
+pub fn dequant_level_bd(level: i32, n: usize, qp: i32, bit_depth: u32) -> i32 {
+    dequant_weighted(level, n, qp, bit_depth, 16)
+}
+
+/// [`dequant_level`] with the scaling-matrix weight `m` in place of 16.
+fn dequant_weighted(level: i32, n: usize, qp: i32, bit_depth: u32, m: i64) -> i32 {
     let log2n = n.trailing_zeros() as i32;
-    let bd_shift = log2n + 3; // bitDepth + Log2(nTbS) + 10 - 15, 8-bit
+    let bd_shift = bit_depth as i32 + log2n - 5;
     let round = 1i64 << (bd_shift - 1);
-    let scale = (16 * LEVEL_SCALE[(qp % 6) as usize]) as i64;
+    let scale = m * i64::from(LEVEL_SCALE[(qp % 6) as usize]);
     let shift = qp / 6;
     let value = (((level as i64 * scale) << shift) + round) >> bd_shift;
     value.clamp(COEFF_MIN as i64, COEFF_MAX as i64) as i32
@@ -476,7 +752,25 @@ pub fn coeff_ssd_scale(n: usize) -> f64 {
 
 /// The chroma QP a luma QP maps to for 4:2:0 (Table 8-10), before any offset.
 pub fn chroma_qp(qp_luma: i32, offset: i32) -> i32 {
-    let qpi = (qp_luma + offset).clamp(0, 57);
+    chroma_qp_bd(qp_luma, offset, 8)
+}
+
+/// [`chroma_qp_bd`] for any chroma format: Table 8-10 when `ChromaArrayType` is 1 (4:2:0),
+/// and `Min(qPi, 51)` otherwise (8.6.1, 4:2:2 and 4:4:4).
+pub fn chroma_qp_for(qp_luma: i32, offset: i32, bit_depth: u32, chroma_format_idc: u32) -> i32 {
+    if chroma_format_idc == 1 {
+        return chroma_qp_bd(qp_luma, offset, bit_depth);
+    }
+    let qp_bd_offset_c = 6 * (bit_depth as i32 - 8);
+    (qp_luma + offset).clamp(-qp_bd_offset_c, 57).min(51)
+}
+
+/// [`chroma_qp`] at any bit depth (8.6.1): qPiCb is clipped to
+/// `-QpBdOffsetC..=57`, so the result can be negative at high bit depths.
+/// The caller adds QpBdOffsetC to get qP.
+pub fn chroma_qp_bd(qp_luma: i32, offset: i32, bit_depth: u32) -> i32 {
+    let qp_bd_offset_c = 6 * (bit_depth as i32 - 8);
+    let qpi = (qp_luma + offset).clamp(-qp_bd_offset_c, 57);
     if qpi < 30 {
         qpi
     } else if qpi > 43 {
@@ -489,6 +783,26 @@ pub fn chroma_qp(qp_luma: i32, offset: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fast_forward_matches_reference() {
+        let mut seed = 12345u32;
+        for &n in &[4usize, 8, 16, 32] {
+            for _ in 0..50 {
+                let res: Vec<i32> = (0..n * n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        ((seed >> 16) % 511) as i32 - 255
+                    })
+                    .collect();
+                let mut a = vec![0; n * n];
+                let mut b = vec![0; n * n];
+                forward_transform(&res, &mut a, n, false);
+                forward_transform_ref(&res, &mut b, n, false);
+                assert_eq!(a, b, "n={n}");
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

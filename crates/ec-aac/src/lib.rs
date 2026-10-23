@@ -18,11 +18,11 @@
 //! window shapes, TNS, pulse data, M/S and intensity stereo, PNS, and SCE, CPE,
 //! LFE, DSE, PCE and FIL elements.  HE-AAC v1 (SBR) is reconstructed: the core
 //! decodes, its low bands feed the SBR QMF/HF/envelope chain, and the output
-//! is at the extension rate.  Parametric Stereo is **not** implemented; a
-//! stream that signals it decodes to its AAC-LC core, at the core sample
-//! rate, and says so through [`AacDecoder::sbr_support`] and
-//! [`AacDecoder::output_sample_rate`] rather than silently claiming the
-//! extension rate.  See `sbr_is_reported_not_silently_upsampled` in the tests.
+//! is at the extension rate.  HE-AAC v2 adds Parametric Stereo (ISO/IEC
+//! 14496-3 subpart 8), reconstructed as FFmpeg does: a PS stream decodes to
+//! two channels at the extension rate.  A PS element whose PS header has not
+//! been decoded yet outputs its mono SBR signal on both channels.  Malformed
+//! PS data disables PS for that frame, with the same fallback.
 
 #![forbid(unsafe_code)]
 
@@ -37,8 +37,13 @@ mod sbr_hf;
 mod sbr_payload;
 pub mod sbr_qmf;
 mod sbr_qmf_window;
+mod ps_data;
+mod ps_dsp;
+mod ps_huff;
 mod sbr_tables;
 pub mod tables;
+#[doc(hidden)]
+pub mod knobs;
 
 pub use config::{
     AOT_AAC_LC, AOT_PS, AOT_SBR, AdtsHeader, AudioSpecificConfig, ProgramConfig,
@@ -69,9 +74,8 @@ pub enum SbrSupport {
     /// SBR is signalled and **is** reconstructed: the decoded audio spans
     /// the full extension bandwidth at the extension sample rate.
     V1,
-    /// SBR is signalled but not reconstructed (Parametric Stereo streams:
-    /// PS itself is still unimplemented). The AAC-LC core decodes, at the
-    /// core rate, half the signalled bandwidth.
+    /// SBR is signalled but not reconstructed. Not produced by this decoder
+    /// any more: Parametric Stereo streams report [`SbrSupport::V1`].
     CoreOnly,
 }
 
@@ -134,17 +138,39 @@ impl AacDecoder {
     pub fn with_config(cfg: AudioSpecificConfig) -> AacDecoder {
         let mut d = AacDecoder::new();
         d.block.set_sf_index(cfg.sf_index);
+        d.block.set_pce(cfg.pce.clone());
         d.sample_rate = cfg.sample_rate;
         d.channels = cfg.channels;
-        // PS is not reconstructed; SBR is. Both still need the core
-        // decoded first, but only a plain-SBR (non-PS) stream gets the
-        // extension-rate QMF chain wired in.
-        if cfg.sbr_present && !cfg.ps_present {
+        // SBR (and Parametric Stereo, for HE-AACv2) is reconstructed: the
+        // core is decoded first, then the extension-rate chain runs on it.
+        if cfg.sbr_present {
             let rate = cfg.extension_sample_rate.unwrap_or(cfg.sample_rate * 2);
             d.block.set_sbr_rate(Some(rate));
+            d.block.set_sbr_ps(cfg.ps_present);
+        } else if !cfg.ps_present {
+            // Plain AAC-LC config: an SBR payload may still follow (implicit signalling).
+            d.block.set_implicit_core(cfg.sample_rate);
+        }
+        if cfg.ps_present {
+            // PS output is stereo whatever the core's channel count.
+            d.channels = 2;
         }
         d.config = Some(cfg);
         d
+    }
+
+    /// Core-only decoding: SBR and PS are never applied. An explicit SBR or PS
+    /// config is dropped, and implicit SBR is never armed, so every SBR extension
+    /// payload is skipped and the output stays at the core rate.
+    pub fn core_only(mut self) -> AacDecoder {
+        self.block.set_sbr_rate(None);
+        self.block.disable_implicit_sbr();
+        if let Some(c) = self.config.as_mut() {
+            c.sbr_present = false;
+            c.ps_present = false;
+            c.extension_sample_rate = None;
+        }
+        self
     }
 
     /// A decoder configured from raw AudioSpecificConfig bytes -- an mp4
@@ -163,23 +189,57 @@ impl AacDecoder {
         self.config.as_ref()
     }
 
-    /// Whether the stream asked for SBR, and what became of it.
+    /// Whether the stream asked for SBR, and what became of it. A plain AAC-LC
+    /// stream whose frames carry an SBR payload (implicit signalling) reports
+    /// [`SbrSupport::V1`] once the first such payload has been decoded; see
+    /// [`AacDecoder::sbr_implicit`].
     pub fn sbr_support(&self) -> SbrSupport {
+        if self.block.implicit_sbr() {
+            return SbrSupport::V1;
+        }
         match &self.config {
-            Some(c) if c.ps_present => SbrSupport::CoreOnly,
-            Some(c) if c.sbr_present => SbrSupport::V1,
+            Some(c) if c.ps_present || c.sbr_present => SbrSupport::V1,
             _ => SbrSupport::NotSignalled,
         }
     }
 
+    /// Whether SBR was switched on by an implicit payload: a stream that
+    /// signals plain AAC-LC (config or ADTS header) but carries an SBR
+    /// extension payload, decoded at twice the core rate as ffmpeg and the
+    /// ISO reference do. Only ever true once the first such payload has been
+    /// decoded, and only for a core rate of at most 24 kHz. Explicit SBR
+    /// signalling is reported by [`AacDecoder::sbr_support`] alone.
+    pub fn sbr_implicit(&self) -> bool {
+        self.block.implicit_sbr()
+    }
+
+    /// Whether Parametric Stereo was switched on by an implicit payload: a
+    /// stream that signals plain AAC-LC but whose SBR extension carries a PS
+    /// extension (the HE-AACv2 form with no explicit signalling). Only true once
+    /// such a PS extension has been decoded, so a caller reads it after the
+    /// first frames. Implies [`AacDecoder::sbr_implicit`].
+    pub fn ps_implicit(&self) -> bool {
+        self.block.implicit_ps()
+    }
+
     /// The rate the samples this decoder hands back are actually at: the
-    /// extension rate for a reconstructed (V1) HE-AAC stream, the core
-    /// rate for plain AAC-LC or an unreconstructed (PS) stream -- claiming
-    /// bandwidth that was not actually rebuilt would be a lie.
+    /// extension rate for a reconstructed (V1) HE-AAC or HE-AACv2 stream,
+    /// the core rate for plain AAC-LC -- claiming bandwidth that was not
+    /// actually rebuilt would be a lie.
+    ///
+    /// For a decoder built from an ADTS header (no config), this is `None`
+    /// until the first frame has been decoded. After that it is the core
+    /// rate, or twice it once implicit SBR has switched on, so a caller
+    /// should read it again after each packet.
     pub fn output_sample_rate(&self) -> Option<u32> {
-        self.config.as_ref().map(|c| match self.sbr_support() {
-            SbrSupport::V1 => c.extension_sample_rate.unwrap_or(c.sample_rate * 2),
-            _ => c.sample_rate,
+        let (core, ext) = match &self.config {
+            Some(c) => (c.sample_rate, c.extension_sample_rate),
+            None if self.sample_rate != 0 => (self.sample_rate, None),
+            None => return None,
+        };
+        Some(match self.sbr_support() {
+            SbrSupport::V1 => ext.unwrap_or(core * 2),
+            _ => core,
         })
     }
 
@@ -191,11 +251,13 @@ impl AacDecoder {
             while at + 7 <= packet.len() {
                 let header = parse_adts(&packet[at..])?;
                 let end = (at + header.frame_length).min(packet.len());
-                let body = &packet[at + header.header_len..end];
+                // A truncated frame can end before its header does; clamp so the slice cannot invert.
+                let body = &packet[(at + header.header_len).min(end)..end];
                 if self.config.is_none() {
                     self.sample_rate = header.sample_rate;
                     self.channels = header.channels;
                     self.block.set_sf_index(header.sf_index);
+                    self.block.set_implicit_core(header.sample_rate);
                 }
                 let mut r = BitReader::new(body);
                 for _ in 0..header.raw_blocks {
@@ -214,6 +276,12 @@ impl AacDecoder {
             let mut r = BitReader::new(packet);
             planes = self.block.raw_data_block(&mut r)?;
         }
+        // ffmpeg decodes an HE-AAC mono stream with no PS payload (SBR reconstructed, one
+        // plane) as two identical channels ("Treating HE-AAC mono as stereo"). Match it.
+        if planes.len() == 1 && self.sbr_support() == SbrSupport::V1 {
+            let dup = planes[0].clone();
+            planes.push(dup);
+        }
         let channels = planes.len();
         if channels == 0 {
             return Ok(DecodedAudio {
@@ -226,12 +294,18 @@ impl AacDecoder {
         if self.channels == 0 {
             self.channels = channels as u16;
         }
-        let order = film_order(channels);
+        // A PCE names each plane's speaker, which orders the output; otherwise the
+        // channel configuration's bitstream order does.
+        let order = self
+            .block
+            .plane_order(channels)
+            .unwrap_or_else(|| film_order(channels).to_vec());
         let frames = planes[0].len();
         let mut samples = vec![0.0f32; frames * channels];
         for (out_ch, &src) in order.iter().take(channels).enumerate() {
             let plane = &planes[src.min(channels - 1)];
-            for (i, &v) in plane.iter().enumerate() {
+            // Planes can differ in length after `merge`; only the first `frames` samples fit.
+            for (i, &v) in plane.iter().take(frames).enumerate() {
                 samples[i * channels + out_ch] = v;
             }
         }

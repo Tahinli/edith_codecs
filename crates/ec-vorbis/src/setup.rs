@@ -199,6 +199,10 @@ pub struct Mode {
     pub mapping: usize,
 }
 
+/// Expanded codebook values one setup header may allocate, across all its books: 4M floats,
+/// 16 MiB. A real encoder's books come to a few hundred thousand.
+const CODEBOOK_VALUE_BUDGET: usize = 1 << 22;
+
 /// Everything the setup header configures.
 #[derive(Debug, Clone)]
 pub struct Setup {
@@ -222,8 +226,9 @@ impl Setup {
 
         let codebook_count = bits.read(8) as usize + 1;
         let mut codebooks = Vec::with_capacity(codebook_count);
+        let mut value_budget = CODEBOOK_VALUE_BUDGET;
         for _ in 0..codebook_count {
-            codebooks.push(Codebook::parse(&mut bits)?);
+            codebooks.push(Codebook::parse(&mut bits, &mut value_budget)?);
         }
 
         // Time-domain transforms: a placeholder in Vorbis I, but the field is

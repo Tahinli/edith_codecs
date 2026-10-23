@@ -1,0 +1,36 @@
+{ "type": "suite", "event": "started", "test_count": 14 }
+{ "type": "test", "event": "started", "name": "nal::tests::annexb_split_three_and_four_byte_codes" }
+{ "type": "test", "event": "started", "name": "nal::tests::annexb_trailing_zeros_trimmed_and_garbage_prefix_skipped" }
+{ "type": "test", "event": "started", "name": "nal::tests::cabac_zero_words_stay_inside_their_slice_nal" }
+{ "type": "test", "event": "started", "name": "nal::tests::header_parse_and_forbidden_bit" }
+{ "type": "test", "name": "nal::tests::annexb_split_three_and_four_byte_codes", "event": "ok", "exec_time": 0.000001262 }
+{ "type": "test", "event": "started", "name": "nal::tests::unescape_removes_only_emulation_bytes" }
+{ "type": "test", "name": "nal::tests::annexb_trailing_zeros_trimmed_and_garbage_prefix_skipped", "event": "ok", "exec_time": 0.000000541 }
+{ "type": "test", "event": "started", "name": "pps::tests::baseline_pps_without_tail" }
+{ "type": "test", "name": "nal::tests::header_parse_and_forbidden_bit", "event": "ok", "exec_time": 0.000000431 }
+{ "type": "test", "event": "started", "name": "pps::tests::high_profile_tail_parsed" }
+{ "type": "test", "name": "nal::tests::cabac_zero_words_stay_inside_their_slice_nal", "event": "ok", "exec_time": 0.000000461 }
+{ "type": "test", "event": "started", "name": "pps::tests::truncated_pps_is_need_more" }
+{ "type": "test", "name": "pps::tests::baseline_pps_without_tail", "event": "ok", "exec_time": 0.000004368 }
+{ "type": "test", "event": "started", "name": "slice::tests::idr_i_slice_header" }
+{ "type": "test", "name": "pps::tests::truncated_pps_is_need_more", "event": "ok", "exec_time": 0.000001933 }
+{ "type": "test", "event": "started", "name": "slice::tests::p_slice_fields_parse" }
+{ "type": "test", "name": "pps::tests::high_profile_tail_parsed", "event": "ok", "exec_time": 0.000003457 }
+{ "type": "test", "event": "started", "name": "slice::tests::truncated_header_is_need_more" }
+{ "type": "test", "name": "slice::tests::p_slice_fields_parse", "event": "ok", "exec_time": 0.000016471 }
+{ "type": "test", "event": "started", "name": "sps::tests::baseline_qcif_geometry" }
+{ "type": "test", "name": "slice::tests::idr_i_slice_header", "event": "ok", "exec_time": 0.000004969 }
+{ "type": "test", "event": "started", "name": "sps::tests::crop_units_420" }
+{ "type": "test", "name": "slice::tests::truncated_header_is_need_more", "event": "ok", "exec_time": 0.000004941 }
+{ "type": "test", "event": "started", "name": "sps::tests::truncated_is_need_more" }
+{ "type": "test", "name": "nal::tests::unescape_removes_only_emulation_bytes", "event": "ok", "exec_time": 0.000001383 }
+{ "type": "test", "name": "sps::tests::crop_units_420", "event": "ok", "exec_time": 0.000003557 }
+{ "type": "test", "name": "sps::tests::baseline_qcif_geometry", "event": "ok", "exec_time": 0.000003266 }
+{ "type": "test", "name": "sps::tests::truncated_is_need_more", "event": "ok", "exec_time": 0.000008596 }
+{ "type": "suite", "event": "ok", "passed": 14, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.001174608 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "pps_scaling_delta_out_of_range_is_corrupt_not_a_panic" }
+{ "type": "test", "name": "pps_scaling_delta_out_of_range_is_corrupt_not_a_panic", "event": "ok", "exec_time": 0.000009748 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000358214 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000040025 }

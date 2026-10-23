@@ -48,7 +48,7 @@ pub fn gate_crop(clip: &str) -> (String, usize, usize) {
         cw >= 128 && ch >= 128,
         "{nw}x{nh} is smaller than a superblock"
     );
-    let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
+    let (x, y) = (((nw - cw) / 2) & !1, ((nh - ch) / 2) & !1);
     (format!("crop={cw}:{ch}:{x}:{y}"), cw, ch)
 }
 
@@ -135,6 +135,11 @@ pub fn source(
 /// aomenc/ffmpeg over an at-most-a-few-MB fixture: seconds, not minutes.
 #[cfg(test)]
 pub(crate) fn run_with_stdin(cmd: &mut Command, input: &[u8]) -> std::process::Output {
+    crate::tool_cache::cached_output(cmd, Some(input), |c| run_child_with_stdin(c, input))
+}
+
+#[cfg(test)]
+fn run_child_with_stdin(cmd: &mut Command, input: &[u8]) -> std::process::Output {
     use std::io::{Read, Write};
     use std::process::Stdio;
     use std::time::{Duration, Instant};

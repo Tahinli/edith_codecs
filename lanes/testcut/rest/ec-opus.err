@@ -1,0 +1,15 @@
+   Compiling num-integer v0.1.47
+   Compiling strength_reduce v0.2.4
+   Compiling primal-check v0.3.4
+   Compiling transpose v0.2.3
+   Compiling num-complex v0.4.6
+   Compiling cpu-time v1.0.0
+   Compiling rustfft v6.4.1
+   Compiling ec-opus v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-opus)
+    Finished `release` profile [optimized] target(s) in 25.72s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_opus-c1d02d5a4318a024)
+     Running tests/conformance.rs (/home/user/.cache/tgt-testcut-rest/release/deps/conformance-ed653e40171ae3d4)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-ba0f226c4105579d)
+     Running tests/malformed_input.rs (/home/user/.cache/tgt-testcut-rest/release/deps/malformed_input-c314b663f2fb9958)
+     Running tests/snr_floor.rs (/home/user/.cache/tgt-testcut-rest/release/deps/snr_floor-a00c156a616ec2d0)
+   Doc-tests ec_opus

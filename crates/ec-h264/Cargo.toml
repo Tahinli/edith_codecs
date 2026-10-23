@@ -1,6 +1,6 @@
 [package]
 name = "ec-h264"
-description = "H.264 software decoder: I, P and B slices, CAVLC and CABAC, 8-bit 4:2:0 progressive, display-order output"
+description = "H.264 software decoder: I, P and B slices, CAVLC and CABAC, monochrome, 4:2:0, 4:2:2 and 4:4:4 (incl. lossless), 8 to 10 bits, progressive and interlaced, display-order output"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,8 @@ authors.workspace = true
 [features]
 # Internal-only RD experiment switches, compiled only by the measurement harness.
 rd-ablation = []
+# Per-stage timing counters in the macroblock coder (measurement builds only).
+enc-profile = []
 
 [dependencies]
 ec-core = { workspace = true }
@@ -22,3 +24,4 @@ ec-h264-syntax = { workspace = true }
 # produces a stream ffmpeg then cannot decode.
 ec-mp4 = { workspace = true }
 ec-matroska = { workspace = true }
+tracking-allocator = "0.4.0"

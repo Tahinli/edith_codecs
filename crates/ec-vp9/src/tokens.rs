@@ -1,6 +1,7 @@
 //! Coefficient token decoding (spec 8.5.2 `decode_coefs` / libvpx
 //! `vp9_detokenize.c`, ported verbatim including its context bookkeeping).
 
+use crate::adapt::Counts;
 use crate::bool::BoolDecoder;
 use crate::tables::*;
 
@@ -53,8 +54,8 @@ fn band_at(tx_size: usize, c: usize) -> usize {
 #[inline]
 fn read_coeff(r: &mut BoolDecoder, probs: &[u8], n: usize) -> i32 {
     let mut val = 0i32;
-    for i in 0..n {
-        val = (val << 1) + r.read_bool(probs[i]) as i32;
+    for &p in &probs[..n] {
+        val = (val << 1) + r.read_bool(p) as i32;
     }
     val
 }
@@ -81,6 +82,7 @@ pub(crate) fn decode_coefs(
     bd: u8,
     #[allow(unused_variables)] pos: (usize, usize),
     #[allow(unused_variables)] plane: usize,
+    counts: &mut Counts,
 ) -> CoeffBlock {
     let max_eob = 16 << (tx_size << 1);
     let mut coef = CoeffBlock {
@@ -93,9 +95,6 @@ pub(crate) fn decode_coefs(
     let mut dqv = dequant[0] as i32;
     let mut band = band_at(tx_size, c);
     let mut prob: &[u8; 3] = &probs4d[plane_type][usize::from(is_inter)][band][ctx];
-    if std::env::var_os("EC_VP9_DBG").is_some() && plane_type == 0 && ctx == 0 && band == 0 {
-        eprintln!("DBG coefs tx={tx_size} dq={dequant:?} ctx={ctx} band={band} prob={prob:?}");
-    }
 
     while c < max_eob {
         if crate::trace_enabled() {
@@ -104,10 +103,15 @@ pub(crate) fn decode_coefs(
                 prob[0], prob[1], prob[2]
             );
         }
+        // libvpx `++eob_branch_count[band][ctx]` before the EOB decision.
+        let cell = usize::from(is_inter);
+        counts.eob_branch[tx_size][plane_type][cell][band][ctx] += 1;
         if !r.read_bool(prob[0]) {
+            counts.coef[tx_size][plane_type][cell][band][ctx][3] += 1;
             break;
         }
         while !r.read_bool(prob[1]) {
+            counts.coef[tx_size][plane_type][cell][band][ctx][0] += 1;
             dqv = dequant[1] as i32;
             token_cache[scan[c] as usize] = 0;
             c += 1;
@@ -120,6 +124,7 @@ pub(crate) fn decode_coefs(
         }
         let mut v: i32;
         if r.read_bool(prob[2]) {
+            counts.coef[tx_size][plane_type][cell][band][ctx][2] += 1;
             let base = prob[2] as usize - 1;
             let p = &PARETO8_FULL[base * 8..base * 8 + 8];
             if r.read_bool(p[0]) {
@@ -158,6 +163,7 @@ pub(crate) fn decode_coefs(
                 v = (2 * dqv) >> dq_shift;
             }
         } else {
+            counts.coef[tx_size][plane_type][cell][band][ctx][1] += 1;
             token_cache[scan[c] as usize] = 1;
             v = dqv >> dq_shift;
         }

@@ -1,0 +1,38 @@
+{ "type": "suite", "event": "started", "test_count": 13 }
+{ "type": "test", "event": "started", "name": "header::tests::bad_marker_and_sync_code_are_corrupt" }
+{ "type": "test", "event": "started", "name": "header::tests::filter_levels_apply_deltas_and_clamp" }
+{ "type": "test", "event": "started", "name": "header::tests::lossless_needs_every_delta_zero" }
+{ "type": "test", "event": "started", "name": "header::tests::segment_qindex_is_absolute_or_relative" }
+{ "type": "test", "name": "header::tests::filter_levels_apply_deltas_and_clamp", "event": "ok", "exec_time": 0.000000832 }
+{ "type": "test", "event": "started", "name": "header::tests::tile_bounds_match_the_spec_formulas" }
+{ "type": "test", "name": "header::tests::bad_marker_and_sync_code_are_corrupt", "event": "ok", "exec_time": 0.00001606 }
+{ "type": "test", "event": "started", "name": "header::tests::truncated_header_is_need_more_not_panic" }
+{ "type": "test", "name": "header::tests::lossless_needs_every_delta_zero", "event": "ok", "exec_time": 0.000000261 }
+{ "type": "test", "event": "started", "name": "quant::tests::table_anchors" }
+{ "type": "test", "name": "header::tests::segment_qindex_is_absolute_or_relative", "event": "ok", "exec_time": 0.000000321 }
+{ "type": "test", "event": "started", "name": "quant::tests::tables_are_monotonic" }
+{ "type": "test", "name": "header::tests::tile_bounds_match_the_spec_formulas", "event": "ok", "exec_time": 0.00000017 }
+{ "type": "test", "event": "started", "name": "superframe::tests::empty_chunk_is_corrupt" }
+{ "type": "test", "name": "header::tests::truncated_header_is_need_more_not_panic", "event": "ok", "exec_time": 0.000015549 }
+{ "type": "test", "event": "started", "name": "superframe::tests::marker_without_matching_head_is_not_an_index" }
+{ "type": "test", "name": "quant::tests::table_anchors", "event": "ok", "exec_time": 0.00000013 }
+{ "type": "test", "event": "started", "name": "superframe::tests::oversized_entry_is_corrupt" }
+{ "type": "test", "name": "quant::tests::tables_are_monotonic", "event": "ok", "exec_time": 0.000001413 }
+{ "type": "test", "event": "started", "name": "superframe::tests::plain_chunk_is_one_frame" }
+{ "type": "test", "name": "superframe::tests::empty_chunk_is_corrupt", "event": "ok", "exec_time": 0.000000231 }
+{ "type": "test", "event": "started", "name": "superframe::tests::splits_at_the_coded_sizes" }
+{ "type": "test", "name": "superframe::tests::marker_without_matching_head_is_not_an_index", "event": "ok", "exec_time": 0.000000832 }
+{ "type": "test", "name": "superframe::tests::oversized_entry_is_corrupt", "event": "ok", "exec_time": 0.000001603 }
+{ "type": "test", "name": "superframe::tests::plain_chunk_is_one_frame", "event": "ok", "exec_time": 0.00000013 }
+{ "type": "test", "name": "superframe::tests::splits_at_the_coded_sizes", "event": "ok", "exec_time": 0.000002475 }
+{ "type": "suite", "event": "ok", "passed": 13, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.001956218 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "altref_fixture_has_superframes_and_hidden_frames" }
+{ "type": "test", "event": "started", "name": "every_fixture_matches_ffprobe" }
+{ "type": "test", "event": "started", "name": "fuzz_10k_mutations_never_panics" }
+{ "type": "test", "name": "altref_fixture_has_superframes_and_hidden_frames", "event": "ok", "exec_time": 0.000249188 }
+{ "type": "test", "name": "fuzz_10k_mutations_never_panics", "event": "ok", "exec_time": 0.025052086 }
+{ "type": "test", "name": "every_fixture_matches_ffprobe", "event": "ok", "exec_time": 7.419600132 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 7.420163641 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000040386 }

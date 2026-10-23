@@ -1,0 +1,5 @@
+   Compiling ec-pcm-ext v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-pcm-ext)
+    Finished `release` profile [optimized] target(s) in 2.06s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_pcm_ext-1f0f41c1e402476f)
+     Running tests/oracle.rs (/home/user/.cache/tgt-testcut-rest/release/deps/oracle-76607e7dac529394)
+   Doc-tests ec_pcm_ext

@@ -27,7 +27,12 @@ pub struct Codebook {
 
 impl Codebook {
     /// Parse one codebook from a setup header (§3.2.1).
-    pub fn parse(bits: &mut Bits) -> Result<Codebook> {
+    ///
+    /// `value_budget` is what the setup header has left for expanded lookup values. A book
+    /// with a lookup stores `entries * dimensions` floats whatever its header costs in bits
+    /// (a type 1 book can state 65535 dimensions in a handful of bytes), so the budget is
+    /// spent here, before the table is allocated.
+    pub fn parse(bits: &mut Bits, value_budget: &mut usize) -> Result<Codebook> {
         if bits.read(24) != 0x0056_4342 {
             return Err(Error::corrupt("codebook sync pattern"));
         }
@@ -90,6 +95,15 @@ impl Codebook {
                 let delta = bits.float32();
                 let value_bits = bits.read(4) + 1;
                 let sequence_p = bits.bit();
+                let Some(table) = entries
+                    .checked_mul(dimensions)
+                    .filter(|n| *n <= *value_budget)
+                else {
+                    return Err(Error::corrupt(
+                        "codebook lookup table exceeds the setup header's budget",
+                    ));
+                };
+                *value_budget -= table;
                 let lookup_values = match lookup_type {
                     1 => lookup1_values(entries, dimensions),
                     _ => entries * dimensions,
@@ -466,7 +480,7 @@ fn balance(lengths: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bits::BitsOut;
+    use crate::bits::{BitsOut, float32_pack};
 
     #[test]
     fn lookup1_values_matches_the_definition() {
@@ -474,6 +488,33 @@ mod tests {
         assert_eq!(lookup1_values(64, 2), 8);
         assert_eq!(lookup1_values(63, 2), 7);
         assert_eq!(lookup1_values(1000, 3), 10);
+    }
+
+    #[test]
+    fn a_lookup_table_past_the_header_budget_is_refused() {
+        // 256 entries of length 8 (a full tree), 65535 dimensions and one multiplicand: the
+        // table is 256 * 65535 floats, 64 MiB, stated in about 175 bytes of header.
+        let mut out = BitsOut::new();
+        out.write(0x0056_4342, 24);
+        out.write(65_535, 16);
+        out.write(256, 24);
+        out.bit(false); // unordered lengths
+        out.bit(false); // not sparse
+        for _ in 0..256 {
+            out.write(7, 5); // length 8
+        }
+        out.write(1, 4); // lookup type 1
+        out.write(float32_pack(0.0), 32);
+        out.write(float32_pack(1.0), 32);
+        out.write(0, 4); // value_bits 1
+        out.bit(false); // sequence_p
+        out.write(0, 1); // the one multiplicand
+        let bytes = out.finish();
+
+        let mut bits = Bits::new(&bytes);
+        let mut budget = 1 << 22;
+        assert!(Codebook::parse(&mut bits, &mut budget).is_err());
+        assert_eq!(budget, 1 << 22, "a refused table spends nothing");
     }
 
     #[test]

@@ -1,68 +1,51 @@
-//! Typed errors. Every `VAStatus` that is not `VA_STATUS_SUCCESS` becomes an
-//! [`Error::Va`] carrying the failing entry point, the raw status and libva's
-//! own description of it — a bare status number in a log is a bug report
-//! waiting to happen.
+//! Typed errors. Every libva failure becomes an [`Error::Va`] carrying the
+//! failing entry point, the raw status and libva's own description of it.
 
-use std::ffi::CStr;
 use std::fmt;
 
-use crate::sys;
+use cros_libva::VaError;
 
-/// Result alias for this crate.
+/// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Everything that can go wrong between here and the driver.
+/// Everything this crate can fail with.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// A libva entry point returned a failing `VAStatus`.
+    /// A libva entry point returned something other than `VA_STATUS_SUCCESS`.
     Va {
-        /// The libva function that failed, e.g. `"vaCreateConfig"`.
+        /// The libva entry point that failed, e.g. `"vaBeginPicture"`.
         op: &'static str,
         /// The raw `VAStatus`.
-        status: sys::VAStatus,
-        /// `vaErrorStr(status)`.
+        status: i32,
+        /// libva's description of `status`.
         message: String,
     },
-    /// Opening a DRM render node failed.
+    /// A DRM render node could not be opened as a VA display.
     Drm {
-        /// The device path that was tried.
+        /// The node that was tried.
         path: String,
-        /// The underlying `open(2)` failure.
-        source: std::io::Error,
+        /// Why it failed.
+        message: String,
     },
-    /// No `/dev/dri/renderD*` node could be opened as a VA display.
+    /// No usable `/dev/dri/renderD*` VA display exists.
     NoDevice,
-    /// The runtime libva is older than the ABI this crate transcribes.
-    ///
-    /// This is the drift guard: the struct layouts in [`crate::sys`] are
-    /// compile-time transcriptions of the 1.23 headers, so refusing to talk to
-    /// an older runtime is the only sound answer.
-    Version {
-        /// Runtime major version reported by `vaInitialize`.
-        major: i32,
-        /// Runtime minor version reported by `vaInitialize`.
-        minor: i32,
-    },
-    /// The driver returned something this FFI cannot interpret.
-    ///
-    /// Not a bitstream error and not a status code — a shape violation, e.g. a
-    /// surface attribute whose value type contradicts its documented type.
+    /// libva returned a value this crate cannot interpret.
     Protocol(String),
 }
 
 impl Error {
-    /// Build an [`Error::Va`] for `op`, looking the status string up in libva.
-    pub(crate) fn va(op: &'static str, status: sys::VAStatus) -> Self {
+    /// Wrap a cros-libva error with the libva entry point it came from.
+    pub(crate) fn va(op: &'static str, e: &VaError) -> Self {
         Error::Va {
             op,
-            status,
-            message: status_str(status),
+            status: e.va_status(),
+            message: e.to_string(),
         }
     }
 
-    /// The raw `VAStatus`, when this error came from a libva call.
-    pub fn status(&self) -> Option<sys::VAStatus> {
+    /// The raw `VAStatus`, if this error came from libva.
+    pub fn status(&self) -> Option<i32> {
         match self {
             Error::Va { status, .. } => Some(*status),
             _ => None,
@@ -70,31 +53,9 @@ impl Error {
     }
 }
 
-/// `vaErrorStr` as an owned Rust string.
-pub(crate) fn status_str(status: sys::VAStatus) -> String {
-    // SAFETY: `vaErrorStr` is documented (va.h:401) to return a pointer to a
-    // static, NUL-terminated english description for any input value —
-    // unknown codes map to a fallback string rather than NULL. It reads no
-    // global state we mutate, so it is safe to call at any time, including
-    // before vaInitialize. The pointer is static, so building a CStr from it
-    // and copying is sound; the copy outlives the borrow.
-    let ptr = unsafe { sys::vaErrorStr(status) };
-    if ptr.is_null() {
-        return format!("VAStatus 0x{status:08x}");
-    }
-    // SAFETY: non-NULL and NUL-terminated per the contract above.
-    unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Turn a `VAStatus` into a `Result`, tagging it with the entry point name.
-pub(crate) fn check(op: &'static str, status: sys::VAStatus) -> Result<()> {
-    if status == sys::VA_STATUS_SUCCESS {
-        Ok(())
-    } else {
-        Err(Error::va(op, status))
-    }
+/// Turn a cros-libva result into ours, tagging the entry point.
+pub fn va_ok<T>(op: &'static str, r: std::result::Result<T, VaError>) -> Result<T> {
+    r.map_err(|e| Error::va(op, &e))
 }
 
 impl fmt::Display for Error {
@@ -105,44 +66,11 @@ impl fmt::Display for Error {
                 status,
                 message,
             } => write!(f, "{op} failed: {message} (VAStatus 0x{status:08x})"),
-            Error::Drm { path, source } => write!(f, "opening DRM node {path}: {source}"),
+            Error::Drm { path, message } => write!(f, "opening DRM node {path}: {message}"),
             Error::NoDevice => write!(f, "no usable /dev/dri/renderD* VA display"),
-            Error::Version { major, minor } => write!(
-                f,
-                "libva {major}.{minor} is older than the {}.{} ABI this build transcribes",
-                crate::MIN_VA_MAJOR,
-                crate::MIN_VA_MINOR
-            ),
             Error::Protocol(what) => write!(f, "libva returned an uninterpretable value: {what}"),
         }
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Drm { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_strings_come_from_libva() {
-        assert_eq!(status_str(sys::VA_STATUS_SUCCESS), "success (no error)");
-        // Any unknown code must still produce a string, never a panic or NULL deref.
-        assert!(!status_str(0x7fff_0000).is_empty());
-    }
-
-    #[test]
-    fn check_maps_success_and_failure() {
-        assert!(check("vaFake", sys::VA_STATUS_SUCCESS).is_ok());
-        let err = check("vaFake", sys::VA_STATUS_ERROR_UNIMPLEMENTED).unwrap_err();
-        assert_eq!(err.status(), Some(sys::VA_STATUS_ERROR_UNIMPLEMENTED));
-        assert!(err.to_string().contains("vaFake"));
-    }
-}
+impl std::error::Error for Error {}

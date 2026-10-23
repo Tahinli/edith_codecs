@@ -243,6 +243,11 @@ impl Decoder {
         // previous stream carried. Segmentation and loop-filter deltas
         // live outside `fc` and never revert.
         let key = frame.first().is_some_and(|b| b & 1 == 0);
+        // An inter frame needs a decoded key frame to predict from. Reject it
+        // before header parsing touches the persisted state.
+        if !key && !self.has_reference_frames() {
+            return Err(Error::corrupt("VP8 inter frame before the first key frame"));
+        }
         let defaults = PersistedState::default();
         let (coeff_probs, mv_probs, ymode_probs, uv_mode_probs) = if key {
             (
@@ -277,6 +282,11 @@ impl Decoder {
             self.state.uv_mode_probs = uv_mode_probs;
         }
         Ok(pic)
+    }
+
+    /// True once a key frame has sized the buffers and filled every reference slot.
+    fn has_reference_frames(&self) -> bool {
+        self.mb_cols != 0 && self.refs[1..4].iter().all(|r| r.is_some())
     }
 
     fn ensure_buffers(&mut self, kf: KeyFrameDims) {
@@ -317,7 +327,9 @@ impl Decoder {
         header: FrameHeader,
         mut hdr_dec: BoolDecoder<'_>,
     ) -> Result<Option<Picture>> {
-        let kf = header.dims.expect("key frame header carries dimensions");
+        let kf = header
+            .dims
+            .ok_or_else(|| Error::corrupt("VP8 key frame without dimensions"))?;
         self.ensure_buffers(kf);
 
         // Token partition bool decoders (§9.5).
@@ -416,13 +428,13 @@ impl Decoder {
                     )
                 };
                 self.mb_info[row * (self.mb_cols + 1) + col].has_nz = coeffs.has_nonzero();
-                self.reconstruct_intra_mb(row - 1, col - 1, &mb, &coeffs);
+                self.reconstruct_intra_mb(row - 1, col - 1, &mb, &coeffs)?;
             }
         }
 
         // Loop filter post-pass (see module docs for the ordering
         // equivalence argument).
-        self.run_loopfilter(&header, true);
+        self.run_loopfilter(&header, true)?;
 
         // A key frame refreshes every reference slot and clears the
         // persisted segment map (§9.3, §9.7).
@@ -439,9 +451,9 @@ impl Decoder {
     /// Loop-filter post-pass over the whole frame (dixie order-equivalent
     /// driver; `inner_edges` follows libvpx's `skip_lf`: skipped MBs
     /// filter only their boundary edges, except 4x4-coded modes).
-    fn run_loopfilter(&mut self, header: &FrameHeader, is_keyframe: bool) {
+    fn run_loopfilter(&mut self, header: &FrameHeader, is_keyframe: bool) -> Result<()> {
         if header.filter_level == 0 {
-            return;
+            return Ok(());
         }
         let infos: Vec<MbFilterInfo> = (0..self.mb_rows)
             .flat_map(|r| (0..self.mb_cols).map(move |c| (r, c)))
@@ -465,7 +477,7 @@ impl Decoder {
         loopfilter::filter_frame_ex(
             yimg, uimg, vimg, ystride, ustride, mcols, mrows, sharpness, simple, &infos,
             is_keyframe,
-        );
+        )
     }
 
     /// Snapshot the reconstructed (post-LF) frame into a bordered
@@ -535,7 +547,7 @@ impl Decoder {
         header: FrameHeader,
         mut hdr_dec: BoolDecoder<'_>,
     ) -> Result<Option<Picture>> {
-        if self.mb_cols == 0 || self.refs[1..4].iter().any(|r| r.is_none()) {
+        if !self.has_reference_frames() {
             return Err(Error::corrupt("VP8 inter frame before the first key frame"));
         }
 
@@ -665,11 +677,11 @@ impl Decoder {
                     slot.has_nz = coeffs.has_nonzero();
                     slot.skip = mb.skip || !coeffs.has_nonzero();
                 }
-                self.reconstruct_inter_mb(row - 1, col - 1, &mb, &coeffs);
+                self.reconstruct_inter_mb(row - 1, col - 1, &mb, &coeffs)?;
             }
         }
 
-        self.run_loopfilter(&header, false);
+        self.run_loopfilter(&header, false)?;
 
         // Reference buffer updates, libvpx `swap_frame_buffers` order:
         // the copies run first (copy_gf = 2 must see a possibly
@@ -889,10 +901,15 @@ impl Decoder {
 
     /// Reconstruct one inter-frame MB: motion compensation from the
     /// reference (or intra prediction), then the residual (§16, §14).
-    fn reconstruct_inter_mb(&mut self, row: usize, col: usize, mb: &MbInfo, coeffs: &MbCoeffs) {
+    fn reconstruct_inter_mb(
+        &mut self,
+        row: usize,
+        col: usize,
+        mb: &MbInfo,
+        coeffs: &MbCoeffs,
+    ) -> Result<()> {
         if mb.ref_frame == 0 {
-            self.reconstruct_intra_mb(row, col, mb, coeffs);
-            return;
+            return self.reconstruct_intra_mb(row, col, mb, coeffs);
         }
         if crate::trace_enabled() {
             eprintln!(
@@ -902,11 +919,22 @@ impl Decoder {
         }
         let reff = self.refs[usize::from(mb.ref_frame)]
             .as_ref()
-            .expect("reference slots checked at frame start");
+            .ok_or_else(|| Error::corrupt("VP8 inter MB refers to an empty reference slot"))?;
         let x = col * 16;
         let y = row * 16;
         let w = self.mb_cols * 16;
         let h = self.mb_rows * 16;
+        // A reference left over from a frame of another size (a key frame that failed after
+        // resizing the decoder) has the wrong border geometry; the predictors index by it.
+        let (cw, ch) = (w / 2, h / 2);
+        if reff.stride != w + 2 * MC_BORDER
+            || reff.y.len() != (w + 2 * MC_BORDER) * (h + 2 * MC_BORDER)
+            || reff.uv_stride != cw + 2 * MC_BORDER
+            || reff.u.len() != (cw + 2 * MC_BORDER) * (ch + 2 * MC_BORDER)
+            || reff.v.len() != (cw + 2 * MC_BORDER) * (ch + 2 * MC_BORDER)
+        {
+            return Err(Error::corrupt("VP8 inter MB refers to a reference of another frame size"));
+        }
         // Luma: one 16x16 predict, or 16 independent 4x4 predicts for
         // SPLITMV (identical output to libvpx's grouped predicts). Each
         // predict lands at its own (bx, by) slot of one 16x16 patch.
@@ -992,6 +1020,8 @@ impl Decoder {
         } else {
             [0; 16]
         };
+        // loop indexes several parallel arrays; the index is clearer than zip chains
+        #[allow(clippy::needless_range_loop)]
         for b in 0..16usize {
             let (bx, by) = ((b % 4) * 4, (b / 4) * 4);
             let mut c = coeffs.y[b];
@@ -1005,12 +1035,15 @@ impl Decoder {
             (&mut self.u.data, &coeffs.u, &pu, self.u.stride),
             (&mut self.v.data, &coeffs.v, &pv, self.v.stride),
         ] {
+            // loop indexes several parallel arrays; the index is clearer than zip chains
+            #[allow(clippy::needless_range_loop)]
             for b in 0..4usize {
                 let (bx, by) = ((b % 2) * 4, (b / 2) * 4);
                 let dst = (1 + y / 2 + by) * stride + 1 + x / 2 + bx;
                 idct_add_into(plane_data, &coeffs_uv[b], pred, 16, by * 16 + bx, dst, stride);
             }
         }
+        Ok(())
     }
 
     /// Key-frame mode record (§11): Y mode at fixed probabilities, then
@@ -1053,7 +1086,7 @@ impl Decoder {
 
     /// Left subblock mode context (dixie `left_block_mode`).
     fn left_block_mode(&self, row: usize, col: usize, j: u8, mb: &MbInfo) -> u8 {
-        if j % 4 == 0 {
+        if j.is_multiple_of(4) {
             let left = self.mbi(row, col - 1);
             if left.y_mode == modes::YMode::BPred.as_u8() {
                 left.b_modes[usize::from(j) + 3]
@@ -1072,7 +1105,13 @@ impl Decoder {
     /// predicts from the reconstructed image (which already carries the
     /// earlier subblocks' residuals, §12.3) and is written back before
     /// the next subblock is predicted.
-    fn reconstruct_intra_mb(&mut self, row: usize, col: usize, mb: &MbInfo, coeffs: &MbCoeffs) {
+    fn reconstruct_intra_mb(
+        &mut self,
+        row: usize,
+        col: usize,
+        mb: &MbInfo,
+        coeffs: &MbCoeffs,
+    ) -> Result<()> {
         let x = col * 16;
         let y = row * 16;
         let y_mode = mb.y_mode;
@@ -1122,7 +1161,7 @@ impl Decoder {
                 }
                 let p = self.y.data[self.y.at_above_left(x + bx, y + by)];
                 let mut block = [0u8; 16];
-                intra::predict4(b_modes[b], &a8, &l4, p, &mut block);
+                intra::predict4(b_modes[b], &a8, &l4, p, &mut block)?;
                 for i in 0..4 {
                     let d = self.y.at(x + bx, y + by + i);
                     self.y.data[d..d + 4].copy_from_slice(&block[i * 4..i * 4 + 4]);
@@ -1153,7 +1192,9 @@ impl Decoder {
             let mut pred = [0u8; 256];
             intra::predict16(
                 y_mode, have_above, have_left, &above, &left, above_left, &mut pred,
-            );
+            )?;
+            // loop indexes several parallel arrays; the index is clearer than zip chains
+            #[allow(clippy::needless_range_loop)]
             for b in 0..16usize {
                 let bx = (b % 4) * 4;
                 let by = (b / 4) * 4;
@@ -1188,7 +1229,7 @@ impl Decoder {
             &left_u,
             al_u,
             &mut pred_u,
-        );
+        )?;
         intra::predict8(
             uv_mode,
             have_above,
@@ -1197,12 +1238,14 @@ impl Decoder {
             &left_v,
             al_v,
             &mut pred_v,
-        );
+        )?;
         let (cx, cy) = (x / 2, y / 2);
         for (plane_data, coeffs_uv, pred8, stride) in [
             (&mut self.u.data, &coeffs.u, &pred_u, self.u.stride),
             (&mut self.v.data, &coeffs.v, &pred_v, self.v.stride),
         ] {
+            // loop indexes several parallel arrays; the index is clearer than zip chains
+            #[allow(clippy::needless_range_loop)]
             for b in 0..4usize {
                 let bx = (b % 2) * 4;
                 let by = (b / 2) * 4;
@@ -1219,6 +1262,7 @@ impl Decoder {
                 }
             }
         }
+        Ok(())
     }
 
     /// Above-right extras (§12.3): real pixels from the above row,
@@ -1263,7 +1307,7 @@ impl Decoder {
             let off = self.y.at(0, row);
             y.extend_from_slice(&self.y.data[off..off + w]);
         }
-        let (cw, ch) = ((w + 1) / 2, (h + 1) / 2);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let mut u = Vec::with_capacity(cw * ch);
         let mut v = Vec::with_capacity(cw * ch);
         for row in 0..ch {

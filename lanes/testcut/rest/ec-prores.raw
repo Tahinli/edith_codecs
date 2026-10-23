@@ -1,0 +1,58 @@
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "idct::tests::simd_matches_reference_10" }
+{ "type": "test", "event": "started", "name": "idct::tests::simd_matches_reference_12" }
+{ "type": "test", "name": "idct::tests::simd_matches_reference_10", "event": "ok", "exec_time": 0.140263551 }
+{ "type": "test", "name": "idct::tests::simd_matches_reference_12", "event": "ok", "exec_time": 0.153177966 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1535422 }
+{ "type": "suite", "event": "started", "test_count": 13 }
+{ "type": "test", "event": "started", "name": "alpha_4444_round_trips_and_ffmpeg_agrees" }
+{ "type": "test", "event": "started", "name": "alpha_config_is_validated" }
+{ "type": "test", "event": "started", "name": "eight_bit_input_is_widened" }
+{ "type": "test", "event": "started", "name": "encode_speed_1080p_hq" }
+{ "type": "test", "name": "alpha_config_is_validated", "event": "ok", "exec_time": 0.00046739 }
+{ "type": "test", "event": "started", "name": "encoder_trait_and_mov_probe" }
+{ "type": "test", "name": "eight_bit_input_is_widened", "event": "ok", "exec_time": 0.010834446 }
+{ "type": "test", "event": "started", "name": "ffmpeg_and_ec_prores_decode_every_profile_identically" }
+{ "type": "test", "name": "encode_speed_1080p_hq", "event": "ok", "exec_time": 1.175718598 }
+{ "type": "test", "event": "started", "name": "frame_sizes_sit_on_apples_rates" }
+{ "type": "test", "name": "ffmpeg_and_ec_prores_decode_every_profile_identically", "event": "ok", "exec_time": 1.701942692 }
+{ "type": "test", "event": "started", "name": "interlaced_every_profile_ffmpeg_and_ours_agree" }
+{ "type": "test", "name": "encoder_trait_and_mov_probe", "event": "ok", "exec_time": 1.7360872029999999 }
+{ "type": "test", "event": "started", "name": "interlaced_fields_are_coded_separately" }
+{ "type": "test", "name": "interlaced_fields_are_coded_separately", "event": "ok", "exec_time": 0.023707021 }
+{ "type": "test", "event": "started", "name": "quality_matches_prores_ks_mandelbrot" }
+{ "type": "test", "name": "alpha_4444_round_trips_and_ffmpeg_agrees", "event": "ok", "exec_time": 3.715399081 }
+{ "type": "test", "event": "started", "name": "quality_matches_prores_ks_noisy" }
+{ "type": "test", "name": "frame_sizes_sit_on_apples_rates", "event": "ok", "exec_time": 3.196635189 }
+{ "type": "test", "event": "started", "name": "quality_matches_prores_ks_testsrc2" }
+{ "type": "test", "name": "interlaced_every_profile_ffmpeg_and_ours_agree", "event": "ok", "exec_time": 6.232035858 }
+{ "type": "test", "event": "started", "name": "random_small_sizes_round_trip" }
+{ "type": "test", "name": "random_small_sizes_round_trip", "event": "ok", "exec_time": 0.603951817 }
+{ "type": "test", "name": "quality_matches_prores_ks_testsrc2", "event": "ok", "exec_time": 9.236378649 }
+{ "type": "test", "name": "quality_matches_prores_ks_mandelbrot", "event": "ok", "exec_time": 13.109078034 }
+{ "type": "test", "name": "quality_matches_prores_ks_noisy", "event": "ok", "exec_time": 12.544037748000001 }
+{ "type": "suite", "event": "ok", "passed": 13, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 16.261346999 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "matches_ffmpeg" }
+{ "type": "test", "name": "matches_ffmpeg", "event": "ok", "exec_time": 19.975577205 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 19.975941582 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "hd_hq_throughput" }
+{ "type": "test", "name": "hd_hq_throughput", "event": "ok", "exec_time": 16.57050784 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 16.570822422 }
+{ "type": "suite", "event": "started", "test_count": 6 }
+{ "type": "test", "event": "started", "name": "corruptions_never_panic" }
+{ "type": "test", "event": "started", "name": "dump_seeds" }
+{ "type": "test", "event": "started", "name": "garbage_is_refused_by_name" }
+{ "type": "test", "event": "started", "name": "hostile_dimensions_are_bounded" }
+{ "type": "test", "name": "dump_seeds", "event": "ignored" }
+{ "type": "test", "event": "started", "name": "truncations_never_panic" }
+{ "type": "test", "name": "garbage_is_refused_by_name", "event": "ok", "exec_time": 0.00015387 }
+{ "type": "test", "event": "started", "name": "wrong_codec_is_unsupported" }
+{ "type": "test", "name": "wrong_codec_is_unsupported", "event": "ok", "exec_time": 0.000001302 }
+{ "type": "test", "name": "hostile_dimensions_are_bounded", "event": "ok", "exec_time": 0.626484821 }
+{ "type": "test", "name": "truncations_never_panic", "event": "ok", "exec_time": 0.629165399 }
+{ "type": "test", "name": "corruptions_never_panic", "event": "ok", "exec_time": 0.98757384 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.987947091 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000034486 }

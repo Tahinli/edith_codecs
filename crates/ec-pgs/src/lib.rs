@@ -22,7 +22,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use ec_core::{
     CodecId, CodecParameters, Decoder, Error, Frame, PixelFormat, Plane, Result, VideoFrame,
@@ -39,6 +40,20 @@ pub const SEG_WDS: u8 = 0x17;
 /// End of display set — the point at which a frame is complete.
 pub const SEG_END: u8 = 0x80;
 
+/// The largest width or height an object or a canvas may state. A disc's canvas is 1920×1080; the
+/// bound is generous, and it keeps the RLE bitmap and the RGBA canvas from being sized by a 16-bit
+/// field (65535×65535 is 17 GB of RGBA).
+pub const MAX_DIMENSION: u32 = 4096;
+
+/// How many finished display sets may wait for [`PgsDecoder::take_frame`] at once. A finished set
+/// is only its composition and the objects it places (the canvas is drawn when it is taken), so
+/// the bound is on a few kilobytes per set, not on a canvas. When the queue is full, [`PgsDecoder::push`]
+/// stops at the next display set and reports how many bytes it took.
+pub const MAX_PENDING_SETS: usize = 8;
+
+/// A palette: 256 straight-alpha RGBA entries.
+type Palette = [[u8; 4]; 256];
+
 /// The magic every `.sup` segment starts with.
 const MAGIC: [u8; 2] = *b"PG";
 /// Bytes before a segment's body: magic, PTS, DTS, type, size.
@@ -53,18 +68,42 @@ pub struct PgsDecoder {
     params: CodecParameters,
     /// Bytes not yet forming a whole segment.
     pending: Vec<u8>,
-    /// Objects by id, decoded run-length data as the stream stated it.
-    objects: HashMap<u16, Object>,
+    /// Objects by id, decoded run-length data as the stream stated it. Shared with the finished
+    /// display sets that place them.
+    objects: HashMap<u16, Arc<Object>>,
     /// The object being assembled out of a multi-segment ODS sequence.
     partial: Option<(u16, Object)>,
-    /// Palettes by id: 256 straight-alpha RGBA entries each.
-    palettes: HashMap<u8, Box<[[u8; 4]; 256]>>,
+    /// Palettes by id. Shared with finished display sets; a later palette segment copies on write.
+    palettes: HashMap<u8, Arc<Palette>>,
     /// Windows by id, for clipping.
     windows: HashMap<u8, Rect>,
     /// The composition the current display set is building.
     composition: Composition,
-    /// Frames finished but not yet taken.
-    ready: Vec<VideoFrame>,
+    /// Display sets finished but not yet taken, oldest first. Capped at [`MAX_PENDING_SETS`].
+    ready: VecDeque<Pending>,
+    /// Bytes of a packet [`Decoder::send_packet`] could not finish because the queue was full.
+    backlog: Vec<u8>,
+    /// An error from a segment of a call that stopped early, reported by the call that consumes
+    /// the rest of its input.
+    deferred: Option<Error>,
+}
+
+/// A finished display set, not yet drawn: the canvas size and everything it places, resolved
+/// against the state at the set's end so that later segments cannot change it.
+struct Pending {
+    width: u32,
+    height: u32,
+    draws: Vec<Draw>,
+}
+
+/// One object placed on a canvas.
+struct Draw {
+    object: Arc<Object>,
+    palette: Arc<Palette>,
+    x: u32,
+    y: u32,
+    window: Option<Rect>,
+    crop: Rect,
 }
 
 #[derive(Clone, Default)]
@@ -116,65 +155,114 @@ impl PgsDecoder {
             palettes: HashMap::new(),
             windows: HashMap::new(),
             composition: Composition::default(),
-            ready: Vec::new(),
+            ready: VecDeque::new(),
+            backlog: Vec::new(),
+            deferred: None,
         }
     }
 
-    /// Feed stream bytes. Every complete segment in them is consumed; a partial
-    /// tail is kept for the next call.
+    /// Feed stream bytes. Complete segments are consumed; a partial tail is kept for the next call.
     ///
-    /// A segment whose body is nonsense (a palette entry short, an object
-    /// claiming more pixels than its bitmap holds) is dropped and the stream
-    /// carries on: one torn display set out of eleven thousand must not cost
-    /// the track.
-    pub fn push(&mut self, bytes: &[u8]) -> Result<()> {
-        let mut buffer = std::mem::take(&mut self.pending);
-        buffer.extend_from_slice(bytes);
-        let mut data: &[u8] = &buffer;
+    /// Returns how many bytes of `bytes` were consumed. That is all of them, unless the queue of
+    /// finished display sets is full ([`MAX_PENDING_SETS`]): then the call stops before the next
+    /// display set and the caller takes frames and pushes `bytes[consumed..]` again. A caller that
+    /// drains every frame as it goes never sees a short count.
+    ///
+    /// A segment whose body is nonsense (a palette entry short, an object claiming more pixels
+    /// than its bitmap holds) is dropped and the stream carries on: one torn display set out of
+    /// eleven thousand must not cost the track. A segment whose *size* is past [`MAX_DIMENSION`]
+    /// is refused with [`Error::corrupt`] the same way. The first such error is returned by the
+    /// call that consumes the rest of its input (an `Err` means every byte was consumed). A
+    /// framing error (no `PG` at a segment boundary) stops the call at once.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<usize> {
+        let mut at = 0;
+        let mut first_error = self.deferred.take();
         loop {
-            if data.len() < HEADER {
+            if self.pending.len() < HEADER {
+                let take = (HEADER - self.pending.len()).min(bytes.len() - at);
+                self.pending.extend_from_slice(&bytes[at..at + take]);
+                at += take;
+                if self.pending.len() < HEADER {
+                    break;
+                }
+                if self.pending[..2] != MAGIC {
+                    // Not a segment boundary at all: resynchronising would invent structure,
+                    // so this is the one hard error.
+                    self.pending.clear();
+                    return Err(Error::corrupt("PGS: segment does not start with `PG`"));
+                }
+            }
+            let kind = self.pending[10];
+            if kind == SEG_END && self.ready.len() >= MAX_PENDING_SETS {
+                // The header waits in `pending`; the next call (or the next take_frame) resumes it.
                 break;
             }
-            if data[..2] != MAGIC {
-                // Not a segment boundary at all: resynchronising would invent
-                // structure, so this is the one hard error.
-                return Err(Error::corrupt("PGS: segment does not start with `PG`"));
+            let size = u16::from_be_bytes([self.pending[11], self.pending[12]]) as usize;
+            let total = HEADER + size;
+            if self.pending.len() < total {
+                let take = (total - self.pending.len()).min(bytes.len() - at);
+                self.pending.extend_from_slice(&bytes[at..at + take]);
+                at += take;
+                if self.pending.len() < total {
+                    break;
+                }
             }
-            let size = u16::from_be_bytes([data[11], data[12]]) as usize;
-            if data.len() < HEADER + size {
-                break;
+            let segment = std::mem::take(&mut self.pending);
+            if let Err(e) = self.segment(kind, &segment[HEADER..total]) {
+                first_error.get_or_insert(e);
             }
-            let kind = data[10];
-            let body = &data[HEADER..HEADER + size];
-            self.segment(kind, body);
-            data = &data[HEADER + size..];
         }
-        self.pending = data.to_vec();
-        Ok(())
+        if at < bytes.len() {
+            self.deferred = first_error;
+            return Ok(at);
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(at),
+        }
     }
 
-    /// The next finished display set, oldest first.
+    /// The next finished display set, drawn, oldest first.
     pub fn take_frame(&mut self) -> Option<VideoFrame> {
-        match self.ready.is_empty() {
-            true => None,
-            false => Some(self.ready.remove(0)),
+        let set = self.ready.pop_front()?;
+        let frame = rasterize(&set);
+        self.resume();
+        frame
+    }
+
+    /// How many finished display sets are waiting for [`PgsDecoder::take_frame`]. Never more than
+    /// [`MAX_PENDING_SETS`].
+    pub fn pending_frames(&self) -> usize {
+        self.ready.len()
+    }
+
+    /// Carry on with what a full queue held back: the rest of a packet, or a header waiting on
+    /// its display set.
+    fn resume(&mut self) {
+        let rest = std::mem::take(&mut self.backlog);
+        match self.push(&rest) {
+            Ok(used) => self.backlog = rest[used..].to_vec(),
+            Err(e) => {
+                self.deferred.get_or_insert(e);
+            }
         }
     }
 
     /// One segment against the running state.
-    fn segment(&mut self, kind: u8, body: &[u8]) {
+    fn segment(&mut self, kind: u8, body: &[u8]) -> Result<()> {
         match kind {
             SEG_PCS => self.pcs(body),
             SEG_WDS => self.wds(body),
             SEG_PDS => self.pds(body),
-            SEG_ODS => self.ods(body),
+            SEG_ODS => self.ods(body)?,
             SEG_END => {
-                if let Some(frame) = self.render() {
-                    self.ready.push(frame);
+                if let Some(set) = self.resolve()? {
+                    self.ready.push_back(set);
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn pcs(&mut self, body: &[u8]) {
@@ -252,26 +340,38 @@ impl PgsDecoder {
         let palette = self
             .palettes
             .entry(body[0])
-            .or_insert_with(|| Box::new([[0, 0, 0, 0]; 256]));
-        for entry in body[2..].chunks_exact(5) {
+            .or_insert_with(|| Arc::new([[0, 0, 0, 0]; 256]));
+        let (entries, _) = body[2..].as_chunks::<5>();
+        let palette = Arc::make_mut(palette);
+        for entry in entries {
             palette[entry[0] as usize] = rgba(entry[1], entry[2], entry[3], entry[4]);
         }
     }
 
-    fn ods(&mut self, body: &[u8]) {
+    fn ods(&mut self, body: &[u8]) -> Result<()> {
         if body.len() < 4 {
-            return;
+            return Ok(());
         }
         let id = u16::from_be_bytes([body[0], body[1]]);
         let sequence = body[3];
         if sequence & 0x80 != 0 {
             // First (or only) segment of the sequence: the dimensions ride here.
             if body.len() < 11 {
-                return;
+                return Ok(());
+            }
+            let width = u32::from(u16::from_be_bytes([body[7], body[8]]));
+            let height = u32::from(u16::from_be_bytes([body[9], body[10]]));
+            if width > MAX_DIMENSION || height > MAX_DIMENSION {
+                // A partial sequence under this id is abandoned too, so its later fragments
+                // cannot attach to an older object.
+                self.partial = None;
+                return Err(Error::corrupt(format!(
+                    "PGS: object {id} is {width}x{height}, past the {MAX_DIMENSION}x{MAX_DIMENSION} limit"
+                )));
             }
             let object = Object {
-                width: u32::from(u16::from_be_bytes([body[7], body[8]])),
-                height: u32::from(u16::from_be_bytes([body[9], body[10]])),
+                width,
+                height,
                 rle: body[11..].to_vec(),
             };
             self.partial = Some((id, object));
@@ -283,75 +383,105 @@ impl PgsDecoder {
         if sequence & 0x40 != 0
             && let Some((id, object)) = self.partial.take()
         {
-            self.objects.insert(id, object);
+            self.objects.insert(id, Arc::new(object));
         }
+        Ok(())
     }
 
-    /// The current composition as one RGBA canvas, or `None` when it states no
-    /// canvas at all (a display set seen before any PCS).
-    fn render(&mut self) -> Option<VideoFrame> {
+    /// The finished display set the composition describes, resolved against the state now, or
+    /// `None` when it states no canvas at all (a display set seen before any PCS). A canvas past
+    /// [`MAX_DIMENSION`] is refused. Nothing is drawn here: that waits for [`rasterize`].
+    fn resolve(&self) -> Result<Option<Pending>> {
         let (width, height) = (self.composition.width, self.composition.height);
         if width == 0 || height == 0 {
-            return None;
+            return Ok(None);
         }
-        let stride = width as usize * 4;
-        let mut canvas = vec![0u8; stride.checked_mul(height as usize)?];
-        let palette = self.palettes.get(&self.composition.palette_id);
-        for placement in &self.composition.objects {
-            let (Some(object), Some(palette)) = (self.objects.get(&placement.object_id), palette)
-            else {
-                continue;
-            };
-            let Some(indices) = decode_rle(&object.rle, object.width, object.height) else {
-                continue;
-            };
-            // A window clips its objects; a crop takes a rectangle out of the
-            // object before it is placed.
-            let window = self.windows.get(&placement.window_id).copied();
-            let crop = placement.crop.unwrap_or(Rect {
-                x: 0,
-                y: 0,
-                width: object.width,
-                height: object.height,
-            });
-            for row in 0..crop.height.min(object.height.saturating_sub(crop.y)) {
-                let target_y = placement.y + row;
-                if target_y >= height {
-                    break;
-                }
-                for col in 0..crop.width.min(object.width.saturating_sub(crop.x)) {
-                    let target_x = placement.x + col;
-                    if target_x >= width {
-                        break;
-                    }
-                    if let Some(w) = window
-                        && (target_x < w.x
-                            || target_y < w.y
-                            || target_x >= w.x + w.width
-                            || target_y >= w.y + w.height)
-                    {
-                        continue;
-                    }
-                    let index = indices[((crop.y + row) * object.width + crop.x + col) as usize];
-                    let colour = palette[index as usize];
-                    // Fully transparent palette entries paint nothing, which is
-                    // what lets two objects share a window.
-                    if colour[3] == 0 {
-                        continue;
-                    }
-                    let at = target_y as usize * stride + target_x as usize * 4;
-                    canvas[at..at + 4].copy_from_slice(&colour);
-                }
+        if width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(Error::corrupt(format!(
+                "PGS: canvas {width}x{height} is past the {MAX_DIMENSION}x{MAX_DIMENSION} limit"
+            )));
+        }
+        let mut draws = Vec::new();
+        if let Some(palette) = self.palettes.get(&self.composition.palette_id) {
+            for placement in &self.composition.objects {
+                let Some(object) = self.objects.get(&placement.object_id) else {
+                    continue;
+                };
+                // A crop takes a rectangle out of the object before it is placed.
+                let crop = placement.crop.unwrap_or(Rect {
+                    x: 0,
+                    y: 0,
+                    width: object.width,
+                    height: object.height,
+                });
+                draws.push(Draw {
+                    object: Arc::clone(object),
+                    palette: Arc::clone(palette),
+                    x: placement.x,
+                    y: placement.y,
+                    window: self.windows.get(&placement.window_id).copied(),
+                    crop,
+                });
             }
         }
-        VideoFrame::try_new(
-            PixelFormat::Rgba8,
+        Ok(Some(Pending {
             width,
             height,
-            vec![Plane::new(canvas, stride)],
-        )
-        .ok()
+            draws,
+        }))
     }
+}
+
+/// One finished display set as an RGBA canvas. An object whose run-length data does not describe
+/// its bitmap is skipped.
+fn rasterize(set: &Pending) -> Option<VideoFrame> {
+    let (width, height) = (set.width, set.height);
+    let stride = width as usize * 4;
+    let mut canvas = vec![0u8; stride * height as usize];
+    for draw in &set.draws {
+        let object = &draw.object;
+        let Some(indices) = decode_rle(&object.rle, object.width, object.height) else {
+            continue;
+        };
+        let crop = draw.crop;
+        for row in 0..crop.height.min(object.height.saturating_sub(crop.y)) {
+            let target_y = draw.y + row;
+            if target_y >= height {
+                break;
+            }
+            for col in 0..crop.width.min(object.width.saturating_sub(crop.x)) {
+                let target_x = draw.x + col;
+                if target_x >= width {
+                    break;
+                }
+                // A window clips its objects.
+                if let Some(w) = draw.window
+                    && (target_x < w.x
+                        || target_y < w.y
+                        || target_x >= w.x + w.width
+                        || target_y >= w.y + w.height)
+                {
+                    continue;
+                }
+                let index = indices[((crop.y + row) * object.width + crop.x + col) as usize];
+                let colour = draw.palette[index as usize];
+                // Fully transparent palette entries paint nothing, which is what lets two
+                // objects share a window.
+                if colour[3] == 0 {
+                    continue;
+                }
+                let at = target_y as usize * stride + target_x as usize * 4;
+                canvas[at..at + 4].copy_from_slice(&colour);
+            }
+        }
+    }
+    VideoFrame::try_new(
+        PixelFormat::Rgba8,
+        width,
+        height,
+        vec![Plane::new(canvas, stride)],
+    )
+    .ok()
 }
 
 impl Decoder for PgsDecoder {
@@ -360,7 +490,15 @@ impl Decoder for PgsDecoder {
     }
 
     fn send_packet(&mut self, packet: &ec_core::Packet) -> Result<()> {
-        self.push(&packet.data)
+        // A packet the full queue held back is finished first; the caller receives before it sends.
+        if !self.backlog.is_empty() {
+            return Err(Error::NeedMore);
+        }
+        let used = self.push(&packet.data)?;
+        if used < packet.data.len() {
+            self.backlog = packet.data[used..].to_vec();
+        }
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
@@ -560,6 +698,51 @@ mod tests {
         .concat();
         decoder.push(&torn).unwrap();
         assert!(decoder.take_frame().is_none());
+    }
+
+    #[test]
+    fn a_long_stream_in_one_push_keeps_the_queue_bounded() {
+        // 3000 display sets in one call: far more than the queue holds. The call stops when the
+        // queue is full and reports how far it got; draining and pushing the rest finishes it.
+        const SETS: usize = 3000;
+        let one = display_set();
+        let stream = one.repeat(SETS);
+        let mut decoder = PgsDecoder::new();
+        let mut at = 0;
+        let mut max_queued = 0;
+        let mut frames = 0;
+        let first = decoder.push(&stream).unwrap();
+        assert!(first < stream.len(), "a full queue must stop the call");
+        at += first;
+        while at < stream.len() || decoder.pending_frames() > 0 {
+            max_queued = max_queued.max(decoder.pending_frames());
+            while let Some(frame) = decoder.take_frame() {
+                assert_eq!((frame.width, frame.height), (16, 4));
+                frames += 1;
+            }
+            if at < stream.len() {
+                at += decoder.push(&stream[at..]).unwrap();
+            }
+            max_queued = max_queued.max(decoder.pending_frames());
+        }
+        assert!(max_queued <= MAX_PENDING_SETS, "queued {max_queued}");
+        assert_eq!(frames, SETS);
+    }
+
+    #[test]
+    fn a_full_queue_holds_the_last_end_until_a_frame_is_taken() {
+        // One more set than the queue holds. The END that would finish the last set has an empty
+        // body, so its header is the last thing in the call: it waits in the decoder, and taking a
+        // frame finishes it without another push.
+        let stream = display_set().repeat(MAX_PENDING_SETS + 1);
+        let mut decoder = PgsDecoder::new();
+        assert_eq!(decoder.push(&stream).unwrap(), stream.len());
+        assert_eq!(decoder.pending_frames(), MAX_PENDING_SETS);
+        let mut frames = 0;
+        while decoder.take_frame().is_some() {
+            frames += 1;
+        }
+        assert_eq!(frames, MAX_PENDING_SETS + 1);
     }
 
     #[test]

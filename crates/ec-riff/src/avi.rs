@@ -9,6 +9,8 @@ use std::io::{Read, Seek, SeekFrom};
 use ec_core::{Error, Result};
 
 const FALLBACK_SCAN: usize = 4 << 20;
+/// Deepest `rec ` list nesting `next_packet` will walk. Real files nest one level.
+const MAX_REC_DEPTH: usize = 16;
 
 /// One audio stream declared by an AVI file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,7 @@ struct OdmlRef {
 #[derive(Debug, Default)]
 struct Hdrl {
     streams: Vec<AviAudioStream>,
+    extras: Vec<Vec<u8>>,
     odml: Vec<OdmlRef>,
 }
 
@@ -86,6 +89,7 @@ struct Hdrl {
 pub struct AviReader<R> {
     inner: R,
     streams: Vec<AviAudioStream>,
+    extras: Vec<Vec<u8>>,
     movi_start: u64,
     movi_end: u64,
     pos: u64,
@@ -135,8 +139,7 @@ impl<R: Read + Seek> AviReader<R> {
                     _ => {}
                 }
             } else if &id == b"idx1" {
-                let mut body = vec![0; size as usize];
-                read_full(&mut inner, &mut body)?;
+                let body = read_body(&mut inner, size)?;
                 idx1 = parse_idx1_body(&body);
             }
             pos = next;
@@ -164,6 +167,7 @@ impl<R: Read + Seek> AviReader<R> {
         Ok(AviReader {
             inner,
             streams: hdrl.streams,
+            extras: hdrl.extras,
             movi_start: pos,
             movi_end,
             pos,
@@ -175,6 +179,12 @@ impl<R: Read + Seek> AviReader<R> {
     /// Audio streams declared in the header.
     pub fn audio_streams(&self) -> &[AviAudioStream] {
         &self.streams
+    }
+
+    /// The `cbSize` tail of audio stream `i`'s WAVEFORMATEX (MS ADPCM's
+    /// coefficient table, IMA's samples per block), empty when it has none.
+    pub fn audio_extradata(&self, i: usize) -> &[u8] {
+        self.extras.get(i).map_or(&[], Vec::as_slice)
     }
 
     /// True when the file supplied an AVI index this reader could use.
@@ -207,14 +217,17 @@ impl<R: Read + Seek> AviReader<R> {
             .ok_or_else(|| Error::corrupt(format!("AVI: no audio stream {stream}")))?;
         let estimate = if stream_info.length > 0 {
             let movi = self.movi_end.saturating_sub(self.movi_start);
-            self.movi_start
-                + movi
-                    .saturating_mul(target)
-                    .saturating_div(u64::from(stream_info.length))
+            self.movi_start.saturating_add(
+                movi.saturating_mul(target)
+                    .saturating_div(u64::from(stream_info.length)),
+            )
         } else {
             self.movi_start
         };
-        let start = estimate.clamp(self.movi_start, self.movi_end.saturating_sub(8));
+        // Not `clamp`: it panics when the movi list is shorter than 8 bytes and the bounds cross.
+        let start = estimate
+            .min(self.movi_end.saturating_sub(8))
+            .max(self.movi_start);
         if let Some((offset, landed)) = self.scan_to_stream(stream, start, target)? {
             self.pos = offset;
             return Ok(landed);
@@ -288,7 +301,7 @@ impl<R: Read + Seek> AviReader<R> {
                         return Err(Error::Eof);
                     }
                     if &kind == b"rec " {
-                        self.queue_packets_in(data + 4, data + size)?;
+                        self.queue_packets_in(data + 4, data + size, 0)?;
                         if let Some(packet) = self.pending.pop_front() {
                             return Ok(packet);
                         }
@@ -311,7 +324,11 @@ impl<R: Read + Seek> AviReader<R> {
         Err(Error::Eof)
     }
 
-    fn queue_packets_in(&mut self, start: u64, end: u64) -> Result<()> {
+    fn queue_packets_in(&mut self, start: u64, end: u64, depth: usize) -> Result<()> {
+        // Each nested `rec ` list recurses once; cap it so a hostile file cannot exhaust the stack.
+        if depth > MAX_REC_DEPTH {
+            return Err(Error::corrupt("AVI rec lists nested too deeply"));
+        }
         let mut pos = start;
         while pos + 8 <= end {
             self.inner.seek(SeekFrom::Start(pos))?;
@@ -333,7 +350,7 @@ impl<R: Read + Seek> AviReader<R> {
                         break;
                     }
                     if &kind == b"rec " {
-                        self.queue_packets_in(data + 4, data + size)?;
+                        self.queue_packets_in(data + 4, data + size, depth + 1)?;
                     }
                 }
             } else if let Some(stream) = stream_number(&id).filter(|_| &id[2..4] == b"wb")
@@ -442,6 +459,7 @@ fn parse_hdrl<R: Read + Seek>(inner: &mut R, start: u64, end: u64) -> Result<Hdr
                 let parsed = parse_strl(inner, stream_no, data + 4, data + size)?;
                 if let Some(stream) = parsed.stream {
                     hdrl.streams.push(stream);
+                    hdrl.extras.push(parsed.extra);
                     hdrl.odml.extend(parsed.odml);
                 }
                 stream_no += 1;
@@ -455,6 +473,7 @@ fn parse_hdrl<R: Read + Seek>(inner: &mut R, start: u64, end: u64) -> Result<Hdr
 #[derive(Default)]
 struct Strl {
     stream: Option<AviAudioStream>,
+    extra: Vec<u8>,
     odml: Vec<OdmlRef>,
 }
 
@@ -482,6 +501,7 @@ fn parse_strl<R: Read + Seek>(inner: &mut R, stream_no: u32, start: u64, end: u6
     let mut fmt = None;
     let mut timing = StreamTiming::default();
     let mut odml = Vec::new();
+    let mut extra = Vec::new();
     let mut pos = start;
     while pos + 8 <= end {
         inner.seek(SeekFrom::Start(pos))?;
@@ -510,6 +530,13 @@ fn parse_strl<R: Read + Seek>(inner: &mut R, stream_no: u32, start: u64, end: u6
             b"strf" => {
                 let mut body = vec![0u8; size.min(18) as usize];
                 read_full(inner, &mut body)?;
+                if body.len() >= 18 {
+                    let cb = u64::from(u16::from_le_bytes([body[16], body[17]]))
+                        .min(size.saturating_sub(18))
+                        .min(4096);
+                    extra.resize(cb as usize, 0);
+                    read_full(inner, &mut extra)?;
+                }
                 if body.len() >= 16 {
                     fmt = Some(AviAudioStream {
                         index: stream_no,
@@ -526,8 +553,7 @@ fn parse_strl<R: Read + Seek>(inner: &mut R, stream_no: u32, start: u64, end: u6
                 }
             }
             b"indx" => {
-                let mut body = vec![0; size as usize];
-                read_full(inner, &mut body)?;
+                let body = read_body(inner, size)?;
                 odml.extend(parse_indx_refs(&body));
             }
             _ => {}
@@ -536,13 +562,14 @@ fn parse_strl<R: Read + Seek>(inner: &mut R, stream_no: u32, start: u64, end: u6
     }
     Ok(Strl {
         stream: audio.then_some(fmt).flatten(),
+        extra,
         odml,
     })
 }
 
 fn parse_idx1_body(body: &[u8]) -> Vec<RawIndexEntry> {
     let mut out = Vec::new();
-    for entry in body.chunks_exact(16) {
+    for entry in body.as_chunks::<16>().0.iter() {
         let id = [entry[0], entry[1], entry[2], entry[3]];
         let Some(stream) = stream_number(&id).filter(|_| &id[2..4] == b"wb") else {
             continue;
@@ -619,7 +646,7 @@ fn parse_odml_standard<R: Read + Seek>(
     streams: &[AviAudioStream],
     movi_end: u64,
 ) -> Result<Vec<RawIndexEntry>> {
-    if index.offset + 8 > movi_end.saturating_add(1 << 30) {
+    if index.offset.saturating_add(8) > movi_end.saturating_add(1 << 30) {
         return Ok(Vec::new());
     }
     inner.seek(SeekFrom::Start(index.offset))?;
@@ -627,14 +654,12 @@ fn parse_odml_standard<R: Read + Seek>(
     if read_some(inner, &mut head)? < 8 {
         return Ok(Vec::new());
     }
-    let size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
-    let mut body = vec![0; size.min(index.size as usize)];
-    read_full(inner, &mut body)?;
+    let size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as u64;
+    let body = read_body(inner, size.min(u64::from(index.size)))?;
     let raw = parse_standard_body(&body, streams);
-    Ok(raw
-        .into_iter()
+    raw.into_iter()
         .filter_map(|e| resolve_standard_entry(inner, e, movi_end).transpose())
-        .collect::<Result<Vec<_>>>()?)
+        .collect()
 }
 
 fn parse_standard_body(body: &[u8], streams: &[AviAudioStream]) -> Vec<RawIndexEntry> {
@@ -688,7 +713,7 @@ fn chunk_matches<R: Read + Seek>(
     id: [u8; 4],
     end: u64,
 ) -> Result<bool> {
-    if offset + 8 > end {
+    if offset.saturating_add(8) > end {
         return Ok(false);
     }
     inner.seek(SeekFrom::Start(offset))?;
@@ -696,8 +721,8 @@ fn chunk_matches<R: Read + Seek>(
     if read_some(inner, &mut head)? < 8 {
         return Ok(false);
     }
-    Ok(head[0..4] == id
-        && offset + 8 + u64::from(u32::from_le_bytes([head[4], head[5], head[6], head[7]])) <= end)
+    let size = u64::from(u32::from_le_bytes([head[4], head[5], head[6], head[7]]));
+    Ok(head[0..4] == id && offset.saturating_add(8).saturating_add(size) <= end)
 }
 
 fn stream_number(id: &[u8; 4]) -> Option<u32> {
@@ -733,4 +758,15 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> Result<()> {
     } else {
         Err(Error::corrupt("AVI header ends mid-field"))
     }
+}
+
+/// Read a `size`-byte body. The buffer grows as bytes arrive, so a size field far past the end
+/// of the file costs only what the file holds, never a `size`-byte allocation up front.
+fn read_body(r: &mut impl Read, size: u64) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    r.by_ref().take(size).read_to_end(&mut body)?;
+    if body.len() as u64 != size {
+        return Err(Error::corrupt("AVI chunk body ends mid-field"));
+    }
+    Ok(body)
 }

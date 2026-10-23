@@ -1,0 +1,42 @@
+[package]
+name = "ec-mpegts-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-core]
+path = "../../ec-core"
+
+[dependencies.ec-mpegts]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "demux_ts"
+path = "fuzz_targets/demux_ts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ts_parts"
+path = "fuzz_targets/ts_parts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "demux_ps"
+path = "fuzz_targets/demux_ps.rs"
+test = false
+doc = false
+bench = false

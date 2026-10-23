@@ -21,7 +21,7 @@
 //! are reproduced exactly (`i32 >> 3` and `& 7` on negatives).
 //!
 //! [RFC 6386]: https://www.rfc-editor.org/rfc/rfc6386
-use crate::avx2_supported;
+use multiversion::target::match_target;
 
 /// `VP8_FILTER_WEIGHT` (filter.c): tap weights sum to this, DC passes.
 const VP8_FILTER_WEIGHT: i32 = 128;
@@ -55,13 +55,7 @@ const BILINEAR_FILTERS: [[i32; 2]; 8] = [
 
 #[inline]
 fn clamp255(v: i32) -> i32 {
-    if v < 0 {
-        0
-    } else if v > 255 {
-        255
-    } else {
-        v
-    }
+    v.clamp(0, 255)
 }
 
 /// Extends the visible `vis_w` x `vis_h` region of `plane` into the `border`
@@ -112,6 +106,8 @@ pub(crate) fn extend_plane(plane: &mut [u8], stride: usize, vis_w: usize, vis_h:
 ///
 /// When `need_clamp` is set, the MV is first passed through
 /// [`clamp_mv_to_umv_border`].
+// mirrors the argument list of the C predictor it ports
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_luma(
     src: &[u8],
     stride: usize,
@@ -128,8 +124,8 @@ pub(crate) fn predict_luma(
     bh: usize,
     bilinear: bool,
 ) {
-    debug_assert!(bw >= 4 && bw <= 16 && bw % 4 == 0);
-    debug_assert!(bh >= 4 && bh <= 16 && bh % 4 == 0);
+    debug_assert!((4..=16).contains(&bw) && bw.is_multiple_of(4));
+    debug_assert!((4..=16).contains(&bh) && bh.is_multiple_of(4));
 
     let mut mv = (i32::from(mv.0), i32::from(mv.1));
     if need_clamp {
@@ -140,10 +136,9 @@ pub(crate) fn predict_luma(
     let fy = (mv.0 & 7) as usize;
     let sx = border as i32 + x as i32 + (mv.1 >> 3);
     let sy = border as i32 + y as i32 + (mv.0 >> 3);
-    // 6-tap reads reach 2 before / 3 after the start; the libvpx clamp
-    // arithmetic keeps those inside the 32-px border.
-    debug_assert!(sx >= 2 && sy >= 2, "reference read outside bordered plane");
-    let (sx, sy) = (sx as usize, sy as usize);
+    // The libvpx clamp keeps a conforming read inside the border; an
+    // unclamped split MV may not, so the origin is brought back in range.
+    let (sx, sy) = clamp_read_origin(sx, sy, stride, vis_h + 2 * border, bw, bh);
 
     if bilinear {
         bilinear_block(src, stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
@@ -162,6 +157,8 @@ pub(crate) fn predict_luma(
 /// lanes of an intermediate row (reads stay inside the 32-px border for
 /// every block shape) and the vertical pass discards the tail lanes with
 /// its `bw`-byte store; the scalar reference only fills the first `bw`.
+// mirrors the argument list of the C predictor it ports
+#[allow(clippy::too_many_arguments)]
 fn sixtap_block(
     src: &[u8],
     stride: usize,
@@ -183,24 +180,45 @@ fn sixtap_block(
         return;
     }
 
+    sixtap_2d(src, stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
+}
+
+/// Both separable passes of [`sixtap_block`] for a fractional phase.
+///
+/// Runtime dispatch is done by `multiversion`: the AVX2 clone runs the
+/// [`simd`] kernels, the baseline clone runs the scalar reference. The
+/// AVX2 pass reads 21 bytes per row, which a 4-wide block at the far edge
+/// of the clamp can push past the buffer; those blocks take the exact-width
+/// scalar path even in the AVX2 clone.
+// mirrors the argument list of the C predictor it ports
+#[allow(clippy::too_many_arguments)]
+#[multiversion::multiversion(targets("x86_64+avx2"))]
+fn sixtap_2d(
+    src: &[u8],
+    stride: usize,
+    sx: usize,
+    sy: usize,
+    fx: usize,
+    fy: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    bw: usize,
+    bh: usize,
+) {
     let hf = &SUB_PEL_FILTERS[fx];
     let vf = &SUB_PEL_FILTERS[fy];
     let rows = bh + 5;
     let mut tmp = [0u8; 21 * 16]; // C: int FData[21 * 24], clamped to u8
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx2_supported() {
-            // SAFETY: AVX2 availability checked by `avx2_supported` just
-            // above; the border/bounds contracts of both kernels hold for
-            // every caller (`bw`/`bh` in 4..=16, bordered source plane).
-            #[allow(unsafe_code)]
-            unsafe {
+    match_target! {
+        "x86_64+avx2" => {
+            if (sy + rows - 2) * stride + sx + 19 <= src.len() {
                 simd::sixtap_h(src, stride, sx, sy, hf, &mut tmp, rows);
                 simd::sixtap_v(&tmp, vf, dst, dst_stride, bw, bh);
+                return;
             }
-            return;
         }
+        _ => {}
     }
 
     sixtap_h_scalar(src, stride, sx, sy, hf, &mut tmp, bw, rows);
@@ -212,6 +230,8 @@ fn sixtap_block(
 /// horizontal lines, each sample `(dot + 64) >> 7` clamped to 0..=255.
 /// Phase 0 is the exact identity (`(p * 128 + 64) >> 7 == p`), so the
 /// uniform loop reproduces the C for every phase combination.
+// mirrors the argument list of the C predictor it ports
+#[allow(clippy::too_many_arguments)]
 fn sixtap_h_scalar(
     src: &[u8],
     stride: usize,
@@ -271,6 +291,12 @@ fn sixtap_v_scalar(
 /// every kernel against its scalar reference over all shapes, phases and
 /// worst-case input bytes.
 ///
+/// The kernels are safe functions. Their only precondition is AVX2, which
+/// the `#[target_feature]` attribute states; they can be called only from a
+/// context that has AVX2 enabled, which is what [`sixtap_2d`] and
+/// [`bilinear_2d`] guarantee by dispatching at runtime. Loads and stores go
+/// through `bytemuck` on slices, so every access is bounds-checked.
+///
 /// Exactness notes shared by the six-tap kernels:
 /// - `_mm*_madd_epi16` multiplies *pairs of samples* by a packed tap pair
 ///   and accumulates in `i32`; every product is exact (widened samples
@@ -284,8 +310,6 @@ fn sixtap_v_scalar(
 /// - `packus_epi16`'s `u8` saturation *is* filter.c's `clamp_pixel`:
 ///   values below 0 saturate to 0, above 255 to 255, the rest unchanged.
 #[cfg(target_arch = "x86_64")]
-#[allow(unsafe_code)]
-#[allow(unsafe_op_in_unsafe_fn)] // each kernel's whole body is its contract
 mod simd {
     use super::{VP8_FILTER_SHIFT, VP8_FILTER_WEIGHT};
     use std::arch::x86_64::*;
@@ -298,15 +322,52 @@ mod simd {
         (b << 16) | (a as u16 as i32)
     }
 
+    /// 16 bytes from the front of `s` (the `loadu_si128` of the kernels).
+    #[inline(always)]
+    fn ld16(s: &[u8]) -> __m128i {
+        bytemuck::pod_read_unaligned(&s[..16])
+    }
+
+    /// The low 8 bytes of `s` in the low half of a register, the high half
+    /// zero. Only `_mm_cvtepu8_epi16` consumers read it, and those take the
+    /// low 8 bytes, so this matches the 16-byte load the C-shaped code
+    /// used without reading past the 8 bytes that matter.
+    #[inline(always)]
+    fn ld8(s: &[u8]) -> __m128i {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&s[..8]);
+        bytemuck::cast(b)
+    }
+
+    /// Stores all 16 bytes of `v` at the front of `d`.
+    #[inline(always)]
+    fn st16(d: &mut [u8], v: __m128i) {
+        let b: [u8; 16] = bytemuck::cast(v);
+        d[..16].copy_from_slice(&b);
+    }
+
+    /// Stores the low 8 bytes of `v` at the front of `d`.
+    #[inline(always)]
+    fn st8(d: &mut [u8], v: __m128i) {
+        let b: [u8; 16] = bytemuck::cast(v);
+        d[..8].copy_from_slice(&b[..8]);
+    }
+
+    /// Stores the low 4 bytes of `v` at the front of `d`.
+    #[inline(always)]
+    fn st4(d: &mut [u8], v: __m128i) {
+        let b: [u8; 16] = bytemuck::cast(v);
+        d[..4].copy_from_slice(&b[..4]);
+    }
+
     /// Six-tap first pass, all 16 lanes of every intermediate row (see
-    /// [`sixtap_block`] for the layout).
+    /// [`sixtap_2d`] for the layout).
     ///
-    /// # Safety
-    /// Requires AVX2. `src` must be a bordered MC plane such that for
-    /// every `i < rows`, the 21 bytes starting at
-    /// `(sy + i - 2) * stride + sx - 2` are in bounds (`sx, sy >= 2`).
+    /// The caller guarantees that for every `i < rows`, the 21 bytes
+    /// starting at `(sy + i - 2) * stride + sx - 2` are in `src` (with
+    /// `sx, sy >= 2`); the slice indexing below enforces it.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn sixtap_h(
+    pub(super) fn sixtap_h(
         src: &[u8],
         stride: usize,
         sx: usize,
@@ -316,7 +377,6 @@ mod simd {
         rows: usize,
     ) {
         debug_assert!(sx >= 2 && sy >= 2);
-        debug_assert!((sy + rows - 2) * stride + sx + 19 <= src.len());
         let tv = [
             _mm256_set1_epi32(tap_pair(hf[0], hf[1])),
             _mm256_set1_epi32(tap_pair(hf[2], hf[3])),
@@ -324,17 +384,20 @@ mod simd {
         ];
         let rnd = _mm256_set1_epi32(VP8_FILTER_WEIGHT >> 1);
         for i in 0..rows {
-            let sp = src.as_ptr().add((sy + i - 2) * stride + sx - 2);
+            let base = (sy + i - 2) * stride + sx - 2;
+            let win = &src[base..base + 21];
             // `cvtepu8_epi16` of the 16-byte window at byte offset `2k`
             // puts each even output's tap pair in one `madd` lane pair:
             // `e` accumulates outputs 0,2,..,14, `o` (window +1 byte)
             // outputs 1,3,..,15.
             let mut e = _mm256_setzero_si256();
             let mut o = _mm256_setzero_si256();
+            // tap loop walks the vector taps and the source offsets together
+            #[allow(clippy::needless_range_loop)]
             for k in 0..3 {
-                let se = _mm256_cvtepu8_epi16(_mm_loadu_si128(sp.add(2 * k).cast()));
+                let se = _mm256_cvtepu8_epi16(ld16(&win[2 * k..]));
                 e = _mm256_add_epi32(e, _mm256_madd_epi16(se, tv[k]));
-                let so = _mm256_cvtepu8_epi16(_mm_loadu_si128(sp.add(2 * k + 1).cast()));
+                let so = _mm256_cvtepu8_epi16(ld16(&win[2 * k + 1..]));
                 o = _mm256_add_epi32(o, _mm256_madd_epi16(so, tv[k]));
             }
             e = _mm256_srai_epi32(_mm256_add_epi32(e, rnd), VP8_FILTER_SHIFT);
@@ -350,18 +413,15 @@ mod simd {
                 _mm256_castsi256_si128(i16),
                 _mm256_extracti128_si256::<1>(i16),
             );
-            _mm_storeu_si128(tmp.as_mut_ptr().add(i * 16).cast(), u8);
+            st16(&mut tmp[i * 16..], u8);
         }
     }
 
     /// Six-tap second pass: `bh` output rows of `bw` (4/8/16) samples from
-    /// the 16-lane-strided intermediate.
-    ///
-    /// # Safety
-    /// Requires AVX2. `dst` must be writable for `bh` rows of `bw` bytes
-    /// at `dst_stride`; `bw` is 4, 8 or 16.
+    /// the 16-lane-strided intermediate. `dst` must hold `bh` rows of `bw`
+    /// bytes at `dst_stride` (slice indexing enforces it); `bw` is 4, 8 or 16.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn sixtap_v(
+    pub(super) fn sixtap_v(
         tmp: &[u8; 21 * 16],
         vf: &[i32; 6],
         dst: &mut [u8],
@@ -370,7 +430,6 @@ mod simd {
         bh: usize,
     ) {
         debug_assert!(matches!(bw, 4 | 8 | 16));
-        debug_assert!(dst.len() >= (bh - 1) * dst_stride + bw);
         let tv = [
             _mm256_set1_epi32(tap_pair(vf[0], vf[1])),
             _mm256_set1_epi32(tap_pair(vf[2], vf[3])),
@@ -378,16 +437,17 @@ mod simd {
         ];
         let rnd = _mm256_set1_epi32(VP8_FILTER_WEIGHT >> 1);
         for r in 0..bh {
-            let ip = tmp.as_ptr().add(r * 16);
             // Rows `r + 2k` / `r + 2k + 1` widened to samples, interleaved
             // by `unpack_epi16` so one `madd` covers two taps of every
             // output; `lo` holds even columns, `hi` odd ones (one run per
             // 128-bit lane).
             let mut lo = _mm256_setzero_si256();
             let mut hi = _mm256_setzero_si256();
+            // tap loop walks the vector taps and the source offsets together
+            #[allow(clippy::needless_range_loop)]
             for k in 0..3 {
-                let a = _mm256_cvtepu8_epi16(_mm_loadu_si128(ip.add(2 * k * 16).cast()));
-                let b = _mm256_cvtepu8_epi16(_mm_loadu_si128(ip.add((2 * k + 1) * 16).cast()));
+                let a = _mm256_cvtepu8_epi16(ld16(&tmp[(r + 2 * k) * 16..]));
+                let b = _mm256_cvtepu8_epi16(ld16(&tmp[(r + 2 * k + 1) * 16..]));
                 lo = _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), tv[k]));
                 hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), tv[k]));
             }
@@ -400,11 +460,11 @@ mod simd {
                 _mm256_castsi256_si128(i16),
                 _mm256_extracti128_si256::<1>(i16),
             );
-            let dp = dst.as_mut_ptr().add(r * dst_stride);
+            let row = &mut dst[r * dst_stride..];
             match bw {
-                16 => _mm_storeu_si128(dp.cast(), u8),
-                8 => _mm_storel_epi64(dp.cast(), u8),
-                4 => _mm_storeu_si32(dp.cast(), u8),
+                16 => st16(row, u8),
+                8 => st8(row, u8),
+                4 => st4(row, u8),
                 _ => unreachable!("bw is 4, 8 or 16"),
             }
         }
@@ -416,11 +476,11 @@ mod simd {
     /// stay `<= 255 * 128 + 64 < 2^15` -- this *is* the C's `unsigned
     /// short` intermediate, narrowed at a provably-in-range point.
     ///
-    /// # Safety
-    /// Requires AVX2. For every `i < rows`, the 17 bytes starting at
-    /// `(sy + i) * stride + sx` must be in bounds of `src`.
+    /// The caller guarantees that for every `i < rows`, the 17 bytes
+    /// starting at `(sy + i) * stride + sx` are in `src`; the slice
+    /// indexing below enforces it.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn bilinear_h(
+    pub(super) fn bilinear_h(
         src: &[u8],
         stride: usize,
         sx: usize,
@@ -429,35 +489,32 @@ mod simd {
         tmp: &mut [u8; 17 * 16],
         rows: usize,
     ) {
-        debug_assert!((sy + rows - 1) * stride + sx + 16 < src.len());
         let f0 = _mm_set1_epi16(hf[0] as i16);
         let f1 = _mm_set1_epi16(hf[1] as i16);
         let rnd = _mm_set1_epi16((VP8_FILTER_WEIGHT / 2) as i16);
         for i in 0..rows {
-            let sp = src.as_ptr().add((sy + i) * stride + sx);
+            let row = &src[(sy + i) * stride + sx..];
             for c in (0..16).step_by(8) {
                 // Lane j pairs the samples `j` and `j + 1` (tap `[0]` on
                 // the window at `c`, tap `[1]` shifted by one byte).
-                let a = _mm_cvtepu8_epi16(_mm_loadu_si128(sp.add(c).cast()));
-                let b = _mm_cvtepu8_epi16(_mm_loadu_si128(sp.add(c + 1).cast()));
+                let a = _mm_cvtepu8_epi16(ld8(&row[c..]));
+                let b = _mm_cvtepu8_epi16(ld8(&row[c + 1..]));
                 let acc = _mm_add_epi16(
                     _mm_add_epi16(_mm_mullo_epi16(a, f0), _mm_mullo_epi16(b, f1)),
                     rnd,
                 );
                 let u8 = _mm_packus_epi16(_mm_srai_epi16::<VP8_FILTER_SHIFT>(acc), acc);
-                _mm_storel_epi64(tmp.as_mut_ptr().add(i * 16 + c).cast(), u8);
+                st8(&mut tmp[i * 16 + c..], u8);
             }
         }
     }
 
     /// Bilinear second pass: rows `r` / `r + 1` of the intermediate, same
-    /// exact-`i16` shape as [`bilinear_h`].
-    ///
-    /// # Safety
-    /// Requires AVX2. `dst` must be writable for `bh` rows of `bw` bytes
-    /// at `dst_stride`; `bw` is 4, 8 or 16.
+    /// exact-`i16` shape as [`bilinear_h`]. `dst` must hold `bh` rows of
+    /// `bw` bytes at `dst_stride` (slice indexing enforces it); `bw` is
+    /// 4, 8 or 16.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn bilinear_v(
+    pub(super) fn bilinear_v(
         tmp: &[u8; 17 * 16],
         vf: &[i32; 2],
         dst: &mut [u8],
@@ -466,24 +523,22 @@ mod simd {
         bh: usize,
     ) {
         debug_assert!(matches!(bw, 4 | 8 | 16));
-        debug_assert!(dst.len() >= (bh - 1) * dst_stride + bw);
         let f0 = _mm_set1_epi16(vf[0] as i16);
         let f1 = _mm_set1_epi16(vf[1] as i16);
         let rnd = _mm_set1_epi16((VP8_FILTER_WEIGHT / 2) as i16);
         for r in 0..bh {
-            let ip = tmp.as_ptr().add(r * 16);
-            let dp = dst.as_mut_ptr().add(r * dst_stride);
+            let drow = &mut dst[r * dst_stride..];
             for c in (0..bw).step_by(8) {
-                let a = _mm_cvtepu8_epi16(_mm_loadl_epi64(ip.add(c).cast()));
-                let b = _mm_cvtepu8_epi16(_mm_loadl_epi64(ip.add(16 + c).cast()));
+                let a = _mm_cvtepu8_epi16(ld8(&tmp[r * 16 + c..]));
+                let b = _mm_cvtepu8_epi16(ld8(&tmp[(r + 1) * 16 + c..]));
                 let acc = _mm_add_epi16(
                     _mm_add_epi16(_mm_mullo_epi16(a, f0), _mm_mullo_epi16(b, f1)),
                     rnd,
                 );
                 let u8 = _mm_packus_epi16(_mm_srai_epi16::<VP8_FILTER_SHIFT>(acc), acc);
                 match bw - c {
-                    8 | 16 => _mm_storel_epi64(dp.add(c).cast(), u8),
-                    _ => _mm_storeu_si32(dp.add(c).cast(), u8),
+                    8 | 16 => st8(&mut drow[c..], u8),
+                    _ => st4(&mut drow[c..], u8),
                 }
             }
         }
@@ -496,6 +551,8 @@ mod simd {
 /// bilinear passes store `unsigned short` intermediates and skip the
 /// clamp: the intermediate is stored as `u8` at a fixed 16-lane stride
 /// (representation-only change, same argument as [`sixtap_block`]).
+// mirrors the argument list of the C predictor it ports
+#[allow(clippy::too_many_arguments)]
 fn bilinear_block(
     src: &[u8],
     stride: usize,
@@ -516,23 +573,41 @@ fn bilinear_block(
         return;
     }
 
+    bilinear_2d(src, stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
+}
+
+/// Both separable passes of [`bilinear_block`] for a fractional phase.
+/// Dispatched like [`sixtap_2d`]: the AVX2 clone runs the [`simd`] kernels
+/// when the read window fits in `src`, the baseline clone the scalar path.
+// mirrors the argument list of the C predictor it ports
+#[allow(clippy::too_many_arguments)]
+#[multiversion::multiversion(targets("x86_64+avx2"))]
+fn bilinear_2d(
+    src: &[u8],
+    stride: usize,
+    sx: usize,
+    sy: usize,
+    fx: usize,
+    fy: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    bw: usize,
+    bh: usize,
+) {
     let hf = &BILINEAR_FILTERS[fx];
     let vf = &BILINEAR_FILTERS[fy];
     let rows = bh + 1;
     let mut tmp = [0u8; 17 * 16]; // C: unsigned short FData[17 * 16], <= 255
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx2_supported() {
-            // SAFETY: AVX2 checked by `avx2_supported`; border/bounds
-            // contracts hold for every caller (see [`sixtap_block`]).
-            #[allow(unsafe_code)] // SAFETY: avx2_supported() checked above
-            unsafe {
+    match_target! {
+        "x86_64+avx2" => {
+            if (sy + rows - 1) * stride + sx + 16 < src.len() {
                 simd::bilinear_h(src, stride, sx, sy, hf, &mut tmp, rows);
                 simd::bilinear_v(&tmp, vf, dst, dst_stride, bw, bh);
+                return;
             }
-            return;
         }
+        _ => {}
     }
 
     bilinear_h_scalar(src, stride, sx, sy, hf, &mut tmp, bw, rows);
@@ -542,6 +617,8 @@ fn bilinear_block(
 /// Scalar first pass of [`bilinear_block`] (filter.c
 /// `filter_block2d_bil_first_pass`): `bh + 1` rows, taps `[0]` and `[1]`.
 /// Phase 0 is the exact identity, as in [`sixtap_h_scalar`].
+// mirrors the argument list of the C predictor it ports
+#[allow(clippy::too_many_arguments)]
 fn bilinear_h_scalar(
     src: &[u8],
     stride: usize,
@@ -600,6 +677,8 @@ fn bilinear_v_scalar(
 ///
 /// When `need_clamp` is set, the MV is first passed through
 /// [`clamp_uvmv_to_umv_border`].
+// mirrors the argument list of the C predictor it ports
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_chroma(
     src: &[u8],
     uv_stride: usize,
@@ -616,8 +695,8 @@ pub(crate) fn predict_chroma(
     bh: usize,
     bilinear: bool,
 ) {
-    debug_assert!(bw >= 2 && bw <= 16 && bw % 2 == 0);
-    debug_assert!(bh >= 2 && bh <= 16 && bh % 2 == 0);
+    debug_assert!((2..=16).contains(&bw) && bw.is_multiple_of(2));
+    debug_assert!((2..=16).contains(&bh) && bh.is_multiple_of(2));
 
     let mut mv = (i32::from(mv.0), i32::from(mv.1));
     if need_clamp {
@@ -634,15 +713,36 @@ pub(crate) fn predict_chroma(
     let fy = (mv.0 & 7) as usize;
     let sx = border as i32 + x as i32 + (mv.1 >> 3);
     let sy = border as i32 + y as i32 + (mv.0 >> 3);
-    // 6-tap reads reach 2 before / 3 after the origin.
-    debug_assert!(sx >= 2 && sy >= 2, "reference read outside bordered plane");
-    let (sx, sy) = (sx as usize, sy as usize);
+    // Chroma planes hold vis_h / 2 visible rows (`vis_*` are luma sizes).
+    let (sx, sy) = clamp_read_origin(sx, sy, uv_stride, vis_h / 2 + 2 * border, bw, bh);
 
     if bilinear {
         bilinear_block(src, uv_stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
     } else {
         sixtap_block(src, uv_stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
     }
+}
+
+/// Keeps a `bw` x `bh` reference read inside a bordered plane of `stride`
+/// columns and `total_rows` rows, `(sx, sy)` being the block origin.
+///
+/// The 6-tap filter reads 2 samples before and 3 after the origin, so the
+/// origin must lie in `2..=stride - bw - 3` (and likewise for rows); one
+/// extra sample of slack is kept. Conforming streams are always in range.
+/// A block whose origin lies outside the border is clamped to the nearest
+/// in-range origin. Every sample it reads is then border replication, so the
+/// prediction equals the unclamped one, and the read stays in bounds.
+fn clamp_read_origin(
+    sx: i32,
+    sy: i32,
+    stride: usize,
+    total_rows: usize,
+    bw: usize,
+    bh: usize,
+) -> (usize, usize) {
+    let max_x = stride.saturating_sub(bw + 4).max(2) as i32;
+    let max_y = total_rows.saturating_sub(bh + 4).max(2) as i32;
+    (sx.clamp(2, max_x) as usize, sy.clamp(2, max_y) as usize)
 }
 
 /// The macroblock-level UMV border edges in eighth-pel units, exactly the
@@ -884,7 +984,7 @@ mod tests {
         //   153*3 - 188*16 + 219*77 + 13*77 - 86*16 + 194*3 + 64 = 14585
         //   14585 >> 7 = 113.
         assert_eq!(dst[0], 40);
-        assert_eq!(dst[1 * 4 + 2], 113);
+        assert_eq!(dst[6], 113);
 
         // Full block against the tap-table reference formula.
         for r in 0..4 {
@@ -1093,16 +1193,14 @@ mod tests {
         out
     }
 
-    /// The AVX2 kernels must be lane-for-lane identical to the scalar
-    /// reference (the libvpx transcription) on every block shape, every
-    /// phase pair, at both a central and a right/bottom-edge origin where
-    /// the wide loads reach furthest into the border.
+    /// The dispatched six-tap predictor must be lane-for-lane identical to
+    /// the scalar reference (the libvpx transcription) on every block shape,
+    /// every phase pair, at both a central and a right/bottom-edge origin
+    /// where the wide loads reach furthest into the border. On an AVX2 host
+    /// the dispatch runs the AVX2 kernels; this compares them to the scalar
+    /// path.
     #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn simd_sixtap_matches_the_scalar_reference_everywhere() {
-        if !avx2_supported() {
-            return;
-        }
+    fn dispatched_sixtap_matches_the_scalar_reference_everywhere() {
         let planes = [plane(), checkerboard_plane()];
         let origins = [
             (BORDER + 2, BORDER + 3),
@@ -1112,7 +1210,11 @@ mod tests {
             for &(sx, sy) in &origins {
                 for bw in [4usize, 8, 16] {
                     for bh in [4usize, 8, 16] {
+                        // test sweeps every filter phase pair; indexes the filter table
+                        #[allow(clippy::needless_range_loop)]
                         for fx in 0..8usize {
+                            // test sweeps every filter phase pair; indexes the filter table
+                            #[allow(clippy::needless_range_loop)]
                             for fy in 0..8usize {
                                 if fx == 0 && fy == 0 {
                                     continue; // whole-pel copy, shared path
@@ -1124,15 +1226,7 @@ mod tests {
                                     p, STRIDE, sx, sy, &SUB_PEL_FILTERS[fx], &mut tmp, bw, bh + 5,
                                 );
                                 sixtap_v_scalar(&tmp, &SUB_PEL_FILTERS[fy], &mut want, 16, bw, bh);
-                                // SAFETY: avx2_supported() checked above.
-                                #[allow(unsafe_code)]
-                                unsafe {
-                                    let mut tmp2 = [0u8; 21 * 16];
-                                    simd::sixtap_h(
-                                        p, STRIDE, sx, sy, &SUB_PEL_FILTERS[fx], &mut tmp2, bh + 5,
-                                    );
-                                    simd::sixtap_v(&tmp2, &SUB_PEL_FILTERS[fy], &mut got, 16, bw, bh);
-                                }
+                                sixtap_block(p, STRIDE, sx, sy, fx, fy, &mut got, 16, bw, bh);
                                 let n = bh * 16;
                                 assert_eq!(
                                     &got[..n],
@@ -1147,13 +1241,9 @@ mod tests {
         }
     }
 
-    /// Same gate for the bilinear kernels.
+    /// Same gate for the bilinear predictor.
     #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn simd_bilinear_matches_the_scalar_reference_everywhere() {
-        if !avx2_supported() {
-            return;
-        }
+    fn dispatched_bilinear_matches_the_scalar_reference_everywhere() {
         let planes = [plane(), checkerboard_plane()];
         let origins = [
             (BORDER + 2, BORDER + 3),
@@ -1163,7 +1253,11 @@ mod tests {
             for &(sx, sy) in &origins {
                 for bw in [4usize, 8, 16] {
                     for bh in [4usize, 8, 16] {
+                        // test sweeps every filter phase pair; indexes the filter table
+                        #[allow(clippy::needless_range_loop)]
                         for fx in 0..8usize {
+                            // test sweeps every filter phase pair; indexes the filter table
+                            #[allow(clippy::needless_range_loop)]
                             for fy in 0..8usize {
                                 if fx == 0 && fy == 0 {
                                     continue;
@@ -1175,15 +1269,7 @@ mod tests {
                                     p, STRIDE, sx, sy, &BILINEAR_FILTERS[fx], &mut tmp, bw, bh + 1,
                                 );
                                 bilinear_v_scalar(&tmp, &BILINEAR_FILTERS[fy], &mut want, 16, bw, bh);
-                                // SAFETY: avx2_supported() checked above.
-                                #[allow(unsafe_code)]
-                                unsafe {
-                                    let mut tmp2 = [0u8; 17 * 16];
-                                    simd::bilinear_h(
-                                        p, STRIDE, sx, sy, &BILINEAR_FILTERS[fx], &mut tmp2, bh + 1,
-                                    );
-                                    simd::bilinear_v(&tmp2, &BILINEAR_FILTERS[fy], &mut got, 16, bw, bh);
-                                }
+                                bilinear_block(p, STRIDE, sx, sy, fx, fy, &mut got, 16, bw, bh);
                                 for r in 0..bh {
                                     assert_eq!(
                                         got[r * 16..r * 16 + bw],

@@ -1,0 +1,9 @@
+   Compiling ec-vorbis v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-vorbis)
+   Compiling ec-probe v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-probe)
+    Finished `release` profile [optimized] target(s) in 17.56s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_probe-a8d6bd3726e30b55)
+     Running tests/dts.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dts-7035bb00bf9048d4)
+     Running tests/legacy_audio.rs (/home/user/.cache/tgt-testcut-rest/release/deps/legacy_audio-a7ded38926e73e7c)
+     Running tests/library.rs (/home/user/.cache/tgt-testcut-rest/release/deps/library-76432ce34869fcbb)
+     Running tests/matrix.rs (/home/user/.cache/tgt-testcut-rest/release/deps/matrix-db6bf9e30e4433b2)
+   Doc-tests ec_probe

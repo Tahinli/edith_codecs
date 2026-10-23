@@ -29,7 +29,65 @@ pub(crate) enum EncEntropy {
     Cabac(Box<CabacEnc>),
 }
 
+/// Append the bits of `src` from bit `from` to its end onto `dst`, bit for
+/// bit. `from` is the bit alignment `src` was started at, so that PCM
+/// alignment inside the appended bits is the same as in `dst`.
+pub(crate) fn append_bits(dst: &mut BitWriter, src: &BitWriter, from: u64) {
+    let bytes = src.as_bytes();
+    for pos in from..src.bit_len() {
+        let byte = bytes[(pos / 8) as usize];
+        dst.write_bit(byte >> (7 - pos % 8) & 1 == 1);
+    }
+}
+
+/// An empty writer at the same bit alignment as `w`, so that a write made into
+/// it costs exactly the bits it would cost in `w`.
+pub(crate) fn aligned_empty(w: &BitWriter) -> BitWriter {
+    let mut fresh = BitWriter::new();
+    for _ in 0..w.bit_len() % 8 {
+        fresh.write_bit(false);
+    }
+    fresh
+}
+
 impl EncEntropy {
+    /// A copy of this coder's state for measuring what a write costs. The
+    /// output buffer is not copied, so the cost is independent of how much of
+    /// the slice has been written; `bit_len` differences are the same as on
+    /// the real writer.
+    pub(crate) fn probe_copy(&self) -> EncEntropy {
+        match self {
+            EncEntropy::Cavlc { w, skip_run } => EncEntropy::Cavlc {
+                w: aligned_empty(w),
+                skip_run: *skip_run,
+            },
+            EncEntropy::Cabac(c) => EncEntropy::Cabac(Box::new(c.probe_copy())),
+        }
+    }
+
+    /// Take over `trial`, a [`EncEntropy::probe_copy`] of this coder taken
+    /// before the trial's writes, together with the bits those writes made.
+    /// The result is the same as having made the trial's writes to `self`:
+    /// the trial's state replaces this one and its bits are appended after
+    /// this coder's bits. Only valid while `self` is unchanged since the probe.
+    pub(crate) fn adopt(&mut self, trial: EncEntropy) {
+        match (self, trial) {
+            (
+                EncEntropy::Cavlc { w, skip_run },
+                EncEntropy::Cavlc {
+                    w: tw,
+                    skip_run: tskip,
+                },
+            ) => {
+                let from = w.bit_len() % 8;
+                append_bits(w, &tw, from);
+                *skip_run = tskip;
+            }
+            (EncEntropy::Cabac(c), EncEntropy::Cabac(t)) => c.adopt(*t),
+            _ => unreachable!("adopt across entropy coders"),
+        }
+    }
+
     /// A CAVLC writer continuing after the slice header.
     pub(crate) fn cavlc(w: BitWriter) -> EncEntropy {
         EncEntropy::Cavlc { w, skip_run: 0 }

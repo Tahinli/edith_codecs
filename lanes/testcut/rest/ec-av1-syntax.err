@@ -1,0 +1,5 @@
+   Compiling ec-av1-syntax v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-av1-syntax)
+    Finished `release` profile [optimized] target(s) in 2.42s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_av1_syntax-820192fad465b1cd)
+     Running tests/streams.rs (/home/user/.cache/tgt-testcut-rest/release/deps/streams-9ef7c1732d14e444)
+   Doc-tests ec_av1_syntax

@@ -145,11 +145,14 @@ pub(crate) const BY_VALUE_TYPES: &[(&str, Option<usize>, bool, &str)] = &[
     // -- decoder.rs: the headline row -------------------------------------
     (
         "Ac3Decoder",
-        Some(3160),
+        Some(3704),
         true,
         "Ac3Decoder::new / with_options -> Ac3Decoder, nesting two deep. Was \
          20024 bytes with decode::Core's four coefficient planes inline, i.e. \
-         2.44x over the 8192-byte budget",
+         2.44x over the 8192-byte budget. 3184 since the dependents Vec (24 bytes, \
+         heap-allocated: one Core per dependent substream of a packet). 3704 since \
+         the dither generator became ffmpeg's 64-word lagged-Fibonacci state \
+         (two instances, +520 bytes), so that the noise matches ffmpeg's",
     ),
     // -- encode.rs: the second-closest row to the budget -------------------
     (
@@ -290,7 +293,7 @@ pub(crate) const BY_VALUE_TYPES: &[(&str, Option<usize>, bool, &str)] = &[
     // -- pin that does is `the_crate_private_core_stays_behind_a_box`.
     (
         "Core",
-        Some(2864),
+        Some(3384),
         false,
         "decode::Core::new -> Core, pub(crate), held inline in Ac3Decoder. \
          Was 19728 bytes with exps/bap/coeffs/delay inline; those four are \
@@ -434,6 +437,7 @@ mod tests {
         ("bsi.rs", include_str!("bsi.rs")),
         ("decode.rs", include_str!("decode.rs")),
         ("decoder.rs", include_str!("decoder.rs")),
+        ("dependent.rs", include_str!("dependent.rs")),
         ("eac3.rs", include_str!("eac3.rs")),
         ("encode.rs", include_str!("encode.rs")),
         ("exps.rs", include_str!("exps.rs")),
@@ -520,7 +524,7 @@ mod tests {
             rows.len(),
             STACK_BUDGET / 1024
         );
-        eprintln!("{:>8}  {:>7}  {}", "BYTES", "%BUDGET", "TYPE");
+        eprintln!("{:>8}  {:>7}  TYPE", "BYTES", "%BUDGET");
         for (name, size) in &rows {
             eprintln!(
                 "{size:>8}  {:>6.1}%  {name}",
@@ -902,17 +906,24 @@ mod tests {
     /// what the budget's reasoning needs: the claim is "no caller gets less
     /// than 2 MiB", and `size >= 2 MiB` is exactly that, whether the region is
     /// one mapping or three.
-    fn stack_region(tid: u32, addr: usize) -> Option<(usize, usize)> {
+    ///
+    /// The third field is whether the mapping is writable. Merging only joins
+    /// VMAs whose protections match, so a merged thread stack is still
+    /// writable. Its size can grow without bound, which is why the tests check
+    /// this flag and never an upper bound on the size.
+    fn stack_region(tid: u32, addr: usize) -> Option<(usize, usize, bool)> {
         let maps = std::fs::read_to_string(format!("/proc/self/task/{tid}/maps")).ok()?;
         for line in maps.lines() {
-            let (range, _) = line.split_once(' ')?;
+            let (range, perms) = line.split_once(' ')?;
             let (lo, hi) = range.split_once('-')?;
             let (lo, hi) = (
                 usize::from_str_radix(lo, 16).ok()?,
                 usize::from_str_radix(hi, 16).ok()?,
             );
             if addr >= lo && addr < hi {
-                return Some((lo, hi));
+                // `perms` is `rwxp`-style: the second character is write.
+                let writable = perms.as_bytes().get(1) == Some(&b'w');
+                return Some((lo, hi, writable));
             }
         }
         None
@@ -942,12 +953,12 @@ mod tests {
                 let tid = std::process::id();
                 let marker = 0u8;
                 let here = &marker as *const u8 as usize;
-                let (lo, hi) =
+                let (lo, hi, rw) =
                     stack_region(tid, here).expect("this thread's own stack is in its maps");
-                (tid, lo, hi)
+                (lo, hi, rw)
             })
             .expect("spawn");
-        let (_tid, lo, hi) = handle.join().expect("the probe thread returned");
+        let (lo, hi, rw) = handle.join().expect("the probe thread returned");
         let size = hi - lo;
         assert!(
             size >= EXPLICIT,
@@ -956,16 +967,23 @@ mod tests {
              the maps parse is finding the wrong region"
         );
         assert!(
-            size <= 512 * 1024 * 1024,
-            "the mapping holding an explicitly-1-MiB thread's frame is {size} \
-             bytes, which is not a stack -- the maps parse found the wrong region"
+            rw,
+            "the mapping holding an explicitly-1-MiB thread's frame is not \
+             writable -- a thread stack is read-write, so the maps parse found \
+             the wrong region"
         );
 
         let tid = std::process::id();
         let marker = 0u8;
         let here = &marker as *const u8 as usize;
-        let (lo, hi) = stack_region(tid, here).expect("this test thread's stack is in its maps");
+        let (lo, hi, rw) =
+            stack_region(tid, here).expect("this test thread's stack is in its maps");
         let size = hi - lo;
+        assert!(
+            rw,
+            "a default test thread's stack mapping is not writable -- the maps \
+             parse found the wrong region"
+        );
         assert!(
             size >= 2 * 1024 * 1024,
             "a default test thread's stack measured {size} bytes, under the \

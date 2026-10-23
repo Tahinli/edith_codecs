@@ -14,6 +14,7 @@ use crate::codebook::ilog;
 use crate::floor::{self, FloorState};
 use crate::residue;
 use crate::setup::{Comments, FloorConfig, Identification, Setup};
+use crate::trim::{GranuleTrim, granule_of};
 use crate::window::Windows;
 
 /// Vorbis I decoder.
@@ -47,6 +48,8 @@ pub struct VorbisDecoder {
     next_pts: Option<i64>,
     frames: VecDeque<Frame>,
     drained: bool,
+    /// Holds decoded samples until the page granules say which are the stream's.
+    trim: GranuleTrim,
     /// Per-block captured decoded residue: (half, per-channel integer residue).
     /// Populated only when `enable_residue_capture` is set.
     residue_capture: Vec<(usize, Vec<Vec<i32>>)>,
@@ -93,6 +96,7 @@ impl VorbisDecoder {
             next_pts: None,
             frames: VecDeque::new(),
             drained: false,
+            trim: GranuleTrim::new(channels),
             residue_capture: Vec::new(),
             bit_split: Vec::new(),
             enable_residue_capture: false,
@@ -128,6 +132,30 @@ impl VorbisDecoder {
         &self.layout
     }
 
+    /// The blocksize of one audio packet, read from its header alone: the mode
+    /// it names and that mode's block flag. A packet answers the previous
+    /// block's quarter plus this block's quarter (`previous / 4 + current / 4`)
+    /// samples after the first, so a reader that counts the blocks of a stream
+    /// can place every packet's samples exactly without decoding any of them.
+    /// Only the first byte of `packet` is read.
+    pub fn packet_blocksize(&self, packet: &[u8]) -> Result<usize> {
+        let mut bits = Bits::new(packet);
+        if bits.bit() {
+            return Err(Error::corrupt("audio packet flagged as a header"));
+        }
+        let mode_bits = ilog(self.setup.modes.len() as u32 - 1);
+        let mode_index = bits.read(mode_bits) as usize;
+        let Some(&mode) = self.setup.modes.get(mode_index) else {
+            return Err(Error::corrupt(
+                "audio packet names a mode that is not there",
+            ));
+        };
+        Ok(match mode.block_flag {
+            true => self.ident.blocksize_1,
+            false => self.ident.blocksize_0,
+        })
+    }
+
     /// Decode one audio packet into per-channel samples in ec-core channel
     /// order. The first packet of a stream answers empty vectors.
     pub fn decode_audio(&mut self, data: &[u8]) -> Result<Vec<Vec<f32>>> {
@@ -157,7 +185,7 @@ impl VorbisDecoder {
         }
 
         let mapping = &self.setup.mappings[mode.mapping];
-        let packet_bits = u64::from(data.len() as u64) * 8;
+        let packet_bits = data.len() as u64 * 8;
         let before_floors = bits.remaining();
         let mut floors = Vec::with_capacity(channels);
         let mut no_residue = Vec::with_capacity(channels);
@@ -347,6 +375,7 @@ impl VorbisDecoder {
         }
         self.frames.clear();
         self.drained = false;
+        self.trim.reset();
     }
 
     /// Enable per-block residue capture for offline histogram analysis.
@@ -448,21 +477,12 @@ fn unlace(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(packets)
 }
 
-impl Decoder for VorbisDecoder {
-    fn codec_parameters(&self) -> &CodecParameters {
-        &self.params
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let samples = self.decode_audio(&packet.data)?;
-        if samples.iter().all(Vec::is_empty) {
-            // The first packet of a run: its block only reaches the first
-            // sample the stream states, so there is nothing final yet.
-            self.next_pts = packet.pts;
-            return Ok(());
-        }
-        let count = samples[0].len();
-        let data: Vec<Buf> = samples
+impl VorbisDecoder {
+    /// Wrap released per-channel samples in an audio frame and queue it. The
+    /// frame is stamped `pts`, or the running sample position when there is none.
+    fn queue(&mut self, out: Vec<Vec<f32>>, pts: Option<i64>) -> Result<()> {
+        let count = out.first().map_or(0, Vec::len);
+        let data: Vec<Buf> = out
             .into_iter()
             .map(|channel| {
                 let mut bytes = Vec::with_capacity(channel.len() * 4);
@@ -481,11 +501,34 @@ impl Decoder for VorbisDecoder {
             data,
         )?;
         let base = TimeBase::new(1, i64::from(self.ident.rate));
-        frame.pts = Some(Timestamp::new(self.next_pts.unwrap_or(self.position), base));
-        self.next_pts = None;
+        frame.pts = Some(Timestamp::new(pts.unwrap_or(self.position), base));
         self.position += count as i64;
         self.frames.push_back(Frame::Audio(frame));
         Ok(())
+    }
+}
+
+impl Decoder for VorbisDecoder {
+    fn codec_parameters(&self) -> &CodecParameters {
+        &self.params
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        let samples = self.decode_audio(&packet.data)?;
+        let before = self.trim.decoded();
+        self.trim.push(samples);
+        if let Some(granule) = granule_of(packet) {
+            self.trim.granule(granule, before);
+        }
+        let out = self.trim.release(false);
+        if out.first().is_none_or(Vec::is_empty) {
+            // The first packet of a run: its block only reaches the first
+            // sample the stream states, so there is nothing final yet.
+            self.next_pts = packet.pts;
+            return Ok(());
+        }
+        let pts = self.next_pts.take();
+        self.queue(out, pts)
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
@@ -500,37 +543,18 @@ impl Decoder for VorbisDecoder {
         // §1.3.2: the terminal block's un-overlapped right half (everything
         // past the last emitted centre) is still valid output up to the
         // stream's final granule position; without this the decoder is
-        // always exactly one hop short at true EOS.
+        // always exactly one hop short at true EOS. The granule trim cuts
+        // whatever lies past that final position.
         if self.centre.is_some() {
-            let count = self.lap[0].len();
-            if count > 0 {
-                let mut out = vec![Vec::new(); self.lap.len()];
-                for (channel, lap) in self.lap.iter_mut().enumerate() {
-                    out[self.to_ec[channel]] = std::mem::take(lap);
-                }
-                let data: Vec<Buf> = out
-                    .into_iter()
-                    .map(|channel| {
-                        let mut bytes = Vec::with_capacity(channel.len() * 4);
-                        for value in channel {
-                            bytes.extend_from_slice(&value.to_le_bytes());
-                        }
-                        Buf::from_vec(bytes)
-                    })
-                    .collect();
-                let mut frame = AudioFrame::try_new(
-                    SampleFormat::F32,
-                    true,
-                    self.layout.clone(),
-                    self.ident.rate,
-                    count,
-                    data,
-                )?;
-                let base = TimeBase::new(1, i64::from(self.ident.rate));
-                frame.pts = Some(Timestamp::new(self.position, base));
-                self.position += count as i64;
-                self.frames.push_back(Frame::Audio(frame));
+            let mut tail = vec![Vec::new(); self.lap.len()];
+            for (channel, lap) in self.lap.iter_mut().enumerate() {
+                tail[self.to_ec[channel]] = std::mem::take(lap);
             }
+            self.trim.push(tail);
+        }
+        let out = self.trim.release(true);
+        if out.first().is_some_and(|c| !c.is_empty()) {
+            self.queue(out, None)?;
         }
         self.drained = true;
         Ok(())

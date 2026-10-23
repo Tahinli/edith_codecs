@@ -1,0 +1,6 @@
+   Compiling ec-dnxhd v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dnxhd)
+    Finished `release` profile [optimized] target(s) in 3.89s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_dnxhd-7051bd5b9251cd86)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-5f05f5c325abd4f0)
+     Running tests/refusals.rs (/home/user/.cache/tgt-testcut-rest/release/deps/refusals-3506f610338add57)
+   Doc-tests ec_dnxhd

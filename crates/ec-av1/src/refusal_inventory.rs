@@ -171,7 +171,7 @@ const REFUSALS: &[&str] = &[
     // the AB-partition footprints still have no rectangular residual path.
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
     "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
-    "a reference picture whose height does not match this frame's own true size",
+    "a reference picture outside the 2x down / 16x up scaling limits",
     "a show_existing_frame header naming an empty reference slot",
     "an inter var-tx tree with a leaf transform larger than 32x32",
     // lane-intrainter r1 lifted the >=16x16 square case (per-TU intra
@@ -687,7 +687,7 @@ const PROVEN: &[(&str, &str, Proof)] = &[
     // named second defect (a non-intrabc uniform-tree block elsewhere in the
     // stream) so the pin tightens automatically when that defect is fixed.
     (
-        "a reference picture whose height does not match this frame's own true size",
+        "a reference picture outside the 2x down / 16x up scaling limits",
         "an_inter_frame_shorter_than_its_reference_is_refused_by_name",
         Proof::NegativeGate,
     ),
@@ -809,7 +809,7 @@ mod tests {
     /// joined the way rustc joins them.
     fn decode_path_refusals() -> BTreeSet<String> {
         let mut found = BTreeSet::new();
-        for src in [include_str!("decode.rs"), include_str!("stream.rs")] {
+        for src in [crate::test_source::module_source("decode"), crate::test_source::module_source("stream")] {
             let bytes = src.as_bytes();
             for (start, _) in src.match_indices("unsupported(") {
                 // `Error::unsupported(` and the bare helper both end here.
@@ -924,7 +924,7 @@ mod tests {
     /// No NEW gate may quietly turn a decode error into a skip.
     #[test]
     fn gates_that_swallow_a_decode_error_are_declared() {
-        let src = include_str!("stream.rs");
+        let src = crate::test_source::module_source("stream");
         let mut found: BTreeSet<String> = BTreeSet::new();
         for (i, _) in src.match_indices("\"SKIP ") {
             let rest = &src[i + "\"SKIP ".len()..];
@@ -1045,7 +1045,7 @@ mod tests {
                 crate::cdf::PARTITION_W64[0].len() - 1,
             ),
         ];
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         let lines: Vec<&str> = src.lines().collect();
         let indent = |l: &str| l.len() - l.trim_start().len();
         let mut found = 0usize;
@@ -1125,7 +1125,7 @@ mod tests {
             crate::cdf::PARTITION_W16[0].len() - 1,
         )];
 
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         let lines: Vec<&str> = src.lines().collect();
         let indent = |l: &str| l.len() - l.trim_start().len();
         let mut found = 0usize;
@@ -1306,7 +1306,7 @@ mod tests {
         // it names it and pins its guard site.
         const REFUSAL: &str = "a Golomb tail longer than this decoder reads";
         assert!(
-            super::pins_refusal(include_str!("decode.rs"), REFUSAL),
+            super::pins_refusal(crate::test_source::module_source("decode"), REFUSAL),
             "this gate proves {REFUSAL:?}, but that string is no longer in decode.rs"
         );
         let roundtrip = |value: u32| -> ec_core::Result<u32> {
@@ -1398,7 +1398,7 @@ mod tests {
             );
         }
 
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         let lines: Vec<&str> = src.lines().collect();
         let mut sites = 0usize;
         for (i, line) in lines.iter().enumerate() {
@@ -1478,7 +1478,7 @@ mod tests {
     #[test]
     fn no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax() {
         const BOUND: &str = "if bw > 64 || bh > 64 || bw * bh < 64 {";
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         assert!(
             src.contains("fn palette_bsize_ctx_wh(bw: usize, bh: usize) -> Option<usize> {"),
             "palette_bsize_ctx_wh is gone -- this enumeration no longer names the predicate \
@@ -1551,7 +1551,7 @@ mod tests {
     /// function.
     #[test]
     fn every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table() {
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         // lane-av1refusalspan: this gate is the PROOF for both refusals below,
         // so it names both and pins both guard sites.
         for refusal in [
@@ -1559,7 +1559,7 @@ mod tests {
             "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
         ] {
             assert!(
-                super::pins_refusal(&src, refusal),
+                super::pins_refusal(src, refusal),
                 "this gate proves {refusal:?}, but that string is no longer in decode.rs"
             );
         }
@@ -1577,9 +1577,7 @@ mod tests {
         let mut callers: BTreeSet<String> = BTreeSet::new();
         for (at, _) in src.match_indices("decode_rect_split(") {
             let enclosing = fn_starts
-                .iter()
-                .filter(|(i, _)| *i < at)
-                .next_back()
+                .iter().rfind(|(i, _)| *i < at)
                 .expect("a decode_rect_split call outside any function");
             if enclosing.1 != "decode_rect_split" {
                 callers.insert(enclosing.1.clone());
@@ -1760,7 +1758,7 @@ mod tests {
     /// reason was not.
     #[test]
     fn every_chroma_unit_decode_block_rect_can_present_has_a_coefficient_table() {
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
 
         // (1) The caller shape set, read out of the call sites' own
         // argument lists. `decode_block_rect(dec, cdfs, neighbours, at, bw,
@@ -1986,7 +1984,7 @@ mod tests {
     /// recorded it as unfixable for exactly that reason.
     #[test]
     fn the_skipped_128_root_chroma_suppression_publishes_the_blocks_own_per_axis_chroma_extent() {
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         let start = src
             .find("fn suppress_internal_lf_edges(")
             .expect("suppress_internal_lf_edges is gone");
@@ -2066,7 +2064,7 @@ mod tests {
     /// completion never enter `decode_block_rect64` at all.
     #[test]
     fn every_chroma_unit_a_64_axis_strip_can_present_has_a_coefficient_table() {
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
 
         // (1) The caller set. Each call's enclosing function is the last
         // top-level `fn` before it.
@@ -2081,9 +2079,7 @@ mod tests {
         let mut callers: BTreeSet<String> = BTreeSet::new();
         for (at, _) in src.match_indices("decode_block_rect64(") {
             let enclosing = fn_starts
-                .iter()
-                .filter(|(i, _)| *i < at)
-                .next_back()
+                .iter().rfind(|(i, _)| *i < at)
                 .expect("a decode_block_rect64 call outside any function");
             if enclosing.1 != "decode_block_rect64" {
                 callers.insert(enclosing.1.clone());
@@ -2231,10 +2227,10 @@ mod tests {
         // inventory row's anchor reads) and pins its guard site.
         const REFUSAL: &str = "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block";
         assert!(
-            include_str!("decode.rs").contains(REFUSAL),
+            crate::test_source::module_source("decode").contains(REFUSAL),
             "this gate proves {REFUSAL:?}, but that string is no longer in decode.rs"
         );
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         // The 128-root call site's own `cfl` argument, with the comment that
         // explains it -- the two lines are matched together so that reordering
         // the arguments cannot leave this test pointing at another `false`.
@@ -2303,7 +2299,7 @@ mod tests {
     /// symbol there.
     #[test]
     fn a_sb_level_horz_vert_strip_admits_no_filter_intra_symbol() {
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         assert!(
             src.contains("\"filter intra on a superblock-level HORZ/VERT strip"),
             "the guard this proof is about is gone -- re-derive the capability claim"
@@ -2395,7 +2391,7 @@ mod tests {
     /// a palette off an empty colour cache.
     #[test]
     fn every_read_intra_mode_call_site_hands_the_reader_a_palette_cache() {
-        let src = include_str!("decode.rs");
+        let src = crate::test_source::module_source("decode");
         let mut sites = 0u32;
         for name in ["read_intra_mode(", "read_intra_mode_rect("] {
             for (at, _) in src.match_indices(name) {
@@ -2420,11 +2416,13 @@ mod tests {
     }
 
     /// Lane-av1refusalspan: the files a proving gate may live in.
-    const GATE_SOURCES: [(&str, &str); 3] = [
-        ("decode.rs", include_str!("decode.rs")),
-        ("stream.rs", include_str!("stream.rs")),
-        ("refusal_inventory.rs", include_str!("refusal_inventory.rs")),
-    ];
+    fn gate_sources() -> [(&'static str, &'static str); 3] {
+        [
+            ("decode.rs", crate::test_source::module_source("decode")),
+            ("stream.rs", crate::test_source::module_source("stream")),
+            ("refusal_inventory.rs", include_str!("refusal_inventory.rs")),
+        ]
+    }
 
     /// Lane-av1refusalspan: every offset in `src` of a line that DEFINES
     /// `fn <gate>(` -- and nothing that merely names it.
@@ -2439,11 +2437,13 @@ mod tests {
             .map(|(at, _)| at)
             .filter(|at| {
                 let line_start = src[..*at].rfind('\n').map_or(0, |i| i + 1);
+                // Qualifiers are bare words (`pub`, `pub(crate)`, `async`, ...).
+                // Anything else on the line before the keyword (a `=`, a quote,
+                // a `//`, a `#[...]`) means the match is not a definition.
                 src[line_start..*at].split_whitespace().all(|word| {
-                    matches!(
-                        word,
-                        "pub" | "async" | "const" | "unsafe" | "extern" | "default"
-                    ) || (word.starts_with("pub(") && word.ends_with(')'))
+                    let bare = word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    let visibility = word.starts_with("pub(") && word.ends_with(')');
+                    bare || visibility
                 })
             })
             .collect()
@@ -2560,17 +2560,16 @@ mod tests {
                     open = open.or(Some(i));
                     depth += 1;
                 }
-                b'}' => {
+                b'}'
                     // A closer seen BEFORE the body opened is not ours (it can
                     // only come from a signature or a type ascription the scan
                     // mis-read); ignore it rather than underflowing `depth`.
-                    if depth > 0 {
+                    if depth > 0 => {
                         depth -= 1;
                         if depth == 0 {
                             return open.map(|o| (o, i));
                         }
                     }
-                }
                 _ => {}
             }
             i += 1;
@@ -2580,7 +2579,7 @@ mod tests {
 
     /// The text of the body of the function defined at `gate_at`, or `None`
     /// when that body is never closed.
-    fn function_body<'a>(src: &'a str, gate_at: usize) -> Option<&'a str> {
+    fn function_body(src: &str, gate_at: usize) -> Option<&str> {
         let (open, close) = body_braces(src, gate_at)?;
         src.get(open..=close)
     }
@@ -2609,7 +2608,7 @@ mod tests {
     /// satisfied by the CHROMA sibling's string seven lines down.
     fn gate_body(gate: &str) -> Result<&'static str, String> {
         let mut hits: Vec<(&str, usize, &'static str)> = Vec::new();
-        for (file, src) in GATE_SOURCES {
+        for (file, src) in gate_sources() {
             for at in gate_definitions(src, gate) {
                 hits.push((file, at, src));
             }
@@ -2802,7 +2801,7 @@ mod tests {
         // A body whose closing brace is missing (a half-finished edit) is a
         // FAILURE. The rule it replaced sliced to end of file and carried on.
         let truncated =
-            format!("fn this_gate() {{\n    let _ = 1;\n\nfn next_gate() {{\n    let _ = 2;\n}}\n");
+            "fn this_gate() {\n    let _ = 1;\n\nfn next_gate() {\n    let _ = 2;\n}\n".to_string();
         assert!(gate_body_in(&truncated, "this_gate").is_err());
     }
 
@@ -2823,7 +2822,7 @@ mod tests {
             resolved += 1;
         }
         assert_eq!(resolved, PROVEN.len());
-        for (file, src) in GATE_SOURCES {
+        for (file, src) in gate_sources() {
             let last = last_fn_name(src).unwrap_or_else(|| panic!("{file} has no function"));
             let at = gate_definitions(src, &last)
                 .last()
@@ -2953,6 +2952,6 @@ mod tests {
                 Some(t.trim_start_matches("pub fn ").trim_start_matches("fn "))
             })
             .filter_map(|head| head.split_once('(').map(|(head, _)| head.trim().to_owned()))
-            .last()
+            .next_back()
     }
 }

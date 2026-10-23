@@ -1,0 +1,40 @@
+{ "type": "suite", "event": "started", "test_count": 7 }
+{ "type": "test", "event": "started", "name": "container::tests::reads_frames_and_stops_at_truncation" }
+{ "type": "test", "event": "started", "name": "container::tests::reserved_type_errors_and_wb_probes" }
+{ "type": "test", "event": "started", "name": "container::tests::seek_lands_on_frame" }
+{ "type": "test", "event": "started", "name": "nb::basic::tests::norms_and_math" }
+{ "type": "test", "name": "container::tests::reserved_type_errors_and_wb_probes", "event": "ok", "exec_time": 0.000005941 }
+{ "type": "test", "event": "started", "name": "nb::basic::tests::saturation" }
+{ "type": "test", "name": "container::tests::seek_lands_on_frame", "event": "ok", "exec_time": 0.000004078 }
+{ "type": "test", "event": "started", "name": "nb::bitstream::tests::parse_mr122_zero_and_nodata" }
+{ "type": "test", "name": "container::tests::reads_frames_and_stops_at_truncation", "event": "ok", "exec_time": 0.000008115 }
+{ "type": "test", "event": "started", "name": "nb::bitstream::tests::sizes" }
+{ "type": "test", "name": "nb::basic::tests::norms_and_math", "event": "ok", "exec_time": 0.000000171 }
+{ "type": "test", "name": "nb::basic::tests::saturation", "event": "ok", "exec_time": 0.000000451 }
+{ "type": "test", "name": "nb::bitstream::tests::parse_mr122_zero_and_nodata", "event": "ok", "exec_time": 0.000002084 }
+{ "type": "test", "name": "nb::bitstream::tests::sizes", "event": "ok", "exec_time": 0.00000032 }
+{ "type": "suite", "event": "ok", "passed": 7, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.001359687 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "amr_3gp_mp4_agree_for_all_modes" }
+{ "type": "test", "name": "amr_3gp_mp4_agree_for_all_modes", "event": "ok", "exec_time": 6.300151616 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 6.300565534 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "all_modes_bit_exact_vs_libopencore" }
+{ "type": "test", "event": "started", "name": "garbage_never_panics" }
+{ "type": "test", "event": "started", "name": "lost_and_bit_flipped_frames_vs_libopencore" }
+{ "type": "test", "name": "garbage_never_panics", "event": "ok", "exec_time": 0.088411677 }
+{ "type": "test", "name": "lost_and_bit_flipped_frames_vs_libopencore", "event": "ok", "exec_time": 3.016793132 }
+{ "type": "test", "name": "all_modes_bit_exact_vs_libopencore", "event": "ok", "exec_time": 26.623213404 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 26.623782782 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "arbitrary_bytes_never_panic" }
+{ "type": "test", "event": "started", "name": "comfort_noise_lost_and_corrupted_frames_match_the_reference" }
+{ "type": "test", "event": "started", "name": "every_mode_matches_the_reference_decoder_in_awb_and_mp4" }
+{ "type": "test", "event": "started", "name": "the_decoder_trait_yields_one_frame_per_packet" }
+{ "type": "test", "name": "the_decoder_trait_yields_one_frame_per_packet", "event": "ok", "exec_time": 0.000135615 }
+{ "type": "test", "name": "arbitrary_bytes_never_panic", "event": "ok", "exec_time": 0.15630039 }
+{ "type": "test", "name": "comfort_noise_lost_and_corrupted_frames_match_the_reference", "event": "ok", "exec_time": 1.057772165 }
+{ "type": "test", "name": "every_mode_matches_the_reference_decoder_in_awb_and_mp4", "event": "ok", "exec_time": 5.267563524 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 5.268054216 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00004225 }

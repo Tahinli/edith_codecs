@@ -1,0 +1,15 @@
+[package]
+name = "ec-dnxhd"
+description = "Avid DNxHD / DNxHR (SMPTE VC-3) software decoder: every DNxHD compression id, DNxHR LB/SQ/HQ/HQX/444, progressive and two-field interlaced, 8/10/12-bit."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+
+[dev-dependencies]
+ec-mp4 = { workspace = true }
+ec-matroska = { workspace = true }
+ec-riff = { workspace = true }

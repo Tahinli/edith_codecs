@@ -1,0 +1,32 @@
+[package]
+name = "ec-h265-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ec-core = { path = "../../ec-core" }
+ec-h265 = { path = ".." }
+ec-h265-syntax = { path = "../../ec-h265-syntax" }
+
+# Kept out of the main workspace: see `exclude` in the root Cargo.toml.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_params_slice"
+path = "fuzz_targets/parse_params_slice.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_annexb"
+path = "fuzz_targets/decode_annexb.rs"
+test = false
+doc = false
+bench = false

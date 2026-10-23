@@ -218,7 +218,8 @@ fn get_coeffs(
                             if prob == 0 {
                                 break;
                             }
-                            v += v + i32::from(g!(n, band, c, prob));
+                            let g = i32::from(g!(n, band, c, prob));
+                            v = v + v + g;
                         }
                         v += 3 + (8 << cat);
                     }

@@ -301,6 +301,92 @@ fn build_mc_border(
     }
 }
 
+/// Largest block width or height the convolve kernels see (a 64-sample superblock).
+const MAX_W: usize = 64;
+
+/// Store one row of 8-tap sums: round, clip to `bd`, and average into `dst` when `avg`.
+#[inline]
+fn store_row(dst: &mut [Sample], acc: &[i32], avg: bool, maxv: i32) {
+    if avg {
+        for (d, &a) in dst.iter_mut().zip(acc) {
+            let v = ((a + 64) >> FILTER_BITS).clamp(0, maxv);
+            *d = ((*d as i32 + v + 1) >> 1) as Sample;
+        }
+    } else {
+        for (d, &a) in dst.iter_mut().zip(acc) {
+            *d = ((a + 64) >> FILTER_BITS).clamp(0, maxv) as Sample;
+        }
+    }
+}
+
+/// Unscaled horizontal 8-tap pass: `convolve_horiz` with `x_step == SUBPEL_SHIFTS`
+/// and one filter for the whole row. Written as one contiguous pass per tap so the
+/// compiler vectorises the inner loop; the sums equal the per-sample form exactly.
+// Same arguments as `convolve_horiz`, which callers already pass; a struct would be copied per call.
+#[allow(clippy::too_many_arguments)]
+fn conv_h_unscaled(
+    buf: &[Sample],
+    stride: usize,
+    origin: isize,
+    dst: &mut [Sample],
+    dst_stride: usize,
+    filt: &[i16; TAPS],
+    w: usize,
+    rows: usize,
+    avg: bool,
+    bd: u8,
+) {
+    let taps: [i32; TAPS] = filt.map(i32::from);
+    let maxv = (1i32 << bd) - 1;
+    let mut acc = [0i32; MAX_W];
+    let acc = &mut acc[..w];
+    for y in 0..rows {
+        // Output x reads samples x-3 ..= x+4 of this row.
+        let start = (origin + (y * stride) as isize - (TAPS as isize / 2 - 1)) as usize;
+        let src = &buf[start..start + w + TAPS - 1];
+        acc.fill(0);
+        for (k, &t) in taps.iter().enumerate() {
+            for (a, &s) in acc.iter_mut().zip(&src[k..k + w]) {
+                *a += s as i16 as i32 * t;
+            }
+        }
+        store_row(&mut dst[y * dst_stride..y * dst_stride + w], acc, avg, maxv);
+    }
+}
+
+/// Unscaled vertical 8-tap pass: `convolve_vert` with `y_step == SUBPEL_SHIFTS` and
+/// one filter for the whole block. Same sums as the per-sample form.
+// Same arguments as `convolve_vert`, which callers already pass; a struct would be copied per call.
+#[allow(clippy::too_many_arguments)]
+fn conv_v_unscaled(
+    buf: &[Sample],
+    stride: usize,
+    origin: isize,
+    dst: &mut [Sample],
+    dst_stride: usize,
+    filt: &[i16; TAPS],
+    w: usize,
+    h: usize,
+    avg: bool,
+    bd: u8,
+) {
+    let taps: [i32; TAPS] = filt.map(i32::from);
+    let maxv = (1i32 << bd) - 1;
+    let mut acc = [0i32; MAX_W];
+    let acc = &mut acc[..w];
+    for y in 0..h {
+        acc.fill(0);
+        for (k, &t) in taps.iter().enumerate() {
+            // Output row y reads rows y-3 ..= y+4 around the block origin.
+            let start = (origin + ((y + k) as isize - (TAPS as isize / 2 - 1)) * stride as isize) as usize;
+            for (a, &s) in acc.iter_mut().zip(&buf[start..start + w]) {
+                *a += s as i16 as i32 * t;
+            }
+        }
+        store_row(&mut dst[y * dst_stride..y * dst_stride + w], acc, avg, maxv);
+    }
+}
+
 /// `convolve_horiz` / `convolve_avg_horiz` (`vpx_dsp/vpx_convolve.c:22`).
 /// `origin` is the block's first sample in `buf`; taps are read from
 /// `origin + y*stride + (x_q4 >> SUBPEL_BITS) - (SUBPEL_TAPS / 2 - 1) + k`.
@@ -322,6 +408,12 @@ fn convolve_horiz(
     avg: bool,
     bd: u8,
 ) {
+    if x_step == SUBPEL_SHIFTS && (0..SUBPEL_SHIFTS).contains(&x0_q4) {
+        // Unscaled: the filter is the same for every output sample.
+        let filt = &f[x0_q4 as usize];
+        conv_h_unscaled(buf, stride, origin, dst, dst_stride, filt, w, rows, avg, bd);
+        return;
+    }
     for y in 0..rows {
         let mut x_q4 = x0_q4;
         for x in 0..w {
@@ -362,6 +454,12 @@ fn convolve_vert(
     avg: bool,
     bd: u8,
 ) {
+    if y_step == SUBPEL_SHIFTS && (0..SUBPEL_SHIFTS).contains(&y0_q4) {
+        // Unscaled: the filter is the same for every output row.
+        let filt = &f[y0_q4 as usize];
+        conv_v_unscaled(buf, stride, origin, dst, dst_stride, filt, w, h, avg, bd);
+        return;
+    }
     for x in 0..w {
         let mut y_q4 = y0_q4;
         for y in 0..h {
@@ -609,6 +707,8 @@ pub(crate) fn build_inter_predictors(
     y: usize,
     w: usize,
     h: usize,
+    bw: usize,
+    bh: usize,
     mv: (i32, i32),
     mb_left: i32,
     mb_right: i32,
@@ -624,9 +724,16 @@ pub(crate) fn build_inter_predictors(
 ) {
     let bd = refp.bd;
     let is_scaled = sf.is_scaled();
-    let mv_q4 = clamp_mv_to_umv_border_sb(
-        mv, w as i32, h as i32, mb_left, mb_right, mb_top, mb_bottom, ss_x, ss_y,
-    );
+    // `dec_build_inter_predictors` clamps (against the WHOLE block's `bw` x
+    // `bh`, not the 4x4 sub-block) only on the scaled path; unscaled MVs are
+    // just widened to 1/16 pel and rely on the border copy below.
+    let mv_q4 = if is_scaled {
+        clamp_mv_to_umv_border_sb(
+            mv, bw as i32, bh as i32, mb_left, mb_right, mb_top, mb_bottom, ss_x, ss_y,
+        )
+    } else {
+        (mv.0 * (1 << (1 - ss_y)), mv.1 * (1 << (1 - ss_x)))
+    };
 
     // Co-ordinate of the containing block, pixel precision, plus the
     // block-relative offset (`x`, `y`).
@@ -803,6 +910,92 @@ pub(crate) fn average_split_mvs(
                 col += b[ref_idx].1;
             }
             (q4(row), q4(col))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Per-sample reference: the `convolve_horiz` / `convolve_vert` loops before the
+    /// unscaled fast path, with the same tap positions and rounding.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_conv(
+        buf: &[Sample],
+        stride: usize,
+        origin: isize,
+        dst: &mut [Sample],
+        dst_stride: usize,
+        f: &[i16; TAPS],
+        horiz: bool,
+        w: usize,
+        h: usize,
+        avg: bool,
+        bd: u8,
+    ) {
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = 0i32;
+                for k in 0..TAPS {
+                    let idx = if horiz {
+                        origin + (y * stride + x) as isize + k as isize - 3
+                    } else {
+                        origin + (y as isize + k as isize - 3) * stride as isize + x as isize
+                    };
+                    sum += buf[idx as usize] as i32 * f[k] as i32;
+                }
+                let v = clip_pixel_bd(round_pow2(sum, FILTER_BITS), bd) as i32;
+                let d = y * dst_stride + x;
+                dst[d] = if avg { round_pow2(dst[d] as i32 + v, 1) as Sample } else { v as Sample };
+            }
+        }
+    }
+
+    /// Deterministic pseudo-random samples in `[0, 2^bd)`.
+    fn samples(n: usize, bd: u8, seed: u32) -> Vec<Sample> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((s >> 8) & ((1 << bd) - 1)) as Sample
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unscaled_fast_path_matches_per_sample_reference() {
+        for kernel in 0..4 {
+            for bd in [8u8, 10, 12] {
+                for frac in 0..SUBPEL_SHIFTS as usize {
+                    for &(w, h) in &[(4usize, 4usize), (8, 8), (16, 8), (32, 32), (64, 64)] {
+                        for avg in [false, true] {
+                            let stride = 80usize;
+                            let buf = samples(stride * 80, bd, (kernel * 977 + frac * 31 + w) as u32);
+                            let origin = (3 * stride + 3) as isize;
+                            let f = &FILTERS[kernel][frac];
+                            let init = samples(64 * 64, bd, 7);
+                            let mut got = init.clone();
+                            let mut want = init.clone();
+                            convolve_horiz(
+                                &buf, stride, origin, &mut got, 64, &FILTERS[kernel], frac as i32,
+                                SUBPEL_SHIFTS, w, h, avg, bd,
+                            );
+                            ref_conv(&buf, stride, origin, &mut want, 64, f, true, w, h, avg, bd);
+                            assert_eq!(got, want, "horiz kernel={kernel} bd={bd} frac={frac} {w}x{h} avg={avg}");
+
+                            let mut got = init.clone();
+                            let mut want = init.clone();
+                            convolve_vert(
+                                &buf, stride, origin, &mut got, 64, &FILTERS[kernel], frac as i32,
+                                SUBPEL_SHIFTS, w, h, avg, bd,
+                            );
+                            ref_conv(&buf, stride, origin, &mut want, 64, f, false, w, h, avg, bd);
+                            assert_eq!(got, want, "vert kernel={kernel} bd={bd} frac={frac} {w}x{h} avg={avg}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

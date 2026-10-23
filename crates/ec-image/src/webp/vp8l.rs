@@ -307,7 +307,8 @@ pub fn decode(data: &[u8], limits: crate::Limits) -> Result<Argb> {
     if version != 0 {
         return Err(Error::corrupt(format!("VP8L: version {version}")));
     }
-    limits.check(width, height)?;
+    // Every VP8L picture comes out as RGBA, four bytes a pixel.
+    limits.check_output(width, height, 4)?;
     let pixels = decode_stream(&mut bits, width, height, true)?;
     Ok(Argb {
         width,

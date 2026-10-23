@@ -5,31 +5,77 @@ use ec_core::{BitReader, Result};
 
 use crate::tables::{QNTZTAB, QUANT_LEVELS, symmetric_level};
 
-/// The pseudo-random source for `bap == 0` mantissas (§7.3.4).
+/// Initial `state[8..64]` of ffmpeg's `av_lfg_init(_, 0)`. Each of the fourteen
+/// MD5 blocks hashes a 16-byte record: the seed word in bytes 0..4, the block
+/// index in byte 4, and whatever the previous digest left in bytes 5..16, since
+/// ffmpeg reuses one buffer in place. `state[0..8]` start at zero, as they do in
+/// ffmpeg's zeroed decoder context. Checked against libavutil's `av_lfg_init`.
+const LFG_SEED: [u32; 56] = [
+    0x3b376b5e, 0xf56be763, 0xcba2a7fc, 0x9751b2c7,
+    0x5b1fe69a, 0x860b05af, 0x2b2650ca, 0x92a97fb0,
+    0x7315e8eb, 0x8b6287a3, 0x2ddbd8b3, 0x1d098ca2,
+    0x6a65b478, 0xc9b22db4, 0x9637fbcf, 0xd4427934,
+    0xb390e2b5, 0x92a84d32, 0x2110b086, 0x25a9182f,
+    0x239295f1, 0xc6f846f7, 0x5c5b3a51, 0xe6a7ba34,
+    0xd6597325, 0xa537e3df, 0xcb80e534, 0xeaecf2dc,
+    0x9bbb6bd1, 0x2ea8bd11, 0x8c06ce60, 0x6859af1d,
+    0xf159f64e, 0xc213bd06, 0x2a5d7785, 0xe621dc54,
+    0xb8cb9a8e, 0xe6a491f8, 0x85d7df25, 0x917d9aee,
+    0xb156c513, 0x5bd929dd, 0xf6a9dab1, 0xc3ec5f2a,
+    0x5215230d, 0xe2b677d7, 0x701e36e7, 0x5405e2c7,
+    0xddcb3ae2, 0x95b866ea, 0x1eb13c9a, 0x346646c2,
+    0x8ba48526, 0xb325e9bf, 0x29f07d49, 0xc986cf38,
+];
+
+/// The pseudo-random source for `bap == 0` mantissas (§7.3.4) and for the
+/// Annex E noise.
 ///
-/// The standard asks only for "any reasonably random sequence" scaled to a
-/// uniform distribution between ±0.707, so this is the classic 16-bit LFSR the
-/// AC-3 reference decoder uses. It is deterministic, which is what makes a
-/// decode reproducible from one run to the next.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Dither(u32);
+/// The standard asks only for "any reasonably random sequence". This is the
+/// lagged-Fibonacci generator ffmpeg's AC-3 decoder draws from (`AVLFG`, seeded
+/// with 0 when the decoder starts and never reseeded), in the same order. A
+/// decode of a stream therefore reproduces ffmpeg's zero-bit noise sample for
+/// sample instead of differing from it by an independent noise sequence.
+#[derive(Debug, Clone)]
+pub struct Dither {
+    state: [u32; 64],
+    index: usize,
+}
+
+impl Default for Dither {
+    fn default() -> Self {
+        let mut state = [0u32; 64];
+        state[8..].copy_from_slice(&LFG_SEED);
+        Dither { state, index: 0 }
+    }
+}
 
 impl Dither {
-    /// Next dither value, uniform in ±0.707.
+    /// Next dither value, uniform in ±0.707 (ffmpeg's mantissa scaled by 2^-23).
     pub fn value(&mut self) -> f32 {
-        self.uniform() * 0.707
+        self.mantissa() as f32 / 8_388_608.0
     }
 
     /// Next value from a zero-mean, unit-variance source — what Annex E
-    /// §3.6.4.2.4 calls `noise()`. A uniform distribution on `[-1, 1)` has
+    /// §3.6.4.2.4 calls `noise()`. A uniform distribution on `[-1, 1]` has
     /// variance 1/3, so it is scaled by `sqrt(3)`.
     pub fn unit_variance(&mut self) -> f32 {
-        self.uniform() * 1.732_050_8
+        self.mantissa() as f32 / 5_931_008.0 * 1.732_050_8
     }
 
-    fn uniform(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(25173).wrapping_add(13849) & 0xffff;
-        f32::from(self.0 as u16 as i16) * (1.0 / 32768.0)
+    /// ffmpeg's integer dither mantissa: `((x >> 8) * 181 >> 8) - 5931008`.
+    fn mantissa(&mut self) -> i32 {
+        let x = self.next_word();
+        let u = ((x >> 8) * 181) >> 8;
+        u as i32 - 5_931_008
+    }
+
+    /// `av_lfg_get`: `state[i] = state[i-24] + state[i-55]`, returning the new word.
+    fn next_word(&mut self) -> u32 {
+        let i = self.index & 63;
+        let v = self.state[(i + 40) & 63].wrapping_add(self.state[(i + 9) & 63]);
+        self.state[i] = v;
+        self.index = self.index.wrapping_add(1);
+        v
     }
 }
 

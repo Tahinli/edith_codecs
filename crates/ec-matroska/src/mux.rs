@@ -50,6 +50,8 @@ struct MuxTrack {
     title: String,
     /// `CodecDelay` in nanoseconds, where a caller stated one.
     delay_ns: Option<u64>,
+    /// `FlagInterlaced`/`FieldOrder` on a video track; [`None`] writes neither.
+    field_order: Option<ec_core::Interlace>,
 }
 
 /// One `CuePoint` waiting for [`Muxer::finish`].
@@ -142,6 +144,27 @@ impl<W: Write + Seek> MatroskaMuxer<W> {
         Ok(())
     }
 
+    /// Say how a video track's pictures are scanned: `FlagInterlaced` and
+    /// `FieldOrder`. Every video track is `Some(Progressive)` until told
+    /// otherwise; [`None`] writes neither element. Before the first packet.
+    pub fn set_field_order(
+        &mut self,
+        stream: u32,
+        order: Option<ec_core::Interlace>,
+    ) -> Result<()> {
+        let track = self
+            .tracks
+            .get_mut(stream as usize)
+            .ok_or_else(|| Error::corrupt(format!("Matroska: no stream {stream} to scan")))?;
+        if self.pos > 0 {
+            return Err(Error::corrupt(
+                "Matroska: a field order set after the first packet",
+            ));
+        }
+        track.field_order = order;
+        Ok(())
+    }
+
     /// States a track's encoder delay: `CodecDelay`, nanoseconds of decoded
     /// output a player throws away before the audible stream starts.
     ///
@@ -163,6 +186,33 @@ impl<W: Write + Seek> MatroskaMuxer<W> {
             .get_mut(stream as usize)
             .ok_or_else(|| Error::corrupt(format!("Matroska: no stream {stream} to delay")))?;
         track.delay_ns = Some(delay_ns);
+        Ok(())
+    }
+
+    /// State a video stream's HDR light levels: `MaxCLL` and `MaxFALL` and, in
+    /// `Colour/MasteringMetadata`, the mastering display's luminances and (where
+    /// [`ec_core::ContentLight::mastering_primaries`] is set) its primaries and
+    /// white point. Units are those of [`ec_core::ContentLight`]. Must be set
+    /// before the first packet, which is when `Tracks` is written; a track never
+    /// told writes none of these.
+    pub fn set_content_light(&mut self, stream: u32, light: ec_core::ContentLight) -> Result<()> {
+        if self.pos > 0 {
+            return Err(Error::corrupt(
+                "Matroska: HDR light levels set after the first packet",
+            ));
+        }
+        let info = self
+            .streams
+            .get_mut(stream as usize)
+            .ok_or_else(|| Error::corrupt(format!("Matroska: no stream {stream} to light")))?;
+        match &mut info.params.media {
+            ec_core::MediaParameters::Video(v) => v.light = light,
+            _ => {
+                return Err(Error::corrupt(format!(
+                    "Matroska: stream {stream} is not a video track"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -301,6 +351,17 @@ impl<W: Write + Seek> MatroskaMuxer<W> {
                     );
                 }
                 let mut dims = Vec::new();
+                // FlagInterlaced: 1 interlaced, 2 progressive. FieldOrder: 0
+                // progressive, 1 top first, 6 bottom first.
+                if let Some(order) = self.tracks[track].field_order {
+                    let (flag, field) = match order {
+                        ec_core::Interlace::Progressive => (2, 0),
+                        ec_core::Interlace::TopFieldFirst => (1, 1),
+                        ec_core::Interlace::BottomFieldFirst => (1, 6),
+                    };
+                    uint(&mut dims, ebml::FLAG_INTERLACED, flag);
+                    uint(&mut dims, ebml::FIELD_ORDER, field);
+                }
                 uint(&mut dims, ebml::PIXEL_WIDTH, u64::from(v.width));
                 uint(&mut dims, ebml::PIXEL_HEIGHT, u64::from(v.height));
                 // Anamorphic content is shown at a size its samples are not
@@ -332,21 +393,43 @@ impl<W: Write + Seek> MatroskaMuxer<W> {
                 );
                 uint(&mut colour, ebml::PRIMARIES, u64::from(v.color.primaries));
                 if let Some(cll) = v.light.max_cll {
-                    uint(&mut colour, ebml::MAX_CLL, cll.max(0.0) as u64);
+                    uint(&mut colour, ebml::MAX_CLL, cll.max(0.0).round() as u64);
                 }
                 if let Some(fall) = v.light.max_fall {
-                    uint(&mut colour, ebml::MAX_FALL, fall.max(0.0) as u64);
+                    uint(&mut colour, ebml::MAX_FALL, fall.max(0.0).round() as u64);
                 }
                 // The mastering display, where the source stated one: a copied
                 // HDR film that loses its grading display is graded again by
-                // every tone map downstream.
-                if v.light.mastering_max.is_some() || v.light.mastering_min.is_some() {
+                // every tone map downstream. ffmpeg's order: primaries, white
+                // point, then the luminances; the chromaticities are the
+                // 0.00002 integers of an `mdcv` divided out to floats.
+                let light = v.light;
+                if light.mastering_max.is_some()
+                    || light.mastering_min.is_some()
+                    || light.mastering_primaries.is_some()
+                {
                     let mut mastering = Vec::new();
-                    if let Some(max) = v.light.mastering_max {
-                        float(&mut mastering, ebml::LUMINANCE_MAX, f64::from(max));
+                    if let Some(p) = light.mastering_primaries {
+                        let xy = |out: &mut Vec<u8>, id: u32, raw: u16| {
+                            float(out, id, f64::from(raw) / 50_000.0)
+                        };
+                        xy(&mut mastering, ebml::PRIMARY_R_X, p.red.0);
+                        xy(&mut mastering, ebml::PRIMARY_R_Y, p.red.1);
+                        xy(&mut mastering, ebml::PRIMARY_G_X, p.green.0);
+                        xy(&mut mastering, ebml::PRIMARY_G_Y, p.green.1);
+                        xy(&mut mastering, ebml::PRIMARY_B_X, p.blue.0);
+                        xy(&mut mastering, ebml::PRIMARY_B_Y, p.blue.1);
+                        xy(&mut mastering, ebml::WHITE_POINT_X, p.white.0);
+                        xy(&mut mastering, ebml::WHITE_POINT_Y, p.white.1);
                     }
-                    if let Some(min) = v.light.mastering_min {
-                        float(&mut mastering, ebml::LUMINANCE_MIN, f64::from(min));
+                    // Rounded to the 0.0001 nit an `mdcv` has, so 0.005 is
+                    // written as 0.005 and not as the f32 nearest to it.
+                    let decimal = |v: f32| (f64::from(v) * 1e4).round() / 1e4;
+                    if let Some(max) = light.mastering_max {
+                        float(&mut mastering, ebml::LUMINANCE_MAX, decimal(max));
+                    }
+                    if let Some(min) = light.mastering_min {
+                        float(&mut mastering, ebml::LUMINANCE_MIN, decimal(min));
                     }
                     elem(&mut colour, ebml::MASTERING_METADATA, &mastering);
                 }
@@ -515,6 +598,7 @@ impl<W: Write + Seek + Send> Muxer for MatroskaMuxer<W> {
             frame_ns,
             title: String::new(),
             delay_ns: None,
+            field_order: Some(ec_core::Interlace::Progressive),
         });
         let mut info = info;
         info.index = index;
@@ -677,6 +761,7 @@ pub(crate) fn matroska_codec_id(codec: CodecId) -> Result<&'static str> {
         CodecId::Ac3 => "A_AC3",
         CodecId::EAc3 => "A_EAC3",
         CodecId::TrueHd => "A_TRUEHD",
+        CodecId::Dts => "A_DTS",
         CodecId::Alac => "A_ALAC",
         CodecId::Flac => "A_FLAC",
         CodecId::Mp3 => "A_MPEG/L3",
@@ -691,6 +776,8 @@ pub(crate) fn matroska_codec_id(codec: CodecId) -> Result<&'static str> {
         CodecId::WebVtt => "S_TEXT/WEBVTT",
         CodecId::Ass => "S_TEXT/ASS",
         CodecId::Pgs => "S_HDMV/PGS",
+        CodecId::DvdSub => "S_VOBSUB",
+        CodecId::DvbSub => "S_DVBSUB",
         codec => {
             return Err(Error::unsupported(
                 format!("{} in Matroska", codec.name()),

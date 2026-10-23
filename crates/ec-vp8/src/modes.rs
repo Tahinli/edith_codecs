@@ -457,7 +457,7 @@ pub fn find_near_mvs(
                 }
                 cnt[cntx] += w;
             } else {
-                cnt[CNT_INTRA] += i32::from(w);
+                cnt[CNT_INTRA] += w;
             }
         }
     }

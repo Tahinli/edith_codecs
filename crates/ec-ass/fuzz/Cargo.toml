@@ -1,0 +1,49 @@
+[package]
+name = "ec-ass-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-ass]
+path = ".."
+
+[dependencies.ec-subs]
+path = "../../ec-subs"
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "script"
+path = "fuzz_targets/script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "styles"
+path = "fuzz_targets/styles.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "events"
+path = "fuzz_targets/events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "overrides"
+path = "fuzz_targets/overrides.rs"
+test = false
+doc = false
+bench = false

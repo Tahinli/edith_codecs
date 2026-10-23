@@ -50,12 +50,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod asc;
 mod boxes;
 mod demux;
 mod esds;
 mod mux;
 
-pub use demux::{Mp4Demuxer, Sample, TrackInfo};
+pub use demux::{Edit, Mp4Demuxer, Sample, TrackInfo};
 pub use esds::{Esds, object_type};
 pub use mux::Mp4Muxer;
 

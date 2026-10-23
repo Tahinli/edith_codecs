@@ -1,0 +1,6 @@
+   Compiling ec-ogg v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-ogg)
+    Finished `release` profile [optimized] target(s) in 3.11s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_ogg-9ba77635e505d39c)
+     Running tests/ogg.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ogg-a11fb94093d6fcc9)
+     Running tests/real_library.rs (/home/user/.cache/tgt-testcut-rest/release/deps/real_library-8f8696596090dc54)
+   Doc-tests ec_ogg

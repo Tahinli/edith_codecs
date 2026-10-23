@@ -14,7 +14,7 @@
 //! - a published bottom line ([`RowBoundary`]) the row below reads through
 //!   atomics, plus a progress counter.
 //!
-//! No `unsafe`, no scoped raw pointers, no rayon: the only shared mutable state
+//! No raw memory access, no scoped raw pointers, no rayon: the only shared mutable state
 //! is one atomic byte per boundary sample and one atomic counter per row.
 //!
 //! # What comes out
@@ -23,7 +23,7 @@
 //! every picture is an IDR, so every picture is a seek point, and a seek point
 //! whose parameter sets are elsewhere is not one.
 
-use crate::ctu::{CtuEncoder, RowBoundary, RowState, SourcePlanes};
+use crate::ctu::{CtuEncoder, Pel, RowBoundary, RowState, SourcePlanes};
 use crate::deblock::{TuMap, deblock};
 use ec_core::color::ContentLight;
 use ec_core::error::{Error, Result};
@@ -34,7 +34,7 @@ use ec_h265_syntax::slice::SliceHeader;
 use ec_h265_syntax::vui::{VideoSignalType, VuiParameters};
 use ec_h265_syntax::{Pps, Sps, Vps, sei};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::cabac::{CabacEncoder, Contexts};
 
@@ -46,6 +46,16 @@ pub enum RateControl {
     /// Aim for `bits` per picture: a model picks the QP, and a picture that
     /// lands more than 25% off is coded a second time at a corrected QP.
     TargetBits(u64),
+    /// Aim for `kbps` kilobits per second at `fps` frames per second. A sequence
+    /// ([`Encoder::encode_sequence`]) runs a frame-level model with feedback, so
+    /// the clip's average lands on the target; a single IDR picture gets the
+    /// per-picture share of it, as [`RateControl::TargetBits`] does.
+    Bitrate {
+        /// Target bitrate in kilobits per second.
+        kbps: u32,
+        /// Frame rate the bitrate is spread over.
+        fps: f64,
+    },
 }
 
 /// Whether 4x4 transform units may skip the transform and code residual
@@ -74,7 +84,12 @@ pub struct EncoderConfig {
     pub height: u32,
     /// Quantiser or bit target.
     pub rate_control: RateControl,
-    /// Worker threads; 0 means "as many as the machine has".
+    /// Worker threads. Output is byte-identical for every value: each CTB row is
+    /// a substream with its own context state, and rows are dealt to workers
+    /// round-robin, so the thread count changes only the schedule.
+    ///
+    /// 0 and the default mean `min(available_parallelism, 6)`, see
+    /// [`default_threads`].
     pub threads: usize,
     /// Coding tree block size, 32 (default) or 64.
     ///
@@ -231,8 +246,16 @@ pub struct EncoderConfig {
     pub sample_aspect_ratio: Option<(u16, u16)>,
     /// `(num_units_in_tick, time_scale)`; also picks the level.
     pub timing: Option<(u32, u32)>,
-    /// HDR mastering metadata, written as prefix SEI.
+    /// `chroma_sample_loc_type` (top, bottom field), each 0..=5, written into the VUI.
+    /// BT.2020 4:2:0 material is type 2. Default absent.
+    pub chroma_sample_loc: Option<(u8, u8)>,
+    /// Content light level (MaxCLL/MaxFALL) and, when `mastering_display` is
+    /// absent, the mastering luminance pair, written as prefix SEI.
     pub content_light: ContentLight,
+    /// Full `mastering_display_colour_volume` (primaries, white point,
+    /// luminances), written as prefix SEI. Takes precedence over the mastering
+    /// pair in `content_light`. Default absent.
+    pub mastering_display: Option<ec_h265_syntax::sei::MasteringDisplay>,
     /// Run the in-loop deblocking filter over the finished picture.
     ///
     /// An intra picture predicts from its unfiltered reconstruction, so this
@@ -243,6 +266,57 @@ pub struct EncoderConfig {
     pub picture_hash: bool,
     /// Return the reconstruction alongside the bitstream.
     pub keep_recon: bool,
+    /// Picture interval of [`Encoder::encode_sequence`]: an IDR, then
+    /// `keyint - 1` P pictures, repeating. 1 (the default) makes every picture
+    /// an IDR, as [`Encoder::encode_batch`] does.
+    pub keyint: usize,
+    /// Whether P pictures are coded as a wavefront (`entropy_coding_sync`): one
+    /// substream per CTB row, contexts synced from the row above after its second
+    /// CTB, and rows coded by up to [`EncoderConfig::threads`] workers.
+    ///
+    /// On by default. The cost is the substream boundary (contexts resynced per
+    /// row, and one entry point per row), which is measured in the lane report
+    /// against off, the single continuous substream the sequential coder writes.
+    /// Off also makes P pictures single-threaded.
+    pub inter_wpp: bool,
+    /// Scale on the lambda the P-picture mode decisions use, against
+    /// `lambda_for(qp)` (the intra lambda, in squared-error units per bit). The
+    /// motion search uses `sqrt(lambda_for(qp))` instead, because it costs SAD.
+    ///
+    /// Measured with `scripts/hevc-bdrate.sh` (ffmpeg PSNR, bframes=0 x265
+    /// anchor, 352x288, QPs 22/27/32/37), BD-rate against x265: +21.9% at scale 1,
+    /// +23.4% at 1/4, +28.9% at 1/16. Scale 1 is the default.
+    pub inter_lambda_scale: f64,
+    /// Whether a sequence with P pictures (`keyint > 1`) codes its IDR pictures with the
+    /// fast intra tool set: no RDOQ, one full-RD intra candidate, no NxN split, no transform
+    /// skip trial, no transform-tree split. An IDR is one picture in `keyint`, so what
+    /// it gives up costs the sequence little (BD-rate within about 1.5 points, measured in
+    /// `lanes/hevcencspeed4.report.md`) while the IDR takes about a third of the
+    /// single-thread time otherwise. Intra-only streams (`keyint == 1`) are not affected.
+    pub gop_fast_idr: bool,
+    /// Luma and chroma bit depth: 8 (Main, the default) or 10 (Main 10).
+    ///
+    /// At 10 bits the input is [`PixelFormat::I010`] (or `u16` planes through
+    /// [`Encoder::encode_idr_samples`]), QP runs from `-QpBdOffset` (-12) to 51,
+    /// and the SPS and VPS carry the Main 10 profile.
+    pub bit_depth: u8,
+    /// Speed/quality trade of the P-picture search and decisions; see [`Preset`].
+    /// `Default` is the reference behaviour and its output never changes.
+    pub speed: Preset,
+}
+
+/// Encoder speed preset. `Default` is the measured reference set. `Fast` and `Faster`
+/// trade rate for speed with coarser motion search, earlier terminations and fewer
+/// candidates; streams stay conforming Main/Main 10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preset {
+    /// Reference search; output is bit-identical to releases before presets existed.
+    #[default]
+    Default,
+    /// About 2x faster, small rate loss.
+    Fast,
+    /// Faster still, larger rate loss.
+    Faster,
 }
 
 impl EncoderConfig {
@@ -253,7 +327,7 @@ impl EncoderConfig {
             width,
             height,
             rate_control: RateControl::ConstantQp(27),
-            threads: 0,
+            threads: default_threads(),
             ctb_size: 32,
             rdo_candidates: 5,
             chroma_mode_search: false,
@@ -269,12 +343,28 @@ impl EncoderConfig {
             video_signal_type: None,
             sample_aspect_ratio: None,
             timing: None,
+            chroma_sample_loc: None,
             content_light: ContentLight::default(),
+            mastering_display: None,
             deblock: true,
             picture_hash: false,
             keep_recon: false,
+            keyint: 1,
+            inter_wpp: true,
+            inter_lambda_scale: 1.0,
+            gop_fast_idr: true,
+            bit_depth: 8,
+            speed: Preset::Default,
         }
     }
+}
+
+/// The worker count the encoder uses when none is asked for: the machine's
+/// parallelism, capped at 6 (the 1080p30 target's thread budget).
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(6)
 }
 
 /// One coded picture.
@@ -291,23 +381,76 @@ pub struct EncodedPicture {
 }
 
 /// An intra-only HEVC encoder.
+#[derive(Clone)]
 pub struct Encoder {
-    cfg: EncoderConfig,
+    pub(crate) cfg: EncoderConfig,
     vps: Vps,
     sps: Sps,
     pps: Pps,
-    coded_width: usize,
-    coded_height: usize,
-    threads: usize,
+    /// The picture parameter set of P pictures: the same as `pps`, with
+    /// wavefronts and transform skip off, and id 1.
+    pub(crate) pps_p: Pps,
+    pub(crate) coded_width: usize,
+    pub(crate) coded_height: usize,
+    pub(crate) threads: usize,
+    pub(crate) pk: crate::enc_p::PKnobs,
 }
 
 /// Bits per pixel this encoder spends at QP 27, the anchor the bit-target model
 /// walks from (measured on 1080p fixtures; the incumbent's own figure was 0.6).
 const BPP_AT_QP27: f64 = 0.6;
 
+/// Bits one picture may spend at `kbps` kilobits per second and `fps` frames per
+/// second.
+pub(crate) fn bitrate_picture_bits(kbps: u32, fps: f64) -> u64 {
+    let bits = f64::from(kbps) * 1000.0 / fps.max(1e-3);
+    (bits.round() as u64).max(1)
+}
+
+/// An encoded picture with its reconstructed Y, Cb and Cr planes.
+pub(crate) type PictureRecon = (EncodedPicture, Vec<Pel>, Vec<Pel>, Vec<Pel>);
+
+/// The smallest QP the encoder codes at: `-QpBdOffset`, which is `-6 * (bit_depth - 8)`.
+pub(crate) fn qp_min(bit_depth: u32) -> i32 {
+    -6 * (bit_depth as i32 - 8)
+}
+
+/// The samples of one plane as `Pel`s, with the stride in samples. An 8-bit
+/// plane widens; a 16-bit plane is little-endian pairs of bytes.
+pub(crate) fn plane_samples(plane: &Plane, sixteen: bool) -> (Vec<Pel>, usize) {
+    if sixteen {
+        let samples = plane
+            .data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| Pel::from_le_bytes(*c))
+            .collect();
+        (samples, plane.stride / 2)
+    } else {
+        (
+            plane.data.iter().map(|&v| Pel::from(v)).collect(),
+            plane.stride,
+        )
+    }
+}
+
 impl Encoder {
     /// Build an encoder, refusing dimensions it cannot code.
-    pub fn new(cfg: EncoderConfig) -> Result<Encoder> {
+    pub fn new(mut cfg: EncoderConfig) -> Result<Encoder> {
+        if cfg.keyint > 1 && cfg.gop_fast_idr {
+            cfg.rdoq = false;
+            cfg.rdo_candidates = cfg.rdo_candidates.min(1);
+            cfg.intra_nxn = false;
+            cfg.transform_skip = TransformSkip::Off;
+            cfg.rqt = false;
+        }
+        if cfg.bit_depth != 8 && cfg.bit_depth != 10 {
+            return Err(Error::unsupported(
+                format!("HEVC encode at {} bits", cfg.bit_depth),
+                "this encoder codes 8-bit and 10-bit 4:2:0",
+            ));
+        }
         if cfg.width < 16 || cfg.height < 16 {
             return Err(Error::unsupported(
                 format!("HEVC encode of {}x{}", cfg.width, cfg.height),
@@ -328,19 +471,27 @@ impl Encoder {
             .timing
             .map(|(units, scale)| f64::from(scale) / f64::from(units.max(1)))
             .unwrap_or(30.0);
-        let ptl = ProfileTierLevel::main(ProfileTierLevel::level_for(
-            coded_width as u32,
-            coded_height as u32,
-            fps,
-        ));
+        let level = ProfileTierLevel::level_for(coded_width as u32, coded_height as u32, fps);
+        let ptl = if cfg.bit_depth == 10 {
+            ProfileTierLevel::main10(level)
+        } else {
+            ProfileTierLevel::main(level)
+        };
+        let bd_minus8 = u32::from(cfg.bit_depth) - 8;
+        // A GOP with P pictures keeps the previous picture as a reference, so the
+        // decoded picture buffer holds two pictures.
+        let dpb_minus1 = if cfg.keyint > 1 { 1 } else { 0 };
         let vps = Vps {
             id: 0,
             ptl,
-            max_dec_pic_buffering_minus1: 0,
+            max_dec_pic_buffering_minus1: dpb_minus1,
             max_num_reorder_pics: 0,
         };
         let log2_ctb = cfg.ctb_size.trailing_zeros();
         let sps = Sps {
+            max_latency_increase_plus1: 0,
+            extension_flags: 0,
+            range: Default::default(),
             vps_id: 0,
             id: 0,
             chroma_format_idc: 1,
@@ -353,10 +504,10 @@ impl Encoder {
                 top: 0,
                 bottom: (coded_height - cfg.height as usize) as u32 / 2,
             },
-            bit_depth_luma_minus8: 0,
-            bit_depth_chroma_minus8: 0,
+            bit_depth_luma_minus8: bd_minus8,
+            bit_depth_chroma_minus8: bd_minus8,
             log2_max_poc_lsb_minus4: 4,
-            max_dec_pic_buffering_minus1: 0,
+            max_dec_pic_buffering_minus1: dpb_minus1,
             max_num_reorder_pics: 0,
             log2_min_cb_size_minus3: 0,
             log2_diff_max_min_cb_size: log2_ctb - 3,
@@ -365,6 +516,7 @@ impl Encoder {
             max_transform_hierarchy_depth_inter: 0,
             max_transform_hierarchy_depth_intra: if cfg.rqt { 1 } else { 0 },
             scaling_list_enabled: false,
+            scaling_list: None,
             amp_enabled: false,
             // No in-loop filters: see `Encoder` docs and the PPS below.
             sao_enabled: false,
@@ -375,12 +527,13 @@ impl Encoder {
             long_term_ref_pics_present: false,
             num_long_term_ref_pics_sps: 0,
             long_term_ref_pics_sps: Vec::new(),
-            temporal_mvp_enabled: false,
+            temporal_mvp_enabled: true,
             strong_intra_smoothing: true,
             ptl,
             vui: Some(VuiParameters {
                 sample_aspect_ratio: cfg.sample_aspect_ratio,
                 video_signal_type: cfg.video_signal_type,
+                chroma_sample_loc: cfg.chroma_sample_loc,
                 timing: cfg.timing,
             }),
         };
@@ -401,20 +554,37 @@ impl Encoder {
             loop_filter_across_slices_enabled: false,
             ..Pps::default()
         };
+        let pps_p = Pps {
+            id: 1,
+            entropy_coding_sync_enabled: cfg.inter_wpp,
+            transform_skip_enabled: false,
+            ..pps.clone()
+        };
         let threads = if cfg.threads == 0 {
-            std::thread::available_parallelism().map_or(1, |n| n.get())
+            default_threads()
         } else {
             cfg.threads
         };
+        let pk = crate::enc_p::PKnobs::for_preset(cfg.speed);
         Ok(Encoder {
             cfg,
             vps,
             sps,
             pps,
+            pps_p,
             coded_width,
             coded_height,
             threads,
+            pk,
         })
+    }
+
+    /// A copy of this encoder that uses `threads` workers per picture.
+    pub(crate) fn with_threads(&self, threads: usize) -> Encoder {
+        Encoder {
+            threads: threads.max(1),
+            ..self.clone()
+        }
     }
 
     /// The sequence parameter set this encoder writes.
@@ -422,15 +592,41 @@ impl Encoder {
         &self.sps
     }
 
+    /// The picture parameter set (id 1) that the P pictures of a sequence refer
+    /// to, as one Annex-B NAL unit. Every P access unit carries it in-band; a
+    /// container that keeps parameter sets out of its samples needs it in its
+    /// configuration record, before the first P picture.
+    pub fn p_picture_parameter_set(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_annex_b(
+            &mut out,
+            NalHeader::new(NalUnitType::Pps),
+            &self.pps_p.to_rbsp(),
+            true,
+        );
+        out
+    }
+
+    /// The pixel format a frame must have: I420 at 8 bits, I010 at 10.
+    pub fn frame_format(&self) -> PixelFormat {
+        if self.cfg.bit_depth == 10 {
+            PixelFormat::I010
+        } else {
+            PixelFormat::I420
+        }
+    }
+
     /// Encode one picture as an IDR access unit.
     ///
-    /// The frame must be [`PixelFormat::I420`] at the configured size; padding
-    /// to the coded size is this encoder's job, not the caller's.
+    /// The frame must be [`Encoder::frame_format`] at the configured size: I420
+    /// for 8-bit, I010 (16-bit little-endian samples) for 10-bit. Padding to the
+    /// coded size is this encoder's job, not the caller's.
     pub fn encode_idr(&self, frame: &VideoFrame) -> Result<EncodedPicture> {
-        if frame.format != PixelFormat::I420 {
+        let want = self.frame_format();
+        if frame.format != want {
             return Err(Error::unsupported(
                 format!("HEVC encode of {:?}", frame.format),
-                "this encoder codes 8-bit 4:2:0 planar",
+                format!("this encoder codes {want:?} at {} bits", self.cfg.bit_depth),
             ));
         }
         if frame.width != self.cfg.width || frame.height != self.cfg.height {
@@ -439,25 +635,18 @@ impl Encoder {
                 frame.width, frame.height, self.cfg.width, self.cfg.height
             )));
         }
-        let planes: Vec<(&[u8], usize)> = frame
-            .planes
-            .iter()
-            .map(|p: &Plane| (&p.data[..], p.stride))
-            .collect();
-        self.encode_idr_planes(
-            planes[0].0,
-            planes[0].1,
-            planes[1].0,
-            planes[1].1,
-            planes[2].0,
-            planes[2].1,
-        )
+        let sixteen = self.cfg.bit_depth == 10;
+        let (y, ys) = plane_samples(&frame.planes[0], sixteen);
+        let (cb, cbs) = plane_samples(&frame.planes[1], sixteen);
+        let (cr, crs) = plane_samples(&frame.planes[2], sixteen);
+        self.encode_idr_samples(&y, ys, &cb, cbs, &cr, crs)
     }
 
-    /// Encode one picture from raw I420 planes with their strides.
+    /// Encode one picture from raw 8-bit I420 planes with their strides.
     ///
     /// This is the surface a compatibility shim maps onto: the planes are the
-    /// *displayed* picture, and the conformance window handles the rest.
+    /// *displayed* picture, and the conformance window handles the rest. It is
+    /// an error on a 10-bit encoder; use [`Encoder::encode_idr_samples`].
     pub fn encode_idr_planes(
         &self,
         y: &[u8],
@@ -467,14 +656,41 @@ impl Encoder {
         cr: &[u8],
         cr_stride: usize,
     ) -> Result<EncodedPicture> {
+        if self.cfg.bit_depth != 8 {
+            return Err(Error::unsupported(
+                format!("8-bit planes at {} bits", self.cfg.bit_depth),
+                "use encode_idr_samples for 10-bit samples",
+            ));
+        }
+        let widen = |p: &[u8]| p.iter().map(|&v| Pel::from(v)).collect::<Vec<Pel>>();
+        self.encode_idr_samples(
+            &widen(y),
+            y_stride,
+            &widen(cb),
+            cb_stride,
+            &widen(cr),
+            cr_stride,
+        )
+    }
+
+    /// Encode one picture from raw planes of samples (each `Pel` a sample of
+    /// the configured bit depth) with their strides in samples.
+    pub fn encode_idr_samples(
+        &self,
+        y: &[Pel],
+        y_stride: usize,
+        cb: &[Pel],
+        cb_stride: usize,
+        cr: &[Pel],
+        cr_stride: usize,
+    ) -> Result<EncodedPicture> {
         let padded = self.pad_source(y, y_stride, cb, cb_stride, cr, cr_stride)?;
         let (mut qp, target) = match self.cfg.rate_control {
-            RateControl::ConstantQp(qp) => (qp.clamp(0, 51), None),
-            RateControl::TargetBits(bits) => {
-                let pixels = (self.cfg.width as f64) * (self.cfg.height as f64);
-                let target_bpp = (bits as f64 / pixels).max(1e-4);
-                let qp = 27.0 + 6.0 * (BPP_AT_QP27 / target_bpp).log2();
-                ((qp.round() as i32).clamp(0, 51), Some(bits))
+            RateControl::ConstantQp(qp) => (qp.clamp(self.qp_min(), 51), None),
+            RateControl::TargetBits(bits) => (self.qp_for_bits(bits), Some(bits)),
+            RateControl::Bitrate { kbps, fps } => {
+                let bits = bitrate_picture_bits(kbps, fps);
+                (self.qp_for_bits(bits), Some(bits))
             }
         };
         let mut coded = self.code_picture(&padded, qp)?;
@@ -486,7 +702,7 @@ impl Encoder {
                 // model: 6 QP steps is a factor of two in rate.
                 let correction = 6.0 * (actual / target).log2();
                 let corrected = (qp as f64 + correction.clamp(-12.0, 12.0)).round() as i32;
-                let corrected = corrected.clamp(0, 51);
+                let corrected = corrected.clamp(self.qp_min(), 51);
                 if corrected != qp {
                     qp = corrected;
                     coded = self.code_picture(&padded, qp)?;
@@ -494,6 +710,19 @@ impl Encoder {
             }
         }
         Ok(coded)
+    }
+
+    /// The lowest QP this encoder codes at: `-QpBdOffset`.
+    pub(crate) fn qp_min(&self) -> i32 {
+        qp_min(u32::from(self.cfg.bit_depth))
+    }
+
+    /// The QP that codes one picture of `bits` bits at the anchor rate model.
+    fn qp_for_bits(&self, bits: u64) -> i32 {
+        let pixels = (self.cfg.width as f64) * (self.cfg.height as f64);
+        let target_bpp = (bits as f64 / pixels).max(1e-4);
+        let qp = 27.0 + 6.0 * (BPP_AT_QP27 / target_bpp).log2();
+        (qp.round() as i32).clamp(self.qp_min(), 51)
     }
 
     /// Encode a batch of pictures, each as its own IDR access unit.
@@ -511,31 +740,31 @@ impl Encoder {
     /// padding rather than filling it with black: the padding is coded and then
     /// cropped away, and a black border would bleed into the last real column
     /// through the prediction and the transform that straddles it.
-    fn pad_source(
+    pub(crate) fn pad_source(
         &self,
-        y: &[u8],
+        y: &[Pel],
         y_stride: usize,
-        cb: &[u8],
+        cb: &[Pel],
         cb_stride: usize,
-        cr: &[u8],
+        cr: &[Pel],
         cr_stride: usize,
     ) -> Result<PaddedSource> {
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let (coded_w, coded_h) = (self.coded_width, self.coded_height);
-        let plane = |src: &[u8],
+        let plane = |src: &[Pel],
                      stride: usize,
                      width: usize,
                      height: usize,
                      out_w: usize,
                      out_h: usize|
-         -> Result<Vec<u8>> {
+         -> Result<Vec<Pel>> {
             if stride < width || src.len() < (height - 1) * stride + width {
                 return Err(Error::corrupt(
                     "HEVC encode: source plane shorter than its stated size".to_string(),
                 ));
             }
-            let mut out = vec![0u8; out_w * out_h];
+            let mut out = vec![0 as Pel; out_w * out_h];
             for row in 0..out_h {
                 let src_row = row.min(height - 1);
                 let line = &src[src_row * stride..src_row * stride + width];
@@ -546,8 +775,12 @@ impl Encoder {
             }
             Ok(out)
         };
+        let y = plane(y, y_stride, w, h, coded_w, coded_h)?;
+        let shift = u32::from(self.cfg.bit_depth) - 8;
+        let y8 = y.iter().map(|&v| (v >> shift) as u8).collect();
         Ok(PaddedSource {
-            y: plane(y, y_stride, w, h, coded_w, coded_h)?,
+            y,
+            y8,
             cb: plane(cb, cb_stride, cw, ch, coded_w / 2, coded_h / 2)?,
             cr: plane(cr, cr_stride, cw, ch, coded_w / 2, coded_h / 2)?,
         })
@@ -555,14 +788,21 @@ impl Encoder {
 
     /// Code one picture at `qp`, wavefront across CTB rows.
     fn code_picture(&self, src: &PaddedSource, qp: i32) -> Result<EncodedPicture> {
+        self.code_picture_planes(src, qp)
+            .map(|(coded, _, _, _)| coded)
+    }
+
+    /// [`Encoder::code_picture`], also returning the padded reconstruction the
+    /// next picture of a sequence predicts from.
+    pub(crate) fn code_picture_planes(&self, src: &PaddedSource, qp: i32) -> Result<PictureRecon> {
         let (width, height) = (self.coded_width, self.coded_height);
         let ctb = self.cfg.ctb_size;
         let cols = width.div_ceil(ctb);
         let rows = height.div_ceil(ctb);
 
-        let mut rec_y = vec![0u8; width * height];
-        let mut rec_cb = vec![0u8; width / 2 * height / 2];
-        let mut rec_cr = vec![0u8; width / 2 * height / 2];
+        let mut rec_y = vec![0 as Pel; width * height];
+        let mut rec_cb = vec![0 as Pel; width / 2 * height / 2];
+        let mut rec_cr = vec![0 as Pel; width / 2 * height / 2];
 
         let boundaries: Vec<RowBoundary> = (0..rows).map(|_| RowBoundary::new(width)).collect();
         let progress: Vec<Progress> = (0..rows).map(|_| Progress(AtomicUsize::new(0))).collect();
@@ -574,9 +814,9 @@ impl Encoder {
         let tu_bands: Vec<Mutex<Vec<u8>>> = (0..rows).map(|_| Mutex::new(Vec::new())).collect();
 
         // One band of the reconstruction per CTB row, handed out by index.
-        let mut bands_y: Vec<&mut [u8]> = rec_y.chunks_mut(ctb * width).collect();
-        let mut bands_cb: Vec<&mut [u8]> = rec_cb.chunks_mut(ctb / 2 * (width / 2)).collect();
-        let mut bands_cr: Vec<&mut [u8]> = rec_cr.chunks_mut(ctb / 2 * (width / 2)).collect();
+        let mut bands_y: Vec<&mut [Pel]> = rec_y.chunks_mut(ctb * width).collect();
+        let mut bands_cb: Vec<&mut [Pel]> = rec_cb.chunks_mut(ctb / 2 * (width / 2)).collect();
+        let mut bands_cr: Vec<&mut [Pel]> = rec_cr.chunks_mut(ctb / 2 * (width / 2)).collect();
         let threads = self.threads.min(rows).max(1);
         // Round-robin: worker t owns rows t, t + threads, ... Each row's
         // predecessor therefore belongs to another worker that is never waiting
@@ -654,6 +894,7 @@ impl Encoder {
                             self.cfg.rqt,
                             self.cfg.cu64,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
+                            u32::from(self.cfg.bit_depth),
                         );
                         for col in 0..cols {
                             if row > 0 {
@@ -705,6 +946,7 @@ impl Encoder {
                 width,
                 height,
                 qp,
+                u32::from(self.cfg.bit_depth),
                 &tus,
             );
         }
@@ -714,7 +956,7 @@ impl Encoder {
             .cfg
             .keep_recon
             .then(|| self.crop_recon(&rec_y, &rec_cb, &rec_cr));
-        Ok(EncodedPicture { au, qp, recon })
+        Ok((EncodedPicture { au, qp, recon }, rec_y, rec_cb, rec_cr))
     }
 
     /// Parameter sets, optional SEI, and the slice, in Annex-B framing.
@@ -722,9 +964,9 @@ impl Encoder {
         &self,
         qp: i32,
         substreams: &[Vec<u8>],
-        rec_y: &[u8],
-        rec_cb: &[u8],
-        rec_cr: &[u8],
+        rec_y: &[Pel],
+        rec_cb: &[Pel],
+        rec_cr: &[Pel],
     ) -> Vec<u8> {
         let mut au = Vec::with_capacity(substreams.iter().map(|s| s.len()).sum::<usize>() + 256);
         write_annex_b(
@@ -745,7 +987,9 @@ impl Encoder {
             &self.pps.to_rbsp(),
             true,
         );
-        if let Some(rbsp) = sei::hdr_metadata_rbsp(self.cfg.content_light) {
+        if let Some(rbsp) =
+            sei::hdr_metadata_rbsp_with(self.cfg.mastering_display, self.cfg.content_light)
+        {
             write_annex_b(&mut au, sei::prefix_sei_header(), &rbsp, true);
         }
 
@@ -775,33 +1019,57 @@ impl Encoder {
 
         if self.cfg.picture_hash {
             let (w, h) = (self.coded_width, self.coded_height);
+            // The hash covers the samples as the picture stores them: one
+            // byte each at 8 bits, two (little-endian) at 10.
+            let bps = if self.cfg.bit_depth == 10 { 2 } else { 1 };
+            let (by, bcb, bcr) = (
+                sample_bytes(rec_y, self.cfg.bit_depth),
+                sample_bytes(rec_cb, self.cfg.bit_depth),
+                sample_bytes(rec_cr, self.cfg.bit_depth),
+            );
             let rbsp = sei::decoded_picture_hash_rbsp(&[
-                (rec_y, w, w, h),
-                (rec_cb, w / 2, w / 2, h / 2),
-                (rec_cr, w / 2, w / 2, h / 2),
+                (&by, w * bps, w * bps, h),
+                (&bcb, w / 2 * bps, w / 2 * bps, h / 2),
+                (&bcr, w / 2 * bps, w / 2 * bps, h / 2),
             ]);
             write_annex_b(&mut au, sei::suffix_sei_header(), &rbsp, false);
         }
         au
     }
 
-    fn crop_recon(&self, rec_y: &[u8], rec_cb: &[u8], rec_cr: &[u8]) -> VideoFrame {
+    pub(crate) fn crop_recon(&self, rec_y: &[Pel], rec_cb: &[Pel], rec_cr: &[Pel]) -> VideoFrame {
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        let crop = |src: &[u8], stride: usize, width: usize, height: usize| -> Vec<u8> {
+        let bd = self.cfg.bit_depth;
+        let crop = |src: &[Pel], stride: usize, width: usize, height: usize| -> Vec<u8> {
             let mut out = Vec::with_capacity(width * height);
             for row in 0..height {
-                out.extend_from_slice(&src[row * stride..row * stride + width]);
+                out.extend(sample_bytes(&src[row * stride..row * stride + width], bd));
             }
             out
         };
+        let bps = if bd == 10 { 2 } else { 1 };
         let planes = vec![
-            Plane::new(crop(rec_y, self.coded_width, w, h), w),
-            Plane::new(crop(rec_cb, self.coded_width / 2, cw, ch), cw),
-            Plane::new(crop(rec_cr, self.coded_width / 2, cw, ch), cw),
+            Plane::new(crop(rec_y, self.coded_width, w, h), w * bps),
+            Plane::new(crop(rec_cb, self.coded_width / 2, cw, ch), cw * bps),
+            Plane::new(crop(rec_cr, self.coded_width / 2, cw, ch), cw * bps),
         ];
-        VideoFrame::try_new(PixelFormat::I420, w as u32, h as u32, planes)
-            .expect("cropped planes are exactly the size I420 asks for")
+        let format = if bd == 10 {
+            PixelFormat::I010
+        } else {
+            PixelFormat::I420
+        };
+        VideoFrame::try_new(format, w as u32, h as u32, planes)
+            .expect("cropped planes are exactly the size the format asks for")
+    }
+}
+
+/// Samples as bytes: one byte each at 8 bits, little-endian pairs at 10.
+pub(crate) fn sample_bytes(samples: &[Pel], bit_depth: u8) -> Vec<u8> {
+    if bit_depth == 10 {
+        samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+    } else {
+        samples.iter().map(|&v| v as u8).collect()
     }
 }
 
@@ -811,7 +1079,7 @@ impl Encoder {
 /// time invalidating each other's caches instead of coding; the padding is the
 /// difference between a wavefront and a contention benchmark.
 #[repr(align(64))]
-struct Progress(AtomicUsize);
+pub(crate) struct Progress(pub(crate) AtomicUsize);
 
 /// Spin, then yield, then sleep until a row's progress counter reaches `target`.
 ///
@@ -819,8 +1087,18 @@ struct Progress(AtomicUsize);
 /// somewhere else, so the wait backs off to a sleep at roughly the granularity
 /// of one coding tree block.
 fn wait_for(counter: &Progress, target: usize) {
+    let never = AtomicBool::new(false);
+    wait_for_or_abort(counter, target, &never);
+}
+
+/// [`wait_for`] that gives up when `abort` is set. Returns whether the target
+/// was reached.
+pub(crate) fn wait_for_or_abort(counter: &Progress, target: usize, abort: &AtomicBool) -> bool {
     let mut spins = 0u32;
     while counter.0.load(Ordering::Acquire) < target {
+        if abort.load(Ordering::Acquire) {
+            return false;
+        }
         if spins < 128 {
             std::hint::spin_loop();
         } else if spins < 256 {
@@ -830,13 +1108,16 @@ fn wait_for(counter: &Progress, target: usize) {
         }
         spins += 1;
     }
+    true
 }
 
 /// One CTB row handed to a worker: its index and its band of each plane.
-type RowAssignment<'a> = (usize, &'a mut [u8], &'a mut [u8], &'a mut [u8]);
+type RowAssignment<'a> = (usize, &'a mut [Pel], &'a mut [Pel], &'a mut [Pel]);
 
-struct PaddedSource {
-    y: Vec<u8>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
+pub(crate) struct PaddedSource {
+    pub(crate) y: Vec<Pel>,
+    /// The luma as 8-bit samples (`y >> (bit_depth - 8)`): what the motion search measures.
+    pub(crate) y8: Vec<u8>,
+    pub(crate) cb: Vec<Pel>,
+    pub(crate) cr: Vec<Pel>,
 }

@@ -32,6 +32,22 @@ pub enum CodecId {
     Vp9,
     /// AOMedia AV1.
     Av1,
+    /// Apple ProRes (all six profiles, 422 Proxy to 4444 XQ).
+    ProRes,
+    /// MPEG-2 video (ISO/IEC 13818-2); MPEG-1 video (11172-2) is carried under the same id.
+    Mpeg2Video,
+    /// Motion JPEG (ITU-T T.81 frames as video; JFIF full range).
+    Mjpeg,
+    /// Avid DNxHD / DNxHR (SMPTE VC-3).
+    Dnxhd,
+    /// MPEG-4 Part 2 Visual (Simple/Advanced Simple profile: XviD, DivX 4/5, `mp4v`) and H.263 baseline.
+    Mpeg4Part2,
+    /// Microsoft MPEG-4 version 1 (MPG4 / DIV1).
+    MsMpeg4V1,
+    /// Microsoft MPEG-4 version 2 (MP42 / DIV2).
+    MsMpeg4V2,
+    /// Microsoft MPEG-4 version 3 (DivX 3: DIV3 / MP43 / DIV4 ...).
+    MsMpeg4V3,
     /// MPEG-4 AAC (LC and friends).
     Aac,
     /// Dolby AC-3.
@@ -48,6 +64,10 @@ pub enum CodecId {
     Flac,
     /// MPEG-1/2 Layer III.
     Mp3,
+    /// MPEG-1/2/2.5 Layer II (MP2).
+    Mp2,
+    /// MPEG-1/2/2.5 Layer I (MP1).
+    Mp1,
     /// Xiph Opus.
     Opus,
     /// Xiph Vorbis.
@@ -64,6 +84,12 @@ pub enum CodecId {
     PcmS32Le,
     /// 32-bit float little-endian PCM.
     PcmF32Le,
+    /// Signed 24-bit big-endian packed PCM.
+    PcmS24Be,
+    /// Signed 32-bit big-endian PCM.
+    PcmS32Be,
+    /// 32-bit float big-endian PCM.
+    PcmF32Be,
     /// SubRip text.
     Srt,
     /// WebVTT text.
@@ -74,6 +100,28 @@ pub enum CodecId {
     Pgs,
     /// MPEG-4 timed text (3GPP `tx3g`).
     Tx3g,
+    /// DV video (IEC 61834, SMPTE 314M/370M): DV25, DVCPRO25/50, DVCPRO HD.
+    DvVideo,
+    /// Uncompressed video (AVI `BI_RGB` / YUY2 / UYVY / I420 / YV12 ...).
+    RawVideo,
+    /// IMA ADPCM (WAV 0x0011 / AVI).
+    ImaAdpcmWav,
+    /// Microsoft ADPCM (WAV 0x0002 / AVI).
+    MsAdpcm,
+    /// QuickTime IMA4 (`ima4`).
+    ImaAdpcmQt,
+    /// G.711 A-law (WAV 0x0006, mov `alaw`).
+    PcmAlaw,
+    /// G.711 mu-law (WAV 0x0007, mov `ulaw`).
+    PcmMulaw,
+    /// AMR narrow-band (3GPP TS 26.071, `samr`).
+    AmrNb,
+    /// AMR wide-band (3GPP TS 26.171, `sawb`).
+    AmrWb,
+    /// DVD-Video subpictures (VobSub, RLE SPU).
+    DvdSub,
+    /// DVB subtitles (ETSI EN 300 743).
+    DvbSub,
 }
 
 impl CodecId {
@@ -81,10 +129,14 @@ impl CodecId {
     pub fn media_type(&self) -> MediaType {
         use CodecId::*;
         match self {
-            H264 | H265 | Vp8 | Vp9 | Av1 => MediaType::Video,
-            Aac | Ac3 | EAc3 | TrueHd | Dts | Alac | Flac | Mp3 | Opus | Vorbis | PcmU8
-            | PcmS16Le | PcmS16Be | PcmS24Le | PcmS32Le | PcmF32Le => MediaType::Audio,
-            Srt | WebVtt | Ass | Pgs | Tx3g => MediaType::Subtitle,
+            H264 | H265 | Vp8 | Vp9 | Av1 | ProRes | Mpeg2Video | Mjpeg | Dnxhd | Mpeg4Part2
+            | MsMpeg4V1 | MsMpeg4V2 | MsMpeg4V3 => MediaType::Video,
+            Aac | Ac3 | EAc3 | TrueHd | Dts | Alac | Flac | Mp3 | Mp2 | Mp1 | Opus | Vorbis
+            | PcmU8 | PcmS16Le | PcmS16Be | PcmS24Le | PcmS32Le | PcmF32Le
+            | PcmS24Be | PcmS32Be | PcmF32Be | ImaAdpcmWav | MsAdpcm | ImaAdpcmQt | PcmAlaw
+            | PcmMulaw | AmrNb | AmrWb => MediaType::Audio,
+            Srt | WebVtt | Ass | Pgs | Tx3g | DvdSub | DvbSub => MediaType::Subtitle,
+            DvVideo | RawVideo => MediaType::Video,
         }
     }
 
@@ -97,6 +149,14 @@ impl CodecId {
             Vp8 => "vp8",
             Vp9 => "vp9",
             Av1 => "av1",
+            ProRes => "prores",
+            Mpeg2Video => "mpeg2video",
+            Mjpeg => "mjpeg",
+            Dnxhd => "dnxhd",
+            Mpeg4Part2 => "mpeg4",
+            MsMpeg4V1 => "msmpeg4v1",
+            MsMpeg4V2 => "msmpeg4v2",
+            MsMpeg4V3 => "msmpeg4v3",
             Aac => "aac",
             Ac3 => "ac3",
             EAc3 => "eac3",
@@ -105,6 +165,8 @@ impl CodecId {
             Alac => "alac",
             Flac => "flac",
             Mp3 => "mp3",
+            Mp2 => "mp2",
+            Mp1 => "mp1",
             Opus => "opus",
             Vorbis => "vorbis",
             PcmU8 => "pcm_u8",
@@ -113,11 +175,25 @@ impl CodecId {
             PcmS24Le => "pcm_s24le",
             PcmS32Le => "pcm_s32le",
             PcmF32Le => "pcm_f32le",
+            PcmS24Be => "pcm_s24be",
+            PcmS32Be => "pcm_s32be",
+            PcmF32Be => "pcm_f32be",
             Srt => "srt",
             WebVtt => "webvtt",
             Ass => "ass",
             Pgs => "pgs",
             Tx3g => "tx3g",
+            DvVideo => "dvvideo",
+            RawVideo => "rawvideo",
+            ImaAdpcmWav => "adpcm_ima_wav",
+            MsAdpcm => "adpcm_ms",
+            ImaAdpcmQt => "adpcm_ima_qt",
+            PcmAlaw => "pcm_alaw",
+            PcmMulaw => "pcm_mulaw",
+            AmrNb => "amr_nb",
+            AmrWb => "amr_wb",
+            DvdSub => "dvd_subtitle",
+            DvbSub => "dvb_subtitle",
         }
     }
 }
@@ -497,6 +573,14 @@ mod tests {
             CodecId::Vp8,
             CodecId::Vp9,
             CodecId::Av1,
+            CodecId::ProRes,
+            CodecId::Mpeg2Video,
+            CodecId::Mjpeg,
+            CodecId::Dnxhd,
+            CodecId::Mpeg4Part2,
+            CodecId::MsMpeg4V1,
+            CodecId::MsMpeg4V2,
+            CodecId::MsMpeg4V3,
             CodecId::Aac,
             CodecId::Ac3,
             CodecId::EAc3,
@@ -505,6 +589,8 @@ mod tests {
             CodecId::Alac,
             CodecId::Flac,
             CodecId::Mp3,
+            CodecId::Mp2,
+            CodecId::Mp1,
             CodecId::Opus,
             CodecId::Vorbis,
             CodecId::PcmU8,
@@ -513,13 +599,27 @@ mod tests {
             CodecId::PcmS24Le,
             CodecId::PcmS32Le,
             CodecId::PcmF32Le,
+            CodecId::PcmS24Be,
+            CodecId::PcmS32Be,
+            CodecId::PcmF32Be,
             CodecId::Srt,
             CodecId::WebVtt,
             CodecId::Ass,
             CodecId::Pgs,
+            CodecId::ImaAdpcmWav,
+            CodecId::MsAdpcm,
+            CodecId::ImaAdpcmQt,
+            CodecId::PcmAlaw,
+            CodecId::PcmMulaw,
+            CodecId::AmrNb,
+            CodecId::AmrWb,
             CodecId::Tx3g,
+            CodecId::DvVideo,
+            CodecId::RawVideo,
+            CodecId::DvdSub,
+            CodecId::DvbSub,
         ];
-        assert_eq!(all.len(), 26);
+        assert_eq!(all.len(), 50);
         let mut names: Vec<&str> = all.iter().map(|c| c.name()).collect();
         names.sort_unstable();
         names.dedup();

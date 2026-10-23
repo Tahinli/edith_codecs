@@ -21,26 +21,29 @@
 //!
 //! Malformed input is an [`Error`](ec_core::Error), never a panic: truncation is
 //! `NeedMore`, a rule violation is `Corrupt`, and the two constructs the family
-//! genuinely does not implement (scaling lists, and short-term reference picture
-//! sets predicted from an SPS set that a caller did not keep) are `Unsupported`
-//! with the reason stated.
+//! genuinely does not implement (short-term reference picture sets predicted from
+//! an SPS set that a caller did not keep, and the multilayer extensions) are
+//! `Unsupported` with the reason stated.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-mod md5;
+pub mod md5;
 pub mod nal;
 pub mod ps;
+pub mod scaling;
 pub mod sei;
 pub mod slice;
 pub mod vui;
 
 pub use nal::{AnnexBNal, NalHeader, NalUnitType, escape_rbsp, split_annex_b, unescape_rbsp};
 pub use ps::{
-    ConformanceWindow, MAX_ST_REF_PICS, Pps, ProfileTierLevel, ShortTermRefPicSet, Sps, Vps,
+    ConformanceWindow, MAX_ST_REF_PICS, PpsRangeExt, Pps, ProfileTierLevel, ShortTermRefPicSet,
+    Sps, SpsRangeExt, Vps,
 };
 pub use slice::{
     LongTermRef, ParsePositions, PredWeightTable, SliceHeader, SliceType, WeightEntry,
     count_emulation_prevention_bytes,
 };
+pub use scaling::{ScalingFactors, ScalingList};
 pub use vui::{ColourDescription, VideoSignalType, VuiParameters};

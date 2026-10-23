@@ -1,0 +1,54 @@
+{ "type": "suite", "event": "started", "test_count": 21 }
+{ "type": "test", "event": "started", "name": "frame::tests::cdef_strengths_pack_the_way_va_wants" }
+{ "type": "test", "event": "started", "name": "frame::tests::feature_mask_is_one_bit_per_feature" }
+{ "type": "test", "event": "started", "name": "frame::tests::identity_warp_is_the_unit_matrix" }
+{ "type": "test", "event": "started", "name": "frame::tests::inverse_recenter_is_its_own_shape" }
+{ "type": "test", "name": "frame::tests::inverse_recenter_is_its_own_shape", "event": "ok", "exec_time": 0.000000842 }
+{ "type": "test", "event": "started", "name": "frame::tests::superres_shrinks_the_coded_width" }
+{ "type": "test", "name": "frame::tests::superres_shrinks_the_coded_width", "event": "ok", "exec_time": 0.000003798 }
+{ "type": "test", "event": "started", "name": "frame::tests::tile_sizes_come_back_out_of_the_starts" }
+{ "type": "test", "name": "frame::tests::cdef_strengths_pack_the_way_va_wants", "event": "ok", "exec_time": 0.000000632 }
+{ "type": "test", "event": "started", "name": "obu::tests::leb128_round_trips_the_spec_examples" }
+{ "type": "test", "name": "frame::tests::tile_sizes_come_back_out_of_the_starts", "event": "ok", "exec_time": 0.000000982 }
+{ "type": "test", "event": "started", "name": "obu::tests::ns_matches_the_worked_table" }
+{ "type": "test", "name": "frame::tests::feature_mask_is_one_bit_per_feature", "event": "ok", "exec_time": 0.000000451 }
+{ "type": "test", "event": "started", "name": "obu::tests::obu_header_rejects_the_forbidden_bit" }
+{ "type": "test", "name": "frame::tests::identity_warp_is_the_unit_matrix", "event": "ok", "exec_time": 0.000000221 }
+{ "type": "test", "event": "started", "name": "obu::tests::tile_log2_and_floor_log2" }
+{ "type": "test", "name": "obu::tests::leb128_round_trips_the_spec_examples", "event": "ok", "exec_time": 0.000003556 }
+{ "type": "test", "event": "started", "name": "obu::tests::uvlc_reads_the_exp_golomb_shape" }
+{ "type": "test", "name": "obu::tests::ns_matches_the_worked_table", "event": "ok", "exec_time": 0.000001302 }
+{ "type": "test", "event": "started", "name": "sequence::tests::monochrome_stops_before_the_chroma_fields" }
+{ "type": "test", "name": "obu::tests::obu_header_rejects_the_forbidden_bit", "event": "ok", "exec_time": 0.000001131 }
+{ "type": "test", "event": "started", "name": "sequence::tests::profile_shapes_the_subsampling" }
+{ "type": "test", "name": "obu::tests::tile_log2_and_floor_log2", "event": "ok", "exec_time": 0.00000021 }
+{ "type": "test", "event": "started", "name": "sequence::tests::reserved_profile_is_corrupt" }
+{ "type": "test", "name": "obu::tests::uvlc_reads_the_exp_golomb_shape", "event": "ok", "exec_time": 0.000002575 }
+{ "type": "test", "event": "started", "name": "tests::frame_header_without_a_sequence_header_is_corrupt" }
+{ "type": "test", "name": "sequence::tests::monochrome_stops_before_the_chroma_fields", "event": "ok", "exec_time": 0.000000901 }
+{ "type": "test", "event": "started", "name": "tests::temporal_delimiter_round_trips" }
+{ "type": "test", "name": "sequence::tests::profile_shapes_the_subsampling", "event": "ok", "exec_time": 0.000000872 }
+{ "type": "test", "event": "started", "name": "tests::tile_group_without_a_frame_header_is_corrupt" }
+{ "type": "test", "name": "sequence::tests::reserved_profile_is_corrupt", "event": "ok", "exec_time": 0.000001593 }
+{ "type": "test", "event": "started", "name": "tests::truncated_obu_is_need_more" }
+{ "type": "test", "name": "tests::frame_header_without_a_sequence_header_is_corrupt", "event": "ok", "exec_time": 0.000010841 }
+{ "type": "test", "event": "started", "name": "warp::tests::an_extreme_shear_is_rejected" }
+{ "type": "test", "name": "tests::temporal_delimiter_round_trips", "event": "ok", "exec_time": 0.000028062 }
+{ "type": "test", "event": "started", "name": "warp::tests::div_lut_anchors_match_the_spec_table" }
+{ "type": "test", "name": "warp::tests::an_extreme_shear_is_rejected", "event": "ok", "exec_time": 0.000000661 }
+{ "type": "test", "event": "started", "name": "warp::tests::identity_warp_is_valid" }
+{ "type": "test", "name": "warp::tests::div_lut_anchors_match_the_spec_table", "event": "ok", "exec_time": 0.000000241 }
+{ "type": "test", "name": "warp::tests::identity_warp_is_valid", "event": "ok", "exec_time": 0.000000281 }
+{ "type": "test", "name": "tests::tile_group_without_a_frame_header_is_corrupt", "event": "ok", "exec_time": 0.00002674 }
+{ "type": "test", "name": "tests::truncated_obu_is_need_more", "event": "ok", "exec_time": 0.000096802 }
+{ "type": "suite", "event": "ok", "passed": 21, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.002784253 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "altref_fixture_has_hidden_frames_and_show_existing" }
+{ "type": "test", "event": "started", "name": "every_fixture_matches_ffprobe" }
+{ "type": "test", "event": "started", "name": "fuzz_10k_mutations_never_panics" }
+{ "type": "test", "name": "altref_fixture_has_hidden_frames_and_show_existing", "event": "ok", "exec_time": 0.001321064 }
+{ "type": "test", "name": "fuzz_10k_mutations_never_panics", "event": "ok", "exec_time": 0.017995736 }
+{ "type": "test", "name": "every_fixture_matches_ffprobe", "event": "ok", "exec_time": 7.576774271 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 7.577352169 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000056045 }

@@ -1,0 +1,25 @@
+[package]
+name = "ec-dvbsub-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-dvbsub]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "packets"
+path = "fuzz_targets/packets.rs"
+test = false
+doc = false
+bench = false

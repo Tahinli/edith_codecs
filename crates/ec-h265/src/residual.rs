@@ -1,7 +1,7 @@
 //! `residual_coding()` (7.3.8.11) and the scan orders it walks (6.5.3 - 6.5.5).
 
 use crate::cabac::{CabacDecoder, CabacEncoder, CabacState, ctx};
-use crate::transform::{coeff_ssd_scale, dequant_level, ideal_level};
+use crate::transform::{coeff_ssd_scale, dequant_level_bd, ideal_level};
 use std::sync::LazyLock;
 
 /// Scan orders: `SCANS[log2BlockSize][scanIdx][pos] = (x, y)`.
@@ -362,6 +362,7 @@ pub fn rdoq(
     levels: &mut [i32],
     n: usize,
     qp: i32,
+    bit_depth: u32,
     c_idx: usize,
     scan_idx: usize,
     cbf_ctx: usize,
@@ -375,7 +376,7 @@ pub fn rdoq(
     let base = enc.snapshot();
     let base_bits = enc.bit_count_f64();
     let err = |level: i32, coeff: i32| {
-        let d = f64::from(dequant_level(level, n, qp) - coeff);
+        let d = f64::from(dequant_level_bd(level, n, qp, bit_depth) - coeff);
         d * d
     };
 
@@ -391,7 +392,7 @@ pub fn rdoq(
         true,
         transform_skip,
     );
-    let mut cost = scale * dist + lambda * bits as f64;
+    let mut cost = scale * dist + lambda * bits;
 
     // Highest scanning position first: dropping the last significant level is
     // what shortens the significance map and moves the coded last position, so
@@ -556,7 +557,7 @@ pub fn rdoq(
                 );
                 enc.bit_count_f64() - base_bits
             };
-            let trial = scale * trial_dist + lambda * trial_bits as f64;
+            let trial = scale * trial_dist + lambda * trial_bits;
             if trial < cost {
                 cost = trial;
                 dist = trial_dist;
@@ -584,7 +585,7 @@ pub fn rdoq(
         false,
         transform_skip,
     );
-    if scale * zero_dist + lambda * zero_bits as f64 <= cost {
+    if scale * zero_dist + lambda * zero_bits <= cost {
         levels[..n * n].fill(0);
         enc.restore(&base);
         return 0;
@@ -660,11 +661,11 @@ fn encode_residual_with(
 ) {
     // `Some` means the PPS turned transform skip on, so the decoder reads a
     // bin for every 4x4 transform block whether or not this one skips.
-    if let Some(skip) = transform_skip {
-        if log2_size == 2 {
-            let ctx_idx = ctx::TRANSFORM_SKIP + if c_idx == 0 { 0 } else { 1 };
-            enc.encode_bin(ctx_idx, u32::from(skip));
-        }
+    if let Some(skip) = transform_skip
+        && log2_size == 2
+    {
+        let ctx_idx = ctx::TRANSFORM_SKIP + if c_idx == 0 { 0 } else { 1 };
+        enc.encode_bin(ctx_idx, u32::from(skip));
     }
     let n = 1usize << log2_size;
     let sub_wide = n >> 2;
@@ -962,6 +963,14 @@ fn encode_subblock(
     greater1_ctx
 }
 
+/// Longest EGk escape suffix (in bits) a conforming stream can produce for
+/// `coeff_abs_level_remaining`; see [`decode_remaining`].
+const MAX_ESCAPE_K: u32 = 16;
+
+/// The level a corrupt escape decodes to: the largest magnitude a 16-bit
+/// `TransCoeffLevel` can hold.
+const CORRUPT_REMAINING: u32 = 1 << 15;
+
 /// Inverse of [`encode_remaining`]: read one `coeff_abs_level_remaining` back
 /// off the bypass bins (9.3.3.11).
 fn decode_remaining(dec: &mut CabacDecoder, rice: u32) -> u32 {
@@ -985,6 +994,12 @@ fn decode_remaining(dec: &mut CabacDecoder, rice: u32) -> u32 {
         let mut rest = 0u32;
         loop {
             if dec.decode_bypass() == 1 {
+                // A conforming level fits in 16 bits (7.4.9.11), so its escape prefix
+                // never reaches MAX_ESCAPE_K. Longer data is corrupt: stop reading and
+                // return a bounded level, so the shift below cannot overflow.
+                if k >= MAX_ESCAPE_K {
+                    return CORRUPT_REMAINING;
+                }
                 rest += 1 << k;
                 k += 1;
             } else {
@@ -995,6 +1010,49 @@ fn decode_remaining(dec: &mut CabacDecoder, rice: u32) -> u32 {
         c_max + rest
     }
 }
+
+/// What the range extension tools change in the parse of one transform block
+/// (7.3.8.11 and 9.3.4.2.5, 9.3.3.11).
+#[derive(Clone, Copy, Debug)]
+pub struct ResidualCfg {
+    /// `log2TrafoSize` of the block (in samples of its own component).
+    pub log2_size: u32,
+    /// Colour component, 0 luma.
+    pub c_idx: usize,
+    /// `scanIdx`.
+    pub scan_idx: usize,
+    /// `sign_data_hiding_enabled_flag`.
+    pub sign_hiding: bool,
+    /// `cu_transquant_bypass_flag`.
+    pub bypass: bool,
+    /// `transform_skip_enabled_flag`.
+    pub ts_enabled: bool,
+    /// `Log2MaxTransformSkipSize`.
+    pub log2_max_ts: u32,
+    /// `transform_skip_context_enabled_flag`.
+    pub ts_context: bool,
+    /// `persistent_rice_adaptation_enabled_flag`.
+    pub persistent_rice: bool,
+    /// `implicit_rdpcm_enabled_flag`.
+    pub implicit_rdpcm: bool,
+    /// `explicit_rdpcm_enabled_flag`.
+    pub explicit_rdpcm: bool,
+    /// `predModeIntra` of the block for an intra coding unit, `None` for an inter one.
+    pub intra_mode: Option<u8>,
+}
+
+/// What the parse of a transform block found besides its levels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidualFlags {
+    /// `transform_skip_flag`.
+    pub transform_skip: bool,
+    /// The RDPCM direction in force (implicit or explicit): 0 horizontal, 1 vertical.
+    pub rdpcm: Option<u8>,
+}
+
+/// Largest Rice parameter persistent adaptation may reach; a conforming stream stays far
+/// below it (levels are 16 bit), so it only bounds a corrupt one.
+const MAX_RICE: u32 = 20;
 
 /// Decode one transform block's levels — the mirror of [`encode_residual`],
 /// read bin for bin through the same context derivations so the same
@@ -1014,11 +1072,59 @@ pub fn decode_residual(
     sign_hiding: bool,
     transform_skip_enabled: bool,
 ) -> bool {
+    let cfg = ResidualCfg {
+        log2_size,
+        c_idx,
+        scan_idx,
+        sign_hiding,
+        bypass: false,
+        ts_enabled: transform_skip_enabled,
+        log2_max_ts: 2,
+        ts_context: false,
+        persistent_rice: false,
+        implicit_rdpcm: false,
+        explicit_rdpcm: false,
+        intra_mode: Some(1),
+    };
+    decode_residual_ext(dec, levels, &cfg).transform_skip
+}
+
+/// [`decode_residual`] with the range extension tools of `cfg`.
+pub fn decode_residual_ext(
+    dec: &mut CabacDecoder,
+    levels: &mut [i32],
+    cfg: &ResidualCfg,
+) -> ResidualFlags {
+    let ResidualCfg {
+        log2_size,
+        c_idx,
+        scan_idx,
+        ..
+    } = *cfg;
     let mut transform_skip = false;
-    if transform_skip_enabled && log2_size == 2 {
+    if cfg.ts_enabled && !cfg.bypass && log2_size <= cfg.log2_max_ts {
         let ctx_idx = ctx::TRANSFORM_SKIP + if c_idx == 0 { 0 } else { 1 };
         transform_skip = dec.decode_bin(ctx_idx) != 0;
     }
+    let mut rdpcm = None;
+    match cfg.intra_mode {
+        None => {
+            if cfg.explicit_rdpcm && (transform_skip || cfg.bypass) {
+                let chroma = usize::from(c_idx != 0);
+                if dec.decode_bin(ctx::EXPLICIT_RDPCM_FLAG + chroma) != 0 {
+                    rdpcm = Some(dec.decode_bin(ctx::EXPLICIT_RDPCM_DIR + chroma) as u8);
+                }
+            }
+        }
+        Some(mode) => {
+            if cfg.implicit_rdpcm && (transform_skip || cfg.bypass) && (mode == 10 || mode == 26) {
+                rdpcm = Some(u8::from(mode == 26));
+            }
+        }
+    }
+    let sign_hiding = cfg.sign_hiding && !cfg.bypass && rdpcm.is_none();
+    let ts_ctx_active = cfg.ts_context && (transform_skip || cfg.bypass);
+    let sb_type = 2 * usize::from(c_idx == 0) + usize::from(transform_skip || cfg.bypass);
     let n = 1usize << log2_size;
     let sub_wide = n >> 2;
     let sub_scan = scan(log2_size - 2, scan_idx);
@@ -1081,9 +1187,7 @@ pub fn decode_residual(
         let (xs, ys) = sub_scan[i];
         let (xs, ys) = (xs as usize, ys as usize);
         let mut infer_dc_sig = false;
-        let coded = if i == last_sub {
-            true
-        } else if i == 0 {
+        let coded = if i == last_sub || i == 0 {
             true
         } else {
             let mut csbf_ctx = 0;
@@ -1124,7 +1228,11 @@ pub fn decode_residual(
             let xc = xs * 4 + xp as usize;
             let yc = ys * 4 + yp as usize;
             let sig = if p > 0 || !infer_dc_sig {
-                let inc = sig_ctx_inc(xc, yc, log2_size, c_idx, sig_base);
+                let inc = if ts_ctx_active {
+                    if c_idx == 0 { 42 } else { 43 }
+                } else {
+                    sig_ctx_inc(xc, yc, log2_size, c_idx, sig_base)
+                };
                 dec.decode_bin(ctx::SIG_COEFF + inc) != 0
             } else {
                 false // filled in by the post-loop inference below
@@ -1188,7 +1296,12 @@ pub fn decode_residual(
         }
 
         let mut magnitude = [0u32; 16];
-        let mut rice = 0u32;
+        let mut rice = if cfg.persistent_rice {
+            u32::from(dec.contexts.stat_coeff[sb_type] / 4).min(MAX_RICE)
+        } else {
+            0
+        };
+        let mut first_remaining = true;
         for (num_sig, &p) in order.iter().enumerate() {
             let coded_greater1 = num_sig < 8;
             let mut level = 1
@@ -1201,7 +1314,22 @@ pub fn decode_residual(
             };
             if level == threshold {
                 let remaining = decode_remaining(dec, rice);
-                rice = (rice + u32::from(level + remaining > (3 << rice))).min(4);
+                if cfg.persistent_rice && first_remaining {
+                    let stat = &mut dec.contexts.stat_coeff[sb_type];
+                    if u64::from(remaining) >= (3u64 << (*stat / 4).min(40)) {
+                        *stat = stat.saturating_add(1);
+                    } else if 2 * u64::from(remaining) < (1u64 << (*stat / 4).min(40)) && *stat > 0
+                    {
+                        *stat -= 1;
+                    }
+                }
+                first_remaining = false;
+                let grow = u32::from(u64::from(level + remaining) > (3u64 << rice));
+                rice = if cfg.persistent_rice {
+                    (rice + grow).min(MAX_RICE)
+                } else {
+                    (rice + grow).min(4)
+                };
                 level += remaining;
             }
             magnitude[p] = level;
@@ -1218,7 +1346,10 @@ pub fn decode_residual(
             levels[yc * n + xc] = if signs[p] { -value } else { value };
         }
     }
-    transform_skip
+    ResidualFlags {
+        transform_skip,
+        rdpcm,
+    }
 }
 
 /// `ctxInc` for `sig_coeff_flag` (9.3.4.2.5).
@@ -1276,15 +1407,14 @@ fn sig_ctx_inc(
     c_idx: usize,
     base: Option<(usize, usize)>,
 ) -> usize {
-    let sig_ctx;
-    if log2_size == 2 {
-        sig_ctx = CTX_IDX_MAP[(yc << 2) + xc];
+    let sig_ctx = if log2_size == 2 {
+        CTX_IDX_MAP[(yc << 2) + xc]
     } else if xc + yc == 0 {
-        sig_ctx = 0;
+        0
     } else {
         let (prev_csbf, base) = base.expect("sig_ctx_base returns Some when log2_size != 2");
         let (xp, yp) = (xc & 3, yc & 3);
-        sig_ctx = match prev_csbf {
+        let ctx = match prev_csbf {
             0 => {
                 if xp + yp == 0 {
                     2
@@ -1314,8 +1444,8 @@ fn sig_ctx_inc(
             }
             _ => 2,
         };
-        return sig_ctx + base;
-    }
+        return ctx + base;
+    };
     if c_idx == 0 { sig_ctx } else { 27 + sig_ctx }
 }
 
@@ -1499,6 +1629,7 @@ mod tests {
         levels: &mut [i32],
         n: usize,
         qp: i32,
+        bit_depth: u32,
         c_idx: usize,
         scan_idx: usize,
         cbf_ctx: usize,
@@ -1511,7 +1642,7 @@ mod tests {
         let lambda = RDOQ_LAMBDA * lambda;
         let base = enc.snapshot();
         let err = |level: i32, coeff: i32| {
-            let d = f64::from(dequant_level(level, n, qp) - coeff);
+            let d = f64::from(dequant_level_bd(level, n, qp, bit_depth) - coeff);
             d * d
         };
 
@@ -1527,7 +1658,7 @@ mod tests {
             true,
             transform_skip,
         );
-        let mut cost = scale * dist + lambda * bits as f64;
+        let mut cost = scale * dist + lambda * bits;
 
         let sub_scan = scan(log2_size - 2, scan_idx);
         let pos_scan = scan(2, scan_idx);
@@ -1601,7 +1732,7 @@ mod tests {
                     trial_last,
                     csbf,
                 );
-                let trial = scale * trial_dist + lambda * trial_bits as f64;
+                let trial = scale * trial_dist + lambda * trial_bits;
                 if trial < cost {
                     cost = trial;
                     dist = trial_dist;
@@ -1627,7 +1758,7 @@ mod tests {
             false,
             transform_skip,
         );
-        if scale * zero_dist + lambda * zero_bits as f64 <= cost {
+        if scale * zero_dist + lambda * zero_bits <= cost {
             levels[..n * n].fill(0);
             enc.restore(&base);
             return 0;
@@ -1687,6 +1818,7 @@ mod tests {
                         &mut levels_a,
                         n,
                         qp,
+                        8,
                         0,
                         scan_idx,
                         ctx::CBF_LUMA,
@@ -1702,6 +1834,7 @@ mod tests {
                         &mut levels_b,
                         n,
                         qp,
+                        8,
                         0,
                         scan_idx,
                         ctx::CBF_LUMA,

@@ -1,0 +1,32 @@
+[package]
+name = "ec-dts-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-dts]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_stream"
+path = "fuzz_targets/decode_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_header"
+path = "fuzz_targets/parse_header.rs"
+test = false
+doc = false
+bench = false

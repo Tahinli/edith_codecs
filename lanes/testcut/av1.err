@@ -1,0 +1,27 @@
+remote-run: host=a
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling rustversion v1.0.23
+   Compiling once_cell v1.21.4
+   Compiling tracing-core v0.1.36
+   Compiling syn v3.0.9
+   Compiling ec-core v0.1.0 (/home/user/lanes/testcut-av1/edith_codecs/crates/ec-core)
+   Compiling pin-project-lite v0.2.17
+   Compiling tracing v0.1.44
+   Compiling ec-av1-syntax v0.1.0 (/home/user/lanes/testcut-av1/edith_codecs/crates/ec-av1-syntax)
+   Compiling tracing-subscriber v0.3.23
+   Compiling multiversion-macros v0.9.1
+   Compiling bytemuck v1.25.2
+   Compiling tracking-allocator v0.4.0
+   Compiling stats_alloc v0.1.10
+   Compiling multiversion v0.9.1
+   Compiling ec-av1 v0.1.0 (/home/user/lanes/testcut-av1/edith_codecs/crates/ec-av1)
+    Finished `release` profile [optimized] target(s) in 2m 33s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-av1/release/deps/ec_av1-ffe888466f559d74)
+     Running tests/aom_conformance.rs (/home/user/.cache/tgt-testcut-av1/release/deps/aom_conformance-59c7cb7723e4cb1d)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-av1/release/deps/fuzz_regressions-cc0500364cf33b8b)
+     Running tests/real_library.rs (/home/user/.cache/tgt-testcut-av1/release/deps/real_library-abc577781c5de312)
+     Running tests/worker_panic.rs (/home/user/.cache/tgt-testcut-av1/release/deps/worker_panic-f6da5efefe4aecda)
+     Running tests/yuv422_dav1d.rs (/home/user/.cache/tgt-testcut-av1/release/deps/yuv422_dav1d-27699023dec5d512)
+   Doc-tests ec_av1

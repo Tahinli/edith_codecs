@@ -4,6 +4,9 @@
 # OOM kill. Used as the cargo target runner (see .cargo/config.toml) so every
 # `cargo test`/`cargo run` invocation of this workspace is capped, from any
 # checkout (main repo or worktree).
+#
+# The cap is EC_MEMGUARD_MAX (default 10G), applied as MemoryMax on every scope.
+# scripts/remote-run.sh sets it to 6G on the lane servers.
 set -euo pipefail
 
 if [ "${EC_NOMEMGUARD:-0}" = "1" ]; then
@@ -11,7 +14,7 @@ if [ "${EC_NOMEMGUARD:-0}" = "1" ]; then
     exec "$@"
 fi
 
-if ! systemd-run --user --scope --quiet -p MemoryMax=10G true >/dev/null 2>&1; then
+if ! systemd-run --user --scope --quiet -p MemoryMax=${EC_MEMGUARD_MAX:-10G} true >/dev/null 2>&1; then
     echo "memguard-runner: systemd-run --user --scope unavailable, running without memory cap" >&2
     exec "$@"
 fi
@@ -32,22 +35,22 @@ unit="memguard-$$-$(date +%s%N)"
 # exits, so probing and then exec'ing under the same --unit fails with
 # "unit was already loaded or has a fragment file" -- measured directly on
 # 2026-09-29 (the probe's own scope was the collision). Probe under "-probe".
-if ! systemd-run --user --scope --quiet --unit="${unit}-probe" -p MemoryMax=10G true >/dev/null 2>&1; then
+if ! systemd-run --user --scope --quiet --unit="${unit}-probe" -p MemoryMax=${EC_MEMGUARD_MAX:-10G} true >/dev/null 2>&1; then
     # Clear a stale fragment for this name (and any leftover default-named
     # scope) and probe once more before giving up on the cap.
     rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/systemd/user/${unit}.scope" \
           "${HOME}/.config/systemd/user/${unit}.scope" \
           "${HOME}"/.config/systemd/user/run-p*.scope 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
-    if ! systemd-run --user --scope --quiet --unit="${unit}-r" -p MemoryMax=10G true >/dev/null 2>&1; then
+    if ! systemd-run --user --scope --quiet --unit="${unit}-r" -p MemoryMax=${EC_MEMGUARD_MAX:-10G} true >/dev/null 2>&1; then
         echo "memguard-runner: scope unavailable even after clearing stale fragments, running without memory cap" >&2
         exec "$@"
     fi
     exec systemd-run --user --scope --quiet --same-dir --unit="${unit}-r" \
-        -p MemoryMax=10G -p MemorySwapMax=2G \
+        -p MemoryMax=${EC_MEMGUARD_MAX:-10G} -p MemorySwapMax=2G \
         -- "$@"
 fi
 
 exec systemd-run --user --scope --quiet --same-dir --unit="$unit" \
-    -p MemoryMax=10G -p MemorySwapMax=2G \
+    -p MemoryMax=${EC_MEMGUARD_MAX:-10G} -p MemorySwapMax=2G \
     -- "$@"

@@ -1,20 +1,23 @@
-//! Intra prediction (spec 8.3.1, 8.3.3, 8.3.4), 8-bit.
+//! Intra prediction (spec 8.3.1, 8.3.3, 8.3.4), generic over the sample type
+//! (`u8` for 8-bit, `u16` for High 10).
 //!
 //! Kernels operate on a small gathered neighbour set so the hot loop touches
 //! the picture plane only twice per block: one gather, one write. All
-//! arithmetic is in `i32` with a final `clamp(0, 255)`.
+//! arithmetic is in `i32` with a final clip to the sample range.
+
+use crate::sample::Sample;
 
 /// Neighbour samples of a 4x4 block, gathered once (spec 8.3.1.2's 13
 /// samples). `top[4..8]` already has the top-right substitution rule applied:
 /// when p[4..7, -1] is unavailable but p[3, -1] is, it is replicated.
 #[derive(Debug, Clone, Copy)]
-pub struct Nbr4 {
+pub struct Nbr4<S: Sample = u8> {
     /// p[0..7, -1].
-    pub top: [u8; 8],
+    pub top: [S; 8],
     /// p[-1, 0..3].
-    pub left: [u8; 4],
+    pub left: [S; 4],
     /// p[-1, -1].
-    pub top_left: u8,
+    pub top_left: S,
     /// p[x, -1] available.
     pub have_top: bool,
     /// p[-1, y] available.
@@ -26,10 +29,10 @@ pub struct Nbr4 {
 /// Modes 0..=8; conformant streams only signal modes whose required samples
 /// are available, but unavailable inputs still produce defined output (DC
 /// fallbacks) rather than reading junk.
-pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
-    let t = |x: usize| i32::from(n.top[x]);
-    let l = |y: usize| i32::from(n.left[y]);
-    let tl = i32::from(n.top_left);
+pub fn pred_4x4<S: Sample>(mode: u8, bd: u32, n: &Nbr4<S>, out: &mut [S; 16]) {
+    let t = |x: usize| n.top[x].to_i32();
+    let l = |y: usize| n.left[y].to_i32();
+    let tl = n.top_left.to_i32();
     match mode {
         // Vertical.
         0 => {
@@ -51,9 +54,9 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
                 (true, true) => (t(0) + t(1) + t(2) + t(3) + l(0) + l(1) + l(2) + l(3) + 4) >> 3,
                 (false, true) => (l(0) + l(1) + l(2) + l(3) + 2) >> 2,
                 (true, false) => (t(0) + t(1) + t(2) + t(3) + 2) >> 2,
-                (false, false) => 128,
+                (false, false) => 1 << (bd - 1),
             };
-            out.fill(v as u8);
+            out.fill(S::from_i32(v));
         }
         // Diagonal down-left (8-52, 8-53).
         3 => {
@@ -64,7 +67,7 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
                     } else {
                         (t(x + y) + 2 * t(x + y + 1) + t(x + y + 2) + 2) >> 2
                     };
-                    out[y * 4 + x] = v as u8;
+                    out[y * 4 + x] = S::from_i32(v);
                 }
             }
         }
@@ -81,7 +84,7 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
                     } else {
                         (t(0) + 2 * tl + l(0) + 2) >> 2
                     };
-                    out[(y * 4 + x) as usize] = v as u8;
+                    out[(y * 4 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -102,7 +105,7 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
                     } else {
                         (le(y - 1) + 2 * le(y - 2) + le(y - 3) + 2) >> 2
                     };
-                    out[(y * 4 + x) as usize] = v as u8;
+                    out[(y * 4 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -123,7 +126,7 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
                     } else {
                         (te(x - 1) + 2 * te(x - 2) + te(x - 3) + 2) >> 2
                     };
-                    out[(y * 4 + x) as usize] = v as u8;
+                    out[(y * 4 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -137,7 +140,7 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
                     } else {
                         (t(i) + 2 * t(i + 1) + t(i + 2) + 2) >> 2
                     };
-                    out[y * 4 + x] = v as u8;
+                    out[y * 4 + x] = S::from_i32(v);
                 }
             }
         }
@@ -156,7 +159,7 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
                     } else {
                         l(3)
                     };
-                    out[y * 4 + x] = v as u8;
+                    out[y * 4 + x] = S::from_i32(v);
                 }
             }
         }
@@ -167,13 +170,13 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
 /// low-pass filtered by [`filter_nbr8`]. `top[8..16]` carries the top-right
 /// substitution rule.
 #[derive(Debug, Clone, Copy)]
-pub struct Nbr8 {
+pub struct Nbr8<S: Sample = u8> {
     /// p'[0..15, -1].
-    pub top: [u8; 16],
+    pub top: [S; 16],
     /// p'[-1, 0..7].
-    pub left: [u8; 8],
+    pub left: [S; 8],
     /// p'[-1, -1].
-    pub top_left: u8,
+    pub top_left: S,
     /// p[x, -1] available.
     pub have_top: bool,
     /// p[-1, y] available.
@@ -189,47 +192,43 @@ pub struct Nbr8 {
 /// corner, left column) is filtered only when it is wholly available, exactly
 /// as the clause states, so an edge block keeps the raw samples the prediction
 /// modes it is allowed to signal actually read.
-pub fn filter_nbr8(n: &Nbr8) -> Nbr8 {
+pub fn filter_nbr8<S: Sample>(n: &Nbr8<S>) -> Nbr8<S> {
     let mut out = *n;
     let have_tl = n.have_tl;
     if n.have_top {
-        let t = |i: usize| i32::from(n.top[i]);
+        let t = |i: usize| n.top[i].to_i32();
         out.top[0] = if have_tl {
-            ((i32::from(n.top_left) + 2 * t(0) + t(1) + 2) >> 2) as u8
+            S::from_i32((n.top_left.to_i32() + 2 * t(0) + t(1) + 2) >> 2)
         } else {
-            ((3 * t(0) + t(1) + 2) >> 2) as u8
+            S::from_i32((3 * t(0) + t(1) + 2) >> 2)
         };
         for x in 1..15 {
-            out.top[x] = ((t(x - 1) + 2 * t(x) + t(x + 1) + 2) >> 2) as u8;
+            out.top[x] = S::from_i32((t(x - 1) + 2 * t(x) + t(x + 1) + 2) >> 2);
         }
-        out.top[15] = ((t(14) + 3 * t(15) + 2) >> 2) as u8;
+        out.top[15] = S::from_i32((t(14) + 3 * t(15) + 2) >> 2);
     }
     if have_tl {
         // 8-82 to 8-84: which taps the corner takes depends on which of its two
         // adjacent samples exist.
-        let (tl, t0, l0) = (
-            i32::from(n.top_left),
-            i32::from(n.top[0]),
-            i32::from(n.left[0]),
-        );
+        let (tl, t0, l0) = (n.top_left.to_i32(), n.top[0].to_i32(), n.left[0].to_i32());
         out.top_left = match (n.have_top, n.have_left) {
-            (true, true) => ((t0 + 2 * tl + l0 + 2) >> 2) as u8,
-            (true, false) => ((3 * tl + t0 + 2) >> 2) as u8,
-            (false, true) => ((3 * tl + l0 + 2) >> 2) as u8,
+            (true, true) => S::from_i32((t0 + 2 * tl + l0 + 2) >> 2),
+            (true, false) => S::from_i32((3 * tl + t0 + 2) >> 2),
+            (false, true) => S::from_i32((3 * tl + l0 + 2) >> 2),
             (false, false) => n.top_left,
         };
     }
     if n.have_left {
-        let l = |i: usize| i32::from(n.left[i]);
+        let l = |i: usize| n.left[i].to_i32();
         out.left[0] = if have_tl {
-            ((i32::from(n.top_left) + 2 * l(0) + l(1) + 2) >> 2) as u8
+            S::from_i32((n.top_left.to_i32() + 2 * l(0) + l(1) + 2) >> 2)
         } else {
-            ((3 * l(0) + l(1) + 2) >> 2) as u8
+            S::from_i32((3 * l(0) + l(1) + 2) >> 2)
         };
         for y in 1..7 {
-            out.left[y] = ((l(y - 1) + 2 * l(y) + l(y + 1) + 2) >> 2) as u8;
+            out.left[y] = S::from_i32((l(y - 1) + 2 * l(y) + l(y + 1) + 2) >> 2);
         }
-        out.left[7] = ((l(6) + 3 * l(7) + 2) >> 2) as u8;
+        out.left[7] = S::from_i32((l(6) + 3 * l(7) + 2) >> 2);
     }
     out
 }
@@ -239,10 +238,10 @@ pub fn filter_nbr8(n: &Nbr8) -> Nbr8 {
 // x and y are sample coordinates that also index the neighbour runs; the
 // clause's index arithmetic is what the loops spell out.
 #[allow(clippy::needless_range_loop)]
-pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
-    let t = |x: i32| i32::from(n.top[x as usize]);
-    let l = |y: i32| i32::from(n.left[y as usize]);
-    let tl = i32::from(n.top_left);
+pub fn pred_8x8<S: Sample>(mode: u8, bd: u32, n: &Nbr8<S>, out: &mut [S; 64]) {
+    let t = |x: i32| n.top[x as usize].to_i32();
+    let l = |y: i32| n.left[y as usize].to_i32();
+    let tl = n.top_left.to_i32();
     // Index -1 of either run is the corner sample.
     let te = |i: i32| if i < 0 { tl } else { t(i) };
     let le = |i: i32| if i < 0 { tl } else { l(i) };
@@ -267,9 +266,9 @@ pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
                 (true, true) => (sum_t + sum_l + 8) >> 4,
                 (true, false) => (sum_t + 4) >> 3,
                 (false, true) => (sum_l + 4) >> 3,
-                (false, false) => 128,
+                (false, false) => 1 << (bd - 1),
             };
-            out.fill(v as u8);
+            out.fill(S::from_i32(v));
         }
         // Diagonal down-left (8-95, 8-96).
         3 => {
@@ -280,7 +279,7 @@ pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
                     } else {
                         (t(x + y) + 2 * t(x + y + 1) + t(x + y + 2) + 2) >> 2
                     };
-                    out[(y * 8 + x) as usize] = v as u8;
+                    out[(y * 8 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -295,7 +294,7 @@ pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
                     } else {
                         (t(0) + 2 * tl + l(0) + 2) >> 2
                     };
-                    out[(y * 8 + x) as usize] = v as u8;
+                    out[(y * 8 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -314,7 +313,7 @@ pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
                     } else {
                         (l(y - 2 * x - 1) + 2 * l(y - 2 * x - 2) + le(y - 2 * x - 3) + 2) >> 2
                     };
-                    out[(y * 8 + x) as usize] = v as u8;
+                    out[(y * 8 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -333,7 +332,7 @@ pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
                     } else {
                         (t(x - 2 * y - 1) + 2 * t(x - 2 * y - 2) + te(x - 2 * y - 3) + 2) >> 2
                     };
-                    out[(y * 8 + x) as usize] = v as u8;
+                    out[(y * 8 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -347,7 +346,7 @@ pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
                     } else {
                         (t(i) + 2 * t(i + 1) + t(i + 2) + 2) >> 2
                     };
-                    out[(y * 8 + x) as usize] = v as u8;
+                    out[(y * 8 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -366,7 +365,7 @@ pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
                     } else {
                         l(7)
                     };
-                    out[(y * 8 + x) as usize] = v as u8;
+                    out[(y * 8 + x) as usize] = S::from_i32(v);
                 }
             }
         }
@@ -376,9 +375,9 @@ pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
 /// A borrowed window into a picture plane for whole-MB prediction: `data`
 /// spans the plane, `stride` its pitch, `origin` the index of this MB's
 /// top-left sample.
-pub struct PlaneWindow<'a> {
+pub struct PlaneWindow<'a, S: Sample = u8> {
     /// The full plane.
-    pub data: &'a mut [u8],
+    pub data: &'a mut [S],
     /// Row pitch.
     pub stride: usize,
     /// Index of the block's top-left sample.
@@ -387,27 +386,55 @@ pub struct PlaneWindow<'a> {
 
 /// Intra_16x16 prediction (spec 8.3.3), writing predictions straight into the
 /// plane; residuals are added on top afterwards.
-pub fn pred_16x16(mode: u8, w: &mut PlaneWindow<'_>, have_top: bool, have_left: bool) {
-    pred_nxn::<16>(mode, w, have_top, have_left, 5, 5);
+pub fn pred_16x16<S: Sample>(
+    mode: u8,
+    bd: u32,
+    w: &mut PlaneWindow<'_, S>,
+    have_top: bool,
+    have_left: bool,
+) {
+    pred_nxn::<16, S>(mode, bd, w, have_top, have_left, 5, 5);
 }
 
 /// Chroma 8x8 prediction for 4:2:0 (spec 8.3.4). Chroma mode numbering
 /// differs from luma 16x16: 0 = DC, 1 = Horizontal, 2 = Vertical, 3 = Plane.
-pub fn pred_chroma_8x8(mode: u8, w: &mut PlaneWindow<'_>, have_top: bool, have_left: bool) {
+pub fn pred_chroma_8x8<S: Sample>(
+    mode: u8,
+    bd: u32,
+    w: &mut PlaneWindow<'_, S>,
+    have_top: bool,
+    have_left: bool,
+) {
+    pred_chroma_8x8_halves(mode, bd, w, have_top, [have_left; 2]);
+}
+
+/// [`pred_chroma_8x8`] with the availability of the left samples given for the
+/// upper and lower four rows separately (constrained intra prediction in an
+/// MBAFF frame can leave only one half available). Only DC prediction can use
+/// a half; the other modes need both.
+pub fn pred_chroma_8x8_halves<S: Sample>(
+    mode: u8,
+    bd: u32,
+    w: &mut PlaneWindow<'_, S>,
+    have_top: bool,
+    left: [bool; 2],
+) {
+    let have_left = left[0] && left[1];
     match mode {
-        0 => pred_chroma_dc(w, have_top, have_left),
-        1 => pred_nxn::<8>(1, w, have_top, have_left, 0, 0),
-        2 => pred_nxn::<8>(0, w, have_top, have_left, 0, 0),
-        _ => pred_nxn::<8>(3, w, have_top, have_left, 0, 34),
+        0 => pred_chroma_dc(bd, w, have_top, left),
+        1 => pred_nxn::<8, S>(1, bd, w, have_top, have_left, 0, 0),
+        2 => pred_nxn::<8, S>(0, bd, w, have_top, have_left, 0, 0),
+        _ => pred_nxn::<8, S>(3, bd, w, have_top, have_left, 0, 34),
     }
 }
 
 /// Shared V/H/DC/Plane engine for NxN whole-block prediction. `mode` uses the
 /// 16x16 numbering (0 V, 1 H, 2 DC, 3 Plane). `dc_shift` = log2(2N),
 /// `plane_scale` = 5 for luma, 34 for 4:2:0 chroma.
-fn pred_nxn<const N: usize>(
+fn pred_nxn<const N: usize, S: Sample>(
     mode: u8,
-    w: &mut PlaneWindow<'_>,
+    bd: u32,
+    w: &mut PlaneWindow<'_, S>,
     have_top: bool,
     have_left: bool,
     dc_shift: u32,
@@ -434,19 +461,20 @@ fn pred_nxn<const N: usize>(
             let mut sum = 0i32;
             if have_top {
                 for x in 0..N {
-                    sum += i32::from(w.data[o - stride + x]);
+                    sum += w.data[o - stride + x].to_i32();
                 }
             }
             if have_left {
                 for y in 0..N {
-                    sum += i32::from(w.data[o + y * stride - 1]);
+                    sum += w.data[o + y * stride - 1].to_i32();
                 }
             }
             let v = match (have_top, have_left) {
                 (true, true) => (sum + (1 << (dc_shift - 1))) >> dc_shift,
                 (true, false) | (false, true) => (sum + (1 << (dc_shift - 2))) >> (dc_shift - 1),
-                (false, false) => 128,
-            } as u8;
+                (false, false) => 1 << (bd - 1),
+            };
+            let v = S::from_i32(v);
             for y in 0..N {
                 w.data[o + y * stride..o + y * stride + N].fill(v);
             }
@@ -456,7 +484,7 @@ fn pred_nxn<const N: usize>(
             let half = (N / 2) as i32;
             let px = |x: i32, y: i32| -> i32 {
                 let idx = (o as i32 + y * stride as i32 + x) as usize;
-                i32::from(w.data[idx])
+                w.data[idx].to_i32()
             };
             let mut h = 0i32;
             let mut v = 0i32;
@@ -464,13 +492,14 @@ fn pred_nxn<const N: usize>(
                 h += (i + 1) * (px(half + i, -1) - px(half - 2 - i, -1));
                 v += (i + 1) * (px(-1, half + i) - px(-1, half - 2 - i));
             }
+            let max = (1i32 << bd) - 1;
             let a = 16 * (px(-1, N as i32 - 1) + px(N as i32 - 1, -1));
             let b = (plane_scale * h + 32) >> 6;
             let c = (plane_scale * v + 32) >> 6;
             for y in 0..N as i32 {
                 for x in 0..N as i32 {
                     let p = (a + b * (x - (half - 1)) + c * (y - (half - 1)) + 16) >> 5;
-                    w.data[o + y as usize * stride + x as usize] = p.clamp(0, 255) as u8;
+                    w.data[o + y as usize * stride + x as usize] = S::clip(p, max);
                 }
             }
         }
@@ -479,40 +508,43 @@ fn pred_nxn<const N: usize>(
 
 /// Chroma DC prediction (spec 8.3.4.1): each 4x4 sub-block averages specific
 /// neighbour runs — corner blocks prefer their adjacent edge.
-fn pred_chroma_dc(w: &mut PlaneWindow<'_>, have_top: bool, have_left: bool) {
+fn pred_chroma_dc<S: Sample>(bd: u32, w: &mut PlaneWindow<'_, S>, have_top: bool, left: [bool; 2]) {
     let stride = w.stride;
     let o = w.origin;
-    let sum_top = |data: &[u8], x0: usize| -> i32 {
-        (0..4).map(|i| i32::from(data[o - stride + x0 + i])).sum()
-    };
-    let sum_left = |data: &[u8], y0: usize| -> i32 {
+    let sum_top =
+        |data: &[S], x0: usize| -> i32 { (0..4).map(|i| data[o - stride + x0 + i].to_i32()).sum() };
+    let sum_left = |data: &[S], y0: usize| -> i32 {
         (0..4)
-            .map(|i| i32::from(data[o + (y0 + i) * stride - 1]))
+            .map(|i| data[o + (y0 + i) * stride - 1].to_i32())
             .sum()
     };
+    #[allow(clippy::needless_range_loop)]
     for by in 0..2 {
         for bx in 0..2 {
+            // The left samples this block reads are its own four rows.
+            let have_left = left[by];
             // (0,0) and (1,1) use both edges; (1,0) prefers top; (0,1) left.
             let v = if bx == by {
                 match (have_top, have_left) {
                     (true, true) => (sum_top(w.data, bx * 4) + sum_left(w.data, by * 4) + 4) >> 3,
                     (true, false) => (sum_top(w.data, bx * 4) + 2) >> 2,
                     (false, true) => (sum_left(w.data, by * 4) + 2) >> 2,
-                    (false, false) => 128,
+                    (false, false) => 1 << (bd - 1),
                 }
             } else if bx == 1 {
                 match (have_top, have_left) {
                     (true, _) => (sum_top(w.data, 4) + 2) >> 2,
                     (false, true) => (sum_left(w.data, 0) + 2) >> 2,
-                    (false, false) => 128,
+                    (false, false) => 1 << (bd - 1),
                 }
             } else {
                 match (have_left, have_top) {
                     (true, _) => (sum_left(w.data, 4) + 2) >> 2,
                     (false, true) => (sum_top(w.data, 0) + 2) >> 2,
-                    (false, false) => 128,
+                    (false, false) => 1 << (bd - 1),
                 }
-            } as u8;
+            };
+            let v = S::from_i32(v);
             for y in 0..4 {
                 let row = o + (by * 4 + y) * stride + bx * 4;
                 w.data[row..row + 4].fill(v);
@@ -521,15 +553,122 @@ fn pred_chroma_dc(w: &mut PlaneWindow<'_>, have_top: bool, have_left: bool) {
     }
 }
 
+/// Chroma 8x16 prediction for 4:2:2 (spec 8.3.4, MbHeightC 16). Mode numbering
+/// as [`pred_chroma_8x8`]. `left` gives the availability of the left samples
+/// for each group of four rows (only DC prediction can use a part of them).
+pub fn pred_chroma_8x16<S: Sample>(
+    mode: u8,
+    bd: u32,
+    w: &mut PlaneWindow<'_, S>,
+    have_top: bool,
+    left: [bool; 4],
+) {
+    let stride = w.stride;
+    let o = w.origin;
+    let have_left = left.iter().all(|&l| l);
+    match mode {
+        0 => {
+            let sum_top = |data: &[S], x0: usize| -> i32 {
+                (0..4).map(|i| data[o - stride + x0 + i].to_i32()).sum()
+            };
+            let sum_left = |data: &[S], y0: usize| -> i32 {
+                (0..4)
+                    .map(|i| data[o + (y0 + i) * stride - 1].to_i32())
+                    .sum()
+            };
+            let mid = 1i32 << (bd - 1);
+            for (by, &hl) in left.iter().enumerate() {
+                for bx in 0..2 {
+                    let v = if (bx == 0 && by == 0) || (bx > 0 && by > 0) {
+                        match (have_top, hl) {
+                            (true, true) => {
+                                (sum_top(w.data, bx * 4) + sum_left(w.data, by * 4) + 4) >> 3
+                            }
+                            (true, false) => (sum_top(w.data, bx * 4) + 2) >> 2,
+                            (false, true) => (sum_left(w.data, by * 4) + 2) >> 2,
+                            (false, false) => mid,
+                        }
+                    } else if bx > 0 {
+                        // by == 0: the top row is preferred.
+                        match (have_top, hl) {
+                            (true, _) => (sum_top(w.data, 4) + 2) >> 2,
+                            (false, true) => (sum_left(w.data, 0) + 2) >> 2,
+                            (false, false) => mid,
+                        }
+                    } else {
+                        // bx == 0, by > 0: the left column is preferred.
+                        match (hl, have_top) {
+                            (true, _) => (sum_left(w.data, by * 4) + 2) >> 2,
+                            (false, true) => (sum_top(w.data, 0) + 2) >> 2,
+                            (false, false) => mid,
+                        }
+                    };
+                    let v = S::from_i32(v);
+                    for y in 0..4 {
+                        let row = o + (by * 4 + y) * stride + bx * 4;
+                        w.data[row..row + 4].fill(v);
+                    }
+                }
+            }
+        }
+        1 => {
+            for y in 0..16 {
+                let v = w.data[o + y * stride - 1];
+                w.data[o + y * stride..o + y * stride + 8].fill(v);
+            }
+        }
+        2 => {
+            let (top, rest) = w.data.split_at_mut(o);
+            let top_row = &top[o - stride..o - stride + 8];
+            for y in 0..16 {
+                rest[y * stride..y * stride + 8].copy_from_slice(top_row);
+            }
+        }
+        _ => {
+            // Plane (8-139..8-144) with xCF 0 and yCF 4.
+            let _ = (have_top, have_left);
+            let px = |x: i32, y: i32| -> i32 {
+                let idx = (o as i32 + y * stride as i32 + x) as usize;
+                w.data[idx].to_i32()
+            };
+            let mut h = 0i32;
+            let mut v = 0i32;
+            for i in 0..4 {
+                h += (i + 1) * (px(4 + i, -1) - px(2 - i, -1));
+            }
+            for i in 0..8 {
+                v += (i + 1) * (px(-1, 8 + i) - px(-1, 6 - i));
+            }
+            let max = (1i32 << bd) - 1;
+            let a = 16 * (px(-1, 15) + px(7, -1));
+            let b = (34 * h + 32) >> 6;
+            let c = (5 * v + 32) >> 6;
+            for y in 0..16i32 {
+                for x in 0..8i32 {
+                    let p = (a + b * (x - 3) + c * (y - 7) + 16) >> 5;
+                    w.data[o + y as usize * stride + x as usize] = S::clip(p, max);
+                }
+            }
+        }
+    }
+}
+
 /// Add a 4x4 residual to the plane with clamping (picture construction,
 /// spec 8.5.14 path for 8-bit).
 #[inline]
-pub fn add_residual_4x4(data: &mut [u8], stride: usize, origin: usize, r: &[i32; 16]) {
+pub fn add_residual_4x4<S: Sample>(
+    data: &mut [S],
+    bd: u32,
+    stride: usize,
+    origin: usize,
+    r: &[i32; 16],
+) {
+    let max = (1i32 << bd) - 1;
     for y in 0..4 {
         let row = origin + y * stride;
         for x in 0..4 {
-            let p = i32::from(data[row + x]) + r[y * 4 + x];
-            data[row + x] = p.clamp(0, 255) as u8;
+            let p = data[row + x].to_i32() + r[y * 4 + x];
+            data[row + x] = S::clip(p, max);
         }
     }
 }
@@ -537,12 +676,66 @@ pub fn add_residual_4x4(data: &mut [u8], stride: usize, origin: usize, r: &[i32;
 /// Add an 8x8 residual to the plane with clamping (spec 8.5.13 / picture
 /// construction).
 #[inline]
-pub fn add_residual_8x8(data: &mut [u8], stride: usize, origin: usize, r: &[i32; 64]) {
+pub fn add_residual_8x8<S: Sample>(
+    data: &mut [S],
+    bd: u32,
+    stride: usize,
+    origin: usize,
+    r: &[i32; 64],
+) {
+    let max = (1i32 << bd) - 1;
     for y in 0..8 {
         let row = origin + y * stride;
         for x in 0..8 {
-            let p = i32::from(data[row + x]) + r[y * 8 + x];
-            data[row + x] = p.clamp(0, 255) as u8;
+            let p = data[row + x].to_i32() + r[y * 8 + x];
+            data[row + x] = S::clip(p, max);
+        }
+    }
+}
+
+/// Add a residual of a macroblock coded with TransformBypassModeFlag when the
+/// intra prediction is purely horizontal or vertical (8.5.15): the residual is
+/// accumulated along the prediction direction, so each sample is the sample
+/// before it (left for `horizontal`, above otherwise) plus its own residual.
+///
+/// `r` is `w * h` values in raster order. `first` says the block opens the
+/// accumulation: its first column (row) starts from the prediction already in
+/// the plane rather than from the reconstructed block beside (above) it. For an
+/// Intra_4x4 or Intra_8x8 block that is always so; for Intra_16x16 and the
+/// chroma of a 4:2:0 / 4:2:2 macroblock the accumulation spans the whole
+/// macroblock, and so continues across the blocks inside it.
+#[allow(clippy::too_many_arguments)]
+pub fn add_residual_dpcm<S: Sample>(
+    data: &mut [S],
+    bd: u32,
+    stride: usize,
+    origin: usize,
+    w: usize,
+    h: usize,
+    r: &[i32],
+    horizontal: bool,
+    first: bool,
+) {
+    let max = (1i32 << bd) - 1;
+    for y in 0..h {
+        let row = origin + y * stride;
+        for x in 0..w {
+            let base = if horizontal {
+                if x == 0 && !first {
+                    data[row - 1].to_i32()
+                } else if x == 0 {
+                    data[row].to_i32()
+                } else {
+                    data[row + x - 1].to_i32()
+                }
+            } else if y == 0 && !first {
+                data[row - stride + x].to_i32()
+            } else if y == 0 {
+                data[row + x].to_i32()
+            } else {
+                data[row - stride + x].to_i32()
+            };
+            data[row + x] = S::clip(base + r[y * w + x], max);
         }
     }
 }
@@ -570,7 +763,7 @@ mod tests {
         assert_eq!(f.top_left, 77);
         for mode in 0..9u8 {
             let mut out = [0u8; 64];
-            pred_8x8(mode, &f, &mut out);
+            pred_8x8(mode, 8, &f, &mut out);
             assert!(out.iter().all(|&v| v == 77), "mode {mode}: {out:?}");
         }
     }
@@ -602,7 +795,7 @@ mod tests {
         assert_eq!(f.top_left, 9);
         // DC with no left run averages the top run alone (8-93).
         let mut out = [0u8; 64];
-        pred_8x8(2, &f, &mut out);
+        pred_8x8(2, 8, &f, &mut out);
         let sum: i32 = (0..8).map(|i| i32::from(f.top[i])).sum();
         assert!(out.iter().all(|&v| i32::from(v) == (sum + 4) >> 3));
     }
@@ -623,10 +816,10 @@ mod tests {
             have_tl: true,
         };
         let mut out = [0u8; 64];
-        pred_8x8(0, &n, &mut out);
+        pred_8x8(0, 8, &n, &mut out);
         assert_eq!(&out[..8], &n.top[..8]);
         assert_eq!(&out[56..], &n.top[..8]);
-        pred_8x8(1, &n, &mut out);
+        pred_8x8(1, 8, &n, &mut out);
         assert_eq!(out[0], 1);
         assert_eq!(out[63], 8);
     }
@@ -641,20 +834,20 @@ mod tests {
             have_left: true,
         };
         let mut out = [0u8; 16];
-        pred_4x4(2, &n, &mut out);
+        pred_4x4(2, 8, &n, &mut out);
         assert!(out.iter().all(|&v| v == 15)); // (40 + 80 + 4) >> 3
         let n2 = Nbr4 {
             have_left: false,
             ..n
         };
-        pred_4x4(2, &n2, &mut out);
+        pred_4x4(2, 8, &n2, &mut out);
         assert!(out.iter().all(|&v| v == 10));
         let n3 = Nbr4 {
             have_top: false,
             have_left: false,
             ..n
         };
-        pred_4x4(2, &n3, &mut out);
+        pred_4x4(2, 8, &n3, &mut out);
         assert!(out.iter().all(|&v| v == 128));
     }
 
@@ -668,10 +861,10 @@ mod tests {
             have_left: true,
         };
         let mut out = [0u8; 16];
-        pred_4x4(0, &n, &mut out);
+        pred_4x4(0, 8, &n, &mut out);
         assert_eq!(&out[0..4], &[1, 2, 3, 4]);
         assert_eq!(&out[12..16], &[1, 2, 3, 4]);
-        pred_4x4(1, &n, &mut out);
+        pred_4x4(1, 8, &n, &mut out);
         assert_eq!(out[0], 9);
         assert_eq!(out[15], 12);
     }
@@ -688,7 +881,7 @@ mod tests {
             have_left: false,
         };
         let mut out = [0u8; 16];
-        pred_4x4(3, &n, &mut out);
+        pred_4x4(3, 8, &n, &mut out);
         assert!(out.iter().all(|&v| v == 50));
     }
 
@@ -710,7 +903,7 @@ mod tests {
             stride,
             origin,
         };
-        pred_16x16(3, &mut w, true, true);
+        pred_16x16(3, 8, &mut w, true, true);
         // A perfect plane through those edges: value at (x, y) approximately
         // 12 + 2x + 3y. Check corners within rounding of the spec filter.
         let v = |x: usize, y: usize| i32::from(data[origin + y * stride + x]);
@@ -737,7 +930,7 @@ mod tests {
             stride,
             origin,
         };
-        pred_chroma_8x8(0, &mut w, true, true);
+        pred_chroma_8x8(0, 8, &mut w, true, true);
         let v = |x: usize, y: usize| data[origin + y * stride + x];
         assert_eq!(v(0, 0), 60); // both edges
         assert_eq!(v(7, 0), 40); // top preferred
@@ -751,7 +944,7 @@ mod tests {
         let mut r = [0i32; 16];
         r[0] = 100;
         r[1] = -300;
-        add_residual_4x4(&mut data, 4, 0, &r);
+        add_residual_4x4(&mut data, 8, 4, 0, &r);
         assert_eq!(data[0], 255);
         assert_eq!(data[1], 0);
         assert_eq!(data[2], 250);

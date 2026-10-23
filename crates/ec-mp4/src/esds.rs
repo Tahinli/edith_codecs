@@ -22,6 +22,10 @@ const TAG_SL_CONFIG: u8 = 0x06;
 /// actually is, which is the only thing telling an `mp4a` entry holding MP3 from
 /// one holding AAC.
 pub mod object_type {
+    /// MPEG-4 Visual (ISO/IEC 14496-2: Simple/Advanced Simple profile, `mp4v`).
+    pub const MPEG4_VISUAL: u8 = 0x20;
+    /// DVD subpictures (VobSub) in an `mp4s` entry.
+    pub const VOBSUB: u8 = 0xE0;
     /// MPEG-4 Audio (AAC and the rest of 14496-3).
     pub const MPEG4_AUDIO: u8 = 0x40;
     /// MPEG-2 AAC Main/LC/SSR.
@@ -34,6 +38,14 @@ pub mod object_type {
     pub const MPEG2_AUDIO: u8 = 0x69;
     /// MPEG-1 Audio (MP3).
     pub const MPEG1_AUDIO: u8 = 0x6B;
+    /// DTS Coherent Acoustics.
+    pub const DTS: u8 = 0xA9;
+    /// DTS-HD High Resolution Audio.
+    pub const DTS_HD_HRA: u8 = 0xAA;
+    /// DTS-HD Master Audio.
+    pub const DTS_HD_MA: u8 = 0xAB;
+    /// DTS Express (LBR).
+    pub const DTS_EXPRESS: u8 = 0xAC;
 }
 
 /// An `esds` payload as its fields.

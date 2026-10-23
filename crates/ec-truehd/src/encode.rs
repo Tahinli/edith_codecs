@@ -109,12 +109,7 @@ fn choose_lsb_bits(residuals: &[i32]) -> Option<u32> {
         min_r = min_r.min(r);
     }
     let threshold = i64::from(max_r).max(-1 - i64::from(min_r)).max(0);
-    for lsb_bits in 0..=24u32 {
-        if (8i64 << lsb_bits) > threshold {
-            return Some(lsb_bits);
-        }
-    }
-    None
+    (0..=24u32).find(|&lsb_bits| (8i64 << lsb_bits) > threshold)
 }
 
 /// Levinson-Durbin on `samples`' own autocorrelation: LPC coefficients
@@ -386,6 +381,8 @@ pub struct TrueHdEncoder {
     /// The last-written blocksize + per-channel `(codebook, lsb_bits,
     /// coeffs)`, so a later AU whose `ChannelPlan::choose` lands on the same
     /// values can skip `params_present` entirely (see `encode_access_unit`).
+    // The (count, per-channel params) key; an alias would only rename it.
+    #[allow(clippy::type_complexity)]
     last_params: Option<(usize, [(u8, u32, Vec<i32>); 2])>,
     eof: bool,
 }
@@ -469,6 +466,8 @@ impl TrueHdEncoder {
         // against the last AU actually written skips the whole section
         // when nothing changed — safe because the decoder's own state is
         // exactly the union of every field this encoder has ever written.
+        // The (count, per-channel params) key; an alias would only rename it.
+        #[allow(clippy::type_complexity)]
         let params_key: (usize, [(u8, u32, &[i32]); 2]) = (
             n,
             std::array::from_fn(|ch| {
@@ -538,11 +537,11 @@ impl TrueHdEncoder {
         // every block regardless of the chosen order — advance the
         // analysis window now so the *next* AU's `choose` sees this one's
         // actual samples.
-        for ch in 0..2 {
-            self.analysis[ch].extend_from_slice(&ch_samples[ch]);
-            let len = self.analysis[ch].len();
+        for (analysis, samples) in self.analysis.iter_mut().zip(ch_samples.iter()) {
+            analysis.extend_from_slice(samples);
+            let len = analysis.len();
             if len > ANALYSIS_WINDOW {
-                self.analysis[ch].drain(..len - ANALYSIS_WINDOW);
+                analysis.drain(..len - ANALYSIS_WINDOW);
             }
         }
 
@@ -592,7 +591,7 @@ impl TrueHdEncoder {
 
         seg.write_bit(true); // end_of_segment
         seg.align_to_byte();
-        if seg.bit_len() % 16 != 0 {
+        if !seg.bit_len().is_multiple_of(16) {
             seg.write_bits(0, 8);
         }
         let seg_bytes = seg.into_bytes();
@@ -701,9 +700,8 @@ impl Encoder for TrueHdEncoder {
                 }
             }
         } else {
-            for word in audio.data[0].chunks_exact(4).take(audio.samples * 2) {
-                self.pending
-                    .push(i32::from_ne_bytes([word[0], word[1], word[2], word[3]]) >> 8);
+            for word in audio.data[0].as_chunks::<4>().0.iter().take(audio.samples * 2) {
+                self.pending.push(i32::from_ne_bytes(*word) >> 8);
             }
         }
         self.drain_full_units();
@@ -806,10 +804,8 @@ mod tests {
                 match enc.receive_packet() {
                     Ok(pkt) => {
                         if let Some(frame) = dec.decode_access_unit(&pkt.data).unwrap() {
-                            for word in frame.data[0].chunks_exact(4) {
-                                decoded.push(
-                                    i32::from_ne_bytes([word[0], word[1], word[2], word[3]]) >> 8,
-                                );
+                            for word in frame.data[0].as_chunks::<4>().0 {
+                                decoded.push(i32::from_ne_bytes(*word) >> 8);
                             }
                         }
                     }

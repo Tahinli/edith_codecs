@@ -1,0 +1,69 @@
+{ "type": "suite", "event": "started", "test_count": 26 }
+{ "type": "test", "event": "started", "name": "dct::tests::dct2_and_dct3_agree_with_reference" }
+{ "type": "test", "event": "started", "name": "dct::tests::dct2_round_trips_through_dct3" }
+{ "type": "test", "event": "started", "name": "dct::tests::dct4_agrees_with_reference" }
+{ "type": "test", "event": "started", "name": "fft::tests::agrees_with_reference_dft_f32" }
+{ "type": "test", "name": "dct::tests::dct2_round_trips_through_dct3", "event": "ok", "exec_time": 0.000156886 }
+{ "type": "test", "event": "started", "name": "fft::tests::agrees_with_reference_dft_f64" }
+{ "type": "test", "name": "dct::tests::dct4_agrees_with_reference", "event": "ok", "exec_time": 1.6006315290000002 }
+{ "type": "test", "event": "started", "name": "fft::tests::inverse_reference_matches_plan" }
+{ "type": "test", "name": "fft::tests::inverse_reference_matches_plan", "event": "ok", "exec_time": 0.000128452 }
+{ "type": "test", "event": "started", "name": "fft::tests::real_fft_matches_complex_fft" }
+{ "type": "test", "name": "fft::tests::real_fft_matches_complex_fft", "event": "ok", "exec_time": 0.000981023 }
+{ "type": "test", "event": "started", "name": "fft::tests::rejects_non_power_of_two" }
+{ "type": "test", "name": "fft::tests::rejects_non_power_of_two", "event": "ok", "exec_time": 0.000039544 }
+{ "type": "test", "event": "started", "name": "fft::tests::round_trips_f32_every_size" }
+{ "type": "test", "name": "fft::tests::round_trips_f32_every_size", "event": "ok", "exec_time": 0.0053601 }
+{ "type": "test", "event": "started", "name": "fft::tests::split_and_interleaved_agree" }
+{ "type": "test", "name": "fft::tests::split_and_interleaved_agree", "event": "ok", "exec_time": 0.000021971 }
+{ "type": "test", "event": "started", "name": "mdct::tests::forward_matches_reference" }
+{ "type": "test", "name": "mdct::tests::forward_matches_reference", "event": "ok", "exec_time": 0.051113121 }
+{ "type": "test", "event": "started", "name": "mdct::tests::inverse_matches_reference" }
+{ "type": "test", "name": "mdct::tests::inverse_matches_reference", "event": "ok", "exec_time": 0.035169587 }
+{ "type": "test", "event": "started", "name": "mdct::tests::tdac_reconstructs_in_f32" }
+{ "type": "test", "name": "mdct::tests::tdac_reconstructs_in_f32", "event": "ok", "exec_time": 0.000185558 }
+{ "type": "test", "event": "started", "name": "mdct::tests::tdac_reconstructs_with_every_window" }
+{ "type": "test", "name": "mdct::tests::tdac_reconstructs_with_every_window", "event": "ok", "exec_time": 0.000545685 }
+{ "type": "test", "event": "started", "name": "mdct::tests::windowed_forward_equals_manual_windowing" }
+{ "type": "test", "name": "mdct::tests::windowed_forward_equals_manual_windowing", "event": "ok", "exec_time": 0.000027913 }
+{ "type": "test", "event": "started", "name": "remap::tests::a_remap_is_the_same_colour_read_by_the_other_matrix" }
+{ "type": "test", "name": "remap::tests::a_remap_is_the_same_colour_read_by_the_other_matrix", "event": "ok", "exec_time": 0.000002444 }
+{ "type": "test", "event": "started", "name": "remap::tests::a_remap_leaves_the_greys_where_they_are" }
+{ "type": "test", "name": "remap::tests::a_remap_leaves_the_greys_where_they_are", "event": "ok", "exec_time": 0.000001032 }
+{ "type": "test", "event": "started", "name": "remap::tests::a_remap_round_trips_within_a_code" }
+{ "type": "test", "name": "remap::tests::a_remap_round_trips_within_a_code", "event": "ok", "exec_time": 0.000035275 }
+{ "type": "test", "event": "started", "name": "remap::tests::a_same_space_remap_touches_nothing" }
+{ "type": "test", "name": "remap::tests::a_same_space_remap_touches_nothing", "event": "ok", "exec_time": 0.000001643 }
+{ "type": "test", "event": "started", "name": "tests::scale_matches_scalar_across_the_lane_boundary" }
+{ "type": "test", "name": "tests::scale_matches_scalar_across_the_lane_boundary", "event": "ok", "exec_time": 0.000001262 }
+{ "type": "test", "event": "started", "name": "tests::throughput" }
+{ "type": "test", "name": "tests::throughput", "event": "ignored", "message": "timing; run in release with --ignored --nocapture" }
+{ "type": "test", "event": "started", "name": "window::tests::all_shapes_satisfy_princen_bradley" }
+{ "type": "test", "name": "window::tests::all_shapes_satisfy_princen_bradley", "event": "ok", "exec_time": 0.000256502 }
+{ "type": "test", "event": "started", "name": "window::tests::apply_matches_scalar_multiply" }
+{ "type": "test", "name": "window::tests::apply_matches_scalar_multiply", "event": "ok", "exec_time": 0.000004578 }
+{ "type": "test", "event": "started", "name": "window::tests::bessel_i0_matches_known_values" }
+{ "type": "test", "name": "window::tests::bessel_i0_matches_known_values", "event": "ok", "exec_time": 0.000000321 }
+{ "type": "test", "event": "started", "name": "window::tests::kbd_rejects_odd_lengths" }
+{ "type": "test", "name": "window::tests::kbd_rejects_odd_lengths", "event": "ok", "exec_time": 0.000035226 }
+{ "type": "test", "event": "started", "name": "window::tests::windows_are_symmetric_and_bounded" }
+{ "type": "test", "name": "window::tests::windows_are_symmetric_and_bounded", "event": "ok", "exec_time": 0.000035667 }
+{ "type": "test", "name": "fft::tests::agrees_with_reference_dft_f32", "event": "ok", "exec_time": 2.232817254 }
+{ "type": "test", "name": "fft::tests::agrees_with_reference_dft_f64", "event": "ok", "exec_time": 2.274737874 }
+{ "type": "test", "name": "dct::tests::dct2_and_dct3_agree_with_reference", "event": "ok", "exec_time": 3.153062096 }
+{ "type": "suite", "event": "ok", "passed": 25, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 3.15348473 }
+{ "type": "suite", "event": "started", "test_count": 6 }
+{ "type": "test", "event": "started", "name": "crates/ec-dsp/src/dct.rs - dct::Dct (line 23)" }
+{ "type": "test", "event": "started", "name": "crates/ec-dsp/src/dct.rs - dct::Dct4 (line 125)" }
+{ "type": "test", "event": "started", "name": "crates/ec-dsp/src/fft.rs - fft::Fft (line 104)" }
+{ "type": "test", "event": "started", "name": "crates/ec-dsp/src/fft.rs - fft::RealFft (line 479)" }
+{ "type": "test", "name": "crates/ec-dsp/src/fft.rs - fft::RealFft (line 479)", "event": "ok", "exec_time": 0.000043331 }
+{ "type": "test", "event": "started", "name": "crates/ec-dsp/src/mdct.rs - mdct::Mdct (line 26)" }
+{ "type": "test", "name": "crates/ec-dsp/src/fft.rs - fft::Fft (line 104)", "event": "ok", "exec_time": 0.000035856 }
+{ "type": "test", "event": "started", "name": "crates/ec-dsp/src/window.rs - window::Window (line 19)" }
+{ "type": "test", "name": "crates/ec-dsp/src/dct.rs - dct::Dct4 (line 125)", "event": "ok", "exec_time": 0.000029044 }
+{ "type": "test", "name": "crates/ec-dsp/src/dct.rs - dct::Dct (line 23)", "event": "ok", "exec_time": 0.000145583 }
+{ "type": "test", "name": "crates/ec-dsp/src/window.rs - window::Window (line 19)", "event": "ok", "exec_time": 0.000208912 }
+{ "type": "test", "name": "crates/ec-dsp/src/mdct.rs - mdct::Mdct (line 26)", "event": "ok", "exec_time": 0.001343054 }
+{ "type": "suite", "event": "ok", "passed": 6, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.002281957 }
+{ "type": "report", "total_time": 0.408247768, "compilation_time": 0.353368742 }

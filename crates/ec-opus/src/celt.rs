@@ -42,6 +42,11 @@ const MAX_PERIOD: usize = 1024;
 const MIN_PERIOD: usize = 15;
 /// Synthesis history kept per channel.
 const DECODE_BUFFER: usize = 2048;
+/// Error text for a stereo or split band without a side channel offset. `y` is set
+/// together with the split flag and never cleared, so a well-formed stream cannot
+/// reach it; a band that does is a decoder defect, reported as corrupt input rather
+/// than a panic.
+const INV_SIDE: &str = "stereo/split band without a side channel offset";
 /// Allocation resolution: 1/8 bit.
 pub(crate) const BITRES: u32 = 3;
 /// Most fine-energy bits a band can get.
@@ -1178,7 +1183,7 @@ fn compute_allocation_shared(
         if n > 1 {
             excess = 0.max(pulses[j] - caps[j]);
             pulses[j] -= excess;
-            let den = c as i32 + 0;
+            let den = c as i32;
             let den = den * n + i32::from(c == 2 && n > 2 && !dual_stereo && j < intensity);
             let nc_log_n = den * (LOG_N[j] + log_m);
             let mut offset = (nc_log_n >> 1) - den * FINE_OFFSET;
@@ -1270,6 +1275,10 @@ pub struct CeltDecDiag {
 pub struct CeltDecoder {
     /// Channels this decoder outputs.
     channels: usize,
+    /// Decode with the RFC 6716 reconstruction (no RFC 8251 Section 8 energy cap
+    /// and no Section 9 hybrid folding). Off by default: RFC 8251 Section 11
+    /// makes the new behaviour the reference.
+    legacy_rfc6716: bool,
     /// Output decimation: 1 at 48 kHz, 2 at 24 kHz, and so on.
     downsample: usize,
     window: Vec<f32>,
@@ -1317,6 +1326,7 @@ impl CeltDecoder {
         let max_n = SHORT_MDCT * 8;
         CeltDecoder {
             channels,
+            legacy_rfc6716: false,
             downsample,
             window: overlap_window(),
             plans: (0..4).map(|lm| ImdctPlan::new(SHORT_MDCT << lm)).collect(),
@@ -1368,6 +1378,13 @@ impl CeltDecoder {
                 offsets: vec![0; NB_BANDS],
             },
         }
+    }
+
+    /// Selects the RFC 6716 reconstruction (`true`) or the RFC 8251 one (`false`,
+    /// the default). The two differ on some hybrid and high-energy frames, so each
+    /// vector set is decoded with the behaviour its reference was made with.
+    pub fn set_legacy_rfc6716(&mut self, on: bool) {
+        self.legacy_rfc6716 = on;
     }
 
     /// Drops all inter-frame state (after a seek, or on a mode switch).
@@ -1584,7 +1601,7 @@ impl CeltDecoder {
             coded_bands,
             c,
             n,
-        );
+        )?;
 
         let anti_collapse_on = if anti_collapse_rsv > 0 {
             dec.dec_bits(1) != 0
@@ -1605,7 +1622,11 @@ impl CeltDecoder {
                 self.band_e[ch * NB_BANDS + i] = if i < start || i >= end {
                     0.0
                 } else {
-                    ((self.old_band_e[ch * NB_BANDS + i] + mean) as f64).exp2() as f32
+                    // RFC 8251 Section 8: cap the log2 energy at 32 so the amplitude
+                    // stays finite (libopus `log2Amp`, `MIN32(QCONST32(32.f, 16), lg)`).
+                    let lg = (self.old_band_e[ch * NB_BANDS + i] + mean) as f64;
+                    let lg = if self.legacy_rfc6716 { lg } else { lg.min(32.0) };
+                    lg.exp2() as f32
                 };
             }
         }
@@ -1863,7 +1884,7 @@ impl CeltDecoder {
         coded_bands: usize,
         c: usize,
         n: usize,
-    ) {
+    ) -> Result<()> {
         let m = 1usize << lm;
         let blocks = if short_blocks != 0 { m } else { 1 };
         let norm_len = m * E_BANDS[NB_BANDS];
@@ -1885,10 +1906,27 @@ impl CeltDecoder {
                 0
             };
 
-            if m * E_BANDS[i] >= m * E_BANDS[start] + n_band
+            // RFC 8251 Section 9: the second band may take the first band as its
+            // lowband even when the first band is narrower than it.
+            let rfc8251 = !self.legacy_rfc6716;
+            if (m * E_BANDS[i] >= m * E_BANDS[start] + n_band || (rfc8251 && i == start + 1))
                 && (update_lowband || lowband_offset == 0)
             {
                 lowband_offset = i;
+            }
+            if rfc8251 && i == start + 1 && start + 2 <= NB_BANDS {
+                // RFC 8251 Section 9: repeat part of band `start` so band `i` can
+                // fold onto it. Copies nothing when band `i` is not wider than it.
+                let n1 = m * (E_BANDS[start + 1] - E_BANDS[start]);
+                let n2 = m * (E_BANDS[start + 2] - E_BANDS[start + 1]);
+                let offset = m * E_BANDS[start];
+                if n2 > n1 && n2 <= 2 * n1 {
+                    self.norm.copy_within(offset + 2 * n1 - n2..offset + n1, offset + n1);
+                    if c == 2 {
+                        let o2 = norm_len + offset;
+                        self.norm.copy_within(o2 + 2 * n1 - n2..o2 + n1, o2 + n1);
+                    }
+                }
             }
 
             let tf_change = self.tf_res[i];
@@ -1907,10 +1945,11 @@ impl CeltDecoder {
                         break;
                     }
                 }
+                // RFC 8251 Section 9: the search is bounded by band `i`.
                 let mut fold_end = lowband_offset - 1;
                 loop {
                     fold_end += 1;
-                    if m * E_BANDS[fold_end] >= low + n_band {
+                    if (rfc8251 && fold_end >= i) || m * E_BANDS[fold_end] >= low + n_band {
                         break;
                     }
                 }
@@ -1966,7 +2005,7 @@ impl CeltDecoder {
                         ..base
                     },
                     &mut remaining_bits,
-                );
+                )?;
                 y_cm = self.quant_band(
                     dec,
                     BandArgs {
@@ -1979,7 +2018,7 @@ impl CeltDecoder {
                         ..base
                     },
                     &mut remaining_bits,
-                );
+                )?;
             } else {
                 x_cm = self.quant_band(
                     dec,
@@ -1990,7 +2029,7 @@ impl CeltDecoder {
                         ..base
                     },
                     &mut remaining_bits,
-                );
+                )?;
                 y_cm = x_cm;
             }
             self.collapse_masks[i * c] = x_cm as u8;
@@ -1999,10 +2038,11 @@ impl CeltDecoder {
             // Keep folding from this band only while it has a bit per sample.
             update_lowband = b > (n_band as i32) << BITRES;
         }
+        Ok(())
     }
 
     /// Decodes one band (Section 4.3.4), recursing for splits and for stereo.
-    fn quant_band(&mut self, dec: &mut RangeDecoder, a: BandArgs, remaining_bits: &mut i32) -> u32 {
+    fn quant_band(&mut self, dec: &mut RangeDecoder, a: BandArgs, remaining_bits: &mut i32) -> Result<u32> {
         let BandArgs {
             i,
             x,
@@ -2047,7 +2087,7 @@ impl CeltDecoder {
             if let Some(o) = lowband_out {
                 self.norm[o] = self.x[x];
             }
-            return 1;
+            return Ok(1);
         }
 
         if !stereo && level == 0 {
@@ -2224,7 +2264,7 @@ impl CeltDecoder {
                     sbits = 1 << BITRES;
                 }
                 mbits -= sbits;
-                let yy = y.unwrap();
+                let yy = y.ok_or_else(|| Error::corrupt(INV_SIDE))?;
                 let swap = itheta > 8192;
                 *remaining_bits -= qalloc + sbits;
                 let (x2, y2) = if swap { (yy, x) } else { (x, yy) };
@@ -2248,7 +2288,7 @@ impl CeltDecoder {
                         ..a
                     },
                     remaining_bits,
-                );
+                )?;
                 self.x[y2] = -(sign as f32) * self.x[x2 + 1];
                 self.x[y2 + 1] = sign as f32 * self.x[x2];
                 let x0 = self.x[x] * mid;
@@ -2294,7 +2334,7 @@ impl CeltDecoder {
                     ..a
                 };
                 let side_args = BandArgs {
-                    x: y.unwrap(),
+                    x: y.ok_or_else(|| Error::corrupt(INV_SIDE))?,
                     y: None,
                     n,
                     blocks,
@@ -2319,7 +2359,7 @@ impl CeltDecoder {
                             ..mid_args
                         },
                         remaining_bits,
-                    );
+                    )?;
                     rebalance = mbits - (rebalance - *remaining_bits);
                     if rebalance > 3 << BITRES && itheta != 0 {
                         sbits += rebalance - (3 << BITRES);
@@ -2331,7 +2371,7 @@ impl CeltDecoder {
                             ..side_args
                         },
                         remaining_bits,
-                    ) << shift;
+                    )? << shift;
                 } else {
                     cm = self.quant_band(
                         dec,
@@ -2340,7 +2380,7 @@ impl CeltDecoder {
                             ..side_args
                         },
                         remaining_bits,
-                    ) << shift;
+                    )? << shift;
                     rebalance = sbits - (rebalance - *remaining_bits);
                     if rebalance > 3 << BITRES && itheta != 16384 {
                         mbits += rebalance - (3 << BITRES);
@@ -2352,7 +2392,7 @@ impl CeltDecoder {
                             ..mid_args
                         },
                         remaining_bits,
-                    );
+                    )?;
                 }
             }
         } else {
@@ -2403,11 +2443,12 @@ impl CeltDecoder {
         // Undo the reorganisations, and pass the band on for later folding.
         if stereo {
             if n != 2 {
-                stereo_merge(&mut self.x, x, y.unwrap(), mid, n);
+                stereo_merge(&mut self.x, x, y.ok_or_else(|| Error::corrupt(INV_SIDE))?, mid, n);
             }
             if inv {
+                let ys = y.ok_or_else(|| Error::corrupt(INV_SIDE))?;
                 for j in 0..n {
-                    self.x[y.unwrap() + j] = -self.x[y.unwrap() + j];
+                    self.x[ys + j] = -self.x[ys + j];
                 }
             }
         } else if level == 0 {
@@ -2446,7 +2487,7 @@ impl CeltDecoder {
             }
             cm &= (1 << bb) - 1;
         }
-        cm
+        Ok(cm)
     }
 
     /// Reads one sample of the folding source.

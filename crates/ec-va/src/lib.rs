@@ -1,67 +1,57 @@
-//! Minimal libva (VA-API) bindings and a safe layer over them.
+//! VA-API (libva) layer over [`cros_libva`].
 //!
 //! This is the hardware-video foundation of the `edith_codecs` family: `ec-hw`
 //! builds stateless VA-API decoders and encoders on top of it, and nothing else
-//! in the family talks to libva directly.
+//! in the family talks to libva directly. Every libva call goes through
+//! cros-libva's safe wrappers, so this crate contains no `unsafe` of its own.
 //!
-//! # Shape
-//!
-//! * [`sys`] — the entire FFI surface, hand-written, one screenful per concern.
-//!   Every ABI assumption is stated there and checked by a `const` assertion
-//!   against numbers printed by `crates/ec-va/abi-probe.c`.
-//! * Everything else is safe: [`Display`], [`Config`], [`Surface`], [`Context`]
-//!   and [`Buffer`] are RAII handles that destroy exactly what they created, in
-//!   the order libva requires (each child holds an `Arc` of its parent, so the
-//!   ordering is a borrow-checker fact rather than a review comment).
-//! * [`Picture`] encodes the `begin -> render -> end -> sync` protocol as a
-//!   typestate machine, so submitting out of order does not compile.
+//! * [`va`] — the whole cros-libva API, re-exported: raw constants and typed
+//!   codec parameter buffers ([`va::BufferType`], e.g.
+//!   `BufferType::PictureParameter(PictureParameter::H264(..))`).
+//! * [`Display`], [`Config`], [`Context`], [`Surface`], [`Picture`], [`Buffer`]
+//!   and [`Image`] are cros-libva's RAII handles. Each child holds an `Rc` of
+//!   its parent, so libva's destruction order is enforced by ownership.
+//! * [`surface`] adds PRIME export/import, timed sync and pool creation;
+//!   [`caps`] probes what the driver supports; [`vpp`] is a video-processing
+//!   pipeline.
 //!
 //! # Version policy
 //!
-//! Built against libva **1.23** headers and refuses older runtimes with
-//! [`Error::Version`]. The alternative — assuming a struct layout and finding
-//! out at runtime — is what broke the previous generation of VA-API bindings
-//! when 1.23 shifted their generated definitions.
+//! The pinned cros-libva revision builds against libva 1.23. The runtime
+//! version is not exposed by cros-libva, so it is not checked here.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use ec_va::{CapReport, Display, Surface, SurfaceSpec};
-//! use ec_va::caps::{Entrypoint, Profile};
+//! use ec_va::caps::{CapReport, Entrypoint, Profile};
 //!
-//! let display = Display::open()?;
+//! let display = ec_va::open()?;
 //! let caps = CapReport::probe(&display)?;
 //! assert!(caps.supports(Profile::H264Main, Entrypoint::VLD));
-//!
-//! let surfaces = Surface::create_pool(&display, &SurfaceSpec::nv12(1920, 1088), 8)?;
 //! # Ok::<(), ec_va::Error>(())
 //! ```
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
-#![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod cacheline;
 pub mod caps;
 pub mod config;
 pub mod display;
 pub mod error;
 pub mod picture;
 pub mod surface;
-pub mod sys;
 pub mod vpp;
 
+pub use cros_libva as va;
+
 pub use caps::{CapEntry, CapReport, Entrypoint, Profile, fourcc_str};
-pub use config::{Config, ConfigAttrib, SurfaceCaps};
-pub use display::Display;
+pub use config::{Config, ConfigAttrib, SurfaceCaps, caps_of};
+pub use display::{Display, open, open_path};
 pub use error::{Error, Result};
-pub use picture::{
-    Buffer, Context, Ended, MappedBuffer, New, Picture, PictureState, Rendering, Synced,
-};
+pub use picture::{Buffer, Context, Picture, create_context};
 pub use surface::{
-    Image, MappedImage, PrimeLayer, PrimeObject, PrimeSurface, Surface, SurfaceSpec,
+    Image, PrimeLayer, PrimeObject, PrimeSurface, Surface, SurfaceExt, SurfaceSpec, create_pool,
+    import_prime,
 };
 pub use vpp::Vpp;
-
-/// Major libva version this crate's ABI transcription targets.
-pub const MIN_VA_MAJOR: i32 = 1;
-/// Minimum libva minor version accepted at runtime.
-pub const MIN_VA_MINOR: i32 = 23;

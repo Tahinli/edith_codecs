@@ -169,7 +169,7 @@ impl Default for AdjustState {
 }
 
 fn noise_fraction_debug() -> bool {
-    std::env::var("EC_AAC_SBR_NOISE_FRACTION").is_ok()
+    crate::knobs::sbr_noise_fraction()
 }
 
 type NoiseFractionRows = Vec<(usize, f64, f64, f64)>;
@@ -227,7 +227,7 @@ pub fn adjust(
     } else {
         LIMITER_FACTOR[usize::from(header.limiter_gains).min(3)]
     };
-    let zero_noise = std::env::var("EC_AAC_SBR_NOISE_ZERO").is_ok();
+    let zero_noise = crate::knobs::sbr_noise_zero();
     let limdump = std::env::var("EC_AAC_SBR_CELLDUMP").is_ok();
     let track_fraction = noise_fraction_debug();
     let h_sl = if header.smoothing_mode == 0 { H_SL } else { 0 };
@@ -530,7 +530,7 @@ mod tests {
         // Q_mapped = 1 (q_q = 6): half the target is noise.
         let noise_energy = vec![vec![1.0f64; tables.n_q]];
         let hdr = header(1, 3);
-        let lim = limiter_band_table(&tables, &build_patches(&tables), hdr.limiter_bands);
+        let lim = limiter_band_table(&tables, &build_patches(&tables), hdr.limiter_bands).unwrap();
         let mut st = AdjustState::new();
         adjust(&mut hf, &tables, &hdr, &channel(&tables, None), &env_energy, &noise_energy, &lim, &mut st, true);
         for m in 0..k2 - kx {
@@ -552,7 +552,7 @@ mod tests {
         let env_energy = vec![vec![4.0f64; tables.n_high]];
         let noise_energy = vec![vec![0.0f64; tables.n_q]];
         let hdr = header(1, 1);
-        let lim = limiter_band_table(&tables, &build_patches(&tables), hdr.limiter_bands);
+        let lim = limiter_band_table(&tables, &build_patches(&tables), hdr.limiter_bands).unwrap();
         let mut st = AdjustState::new();
         adjust(&mut hf, &tables, &hdr, &channel(&tables, Some(flags)), &env_energy, &noise_energy, &lim, &mut st, true);
         let mid = ((tables.f_high[1] + tables.f_high[2]) >> 1) as usize - kx;

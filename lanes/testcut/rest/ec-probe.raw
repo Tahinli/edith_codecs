@@ -1,0 +1,68 @@
+{ "type": "suite", "event": "started", "test_count": 10 }
+{ "type": "test", "event": "started", "name": "decoder::tests::opus_layouts_come_off_the_head_or_are_implied" }
+{ "type": "test", "event": "started", "name": "decoder::tests::pcm_reads_every_width_at_full_scale" }
+{ "type": "test", "event": "started", "name": "dts::tests::all_four_sync_forms_state_the_same_core" }
+{ "type": "test", "event": "started", "name": "dts::tests::extension_substream_length_is_read_in_both_header_forms" }
+{ "type": "test", "name": "dts::tests::all_four_sync_forms_state_the_same_core", "event": "ok", "exec_time": 0.000001723 }
+{ "type": "test", "event": "started", "name": "dts::tests::junk_is_not_a_header" }
+{ "type": "test", "name": "decoder::tests::opus_layouts_come_off_the_head_or_are_implied", "event": "ok", "exec_time": 0.000025538 }
+{ "type": "test", "event": "started", "name": "tags::tests::id3_tags_are_read_in_both_versions" }
+{ "type": "test", "name": "dts::tests::extension_substream_length_is_read_in_both_header_forms", "event": "ok", "exec_time": 0.000000992 }
+{ "type": "test", "event": "started", "name": "tags::tests::vorbis_comments_are_case_insensitive_keys" }
+{ "type": "test", "name": "decoder::tests::pcm_reads_every_width_at_full_scale", "event": "ok", "exec_time": 0.000000591 }
+{ "type": "test", "event": "started", "name": "tests::an_id3_tag_does_not_hide_the_format" }
+{ "type": "test", "name": "dts::tests::junk_is_not_a_header", "event": "ok", "exec_time": 0.000000871 }
+{ "type": "test", "event": "started", "name": "tests::duration_converts_initial_padding_out_of_sample_units" }
+{ "type": "test", "name": "tags::tests::id3_tags_are_read_in_both_versions", "event": "ok", "exec_time": 0.000008706 }
+{ "type": "test", "event": "started", "name": "tests::magic_numbers_name_their_formats" }
+{ "type": "test", "name": "tests::an_id3_tag_does_not_hide_the_format", "event": "ok", "exec_time": 0.000013426 }
+{ "type": "test", "name": "tests::magic_numbers_name_their_formats", "event": "ok", "exec_time": 0.000003677 }
+{ "type": "test", "name": "tags::tests::vorbis_comments_are_case_insensitive_keys", "event": "ok", "exec_time": 0.000003907 }
+{ "type": "test", "name": "tests::duration_converts_initial_padding_out_of_sample_units", "event": "ok", "exec_time": 0.000949555 }
+{ "type": "suite", "event": "ok", "passed": 10, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00212818 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "dts_in_wav_pcm_tag_and_2001_tag" }
+{ "type": "test", "event": "started", "name": "plain_pcm_wav_is_still_pcm" }
+{ "type": "test", "event": "started", "name": "raw_dts_little_endian" }
+{ "type": "test", "event": "started", "name": "raw_dts_stereo_and_51" }
+{ "type": "test", "name": "plain_pcm_wav_is_still_pcm", "event": "ok", "exec_time": 0.000303411 }
+{ "type": "test", "name": "raw_dts_little_endian", "event": "ok", "exec_time": 0.162929346 }
+{ "type": "test", "name": "dts_in_wav_pcm_tag_and_2001_tag", "event": "ok", "exec_time": 0.558066538 }
+{ "type": "test", "name": "raw_dts_stereo_and_51", "event": "ok", "exec_time": 0.710392372 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.711372825 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "legacy_audio_decodes_through_the_probe" }
+{ "type": "test", "name": "legacy_audio_decodes_through_the_probe", "event": "ok", "exec_time": 5.784338349 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 5.78483905 }
+{ "type": "suite", "event": "started", "test_count": 7 }
+{ "type": "test", "event": "started", "name": "a_cover_art_tagged_mp3_opens" }
+{ "type": "test", "event": "started", "name": "a_real_library_sweep" }
+{ "type": "test", "event": "started", "name": "a_truehd_track_decodes" }
+{ "type": "test", "event": "started", "name": "avi_ac3_matches_reference_decoder_on_real_sample" }
+{ "type": "test", "name": "avi_ac3_matches_reference_decoder_on_real_sample", "event": "ok", "exec_time": 0.000006011 }
+{ "type": "test", "event": "started", "name": "avi_audio_chunks_end_cleanly_on_real_files" }
+{ "type": "test", "name": "a_real_library_sweep", "event": "ok", "exec_time": 0.000310855 }
+{ "type": "test", "event": "started", "name": "avi_seek_matches_reference_decoder_on_real_files" }
+{ "type": "test", "name": "avi_audio_chunks_end_cleanly_on_real_files", "event": "ok", "exec_time": 0.000006522 }
+{ "type": "test", "event": "started", "name": "avi_seek_matches_reference_decoder_on_synthetic_mp3" }
+{ "type": "test", "name": "a_cover_art_tagged_mp3_opens", "event": "ok", "exec_time": 0.000568669 }
+{ "type": "test", "name": "avi_seek_matches_reference_decoder_on_real_files", "event": "ok", "exec_time": 0.000003847 }
+{ "type": "test", "name": "a_truehd_track_decodes", "event": "ok", "exec_time": 0.000162846 }
+{ "type": "test", "name": "avi_seek_matches_reference_decoder_on_synthetic_mp3", "event": "ok", "exec_time": 0.955404486 }
+{ "type": "suite", "event": "ok", "passed": 7, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.956574956 }
+{ "type": "suite", "event": "started", "test_count": 6 }
+{ "type": "test", "event": "started", "name": "a_hundred_random_seeks_land_where_they_say" }
+{ "type": "test", "event": "started", "name": "a_mislabelled_file_opens_as_what_it_is" }
+{ "type": "test", "event": "started", "name": "cover_art_is_never_a_video_track" }
+{ "type": "test", "event": "started", "name": "every_fixture_probes_decodes_and_counts" }
+{ "type": "test", "name": "cover_art_is_never_a_video_track", "event": "ok", "exec_time": 0.000245072 }
+{ "type": "test", "event": "started", "name": "id3_tags_come_off_a_real_file" }
+{ "type": "test", "name": "a_mislabelled_file_opens_as_what_it_is", "event": "ok", "exec_time": 0.000307769 }
+{ "type": "test", "event": "started", "name": "the_head_of_a_file_is_exact" }
+{ "type": "test", "name": "id3_tags_come_off_a_real_file", "event": "ok", "exec_time": 0.000106981 }
+{ "type": "test", "name": "the_head_of_a_file_is_exact", "event": "ok", "exec_time": 0.329863439 }
+{ "type": "test", "name": "a_hundred_random_seeks_land_where_they_say", "event": "ok", "exec_time": 1.245568052 }
+{ "type": "test", "name": "every_fixture_probes_decodes_and_counts", "event": "ok", "exec_time": 8.426184302 }
+{ "type": "suite", "event": "ok", "passed": 6, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 8.427002901 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000039466 }

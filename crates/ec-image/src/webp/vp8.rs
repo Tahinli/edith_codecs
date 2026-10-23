@@ -655,14 +655,18 @@ fn inverse_wht(input: &[i16; 16], coeffs: &mut [[i16; 16]; 25]) {
     }
 }
 
-const COS_PI8_SQRT2_MINUS1: i32 = 20091;
-const SIN_PI8_SQRT2: i32 = 35468;
+const COS_PI8_SQRT2_MINUS1: i64 = 20091;
+const SIN_PI8_SQRT2: i64 = 35468;
 
 /// The 4x4 inverse DCT of RFC 6386 section 14.4, bit-exact as specified.
+///
+/// The arithmetic runs in i64: a hostile block's coefficients can push the second
+/// pass past i32, and a valid stream never gets near that range, so the result on
+/// every valid block is unchanged.
 fn inverse_dct(block: &[i16; 16]) -> [i32; 16] {
-    let mut tmp = [0i32; 16];
+    let mut tmp = [0i64; 16];
     for i in 0..4 {
-        let ip = |k: usize| i32::from(block[k * 4 + i]);
+        let ip = |k: usize| i64::from(block[k * 4 + i]);
         let a1 = ip(0) + ip(2);
         let b1 = ip(0) - ip(2);
         let t1 = (ip(1) * SIN_PI8_SQRT2) >> 16;
@@ -676,7 +680,7 @@ fn inverse_dct(block: &[i16; 16]) -> [i32; 16] {
         tmp[4 + i] = b1 + c1;
         tmp[8 + i] = b1 - c1;
     }
-    let mut out = [0i32; 16];
+    let mut out = [0i64; 16];
     for i in 0..4 {
         let ip = |k: usize| tmp[i * 4 + k];
         let a1 = ip(0) + ip(2);
@@ -692,7 +696,8 @@ fn inverse_dct(block: &[i16; 16]) -> [i32; 16] {
         out[i * 4 + 1] = (b1 + c1 + 4) >> 3;
         out[i * 4 + 2] = (b1 - c1 + 4) >> 3;
     }
-    out
+    // Every residue a valid stream produces fits in i32 after the shift.
+    out.map(|v| v as i32)
 }
 
 /// The macroblock's working buffer: one row of "above" pixels (with the four

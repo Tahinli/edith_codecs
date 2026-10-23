@@ -18,6 +18,8 @@ rustfft = { version = "6", optional = true, default-features = false }
 [dev-dependencies]
 ec-dsp.workspace = true
 ec-ogg.workspace = true
+cpu-time = "1.0.0"
+tracking-allocator = "0.4.0"
 
 [features]
 default = ["fft-rustfft"]

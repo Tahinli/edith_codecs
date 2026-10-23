@@ -16,7 +16,10 @@ use ec_opus::Decoder;
 // counted, so parallel tests (and ffmpeg child plumbing) allocate freely.
 // ---------------------------------------------------------------------------
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::System;
+use std::sync::Once;
+
+use tracking_allocator::{AllocationGroupId, AllocationRegistry, AllocationTracker, Allocator};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,26 +35,34 @@ fn counting_here() -> bool {
     COUNTING_HERE.try_with(Cell::get).unwrap_or(false)
 }
 
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+impl AllocationTracker for CountingAlloc {
+    fn allocated(&self, _addr: usize, _object_size: usize, _wrapped: usize, _g: AllocationGroupId) {
         if counting_here() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
         }
-        unsafe { System.alloc(layout) }
     }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if counting_here() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(ptr, layout, new_size) }
+    fn deallocated(
+        &self,
+        _addr: usize,
+        _object_size: usize,
+        _wrapped: usize,
+        _source: AllocationGroupId,
+        _current: AllocationGroupId,
+    ) {
     }
 }
 
 #[global_allocator]
-static A: CountingAlloc = CountingAlloc;
+static A: Allocator<System> = Allocator::system();
+
+/// Installs the tracker once; every test that arms the counter calls this first.
+fn install_counter() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = AllocationRegistry::set_global_tracker(CountingAlloc);
+        AllocationRegistry::enable_tracking();
+    });
+}
 
 /// One packet of an `opus_demo` test vector file.
 struct VectorPacket {
@@ -90,15 +101,26 @@ fn vectors_dir() -> PathBuf {
 /// Decodes a vector at 48 kHz stereo, returning the samples and how many
 /// packets ended with the reference range state.
 fn decode_vector(packets: &[VectorPacket]) -> (Vec<f32>, usize, usize) {
-    let mut dec = Decoder::new(48000, 2).unwrap();
+    decode_vector_ch(packets, 2, true)
+}
+
+/// Decodes a vector at 48 kHz with `channels` output channels (1 or 2), with the
+/// RFC 6716 reconstruction when `legacy` and the RFC 8251 one otherwise.
+fn decode_vector_ch(
+    packets: &[VectorPacket],
+    channels: usize,
+    legacy: bool,
+) -> (Vec<f32>, usize, usize) {
+    let mut dec = Decoder::new(48000, channels).unwrap();
+    dec.set_legacy_rfc6716(legacy);
     let mut pcm = Vec::new();
-    let mut buf = vec![0.0f32; 5760 * 2];
+    let mut buf = vec![0.0f32; 5760 * channels];
     let mut matched = 0;
     let mut decoded = 0;
     for p in packets {
         match dec.decode_float(&p.payload, &mut buf) {
             Ok(n) => {
-                pcm.extend_from_slice(&buf[..n * 2]);
+                pcm.extend_from_slice(&buf[..n * channels]);
                 decoded += 1;
                 if dec.final_range() == p.final_range {
                     matched += 1;
@@ -386,9 +408,72 @@ fn to_i16(pcm: &[f32]) -> Vec<i16> {
 
 fn read_i16(path: &Path) -> Vec<i16> {
     let d = fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    d.chunks_exact(2)
+    d.as_chunks::<2>().0.iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect()
+}
+
+/// The RFC 8251 updated vectors (`opus_newvectors`), fetched by
+/// `scripts/fetch-vectors.sh opus-rfc8251`. Each `testvectorNN.bit` has two
+/// stereo references: `testvectorNN.dec` (with the CELT 180-degree phase shift
+/// of RFC 8251 Section 10) and `testvectorNNm.dec` (without it). An
+/// implementation is compliant when it matches either set.
+fn vectors_dir_8251() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/vectors/opus-rfc8251/opus_newvectors")
+}
+
+/// Runs one RFC 8251 vector (stereo) against one of its reference files. Returns
+/// `(range-exact, decoded packets, quality %)`; the caller decides what passes.
+fn run_rfc8251(name: &str, reference: &str) -> (usize, usize, f64) {
+    let dir = vectors_dir_8251();
+    let bit = dir.join(format!("{name}.bit"));
+    if !bit.exists() {
+        assert!(
+            std::env::var_os("EC_REQUIRE_FIXTURES").is_none(),
+            "RFC 8251 test vector {name} missing at {} — run scripts/fetch-vectors.sh opus-rfc8251",
+            bit.display()
+        );
+        eprintln!("SKIP RFC 8251 test vector {name} missing at {}", bit.display());
+        return (0, 0, f64::NAN);
+    }
+    let packets = read_vector(&bit);
+    let (pcm, matched, decoded) = decode_vector_ch(&packets, 2, false);
+    let refs = read_i16(&dir.join(reference));
+    let mine = to_i16(&pcm);
+    assert_eq!(
+        refs.len(),
+        mine.len(),
+        "{reference}: decoded {} samples, reference has {}",
+        mine.len(),
+        refs.len()
+    );
+    let identical = refs.iter().zip(&mine).filter(|(a, b)| a == b).count();
+    let quality = opus_compare(&refs, &mine, 2);
+    println!(
+        "{reference}: {matched}/{decoded} packets range-exact, {:.4} % samples identical, quality {quality:.2} %",
+        100.0 * identical as f64 / refs.len() as f64
+    );
+    (matched, decoded, quality)
+}
+
+/// RFC 8251 Section 11: "An implementation is compliant as long as it passes
+/// either set of vectors." A set passes when every vector in it has all packets
+/// range-exact and quality >= 0. The `.dec` set (with the CELT 180-degree phase
+/// shift) and the `m` set (without it) are both run and both reported.
+#[test]
+fn rfc8251_test_vectors() {
+    let _timing = timing_shared();
+    let mut dec_ok = true;
+    let mut m_ok = true;
+    for name in VECTORS {
+        let (dm, dd, dq) = run_rfc8251(name, &format!("{name}.dec"));
+        let (mm, md, mq) = run_rfc8251(name, &format!("{name}m.dec"));
+        dec_ok &= dm == dd && dq >= 0.0;
+        m_ok &= mm == md && mq >= 0.0;
+    }
+    println!("RFC 8251 set `.dec` passes: {dec_ok}; set `m` passes: {m_ok}");
+    assert!(dec_ok || m_ok, "neither RFC 8251 set passes (see the per-vector lines above)");
 }
 
 /// Every vector in the RFC 6716 suite, in the order the RFC lists them.
@@ -412,6 +497,7 @@ const VECTORS: [&str; 12] = [
 /// MUST stay within the `opus_compare` threshold (quality >= 0).
 #[test]
 fn rfc6716_test_vectors() {
+    let _timing = timing_shared();
     // A missing test vector made this gate skip GREEN having decoded nothing —
     // the "gate skips on its own failure" class. The root `fixtures/` tree is
     // gitignored, so `git worktree add` hands every lane worktree a tree without
@@ -569,7 +655,7 @@ fn ffmpeg_decode(path: &Path, channels: usize) -> Option<Vec<f32>> {
     }
     Some(
         out.stdout
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
@@ -623,6 +709,7 @@ fn tone_power(x: &[f32], channels: usize, ch: usize, freq: f64) -> f64 {
 
 #[test]
 fn ogg_opus_fixtures_match_ffmpeg() {
+    let _timing = timing_shared();
     // Mapping family 1 puts 5.1 in Vorbis order; ffmpeg hands its own order
     // back, so the comparison permutes one into the other.
     const VORBIS_TO_FFMPEG_5_1: [usize; 6] = [0, 2, 1, 4, 5, 3];
@@ -666,6 +753,7 @@ fn ogg_opus_fixtures_match_ffmpeg() {
 
 #[test]
 fn five_one_channels_land_in_the_right_places() {
+    let _timing = timing_shared();
     // The fixture carries one distinct sine per channel, so a channel-order
     // bug shows up as a channel playing the wrong tone. The tones themselves
     // come from the reference decode rather than from an assumption about how
@@ -708,8 +796,55 @@ fn five_one_channels_land_in_the_right_places() {
     }
 }
 
+/// Every speed-floor test takes this exclusively and every other test in this
+/// binary takes it shared, so a floor is never measured while another
+/// conformance test is loading the same host.
+static TIMING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn timing_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    TIMING.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn timing_exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+    TIMING.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Seconds of CPU time consumed by the calling thread, or `None` where the
+/// clock is unavailable. Used by the speed floors: a loaded host that
+/// deschedules the test thread (or runs the other conformance tests beside it)
+/// must not count against the floor, so the floors measure work, not wall time.
+fn thread_cpu_secs() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(t) = cpu_time::ThreadTime::try_now() {
+            return Some(t.as_duration().as_secs_f64());
+        }
+    }
+    None
+}
+
+/// Time one run of `f`: thread CPU time where available, wall time elsewhere.
+fn timed_once<F: FnMut()>(f: &mut F) -> f64 {
+    let cpu0 = thread_cpu_secs();
+    let wall = std::time::Instant::now();
+    f();
+    match (cpu0, thread_cpu_secs()) {
+        (Some(a), Some(b)) => b - a,
+        _ => wall.elapsed().as_secs_f64(),
+    }
+}
+
+/// Best of three runs. The fastest run is the one least disturbed by the host,
+/// which is the usual benchmark practice for a throughput floor.
+fn best_of_3<F: FnMut()>(mut f: F) -> f64 {
+    (0..3)
+        .map(|_| timed_once(&mut f))
+        .fold(f64::INFINITY, f64::min)
+}
+
 #[test]
 fn decode_speed() {
+    let _timing = timing_exclusive();
     if cfg!(debug_assertions) {
         eprintln!("decode speed is only meaningful in release; skipped");
         return;
@@ -735,14 +870,14 @@ fn decode_speed() {
             samples += dec.decode_float(p, &mut out).unwrap();
         }
         let passes = 20;
-        let start = std::time::Instant::now();
-        for _ in 0..passes {
-            dec.reset();
-            for p in &audio {
-                dec.decode_float(p, &mut out).unwrap();
+        let elapsed = best_of_3(|| {
+            for _ in 0..passes {
+                dec.reset();
+                for p in &audio {
+                    dec.decode_float(p, &mut out).unwrap();
+                }
             }
-        }
-        let elapsed = start.elapsed().as_secs_f64();
+        });
         let audio_secs = (samples * passes) as f64 / 48000.0;
         let realtime = audio_secs / elapsed;
         println!(
@@ -760,14 +895,15 @@ fn decode_speed() {
     let path = vectors_dir().join("testvector01.bit");
     if path.exists() {
         let packets = read_vector(&path);
-        let mut dec = Decoder::new(48000, 2).unwrap();
         let mut out = vec![0.0f32; 5760 * 2];
         let mut samples = 0usize;
-        let start = std::time::Instant::now();
-        for p in &packets {
-            samples += dec.decode_float(&p.payload, &mut out).unwrap();
-        }
-        let elapsed = start.elapsed().as_secs_f64();
+        let elapsed = best_of_3(|| {
+            let mut dec = Decoder::new(48000, 2).unwrap();
+            samples = 0;
+            for p in &packets {
+                samples += dec.decode_float(&p.payload, &mut out).unwrap();
+            }
+        });
         let realtime = samples as f64 / 48000.0 / elapsed;
         println!("testvector01 (stereo music): {realtime:.0}x realtime");
         assert!(realtime >= 135.0, "stereo music decodes at {realtime:.0}x");
@@ -777,6 +913,7 @@ fn decode_speed() {
 #[test]
 #[ignore = "probe: report harness with no asserts; unblocks by setting EC_OPUS_FILES to committed .opus fixtures -- unset, it decodes nothing"]
 fn real_library_sweep() {
+    let _timing = timing_shared();
     // Files named on the command line (EC_OPUS_FILES=a.opus:b.opus), decoded
     // and compared against libopus channel by channel, with the decode speed.
     let files = std::env::var("EC_OPUS_FILES").unwrap_or_default();
@@ -909,6 +1046,7 @@ fn delayed_corr(source: &[f32], decoded: &[f32], channels: usize, delay: usize) 
 /// the world (the incumbent's exact disease).
 #[test]
 fn encoder_roundtrips_at_every_rate() {
+    let _timing = timing_shared();
     for channels in [1usize, 2] {
         let pcm = test_signal(channels, 2.0);
         for kbps in [32u32, 64, 96, 128, 160, 165, 192, 256, 320, 510] {
@@ -934,6 +1072,7 @@ fn encoder_roundtrips_at_every_rate() {
 /// It ships off; the gate tables that rejected it are at the setter.
 #[test]
 fn libopus_input_alignment_delays_and_still_decodes() {
+    let _timing = timing_shared();
     let pcm = test_signal(2, 1.0);
     let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
     enc.set_bitrate(128_000);
@@ -956,6 +1095,7 @@ fn libopus_input_alignment_delays_and_still_decodes() {
 // voice/music bandwidth tables blended by voice_est) since lane opus-mode;
 // matched against ffmpeg libopus on real speech in lanes/opus-mode-r1.sweep.txt.
 fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
+    let _timing = timing_shared();
     #[derive(Clone, Copy, Debug)]
     struct Case {
         app: Application,
@@ -1311,6 +1451,7 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
 /// stays decodable and lands near its target.
 #[test]
 fn encoder_frame_sizes_and_vbr() {
+    let _timing = timing_shared();
     let pcm = test_signal(2, 1.0);
     for frame in [120usize, 240, 480, 960] {
         let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
@@ -1438,6 +1579,7 @@ fn temp_path(name: &str) -> PathBuf {
 /// bars here are correlation >= 0.9 at 96/165/256 kbps.
 #[test]
 fn oracle_decodes_our_packets_across_the_rate_table() {
+    let _timing = timing_shared();
     for channels in [1usize, 2] {
         let pcm = test_signal(channels, 2.0);
         let total = pcm.len() / channels;
@@ -1553,6 +1695,7 @@ fn oracle_decodes_our_packets_across_the_rate_table() {
 /// back in its place (order-preserved) at correlation >= 0.9.
 #[test]
 fn five_one_encode_end_to_end() {
+    let _timing = timing_shared();
     const VORBIS_TO_FFMPEG_5_1: [usize; 6] = [0, 2, 1, 4, 5, 3];
     const TONES: [f64; 6] = [220.0, 440.0, 660.0, 55.0, 880.0, 1320.0];
     let total = 96000usize;
@@ -1571,7 +1714,7 @@ fn five_one_encode_end_to_end() {
     enc.set_bitrate(384_000);
     let mut out = vec![0u8; 8 * 1500];
     let mut packets = Vec::new();
-    for block in pcm.chunks_exact(960 * 6) {
+    for block in pcm.as_chunks::<{ 960 * 6 }>().0 {
         let len = enc.encode_float(block, 960, &mut out).expect("encode");
         packets.push(out[..len].to_vec());
     }
@@ -1608,6 +1751,7 @@ fn five_one_encode_end_to_end() {
 /// libopus hands back is exactly the input length.
 #[test]
 fn ogg_opus_round_trip_duration_is_exact() {
+    let _timing = timing_shared();
     let pcm = test_signal(2, 2.0);
     let total = pcm.len() / 2;
     let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
@@ -1670,6 +1814,7 @@ fn ogg_opus_round_trip_duration_is_exact() {
 /// `EC_OPUS_DEMO=/path/to/opus_demo cargo test`.
 #[test]
 fn opus_demo_decodes_our_bit_stream() {
+    let _timing = timing_shared();
     let Ok(demo) = std::env::var("EC_OPUS_DEMO") else {
         eprintln!("EC_OPUS_DEMO unset, skipped");
         return;
@@ -1679,7 +1824,7 @@ fn opus_demo_decodes_our_bit_stream() {
     enc.set_bitrate(256_000);
     let mut out = vec![0u8; 1500];
     let mut bit = Vec::new();
-    for block in pcm.chunks_exact(960 * 2) {
+    for block in pcm.as_chunks::<{ 960 * 2 }>().0 {
         let len = enc.encode_float(block, 960, &mut out).expect("encode");
         bit.extend_from_slice(&(len as u32).to_be_bytes());
         bit.extend_from_slice(&enc.final_range().to_be_bytes());
@@ -1724,6 +1869,8 @@ fn opus_demo_decodes_our_bit_stream() {
 /// encoder).
 #[test]
 fn steady_state_encode_loop_zero_alloc() {
+    install_counter();
+    let _timing = timing_shared();
     let pcm = test_signal(2, 0.5);
     let pcm6 = {
         let mono = test_signal(1, 0.5);
@@ -1739,12 +1886,12 @@ fn steady_state_encode_loop_zero_alloc() {
     let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
     enc.set_bitrate(256_000);
     let mut out = vec![0u8; 1500];
-    for block in pcm.chunks_exact(960 * 2) {
+    for block in pcm.as_chunks::<{ 960 * 2 }>().0 {
         enc.encode_float(block, 960, &mut out).unwrap();
     }
     ALLOCS.store(0, Ordering::SeqCst);
     COUNTING_HERE.with(|c| c.set(true));
-    for block in pcm.chunks_exact(960 * 2) {
+    for block in pcm.as_chunks::<{ 960 * 2 }>().0 {
         enc.encode_float(block, 960, &mut out).unwrap();
     }
     COUNTING_HERE.with(|c| c.set(false));
@@ -1755,12 +1902,12 @@ fn steady_state_encode_loop_zero_alloc() {
     let mut ms = MultistreamEncoder::surround_5_1(48000).unwrap();
     ms.set_bitrate(384_000);
     let mut out6 = vec![0u8; 8 * 1500];
-    for block in pcm6.chunks_exact(960 * 6) {
+    for block in pcm6.as_chunks::<{ 960 * 6 }>().0 {
         ms.encode_float(block, 960, &mut out6).unwrap();
     }
     ALLOCS.store(0, Ordering::SeqCst);
     COUNTING_HERE.with(|c| c.set(true));
-    for block in pcm6.chunks_exact(960 * 6) {
+    for block in pcm6.as_chunks::<{ 960 * 6 }>().0 {
         ms.encode_float(block, 960, &mut out6).unwrap();
     }
     COUNTING_HERE.with(|c| c.set(false));
@@ -1780,6 +1927,7 @@ fn steady_state_encode_loop_zero_alloc() {
 /// O(n^2), a debug path left on), not machine variance.
 #[test]
 fn encode_speed() {
+    let _timing = timing_exclusive();
     if cfg!(debug_assertions) {
         eprintln!("encode speed is only meaningful in release; skipped");
         return;
@@ -1800,13 +1948,13 @@ fn encode_speed() {
             enc.encode_float(block, 960, &mut out).unwrap();
         }
         let passes = 4;
-        let start = std::time::Instant::now();
-        for _ in 0..passes {
-            for block in pcm.chunks_exact(960 * channels) {
-                enc.encode_float(block, 960, &mut out).unwrap();
+        let elapsed = best_of_3(|| {
+            for _ in 0..passes {
+                for block in pcm.chunks_exact(960 * channels) {
+                    enc.encode_float(block, 960, &mut out).unwrap();
+                }
             }
-        }
-        let elapsed = start.elapsed().as_secs_f64();
+        });
         let realtime = secs * passes as f64 / elapsed;
         println!("{name}: {realtime:.0}x realtime");
         assert!(
@@ -1825,17 +1973,17 @@ fn encode_speed() {
     let mut ms = MultistreamEncoder::surround_5_1(48000).unwrap();
     ms.set_bitrate(384_000);
     let mut out = vec![0u8; 8 * 1500];
-    for block in pcm6.chunks_exact(960 * 6) {
+    for block in pcm6.as_chunks::<{ 960 * 6 }>().0 {
         ms.encode_float(block, 960, &mut out).unwrap();
     }
     let passes = 4;
-    let start = std::time::Instant::now();
-    for _ in 0..passes {
-        for block in pcm6.chunks_exact(960 * 6) {
-            ms.encode_float(block, 960, &mut out).unwrap();
+    let elapsed = best_of_3(|| {
+        for _ in 0..passes {
+            for block in pcm6.as_chunks::<{ 960 * 6 }>().0 {
+                ms.encode_float(block, 960, &mut out).unwrap();
+            }
         }
-    }
-    let elapsed = start.elapsed().as_secs_f64();
+    });
     let realtime = secs * passes as f64 / elapsed;
     println!("5.1 384k: {realtime:.0}x realtime");
     assert!(realtime >= 25.0, "5.1: {realtime:.0}x is below 25x");
@@ -1846,6 +1994,7 @@ fn encode_speed() {
 /// TOC bytes at random payloads to make sure every mode is actually entered.
 #[test]
 fn garbage_payloads_never_panic() {
+    let _timing = timing_shared();
     let mut state = 0x12345678u32;
     let mut rand = move || {
         state ^= state << 13;
@@ -1935,7 +2084,7 @@ fn read_wav_mono(path: &Path) -> Vec<f32> {
         let len = u32::from_le_bytes([d[pos + 4], d[pos + 5], d[pos + 6], d[pos + 7]]) as usize;
         if id == b"data" {
             return d[pos + 8..pos + 8 + len]
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
                 .collect();
         }
@@ -2058,6 +2207,7 @@ fn aligned_corr(reference: &[f32], decoded: &[f32], max_lag: usize) -> (f64, usi
 
 #[test]
 fn silk_mono_nb_wb_roundtrip() {
+    let _timing = timing_shared();
     let wav = fixture("wav16-mono-48000.wav");
     let mut sources = vec![("synthetic", speech_like())];
     if wav.exists() {
@@ -2109,6 +2259,7 @@ fn silk_mono_nb_wb_roundtrip() {
 
 #[test]
 fn silk_mediumband_and_10ms_roundtrip() {
+    let _timing = timing_shared();
     let pcm = speech_like();
     for (tag, fs_khz, frame_ms, config, cutoff, bps, floor) in [
         ("NB10", 8usize, 10usize, 0u8, 3500.0, 12_000u32, 0.89f64),
@@ -2145,6 +2296,7 @@ fn silk_mediumband_and_10ms_roundtrip() {
 
 #[test]
 fn silk_multiframe_packets_roundtrip() {
+    let _timing = timing_shared();
     let full = speech_like();
     let pcm = &full[..46_080];
     for (tag, enc, frame_ms, config, cutoff, bps, floor) in [
@@ -2233,6 +2385,7 @@ fn aligned_channel_corr(reference: &[f32], decoded: &[f32], channels: usize, ch:
 
 #[test]
 fn silk_stereo_speech_roundtrip() {
+    let _timing = timing_shared();
     let pcm = stereo_speech_pair();
     let total = pcm.len() / 2;
     for (tag, bandwidth, per_channel_bps, cutoff, frame, config, code, frames) in [
@@ -2256,7 +2409,7 @@ fn silk_stereo_speech_roundtrip() {
         let mono_frame_ms = frame_ms.min(20);
         let mut mono_floor = [0.0f64; 2];
         for ch in 0..2 {
-            let mono: Vec<f32> = pcm.chunks_exact(2).map(|f| f[ch]).collect();
+            let mono: Vec<f32> = pcm.as_chunks::<2>().0.iter().map(|f| f[ch]).collect();
             let silk = match bandwidth {
                 Bandwidth::Narrow => SilkEncoder::new(false),
                 Bandwidth::Medium => SilkEncoder::new_mediumband(),
@@ -2296,7 +2449,7 @@ fn silk_stereo_speech_roundtrip() {
         let bytes: usize = packets.iter().map(Vec::len).sum();
         let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * frame_ms as f64);
         for ch in 0..2 {
-            let source: Vec<f32> = pcm.chunks_exact(2).map(|f| f[ch]).collect();
+            let source: Vec<f32> = pcm.as_chunks::<2>().0.iter().map(|f| f[ch]).collect();
             let reference = lowpass(&source, cutoff);
             let corr = aligned_channel_corr(&reference, &decoded, 2, ch);
             eprintln!(
@@ -2349,6 +2502,7 @@ fn silk_stereo_speech_roundtrip() {
 }
 #[test]
 fn silk_compares_to_celt_on_speech_at_speech_rates() {
+    let _timing = timing_shared();
     let pcm = speech_like();
     for (tag, silk, bandwidth, bps, cutoff) in [
         (
@@ -2445,6 +2599,7 @@ fn silk_sources() -> Vec<(&'static str, Vec<f32>)> {
 /// the open-loop writer's quality at 27-50 kbps.
 #[test]
 fn silk_nsq_improves_quality_at_equal_rate() {
+    let _timing = timing_shared();
     let mut failures = Vec::new();
     for (name, pcm) in &silk_sources() {
         let (decoded, packets, _, _) = silk_roundtrip(pcm, true, Some(16000));
@@ -2472,6 +2627,7 @@ fn silk_nsq_improves_quality_at_equal_rate() {
 /// `set_bitrate` lands the coded rate within 20% of 8/12/16/24 kbps.
 #[test]
 fn silk_rate_control_tracks_target() {
+    let _timing = timing_shared();
     for (name, pcm) in &silk_sources() {
         for wideband in [false, true] {
             for kbps_target in [8u32, 12, 16, 24] {
@@ -2500,6 +2656,7 @@ fn silk_rate_control_tracks_target() {
 /// directly against `SilkEncoder`.
 #[test]
 fn silk_packets_track_encoder_bitrate() {
+    let _timing = timing_shared();
     let pcm = test_signal(1, 2.0);
     for kbps_target in [8u32, 12, 16] {
         let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
@@ -2567,6 +2724,7 @@ fn hybrid_delay(bps: u32) -> usize {
 
 #[test]
 fn hybrid_layers_align() {
+    let _timing = timing_shared();
     let mut click = vec![0f32; 48000];
     // Well inside the stream so both layers' predictors are running.
     let at = 960 * 10 + 300;
@@ -2605,6 +2763,7 @@ fn hybrid_layers_align() {
 /// [`Encoder::look_ahead`] of that same configuration, never a constant.
 #[test]
 fn hybrid_fb_roundtrip() {
+    let _timing = timing_shared();
     for (name, pcm) in silk_sources() {
         let (decoded, packets) = hybrid_roundtrip(&pcm, 32_000, None, (false, false));
         let toc = ec_opus::Toc::new(packets[0][0]);
@@ -2696,6 +2855,7 @@ fn hybrid_roundtrip_shape(
 
 #[test]
 fn hybrid_shapes_roundtrip() {
+    let _timing = timing_shared();
     for (tag, channels, frame, bps, bandwidth, config, floor) in [
         (
             "mono-swb10",
@@ -2802,10 +2962,10 @@ fn hybrid_shapes_roundtrip() {
 
 /// Expand a leading `~` to the home directory (the std `Path` API cannot).
 fn shellexpand(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(p)
 }
@@ -2838,7 +2998,7 @@ fn ffmpeg_decode_pcm(path: &Path, secs: f64) -> Vec<f32> {
         String::from_utf8_lossy(&out.stderr)
     );
     out.stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
@@ -3003,6 +3163,7 @@ fn per_second_corr(source: &[f32], decoded: &[f32], channels: usize) -> (f64, u3
 #[test]
 #[ignore = "probe: per-second correlation dump for the 64k lane; unblocks when ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists)"]
 fn reelm64_persecond_diag() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0;
     const FRAME: usize = 960; // 20 ms
     const CHANNELS: usize = 2;
@@ -3177,6 +3338,8 @@ fn reelm64_persecond_diag() {
         let f0 = s * frames_per_sec;
         let f1 = ((s + 1) * frames_per_sec).min(diags.len());
         out_str.push_str(&format!("# second {} gap={:+.4}\n", s, g));
+        // Index loop kept: the index also drives other lookups or parallel arrays.
+        #[allow(clippy::needless_range_loop)]
         for fi in f0..f1.min(diags.len()) {
             let d = &diags[fi];
             let b_ref = ref_payload.get(fi).copied().unwrap_or(0);
@@ -3262,6 +3425,7 @@ fn reelm64_persecond_diag() {
 #[test]
 #[ignore = "library gate: hand-run 14-row sweep, 120s per source, needs ffmpeg libopus and the local ~/Music corpus (~12 min); the reelm@64k dropout that first failed it is fixed per lanes/opus-drop-r2.report.md, so only the corpus dependency keeps it out of the default suite"]
 fn encoder_library_gate_vs_libopus() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0; // 2 min cap; full 600s made the 14-row sweep infeasible
     const FRAME: usize = 960; // 20 ms at 48 kHz
     const CHANNELS: usize = 2;
@@ -3481,7 +3645,7 @@ fn ffmpeg_decode_pcm_mono(path: &Path, secs: f64) -> Vec<f32> {
         String::from_utf8_lossy(&out.stderr)
     );
     out.stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
@@ -3574,6 +3738,7 @@ fn first_audio_toc(ogg: &[u8]) -> u8 {
 #[test]
 #[ignore = "library gate: hand-run mono VoIP sweep; blocked until ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists) and it is a multi-minute ffmpeg run, not a suite test"]
 fn silk_library_gate_vs_libopus() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0; // 2 min cap
     const FRAME: usize = 960; // 20 ms at 48 kHz
     const CHANNELS: usize = 1; // MONO
@@ -3597,7 +3762,8 @@ fn silk_library_gate_vs_libopus() {
     // (label, kbps, forced bandwidth, forced mode, reference lowpass cutoff).
     // cutoff: NB 4 kHz, WB 8 kHz, hybrid-FB unfiltered (None) — compare each
     // encoder only against the band it can actually reproduce.
-    let rows: &[(&str, u32, Option<Bandwidth>, Option<Mode>, Option<f64>)] = &[
+    type Row = (&'static str, u32, Option<Bandwidth>, Option<Mode>, Option<f64>);
+    let rows: &[Row] = &[
         // All rows auto since lane opus-mode: the selector is libopus's, so
         // the mode must match the reference's (asserted below) and the
         // comparison is full-band (no lowpass).
@@ -3813,6 +3979,7 @@ fn silk_library_gate_vs_libopus() {
 #[test]
 #[ignore = "probe: per-second SILK 12k bit-allocation dump; unblocks when ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists)"]
 fn silk_silkq_persecond_diag() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0;
     const FRAME: usize = 960; // 20 ms at 48 kHz
     const CHANNELS: usize = 1; // MONO
@@ -4008,6 +4175,8 @@ fn silk_silkq_persecond_diag() {
         let f0 = s * frames_per_sec;
         let f1 = ((s + 1) * frames_per_sec).min(diags.len());
         out_str.push_str(&format!("# second {} gap={:+.4}\n", s, g));
+        // Index loop kept: the index also drives other lookups or parallel arrays.
+        #[allow(clippy::needless_range_loop)]
         for fi in f0..f1.min(diags.len()) {
             let d = &diags[fi];
             let b_ref = ref_payload.get(fi).copied().unwrap_or(0);
@@ -4085,6 +4254,7 @@ fn silk_silkq_persecond_diag() {
 #[test]
 #[ignore = "probe: per-frame SILK Indices side-by-side oracle dump; unblocks when ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists)"]
 fn silk_silkq_oracle() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0;
     const FRAME: usize = 960; // 20 ms at 48 kHz
     const CHANNELS: usize = 1;
@@ -4367,6 +4537,7 @@ fn collect_indices(packets: &[Vec<u8>]) -> Vec<(ec_opus::SilkDecIndices, usize)>
 #[test]
 #[ignore = "probe: per-band spectral divergence dump at 12k; unblocks when ~/Music/reelm.wav is back in the corpus (hard-asserts src.exists)"]
 fn silk_spectral_divergence_12k() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0;
     const FRAME: usize = 960; // 20 ms at 48 kHz
     const CHANNELS: usize = 1;
@@ -4645,6 +4816,8 @@ fn silk_spectral_divergence_12k() {
     // starved packet (<= 20 bytes) line up with the packet's mean ef2?
     let mut pkt_ef2 = vec![0.0f64; ours_packets.len()];
     let mut pkt_cnt = vec![0u32; ours_packets.len()];
+    // Index loop kept: the index also drives other lookups or parallel arrays.
+    #[allow(clippy::needless_range_loop)]
     for xi in 0..nframes {
         let p = pkt_of(xi).min(pkt_ef2.len() - 1);
         pkt_ef2[p] += ef2_o[xi];
@@ -4723,6 +4896,7 @@ fn silk_spectral_divergence_12k() {
 #[test]
 #[ignore = "probe: needs hand-supplied SW_REF/SW_TEST .sw files to cross-check our opus_compare against the C tool; asserts nothing without those env vars"]
 fn opus_compare_harness() {
+    let _timing = timing_shared();
     let ref_path = std::env::var("SW_REF").expect("SW_REF");
     let test_path = std::env::var("SW_TEST").expect("SW_TEST");
     let channels: usize = std::env::var("SW_CH")
@@ -4759,6 +4933,7 @@ fn opus_compare_harness() {
 #[test]
 #[ignore = "probe: needs hand-supplied SW_SRC/SW_KBPS/SW_OUT_SRC/SW_OUT_DEC to round-trip a .sw through our encoder; only writes .sw dumps, asserts nothing"]
 fn opus_compare_harness_ours() {
+    let _timing = timing_shared();
     let src_path = std::env::var("SW_SRC").expect("SW_SRC");
     let kbps: u32 = std::env::var("SW_KBPS")
         .ok()
@@ -4816,11 +4991,13 @@ fn bytemap(p: &[i16]) -> Vec<u8> {
 /// any particular codec. Two cases:
 ///   * identical signals  -> C err=0.000000, Q=100.0 (exact)
 ///   * mild perturbation   -> C err=4.444987, Q=-593.31 (exact to 6 dp)
+///
 /// The perturbation case sits in the practical error range (same band as the
 /// real-audio validation pairs); the identical case pins the zero-error path
 /// with no floating-point tolerance. No audio files or external tools needed.
 #[test]
 fn opus_compare_err_pinned_against_c() {
+    let _timing = timing_shared();
     const N: usize = 48000 * 4; // 4 s per channel
     let t: Vec<f64> = (0..N).map(|i| i as f64 / 48000.0).collect();
 
@@ -4902,6 +5079,7 @@ const CELT_EBANDS: [usize; NBANDS + 1] = [
 #[test]
 #[ignore = "probe: per-window CELT band divergence sweep over the local corpus; a multi-minute ffmpeg report run, not a suite gate"]
 fn spectral_divergence_vs_libopus() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0;
     const FRAME: usize = 960;
     const CHANNELS: usize = 2;
@@ -5343,6 +5521,7 @@ fn spectral_divergence_vs_libopus() {
 /// peak exceeds 4x the input peak in any frame.
 #[test]
 fn celt_silence_then_attack_decodes_bounded() {
+    let _timing = timing_shared();
     let fs = 960usize;
     let ch = 2usize;
     let src = shellexpand("~/Music/reell.mp4");
@@ -5384,6 +5563,7 @@ fn celt_silence_then_attack_decodes_bounded() {
 #[test]
 #[ignore = "probe: HOP_SRC/HOP_MS-driven hop-energy dump around the reell startup attack; returns silently when HOP_SRC is absent, so it can never be a suite gate"]
 fn reell_startup_hop_energies() {
+    let _timing = timing_shared();
     const CH: usize = 2;
     // HOP_SRC / HOP_MS pick another source and window centre (diagnostic).
     let src_s =
@@ -5414,7 +5594,7 @@ fn reell_startup_hop_energies() {
     let mut out = vec![0u8; 1500];
     let mut buf = vec![0f32; 5760 * CH];
     let mut ours_dec = Vec::new();
-    for block in pcm.chunks_exact(960 * CH) {
+    for block in pcm.as_chunks::<{ 960 * CH }>().0 {
         let n = enc.encode_float(block, 960, &mut out).unwrap();
         let m = dec.decode_float(&out[..n], &mut buf).unwrap();
         ours_dec.extend_from_slice(&buf[..m * CH]);
@@ -5467,6 +5647,7 @@ fn reell_startup_hop_energies() {
 #[test]
 #[ignore = "probe: self-contained, but prints where a synthetic click lands after a CELT-only roundtrip and asserts nothing; unblocks when that offset is turned into a tolerance assert"]
 fn celt_click_peak_offset() {
+    let _timing = timing_shared();
     let mut click = vec![0f32; 48000];
     let at = 960 * 10 + 300;
     click[at] = 0.9;
@@ -5498,6 +5679,7 @@ fn celt_click_peak_offset() {
 #[test]
 #[ignore = "probe: per-frame short-block allocation dump over the local corpus; a multi-minute ffmpeg report run, not a suite gate"]
 fn short_block_bits_vs_libopus() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0;
     const FRAME: usize = 960;
     const CHANNELS: usize = 2;
@@ -5622,6 +5804,8 @@ fn short_block_bits_vs_libopus() {
             // Per-band mean pulses.
             report.push_str("# mean pulses per band (ours / ref)\n");
             report.push_str("# band_hz\tours\tref\tdiff\n");
+            // Index loop kept: the index also drives other lookups or parallel arrays.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..nb {
                 let om: f64 =
                     ours_t.iter().map(|d| d.pulses[i] as f64).sum::<f64>() / on.max(1) as f64;
@@ -5639,6 +5823,8 @@ fn short_block_bits_vs_libopus() {
             // Per-band mean fine_quant.
             report.push_str("# mean fine_quant per band (ours / ref)\n");
             report.push_str("# band_hz\tours\tref\n");
+            // Index loop kept: the index also drives other lookups or parallel arrays.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..nb {
                 let om: f64 =
                     ours_t.iter().map(|d| d.fine_quant[i] as f64).sum::<f64>() / on.max(1) as f64;
@@ -5679,7 +5865,7 @@ fn short_block_bits_vs_libopus() {
                 let mut h = [0usize; 4];
                 for d in v {
                     for &t in &d.tf_res {
-                        h[(t + 1).max(0).min(3) as usize] += 1;
+                        h[(t + 1).clamp(0, 3) as usize] += 1;
                     }
                 }
                 h
@@ -5698,6 +5884,8 @@ fn short_block_bits_vs_libopus() {
                 trim_hist(&ref_t)
             ));
             report.push_str("# mean dynalloc boost per band (1/8 bit) ours / ref\n");
+            // Index loop kept: the index also drives other lookups or parallel arrays.
+            #[allow(clippy::needless_range_loop)]
             for b in 0..nb {
                 let mo = mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| {
                     d.offsets[b] as f64
@@ -5778,6 +5966,7 @@ fn short_block_bits_vs_libopus() {
 #[test]
 #[ignore = "probe: EC_ERRMAP_SRC-driven per-window error map; returns silently when the named source is missing, so it can never be a suite gate"]
 fn err_map_vs_libopus() {
+    let _timing = timing_shared();
     const SECS: f64 = 120.0;
     const FRAME: usize = 960;
     const CH: usize = 2;
@@ -5922,7 +6111,7 @@ fn err_map_vs_libopus() {
             f.dec.coded_bands,
             f.dec.dual_stereo as u8,
             f.dec.tf_res.iter().sum::<i32>(),
-            &f.dec.tf_res.iter().take(8).collect::<Vec<_>>(),
+            f.dec.tf_res.iter().take(8).collect::<Vec<_>>(),
             f.dec.spread,
             f.dec.anti_collapse as u8,
             f.dec.total_bits,
@@ -6014,9 +6203,9 @@ fn err_map_vs_libopus() {
         worst + 1
     ));
     for fi in worst * 50..(worst + 1) * 50 {
-        let our = ours_fd.get(fi).map(&fmt_fd).unwrap_or_else(|| "-".into());
+        let our = ours_fd.get(fi).map(fmt_fd).unwrap_or_else(|| "-".into());
         let rf = ref_at(fi * FRAME + 480)
-            .map(&fmt_fd)
+            .map(fmt_fd)
             .unwrap_or_else(|| "-".into());
         out.push_str(&format!("f{fi}: OUR {our}\n     REF {rf}\n"));
     }
@@ -6032,6 +6221,7 @@ fn err_map_vs_libopus() {
 #[test]
 #[ignore = "probe: FRAME_SRC/FRAME_FROM/FRAME_TO-driven per-frame decision dump; returns silently when FRAME_SRC is missing, so it can never be a suite gate"]
 fn frame_decisions_vs_libopus() {
+    let _timing = timing_shared();
     const CH: usize = 2;
     let src_s =
         std::env::var("FRAME_SRC").unwrap_or_else(|_| "~/Music/reell.mp4".into());
@@ -6109,7 +6299,7 @@ fn frame_decisions_vs_libopus() {
     let mut dec = Decoder::new(48000, CH).unwrap();
     let mut out = vec![0u8; 1500];
     let mut ours_rows = Vec::new();
-    for block in pcm.chunks_exact(960 * CH).take(to) {
+    for block in pcm.as_chunks::<{ 960 * CH }>().0.iter().take(to) {
         let n = enc.encode_float(block, 960, &mut out).unwrap();
         let ok = ec_opus::Toc::new(out[0]).mode() != Mode::Silk
             && dec.decode_float(&out[..n], &mut buf).is_ok();
@@ -6202,6 +6392,7 @@ const NB_BANDS_DIAG: usize = ec_opus::celt::NB_BANDS;
 #[test]
 #[ignore = "needs the local library sources; run with --ignored"]
 fn analysis_music_prob_separates_speech_from_music() {
+    let _timing = timing_shared();
     const SECS: f64 = 30.0;
     const FRAME: usize = 960;
     const CHANNELS: usize = 2;
@@ -6248,7 +6439,7 @@ fn analysis_music_prob_separates_speech_from_music() {
         // Histogram of the detected bandwidth index, which drives
         // `opus_encoder.c`'s `detected_bandwidth` clamp.
         let mut bw_hist = [0u32; 21];
-        for chunk in pcm.chunks_exact(FRAME * CHANNELS) {
+        for chunk in pcm.as_chunks::<{ FRAME * CHANNELS }>().0 {
             enc.encode_float(chunk, FRAME, &mut out).expect("encode");
             let d = enc.last_celt_diag();
             n += 1;
@@ -6324,4 +6515,103 @@ fn analysis_music_prob_separates_speech_from_music() {
             m.2
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rate against the target: the CBR default must land within 5% of the bitrate
+// asked for, on stereo music and speech.
+// ---------------------------------------------------------------------------
+
+/// Encodes each corpus source at 32, 64 and 128 kbps (default CBR), decodes it
+/// with our decoder, and asserts the realised rate is within 5% of the target and
+/// that no CBR packet exceeds its byte budget (the D2b packet budget). Speech is
+/// coded in Voip mode, where SILK packets come from. Corpus-backed like the
+/// library gates: `cargo test --release -p ec-opus --test conformance
+/// encoder_rate_target_gate -- --ignored --nocapture` with the sources in place.
+#[test]
+#[ignore = "corpus gate: needs ffmpeg and the ~/Music, ~/Downloads sources (about 3 min)"]
+fn encoder_rate_target_gate() {
+    let _timing = timing_shared();
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    const CHANNELS: usize = 2;
+    const MAX_LAG: usize = 2000;
+    let sources: &[(&str, &str, &str)] = &[
+        ("nik", "music", "~/Music/reeln.mp4"),
+        ("reelo", "music", "~/Music/reelo.mp3"),
+        ("her", "music", "~/Music/reeli.mp3"),
+        ("reell", "music", "~/Music/reell.mp4"),
+        (
+            "hein",
+            "speech",
+            "~/Downloads/reelm.mp3",
+        ),
+    ];
+    let mut rows = Vec::new();
+    let mut violations = Vec::new();
+    for &(tag, kind, path) in sources {
+        let src = shellexpand(path);
+        if !src.exists() {
+            eprintln!("SKIP {tag}: missing {}", src.display());
+            continue;
+        }
+        let pcm = ffmpeg_decode_pcm(&src, SECS);
+        let frames = pcm.len() / CHANNELS;
+        assert!(frames > 48_000, "{tag}: source too short");
+        let seconds = frames as f64 / 48000.0;
+        for &kbps in &[32u32, 64, 128] {
+            // Speech goes through Voip, which is where SILK packets come from.
+            let app = if kind == "speech" { Application::Voip } else { Application::Audio };
+            let mut enc = Encoder::new(48000, CHANNELS, app).expect("encoder");
+            enc.set_bitrate(kbps * 1000);
+            // CBR packet budget, as the encoder derives it (payload bytes).
+            let budget = ((kbps as u64 * 1000 * FRAME as u64 + 4 * 48000) / (8 * 48000)) as usize - 1;
+            let mut dec = Decoder::new(48000, CHANNELS).unwrap();
+            let mut out = vec![0u8; 1500];
+            let mut buf = vec![0.0f32; 5760 * CHANNELS];
+            let mut decoded = Vec::new();
+            let mut bytes = 0usize;
+            let (mut over, mut under) = (0usize, 0usize);
+            let mut padded = Vec::new();
+            for block in pcm.chunks(FRAME * CHANNELS) {
+                let block = if block.len() < FRAME * CHANNELS {
+                    padded.clear();
+                    padded.extend_from_slice(block);
+                    padded.resize(FRAME * CHANNELS, 0.0);
+                    &padded[..]
+                } else {
+                    block
+                };
+                let len = enc.encode_float(block, FRAME, &mut out).expect("encode");
+                bytes += len;
+                let payload = len - 1;
+                over += usize::from(payload > budget);
+                under += usize::from(payload < budget);
+                let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
+                decoded.extend_from_slice(&buf[..n * CHANNELS]);
+            }
+            let real = bytes as f64 * 8.0 / seconds / 1000.0;
+            let pct = (real / kbps as f64 - 1.0) * 100.0;
+            let (_, aligned) = align_to_source(&pcm, &decoded, CHANNELS, MAX_LAG);
+            let cmp = (pcm.len().min(aligned.len())) / CHANNELS * CHANNELS;
+            let q = opus_compare(&to_i16(&pcm[..cmp]), &to_i16(&aligned[..cmp]), CHANNELS);
+            println!(
+                "{tag} ({kind}) @{kbps}k: realised {real:.2} kbps ({pct:+.2}%), Q {q:.2}, \
+                 budget {budget} B: {over} over, {under} under"
+            );
+            if pct.abs() > 5.0 {
+                violations.push(format!("{tag} ({kind}) @{kbps}k: {pct:+.2}% (|>5%|)"));
+            }
+            if over > 0 {
+                violations.push(format!("{tag} ({kind}) @{kbps}k: {over} packets over the {budget} B budget"));
+            }
+            rows.push(format!("{tag}\t{kind}\t{kbps}\t{real:.2}\t{pct:+.2}\t{q:.2}\t{over}\t{under}"));
+        }
+    }
+    assert!(!rows.is_empty(), "no rate rows: no corpus source present");
+    assert!(
+        violations.is_empty(),
+        "rate or packet budget violated:\n{}",
+        violations.join("\n")
+    );
 }

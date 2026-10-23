@@ -1,0 +1,26 @@
+   Compiling once_cell v1.21.4
+   Compiling pin-project-lite v0.2.17
+   Compiling ec-h264 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-h264)
+   Compiling tracing-core v0.1.36
+   Compiling tracing v0.1.44
+   Compiling tracing-subscriber v0.3.23
+   Compiling tracking-allocator v0.4.0
+    Finished `release` profile [optimized] target(s) in 36.92s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_h264-16a4543e775043bc)
+     Running tests/conformance.rs (/home/user/.cache/tgt-testcut-rest/release/deps/conformance-efd3d1c1c7e4b8b6)
+     Running tests/encode.rs (/home/user/.cache/tgt-testcut-rest/release/deps/encode-fc5ae9c94907deff)
+error: test failed, to rerun pass `-p ec-h264 --test encode`
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-fdd25d6e27177eff)
+     Running tests/high10.rs (/home/user/.cache/tgt-testcut-rest/release/deps/high10-bba80994e79ae727)
+     Running tests/high422.rs (/home/user/.cache/tgt-testcut-rest/release/deps/high422-bde0ac0467e7f328)
+     Running tests/high422_jvt.rs (/home/user/.cache/tgt-testcut-rest/release/deps/high422_jvt-75c51b7288b0bb56)
+     Running tests/high444.rs (/home/user/.cache/tgt-testcut-rest/release/deps/high444-81b34dc6d8ea8b3c)
+     Running tests/high444_jvt.rs (/home/user/.cache/tgt-testcut-rest/release/deps/high444_jvt-e6c3c0b4353d11a6)
+     Running tests/interlaced.rs (/home/user/.cache/tgt-testcut-rest/release/deps/interlaced-2ea2d42acadb998e)
+     Running tests/mbaff_x264.rs (/home/user/.cache/tgt-testcut-rest/release/deps/mbaff_x264-2bb94f2bbb61f4bd)
+     Running tests/no_panic.rs (/home/user/.cache/tgt-testcut-rest/release/deps/no_panic-369bd35b8cccbd54)
+     Running tests/refusals.rs (/home/user/.cache/tgt-testcut-rest/release/deps/refusals-32c4904720583146)
+   Doc-tests ec_h264
+WARNING: No rustdoc doctest environment variable provided so doctests will be run in the same process
+error: 1 target failed:
+    `-p ec-h264 --test encode`

@@ -1,0 +1,5 @@
+   Compiling ec-vp9-syntax v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-vp9-syntax)
+    Finished `release` profile [optimized] target(s) in 1.09s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_vp9_syntax-36224900b85dd5d3)
+     Running tests/streams.rs (/home/user/.cache/tgt-testcut-rest/release/deps/streams-6495cd048e568913)
+   Doc-tests ec_vp9_syntax

@@ -284,9 +284,13 @@ impl FrameHeader {
         let mut lf_delta_update = false;
         if lf_delta_enabled && d.read_bool(128) {
             lf_delta_update = true;
+            // loop indexes several parallel arrays; the index is clearer than zip chains
+            #[allow(clippy::needless_range_loop)]
             for i in 0..4 {
                 ref_lf_delta[i] = d.read_maybe_signed(6);
             }
+            // loop indexes several parallel arrays; the index is clearer than zip chains
+            #[allow(clippy::needless_range_loop)]
             for i in 0..4 {
                 mode_lf_delta[i] = d.read_maybe_signed(6);
             }
@@ -416,7 +420,11 @@ impl FrameHeader {
                 }
             }
             // MV probability updates: P(7) form, x ? x << 1 : 1 (§17.2).
+            // loop indexes several parallel arrays; the index is clearer than zip chains
+            #[allow(clippy::needless_range_loop)]
             for c in 0..2 {
+                // loop indexes several parallel arrays; the index is clearer than zip chains
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..MV_PROB_CNT {
                     if d.read_bool(MV_UPDATE_PROBS[c][j]) {
                         state.mv_probs[c][j] = d.read_prob7();

@@ -70,6 +70,7 @@ fn main() {
         sbr_present: true,
         ps_present: false,
         extension_sample_rate: Some(ext_rate),
+        pce: Vec::new(),
     });
 
     let time_base = TimeBase::from_rate(core_rate);

@@ -2,22 +2,13 @@
 //! real library. Every test that needs a fixture or ffmpeg skips loudly when it
 //! is absent rather than passing quietly.
 
+mod common;
+
+use common::{fixtures, have_ffmpeg};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ec_aac::{AacDecoder, AacEncoder, AacEncoderConfig};
-
-fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
-}
-
-fn have_ffmpeg() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 /// Fixture-presence probe for the committed `fixtures/audio` media this file
 /// decodes. Returns whether the fixture is present, but never silently: under
@@ -61,7 +52,7 @@ fn ffmpeg_decode(path: &Path, channels: usize) -> Vec<Vec<f32>> {
 
 fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -361,10 +352,9 @@ fn asc_round_trips_every_sample_rate() {
     assert_eq!(ec_aac::sf_index_for_rate(37_000), None);
 }
 
-/// A refusal is a claim: this pins the current contract -- plain SBR (no
-/// Parametric Stereo) is reconstructed and reports the extension rate; a
-/// Parametric Stereo stream still falls back to its core (PS itself is a
-/// separate, unimplemented tool); plain AAC-LC reports nothing missing.
+/// A refusal is a claim: this pins the current contract -- SBR and HE-AACv2
+/// (SBR with Parametric Stereo) are reconstructed and report the extension
+/// rate; plain AAC-LC reports nothing missing.
 #[test]
 fn sbr_is_reported_not_silently_upsampled() {
     // AOT 5 (SBR), core index 6 (24 kHz), stereo, extension index 3 (48 kHz),
@@ -379,13 +369,15 @@ fn sbr_is_reported_not_silently_upsampled() {
     );
 
     // Same layout, AOT 29 (PS) instead of 5 (SBR): 11101 0110 0010 0011 00010.
+    // Parametric Stereo is reconstructed now, so this reports the extension
+    // rate (the decoder also outputs two channels for it).
     let ps_asc = [0xEBu8, 0x11, 0x88];
     let ps_decoder = AacDecoder::with_config_bytes(&ps_asc).expect("HE-AAC v2 config parses");
-    assert_eq!(ps_decoder.sbr_support(), ec_aac::SbrSupport::CoreOnly);
+    assert_eq!(ps_decoder.sbr_support(), ec_aac::SbrSupport::V1);
     assert_eq!(
         ps_decoder.output_sample_rate(),
-        Some(24_000),
-        "PS is still unreconstructed: must report the core rate it actually produces"
+        Some(48_000),
+        "a reconstructed HE-AACv2 stream must report the extension rate it produces"
     );
 
     let plain = AacDecoder::with_config_bytes(&ec_aac::audio_specific_config_bytes(48_000, 2))
@@ -478,6 +470,223 @@ fn encoder_beats_the_incumbent_bar() {
         checked += 1;
     }
     assert!(checked > 0, "no lossless fixtures found");
+}
+
+/// Every channel count the encoder claims (1 to 6 and 8), at 64 kbps per channel, the
+/// scaling the stereo row uses (128 kbps for 2 channels). Each row is
+/// (layout, channels, kbps, bar, which incumbent the bar is). rusty_aac 0.5.0 (the
+/// INCUMBENT_BAR incumbent above) refuses 7+ channels, so the 8-channel bar is ffmpeg's
+/// native AAC encoder on the same fixture at the same bitrate, a stricter proxy.
+/// Measured 2026-10-18 by running each incumbent through the same decode and
+/// best-lag correlation (`~/.cache/aacencbar-inc`, not in the repo).
+const LAYOUT_BAR: &[(&str, usize, u32, f64, &str)] = &[
+    ("mono", 1, 64, 0.9698, "rusty_aac 0.5.0"),
+    ("stereo", 2, 128, 0.9743, "rusty_aac 0.5.0"),
+    ("3.0", 3, 192, 0.9711, "rusty_aac 0.5.0"),
+    ("4.0", 4, 256, 0.9645, "rusty_aac 0.5.0"),
+    ("5.0", 5, 320, 0.9712, "rusty_aac 0.5.0"),
+    ("5.1", 6, 384, 0.9648, "rusty_aac 0.5.0"),
+    ("7.1", 8, 512, 0.9994, "ffmpeg native aac"),
+];
+
+/// Every LAYOUT_BAR row: worst-channel correlation against its incumbent's bar, and the
+/// ADTS rate within 5% of the target.
+#[test]
+fn encoder_meets_every_layout_bar() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = fixtures().join("audio");
+    let tmp = std::env::temp_dir().join("ec-aac-layout-bar");
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let mut checked = 0;
+    let mut failed = Vec::new();
+    for (name, channels, kbps, bar, incumbent) in LAYOUT_BAR {
+        let src = dir.join(format!("flac-{name}-48000.flac"));
+        if !require_fixture(&src, "scripts/gen-aac-layouts.sh OUTDIR (3.0, 4.0, 5.0, 7.1)") {
+            continue;
+        }
+        let source = ffmpeg_decode(&src, *channels);
+        let mut interleaved = Vec::with_capacity(source[0].len() * channels);
+        for i in 0..source[0].len() {
+            for plane in &source {
+                interleaved.push(plane[i]);
+            }
+        }
+        let adts = encode_to_adts(&interleaved, *channels as u16, 48_000, *kbps);
+        let path = tmp.join(format!("{name}-{kbps}k.aac"));
+        std::fs::write(&path, &adts).expect("write");
+        let rate = adts.len() as f64 * 8.0 * 48_000.0 / source[0].len() as f64 / 1000.0;
+        let ours = ffmpeg_decode(&path, *channels);
+        let corr: Vec<f64> = source
+            .iter()
+            .zip(&ours)
+            .map(|(a, b)| best_correlation(a, b))
+            .collect();
+        let worst = corr.iter().copied().fold(f64::MAX, f64::min);
+        println!(
+            "layout {name} {kbps}k: {rate:.1} kbps ({:+.1}%), worst channel {worst:.4} \
+             (bar {bar:.4}, {incumbent}) per-channel {corr:.4?}",
+            (rate / f64::from(*kbps) - 1.0) * 100.0
+        );
+        if (rate / f64::from(*kbps) - 1.0).abs() > 0.05 {
+            failed.push(format!("{name} {kbps}k: rate {rate:.1} kbps outside +-5%"));
+        }
+        if worst < *bar {
+            failed.push(format!(
+                "{name} {kbps}k: worst channel {worst:.4} under the bar {bar:.4} ({incumbent})"
+            ));
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no lossless fixtures found");
+    assert!(failed.is_empty(), "layout bars missed:\n{}", failed.join("\n"));
+}
+
+/// Noise-bearing synthetic content for NOISY_BAR. Each clip is 10 s, 48 kHz, stereo, built
+/// here by ffmpeg's lavfi sources, so no media is committed. Each entry is
+/// (name, lavfi inputs, filter_complex ending in [o]).
+const NOISY_CLIPS: &[(&str, &[&str], &str)] = &[
+    (
+        // (a) the bench content: two slow-AM tone pairs plus independent pink noise at 0.03.
+        "bench",
+        &[
+            "aevalsrc='0.25*sin(2*PI*220*t)+0.12*sin(2*PI*277.18*t)*(0.5+0.5*sin(2*PI*2*t))+0.1*sin(2*PI*329.63*t)|0.25*sin(2*PI*222*t)+0.12*sin(2*PI*280*t)*(0.5+0.5*sin(2*PI*2*t))+0.1*sin(2*PI*331*t)':s=48000:d=10",
+            "anoisesrc=d=10:c=pink:a=0.03:s=48000:r=48000:seed=1",
+            "anoisesrc=d=10:c=pink:a=0.03:s=48000:r=48000:seed=2",
+        ],
+        "[1:a][2:a]amerge=inputs=2,aformat=channel_layouts=stereo[n];[0:a][n]amix=inputs=2:normalize=0,aformat=sample_fmts=s16:channel_layouts=stereo[o]",
+    ),
+    (
+        // (b) music-like: four harmonics with 5.5 Hz vibrato per channel, a white burst every
+        // 0.5 s (exponential decay), and a low-level white noise floor.
+        "music",
+        &[
+            "aevalsrc='0.12*sin(2*PI*(196*t+2*sin(2*PI*5.5*t))) + 0.07*sin(2*PI*(392*t+2*sin(2*PI*5.5*t))) + 0.05*sin(2*PI*(588*t+2*sin(2*PI*5.5*t))) + 0.04*sin(2*PI*(784*t+2*sin(2*PI*5.5*t)))|0.12*sin(2*PI*(247*t+2*sin(2*PI*5.3*t+1))) + 0.07*sin(2*PI*(494*t+2*sin(2*PI*5.3*t+1))) + 0.05*sin(2*PI*(741*t+2*sin(2*PI*5.3*t+1))) + 0.04*sin(2*PI*(988*t+2*sin(2*PI*5.3*t+1)))':s=48000:d=10",
+            "anoisesrc=d=10:c=white:a=0.5:s=48000:r=48000:seed=3",
+            "anoisesrc=d=10:c=white:a=0.004:s=48000:r=48000:seed=5",
+            "anoisesrc=d=10:c=white:a=0.004:s=48000:r=48000:seed=6",
+        ],
+        "[1:a]aeval='val(0)*exp(-30*mod(t,0.5))|val(0)*exp(-30*mod(t,0.5))':c=stereo[b];[2:a][3:a]amerge=inputs=2,aformat=channel_layouts=stereo[f];[0:a][b]amix=inputs=2:normalize=0[t1];[t1][f]amix=inputs=2:normalize=0,aformat=sample_fmts=s16:channel_layouts=stereo[o]",
+    ),
+    (
+        // (c) speech-like: white noise bursts through two formant band pairs, gated at 4 Hz,
+        // plus 120 Hz and 118 Hz decaying pitch pulses.
+        "speech",
+        &[
+            "anoisesrc=d=10:c=white:a=0.3:s=48000:r=48000:seed=7",
+            "anoisesrc=d=10:c=white:a=0.3:s=48000:r=48000:seed=8",
+            "aevalsrc='exp(-600*mod(t,1/120))*sin(2*PI*120*t)*0.5|exp(-600*mod(t,1/118))*sin(2*PI*118*t)*0.5':s=48000:d=10",
+        ],
+        "[0:a]bandpass=f=700:width_type=h:w=150,bandpass=f=1200:width_type=h:w=200[a1];[1:a]bandpass=f=1200:width_type=h:w=200,bandpass=f=2600:width_type=h:w=300[a2];[a1][a2]amerge=inputs=2[nz];[nz]aeval='val(0)*(0.5+0.5*sin(2*PI*4*t))|val(1)*(0.5+0.5*sin(2*PI*4*t))'[nzg];[2:a]aeval='val(0)*0.3|val(1)*0.3'[p];[nzg][p]amix=inputs=2:normalize=0,aformat=sample_fmts=s16:channel_layouts=stereo[o]",
+    ),
+    (
+        // (d) independent white noise per channel at about -20 dBFS RMS (measured -19.97).
+        "white",
+        &[
+            "anoisesrc=d=10:c=white:a=0.1738:s=48000:r=48000:seed=9",
+            "anoisesrc=d=10:c=white:a=0.1738:s=48000:r=48000:seed=10",
+        ],
+        "[0:a][1:a]amerge=inputs=2,aformat=sample_fmts=s16:channel_layouts=stereo[o]",
+    ),
+];
+
+/// Incumbent (ffmpeg's native AAC encoder, `-c:a aac -b:a <kbps>k`, 2026-10-18) per-channel
+/// correlation on each NOISY_CLIPS entry, at the best lag in {0, 1024, 2048}, minimum over
+/// the two channels. The bar is the incumbent minus 0.002, rounded down to four decimals.
+/// Only 128k and 192k are gated (the 96k rows are measured and reported only).
+/// (clip, kbps, incumbent, bar, gated)
+const NOISY_BAR: &[(&str, u32, f64, f64, bool)] = &[
+    ("bench", 96, 0.999344, 0.9973, false),
+    ("bench", 128, 0.999594, 0.9975, true),
+    ("bench", 192, 0.999618, 0.9976, true),
+    ("music", 96, 0.942434, 0.9404, false),
+    ("music", 128, 0.962250, 0.9602, true),
+    ("music", 192, 0.978655, 0.9766, true),
+    ("speech", 96, 0.991754, 0.9897, false),
+    ("speech", 128, 0.999023, 0.9970, true),
+    ("speech", 192, 0.999609, 0.9976, true),
+    ("white", 96, 0.572339, 0.5703, false),
+    ("white", 128, 0.668895, 0.6668, true),
+    ("white", 192, 0.702850, 0.7008, true),
+];
+
+/// Renders one NOISY_CLIPS entry to a 16-bit WAV in `dir` (cached across rows).
+fn noisy_clip(name: &str, dir: &Path) -> PathBuf {
+    let out = dir.join(format!("noisy-{name}.wav"));
+    if out.exists() {
+        return out;
+    }
+    let (_, inputs, filter) = NOISY_CLIPS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .expect("a NOISY_CLIPS entry");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-y"]);
+    for input in *inputs {
+        cmd.args(["-f", "lavfi", "-i", input]);
+    }
+    cmd.args(["-filter_complex", filter, "-map", "[o]", "-c:a", "pcm_s16le"])
+        .arg(&out);
+    let run = cmd.output().expect("ffmpeg runs");
+    assert!(
+        run.status.success(),
+        "ffmpeg could not render {name}: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    out
+}
+
+/// Stereo AAC-LC at each NOISY_BAR bitrate on the noise-bearing clips: worst-channel
+/// correlation against the incumbent's bar, and the ADTS rate within 5% of the target.
+#[test]
+fn encoder_meets_noisy_bar() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("ec-aac-noisy-bar");
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let mut failed = Vec::new();
+    for (name, kbps, incumbent, bar, gated) in NOISY_BAR {
+        let src = noisy_clip(name, &tmp);
+        let source = ffmpeg_decode(&src, 2);
+        let mut interleaved = Vec::with_capacity(source[0].len() * 2);
+        for i in 0..source[0].len() {
+            for plane in &source {
+                interleaved.push(plane[i]);
+            }
+        }
+        let adts = encode_to_adts(&interleaved, 2, 48_000, *kbps);
+        let path = tmp.join(format!("{name}-{kbps}k.aac"));
+        std::fs::write(&path, &adts).expect("write");
+        let rate = adts.len() as f64 * 8.0 * 48_000.0 / source[0].len() as f64 / 1000.0;
+        let ours = ffmpeg_decode(&path, 2);
+        let corr: Vec<f64> = source
+            .iter()
+            .zip(&ours)
+            .map(|(a, b)| best_correlation(a, b))
+            .collect();
+        let worst = corr.iter().copied().fold(f64::MAX, f64::min);
+        println!(
+            "noisy {name} {kbps}k: {rate:.1} kbps ({:+.1}%), worst channel {worst:.4} \
+             (incumbent {incumbent:.4}, bar {bar:.4}, gated {gated}) per-channel {corr:.4?}",
+            (rate / f64::from(*kbps) - 1.0) * 100.0
+        );
+        if !gated {
+            continue;
+        }
+        if (rate / f64::from(*kbps) - 1.0).abs() > 0.05 {
+            failed.push(format!("{name} {kbps}k: rate {rate:.1} kbps outside +-5%"));
+        }
+        if worst < *bar {
+            failed.push(format!(
+                "{name} {kbps}k: worst channel {worst:.4} under the bar {bar:.4}"
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "noisy bars missed:\n{}", failed.join("\n"));
 }
 
 fn tone_pcm(rate: u32, channels: usize, secs: f64) -> Vec<f32> {

@@ -10,12 +10,13 @@
 //! Reference: `vainfo` on this box (Mesa 26.1.6, radeonsi gfx1200, RX 9060 XT).
 
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::rc::Rc;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use ec_va::caps::{Entrypoint, Profile};
-use ec_va::{
-    CapReport, Config, Context, Display, Error, Image, Picture, Surface, SurfaceSpec, sys,
-};
+use ec_va::va;
+use ec_va::{CapReport, Config, Display, Image, Surface, SurfaceExt, SurfaceSpec, create_pool};
 
 /// Runs the tests in this binary one at a time.
 ///
@@ -32,35 +33,47 @@ fn serial() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn display() -> Arc<Display> {
-    Display::open().expect("no VA-API display; this test needs the GPU")
+fn display() -> Rc<Display> {
+    ec_va::open().expect("no VA-API display; this test needs the GPU")
+}
+
+/// The driver's `VAImageFormat` for `fourcc`.
+fn image_format(display: &Display, fourcc: u32) -> va::VAImageFormat {
+    display
+        .query_image_formats()
+        .expect("vaQueryImageFormats")
+        .into_iter()
+        .find(|f| f.fourcc == fourcc)
+        .expect("driver lacks the image format")
+}
+
+fn pool(display: &Rc<Display>, spec: &SurfaceSpec, n: usize) -> Vec<Surface> {
+    create_pool(display, spec, n).expect("pool")
+}
+
+fn one(display: &Rc<Display>, spec: &SurfaceSpec) -> Surface {
+    pool(display, spec, 1).pop().expect("surface")
 }
 
 // --------------------------------------------------------------------------
 // Display
 // --------------------------------------------------------------------------
 
+// The raw `Display::version` / `device_path` / `is_valid` checks no longer
+// exist in cros-libva; what remains observable is that the open succeeded and
+// the driver answers real queries.
 #[test]
 fn display_opens_on_a_render_node() {
     let _serial = serial();
     let display = display();
-    assert!(display.is_valid());
-    let (major, minor) = display.version();
-    assert_eq!(major, ec_va::MIN_VA_MAJOR);
-    assert!(
-        minor >= ec_va::MIN_VA_MINOR,
-        "runtime libva {major}.{minor} is older than the transcribed ABI"
-    );
-    assert!(
-        display
-            .device_path()
-            .to_string_lossy()
-            .starts_with("/dev/dri/renderD"),
-        "expected a render node, got {:?}",
-        display.device_path()
-    );
-    let vendor = display.vendor().expect("vendor string");
+    let vendor = ec_va::display::vendor(&display).expect("vendor string");
     assert!(!vendor.is_empty(), "driver reported an empty vendor string");
+    assert!(
+        !display
+            .query_config_profiles()
+            .expect("profiles")
+            .is_empty()
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -123,7 +136,7 @@ fn caps_match_vainfo_on_this_gpu() {
         .entry(Profile::HEVCMain10, Entrypoint::VLD)
         .expect("HEVC Main10 VLD");
     assert!(
-        main10.supports_rt_format(sys::VA_RT_FORMAT_YUV420_10),
+        main10.supports_rt_format(va::VA_RT_FORMAT_YUV420_10),
         "HEVC Main10 VLD advertised rt_formats 0x{:08x} without a 10-bit format",
         main10.rt_formats
     );
@@ -131,24 +144,24 @@ fn caps_match_vainfo_on_this_gpu() {
         .surfaces
         .as_ref()
         .expect("surface caps")
-        .supports_fourcc(sys::VA_FOURCC_P010);
+        .supports_fourcc(va::VA_FOURCC_P010);
     assert!(p010_supported, "Main10 cannot allocate P010 surfaces");
 
     // 8-bit decode: NV12 everywhere.
     let h264 = caps
         .entry(Profile::H264Main, Entrypoint::VLD)
         .expect("H264 Main VLD");
-    assert!(h264.supports_rt_format(sys::VA_RT_FORMAT_YUV420));
+    assert!(h264.supports_rt_format(va::VA_RT_FORMAT_YUV420));
     assert!(
         h264.surfaces
             .as_ref()
             .expect("surface caps")
-            .supports_fourcc(sys::VA_FOURCC_NV12)
+            .supports_fourcc(va::VA_FOURCC_NV12)
     );
 
     // Readback formats: `vaGetImage` must be able to produce NV12 and P010.
-    assert!(caps.image_formats.contains(&sys::VA_FOURCC_NV12));
-    assert!(caps.image_formats.contains(&sys::VA_FOURCC_P010));
+    assert!(caps.image_formats.contains(&va::VA_FOURCC_NV12));
+    assert!(caps.image_formats.contains(&va::VA_FOURCC_P010));
 
     assert!(
         caps.profiles_for(Entrypoint::VLD).len() >= 9,
@@ -181,7 +194,7 @@ fn caps_report_driver_legal_surface_sizes() {
 
     // DRM PRIME 2 export must be advertised: that is how frames leave the GPU.
     assert!(
-        surfaces.memory_types & sys::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0,
+        surfaces.memory_types & va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0,
         "memory types 0x{:08x} lack DRM_PRIME_2",
         surfaces.memory_types
     );
@@ -197,11 +210,12 @@ fn unsupported_pair_is_refused_by_the_driver() {
     assert!(!caps.supports(Profile::VP9Profile1, Entrypoint::VLD));
 
     let err = Config::new(&display, Profile::VP9Profile1, Entrypoint::VLD, &[])
-        .expect_err("VP9 Profile1 decode does not exist on this GPU");
+        .err()
+        .expect("VP9 Profile1 decode does not exist on this GPU");
     let status = err.status().expect("a VAStatus-carrying error");
     assert!(
-        status == sys::VA_STATUS_ERROR_UNSUPPORTED_PROFILE
-            || status == sys::VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT,
+        status == va::VA_STATUS_ERROR_UNSUPPORTED_PROFILE as i32
+            || status == va::VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT as i32,
         "unexpected refusal: {err}"
     );
     assert!(err.to_string().contains("vaCreateConfig"), "{err}");
@@ -219,21 +233,21 @@ fn surface_pool_create_and_destroy_is_leak_free() {
 
     // Warm up so first-touch allocations are not counted as a leak.
     for _ in 0..4 {
-        let pool = Surface::create_pool(&display, &spec, 16).expect("pool");
-        assert_eq!(pool.len(), 16);
-        drop(pool);
+        let p = pool(&display, &spec, 16);
+        assert_eq!(p.len(), 16);
+        drop(p);
     }
 
     let before = vm_rss_kb();
     for _ in 0..100 {
-        let pool = Surface::create_pool(&display, &spec, 16).expect("pool");
+        let p = pool(&display, &spec, 16);
         // Every id must be distinct and valid, or the pool is aliasing memory.
-        let mut ids: Vec<_> = pool.iter().map(|s| s.id()).collect();
+        let mut ids: Vec<_> = p.iter().map(|s| s.id()).collect();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 16, "vaCreateSurfaces returned duplicate ids");
-        assert!(ids.iter().all(|&id| id != sys::VA_INVALID_SURFACE));
-        drop(pool);
+        assert!(ids.iter().all(|&id| id != va::VA_INVALID_SURFACE));
+        drop(p);
     }
     let after = vm_rss_kb();
 
@@ -250,100 +264,107 @@ fn surface_pool_create_and_destroy_is_leak_free() {
 fn derive_image_maps_and_reads_back() {
     let _serial = serial();
     let display = display();
-    let surface = Surface::create(&display, &SurfaceSpec::nv12(64, 64)).expect("surface");
-    let mut image = surface.derive_image().expect("vaDeriveImage");
+    let surface = one(&display, &SurfaceSpec::nv12(64, 64));
+    let mut image = Image::derive_from(&surface, (64, 64)).expect("vaDeriveImage");
 
-    assert_eq!(image.fourcc(), sys::VA_FOURCC_NV12);
-    assert_eq!(image.size(), (64, 64));
-    assert_eq!(image.num_planes(), 2, "NV12 is luma + interleaved chroma");
-    let pitch = image.pitch(0).expect("luma pitch");
+    let va_image = *image.image();
+    assert_eq!(va_image.format.fourcc, va::VA_FOURCC_NV12);
+    assert_eq!(image.display_resolution(), (64, 64));
+    assert!(image.is_derived());
+    assert_eq!(va_image.num_planes, 2, "NV12 is luma + interleaved chroma");
+    let pitch = va_image.pitches[0] as usize;
     assert!(pitch >= 64, "luma pitch {pitch} is narrower than the image");
+    assert!(va_image.pitches[1] > 0, "chroma pitch missing");
+    let luma_off = va_image.offsets[0] as usize;
+    let chroma_off = va_image.offsets[1] as usize;
+    assert!(
+        chroma_off >= luma_off + pitch * 64,
+        "luma plane must be at least pitch * height"
+    );
 
     {
-        let mut mapped = image.map().expect("vaMapBuffer");
-        let luma = mapped.plane_mut(0).expect("luma plane");
-        assert_eq!(
-            luma.len(),
-            pitch as usize * 64,
-            "luma plane length must be pitch * height"
+        let bytes: &mut [u8] = image.as_mut();
+        assert!(
+            bytes.len() > chroma_off,
+            "mapping shorter than chroma plane"
         );
-        for (i, byte) in luma.iter_mut().enumerate() {
+        for (i, byte) in bytes[luma_off..luma_off + pitch * 64]
+            .iter_mut()
+            .enumerate()
+        {
             *byte = (i % 251) as u8;
         }
-        let chroma = mapped.plane(1).expect("chroma plane");
-        assert!(!chroma.is_empty());
-        assert!(mapped.plane(2).is_none(), "NV12 has no third plane");
-
-        let luma = mapped.plane(0).expect("luma plane");
+        let luma = &bytes[luma_off..];
         assert_eq!(luma[0], 0);
         assert_eq!(luma[250], 250);
         assert_eq!(luma[251], 0, "write did not survive within the mapping");
     }
+    drop(image);
 
-    // Re-mapping after the guard dropped proves the unmap actually happened:
-    // libva returns the same buffer only once per map, and a never-unmapped
-    // mapping is the incumbent's per-frame leak.
+    // Re-deriving after the drop proves the unmap/destroy actually happened.
     //
     // What is deliberately *not* asserted: that the bytes written above are
     // readable through this second mapping. On radeonsi 26.1 a derived-image
     // mapping is write-oriented staging — the write reaches the surface (see
     // `created_image_reads_a_surface_back`), but a fresh map reads back zeros.
-    // Readback therefore goes through `vaGetImage`, never through a re-derive.
-    let mapped = image.map().expect("second vaMapBuffer after unmap");
+    let again = Image::derive_from(&surface, (64, 64)).expect("second vaDeriveImage");
     assert_eq!(
-        mapped.plane(0).expect("luma").len(),
-        pitch as usize * 64,
+        again.image().pitches[0] as usize,
+        pitch,
         "second mapping has a different geometry"
     );
+    assert!(!AsRef::<[u8]>::as_ref(&again).is_empty());
 }
 
 #[test]
 fn created_image_reads_a_surface_back() {
     let _serial = serial();
     let display = display();
-    let surface = Surface::create(&display, &SurfaceSpec::nv12(64, 64)).expect("surface");
+    let surface = one(&display, &SurfaceSpec::nv12(64, 64));
     // Paint through the derived image so there is something known to read back.
     {
-        let mut derived = surface.derive_image().expect("derive");
-        let mut mapped = derived.map().expect("map");
-        for byte in mapped.plane_mut(0).expect("luma") {
+        let mut derived = Image::derive_from(&surface, (64, 64)).expect("derive");
+        let luma_off = derived.image().offsets[0] as usize;
+        let pitch = derived.image().pitches[0] as usize;
+        let bytes: &mut [u8] = derived.as_mut();
+        for byte in &mut bytes[luma_off..luma_off + pitch * 64] {
             *byte = 0x5a;
         }
     }
     surface.sync().expect("sync");
 
-    let mut image = Image::create(&display, sys::VA_FOURCC_NV12, 64, 64).expect("vaCreateImage");
-    surface
-        .read_into(&mut image, 0, 0, 64, 64)
-        .expect("vaGetImage");
-    let mapped = image.map().expect("map");
-    let luma = mapped.plane(0).expect("luma");
+    let fmt = image_format(&display, va::VA_FOURCC_NV12);
+    let image = Image::create_from(&surface, fmt, (64, 64), (64, 64)).expect("vaGetImage");
+    let luma_off = image.image().offsets[0] as usize;
+    let bytes: &[u8] = image.as_ref();
     assert!(
-        luma.iter().take(64).all(|&b| b == 0x5a),
+        bytes[luma_off..luma_off + 64].iter().all(|&b| b == 0x5a),
         "vaGetImage did not return the painted luma"
     );
+    drop(image);
 
-    // Out-of-range regions are refused before reaching the driver.
-    drop(mapped);
-    let err = surface
-        .read_into(&mut image, 0, 0, 128, 128)
-        .expect_err("region larger than the image must be refused");
-    assert!(matches!(err, Error::Protocol(_)), "{err}");
+    // A region larger than the surface must be refused, not read out of bounds.
+    let fmt = image_format(&display, va::VA_FOURCC_NV12);
+    let refused = Image::create_from(&surface, fmt, (128, 128), (128, 128));
+    assert!(
+        refused.is_err(),
+        "region larger than the surface must be refused"
+    );
 }
 
 #[test]
 fn prime_export_owns_and_releases_its_descriptors() {
     let _serial = serial();
     let display = display();
-    let surface = Surface::create(&display, &SurfaceSpec::nv12(64, 64)).expect("surface");
-    surface.sync().expect("sync before export");
+    let surface = one(&display, &SurfaceSpec::nv12(64, 64));
+    surface
+        .sync_timeout(Duration::from_secs(5))
+        .expect("sync before export");
 
     let baseline = open_fd_count();
-    let exported = surface
-        .export_prime(sys::VA_EXPORT_SURFACE_READ_ONLY)
-        .expect("vaExportSurfaceHandle");
+    let exported = surface.export().expect("vaExportSurfaceHandle");
 
-    assert_eq!(exported.fourcc, sys::VA_FOURCC_NV12);
+    assert_eq!(exported.fourcc, va::VA_FOURCC_NV12);
     assert_eq!((exported.width, exported.height), (64, 64));
     assert!(!exported.objects.is_empty(), "no DRM objects exported");
     assert!(!exported.layers.is_empty(), "no layers exported");
@@ -382,39 +403,39 @@ fn picture_typestate_walks_the_va_protocol() {
     let _serial = serial();
     let display = display();
     let config = Config::new(&display, Profile::H264Main, Entrypoint::VLD, &[]).expect("config");
-    let targets = Surface::create_pool(&display, &SurfaceSpec::nv12(1920, 1088), 2).expect("pool");
-    let context =
-        Context::new(&config, 1920, 1088, sys::VA_PROGRESSIVE, &targets).expect("context");
+    let targets = pool(&display, &SurfaceSpec::nv12(1920, 1088), 2);
+    let context = ec_va::create_context(&display, &config, 1920, 1088, Some(&targets), true)
+        .expect("context");
+    let targets: Vec<Rc<Surface>> = targets.into_iter().map(Rc::new).collect();
 
-    // New -> Rendering. Each transition consumes the picture, so nothing can
-    // call `begin` twice or reach `sync` without `end` (see the compile_fail
-    // examples in the `picture` module docs).
-    let picture = Picture::new(&context, Arc::clone(&targets[0]));
-    let picture = picture.begin().expect("vaBeginPicture");
-    assert_eq!(picture.target().id(), targets[0].id());
+    // New -> Begin. Each transition consumes the picture, so nothing can call
+    // `begin` twice or reach `sync` without `end`.
+    let picture = ec_va::Picture::new(0, Rc::clone(&context), Rc::clone(&targets[0]));
+    let picture = picture.begin::<()>().expect("vaBeginPicture");
+    assert_eq!(picture.surface::<()>().id(), targets[0].id());
 
-    // Rendering -> Ended. Submitting a picture with no parameter buffers is a
-    // driver-level error here (mesa creates the decoder lazily from the picture
-    // parameters, so it has nothing to end); what matters is that it surfaces
-    // as a typed error instead of a panic, an abort or a GPU hang. Real
-    // submissions carry parameter/slice buffers and are `ec-hw`'s job.
-    let err = picture
-        .end()
-        .expect_err("empty submission is rejected by radeonsi");
+    // Begin -> Render -> End. Submitting a picture with no parameter buffers
+    // is a driver-level error here (mesa creates the decoder lazily from the
+    // picture parameters); what matters is that it surfaces as a typed error
+    // instead of a panic, an abort or a GPU hang. Real submissions carry
+    // parameter/slice buffers and are `ec-hw`'s job.
+    let failed = picture.render().and_then(|p| p.end());
+    let err = failed
+        .err()
+        .expect("empty submission is rejected by radeonsi");
     assert_eq!(
-        err.status(),
-        Some(sys::VA_STATUS_ERROR_INVALID_CONTEXT),
+        err.va_status(),
+        va::VA_STATUS_ERROR_INVALID_CONTEXT as i32,
         "{err}"
     );
-    assert!(err.to_string().contains("vaEndPicture"), "{err}");
 
     // The display is still usable afterwards: an abandoned picture must not
     // wedge the context.
-    let picture = Picture::new(&context, Arc::clone(&targets[1]))
-        .begin()
+    let picture = ec_va::Picture::new(0, Rc::clone(&context), Rc::clone(&targets[1]))
+        .begin::<()>()
         .expect("second vaBeginPicture after a failed end");
     drop(picture);
-    assert!(display.is_valid());
+    assert!(display.query_vendor_string().is_ok());
 }
 
 #[test]
@@ -423,80 +444,75 @@ fn buffers_map_unmap_and_destroy() {
     let display = display();
     let config =
         Config::new(&display, Profile::H264Main, Entrypoint::EncSlice, &[]).expect("config");
-    let targets = Surface::create_pool(&display, &SurfaceSpec::nv12(1920, 1088), 1).expect("pool");
-    let context =
-        Context::new(&config, 1920, 1088, sys::VA_PROGRESSIVE, &targets).expect("context");
+    let targets = pool(&display, &SurfaceSpec::nv12(1920, 1088), 1);
+    let context = ec_va::create_context(&display, &config, 1920, 1088, Some(&targets), true)
+        .expect("context");
 
-    // Coded-output buffer: allocated empty, mapped, written, unmapped, dropped.
-    const CODED_SIZE: u32 = 1 << 20;
-    let mut coded = ec_va::Buffer::allocate(&context, sys::VAEncCodedBufferType, CODED_SIZE)
+    // Coded-output buffer: allocated empty, mapped, unmapped, dropped.
+    const CODED_SIZE: usize = 1 << 20;
+    let coded = context
+        .create_enc_coded(CODED_SIZE)
         .expect("vaCreateBuffer");
-    assert_eq!(coded.buffer_type(), sys::VAEncCodedBufferType);
-    assert_ne!(coded.id(), sys::VA_INVALID_ID);
+    assert_ne!(coded.id(), va::VA_INVALID_ID);
     {
-        let mut mapped = coded.map().expect("vaMapBuffer");
-        // SAFETY: 64 bytes of a 1 MiB allocation.
-        let slice = unsafe { mapped.as_mut_slice(64) };
-        slice[0] = 0x42;
-        // SAFETY: same 64-byte window, now read-only.
-        assert_eq!(unsafe { mapped.as_slice(64) }[0], 0x42);
+        let mapped = va::MappedCodedBuffer::new(&coded).expect("vaMapBuffer");
+        // Never filled by an encode: no segment carries payload bytes.
+        assert!(mapped.iter().all(|s| s.buf.is_empty()));
     }
     // Mapping again proves the guard released the mapping.
-    drop(coded.map().expect("second vaMapBuffer after unmap"));
+    drop(va::MappedCodedBuffer::new(&coded).expect("second vaMapBuffer after unmap"));
 
     // Parameter buffer: data is copied into driver memory during the call.
-    let params = [0u8; 32];
-    let buffer = ec_va::Buffer::from_bytes(&context, sys::VAEncMiscParameterBufferType, &params)
-        .expect("vaCreateBuffer from bytes");
-    assert_ne!(buffer.id(), sys::VA_INVALID_ID);
-
-    // An empty buffer is refused before it reaches the driver.
-    let err = ec_va::Buffer::from_bytes(&context, sys::VAEncMiscParameterBufferType, &[])
-        .expect_err("empty buffer must be refused");
-    assert!(matches!(err, Error::Protocol(_)), "{err}");
+    let buffer = ec_va::picture::buffer(
+        &context,
+        va::BufferType::EncMiscParameter(va::EncMiscParameter::FrameRate(
+            va::EncMiscParameterFrameRate::new(30, 0),
+        )),
+    )
+    .expect("vaCreateBuffer from a typed parameter");
+    drop(buffer);
+    drop(coded);
 }
 
 #[test]
 fn context_keeps_its_dependencies_alive() {
     let _serial = serial();
     // Dropping the config and the surfaces while the context lives must be
-    // safe: the context holds `Arc`s, so libva's destruction order (buffers ->
+    // safe: the context holds `Rc`s, so libva's destruction order (buffers ->
     // context -> surfaces -> config -> display) cannot be violated.
     let display = display();
     let config = Config::new(&display, Profile::H264Main, Entrypoint::VLD, &[]).expect("config");
-    let targets = Surface::create_pool(&display, &SurfaceSpec::nv12(1920, 1088), 2).expect("pool");
-    let context =
-        Context::new(&config, 1920, 1088, sys::VA_PROGRESSIVE, &targets).expect("context");
-    let target = Arc::clone(&targets[0]);
+    let targets = pool(&display, &SurfaceSpec::nv12(1920, 1088), 2);
+    let context = ec_va::create_context(&display, &config, 1920, 1088, Some(&targets), true)
+        .expect("context");
+    let target = Rc::new(targets.into_iter().next().expect("target"));
     drop(config);
-    drop(targets);
 
-    let picture = Picture::new(&context, target).begin().expect("begin");
+    let picture = ec_va::Picture::new(0, Rc::clone(&context), target)
+        .begin::<()>()
+        .expect("begin");
     drop(picture);
     drop(context);
-    assert!(display.is_valid());
+    assert!(display.query_vendor_string().is_ok());
 }
 
 // --------------------------------------------------------------------------
 // VPP
 // --------------------------------------------------------------------------
 
-/// `vaQueryVideoProcFilters` on the real display: whatever this driver
-/// advertises, the call must succeed and return values `Vpp` can act on. Not
-/// a claim about which filters exist — radeonsi's list is print-only here —
-/// just that the query path works end to end.
+// `vaQueryVideoProcFilters` is no longer wrapped (cros-libva has no such
+// call), so the filter list cannot be printed. The equivalent: a pipeline
+// still opens on the real display and runs a whole-surface NV12 pass.
 #[test]
 fn vpp_filters_probe() {
     let _serial = serial();
     let display = display();
-    let targets = Surface::create_pool(&display, &SurfaceSpec::nv12(1920, 1080), 1).expect("pool");
-    let vpp = ec_va::Vpp::new(&display, sys::VA_RT_FORMAT_YUV420, &targets).expect("vpp opens");
-    let filters = vpp.filters().expect("vaQueryVideoProcFilters");
-    println!("radeonsi VAProcFilterType list: {filters:?}");
-    println!(
-        "HighDynamicRangeToneMapping (8) advertised: {}",
-        filters.contains(&sys::VAProcFilterHighDynamicRangeToneMapping)
-    );
+    let targets = pool(&display, &SurfaceSpec::nv12(1920, 1080), 2);
+    let vpp = ec_va::Vpp::new(&display, va::VA_RT_FORMAT_YUV420, 1920, 1080).expect("vpp opens");
+    let mut it = targets.into_iter();
+    let src = it.next().expect("src");
+    let dst = Rc::new(it.next().expect("dst"));
+    vpp.convert(&src, dst).expect("vpp pipeline runs");
 }
 
 /// `Vpp::convert` end to end: a P010 source surface into an NV12 destination,
@@ -506,20 +522,17 @@ fn vpp_filters_probe() {
 fn vpp_converts_p010_to_nv12() {
     let _serial = serial();
     let display = display();
-    let src_spec = SurfaceSpec::p010(64, 64);
-    let source = Surface::create(&display, &src_spec).expect("p010 source surface");
-    let dest_targets = Surface::create_pool(&display, &SurfaceSpec::nv12(64, 64), 1).expect("pool");
+    let source = one(&display, &SurfaceSpec::p010(64, 64));
+    let dest = Rc::new(one(&display, &SurfaceSpec::nv12(64, 64)));
     let vpp = ec_va::Vpp::new(
         &display,
-        sys::VA_RT_FORMAT_YUV420 | sys::VA_RT_FORMAT_YUV420_10,
-        &dest_targets,
+        va::VA_RT_FORMAT_YUV420 | va::VA_RT_FORMAT_YUV420_10,
+        64,
+        64,
     )
     .expect("vpp opens");
-    let dest = vpp
-        .convert(&source, Arc::clone(&dest_targets[0]))
-        .expect("convert");
-    assert_eq!(dest.id(), dest_targets[0].id());
-    assert!(display.is_valid());
+    let out = vpp.convert(&source, Rc::clone(&dest)).expect("convert");
+    assert_eq!(out.id(), dest.id());
 }
 
 // --------------------------------------------------------------------------
@@ -544,4 +557,82 @@ fn open_fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd")
         .expect("/proc/self/fd")
         .count()
+}
+
+/// Export a painted NV12 surface as DMA-BUFs, import the fds as a new surface,
+/// and read both back: the two must be byte-identical plane for plane. The
+/// import also has to leave no fds behind once it is dropped.
+#[test]
+fn dma_buf_import_reads_back_identical_pixels() {
+    let _serial = serial();
+    let display = display();
+    let (width, height) = (256u32, 192u32);
+    let surface = one(&display, &SurfaceSpec::nv12(width, height));
+    let fmt = image_format(&display, va::VA_FOURCC_NV12);
+
+    // A pattern that varies by row and column, so a shifted or swapped plane
+    // cannot read back equal by accident. The image is written back to the
+    // surface (vaPutImage) when it drops.
+    {
+        let mut source =
+            Image::create_from(&surface, fmt, (width, height), (width, height)).expect("image");
+        let va_image = *source.image();
+        let bytes: &mut [u8] = source.as_mut();
+        for plane in 0..2usize {
+            let pitch = va_image.pitches[plane] as usize;
+            let off = va_image.offsets[plane] as usize;
+            let rows = if plane == 0 { height } else { height / 2 } as usize;
+            for row in 0..rows {
+                for col in 0..pitch {
+                    bytes[off + row * pitch + col] = (row * 7 + col * 3 + plane * 101) as u8;
+                }
+            }
+        }
+    }
+    surface.sync().expect("sync");
+
+    let baseline = open_fd_count();
+    let exported = surface.export().expect("export");
+    let imported =
+        ec_va::surface::import_prime(&display, &exported).expect("import the exported fds");
+    imported.sync().expect("sync the import");
+
+    let from_original =
+        Image::create_from(&surface, fmt, (width, height), (width, height)).expect("read original");
+    let from_import = Image::create_from(&imported, fmt, (width, height), (width, height))
+        .expect("read imported");
+
+    let (io, ic) = (*from_original.image(), *from_import.image());
+    let (original, copy): (&[u8], &[u8]) = (from_original.as_ref(), from_import.as_ref());
+    for plane in 0..2usize {
+        let rows = if plane == 0 { height } else { height / 2 } as usize;
+        let (po, pc) = (io.pitches[plane] as usize, ic.pitches[plane] as usize);
+        let (oo, oc) = (io.offsets[plane] as usize, ic.offsets[plane] as usize);
+        assert_eq!(po, pc, "plane {plane}: pitches differ");
+        let want = &original[oo..oo + po * rows];
+        let got = &copy[oc..oc + pc * rows];
+        assert!(
+            want.iter().any(|&b| b != 0),
+            "plane {plane}: the source read back empty, so the comparison proves nothing"
+        );
+        assert_eq!(
+            want, got,
+            "plane {plane}: the import reads back different pixels"
+        );
+    }
+    drop(from_original);
+    drop(from_import);
+
+    // The export owns its fds: they close with the descriptor, not before.
+    assert!(
+        open_fd_count() >= baseline,
+        "the import closed its fds early"
+    );
+    drop(imported);
+    drop(exported);
+    assert_eq!(
+        open_fd_count(),
+        baseline,
+        "dropping the import and the export leaked file descriptors"
+    );
 }

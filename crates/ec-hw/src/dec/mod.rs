@@ -18,10 +18,13 @@
 //! per-frame timestamp it fed in.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use ec_va::caps::{Entrypoint, Profile};
-use ec_va::{CapReport, Config, ConfigAttrib, Context, Display, Surface, SurfaceSpec, sys};
+use ec_va::va;
+use ec_va::{CapReport, Config, ConfigAttrib, Context, Display, Surface, SurfaceSpec};
 
 use crate::error::{Error, Result};
 use crate::frame::Frame;
@@ -30,14 +33,25 @@ use crate::pool::SurfacePool;
 mod av1;
 mod dpb264;
 mod h264;
-mod hevc;
 mod vp9;
 
+#[doc(hidden)]
 pub use av1::Av1Decoder;
-pub use h264::H264Decoder;
-pub use hevc::HevcDecoder;
-pub use vp9::Vp9Decoder;
+#[doc(hidden)]
+pub use av1::fuzz_build_parameters as av1_fuzz_build_parameters;
+mod hevc;
 
+#[doc(hidden)]
+pub use h264::H264Decoder;
+#[doc(hidden)]
+pub use h264::fuzz_build_parameters as h264_fuzz_build_parameters;
+#[doc(hidden)]
+pub use vp9::Vp9Decoder;
+#[doc(hidden)]
+pub use vp9::fuzz_build_parameters as vp9_fuzz_build_parameters;
+pub use hevc::HevcDecoder;
+#[doc(hidden)]
+pub use hevc::fuzz_build_parameters as hevc_fuzz_build_parameters;
 /// The codecs this crate decodes in hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -66,6 +80,31 @@ pub struct StreamInfo {
     pub num_surfaces: usize,
 }
 
+/// The units of a fuzz input: a run of little-endian `u32` lengths, each followed
+/// by that many bytes. A unit cut short by the end of the input is kept, and it ends
+/// the walk. Lets a fuzz target feed several chunks to one persistent parser.
+pub(crate) fn units(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut rest = data;
+    while let Some((len, tail)) = rest.split_first_chunk::<4>() {
+        let take = (u32::from_le_bytes(*len) as usize).min(tail.len());
+        out.push(&tail[..take]);
+        rest = &tail[take..];
+    }
+    out
+}
+
+/// The RT format a decode context is created with: P010 (`YUV420_10`) for any
+/// stream above 8 bits, HEVC Main 10 included, and 8-bit 4:2:0 otherwise. A
+/// context that asks for 8-bit only cannot take a 10-bit surface.
+pub(crate) fn rt_format_for_bit_depth(bit_depth: u8) -> u32 {
+    if bit_depth > 8 {
+        va::VA_RT_FORMAT_YUV420_10
+    } else {
+        va::VA_RT_FORMAT_YUV420
+    }
+}
+
 /// A hardware decoder for one elementary stream.
 pub struct Decoder {
     inner: Inner,
@@ -73,9 +112,9 @@ pub struct Decoder {
 
 enum Inner {
     H264(Box<H264Decoder>),
-    H265(Box<HevcDecoder>),
     Vp9(Box<Vp9Decoder>),
     Av1(Box<Av1Decoder>),
+    H265(Box<HevcDecoder>),
 }
 
 impl Decoder {
@@ -84,12 +123,12 @@ impl Decoder {
     /// Nothing is allocated on the GPU yet: the surface pool and context need
     /// the stream's size and bit depth, which only its first parameter set
     /// carries, so they are created on the first [`Decoder::decode`] call.
-    pub fn new(display: &Arc<Display>, codec: Codec) -> Result<Decoder> {
+    pub fn new(display: &Rc<Display>, codec: Codec) -> Result<Decoder> {
         let inner = match codec {
             Codec::H264 => Inner::H264(Box::new(H264Decoder::new(display))),
-            Codec::H265 => Inner::H265(Box::new(HevcDecoder::new(display))),
             Codec::Vp9 => Inner::Vp9(Box::new(Vp9Decoder::new(display))),
             Codec::Av1 => Inner::Av1(Box::new(Av1Decoder::new(display))),
+            Codec::H265 => Inner::H265(Box::new(HevcDecoder::new(display))),
         };
         Ok(Decoder { inner })
     }
@@ -99,9 +138,9 @@ impl Decoder {
     pub fn decode(&mut self, data: &[u8], timestamp: i64) -> Result<()> {
         match &mut self.inner {
             Inner::H264(d) => d.decode(data, timestamp),
-            Inner::H265(d) => d.decode(data, timestamp),
             Inner::Vp9(d) => d.decode(data, timestamp),
             Inner::Av1(d) => d.decode(data, timestamp),
+            Inner::H265(d) => d.decode(data, timestamp),
         }
     }
 
@@ -109,9 +148,9 @@ impl Decoder {
     pub fn next_frame(&mut self) -> Option<Frame> {
         match &mut self.inner {
             Inner::H264(d) => d.next_frame(),
-            Inner::H265(d) => d.next_frame(),
             Inner::Vp9(d) => d.next_frame(),
             Inner::Av1(d) => d.next_frame(),
+            Inner::H265(d) => d.next_frame(),
         }
     }
 
@@ -119,9 +158,9 @@ impl Decoder {
     pub fn flush(&mut self) -> Result<()> {
         match &mut self.inner {
             Inner::H264(d) => d.flush(),
-            Inner::H265(d) => d.flush(),
             Inner::Vp9(d) => d.flush(),
             Inner::Av1(d) => d.flush(),
+            Inner::H265(d) => d.flush(),
         }
         Ok(())
     }
@@ -130,9 +169,9 @@ impl Decoder {
     pub fn reset(&mut self) {
         match &mut self.inner {
             Inner::H264(d) => d.reset(),
-            Inner::H265(d) => d.reset(),
             Inner::Vp9(d) => d.reset(),
             Inner::Av1(d) => d.reset(),
+            Inner::H265(d) => d.reset(),
         }
     }
 
@@ -141,7 +180,8 @@ impl Decoder {
     pub fn gap_frames_synthesized(&self) -> u64 {
         match &self.inner {
             Inner::H264(d) => d.gap_frames_synthesized(),
-            _ => 0,
+            Inner::Vp9(_) | Inner::Av1(_) => 0,
+            Inner::H265(_) => 0,
         }
     }
 
@@ -149,9 +189,9 @@ impl Decoder {
     pub fn stream_info(&self) -> Option<StreamInfo> {
         match &self.inner {
             Inner::H264(d) => d.stream_info(),
-            Inner::H265(d) => d.stream_info(),
             Inner::Vp9(d) => d.stream_info(),
             Inner::Av1(d) => d.stream_info(),
+            Inner::H265(d) => d.stream_info(),
         }
     }
 
@@ -161,8 +201,8 @@ impl Decoder {
     pub fn colour(&self) -> Option<crate::frame::Colour> {
         match &self.inner {
             Inner::H264(d) => d.colour(),
-            Inner::H265(d) => d.colour(),
             Inner::Vp9(_) | Inner::Av1(_) => None,
+            Inner::H265(d) => d.colour(),
         }
     }
 }
@@ -198,10 +238,51 @@ impl ReadyFrames {
 }
 
 /// The GPU-side state one decoded stream needs: config, context, surfaces.
+/// A pending picture older than this is settled before the next submit, so a
+/// session that sat idle never submits behind an unchecked picture.
+const IDLE_SETTLE: Duration = Duration::from_millis(250);
+
+/// VA statuses that mean the context or the hardware is gone, not that one
+/// parameter was wrong.
+fn context_gone(status: i32) -> bool {
+    status_is(
+        status,
+        &[
+            va::VA_STATUS_ERROR_INVALID_CONTEXT,
+            va::VA_STATUS_ERROR_OPERATION_FAILED,
+            va::VA_STATUS_ERROR_HW_BUSY,
+            va::VA_STATUS_ERROR_TIMEDOUT,
+            va::VA_STATUS_ERROR_DECODING_ERROR,
+        ],
+    )
+}
+
+/// Whether a `VAStatus` is one of `codes` (libva's constants are unsigned,
+/// `VAStatus` is signed).
+fn status_is(status: i32, codes: &[u32]) -> bool {
+    codes.iter().any(|&c| c as i32 == status)
+}
+
+/// A picture submitted but not yet waited for.
+struct Pending {
+    surface: Rc<Surface>,
+    since: Instant,
+}
+
 pub(crate) struct Session {
-    pub(crate) context: Arc<Context>,
+    /// The process-wide reset epoch this session was created in. Once it moves
+    /// the context has been reset along with the guilty one.
+    born_epoch: u64,
+    /// The last submitted picture, waited for after the next one is submitted
+    /// (depth-1 pipelining; see [`Session::submit`]).
+    pending: std::sync::Mutex<Option<Pending>>,
+    /// Set once a picture hung or lost the GPU context. Every submission after
+    /// that is refused: on Mesa, submitting to a context the kernel has reset
+    /// aborts the whole process from the driver's own thread, which no
+    /// `catch_unwind` can stop.
+    pub(crate) poisoned: std::sync::atomic::AtomicBool,
+    pub(crate) context: Rc<Context>,
     /// The readback image every frame of this stream reuses.
-    pub(crate) images: crate::frame::ImageCache,
     pub(crate) pool: SurfacePool,
     pub(crate) coded_size: (u32, u32),
     pub(crate) display_size: (u32, u32),
@@ -218,13 +299,19 @@ impl Session {
     /// the driver either refuses the config or silently decodes to NV12 and
     /// throws away two bits per sample.
     pub(crate) fn new(
-        display: &Arc<Display>,
+        display: &Rc<Display>,
         profile: Profile,
         coded_size: (u32, u32),
         display_size: (u32, u32),
         bit_depth: u8,
         num_surfaces: usize,
     ) -> Result<Session> {
+        let born_epoch = crate::reset::gpu_reset_epoch();
+        if crate::reset::gpu_recently_reset() {
+            return Err(Error::hw_reset(
+                "the GPU was reset moments ago; new hardware sessions wait out the grace period",
+            ));
+        }
         let caps = CapReport::probe(display)?;
         let entry = caps.entry(profile, Entrypoint::VLD).ok_or_else(|| {
             Error::unsupported(
@@ -233,11 +320,7 @@ impl Session {
             )
         })?;
 
-        let rt_format = if bit_depth > 8 {
-            sys::VA_RT_FORMAT_YUV420_10
-        } else {
-            sys::VA_RT_FORMAT_YUV420
-        };
+        let rt_format = rt_format_for_bit_depth(bit_depth);
         if !entry.supports_rt_format(rt_format) {
             return Err(Error::unsupported(
                 format!("{bit_depth}-bit {profile:?} decode"),
@@ -276,13 +359,22 @@ impl Session {
         } else {
             SurfaceSpec::nv12(w, h)
         }
-        .with_usage_hint(sys::VA_SURFACE_ATTRIB_USAGE_HINT_DECODER);
-        let pool = SurfacePool::new(display, &spec, num_surfaces)?;
-        let context = Context::new(&config, w, h, sys::VA_PROGRESSIVE, pool.targets())?;
+        .with_usage_hint(va::VA_SURFACE_ATTRIB_USAGE_HINT_DECODER);
+        let surfaces = ec_va::create_pool(display, &spec, num_surfaces)?;
+        let context =
+            ec_va::picture::create_context(display, &config, w, h, Some(&surfaces), true)?;
+        let pool = SurfacePool::from_surfaces(surfaces, &spec);
 
+        if crate::reset::gpu_reset_epoch() != born_epoch {
+            return Err(Error::hw_reset(
+                "the GPU was reset while the session was created",
+            ));
+        }
         Ok(Session {
+            born_epoch,
+            pending: std::sync::Mutex::new(None),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
             context,
-            images: crate::frame::ImageCache::default(),
             pool,
             coded_size,
             display_size,
@@ -291,10 +383,21 @@ impl Session {
         })
     }
 
-    /// Submit one picture: begin, render every buffer, end. No sync — the
-    /// driver keeps submissions in order within a context, and the wait belongs
-    /// where the pixels are actually read.
-    pub(crate) fn submit(&self, target: &Arc<Surface>, buffers: Vec<ec_va::Buffer>) -> Result<()> {
+    /// Submit one picture: begin, render every buffer, end, then wait for the
+    /// *previous* picture (depth-1 pipelining).
+    ///
+    /// A corrupt slice can hang the ring; the kernel resets it after its job
+    /// timeout, and every context that submits afterwards is aborted by the
+    /// driver. So a wait that errors or runs long condemns the whole process's
+    /// sessions ([`crate::reset`]) and nothing submits to a reset context.
+    ///
+    /// Waiting for picture N-1 after submitting N keeps the GPU one picture
+    /// ahead of the CPU. It never submits behind an undetected reset: the hung
+    /// picture is waited for right after the next submit (the ring cannot have
+    /// been reset yet, the job timeout is seconds), and a pending picture
+    /// older than [`IDLE_SETTLE`] is settled before anything is submitted.
+    /// Frames read back also watch their wait ([`crate::reset::sync_watched`]).
+    pub(crate) fn submit(&self, target: &Rc<Surface>, buffers: Vec<ec_va::Buffer>) -> Result<()> {
         if buffers.is_empty() {
             // radeonsi answers an empty submission with INVALID_CONTEXT, which
             // reads like a driver bug report rather than what it is: a picture
@@ -303,11 +406,73 @@ impl Session {
                 "refusing to submit a picture with no parameter buffers",
             ));
         }
-        ec_va::Picture::new(&self.context, Arc::clone(target))
-            .begin()?
-            .render_all(buffers)?
-            .end()?;
+        self.check_alive()?;
+        // An old pending picture is waited for first: its wait is instant when
+        // it is done, and an error condemns the session before we submit.
+        let stale = self
+            .pending_slot()
+            .as_ref()
+            .filter(|p| p.since.elapsed() > IDLE_SETTLE)
+            .map(|p| Rc::clone(&p.surface));
+        if let Some(old) = stale {
+            self.settle(&old)?;
+            self.check_alive()?;
+        }
+        let outcome = ec_va::picture::submit(&self.context, Rc::clone(target), buffers);
+        if let Err(e) = outcome {
+            match e.status() {
+                Some(status)
+                    if status_is(
+                        status,
+                        &[
+                            va::VA_STATUS_ERROR_OPERATION_FAILED,
+                            va::VA_STATUS_ERROR_DECODING_ERROR,
+                        ],
+                    ) =>
+                {
+                    self.poison()
+                }
+                Some(status) if context_gone(status) => crate::reset::report_gpu_reset(),
+                _ => {}
+            }
+            return Err(e.into());
+        }
+        let previous = self.pending_slot().replace(Pending {
+            surface: Rc::clone(target),
+            since: Instant::now(),
+        });
+        if let Some(previous) = previous {
+            self.settle(&previous.surface)?;
+        }
         Ok(())
+    }
+
+    fn pending_slot(&self) -> std::sync::MutexGuard<'_, Option<Pending>> {
+        match self.pending.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn check_alive(&self) -> Result<()> {
+        if crate::reset::gpu_reset_epoch() != self.born_epoch {
+            return Err(Error::hw_reset(
+                "the GPU was reset after this session was created; its context is lost",
+            ));
+        }
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::poisoned("an earlier picture failed on the GPU"));
+        }
+        Ok(())
+    }
+
+    fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    /// Wait for a submitted picture, condemning every session on a reset.
+    fn settle(&self, surface: &Surface) -> Result<()> {
+        crate::reset::sync_watched(surface)
     }
 
     pub(crate) fn info(&self) -> StreamInfo {
@@ -318,5 +483,20 @@ impl Session {
             profile: self.profile,
             num_surfaces: self.pool.len(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a decode context was always created 8-bit 4:2:0, so no HEVC
+    // Main 10 stream could decode into its P010 surfaces (cros-codecs patch
+    // in edith vendor/, backend/vaapi/decoder.rs, "upstream's own TODO").
+    #[test]
+    fn decode_context_rt_format_follows_the_bit_depth() {
+        assert_eq!(rt_format_for_bit_depth(8), va::VA_RT_FORMAT_YUV420);
+        assert_eq!(rt_format_for_bit_depth(10), va::VA_RT_FORMAT_YUV420_10);
+        assert_ne!(rt_format_for_bit_depth(10), rt_format_for_bit_depth(8));
     }
 }

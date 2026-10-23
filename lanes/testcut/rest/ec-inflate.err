@@ -1,0 +1,8 @@
+   Compiling simd-adler32 v0.3.10
+   Compiling miniz_oxide v0.8.9
+   Compiling flate2 v1.1.9
+   Compiling ec-inflate v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-inflate)
+    Finished `release` profile [optimized] target(s) in 2.73s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_inflate-13184fa6a8c24ceb)
+     Running tests/inflate.rs (/home/user/.cache/tgt-testcut-rest/release/deps/inflate-09082b92dbd21acb)
+   Doc-tests ec_inflate

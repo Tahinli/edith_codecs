@@ -43,6 +43,8 @@ pub const TRACK_LANGUAGE: u32 = 0x22B59C;
 pub const TRACK_LANGUAGE_BCP47: u32 = 0x22B59D;
 
 pub const VIDEO: u32 = 0xE0;
+pub const FLAG_INTERLACED: u32 = 0x9A;
+pub const FIELD_ORDER: u32 = 0x9D;
 pub const PIXEL_WIDTH: u32 = 0xB0;
 pub const PIXEL_HEIGHT: u32 = 0xBA;
 pub const DISPLAY_WIDTH: u32 = 0x54B0;
@@ -55,6 +57,14 @@ pub const PRIMARIES: u32 = 0x55BB;
 pub const MAX_CLL: u32 = 0x55BC;
 pub const MAX_FALL: u32 = 0x55BD;
 pub const MASTERING_METADATA: u32 = 0x55D0;
+pub const PRIMARY_R_X: u32 = 0x55D1;
+pub const PRIMARY_R_Y: u32 = 0x55D2;
+pub const PRIMARY_G_X: u32 = 0x55D3;
+pub const PRIMARY_G_Y: u32 = 0x55D4;
+pub const PRIMARY_B_X: u32 = 0x55D5;
+pub const PRIMARY_B_Y: u32 = 0x55D6;
+pub const WHITE_POINT_X: u32 = 0x55D7;
+pub const WHITE_POINT_Y: u32 = 0x55D8;
 pub const LUMINANCE_MAX: u32 = 0x55D9;
 pub const LUMINANCE_MIN: u32 = 0x55DA;
 

@@ -4,6 +4,7 @@
 use crate::filterbank::{Imdct, Synthesis, alias_reduce};
 use crate::header::{ChannelMode, FrameHeader, Version, crc16};
 use crate::huffman;
+use crate::layer12::Layer12;
 use crate::tables::{
     LSF_PARTITIONS, MAX_QUANT, PRETAB, SLEN, long_starts, power43, short_starts, short_widths,
 };
@@ -137,6 +138,7 @@ pub struct Mp3Decode {
     xr: [Box<[f32; 576]>; 2],
     scalefac_l: [[u8; 23]; 2],
     scalefac_s: [[[u8; 3]; 13]; 2],
+    layer12: Layer12,
 }
 
 impl Default for Mp3Decode {
@@ -150,6 +152,7 @@ impl Default for Mp3Decode {
             xr: [Box::new([0.0; 576]), Box::new([0.0; 576])],
             scalefac_l: [[0; 23]; 2],
             scalefac_s: [[[0; 3]; 13]; 2],
+            layer12: Layer12::default(),
         }
     }
 }
@@ -166,6 +169,7 @@ impl Mp3Decode {
         for synth in &mut self.synthesis {
             synth.reset();
         }
+        self.layer12.reset();
         for overlap in &mut self.overlap {
             overlap.iter_mut().for_each(|sb| sb.fill(0.0));
         }
@@ -179,12 +183,6 @@ impl Mp3Decode {
     /// is what the reservoir mechanism means.
     pub fn decode_frame(&mut self, frame: &[u8]) -> Result<DecodedFrame> {
         let header = FrameHeader::parse(frame)?;
-        if header.layer != 3 {
-            return Err(Error::unsupported(
-                format!("MPEG audio layer {}", header.layer),
-                "only Layer III is implemented in ec-mp3",
-            ));
-        }
         let Some(frame_len) = header.frame_len() else {
             return Err(Error::unsupported(
                 "free-format MPEG audio",
@@ -193,6 +191,14 @@ impl Mp3Decode {
         };
         if frame.len() < frame_len {
             return Err(Error::NeedMore);
+        }
+        if header.layer != 3 {
+            let samples = self.layer12.decode(&header, &frame[..frame_len])?;
+            return Ok(DecodedFrame {
+                sample_rate: header.sample_rate,
+                channels: header.channels(),
+                samples,
+            });
         }
         let side_len = header.side_info_len();
         let crc_len = usize::from(header.crc) * 2;
@@ -721,15 +727,11 @@ impl Mp3Reader {
                     "no bitrate index, so the frame length is only knowable by scanning",
                 ));
             };
-            if header.layer != 3 {
-                self.consumed += 1;
-                continue;
-            }
             if data.len() < frame_len {
                 return Err(Error::NeedMore);
             }
             let frame = &data[..frame_len];
-            if !self.started && is_info_frame(&header, frame) {
+            if !self.started && header.layer == 3 && is_info_frame(&header, frame) {
                 self.started = true;
                 self.consumed += frame_len;
                 continue;

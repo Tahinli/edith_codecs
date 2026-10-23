@@ -572,12 +572,12 @@ impl Encoder for AlacEncoder {
         let mut interleaved = Vec::with_capacity(audio.samples * channels);
         match (audio.planar, want) {
             (false, SampleFormat::S16) => {
-                for pair in audio.data[0].chunks_exact(2).take(audio.samples * channels) {
+                for pair in audio.data[0].as_chunks::<2>().0.iter().take(audio.samples * channels) {
                     interleaved.push(i32::from(i16::from_ne_bytes([pair[0], pair[1]])) >> shift);
                 }
             }
             (false, _) => {
-                for word in audio.data[0].chunks_exact(4).take(audio.samples * channels) {
+                for word in audio.data[0].as_chunks::<4>().0.iter().take(audio.samples * channels) {
                     interleaved.push(i32::from_ne_bytes([word[0], word[1], word[2], word[3]]) >> shift);
                 }
             }

@@ -202,6 +202,8 @@ pub fn info(data: &[u8]) -> Result<Info> {
         format: ImageFormat::Bmp,
         width: header.width,
         height: header.height,
+        // BMP has no EXIF; the orientation is the identity.
+        orientation: 1,
     })
 }
 
@@ -288,8 +290,11 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
     // indices or direct samples, and the bottom-up flip is the same either way.
     let has_alpha = header.masks[3] != 0
         || (header.bits == 32 && header.compression == BI_RGB && palette.is_empty());
-    let mut out = vec![0u8; width * height * if has_alpha { 4 } else { 3 }];
     let channels = if has_alpha { 4 } else { 3 };
+    // The output is checked before anything else sizes from the header; the RLE index buffer
+    // below is width * height, which this bound already covers.
+    let out_len = limits.check_output(header.width, header.height, channels)?;
+    let mut out = vec![0u8; out_len];
     let row_of = |y: usize| if header.top_down { y } else { height - 1 - y };
 
     match header.compression {

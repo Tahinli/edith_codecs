@@ -546,6 +546,8 @@ pub struct TplCandidate {
 /// distance from the current frame to the query block's own single
 /// reference frame, rather than `start_to_current_frame_offset` from the
 /// first (storage-time) projection.
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn add_tpl_ref_mv(
     tpl: &TplField,
     mi_row: usize,

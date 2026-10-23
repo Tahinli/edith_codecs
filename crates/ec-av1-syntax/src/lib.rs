@@ -253,6 +253,14 @@ impl Av1Parser {
             ObuType::Frame => {
                 let mut r = BitReader::new(payload);
                 let h = self.parse_frame_header_from(&mut r, header, false)?;
+                // An OBU_FRAME codes a frame with tiles, so the spec requires its
+                // show_existing_frame to be 0. A show-existing header returns before
+                // tile_info is read, and the tile group would then index empty tile starts.
+                if h.show_existing_frame {
+                    return Err(Error::corrupt(
+                        "AV1 OBU_FRAME with show_existing_frame = 1 (it must be 0)",
+                    ));
+                }
                 r.align_to_byte();
                 let consumed = (r.bit_position() / 8) as usize;
                 let tiles = parse_tile_group(

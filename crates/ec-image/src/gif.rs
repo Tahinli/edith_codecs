@@ -442,6 +442,8 @@ pub fn info(data: &[u8]) -> Result<Info> {
         format: ImageFormat::Gif,
         width,
         height,
+        // GIF has no EXIF; the orientation is the identity.
+        orientation: 1,
     })
 }
 
@@ -475,23 +477,14 @@ pub fn decode_animation(data: &[u8], limits: Limits) -> Result<Vec<AnimationFram
 
     // The canvas-sized RGBA buffer is the largest allocation; check it
     // against max_alloc before requesting it.
-    let canvas_bytes = (canvas_w as usize)
-        .checked_mul(canvas_h as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| Error::corrupt("GIF: canvas size overflows usize"))?;
-    if canvas_bytes > limits.max_alloc {
-        return Err(Error::unsupported(
-            format!("{canvas_w}x{canvas_h} RGBA canvas"),
-            format!("{canvas_bytes} bytes past the {} limit", limits.max_alloc),
-        ));
-    }
+    let canvas_bytes = limits.check_output(canvas_w, canvas_h, 4)?;
 
     let has_gct = packed & 0x80 != 0;
     let gct_len = 1usize << ((packed & 0x07) + 1);
 
     let global_palette: Vec<[u8; 3]> = if has_gct {
         let raw = r.bytes(gct_len * 3)?;
-        raw.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
+        raw.as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2]]).collect()
     } else {
         Vec::new()
     };
@@ -531,7 +524,7 @@ pub fn decode_animation(data: &[u8], limits: Limits) -> Result<Vec<AnimationFram
 
                 let palette = if has_lct {
                     let raw = r.bytes(lct_len * 3)?;
-                    raw.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
+                    raw.as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2]]).collect()
                 } else if global_palette.is_empty() {
                     return Err(Error::corrupt("GIF: no colour table for frame"));
                 } else {

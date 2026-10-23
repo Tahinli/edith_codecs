@@ -738,17 +738,24 @@ pub(crate) fn inverse_transform_add(
             if adst_cols { iadst16 } else { idct16 },
         ),
     };
-    let mut out = vec![0i32; n * n];
+    // Scratch lives on the stack (at most 16x16). An all-zero input row transforms
+    // to an all-zero row (every stage is linear and rounds 0 to 0), so those rows
+    // are skipped and their zeros are already in place.
+    let mut out = [0i32; 256];
     for i in 0..n {
-        row_fn(&coeffs[i * n..], &mut out[i * n..], bd);
+        let row = &coeffs[i * n..i * n + n];
+        if row.iter().any(|&c| c != 0) {
+            row_fn(row, &mut out[i * n..i * n + n], bd);
+        }
     }
-    let mut temp_in = vec![0i32; n];
-    let mut temp_out = vec![0i32; n];
+    let mut temp_in = [0i32; 16];
+    let mut temp_out = [0i32; 16];
+    let (temp_in, temp_out) = (&mut temp_in[..n], &mut temp_out[..n]);
     for i in 0..n {
         for j in 0..n {
             temp_in[j] = out[j * n + i];
         }
-        col_fn(&temp_in, &mut temp_out, bd);
+        col_fn(temp_in, temp_out, bd);
         for j in 0..n {
             let d = &mut dest[off + j * stride + i];
             *d = clip_add(*d, (temp_out[j] + (1 << (shift - 1))) >> shift, bd);

@@ -1,0 +1,13 @@
+   Compiling ec-ac3 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-ac3)
+    Finished `release` profile [optimized] target(s) in 7.64s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_ac3-4821da7b69ad8066)
+error: test failed, to rerun pass `-p ec-ac3 --lib`
+     Running tests/decode_matrix.rs (/home/user/.cache/tgt-testcut-rest/release/deps/decode_matrix-c250c49f102bad6e)
+     Running tests/dependent.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dependent-c8ec58dada11c0d1)
+     Running tests/encode_matrix.rs (/home/user/.cache/tgt-testcut-rest/release/deps/encode_matrix-d56248581f7c6a7d)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-2765ec8548a253a4)
+     Running tests/packet_walk.rs (/home/user/.cache/tgt-testcut-rest/release/deps/packet_walk-563129329f52c55c)
+     Running tests/real_library.rs (/home/user/.cache/tgt-testcut-rest/release/deps/real_library-52327ddbaddc96a4)
+   Doc-tests ec_ac3
+error: 1 target failed:
+    `-p ec-ac3 --lib`

@@ -99,8 +99,8 @@ impl Decoder for Ac3Decoder {
 /// `i16::MAX` rather than wrap to silence.
 fn s16le(samples: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() / 2);
-    for chunk in samples.chunks_exact(4) {
-        let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for chunk in samples.as_chunks::<4>().0 {
+        let v = f32::from_le_bytes(*chunk);
         let scaled = (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
         out.extend_from_slice(&scaled.to_le_bytes());
     }
@@ -161,8 +161,10 @@ mod tests {
             .flat_map(|v| v.to_le_bytes())
             .collect();
         let got: Vec<i16> = s16le(&pcm)
-            .chunks_exact(2)
-            .map(|s| i16::from_le_bytes([s[0], s[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| i16::from_le_bytes(*s))
             .collect();
         assert_eq!(got, [-32768, -32768, 0, 16384, 32767, 32767]);
     }
@@ -220,7 +222,7 @@ mod tests {
             offset += len;
             while let Ok(Frame::Audio(frame)) = dec.receive_frame() {
                 for plane in &frame.data {
-                    decoded_s16.extend(plane.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+                    decoded_s16.extend(plane.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b)));
                 }
             }
         }

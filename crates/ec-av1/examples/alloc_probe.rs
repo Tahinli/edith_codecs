@@ -1,60 +1,72 @@
 //! Temporary lane-alloc instrument: count allocations and sample backtraces.
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+//!
+//! Allocation totals come from `stats_alloc`. The per-size histogram and the
+//! sampled backtraces come from `tracking-allocator`, which calls back into a
+//! tracker on every allocation. Neither crate needs `unsafe` in this file.
+//! Reallocs are excluded from totals and histogram, as the old hand-written
+//! allocator did.
+use std::alloc::System;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static COUNT: AtomicUsize = AtomicUsize::new(0);
-static BYTES: AtomicUsize = AtomicUsize::new(0);
+use stats_alloc::StatsAlloc;
+use tracking_allocator::{AllocationGroupId, AllocationRegistry, AllocationTracker, Allocator};
+
 static SIZES: [AtomicUsize; 24] = [const { AtomicUsize::new(0) }; 24];
 static TRACES: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
-
-thread_local! { static IN: Cell<bool> = const { Cell::new(false) }; }
+/// `reallocations` as of the last tracked allocation. A realloc bumps that counter
+/// and then reaches the tracker as an allocation, so a bump means "not a new alloc".
+static SEEN_REALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 struct Track;
-unsafe impl GlobalAlloc for Track {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let n = COUNT.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(l.size(), Ordering::Relaxed);
-        let cls = (usize::BITS - l.size().leading_zeros()) as usize;
-        SIZES[cls.min(23)].fetch_add(1, Ordering::Relaxed);
-        if n % 512 == 0 {
-            let re = IN.with(|f| f.replace(true));
-            if !re {
-                let bt = format!("{}", std::backtrace::Backtrace::force_capture());
-                let mut key: Vec<String> = Vec::new();
-                let lines: Vec<&str> = bt.lines().collect();
-                for (i, l) in lines.iter().enumerate() {
-                    if l.contains("ec_av1::") && key.len() < 6 {
-                        let at = lines
-                            .get(i + 1)
-                            .filter(|n| n.trim_start().starts_with("at "))
-                            .map(|n| n.trim().to_string())
-                            .unwrap_or_default();
-                        key.push(format!("{} {}", l.trim(), at));
-                    }
-                }
-                let mut g = TRACES.lock().unwrap();
-                *g.get_or_insert_with(HashMap::new).entry(key.join(" <- ")).or_insert(0) += 1;
-                drop(g);
-                IN.with(|f| f.set(false));
-            }
+impl AllocationTracker for Track {
+    fn allocated(&self, _addr: usize, object_size: usize, _wrapped: usize, _g: AllocationGroupId) {
+        let st = A.stats();
+        if st.reallocations != SEEN_REALLOCS.swap(st.reallocations, Ordering::Relaxed) {
+            return;
         }
-        unsafe { System.alloc(l) }
+        // `allocations` already includes this allocation; index it from 0 like the old counter.
+        let n = st.allocations - 1;
+        let cls = (usize::BITS - object_size.leading_zeros()) as usize;
+        SIZES[cls.min(23)].fetch_add(1, Ordering::Relaxed);
+        if n.is_multiple_of(512) {
+            let bt = format!("{}", std::backtrace::Backtrace::force_capture());
+            let mut key: Vec<String> = Vec::new();
+            let lines: Vec<&str> = bt.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                if l.contains("ec_av1::") && key.len() < 6 {
+                    let at = lines
+                        .get(i + 1)
+                        .filter(|n| n.trim_start().starts_with("at "))
+                        .map(|n| n.trim().to_string())
+                        .unwrap_or_default();
+                    key.push(format!("{} {}", l.trim(), at));
+                }
+            }
+            let mut g = TRACES.lock().unwrap();
+            *g.get_or_insert_with(HashMap::new).entry(key.join(" <- ")).or_insert(0) += 1;
+            // The capture's own reallocs were not tracked; skip them too.
+            SEEN_REALLOCS.store(A.stats().reallocations, Ordering::Relaxed);
+        }
     }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        unsafe { System.dealloc(p, l) }
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        unsafe { System.realloc(p, l, new) }
+    fn deallocated(
+        &self,
+        _addr: usize,
+        _object_size: usize,
+        _wrapped: usize,
+        _source: AllocationGroupId,
+        _current: AllocationGroupId,
+    ) {
     }
 }
 
 #[global_allocator]
-static A: Track = Track;
+static A: StatsAlloc<Allocator<System>> = StatsAlloc::new(Allocator::system());
 
 fn main() {
+    AllocationRegistry::set_global_tracker(Track).expect("tracker");
+    AllocationRegistry::enable_tracking();
     let path = std::env::args().nth(1).expect("usage: alloc_probe <stream.obu>");
     let data = std::fs::read(&path).expect("read");
     let mut shown = 0usize;
@@ -65,11 +77,8 @@ fn main() {
         Ok(())
     });
     println!("shown={shown} result={:?}", r.is_ok());
-    println!(
-        "allocs={} bytes={}",
-        COUNT.load(Ordering::Relaxed),
-        BYTES.load(Ordering::Relaxed)
-    );
+    let st = A.stats();
+    println!("allocs={} bytes={}", st.allocations, st.bytes_allocated);
     for (i, c) in SIZES.iter().enumerate() {
         let v = c.load(Ordering::Relaxed);
         if v > 0 {

@@ -56,6 +56,9 @@ const LEAKAGE_SLOPE: f32 = 2.0;
 const MAX_NEURONS: usize = 32;
 /// `1/128`, the `i8` weight scale (`WEIGHTS_SCALE`).
 const WEIGHTS_SCALE: f32 = 1.0 / 128.0;
+/// libopus's truncated `1.442695` (log2(e)), kept verbatim for bit-exact band energies.
+#[allow(clippy::approx_constant)]
+const LIBOPUS_LOG2_E: f32 = 1.442_695;
 
 /// Tonality band edges in 480-point FFT bins (`tbands`).
 const TBANDS: [usize; NB_TBANDS + 1] = [
@@ -122,7 +125,7 @@ impl Default for AnalysisInfo {
 /// the per-bin phase, kept because the tonality features are calibrated on it.
 pub(crate) fn fast_atan2f(y: f32, x: f32) -> f32 {
     const CA: f32 = 0.431_579_74;
-    const CB: f32 = 0.678_484_04;
+    const CB: f32 = 0.678484;
     const CC: f32 = 0.085_955_42;
     const CE: f32 = core::f32::consts::FRAC_PI_2;
     let x2 = x * x;
@@ -142,11 +145,11 @@ pub(crate) fn fast_atan2f(y: f32, x: f32) -> f32 {
 
 /// libopus `tansig_approx()`.
 fn tansig_approx(x: f32) -> f32 {
-    const N0: f32 = 952.528_02;
-    const N1: f32 = 96.392_357;
-    const N2C: f32 = 0.608_630_42;
-    const D0: f32 = 952.723_99;
-    const D1: f32 = 413.368_01;
+    const N0: f32 = 952.528;
+    const N1: f32 = 96.39236;
+    const N2C: f32 = 0.6086304;
+    const D0: f32 = 952.724;
+    const D1: f32 = 413.368;
     const D2: f32 = 11.886_009;
     let x2 = x * x;
     let num = (N2C * x2 + N1) * x2 + N0;
@@ -552,7 +555,6 @@ impl TonalityAnalysis {
         }
         let mut frame_tonality = 0.0f32;
         let mut max_frame_tonality = 0.0f32;
-        let activity;
         let mut frame_noisiness = 0.0f32;
         let mut frame_stationarity = 0.0f32;
         if self.count == 0 {
@@ -576,7 +578,7 @@ impl TonalityAnalysis {
             for i in 1..4 {
                 e += bin_e(&re, &im, i);
             }
-            band_log2[0] = 0.5 * 1.442_695 * (e + 1e-10).ln();
+            band_log2[0] = 0.5 * LIBOPUS_LOG2_E * (e + 1e-10).ln();
         }
         let mut band_tonality = [0.0f32; NB_TBANDS];
         let mut slope = 0.0f32;
@@ -589,6 +591,8 @@ impl TonalityAnalysis {
                 ne += be * 2.0 * (0.5 - noisiness[i]);
             }
             // Check for extreme band energies that could cause NaNs later.
+            // NaN must take this branch too, so the negated form is deliberate.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
             if !(e < 1e9) || e.is_nan() {
                 self.info[write].valid = false;
                 self.fft_re = re;
@@ -599,7 +603,7 @@ impl TonalityAnalysis {
             frame_noisiness += ne / (1e-15 + e);
             frame_loudness += (e + 1e-10).sqrt();
             log_e[b] = (e + 1e-10).ln();
-            band_log2[b + 1] = 0.5 * 1.442_695 * (e + 1e-10).ln();
+            band_log2[b + 1] = 0.5 * LIBOPUS_LOG2_E * (e + 1e-10).ln();
             self.log_e[self.e_count][b] = log_e[b];
             if self.count == 0 {
                 self.high_e[b] = log_e[b];
@@ -634,7 +638,7 @@ impl TonalityAnalysis {
             band_tonality[b] = (te / (1e-15 + e)).max(stationarity * self.prev_band_tonality[b]);
             frame_tonality += band_tonality[b];
             if b >= NB_TBANDS - NB_TONAL_SKIP_BANDS {
-                frame_tonality -= band_tonality[b - NB_TBANDS + NB_TONAL_SKIP_BANDS];
+                frame_tonality -= band_tonality[b + NB_TONAL_SKIP_BANDS - NB_TBANDS];
             }
             max_frame_tonality =
                 max_frame_tonality.max((1.0 + 0.03 * (b as f32 - NB_TBANDS as f32)) * frame_tonality);
@@ -706,7 +710,7 @@ impl TonalityAnalysis {
             if e * 1e9 > max_e && (em > 3.0 * noise_floor * width || e > noise_floor * width) {
                 bandwidth = b as i32 + 1;
             }
-            is_masked[b] = e < if self.prev_bandwidth >= b as i32 + 1 { 0.01 } else { 0.05 } * bandwidth_mask;
+            is_masked[b] = e < if self.prev_bandwidth > b as i32 { 0.01 } else { 0.05 } * bandwidth_mask;
             bandwidth_mask = (0.05 * bandwidth_mask).max(e);
         }
         // The last two bands have no spectrum, only the energy above 12 kHz.
@@ -766,7 +770,7 @@ impl TonalityAnalysis {
             relative_e = 0.5;
         }
         frame_noisiness /= NB_TBANDS as f32;
-        activity = frame_noisiness + (1.0 - frame_noisiness) * relative_e;
+        let activity = frame_noisiness + (1.0 - frame_noisiness) * relative_e;
         let mut frame_tonality = max_frame_tonality / (NB_TBANDS - NB_TONAL_SKIP_BANDS) as f32;
         frame_tonality = frame_tonality.max(self.prev_tonality * 0.8);
         self.prev_tonality = frame_tonality;

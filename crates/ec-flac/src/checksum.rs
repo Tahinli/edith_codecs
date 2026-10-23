@@ -112,13 +112,10 @@ impl Md5 {
                 return;
             }
         }
-        let mut chunks = data.chunks_exact(64);
-        for chunk in &mut chunks {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(chunk);
-            self.compress(&block);
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            self.compress(block);
         }
-        let rest = chunks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);
         self.used = rest.len();
     }

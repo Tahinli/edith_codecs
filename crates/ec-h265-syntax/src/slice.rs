@@ -121,6 +121,8 @@ pub struct SliceHeader {
     pub cb_qp_offset: i32,
     /// `slice_cr_qp_offset`.
     pub cr_qp_offset: i32,
+    /// `cu_chroma_qp_offset_enabled_flag` (7.3.6.1): CUs may carry a chroma QP offset.
+    pub cu_chroma_qp_offset_enabled: bool,
     /// `slice_deblocking_filter_disabled_flag`, after any override.
     pub deblocking_filter_disabled: bool,
     /// `slice_beta_offset_div2`.
@@ -175,6 +177,7 @@ impl SliceHeader {
             qp_delta,
             cb_qp_offset: 0,
             cr_qp_offset: 0,
+            cu_chroma_qp_offset_enabled: false,
             deblocking_filter_disabled: pps.deblocking_filter_disabled,
             beta_offset_div2: 0,
             tc_offset_div2: 0,
@@ -342,6 +345,7 @@ impl SliceHeader {
                     h.short_term_ref_pic_set = ShortTermRefPicSet::parse(
                         &mut r,
                         sps.num_short_term_ref_pic_sets,
+                        sps.num_short_term_ref_pic_sets,
                         &sps.short_term_ref_pic_sets,
                     )?;
                 } else {
@@ -374,6 +378,16 @@ impl SliceHeader {
                         0
                     };
                     let num_long_term_pics = r.read_ue()?;
+                    // 7-52 and 7.4.7.1: num_long_term_sps is at most the SPS count, and the
+                    // long-term pictures of a slice are bounded by the DPB (32 is the ceiling).
+                    // Checked before the loop sum, which would overflow on u32::MAX inputs.
+                    if num_long_term_sps > sps.num_long_term_ref_pics_sps
+                        || num_long_term_sps.saturating_add(num_long_term_pics) > 32
+                    {
+                        return Err(Error::corrupt(
+                            "HEVC slice header: too many long-term pictures",
+                        ));
+                    }
                     let mut prev_delta_msb = 0u32;
                     for i in 0..num_long_term_sps + num_long_term_pics {
                         let mut entry = LongTermRef::default();
@@ -405,7 +419,9 @@ impl SliceHeader {
                             entry.delta_poc_msb_cycle = if i == 0 || i == num_long_term_sps {
                                 delta
                             } else {
-                                delta + prev_delta_msb
+                                // Saturating: the accumulated cycle is only ever compared, and a
+                                // corrupt run of ue(v) values must not overflow the sum.
+                                delta.saturating_add(prev_delta_msb)
                             };
                             prev_delta_msb = entry.delta_poc_msb_cycle;
                         }
@@ -436,11 +452,12 @@ impl SliceHeader {
                     // an unchecked ue(v) is a header-declared allocation an
                     // attacker fully controls (up to 2^32 entries from a
                     // handful of bits).
-                    if h.num_ref_idx_l0_active_minus1 > 14 || h.num_ref_idx_l1_active_minus1 > 14 {
-                        return Err(Error::corrupt(
-                            "HEVC slice header: num_ref_idx_lX_active_minus1 out of range",
-                        ));
-                    }
+                }
+                // The PPS defaults are checked too: they reach the same sizes.
+                if h.num_ref_idx_l0_active_minus1 > 14 || h.num_ref_idx_l1_active_minus1 > 14 {
+                    return Err(Error::corrupt(
+                        "HEVC slice header: num_ref_idx_lX_active_minus1 out of range",
+                    ));
                 }
                 let num_pic_total_curr = h.short_term_ref_pic_set.num_used_by_curr + num_long_term;
                 if pps.lists_modification_present && num_pic_total_curr > 1 {
@@ -486,6 +503,9 @@ impl SliceHeader {
                 h.cb_qp_offset = r.read_se()?;
                 h.cr_qp_offset = r.read_se()?;
             }
+            if pps.range.chroma_qp_offset_list_enabled {
+                h.cu_chroma_qp_offset_enabled = r.read_bit()?;
+            }
             h.deblocking_filter_disabled = pps.deblocking_filter_disabled;
             h.beta_offset_div2 = pps.beta_offset_div2;
             h.tc_offset_div2 = pps.tc_offset_div2;
@@ -509,12 +529,13 @@ impl SliceHeader {
                 if count as u64 > sps.pic_height_in_ctbs() as u64 * sps.pic_width_in_ctbs() as u64 {
                     return Err(Error::corrupt("HEVC slice: num_entry_point_offsets absurd"));
                 }
-                let offset_len = r.read_ue()? + 1;
+                let offset_len = r.read_ue()?.saturating_add(1);
                 if offset_len > 32 {
                     return Err(Error::corrupt("HEVC slice: offset_len_minus1 > 31"));
                 }
                 for _ in 0..count {
-                    h.entry_point_offsets.push(r.read_bits(offset_len)? + 1);
+                    h.entry_point_offsets
+                        .push(r.read_bits(offset_len)?.saturating_add(1));
                 }
             }
         }
@@ -620,14 +641,27 @@ fn parse_pred_weight_table(
     if chroma {
         table.delta_chroma_log2_weight_denom = r.read_se()?;
     }
-    let chroma_log2 = table.luma_log2_weight_denom as i32 + table.delta_chroma_log2_weight_denom;
+    // 7-56: luma_log2_weight_denom is in 0..=7. Checked before the chroma sum below.
+    if table.luma_log2_weight_denom > 7 {
+        return Err(Error::corrupt(
+            "HEVC pred_weight_table: luma_log2_weight_denom out of range",
+        ));
+    }
+    let chroma_log2 =
+        (table.luma_log2_weight_denom as i32).saturating_add(table.delta_chroma_log2_weight_denom);
     if !(0..=7).contains(&chroma_log2) {
         return Err(Error::corrupt(
             "HEVC pred_weight_table: ChromaLog2WeightDenom out of range",
         ));
     }
-    // A fuzzed SPS can name any bit depth; the shift below has to survive it.
-    let half_range = 1i64 << (sps.bit_depth_chroma_minus8.min(8) + 7);
+    // wpOffsetHalfRangeC = 1 << (high_precision_offsets_enabled_flag ? (BitDepthC - 1) : 7).
+    // The offset scaling by BitDepthC happens in weighted prediction.
+    let half_range = 1i64
+        << if sps.range.high_precision_offsets_enabled {
+            sps.bit_depth_chroma_minus8 + 7
+        } else {
+            7
+        };
 
     let lists: &[u32] = if h.slice_type == SliceType::B {
         &[
@@ -709,6 +743,7 @@ mod tests {
             max_transform_hierarchy_depth_inter: 0,
             max_transform_hierarchy_depth_intra: 0,
             scaling_list_enabled: false,
+            scaling_list: None,
             amp_enabled: false,
             sao_enabled: false,
             pcm_enabled: false,
@@ -722,6 +757,9 @@ mod tests {
             strong_intra_smoothing: true,
             ptl: ProfileTierLevel::main(120),
             vui: None,
+            max_latency_increase_plus1: 0,
+            extension_flags: 0,
+            range: Default::default(),
         }
     }
 
@@ -749,6 +787,31 @@ mod tests {
     }
 
     #[test]
+    fn entry_point_counts_past_32_and_past_u8_round_trip() {
+        // A 4K wavefront film has 33 (PicHeightInCtbsY - 1), past the [u32; 32]
+        // the parser once held; 20 x 22 tiles give 440, past what a u8 product holds.
+        let pps = Pps {
+            entropy_coding_sync_enabled: true,
+            tiles_enabled: true,
+            deblocking_filter_control_present: true,
+            deblocking_filter_disabled: true,
+            ..Pps::default()
+        };
+        let sps = sps();
+        assert!(sps.pic_width_in_ctbs() as usize * sps.pic_height_in_ctbs() as usize >= 440);
+        for count in [33usize, 440] {
+            let mut header = SliceHeader::intra(&pps, 0);
+            header.entry_point_offsets = (0..count as u32).map(|i| 100 + i).collect();
+            let mut w = BitWriter::new();
+            header.write(&mut w, &sps, &pps, NalUnitType::IdrWRadl);
+            let rbsp = w.into_bytes();
+            let (parsed, _) = SliceHeader::parse(&rbsp, &sps, &pps, NalUnitType::IdrWRadl).unwrap();
+            assert_eq!(parsed.entry_point_offsets.len(), count);
+            assert_eq!(parsed, header);
+        }
+    }
+
+    #[test]
     fn emulation_prevention_bytes_are_counted() {
         assert_eq!(count_emulation_prevention_bytes(&[0, 0, 3, 1, 0xff]), 1);
         assert_eq!(count_emulation_prevention_bytes(&[0, 0, 3, 0, 0, 3, 2]), 2);
@@ -767,5 +830,39 @@ mod tests {
         };
         let escaped = [0u8, 0, 3, 1, 0xff];
         assert_eq!(pos.slice_data_byte_offset(&escaped), 2 + 5);
+    }
+
+    #[test]
+    fn chroma_offset_uses_half_range_128_at_10_bits() {
+        // 10-bit Main10 SPS, P slice with one reference, chroma denom 1 (luma 0 + delta 1).
+        // Cb: delta weight 2 gives ChromaWeight 2 + 2 = 4, delta offset 10.
+        //   7-56: 128 + 10 - ((128 * 4) >> 1) = 138 - 256 = -118.
+        // Cr: delta weight -1 gives ChromaWeight 2 - 1 = 1, delta offset 0.
+        //   7-56: 128 + 0 - ((128 * 1) >> 1) = 128 - 64 = 64.
+        // The old 1 << (BitDepthC - 1) = 512 half range would give -502 and 256 instead.
+        let pps = Pps::default();
+        let mut sps = sps();
+        sps.bit_depth_chroma_minus8 = 2;
+        let mut h = SliceHeader::intra(&pps, 0);
+        h.slice_type = SliceType::P;
+        h.num_ref_idx_l0_active_minus1 = 0;
+
+        let mut w = BitWriter::new();
+        w.write_ue(0); // luma_log2_weight_denom
+        w.write_se(1); // delta_chroma_log2_weight_denom
+        w.write_bit(false); // luma_weight_l0_flag[0]
+        w.write_bit(true); // chroma_weight_l0_flag[0]
+        w.write_se(2); // delta_chroma_weight_l0[0][Cb]
+        w.write_se(10); // delta_chroma_offset_l0[0][Cb]
+        w.write_se(-1); // delta_chroma_weight_l0[0][Cr]
+        w.write_se(0); // delta_chroma_offset_l0[0][Cr]
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let table = parse_pred_weight_table(&mut r, &h, &sps).unwrap();
+        assert_eq!(table.delta_chroma_log2_weight_denom, 1);
+        assert_eq!(table.l0.len(), 1);
+        assert_eq!(table.l0[0].luma, None);
+        assert_eq!(table.l0[0].chroma, Some([(2, -118), (-1, 64)]));
     }
 }

@@ -1109,6 +1109,8 @@ fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
 /// absolute threshold of hearing as a lower bound: below it the residue
 /// quantises to zero and costs a class-0 partition. `headroom` is tilted per
 /// post by [`headroom_tilt`]: more at LF for a finer step, less at HF.
+// Ten inputs, each a distinct curve the fit weighs; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn fit_floor(
     floor: &Floor1,
     ath: &[f64],
@@ -1758,9 +1760,11 @@ impl Encoder for VorbisEncoder {
 /// Little-endian floats out of a plane.
 fn floats(plane: &Buf, count: usize) -> Vec<f32> {
     plane
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take(count)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 

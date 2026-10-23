@@ -186,11 +186,13 @@ impl Real for f64 {
 /// Multiplies `data` by `factor` in place, vectorised.
 pub(crate) fn scale<T: Real>(data: &mut [T], factor: T) {
     let fv = factor.splat();
-    let mut chunks = data.chunks_exact_mut(T::LANES);
-    for chunk in &mut chunks {
+    // Split off the whole-lane prefix; `chunks_mut` over it yields only full chunks.
+    let full = data.len() / T::LANES * T::LANES;
+    let (head, tail) = data.split_at_mut(full);
+    for chunk in head.chunks_mut(T::LANES) {
         T::store(T::load(chunk) * fv, chunk);
     }
-    for v in chunks.into_remainder() {
+    for v in tail {
         *v = *v * factor;
     }
 }

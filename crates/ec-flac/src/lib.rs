@@ -179,7 +179,7 @@ mod tests {
             };
             assert_eq!(frame.format, SampleFormat::S16);
             assert_eq!(frame.channels(), 2);
-            for chunk in frame.data[0].chunks_exact(2).take(frame.samples * 2) {
+            for chunk in frame.data[0].as_chunks::<2>().0.iter().take(frame.samples * 2) {
                 got.push(i16::from_ne_bytes([chunk[0], chunk[1]]) as i32);
             }
         }

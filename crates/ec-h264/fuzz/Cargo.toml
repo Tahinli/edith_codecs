@@ -1,0 +1,31 @@
+[package]
+name = "ec-h264-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ec-core = { path = "../../ec-core" }
+ec-h264 = { path = ".." }
+
+# Kept out of the main workspace: see `exclude` in the root Cargo.toml.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_annexb"
+path = "fuzz_targets/decode_annexb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_avcc"
+path = "fuzz_targets/decode_avcc.rs"
+test = false
+doc = false
+bench = false

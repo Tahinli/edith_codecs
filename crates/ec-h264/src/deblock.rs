@@ -2,6 +2,7 @@
 //! macroblock is intra, so boundary strength is 4 on macroblock edges and 3
 //! inside (8.7.2.1) — no motion-vector or reference comparisons yet.
 
+use crate::sample::Sample;
 use crate::tables::{ALPHA, BETA, CHROMA_QP, TC0};
 
 /// Filter parameters of one edge segment.
@@ -20,21 +21,27 @@ pub struct EdgeParams {
 /// Resolve thresholds (spec 8.7.2.2) for a luma or chroma edge.
 /// `qp_avg` = (qPp + qPq + 1) >> 1, offsets are the slice's FilterOffsetA/B.
 #[inline]
-pub fn edge_params(qp_avg: i32, offset_a: i32, offset_b: i32, bs: u8) -> EdgeParams {
+pub fn edge_params(qp_avg: i32, offset_a: i32, offset_b: i32, bs: u8, bd: u32) -> EdgeParams {
+    let scale = bd - 8;
     let index_a = (qp_avg + offset_a).clamp(0, 51) as usize;
     let index_b = (qp_avg + offset_b).clamp(0, 51) as usize;
     EdgeParams {
-        alpha: i32::from(ALPHA[index_a]),
-        beta: i32::from(BETA[index_b]),
-        tc0: i32::from(TC0[(bs - 1).min(2) as usize][index_a]),
+        alpha: i32::from(ALPHA[index_a]) << scale,
+        beta: i32::from(BETA[index_b]) << scale,
+        tc0: i32::from(TC0[(bs - 1).min(2) as usize][index_a]) << scale,
         bs,
     }
 }
 
 /// Map a luma QP to the chroma QP for deblocking (spec 8.7.2 via 8.5.8).
 #[inline]
-pub fn chroma_qp(qp_luma: i32, offset: i32) -> i32 {
-    i32::from(CHROMA_QP[(qp_luma + offset).clamp(0, 51) as usize])
+pub fn chroma_qp(qp_luma: i32, offset: i32, qp_bd_offset: i32) -> i32 {
+    let qpi = (qp_luma + offset).clamp(-qp_bd_offset, 51);
+    if qpi < 0 {
+        qpi
+    } else {
+        i32::from(CHROMA_QP[qpi as usize])
+    }
 }
 
 /// Filter one line of samples across a luma edge (spec 8.7.2.3 / 8.7.2.4).
@@ -43,77 +50,89 @@ pub fn chroma_qp(qp_luma: i32, offset: i32) -> i32 {
 /// across the edge (1 for vertical edges, stride for horizontal), and `edge`
 /// is the index of q0. Samples p3..q3 must be in bounds.
 #[inline]
-pub fn filter_luma_line(data: &mut [u8], edge: usize, s: usize, e: &EdgeParams) {
-    let q0 = i32::from(data[edge]);
-    let p0 = i32::from(data[edge - s]);
+pub fn filter_luma_line<S: Sample>(
+    data: &mut [S],
+    max: i32,
+    edge: usize,
+    s: usize,
+    e: &EdgeParams,
+) {
+    let q0 = data[edge].to_i32();
+    let p0 = data[edge - s].to_i32();
     if (p0 - q0).abs() >= e.alpha {
         return;
     }
-    let p1 = i32::from(data[edge - 2 * s]);
-    let q1 = i32::from(data[edge + s]);
+    let p1 = data[edge - 2 * s].to_i32();
+    let q1 = data[edge + s].to_i32();
     if (p1 - p0).abs() >= e.beta || (q1 - q0).abs() >= e.beta {
         return;
     }
-    let p2 = i32::from(data[edge - 3 * s]);
-    let q2 = i32::from(data[edge + 2 * s]);
+    let p2 = data[edge - 3 * s].to_i32();
+    let q2 = data[edge + 2 * s].to_i32();
     let ap = (p2 - p0).abs();
     let aq = (q2 - q0).abs();
     if e.bs < 4 {
         let tc = e.tc0 + i32::from(ap < e.beta) + i32::from(aq < e.beta);
         let delta = (((q0 - p0) * 4 + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-        data[edge - s] = (p0 + delta).clamp(0, 255) as u8;
-        data[edge] = (q0 - delta).clamp(0, 255) as u8;
+        data[edge - s] = S::clip(p0 + delta, max);
+        data[edge] = S::clip(q0 - delta, max);
         if ap < e.beta {
             let d = ((p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1).clamp(-e.tc0, e.tc0);
-            data[edge - 2 * s] = (p1 + d) as u8;
+            data[edge - 2 * s] = S::from_i32(p1 + d);
         }
         if aq < e.beta {
             let d = ((q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1).clamp(-e.tc0, e.tc0);
-            data[edge + s] = (q1 + d) as u8;
+            data[edge + s] = S::from_i32(q1 + d);
         }
     } else {
         // bS == 4 (8.7.2.4).
         let strong = (p0 - q0).abs() < (e.alpha >> 2) + 2;
         if strong && ap < e.beta {
-            let p3 = i32::from(data[edge - 4 * s]);
-            data[edge - s] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u8;
-            data[edge - 2 * s] = ((p2 + p1 + p0 + q0 + 2) >> 2) as u8;
-            data[edge - 3 * s] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) as u8;
+            let p3 = data[edge - 4 * s].to_i32();
+            data[edge - s] = S::from_i32((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3);
+            data[edge - 2 * s] = S::from_i32((p2 + p1 + p0 + q0 + 2) >> 2);
+            data[edge - 3 * s] = S::from_i32((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3);
         } else {
-            data[edge - s] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
+            data[edge - s] = S::from_i32((2 * p1 + p0 + q1 + 2) >> 2);
         }
         if strong && aq < e.beta {
-            let q3 = i32::from(data[edge + 3 * s]);
-            data[edge] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) as u8;
-            data[edge + s] = ((p0 + q0 + q1 + q2 + 2) >> 2) as u8;
-            data[edge + 2 * s] = ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) as u8;
+            let q3 = data[edge + 3 * s].to_i32();
+            data[edge] = S::from_i32((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3);
+            data[edge + s] = S::from_i32((p0 + q0 + q1 + q2 + 2) >> 2);
+            data[edge + 2 * s] = S::from_i32((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3);
         } else {
-            data[edge] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
+            data[edge] = S::from_i32((2 * q1 + q0 + p1 + 2) >> 2);
         }
     }
 }
 
 /// Filter one line across a chroma edge (chromaStyleFilteringFlag = 1).
 #[inline]
-pub fn filter_chroma_line(data: &mut [u8], edge: usize, s: usize, e: &EdgeParams) {
-    let q0 = i32::from(data[edge]);
-    let p0 = i32::from(data[edge - s]);
+pub fn filter_chroma_line<S: Sample>(
+    data: &mut [S],
+    max: i32,
+    edge: usize,
+    s: usize,
+    e: &EdgeParams,
+) {
+    let q0 = data[edge].to_i32();
+    let p0 = data[edge - s].to_i32();
     if (p0 - q0).abs() >= e.alpha {
         return;
     }
-    let p1 = i32::from(data[edge - 2 * s]);
-    let q1 = i32::from(data[edge + s]);
+    let p1 = data[edge - 2 * s].to_i32();
+    let q1 = data[edge + s].to_i32();
     if (p1 - p0).abs() >= e.beta || (q1 - q0).abs() >= e.beta {
         return;
     }
     if e.bs < 4 {
         let tc = e.tc0 + 1;
         let delta = (((q0 - p0) * 4 + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
-        data[edge - s] = (p0 + delta).clamp(0, 255) as u8;
-        data[edge] = (q0 - delta).clamp(0, 255) as u8;
+        data[edge - s] = S::clip(p0 + delta, max);
+        data[edge] = S::clip(q0 - delta, max);
     } else {
-        data[edge - s] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8;
-        data[edge] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8;
+        data[edge - s] = S::from_i32((2 * p1 + p0 + q1 + 2) >> 2);
+        data[edge] = S::from_i32((2 * q1 + q0 + p1 + 2) >> 2);
     }
 }
 
@@ -289,17 +308,17 @@ mod tests {
 
     #[test]
     fn thresholds_clamp_and_lookup() {
-        let e = edge_params(26, 0, 0, 3);
+        let e = edge_params(26, 0, 0, 3, 8);
         assert_eq!(e.alpha, i32::from(ALPHA[26]));
         assert_eq!(e.beta, i32::from(BETA[26]));
         assert_eq!(e.tc0, i32::from(TC0[2][26]));
         // Offsets push the index outside [0, 51] and clamp.
-        let e2 = edge_params(51, 12, 12, 4);
+        let e2 = edge_params(51, 12, 12, 4, 8);
         assert_eq!(e2.alpha, 255);
-        let e3 = edge_params(0, -12, -12, 3);
+        let e3 = edge_params(0, -12, -12, 3, 8);
         assert_eq!(e3.alpha, 0);
-        assert_eq!(chroma_qp(51, 0), 39);
-        assert_eq!(chroma_qp(20, 2), 22);
+        assert_eq!(chroma_qp(51, 0, 0), 39);
+        assert_eq!(chroma_qp(20, 2, 0), 22);
     }
 
     /// A hard step across a bS=4 edge at moderate QP gets smoothed; a flat
@@ -308,12 +327,12 @@ mod tests {
     fn strong_filter_smooths_step() {
         // Line: p3 p2 p1 p0 | q0 q1 q2 q3.
         let mut line = [60u8, 60, 60, 60, 80, 80, 80, 80];
-        let e = edge_params(32, 0, 0, 4);
-        filter_luma_line(&mut line, 4, 1, &e);
+        let e = edge_params(32, 0, 0, 4, 8);
+        filter_luma_line(&mut line, 255, 4, 1, &e);
         // (p0, q0) move toward each other.
         assert!(line[3] > 60 && line[4] < 80, "{line:?}");
         let mut flat = [90u8; 8];
-        filter_luma_line(&mut flat, 4, 1, &e);
+        filter_luma_line(&mut flat, 255, 4, 1, &e);
         assert_eq!(flat, [90; 8]);
     }
 
@@ -321,16 +340,16 @@ mod tests {
     #[test]
     fn large_step_is_preserved() {
         let mut line = [10u8, 10, 10, 10, 200, 200, 200, 200];
-        let e = edge_params(26, 0, 0, 4);
-        filter_luma_line(&mut line, 4, 1, &e);
+        let e = edge_params(26, 0, 0, 4, 8);
+        filter_luma_line(&mut line, 255, 4, 1, &e);
         assert_eq!(line, [10, 10, 10, 10, 200, 200, 200, 200]);
     }
 
     #[test]
     fn chroma_filter_touches_only_p0_q0() {
         let mut line = [60u8, 60, 60, 60, 74, 74, 74, 74];
-        let e = edge_params(32, 0, 0, 3);
-        filter_chroma_line(&mut line, 4, 1, &e);
+        let e = edge_params(32, 0, 0, 3, 8);
+        filter_chroma_line(&mut line, 255, 4, 1, &e);
         assert_eq!(line[2], 60);
         assert_eq!(line[5], 74);
         assert!(line[3] >= 60 && line[4] <= 74);

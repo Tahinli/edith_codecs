@@ -1,11 +1,20 @@
-//! HEVC decode parameter buffers (`va.h:5287`, `va_dec_hevc.h`).
+//! HEVC decode parameter buffers (`va.h:5287`, `va_dec_hevc.h`), as plain Rust
+//! values.
+//!
+//! Every struct here carries the fields of the libva buffer it becomes, under
+//! the same names. [`PictureParameterBufferHEVC::to_buffer`] and friends hand
+//! them to cros-libva's typed constructors, which lay them out for the driver.
 
-use ec_va::sys::{
-    VAIQMatrixBufferType, VAPictureParameterBufferType, VASliceParameterBufferType, VASurfaceID,
+use ec_va::va::{
+    BufferType, HevcLongSliceFlags, HevcPicFields, HevcSliceParsingFields, IQMatrix, PictureHEVC,
+    PictureParameter, SliceParameter,
+};
+use ec_va::va::{
+    IQMatrixBufferHEVC as CrosIQMatrix, PictureParameterBufferHEVC as CrosPicture,
+    SliceParameterBufferHEVC as CrosSlice,
 };
 
-use super::{INVALID_SURFACE, VaParam};
-use crate::va_bits;
+use super::INVALID_SURFACE;
 
 /// `VA_PICTURE_HEVC_INVALID`.
 pub const PICTURE_INVALID: u32 = 0x0000_0001;
@@ -23,16 +32,14 @@ pub const PICTURE_RPS_ST_CURR_AFTER: u32 = 0x0000_0020;
 pub const PICTURE_RPS_LT_CURR: u32 = 0x0000_0040;
 
 /// `VAPictureHEVC`, `va.h:5287`.
-#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VAPictureHEVC {
     /// Surface holding the picture, or [`INVALID_SURFACE`].
-    pub picture_id: VASurfaceID,
+    pub picture_id: u32,
     /// `PicOrderCntVal`.
     pub pic_order_cnt: i32,
     /// `VA_PICTURE_HEVC_*` bitmask.
     pub flags: u32,
-    pub(crate) va_reserved: [u32; 4],
 }
 
 impl VAPictureHEVC {
@@ -41,17 +48,19 @@ impl VAPictureHEVC {
         picture_id: INVALID_SURFACE,
         pic_order_cnt: 0,
         flags: PICTURE_INVALID,
-        va_reserved: [0; 4],
     };
 
     /// A reference or current picture.
-    pub fn new(picture_id: VASurfaceID, pic_order_cnt: i32, flags: u32) -> VAPictureHEVC {
+    pub fn new(picture_id: u32, pic_order_cnt: i32, flags: u32) -> VAPictureHEVC {
         VAPictureHEVC {
             picture_id,
             pic_order_cnt,
             flags,
-            va_reserved: [0; 4],
         }
+    }
+
+    fn to_cros(self) -> PictureHEVC {
+        PictureHEVC::new(self.picture_id, self.pic_order_cnt, self.flags)
     }
 }
 
@@ -61,54 +70,53 @@ impl Default for VAPictureHEVC {
     }
 }
 
-va_bits! {
-    /// `VAPictureParameterBufferHEVC::pic_fields`.
-    PicFields: u32 {
-        chroma_format_idc: 2,
-        separate_colour_plane_flag: 1,
-        pcm_enabled_flag: 1,
-        scaling_list_enabled_flag: 1,
-        transform_skip_enabled_flag: 1,
-        amp_enabled_flag: 1,
-        strong_intra_smoothing_enabled_flag: 1,
-        sign_data_hiding_enabled_flag: 1,
-        constrained_intra_pred_flag: 1,
-        cu_qp_delta_enabled_flag: 1,
-        weighted_pred_flag: 1,
-        weighted_bipred_flag: 1,
-        transquant_bypass_enabled_flag: 1,
-        tiles_enabled_flag: 1,
-        entropy_coding_sync_enabled_flag: 1,
-        pps_loop_filter_across_slices_enabled_flag: 1,
-        loop_filter_across_tiles_enabled_flag: 1,
-        pcm_loop_filter_disabled_flag: 1,
-        no_pic_reordering_flag: 1,
-        no_bi_pred_flag: 1,
-    }
+/// `VAPictureParameterBufferHEVC::pic_fields`, one field per flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct PicFields {
+    pub chroma_format_idc: u32,
+    pub separate_colour_plane_flag: u32,
+    pub pcm_enabled_flag: u32,
+    pub scaling_list_enabled_flag: u32,
+    pub transform_skip_enabled_flag: u32,
+    pub amp_enabled_flag: u32,
+    pub strong_intra_smoothing_enabled_flag: u32,
+    pub sign_data_hiding_enabled_flag: u32,
+    pub constrained_intra_pred_flag: u32,
+    pub cu_qp_delta_enabled_flag: u32,
+    pub weighted_pred_flag: u32,
+    pub weighted_bipred_flag: u32,
+    pub transquant_bypass_enabled_flag: u32,
+    pub tiles_enabled_flag: u32,
+    pub entropy_coding_sync_enabled_flag: u32,
+    pub pps_loop_filter_across_slices_enabled_flag: u32,
+    pub loop_filter_across_tiles_enabled_flag: u32,
+    pub pcm_loop_filter_disabled_flag: u32,
+    pub no_pic_reordering_flag: u32,
+    pub no_bi_pred_flag: u32,
 }
 
-va_bits! {
-    /// `VAPictureParameterBufferHEVC::slice_parsing_fields`.
-    SliceParsingFields: u32 {
-        lists_modification_present_flag: 1,
-        long_term_ref_pics_present_flag: 1,
-        sps_temporal_mvp_enabled_flag: 1,
-        cabac_init_present_flag: 1,
-        output_flag_present_flag: 1,
-        dependent_slice_segments_enabled_flag: 1,
-        pps_slice_chroma_qp_offsets_present_flag: 1,
-        sample_adaptive_offset_enabled_flag: 1,
-        deblocking_filter_override_enabled_flag: 1,
-        pps_disable_deblocking_filter_flag: 1,
-        slice_segment_header_extension_present_flag: 1,
-        rap_pic_flag: 1,
-        idr_pic_flag: 1,
-        intra_pic_flag: 1,
-    }
+/// `VAPictureParameterBufferHEVC::slice_parsing_fields`, one field per flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct SliceParsingFields {
+    pub lists_modification_present_flag: u32,
+    pub long_term_ref_pics_present_flag: u32,
+    pub sps_temporal_mvp_enabled_flag: u32,
+    pub cabac_init_present_flag: u32,
+    pub output_flag_present_flag: u32,
+    pub dependent_slice_segments_enabled_flag: u32,
+    pub pps_slice_chroma_qp_offsets_present_flag: u32,
+    pub sample_adaptive_offset_enabled_flag: u32,
+    pub deblocking_filter_override_enabled_flag: u32,
+    pub pps_disable_deblocking_filter_flag: u32,
+    pub slice_segment_header_extension_present_flag: u32,
+    pub rap_pic_flag: u32,
+    pub idr_pic_flag: u32,
+    pub intra_pic_flag: u32,
 }
 
 /// `VAPictureParameterBufferHEVC`, `va_dec_hevc.h:57`.
-#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PictureParameterBufferHEVC {
     /// The picture being decoded.
@@ -161,17 +169,17 @@ pub struct PictureParameterBufferHEVC {
     pub num_tile_columns_minus1: u8,
     /// `num_tile_rows_minus1`.
     pub num_tile_rows_minus1: u8,
-    /// `column_width_minus1`, filled even for uniform spacing.
+    /// `column_width_minus1`.
     pub column_width_minus1: [u16; 19],
-    /// `row_height_minus1`, filled even for uniform spacing.
+    /// `row_height_minus1`.
     pub row_height_minus1: [u16; 21],
-    /// Flags a driver needs to parse slice segment headers.
+    /// Slice parsing flags.
     pub slice_parsing_fields: SliceParsingFields,
     /// `log2_max_pic_order_cnt_lsb_minus4`.
     pub log2_max_pic_order_cnt_lsb_minus4: u8,
     /// `num_short_term_ref_pic_sets`.
     pub num_short_term_ref_pic_sets: u8,
-    /// `num_long_term_ref_pics_sps`.
+    /// `num_long_term_ref_pic_sps`.
     pub num_long_term_ref_pic_sps: u8,
     /// `num_ref_idx_l0_default_active_minus1`.
     pub num_ref_idx_l0_default_active_minus1: u8,
@@ -183,10 +191,8 @@ pub struct PictureParameterBufferHEVC {
     pub pps_tc_offset_div2: i8,
     /// `num_extra_slice_header_bits`.
     pub num_extra_slice_header_bits: u8,
-    /// Size in bits of the `st_ref_pic_set()` written in the slice header, so
-    /// the driver can skip it; zero when the slice referenced an SPS set.
+    /// Bits used by the short-term RPS in the slice header.
     pub st_rps_bits: u32,
-    pub(crate) va_reserved: [u32; 8],
 }
 
 impl Default for PictureParameterBufferHEVC {
@@ -229,58 +235,137 @@ impl Default for PictureParameterBufferHEVC {
             pps_tc_offset_div2: 0,
             num_extra_slice_header_bits: 0,
             st_rps_bits: 0,
-            va_reserved: [0; 8],
         }
     }
 }
 
-// SAFETY: `#[repr(C)]` transcription of `VAPictureParameterBufferHEVC`, checked
-// by the assertion block below; all fields are integers or integer arrays.
-unsafe impl VaParam for PictureParameterBufferHEVC {
-    const TYPE: i32 = VAPictureParameterBufferType;
-}
-
-va_bits! {
-    /// `VASliceParameterBufferHEVC::LongSliceFlags`.
-    LongSliceFlags: u32 {
-        last_slice_of_pic: 1,
-        dependent_slice_segment_flag: 1,
-        slice_type: 2,
-        color_plane_id: 2,
-        slice_sao_luma_flag: 1,
-        slice_sao_chroma_flag: 1,
-        mvd_l1_zero_flag: 1,
-        cabac_init_flag: 1,
-        slice_temporal_mvp_enabled_flag: 1,
-        slice_deblocking_filter_disabled_flag: 1,
-        collocated_from_l0_flag: 1,
-        slice_loop_filter_across_slices_enabled_flag: 1,
+impl PictureParameterBufferHEVC {
+    /// The typed cros-libva buffer for this picture.
+    pub fn to_buffer(&self) -> BufferType {
+        let f = self.pic_fields;
+        let pic = HevcPicFields::new(
+            f.chroma_format_idc,
+            f.separate_colour_plane_flag,
+            f.pcm_enabled_flag,
+            f.scaling_list_enabled_flag,
+            f.transform_skip_enabled_flag,
+            f.amp_enabled_flag,
+            f.strong_intra_smoothing_enabled_flag,
+            f.sign_data_hiding_enabled_flag,
+            f.constrained_intra_pred_flag,
+            f.cu_qp_delta_enabled_flag,
+            f.weighted_pred_flag,
+            f.weighted_bipred_flag,
+            f.transquant_bypass_enabled_flag,
+            f.tiles_enabled_flag,
+            f.entropy_coding_sync_enabled_flag,
+            f.pps_loop_filter_across_slices_enabled_flag,
+            f.loop_filter_across_tiles_enabled_flag,
+            f.pcm_loop_filter_disabled_flag,
+            f.no_pic_reordering_flag,
+            f.no_bi_pred_flag,
+        );
+        let s = self.slice_parsing_fields;
+        let slice = HevcSliceParsingFields::new(
+            s.lists_modification_present_flag,
+            s.long_term_ref_pics_present_flag,
+            s.sps_temporal_mvp_enabled_flag,
+            s.cabac_init_present_flag,
+            s.output_flag_present_flag,
+            s.dependent_slice_segments_enabled_flag,
+            s.pps_slice_chroma_qp_offsets_present_flag,
+            s.sample_adaptive_offset_enabled_flag,
+            s.deblocking_filter_override_enabled_flag,
+            s.pps_disable_deblocking_filter_flag,
+            s.slice_segment_header_extension_present_flag,
+            s.rap_pic_flag,
+            s.idr_pic_flag,
+            s.intra_pic_flag,
+        );
+        let refs: [PictureHEVC; 15] = self.reference_frames.map(VAPictureHEVC::to_cros);
+        BufferType::PictureParameter(PictureParameter::HEVC(CrosPicture::new(
+            self.curr_pic.to_cros(),
+            refs,
+            self.pic_width_in_luma_samples,
+            self.pic_height_in_luma_samples,
+            &pic,
+            self.sps_max_dec_pic_buffering_minus1,
+            self.bit_depth_luma_minus8,
+            self.bit_depth_chroma_minus8,
+            self.pcm_sample_bit_depth_luma_minus1,
+            self.pcm_sample_bit_depth_chroma_minus1,
+            self.log2_min_luma_coding_block_size_minus3,
+            self.log2_diff_max_min_luma_coding_block_size,
+            self.log2_min_transform_block_size_minus2,
+            self.log2_diff_max_min_transform_block_size,
+            self.log2_min_pcm_luma_coding_block_size_minus3,
+            self.log2_diff_max_min_pcm_luma_coding_block_size,
+            self.max_transform_hierarchy_depth_intra,
+            self.max_transform_hierarchy_depth_inter,
+            self.init_qp_minus26,
+            self.diff_cu_qp_delta_depth,
+            self.pps_cb_qp_offset,
+            self.pps_cr_qp_offset,
+            self.log2_parallel_merge_level_minus2,
+            self.num_tile_columns_minus1,
+            self.num_tile_rows_minus1,
+            self.column_width_minus1,
+            self.row_height_minus1,
+            &slice,
+            self.log2_max_pic_order_cnt_lsb_minus4,
+            self.num_short_term_ref_pic_sets,
+            self.num_long_term_ref_pic_sps,
+            self.num_ref_idx_l0_default_active_minus1,
+            self.num_ref_idx_l1_default_active_minus1,
+            self.pps_beta_offset_div2,
+            self.pps_tc_offset_div2,
+            self.num_extra_slice_header_bits,
+            self.st_rps_bits,
+        )))
     }
 }
 
-/// `VASliceParameterBufferHEVC`, `va_dec_hevc.h:352`.
-#[repr(C)]
+/// `VASliceParameterBufferHEVC::LongSliceFlags`, one field per flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct LongSliceFlags {
+    pub last_slice_of_pic: u32,
+    pub dependent_slice_segment_flag: u32,
+    pub slice_type: u32,
+    pub color_plane_id: u32,
+    pub slice_sao_luma_flag: u32,
+    pub slice_sao_chroma_flag: u32,
+    pub mvd_l1_zero_flag: u32,
+    pub cabac_init_flag: u32,
+    pub slice_temporal_mvp_enabled_flag: u32,
+    pub slice_deblocking_filter_disabled_flag: u32,
+    pub collocated_from_l0_flag: u32,
+    pub slice_loop_filter_across_slices_enabled_flag: u32,
+}
+
+/// `VASliceParameterBufferHEVC`, `va_dec_hevc.h:101`.
 #[derive(Debug, Clone, Copy)]
 pub struct SliceParameterBufferHEVC {
-    /// Bytes of slice data, NAL unit header included.
+    /// Bytes of slice data for this slice.
     pub slice_data_size: u32,
     /// Offset of this slice's NAL unit within the data buffer.
     pub slice_data_offset: u32,
     /// `VA_SLICE_DATA_FLAG_*`.
     pub slice_data_flag: u32,
-    /// Bytes from the NAL unit header to `slice_data()`, in escaped bytes.
+    /// Bits from the start of the NAL unit to `slice_data()`, in the
+    /// *unescaped* RBSP.
     pub slice_data_byte_offset: u32,
     /// `slice_segment_address`.
     pub slice_segment_address: u32,
-    /// Indices into `reference_frames`, `0xff` for unused entries.
+    /// `RefPicList[2][15]`: indices into `reference_frames`, `0xff` when unused.
     pub ref_pic_list: [[u8; 15]; 2],
-    /// Slice flags.
+    /// Per-slice flags.
     pub long_slice_flags: LongSliceFlags,
-    /// Index into `ref_pic_list`, `0xff` when there is no collocated picture.
+    /// `collocated_ref_idx`.
     pub collocated_ref_idx: u8,
-    /// `num_ref_idx_l0_active_minus1`, override applied.
+    /// `num_ref_idx_l0_active_minus1`.
     pub num_ref_idx_l0_active_minus1: u8,
-    /// `num_ref_idx_l1_active_minus1`, override applied.
+    /// `num_ref_idx_l1_active_minus1`.
     pub num_ref_idx_l1_active_minus1: u8,
     /// `slice_qp_delta`.
     pub slice_qp_delta: i8,
@@ -318,9 +403,8 @@ pub struct SliceParameterBufferHEVC {
     pub num_entry_point_offsets: u16,
     /// `entry_offset_to_subset_array`.
     pub entry_offset_to_subset_array: u16,
-    /// Emulation prevention bytes inside the slice header.
+    /// `slice_data_num_emu_prevn_bytes`.
     pub slice_data_num_emu_prevn_bytes: u16,
-    pub(crate) va_reserved: [u32; 2],
 }
 
 impl Default for SliceParameterBufferHEVC {
@@ -355,33 +439,77 @@ impl Default for SliceParameterBufferHEVC {
             num_entry_point_offsets: 0,
             entry_offset_to_subset_array: 0,
             slice_data_num_emu_prevn_bytes: 0,
-            va_reserved: [0; 2],
         }
     }
 }
 
-// SAFETY: as `PictureParameterBufferHEVC`.
-unsafe impl VaParam for SliceParameterBufferHEVC {
-    const TYPE: i32 = VASliceParameterBufferType;
+impl SliceParameterBufferHEVC {
+    /// The typed cros-libva buffer for this slice.
+    pub fn to_buffer(&self) -> BufferType {
+        let f = self.long_slice_flags;
+        let flags = HevcLongSliceFlags::new(
+            f.last_slice_of_pic,
+            f.dependent_slice_segment_flag,
+            f.slice_type,
+            f.color_plane_id,
+            f.slice_sao_luma_flag,
+            f.slice_sao_chroma_flag,
+            f.mvd_l1_zero_flag,
+            f.cabac_init_flag,
+            f.slice_temporal_mvp_enabled_flag,
+            f.slice_deblocking_filter_disabled_flag,
+            f.collocated_from_l0_flag,
+            f.slice_loop_filter_across_slices_enabled_flag,
+        );
+        BufferType::SliceParameter(SliceParameter::HEVC(CrosSlice::new(
+            self.slice_data_size,
+            self.slice_data_offset,
+            self.slice_data_flag,
+            self.slice_data_byte_offset,
+            self.slice_segment_address,
+            self.ref_pic_list,
+            &flags,
+            self.collocated_ref_idx,
+            self.num_ref_idx_l0_active_minus1,
+            self.num_ref_idx_l1_active_minus1,
+            self.slice_qp_delta,
+            self.slice_cb_qp_offset,
+            self.slice_cr_qp_offset,
+            self.slice_beta_offset_div2,
+            self.slice_tc_offset_div2,
+            self.luma_log2_weight_denom,
+            self.delta_chroma_log2_weight_denom,
+            self.delta_luma_weight_l0,
+            self.luma_offset_l0,
+            self.delta_chroma_weight_l0,
+            self.chroma_offset_l0,
+            self.delta_luma_weight_l1,
+            self.luma_offset_l1,
+            self.delta_chroma_weight_l1,
+            self.chroma_offset_l1,
+            self.five_minus_max_num_merge_cand,
+            self.num_entry_point_offsets,
+            self.entry_offset_to_subset_array,
+            self.slice_data_num_emu_prevn_bytes,
+        )))
+    }
 }
 
-/// `VAIQMatrixBufferHEVC`, `va_dec_hevc.h:561`.
-#[repr(C)]
+/// `VAIQMatrixBufferHEVC`, `va_dec_hevc.h`. Coefficients in raster order.
 #[derive(Debug, Clone, Copy)]
 pub struct IQMatrixBufferHEVC {
-    /// `ScalingList[0]`.
+    /// `ScalingList4x4`.
     pub scaling_list_4x4: [[u8; 16]; 6],
-    /// `ScalingList[1]`.
+    /// `ScalingList8x8`.
     pub scaling_list_8x8: [[u8; 64]; 6],
-    /// `ScalingList[2]`.
+    /// `ScalingList16x16`.
     pub scaling_list_16x16: [[u8; 64]; 6],
-    /// `ScalingList[3]`.
+    /// `ScalingList32x32`.
     pub scaling_list_32x32: [[u8; 64]; 2],
-    /// DC coefficients of the 16x16 lists.
+    /// `ScalingListDC16x16`.
     pub scaling_list_dc_16x16: [u8; 6],
-    /// DC coefficients of the 32x32 lists.
+    /// `ScalingListDC32x32`.
     pub scaling_list_dc_32x32: [u8; 2],
-    pub(crate) va_reserved: [u32; 4],
 }
 
 impl Default for IQMatrixBufferHEVC {
@@ -393,81 +521,20 @@ impl Default for IQMatrixBufferHEVC {
             scaling_list_32x32: [[16; 64]; 2],
             scaling_list_dc_16x16: [16; 6],
             scaling_list_dc_32x32: [16; 2],
-            va_reserved: [0; 4],
         }
     }
 }
 
-// SAFETY: as `PictureParameterBufferHEVC`.
-unsafe impl VaParam for IQMatrixBufferHEVC {
-    const TYPE: i32 = VAIQMatrixBufferType;
+impl IQMatrixBufferHEVC {
+    /// The typed cros-libva buffer for these scaling lists.
+    pub fn to_buffer(&self) -> BufferType {
+        BufferType::IQMatrix(IQMatrix::HEVC(CrosIQMatrix::new(
+            self.scaling_list_4x4,
+            self.scaling_list_8x8,
+            self.scaling_list_16x16,
+            self.scaling_list_32x32,
+            self.scaling_list_dc_16x16,
+            self.scaling_list_dc_32x32,
+        )))
+    }
 }
-
-// ---------------------------------------------------------------------------
-// ABI transcription check — `crates/ec-hw/abi-probe.c`, libva 1.23.0, x86_64:
-//
-//   VAPictureHEVC                size=28   align=4  pic_order_cnt=4 flags=8
-//   VAPictureParameterBufferHEVC size=604  align=4  ReferenceFrames=28
-//                                                   pic_width_in_luma_samples=448
-//                                                   pic_fields=452
-//                                                   sps_max_dec_pic_buffering_minus1=456
-//                                                   column_width_minus1=476
-//                                                   row_height_minus1=514
-//                                                   slice_parsing_fields=556
-//                                                   log2_max_pic_order_cnt_lsb_minus4=560
-//                                                   st_rps_bits=568
-//   VASliceParameterBufferHEVC   size=264  align=4  slice_segment_address=16
-//                                                   RefPicList=20 LongSliceFlags=52
-//                                                   collocated_ref_idx=56
-//                                                   luma_log2_weight_denom=64
-//                                                   delta_luma_weight_l0=66
-//                                                   delta_luma_weight_l1=156
-//                                                   five_minus_max_num_merge_cand=246
-//                                                   num_entry_point_offsets=248
-//                                                   slice_data_num_emu_prevn_bytes=252
-//   VAIQMatrixBufferHEVC         size=1016 align=4  ScalingList32x32=864
-//                                                   ScalingListDC16x16=992
-const _: () = {
-    use std::mem::{align_of, offset_of, size_of};
-
-    assert!(size_of::<VAPictureHEVC>() == 28 && align_of::<VAPictureHEVC>() == 4);
-    assert!(offset_of!(VAPictureHEVC, pic_order_cnt) == 4);
-    assert!(offset_of!(VAPictureHEVC, flags) == 8);
-
-    assert!(
-        size_of::<PictureParameterBufferHEVC>() == 604
-            && align_of::<PictureParameterBufferHEVC>() == 4
-    );
-    assert!(offset_of!(PictureParameterBufferHEVC, reference_frames) == 28);
-    assert!(offset_of!(PictureParameterBufferHEVC, pic_width_in_luma_samples) == 448);
-    assert!(offset_of!(PictureParameterBufferHEVC, pic_fields) == 452);
-    assert!(offset_of!(PictureParameterBufferHEVC, sps_max_dec_pic_buffering_minus1) == 456);
-    assert!(offset_of!(PictureParameterBufferHEVC, column_width_minus1) == 476);
-    assert!(offset_of!(PictureParameterBufferHEVC, row_height_minus1) == 514);
-    assert!(offset_of!(PictureParameterBufferHEVC, slice_parsing_fields) == 556);
-    assert!(
-        offset_of!(
-            PictureParameterBufferHEVC,
-            log2_max_pic_order_cnt_lsb_minus4
-        ) == 560
-    );
-    assert!(offset_of!(PictureParameterBufferHEVC, st_rps_bits) == 568);
-
-    assert!(
-        size_of::<SliceParameterBufferHEVC>() == 264 && align_of::<SliceParameterBufferHEVC>() == 4
-    );
-    assert!(offset_of!(SliceParameterBufferHEVC, slice_segment_address) == 16);
-    assert!(offset_of!(SliceParameterBufferHEVC, ref_pic_list) == 20);
-    assert!(offset_of!(SliceParameterBufferHEVC, long_slice_flags) == 52);
-    assert!(offset_of!(SliceParameterBufferHEVC, collocated_ref_idx) == 56);
-    assert!(offset_of!(SliceParameterBufferHEVC, luma_log2_weight_denom) == 64);
-    assert!(offset_of!(SliceParameterBufferHEVC, delta_luma_weight_l0) == 66);
-    assert!(offset_of!(SliceParameterBufferHEVC, delta_luma_weight_l1) == 156);
-    assert!(offset_of!(SliceParameterBufferHEVC, five_minus_max_num_merge_cand) == 246);
-    assert!(offset_of!(SliceParameterBufferHEVC, num_entry_point_offsets) == 248);
-    assert!(offset_of!(SliceParameterBufferHEVC, slice_data_num_emu_prevn_bytes) == 252);
-
-    assert!(size_of::<IQMatrixBufferHEVC>() == 1016 && align_of::<IQMatrixBufferHEVC>() == 4);
-    assert!(offset_of!(IQMatrixBufferHEVC, scaling_list_32x32) == 864);
-    assert!(offset_of!(IQMatrixBufferHEVC, scaling_list_dc_16x16) == 992);
-};

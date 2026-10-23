@@ -1,0 +1,176 @@
+{ "type": "suite", "event": "started", "test_count": 14 }
+{ "type": "test", "event": "started", "name": "dsp::tests::gmc1_identity" }
+{ "type": "test", "event": "started", "name": "dsp::tests::gmc_identity" }
+{ "type": "test", "event": "started", "name": "dsp::tests::hpel_copy_and_avg" }
+{ "type": "test", "event": "started", "name": "dsp::tests::idct_dc_only" }
+{ "type": "test", "name": "dsp::tests::gmc1_identity", "event": "ok", "exec_time": 0.000001613 }
+{ "type": "test", "event": "started", "name": "dsp::tests::qpel_mc00_copy_and_flat" }
+{ "type": "test", "name": "dsp::tests::hpel_copy_and_avg", "event": "ok", "exec_time": 0.000012052 }
+{ "type": "test", "event": "started", "name": "dsp::tests::qpel_window_is_tight" }
+{ "type": "test", "name": "dsp::tests::gmc_identity", "event": "ok", "exec_time": 0.000003026 }
+{ "type": "test", "event": "started", "name": "h263data::spec_tests::cbpy_and_mvd_match_tables_12_and_14" }
+{ "type": "test", "name": "dsp::tests::qpel_mc00_copy_and_flat", "event": "ok", "exec_time": 0.000102904 }
+{ "type": "test", "event": "started", "name": "h263data::spec_tests::mcbpc_matches_tables_7_and_8" }
+{ "type": "test", "name": "dsp::tests::qpel_window_is_tight", "event": "ok", "exec_time": 0.000014006 }
+{ "type": "test", "event": "started", "name": "h263data::spec_tests::scans_match_figures" }
+{ "type": "test", "name": "h263data::spec_tests::cbpy_and_mvd_match_tables_12_and_14", "event": "ok", "exec_time": 0.000004648 }
+{ "type": "test", "event": "started", "name": "h263data::spec_tests::small_tables_match_the_text" }
+{ "type": "test", "name": "dsp::tests::idct_dc_only", "event": "ok", "exec_time": 0.000003556 }
+{ "type": "test", "event": "started", "name": "h263data::spec_tests::tcoef_matches_tables_16_and_i2" }
+{ "type": "test", "name": "h263data::spec_tests::scans_match_figures", "event": "ok", "exec_time": 0.000001503 }
+{ "type": "test", "event": "started", "name": "tables::tests::rl_lengths" }
+{ "type": "test", "name": "h263data::spec_tests::mcbpc_matches_tables_7_and_8", "event": "ok", "exec_time": 0.000015209 }
+{ "type": "test", "event": "started", "name": "tables::tests::scans_are_permutations" }
+{ "type": "test", "name": "h263data::spec_tests::tcoef_matches_tables_16_and_i2", "event": "ok", "exec_time": 0.0000312 }
+{ "type": "test", "event": "started", "name": "tables::tests::vlcs_prefix_free" }
+{ "type": "test", "name": "tables::tests::rl_lengths", "event": "ok", "exec_time": 0.00000016 }
+{ "type": "test", "name": "h263data::spec_tests::small_tables_match_the_text", "event": "ok", "exec_time": 0.000001213 }
+{ "type": "test", "name": "tables::tests::scans_are_permutations", "event": "ok", "exec_time": 0.000000661 }
+{ "type": "test", "name": "tables::tests::vlcs_prefix_free", "event": "ok", "exec_time": 0.000285798 }
+{ "type": "suite", "event": "ok", "passed": 14, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00211042 }
+{ "type": "suite", "event": "started", "test_count": 11 }
+{ "type": "test", "event": "started", "name": "avi_dx50_bframes" }
+{ "type": "test", "event": "started", "name": "avi_fmp4" }
+{ "type": "test", "event": "started", "name": "avi_xvid_qpel" }
+{ "type": "test", "event": "started", "name": "corrupt_input_does_not_panic" }
+{ "type": "test", "name": "corrupt_input_does_not_panic", "event": "ok", "exec_time": 0.475913577 }
+{ "type": "test", "event": "started", "name": "data_partitioning_is_refused_by_name" }
+{ "type": "test", "name": "avi_fmp4", "event": "ok", "exec_time": 0.510716282 }
+{ "type": "test", "event": "started", "name": "gp3_h263" }
+{ "type": "test", "name": "avi_dx50_bframes", "event": "ok", "exec_time": 0.593131037 }
+{ "type": "test", "event": "started", "name": "mkv_asp" }
+{ "type": "test", "name": "avi_xvid_qpel", "event": "ok", "exec_time": 0.624677557 }
+{ "type": "test", "event": "started", "name": "mp4_mp4v" }
+{ "type": "test", "name": "data_partitioning_is_refused_by_name", "event": "ok", "exec_time": 0.389181683 }
+{ "type": "test", "event": "started", "name": "mp4_mp4v_global_header" }
+{ "type": "test", "name": "gp3_h263", "event": "ok", "exec_time": 0.575804487 }
+{ "type": "test", "event": "started", "name": "packed_bitstream_matches_unpacked" }
+{ "type": "test", "name": "mkv_asp", "event": "ok", "exec_time": 0.627442368 }
+{ "type": "test", "event": "started", "name": "speed_720p_at_least_120_fps" }
+{ "type": "test", "name": "speed_720p_at_least_120_fps", "event": "ignored" }
+{ "type": "test", "name": "mp4_mp4v", "event": "ok", "exec_time": 0.610360507 }
+{ "type": "test", "name": "mp4_mp4v_global_header", "event": "ok", "exec_time": 0.589948811 }
+{ "type": "test", "name": "packed_bitstream_matches_unpacked", "event": "ok", "exec_time": 0.539437308 }
+{ "type": "suite", "event": "ok", "passed": 10, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 1.629866568 }
+{ "type": "suite", "event": "started", "test_count": 32 }
+{ "type": "test", "event": "started", "name": "aic" }
+{ "type": "test", "event": "started", "name": "all_tools" }
+{ "type": "test", "event": "started", "name": "bframes" }
+{ "type": "test", "event": "started", "name": "bframes_1" }
+{ "type": "test", "name": "bframes", "event": "ok", "exec_time": 0.544905984 }
+{ "type": "test", "event": "started", "name": "cbr_cif" }
+{ "type": "test", "name": "all_tools", "event": "ok", "exec_time": 0.65729423 }
+{ "type": "test", "event": "started", "name": "h263_formats" }
+{ "type": "test", "name": "bframes_1", "event": "ok", "exec_time": 0.667303808 }
+{ "type": "test", "event": "started", "name": "h263_with_gob_headers" }
+{ "type": "test", "name": "aic", "event": "ok", "exec_time": 0.678700135 }
+{ "type": "test", "event": "started", "name": "hd_720p_with_everything" }
+{ "type": "test", "name": "h263_with_gob_headers", "event": "ok", "exec_time": 0.608677189 }
+{ "type": "test", "event": "started", "name": "interlaced_dct" }
+{ "type": "test", "name": "cbr_cif", "event": "ok", "exec_time": 0.731785651 }
+{ "type": "test", "event": "started", "name": "interlaced_direct_q31" }
+{ "type": "test", "name": "hd_720p_with_everything", "event": "ok", "exec_time": 0.941185699 }
+{ "type": "test", "event": "started", "name": "interlaced_everything" }
+{ "type": "test", "name": "interlaced_direct_q31", "event": "ok", "exec_time": 0.683896118 }
+{ "type": "test", "event": "started", "name": "interlaced_me_bf" }
+{ "type": "test", "name": "interlaced_dct", "event": "ok", "exec_time": 0.70499618 }
+{ "type": "test", "event": "started", "name": "interlaced_resync_bf" }
+{ "type": "test", "name": "interlaced_everything", "event": "ok", "exec_time": 0.759352734 }
+{ "type": "test", "event": "started", "name": "interlaced_resync_bf_tiny_packets" }
+{ "type": "test", "name": "interlaced_me_bf", "event": "ok", "exec_time": 0.639151904 }
+{ "type": "test", "event": "started", "name": "mpeg_quant" }
+{ "type": "test", "name": "interlaced_resync_bf", "event": "ok", "exec_time": 0.73412965 }
+{ "type": "test", "event": "started", "name": "mpeg_quant_q31_qpel" }
+{ "type": "test", "name": "interlaced_resync_bf_tiny_packets", "event": "ok", "exec_time": 0.553629694 }
+{ "type": "test", "event": "started", "name": "mv4" }
+{ "type": "test", "name": "h263_formats", "event": "ok", "exec_time": 2.539556482 }
+{ "type": "test", "event": "started", "name": "odd_size" }
+{ "type": "test", "name": "mpeg_quant", "event": "ok", "exec_time": 0.693841747 }
+{ "type": "test", "event": "started", "name": "qpel" }
+{ "type": "test", "name": "mpeg_quant_q31_qpel", "event": "ok", "exec_time": 0.649577756 }
+{ "type": "test", "event": "started", "name": "qpel_bf_mv4" }
+{ "type": "test", "name": "mv4", "event": "ok", "exec_time": 0.705474669 }
+{ "type": "test", "event": "started", "name": "resync_packets" }
+{ "type": "test", "name": "qpel", "event": "ok", "exec_time": 0.508985316 }
+{ "type": "test", "event": "started", "name": "resync_small_packets" }
+{ "type": "test", "name": "odd_size", "event": "ok", "exec_time": 0.644485738 }
+{ "type": "test", "event": "started", "name": "simple_q2" }
+{ "type": "test", "name": "qpel_bf_mv4", "event": "ok", "exec_time": 0.547658412 }
+{ "type": "test", "event": "started", "name": "simple_q31" }
+{ "type": "test", "name": "resync_packets", "event": "ok", "exec_time": 0.700264849 }
+{ "type": "test", "event": "started", "name": "simple_q8" }
+{ "type": "test", "name": "resync_small_packets", "event": "ok", "exec_time": 0.614274709 }
+{ "type": "test", "event": "started", "name": "tiny" }
+{ "type": "test", "name": "simple_q2", "event": "ok", "exec_time": 0.580582302 }
+{ "type": "test", "event": "started", "name": "wide" }
+{ "type": "test", "name": "simple_q31", "event": "ok", "exec_time": 0.635501778 }
+{ "type": "test", "event": "started", "name": "xvid_gmc" }
+{ "type": "test", "name": "simple_q8", "event": "ok", "exec_time": 0.61931557 }
+{ "type": "test", "event": "started", "name": "xvid_gmc_no_bframes_mpeg_quant" }
+{ "type": "test", "name": "tiny", "event": "ok", "exec_time": 0.584761233 }
+{ "type": "test", "event": "started", "name": "xvid_gmc_qpel_mv4" }
+{ "type": "test", "name": "wide", "event": "ok", "exec_time": 0.693903153 }
+{ "type": "test", "event": "started", "name": "xvid_interlaced" }
+{ "type": "test", "name": "xvid_gmc", "event": "ok", "exec_time": 0.847735395 }
+{ "type": "test", "event": "started", "name": "xvid_mpeg_quant_qpel" }
+{ "type": "test", "name": "xvid_gmc_no_bframes_mpeg_quant", "event": "ok", "exec_time": 0.920540815 }
+{ "type": "test", "name": "xvid_gmc_qpel_mv4", "event": "ok", "exec_time": 0.916042424 }
+{ "type": "test", "name": "xvid_interlaced", "event": "ok", "exec_time": 0.814621578 }
+{ "type": "test", "name": "xvid_mpeg_quant_qpel", "event": "ok", "exec_time": 0.691203515 }
+{ "type": "suite", "event": "ok", "passed": 32, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 6.094496061 }
+{ "type": "suite", "event": "started", "test_count": 26 }
+{ "type": "test", "event": "started", "name": "v1_is_refused" }
+{ "type": "test", "event": "started", "name": "v2_all_intra" }
+{ "type": "test", "event": "started", "name": "v2_cif_bitrate" }
+{ "type": "test", "event": "started", "name": "v2_mandelbrot" }
+{ "type": "test", "name": "v1_is_refused", "event": "ok", "exec_time": 0.000005491 }
+{ "type": "test", "event": "started", "name": "v2_odd_size" }
+{ "type": "test", "name": "v2_odd_size", "event": "ok", "exec_time": 0.772868548 }
+{ "type": "test", "event": "started", "name": "v2_q2" }
+{ "type": "test", "name": "v2_all_intra", "event": "ok", "exec_time": 0.833270067 }
+{ "type": "test", "event": "started", "name": "v2_q28" }
+{ "type": "test", "name": "v2_mandelbrot", "event": "ok", "exec_time": 0.953504712 }
+{ "type": "test", "event": "started", "name": "v2_q6" }
+{ "type": "test", "name": "v2_cif_bitrate", "event": "ok", "exec_time": 1.00920735 }
+{ "type": "test", "event": "started", "name": "v3_all_intra" }
+{ "type": "test", "name": "v2_q6", "event": "ok", "exec_time": 0.678541216 }
+{ "type": "test", "event": "started", "name": "v3_cif_bitrate" }
+{ "type": "test", "name": "v2_q28", "event": "ok", "exec_time": 0.838433169 }
+{ "type": "test", "event": "started", "name": "v3_g_variation" }
+{ "type": "test", "name": "v2_q2", "event": "ok", "exec_time": 0.944664403 }
+{ "type": "test", "event": "started", "name": "v3_hd_ish" }
+{ "type": "test", "name": "v3_all_intra", "event": "ok", "exec_time": 0.795129292 }
+{ "type": "test", "event": "started", "name": "v3_high_bitrate" }
+{ "type": "test", "name": "v3_cif_bitrate", "event": "ok", "exec_time": 0.862363752 }
+{ "type": "test", "event": "started", "name": "v3_low_bitrate" }
+{ "type": "test", "name": "v3_g_variation", "event": "ok", "exec_time": 0.87257549 }
+{ "type": "test", "event": "started", "name": "v3_mandelbrot" }
+{ "type": "test", "name": "v3_hd_ish", "event": "ok", "exec_time": 0.939142756 }
+{ "type": "test", "event": "started", "name": "v3_mandelbrot_hi" }
+{ "type": "test", "name": "v3_high_bitrate", "event": "ok", "exec_time": 0.92925148 }
+{ "type": "test", "event": "started", "name": "v3_mbd_rd" }
+{ "type": "test", "name": "v3_low_bitrate", "event": "ok", "exec_time": 0.854832226 }
+{ "type": "test", "event": "started", "name": "v3_me_range" }
+{ "type": "test", "name": "v3_mandelbrot", "event": "ok", "exec_time": 0.964478444 }
+{ "type": "test", "event": "started", "name": "v3_odd_size" }
+{ "type": "test", "name": "v3_mbd_rd", "event": "ok", "exec_time": 0.886658331 }
+{ "type": "test", "event": "started", "name": "v3_odd_size2" }
+{ "type": "test", "name": "v3_mandelbrot_hi", "event": "ok", "exec_time": 1.051730125 }
+{ "type": "test", "event": "started", "name": "v3_q12" }
+{ "type": "test", "name": "v3_me_range", "event": "ok", "exec_time": 0.858336005 }
+{ "type": "test", "event": "started", "name": "v3_q2" }
+{ "type": "test", "name": "v3_odd_size2", "event": "ok", "exec_time": 0.730893533 }
+{ "type": "test", "event": "started", "name": "v3_q28" }
+{ "type": "test", "name": "v3_odd_size", "event": "ok", "exec_time": 0.848692256 }
+{ "type": "test", "event": "started", "name": "v3_q31" }
+{ "type": "test", "name": "v3_q12", "event": "ok", "exec_time": 0.845562007 }
+{ "type": "test", "event": "started", "name": "v3_q5" }
+{ "type": "test", "name": "v3_q2", "event": "ok", "exec_time": 0.747540256 }
+{ "type": "test", "event": "started", "name": "v3_rate_ctl" }
+{ "type": "test", "name": "v3_q31", "event": "ok", "exec_time": 0.722918841 }
+{ "type": "test", "name": "v3_q28", "event": "ok", "exec_time": 0.841488776 }
+{ "type": "test", "name": "v3_q5", "event": "ok", "exec_time": 0.766482217 }
+{ "type": "test", "name": "v3_rate_ctl", "event": "ok", "exec_time": 0.647109454 }
+{ "type": "suite", "event": "ok", "passed": 26, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 5.606847639 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000042509 }

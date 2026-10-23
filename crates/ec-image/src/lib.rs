@@ -37,7 +37,15 @@ pub mod jpeg;
 pub mod png;
 pub mod tiff;
 mod upsample;
+pub mod gif_encode;
+pub mod png_encode;
+pub mod transform;
 pub mod webp;
+
+mod exif;
+mod probe;
+
+pub use probe::{probe, probe_reader, PROBE_LIMIT};
 
 use ec_core::{PixelFormat, Plane, VideoFrame};
 
@@ -121,17 +129,23 @@ fn is_bmp(data: &[u8]) -> bool {
     matches!(info_size, 12 | 16 | 40 | 52 | 56 | 64 | 108 | 124) && offset >= 14 + info_size
 }
 
+/// The default decode budget for one buffer, in bytes: 512 MiB, the same default the `image`
+/// crate applies. [`decode`] and [`decode_animation`] refuse any picture whose decoded output
+/// (width x height x bytes per pixel) is larger; [`decode_with_limits`] lets a caller raise it.
+pub const DEFAULT_MAX_ALLOC: usize = 512 << 20;
+
 /// Bounds applied before any buffer is sized from a header field.
 ///
 /// A three-byte dimension field can ask for a 68-gigapixel allocation; this is
 /// the trust boundary that says no first. The default admits everything the
 /// formats themselves can express up to 2^28 pixels — comfortably past 8K
-/// (33 Mpx) and far below what would exhaust a desktop.
+/// (33 Mpx) — and refuses a decoded picture past [`DEFAULT_MAX_ALLOC`] bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     /// Largest `width * height` accepted.
     pub max_pixels: u64,
-    /// Largest single decompressed buffer accepted, in bytes.
+    /// Largest single decompressed buffer accepted, in bytes. The decoded picture
+    /// is the buffer that matters most; see [`Limits::check_output`].
     pub max_alloc: usize,
     /// Largest total bytes accepted across every frame of one decode call.
     ///
@@ -149,7 +163,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_pixels: 1 << 28,
-            max_alloc: 1 << 30,
+            max_alloc: DEFAULT_MAX_ALLOC,
             max_total_alloc: 1 << 32,
         }
     }
@@ -169,6 +183,28 @@ impl Limits {
             ));
         }
         Ok(())
+    }
+
+    /// Check a decoded picture, `width * height * bytes_per_pixel`, before anything is sized
+    /// from it. A refusal names the dimensions and the budget, and comes before any pixel work.
+    pub fn check_output(&self, width: u32, height: u32, bytes_per_pixel: usize) -> Result<usize> {
+        self.check(width, height)?;
+        let what = format!("{width}x{height} image");
+        let bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|p| p.checked_mul(bytes_per_pixel))
+            .ok_or_else(|| Error::corrupt(format!("{what}: size overflows usize")))?;
+        if bytes > self.max_alloc {
+            return Err(Error::unsupported(
+                what,
+                format!(
+                    "{bytes} bytes of decoded pixels past the {} byte budget \
+                     (512 MiB by default; decode_with_limits raises it)",
+                    self.max_alloc
+                ),
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Check a byte count computed from header-declared fields (a frame's or
@@ -223,7 +259,7 @@ pub struct Metadata {
     pub gamma: Option<f64>,
     /// PNG `sRGB`: rendering intent 0..=3, meaning the file is sRGB.
     pub srgb_intent: Option<u8>,
-    /// EXIF orientation tag 1..=8, from a JPEG APP1 or a WebP `EXIF` chunk.
+    /// EXIF orientation tag 1..=8, from a JPEG APP1, a PNG `eXIf` or a WebP `EXIF` chunk.
     ///
     /// Exposed, never applied — the same choice the incumbent `image` crate
     /// makes, so a caller swapping between them sees the same pixels.
@@ -315,23 +351,23 @@ impl Image {
         match &self.pixels {
             Pixels::L8(d) => d.iter().for_each(|&l| out.extend_from_slice(&[l, l, l])),
             Pixels::La8(d) => d
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .for_each(|p| out.extend_from_slice(&[p[0], p[0], p[0]])),
             Pixels::Rgb8(d) => out.extend_from_slice(d),
             Pixels::Rgba8(d) => d
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .for_each(|p| out.extend_from_slice(&p[..3])),
             Pixels::L16(d) => d.iter().for_each(|&l| {
                 let l = narrow(l);
                 out.extend_from_slice(&[l, l, l]);
             }),
-            Pixels::La16(d) => d.chunks_exact(2).for_each(|p| {
+            Pixels::La16(d) => d.as_chunks::<2>().0.iter().for_each(|p| {
                 let l = narrow(p[0]);
                 out.extend_from_slice(&[l, l, l]);
             }),
             Pixels::Rgb16(d) => d.iter().for_each(|&s| out.push(narrow(s))),
             Pixels::Rgba16(d) => d
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .for_each(|p| out.extend(p[..3].iter().map(|&s| narrow(s)))),
         }
         out
@@ -346,21 +382,21 @@ impl Image {
                 .iter()
                 .for_each(|&l| out.extend_from_slice(&[l, l, l, 255])),
             Pixels::La8(d) => d
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .for_each(|p| out.extend_from_slice(&[p[0], p[0], p[0], p[1]])),
             Pixels::Rgb8(d) => d
-                .chunks_exact(3)
+                .as_chunks::<3>().0.iter()
                 .for_each(|p| out.extend_from_slice(&[p[0], p[1], p[2], 255])),
             Pixels::Rgba8(d) => out.extend_from_slice(d),
             Pixels::L16(d) => d.iter().for_each(|&l| {
                 let l = narrow(l);
                 out.extend_from_slice(&[l, l, l, 255]);
             }),
-            Pixels::La16(d) => d.chunks_exact(2).for_each(|p| {
+            Pixels::La16(d) => d.as_chunks::<2>().0.iter().for_each(|p| {
                 let l = narrow(p[0]);
                 out.extend_from_slice(&[l, l, l, narrow(p[1])]);
             }),
-            Pixels::Rgb16(d) => d.chunks_exact(3).for_each(|p| {
+            Pixels::Rgb16(d) => d.as_chunks::<3>().0.iter().for_each(|p| {
                 out.extend_from_slice(&[narrow(p[0]), narrow(p[1]), narrow(p[2]), 255]);
             }),
             Pixels::Rgba16(d) => d.iter().for_each(|&s| out.push(narrow(s))),
@@ -372,9 +408,9 @@ impl Image {
     pub fn to_rgb16(&self) -> Vec<u16> {
         match &self.pixels {
             Pixels::Rgb16(d) => d.clone(),
-            Pixels::Rgba16(d) => d.chunks_exact(4).flat_map(|p| p[..3].to_vec()).collect(),
+            Pixels::Rgba16(d) => d.as_chunks::<4>().0.iter().flat_map(|p| p[..3].to_vec()).collect(),
             Pixels::L16(d) => d.iter().flat_map(|&l| [l, l, l]).collect(),
-            Pixels::La16(d) => d.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0]]).collect(),
+            Pixels::La16(d) => d.as_chunks::<2>().0.iter().flat_map(|p| [p[0], p[0], p[0]]).collect(),
             _ => self.to_rgb8().into_iter().map(widen).collect(),
         }
     }
@@ -384,12 +420,12 @@ impl Image {
         match &self.pixels {
             Pixels::Rgba16(d) => d.clone(),
             Pixels::Rgb16(d) => d
-                .chunks_exact(3)
+                .as_chunks::<3>().0.iter()
                 .flat_map(|p| [p[0], p[1], p[2], u16::MAX])
                 .collect(),
             Pixels::L16(d) => d.iter().flat_map(|&l| [l, l, l, u16::MAX]).collect(),
             Pixels::La16(d) => d
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .flat_map(|p| [p[0], p[0], p[0], p[1]])
                 .collect(),
             _ => self.to_rgba8().into_iter().map(widen).collect(),
@@ -426,6 +462,8 @@ pub struct Info {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
+    /// EXIF orientation 1..=8 (1 when the file carries none). Reported, not applied.
+    pub orientation: u8,
 }
 
 /// Decode `data`, guessing the format from its leading bytes.
@@ -449,7 +487,11 @@ pub fn decode_with_limits(data: &[u8], limits: Limits) -> Result<Image> {
     }
 }
 
-/// Dimensions from the header alone, without decoding the pixels.
+/// Format, dimensions and EXIF orientation from the header alone, without
+/// decoding the pixels.
+///
+/// The whole of `data` is read as header. To look at a bounded prefix or a
+/// stream instead, use [`probe`] or [`probe_reader`].
 pub fn info(data: &[u8]) -> Result<Info> {
     match ImageFormat::guess(data) {
         Some(ImageFormat::Png) => png::info(data),
@@ -485,13 +527,19 @@ pub struct AnimationFrame {
 /// -- returns exactly one frame, with a zero delay, so a caller that wants
 /// frames never needs to know which format it holds.
 pub fn decode_animation(data: &[u8]) -> Result<Vec<AnimationFrame>> {
+    decode_animation_with_limits(data, Limits::default())
+}
+
+/// [`decode_animation`] with caller-chosen [`Limits`].
+///
+/// The limits bound every frame and the whole composite, so a caller with a
+/// tighter memory budget than the default can lower them here.
+pub fn decode_animation_with_limits(data: &[u8], limits: Limits) -> Result<Vec<AnimationFrame>> {
     match ImageFormat::guess(data) {
-        Some(ImageFormat::Gif) => gif::decode_animation(data, Limits::default()),
-        Some(ImageFormat::WebP) if webp::is_animated(data) => {
-            webp::decode_frames(data, Limits::default())
-        }
+        Some(ImageFormat::Gif) => gif::decode_animation(data, limits),
+        Some(ImageFormat::WebP) if webp::is_animated(data) => webp::decode_frames(data, limits),
         _ => Ok(vec![AnimationFrame {
-            image: decode(data)?,
+            image: decode_with_limits(data, limits)?,
             delay_num: 0,
             delay_den: 100,
         }]),
@@ -547,6 +595,17 @@ mod tests {
         assert!(limits.check(1920, 1080).is_ok());
         assert!(limits.check(0, 10).is_err());
         assert!(limits.check(100_000, 100_000).is_err());
+    }
+
+    #[test]
+    fn check_output_names_the_picture_and_refuses_past_the_budget() {
+        let limits = Limits::default();
+        assert_eq!(limits.max_alloc, 512 << 20);
+        assert!(limits.check_output(12000, 12000, 3).is_ok());
+        let err = limits.check_output(12000, 12000, 4).expect_err("576 MB is past 512 MiB");
+        let text = format!("{err}");
+        assert!(text.contains("12000x12000"), "{text}");
+        assert!(text.contains("536870912"), "{text}");
     }
 
     #[test]

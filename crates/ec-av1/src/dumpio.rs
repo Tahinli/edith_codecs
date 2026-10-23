@@ -55,7 +55,7 @@ impl LoudDump {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path).unwrap_or_else(|e| {
             abort(
-                &site,
+                site,
                 &path,
                 0,
                 Some(expected),
@@ -83,7 +83,7 @@ impl LoudDump {
             .open(&path)
             .unwrap_or_else(|e| {
                 abort(
-                    &site,
+                    site,
                     &path,
                     0,
                     None,
@@ -245,6 +245,7 @@ pub fn pin(site: &str, path: impl AsRef<Path>, bytes: &[u8]) {
 /// Non-fatal, but not silent: a shortfall comes back as the very same failure
 /// line [`pin`] would have panicked with, expected-vs-on-disk counts included,
 /// for the caller to print as a warning.
+#[cfg(test)] // only the self-test below calls it; keeps the non-test build free of dead code
 pub fn pin_reporting(site: &str, path: impl AsRef<Path>, bytes: &[u8]) -> Result<(), String> {
     let path = path.as_ref();
     let expected = bytes.len();

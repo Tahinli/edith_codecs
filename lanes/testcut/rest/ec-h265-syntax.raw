@@ -1,0 +1,110 @@
+{ "type": "suite", "event": "started", "test_count": 40 }
+{ "type": "test", "event": "started", "name": "md5::tests::chunked_updates_match_one_shot" }
+{ "type": "test", "event": "started", "name": "md5::tests::rfc1321_test_suite" }
+{ "type": "test", "event": "started", "name": "nal::tests::annex_b_split_finds_units" }
+{ "type": "test", "event": "started", "name": "nal::tests::escaping_round_trips_and_kills_start_codes" }
+{ "type": "test", "name": "md5::tests::chunked_updates_match_one_shot", "event": "ok", "exec_time": 0.000013966 }
+{ "type": "test", "event": "started", "name": "nal::tests::header_round_trip" }
+{ "type": "test", "name": "md5::tests::rfc1321_test_suite", "event": "ok", "exec_time": 0.000017122 }
+{ "type": "test", "event": "started", "name": "ps::tests::ceil_log2_counts_values" }
+{ "type": "test", "name": "nal::tests::escaping_round_trips_and_kills_start_codes", "event": "ok", "exec_time": 0.000002375 }
+{ "type": "test", "event": "started", "name": "ps::tests::conformance_window_must_leave_a_picture" }
+{ "type": "test", "name": "nal::tests::header_round_trip", "event": "ok", "exec_time": 0.000002856 }
+{ "type": "test", "event": "started", "name": "ps::tests::levels_round_up_with_size_and_rate" }
+{ "type": "test", "name": "ps::tests::ceil_log2_counts_values", "event": "ok", "exec_time": 0.00000013 }
+{ "type": "test", "event": "started", "name": "ps::tests::parameter_sets_round_trip" }
+{ "type": "test", "name": "ps::tests::conformance_window_must_leave_a_picture", "event": "ok", "exec_time": 0.000022933 }
+{ "type": "test", "event": "started", "name": "ps::tests::pps_loop_filter_offsets_are_range_checked" }
+{ "type": "test", "name": "ps::tests::parameter_sets_round_trip", "event": "ok", "exec_time": 0.000036758 }
+{ "type": "test", "event": "started", "name": "ps::tests::pps_reference_counts_and_qp_are_range_checked" }
+{ "type": "test", "name": "nal::tests::annex_b_split_finds_units", "event": "ok", "exec_time": 0.000002304 }
+{ "type": "test", "event": "started", "name": "ps::tests::pps_tile_count_is_capped_for_uniform_spacing_too" }
+{ "type": "test", "name": "ps::tests::levels_round_up_with_size_and_rate", "event": "ok", "exec_time": 0.00000012 }
+{ "type": "test", "event": "started", "name": "ps::tests::seven_sub_layers_is_refused_by_name_and_six_is_not" }
+{ "type": "test", "name": "ps::tests::pps_loop_filter_offsets_are_range_checked", "event": "ok", "exec_time": 0.000012343 }
+{ "type": "test", "event": "started", "name": "ps::tests::sps_block_sizes_and_depths_are_range_checked" }
+{ "type": "test", "name": "ps::tests::pps_reference_counts_and_qp_are_range_checked", "event": "ok", "exec_time": 0.000032881 }
+{ "type": "test", "event": "started", "name": "ps::tests::sps_dpb_size_and_ids_are_range_checked" }
+{ "type": "test", "name": "ps::tests::seven_sub_layers_is_refused_by_name_and_six_is_not", "event": "ok", "exec_time": 0.00002124 }
+{ "type": "test", "event": "started", "name": "ps::tests::st_ref_pic_set_fields_are_range_checked" }
+{ "type": "test", "name": "ps::tests::pps_tile_count_is_capped_for_uniform_spacing_too", "event": "ok", "exec_time": 0.000012634 }
+{ "type": "test", "event": "started", "name": "ps::tests::vps_dpb_size_is_range_checked" }
+{ "type": "test", "name": "ps::tests::sps_block_sizes_and_depths_are_range_checked", "event": "ok", "exec_time": 0.000048551 }
+{ "type": "test", "event": "started", "name": "scaling::tests::a_prediction_reaching_before_matrix_zero_is_refused" }
+{ "type": "test", "name": "ps::tests::sps_dpb_size_and_ids_are_range_checked", "event": "ok", "exec_time": 0.000029054 }
+{ "type": "test", "event": "started", "name": "scaling::tests::custom_list_round_trips_through_write_and_parse" }
+{ "type": "test", "name": "ps::tests::st_ref_pic_set_fields_are_range_checked", "event": "ok", "exec_time": 0.000033983 }
+{ "type": "test", "event": "started", "name": "scaling::tests::dc_upsamples_the_16x16_factor_at_the_origin_only" }
+{ "type": "test", "name": "ps::tests::vps_dpb_size_is_range_checked", "event": "ok", "exec_time": 0.000003467 }
+{ "type": "test", "event": "started", "name": "scaling::tests::default_factors_match_the_hm_raster_matrices" }
+{ "type": "test", "name": "scaling::tests::dc_upsamples_the_16x16_factor_at_the_origin_only", "event": "ok", "exec_time": 0.000022543 }
+{ "type": "test", "event": "started", "name": "scaling::tests::default_list_round_trips_through_write_and_parse" }
+{ "type": "test", "name": "scaling::tests::a_prediction_reaching_before_matrix_zero_is_refused", "event": "ok", "exec_time": 0.000003647 }
+{ "type": "test", "event": "started", "name": "scaling::tests::default_lists_are_flat_at_4x4_and_table_7_6_above" }
+{ "type": "test", "name": "scaling::tests::custom_list_round_trips_through_write_and_parse", "event": "ok", "exec_time": 0.000082484 }
+{ "type": "test", "event": "started", "name": "scaling::tests::default_tables_are_table_7_6_in_diagonal_order" }
+{ "type": "test", "name": "scaling::tests::default_factors_match_the_hm_raster_matrices", "event": "ok", "exec_time": 0.000018926 }
+{ "type": "test", "event": "started", "name": "scaling::tests::pps_list_overrides_sps_list_and_flat_when_disabled" }
+{ "type": "test", "name": "scaling::tests::default_lists_are_flat_at_4x4_and_table_7_6_above", "event": "ok", "exec_time": 0.000002826 }
+{ "type": "test", "event": "started", "name": "scaling::tests::prediction_copies_the_dc_too_and_the_32x32_step_is_three" }
+{ "type": "test", "name": "scaling::tests::default_list_round_trips_through_write_and_parse", "event": "ok", "exec_time": 0.000062106 }
+{ "type": "test", "event": "started", "name": "scaling::tests::prediction_copies_the_named_reference_matrix" }
+{ "type": "test", "name": "scaling::tests::prediction_copies_the_dc_too_and_the_32x32_step_is_three", "event": "ok", "exec_time": 0.000010249 }
+{ "type": "test", "event": "started", "name": "sei::tests::content_light_and_transfer_read_back_among_others" }
+{ "type": "test", "name": "scaling::tests::default_tables_are_table_7_6_in_diagonal_order", "event": "ok", "exec_time": 0.000003857 }
+{ "type": "test", "event": "started", "name": "sei::tests::hdr10_mastering_display_example_reads_back" }
+{ "type": "test", "name": "scaling::tests::pps_list_overrides_sps_list_and_flat_when_disabled", "event": "ok", "exec_time": 0.000110257 }
+{ "type": "test", "event": "started", "name": "sei::tests::hdr_sei_reads_back_through_ec_core" }
+{ "type": "test", "name": "scaling::tests::prediction_copies_the_named_reference_matrix", "event": "ok", "exec_time": 0.000011141 }
+{ "type": "test", "event": "started", "name": "sei::tests::malformed_sei_is_an_error_not_a_panic" }
+{ "type": "test", "name": "sei::tests::content_light_and_transfer_read_back_among_others", "event": "ok", "exec_time": 0.000003217 }
+{ "type": "test", "event": "started", "name": "sei::tests::picture_hash_is_md5_of_each_plane" }
+{ "type": "test", "name": "sei::tests::hdr_sei_reads_back_through_ec_core", "event": "ok", "exec_time": 0.000003517 }
+{ "type": "test", "event": "started", "name": "sei::tests::picture_hashes_read_back_for_each_hash_type" }
+{ "type": "test", "name": "sei::tests::picture_hash_is_md5_of_each_plane", "event": "ok", "exec_time": 0.000004138 }
+{ "type": "test", "event": "started", "name": "slice::tests::byte_offset_counts_escape_bytes" }
+{ "type": "test", "name": "sei::tests::malformed_sei_is_an_error_not_a_panic", "event": "ok", "exec_time": 0.000012834 }
+{ "type": "test", "event": "started", "name": "slice::tests::chroma_offset_uses_half_range_128_at_10_bits" }
+{ "type": "test", "name": "sei::tests::picture_hashes_read_back_for_each_hash_type", "event": "ok", "exec_time": 0.000003958 }
+{ "type": "test", "event": "started", "name": "slice::tests::emulation_prevention_bytes_are_counted" }
+{ "type": "test", "name": "slice::tests::chroma_offset_uses_half_range_128_at_10_bits", "event": "ok", "exec_time": 0.000003767 }
+{ "type": "test", "event": "started", "name": "slice::tests::entry_point_counts_past_32_and_past_u8_round_trip" }
+{ "type": "test", "name": "slice::tests::byte_offset_counts_escape_bytes", "event": "ok", "exec_time": 0.000000361 }
+{ "type": "test", "event": "started", "name": "slice::tests::intra_slice_header_round_trips_with_entry_points" }
+{ "type": "test", "name": "sei::tests::hdr10_mastering_display_example_reads_back", "event": "ok", "exec_time": 0.000001803 }
+{ "type": "test", "event": "started", "name": "vui::tests::cpb_count_past_31_is_refused_and_31_is_not" }
+{ "type": "test", "name": "slice::tests::emulation_prevention_bytes_are_counted", "event": "ok", "exec_time": 0.000000421 }
+{ "type": "test", "event": "started", "name": "vui::tests::vui_round_trips" }
+{ "type": "test", "name": "slice::tests::entry_point_counts_past_32_and_past_u8_round_trip", "event": "ok", "exec_time": 0.000073037 }
+{ "type": "test", "name": "slice::tests::intra_slice_header_round_trips_with_entry_points", "event": "ok", "exec_time": 0.000008327 }
+{ "type": "test", "name": "vui::tests::vui_round_trips", "event": "ok", "exec_time": 0.000002645 }
+{ "type": "test", "name": "vui::tests::cpb_count_past_31_is_refused_and_31_is_not", "event": "ok", "exec_time": 0.000009397 }
+{ "type": "suite", "event": "ok", "passed": 40, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.003144739 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "ten_thousand_malformed_inputs_never_panic" }
+{ "type": "test", "event": "started", "name": "truncation_is_need_more_not_corrupt" }
+{ "type": "test", "name": "truncation_is_need_more_not_corrupt", "event": "ok", "exec_time": 0.000029094 }
+{ "type": "test", "name": "ten_thousand_malformed_inputs_never_panic", "event": "ok", "exec_time": 0.025804721 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.026159018 }
+{ "type": "suite", "event": "started", "test_count": 7 }
+{ "type": "test", "event": "started", "name": "delta_poc_msb_cycle_accumulation_does_not_overflow" }
+{ "type": "test", "event": "started", "name": "entry_point_offset_all_ones_does_not_overflow" }
+{ "type": "test", "event": "started", "name": "inter_rps_abs_delta_out_of_range_does_not_overflow" }
+{ "type": "test", "event": "started", "name": "long_term_picture_count_sum_does_not_overflow" }
+{ "type": "test", "name": "delta_poc_msb_cycle_accumulation_does_not_overflow", "event": "ok", "exec_time": 0.000034033 }
+{ "type": "test", "event": "started", "name": "pps_default_num_ref_idx_out_of_range_does_not_allocate" }
+{ "type": "test", "name": "long_term_picture_count_sum_does_not_overflow", "event": "ok", "exec_time": 0.000061225 }
+{ "type": "test", "event": "started", "name": "pred_weight_chroma_denom_sum_does_not_overflow" }
+{ "type": "test", "name": "entry_point_offset_all_ones_does_not_overflow", "event": "ok", "exec_time": 0.000100499 }
+{ "type": "test", "event": "started", "name": "short_term_rps_delta_poc_out_of_range_does_not_overflow" }
+{ "type": "test", "name": "inter_rps_abs_delta_out_of_range_does_not_overflow", "event": "ok", "exec_time": 0.000013926 }
+{ "type": "test", "name": "pps_default_num_ref_idx_out_of_range_does_not_allocate", "event": "ok", "exec_time": 0.000029886 }
+{ "type": "test", "name": "short_term_rps_delta_poc_out_of_range_does_not_overflow", "event": "ok", "exec_time": 0.000009739 }
+{ "type": "test", "name": "pred_weight_chroma_denom_sum_does_not_overflow", "event": "ok", "exec_time": 0.000109215 }
+{ "type": "suite", "event": "ok", "passed": 7, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.001192261 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "every_sei_in_the_conformance_streams_parses" }
+{ "type": "test", "name": "every_sei_in_the_conformance_streams_parses", "event": "ok", "exec_time": 0.078925787 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.079238684 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.00003765 }

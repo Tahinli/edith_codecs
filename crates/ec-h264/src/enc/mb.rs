@@ -41,6 +41,7 @@ use super::quant::{
     forward_4x4, forward_8x8, forward_hadamard_2x2, forward_hadamard_4x4, quant_4x4,
     quant_4x4_offset, quant_8x8, quant_8x8_offset, quant_chroma_dc, quant_luma_dc,
 };
+use super::timing::mb_timed;
 use super::{
     entropy::{EncEntropy, sub_block_4x4},
     lambda_ssd,
@@ -57,7 +58,52 @@ pub enum Preset {
     Balanced,
 }
 
+/// Speed settings of `Preset::Fast`. The defaults are what the encoder ships;
+/// `EC_H264_INTRA_GATE` and `EC_H264_SKIP_I8` override them for sweeps (see
+/// `fast_knobs` in `mod.rs`). Balanced ignores all of them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FastKnobs {
+    /// A P macroblock skips its intra branch when the best inter SATD is at
+    /// most this fraction of the Intra_16x16 SATD. Zero keeps the branch.
+    pub intra_gate: f64,
+    /// Intra_8x8 is not tried; Intra_4x4 and Intra_16x16 are still coded.
+    pub skip_i8: bool,
+    /// Sub-sample refinement: 0 none, 1 half-sample ring only, 2 half and quarter.
+    pub me_sub: u8,
+    /// Sub-sample candidates are ranked on SATD (true) or SAD (false).
+    pub me_satd: bool,
+    /// Intra_8x8 is skipped inside P pictures only.
+    pub p_skip_i8: bool,
+    /// Inter transform size: 0 codes both and keeps the cheaper, 1 only 8x8, 2 only 4x4.
+    pub inter_tx: u8,
+    /// In P pictures the gate is tried against the DC mode's SATD before the
+    /// other Intra_16x16 modes are costed.
+    pub lazy_i16: bool,
+    /// Early P_Skip threshold in percent of the quantiser step; zero is off.
+    pub early_skip: u32,
+    /// With `inter_tx` 3: the 8x8 transform is tried only when the 4x4 coding
+    /// left at most this many levels in the macroblock.
+    pub tx8_nz_limit: u32,
+}
+
+impl Default for FastKnobs {
+    fn default() -> FastKnobs {
+        FastKnobs {
+            intra_gate: 2.0,
+            skip_i8: false,
+            me_sub: 1,
+            me_satd: false,
+            p_skip_i8: true,
+            inter_tx: 3,
+            lazy_i16: true,
+            early_skip: 8,
+            tx8_nz_limit: 16,
+        }
+    }
+}
+
 /// Source planes of one picture, edge-padded out to whole macroblocks.
+#[derive(Default)]
 pub(crate) struct Source {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
@@ -87,6 +133,8 @@ pub(crate) struct MbEnc<'a> {
     /// Extra rate saving an 8x8 trial must buy before it may replace 4x4.
     pub t8x8_margin_bits: f64,
     pub preset: Preset,
+    /// Fast-preset speed knobs (see [`FastKnobs`]).
+    pub fast: FastKnobs,
     /// The PPS carries transform_8x8_mode_flag: transform_size_8x8_flag must
     /// be written for every eligible macroblock (7.3.5).
     pub transform_8x8: bool,
@@ -115,12 +163,12 @@ pub(crate) struct MbEnc<'a> {
 impl MbEnc<'_> {
     /// Intra 8x8 eligibility of macroblock row `mb_y`.
     fn t8x8_intra(&self, mb_y: usize) -> bool {
-        self.transform_8x8_intra && (mb_y % 2 == 0 || !self.transform_8x8_roweven)
+        self.transform_8x8_intra && (mb_y.is_multiple_of(2) || !self.transform_8x8_roweven)
     }
 
     /// Inter 8x8 eligibility of macroblock row `mb_y`.
     fn t8x8_inter(&self, mb_y: usize) -> bool {
-        self.transform_8x8_inter && (mb_y % 2 == 0 || !self.transform_8x8_roweven)
+        self.transform_8x8_inter && (mb_y.is_multiple_of(2) || !self.transform_8x8_roweven)
     }
 }
 
@@ -170,27 +218,35 @@ impl Default for Levels {
 // (22.958B -> 23.042B cycles over 10 reps despite fewer instructions
 // retired) -- reverted, dead end; see ledger.
 fn satd4(src: &[u8], sstride: usize, sx: usize, sy: usize, pred: &[u8], pstride: usize) -> i32 {
-    let mut d = [0i32; 16];
-    for y in 0..4 {
+    // Differences are at most 255 in magnitude and the 2-D Hadamard sums 16 of
+    // them, so every intermediate fits an i16.
+    let mut d = [[0i16; 4]; 4];
+    for (y, row) in d.iter_mut().enumerate() {
+        let s = &src[(sy + y) * sstride + sx..][..4];
+        let p = &pred[y * pstride..][..4];
         for x in 0..4 {
-            d[y * 4 + x] =
-                i32::from(src[(sy + y) * sstride + sx + x]) - i32::from(pred[y * pstride + x]);
+            row[x] = i16::from(s[x]) - i16::from(p[x]);
         }
     }
-    for i in 0..4 {
-        let o = i * 4;
-        let (a, b, c, e) = (d[o], d[o + 1], d[o + 2], d[o + 3]);
+    // Vertical butterflies, lane-wise over the four columns.
+    let mut v = [[0i16; 4]; 4];
+    for x in 0..4 {
+        let (a, b, c, e) = (d[0][x], d[1][x], d[2][x], d[3][x]);
         let (s0, s1, s2, s3) = (a + b, c + e, a - b, c - e);
-        d[o] = s0 + s1;
-        d[o + 1] = s0 - s1;
-        d[o + 2] = s2 + s3;
-        d[o + 3] = s2 - s3;
+        v[0][x] = s0 + s1;
+        v[1][x] = s0 - s1;
+        v[2][x] = s2 + s3;
+        v[3][x] = s2 - s3;
     }
-    let mut sum = 0;
-    for j in 0..4 {
-        let (a, b, c, e) = (d[j], d[4 + j], d[8 + j], d[12 + j]);
+    // Horizontal butterflies per row, then the absolute sum.
+    let mut sum = 0i32;
+    for row in &v {
+        let (a, b, c, e) = (row[0], row[1], row[2], row[3]);
         let (s0, s1, s2, s3) = (a + b, c + e, a - b, c - e);
-        sum += (s0 + s1).abs() + (s0 - s1).abs() + (s2 + s3).abs() + (s2 - s3).abs();
+        sum += i32::from((s0 + s1).abs())
+            + i32::from((s0 - s1).abs())
+            + i32::from((s2 + s3).abs())
+            + i32::from((s2 - s3).abs());
     }
     (sum + 2) >> 2
 }
@@ -272,6 +328,28 @@ fn sad(
     sum
 }
 
+/// Sum and maximum of the absolute differences between the 16x16 source block
+/// at `(sx, sy)` and a 16-wide prediction.
+fn sad_max16(src: &[u8], sstride: usize, sx: usize, sy: usize, pred: &[u8]) -> (i32, i32) {
+    let mut acc = i16x16::ZERO;
+    let mut mx = i16x16::ZERO;
+    for y in 0..16 {
+        let a = load16(src, (sy + y) * sstride + sx);
+        let b = load16(pred, y * 16);
+        let d = (a - b).abs();
+        acc += d;
+        mx = mx.max(d);
+    }
+    let sum = acc.to_array().iter().map(|&v| i32::from(v)).sum();
+    let max = mx
+        .to_array()
+        .iter()
+        .map(|&v| i32::from(v))
+        .max()
+        .unwrap_or(0);
+    (sum, max)
+}
+
 /// Sixteen samples widened to 16-bit lanes; the tail past the slice is zero,
 /// which only a caller reading past the plane could reach.
 #[inline]
@@ -315,12 +393,17 @@ fn modes_allowed(have_top: bool, have_left: bool, have_tl: bool) -> [bool; 9] {
 
 #[inline]
 fn motion_rate(e: &MbEnc<'_>, bits: f64) -> i32 {
-    let lambda = if e.lambda_standard {
+    (motion_lambda(e) * bits).round() as i32
+}
+
+/// The multiplier `motion_rate` applies, for loops that price many vectors.
+#[inline]
+fn motion_lambda(e: &MbEnc<'_>) -> f64 {
+    if e.lambda_standard {
         e.lambda.sqrt()
     } else {
         e.lambda
-    };
-    (lambda * bits).round() as i32
+    }
 }
 
 /// Everything one macroblock's coding writes into the picture, kept so that a
@@ -336,7 +419,7 @@ struct MbState {
     ref_id: [[i32; 2]; 16],
     mvd_abs: [[u8; 4]; 16],
     blk: [u8; 16],
-    mb_qp: u8,
+    mb_qp: i8,
     mb_flags: u8,
     mb_cbp: u8,
     mb_dc_cbf: u8,
@@ -460,6 +543,8 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
         a: nbr.a.then(|| info(mb_addr - 1)),
         b: nbr.b.then(|| info(mb_addr - pic.mb_w)),
         qp_delta_inc: e.qp_delta_inc,
+        field: false,
+        mbaff_a: None,
     };
     // ctxIdxInc for mb_skip_flag (9.3.3.1.1.1).
     e.skip_inc = usize::from(nbr.a && pic.mb_flags[mb_addr - 1] & FLAG_SKIP == 0)
@@ -480,7 +565,7 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
 
     let mut inter: Option<Vec<InterChoice>> = None;
     if e.slice_type == SliceType::P {
-        inter = Some(choose_inter(pic, e, mb_x, mb_y));
+        inter = Some(mb_timed!(0, choose_inter(pic, e, mb_x, mb_y)));
     }
 
     // Intra against inter is decided on real coded cost: both branches are
@@ -505,9 +590,24 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
     // The second encode costs about two seconds on a run that took 28.8: each
     // P macroblock is coded twice, and the loser's reconstruction and entropy
     // writer are thrown away.
-    let intra_cost = intra_pre_cost(pic, e, &nbr, mb_x, mb_y);
+    // In a P picture at Fast the gate only needs a cheap intra estimate. The
+    // DC mode's SATD is an upper bound on the best mode's, so when the inter
+    // candidate already beats the gate against it the other three modes are
+    // never costed.
+    let gate = e.preset == Preset::Fast && e.fast.intra_gate > 0.0;
+    let intra_cost = match inter.as_ref() {
+        Some(c) if gate && e.fast.lazy_i16 => {
+            let dc = mb_timed!(1, intra_pre_cost(pic, e, &nbr, mb_x, mb_y, &[2]));
+            if f64::from(c[0].satd) <= e.fast.intra_gate * f64::from(dc.satd) {
+                dc
+            } else {
+                mb_timed!(1, intra_pre_cost(pic, e, &nbr, mb_x, mb_y, &[2, 0, 1, 3]))
+            }
+        }
+        _ => mb_timed!(1, intra_pre_cost(pic, e, &nbr, mb_x, mb_y, &[2, 0, 1, 3])),
+    };
     let Some(choices) = inter else {
-        encode_intra_mb(pic, e, w, mb_addr, nbr, intra_cost);
+        mb_timed!(3, encode_intra_mb(pic, e, w, mb_addr, nbr, intra_cost));
         return;
     };
 
@@ -516,7 +616,16 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
     } else {
         lambda_ssd(e.qp)
     };
-    let before = save_mb_state(pic, e, mb_addr);
+    let gated = e.preset == Preset::Fast
+        && e.fast.intra_gate > 0.0
+        && f64::from(choices[0].satd) <= e.fast.intra_gate * f64::from(intra_cost.satd);
+    if gated {
+        // Inter only and one candidate at Fast: nothing is compared, so the
+        // macroblock is coded straight into the picture and the writer.
+        mb_timed!(2, encode_inter_mb(pic, e, w, mb_addr, nbr, choices[0]));
+        return;
+    }
+    let before = mb_timed!(4, save_mb_state(pic, e, mb_addr));
     // The shape and the skip flag are ranked the same way intra and inter are:
     // by coding each candidate and measuring it. The SATD total that ordered
     // them inside the search is a prediction-domain estimate that never sees
@@ -529,32 +638,35 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
     };
     let mut best_inter: Option<(f64, MbState, EncEntropy)> = None;
     for &choice in &choices[..rd_cands.max(1)] {
-        load_mb_state(pic, e, mb_addr, &before);
-        let mut w_c = w.clone();
+        mb_timed!(4, load_mb_state(pic, e, mb_addr, &before));
+        let mut w_c = mb_timed!(5, w.probe_copy());
         let start = w_c.bit_len();
-        encode_inter_mb(pic, e, &mut w_c, mb_addr, nbr, choice);
+        mb_timed!(2, encode_inter_mb(pic, e, &mut w_c, mb_addr, nbr, choice));
         let bits = (w_c.bit_len() - start) as f64;
         let rd = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda * bits;
         if best_inter.as_ref().is_none_or(|b| rd < b.0) {
-            best_inter = Some((rd, save_mb_state(pic, e, mb_addr), w_c));
+            best_inter = Some((rd, mb_timed!(4, save_mb_state(pic, e, mb_addr)), w_c));
         }
     }
     let (inter_rd, after_inter, w_inter) = best_inter.expect("at least one inter candidate");
-    load_mb_state(pic, e, mb_addr, &before);
+    mb_timed!(4, load_mb_state(pic, e, mb_addr, &before));
 
-    let mut w_intra = w.clone();
+    let mut w_intra = mb_timed!(5, w.probe_copy());
     let intra_bits = {
         let start = w_intra.bit_len();
-        encode_intra_mb(pic, e, &mut w_intra, mb_addr, nbr, intra_cost);
+        mb_timed!(
+            3,
+            encode_intra_mb(pic, e, &mut w_intra, mb_addr, nbr, intra_cost)
+        );
         (w_intra.bit_len() - start) as f64
     };
     let intra_rd = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda * intra_bits;
 
     if intra_rd < inter_rd {
-        *w = w_intra;
+        w.adopt(w_intra);
     } else {
-        load_mb_state(pic, e, mb_addr, &after_inter);
-        *w = w_inter;
+        mb_timed!(4, load_mb_state(pic, e, mb_addr, &after_inter));
+        w.adopt(w_inter);
     }
 }
 
@@ -563,6 +675,9 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
 /// [`encode_intra_mb`]).
 struct IntraCost {
     i16_mode: u8,
+    /// SATD of the Intra_16x16 mode above: the cheap intra estimate that
+    /// `Preset::Fast` gates the full intra branch on.
+    satd: i32,
     /// True when Intra_4x4 may be used at all for this picture and preset.
     allow_i4: bool,
 }
@@ -575,12 +690,13 @@ fn intra_pre_cost(
     nbr: &MbNeighbors,
     mb_x: usize,
     mb_y: usize,
+    modes: &[u8],
 ) -> IntraCost {
     let (sx, sy) = (mb_x * 16, mb_y * 16);
     let stride = pic.y.stride;
     let origin = pic.y.at(sx, sy);
     let mut best = (i32::MAX, 2u8);
-    for mode in [2u8, 0, 1, 3] {
+    for &mode in modes {
         let ok = match mode {
             0 => nbr.b,
             1 => nbr.a,
@@ -595,7 +711,7 @@ fn intra_pre_cost(
             stride,
             origin,
         };
-        pred_16x16(mode, &mut win, nbr.b, nbr.a);
+        pred_16x16(mode, 8, &mut win, nbr.b, nbr.a);
         let cost = satd16(&e.src.y, e.src.stride, sx, sy, &pic.y.data, stride, origin);
         if cost < best.0 {
             best = (cost, mode);
@@ -603,6 +719,7 @@ fn intra_pre_cost(
     }
     IntraCost {
         i16_mode: best.1,
+        satd: best.0,
         // Intra_4x4 is tried in P pictures too, at every preset. Re-measured
         // once the intra-versus-inter decision became a real one (BD-PSNR
         // against x264, GOP 10, QP 22/26/30/34): restricting it to I pictures
@@ -622,6 +739,9 @@ fn intra_pre_cost(
 /// rate is worse than charging half on both contents, and the curve is flat
 /// below a half and falls away above it.
 const MV_BITS_WEIGHT: f64 = 0.5;
+
+/// Cap on whole-sample walk iterations per partition at `Preset::Fast`.
+const FAST_ME_PASSES: usize = 3;
 
 /// The offsets the whole-sample search steps through, in units of the current
 /// step size.
@@ -785,6 +905,9 @@ const SHAPE_RD_CANDIDATES: usize = 5;
 /// The inter decision for a P macroblock.
 #[derive(Clone, Copy)]
 struct InterChoice {
+    /// The candidate's SATD cost (luma plus chroma) as the shape search ranked it;
+    /// zero where the search did not rank it.
+    satd: i32,
     shape: PShape,
     /// One motion vector per partition.
     mv: [[i16; 2]; 4],
@@ -792,6 +915,9 @@ struct InterChoice {
     skip_mv: [i16; 2],
     /// The skip candidate is at least as good as the searched one.
     prefer_skip: bool,
+    /// The prediction is so close to the source that the macroblock is coded
+    /// as P_Skip without costing a residual (`Preset::Fast` only).
+    force_skip: bool,
 }
 
 /// Motion search plus the skip candidate.
@@ -802,6 +928,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
         mb_y,
         slice_id: e.slice_id,
         written: 0,
+        pos: Default::default(),
     };
     let n = ctx.neighbours(pic, 0, 0, 4, 0);
     let mvp = predict_mv(&n, 0, 4, 4, 0);
@@ -881,6 +1008,42 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
         (f64::from(sum) * CHROMA_ME_WEIGHT) as i32
     };
 
+    // Early skip: a prediction at the P_Skip vector that already sits inside
+    // the quantiser's dead zone codes nothing, so neither the search nor a
+    // residual is worth the time. Judged on luma SAD, the largest single
+    // difference and the chroma SATD, all against the quantiser step.
+    if e.preset == Preset::Fast && e.fast.early_skip > 0 {
+        let qstep = ((f64::from(e.qp) - 4.0) / 6.0).exp2();
+        let k = f64::from(e.fast.early_skip) / 100.0;
+        let mut buf = [0u8; 256];
+        mc_luma(
+            &plane,
+            sx as i32,
+            sy as i32,
+            skip_mv,
+            16,
+            16,
+            16,
+            &mut buf,
+            Put::Set,
+        );
+        let (sad_luma, max_luma) = sad_max16(&e.src.y, sw, sx, sy, &buf);
+        if f64::from(sad_luma) <= 256.0 * k * qstep && f64::from(max_luma) <= 4.0 * k * qstep + 2.0
+        {
+            let c = chroma_satd(0, 0, 16, 16, skip_mv);
+            if f64::from(c) <= 64.0 * k * qstep * 4.0 {
+                return vec![InterChoice {
+                    satd: 0,
+                    shape: PShape::Whole,
+                    mv: [skip_mv; 4],
+                    skip_mv,
+                    prefer_skip: true,
+                    force_skip: true,
+                }];
+            }
+        }
+    }
+
     let range = match e.preset {
         Preset::Fast => 16i16,
         Preset::Balanced => 48,
@@ -888,6 +1051,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
 
     // One search over a `w` x `h` partition at `(px, py)` samples inside the
     // macroblock, seeded with the candidate vectors of its neighbourhood.
+    let mlam = motion_lambda(e);
     let search = |px: usize, py: usize, w: usize, h: usize, mvp: [i16; 2], seeds: &[[i16; 2]]| {
         let (x0, y0) = (sx + px, sy + py);
         let mut buf = [0u8; 256];
@@ -896,11 +1060,12 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
         // which is what a search can afford; the winner is re-costed on SATD
         // because the intra candidates are SATD and the two scales differ.
         let mut cost_of = |mv: [i16; 2], satd: bool| -> i32 {
-            let bits = motion_rate(
-                e,
-                f64::from(se_bits(i32::from(mv[0] - mvp[0])) + se_bits(i32::from(mv[1] - mvp[1])))
-                    * MV_BITS_WEIGHT,
-            );
+            let bits = (mlam
+                * f64::from(
+                    se_bits(i32::from(mv[0] - mvp[0])) + se_bits(i32::from(mv[1] - mvp[1])),
+                )
+                * MV_BITS_WEIGHT)
+                .round() as i32;
             if !satd && mv[0] & 3 == 0 && mv[1] & 3 == 0 {
                 let o = integer_origin(
                     &plane,
@@ -911,7 +1076,17 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
                 );
                 return sad(&e.src.y, sw, x0, y0, &plane.data[o..], plane.stride, w, h) + bits;
             }
-            mc_luma(&plane, x0 as i32, y0 as i32, mv, w, h, w, &mut buf, crate::inter::Put::Set);
+            mc_luma(
+                &plane,
+                x0 as i32,
+                y0 as i32,
+                mv,
+                w,
+                h,
+                w,
+                &mut buf,
+                crate::inter::Put::Set,
+            );
             let d = if satd {
                 satd_block(&e.src.y, sw, x0, y0, &buf, w, 0, w, h)
             } else {
@@ -920,13 +1095,20 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
             d + bits
         };
 
+        let fast = e.preset == Preset::Fast;
         let mut best = ([0i16; 2], i32::MAX);
-        for &cand in seeds {
-            let c = cost_of(cand, false);
-            if c < best.1 {
-                best = (cand, c);
+        mb_timed!(
+            12,
+            for (i, &cand) in seeds.iter().enumerate() {
+                if seeds[..i].contains(&cand) {
+                    continue;
+                }
+                let c = cost_of(cand, false);
+                if c < best.1 {
+                    best = (cand, c);
+                }
             }
-        }
+        );
         // Every partition is searched. This used to stop at a seed whose cost
         // was already under half a level a sample, on the reasoning that the
         // prediction fit and the search is the encoder's hot loop. Swept on
@@ -936,65 +1118,127 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
         // -0.466/-0.470/-0.468/-0.476 on the screen capture. A seed that fits
         // is exactly where a little more refinement is cheap.
         {
-            let mut step = 4i16 * 4; // four whole samples, in quarter units
-            while step >= 4 {
-                let mut improved = true;
-                while improved {
-                    improved = false;
-                    for (dx, dy) in ME_PATTERN {
-                        let (dx, dy) = (dx * step, dy * step);
-                        let cand = [best.0[0] + dx, best.0[1] + dy];
-                        if (cand[0] - mvp[0]).abs() > range * 4
-                            || (cand[1] - mvp[1]).abs() > range * 4
-                        {
-                            continue;
+            // Fast opens at two whole samples: the seeds already carry the
+            // neighbours' motion, so the walk only has to settle around them.
+            let mut step = if fast { 2i16 * 4 } else { 4i16 * 4 };
+            let mut passes = 0;
+            mb_timed!(
+                13,
+                while step >= 4 {
+                    let mut improved = true;
+                    while improved {
+                        improved = false;
+                        passes += 1;
+                        if fast && passes > FAST_ME_PASSES {
+                            break;
                         }
-                        let c = cost_of(cand, false);
-                        if c < best.1 {
-                            best = (cand, c);
-                            improved = true;
+                        for (dx, dy) in ME_PATTERN {
+                            let (dx, dy) = (dx * step, dy * step);
+                            let cand = [best.0[0] + dx, best.0[1] + dy];
+                            if (cand[0] - mvp[0]).abs() > range * 4
+                                || (cand[1] - mvp[1]).abs() > range * 4
+                            {
+                                continue;
+                            }
+                            let c = cost_of(cand, false);
+                            if c < best.1 {
+                                best = (cand, c);
+                                improved = true;
+                            }
                         }
                     }
+                    step /= 2;
                 }
-                step /= 2;
-            }
+            );
             // Sub-sample refinement runs on SATD, not SAD: interpolation
             // smooths, and a sum of absolute differences reads the smoothing
             // as a better match where a transform-domain cost does not. Worth
             // 0.06 dB BD-PSNR on the film clip and 0.04 dB on the screen
             // capture. The whole-sample winner is re-costed in the same domain
             // first so the two halves of the search compare.
-            best.1 = cost_of(best.0, true);
-            // Both sub-sample steps iterate to convergence at every preset.
-            // Stopping the refinement after one pass at Fast, which is what
-            // this used to do, costs 0.111 dB BD-PSNR on the film clip and
-            // 0.035 on the screen capture for 2% of the comparison's wall
-            // clock.
-            for step in [2i16, 1] {
-                let mut improved = true;
-                while improved {
-                    improved = false;
-                    for (dx, dy) in [
-                        (step, 0),
-                        (-step, 0),
-                        (0, step),
-                        (0, -step),
-                        (step, step),
-                        (-step, -step),
-                        (step, -step),
-                        (-step, step),
-                    ] {
-                        let cand = [best.0[0] + dx, best.0[1] + dy];
-                        let c = cost_of(cand, true);
+            let sub_satd = !fast || e.fast.me_satd;
+            mb_timed!(14, {
+                best.1 = cost_of(best.0, sub_satd);
+                // Balanced iterates both sub-sample steps to convergence. Fast
+                // looks at each ring of eight once.
+                let rings: &[i16] = if !fast {
+                    &[2, 1]
+                } else {
+                    match e.fast.me_sub {
+                        0 => &[],
+                        1 => &[2],
+                        _ => &[2, 1],
+                    }
+                };
+                if fast && e.fast.me_sub == 1 {
+                    // The four half-sample neighbours on the axes, then only the
+                    // diagonal the two winning axes point at.
+                    let base = best;
+                    let mut axis = [(base.0, base.1); 2];
+                    for (k, dirs) in [[(2i16, 0i16), (-2, 0)], [(0, 2), (0, -2)]]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        for (dx, dy) in dirs {
+                            let cand = [base.0[0] + dx, base.0[1] + dy];
+                            let c = cost_of(cand, sub_satd);
+                            if c < axis[k].1 {
+                                axis[k] = (cand, c);
+                            }
+                        }
+                    }
+                    let both = axis[0].1 < base.1 && axis[1].1 < base.1;
+                    if both {
+                        let cand = [axis[0].0[0], axis[1].0[1]];
+                        let c = cost_of(cand, sub_satd);
                         if c < best.1 {
                             best = (cand, c);
-                            improved = true;
+                        }
+                    }
+                    for a in axis {
+                        if a.1 < best.1 {
+                            best = a;
                         }
                     }
                 }
-            }
+                let rings: &[i16] = if fast && e.fast.me_sub == 1 {
+                    &[]
+                } else {
+                    rings
+                };
+                for &step in rings {
+                    let mut improved = true;
+                    while improved {
+                        improved = false;
+                        for (dx, dy) in [
+                            (step, 0),
+                            (-step, 0),
+                            (0, step),
+                            (0, -step),
+                            (step, step),
+                            (-step, -step),
+                            (step, -step),
+                            (-step, step),
+                        ] {
+                            let cand = [best.0[0] + dx, best.0[1] + dy];
+                            let c = cost_of(cand, sub_satd);
+                            if c < best.1 {
+                                best = (cand, c);
+                                improved = !fast;
+                            }
+                        }
+                    }
+                }
+            });
         }
-        (best.0, cost_of(best.0, true))
+        (
+            best.0,
+            if !fast || e.fast.me_satd {
+                best.1
+            } else {
+                cost_of(best.0, true)
+            },
+        )
     };
 
     let seeds = [mvp, skip_mv, [0, 0], n[0].mv, n[1].mv, n[2].mv];
@@ -1002,7 +1246,17 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
     let cost16 = cost16 + chroma_satd(0, 0, 16, 16, mv16);
     let skip_cost = {
         let mut buf = [0u8; 256];
-        mc_luma(&plane, sx as i32, sy as i32, skip_mv, 16, 16, 16, &mut buf, Put::Set);
+        mc_luma(
+            &plane,
+            sx as i32,
+            sy as i32,
+            skip_mv,
+            16,
+            16,
+            16,
+            &mut buf,
+            Put::Set,
+        );
         // P_Skip's rebate is the signalling it genuinely saves. Re-measured on
         // consecutive pictures: 0 and 2 read -1.102/-1.154 dB on the film clip
         // and -0.741/-0.696 on the screen capture -- the two contents disagree
@@ -1121,10 +1375,12 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
         }
     }
     let winner = InterChoice {
+        satd: best.2,
         shape: best.0,
         mv: best.1,
         skip_mv,
         prefer_skip: best.0 == PShape::Whole && skip_cost <= best.2,
+        force_skip: false,
     };
     // The SATD winner first, then the shapes it beat, then the skip candidate
     // when the winner is not already it. The caller codes as many of these as
@@ -1133,19 +1389,23 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
     for (shape, mv) in evaluated {
         if shape != winner.shape || winner.prefer_skip {
             cands.push(InterChoice {
+                satd: 0,
                 shape,
                 mv,
                 skip_mv,
                 prefer_skip: false,
+                force_skip: false,
             });
         }
     }
     if !winner.prefer_skip {
         cands.push(InterChoice {
+            satd: skip_cost,
             shape: PShape::Whole,
             mv: [skip_mv; 4],
             skip_mv,
             prefer_skip: true,
+            force_skip: false,
         });
     }
     cands
@@ -1236,7 +1496,7 @@ fn code_luma_4x4(
         }
         if intra {
             lv.cbp_luma |= 1 << (blk >> 2);
-            add_residual_4x4(&mut pic.y.data, stride, origin, &resid);
+            add_residual_4x4(&mut pic.y.data, 8, stride, origin, &resid);
         } else {
             for i in 0..16 {
                 let z = i64::from(source[i]);
@@ -1296,7 +1556,7 @@ fn code_luma_4x4(
         let (x, y) = (mb_x * 16 + dx as usize * 4, mb_y * 16 + dy as usize * 4);
         let origin = pic.y.at(x, y);
         lv.cbp_luma |= 1 << (blk >> 2);
-        add_residual_4x4(&mut pic.y.data, stride, origin, &resid);
+        add_residual_4x4(&mut pic.y.data, 8, stride, origin, &resid);
     }
 }
 
@@ -1557,7 +1817,7 @@ fn code_i16_luma(
         stride,
         origin,
     };
-    pred_16x16(mode, &mut win, nbr.b, nbr.a);
+    pred_16x16(mode, 8, &mut win, nbr.b, nbr.a);
     code_luma_i16(pic, e, mb_x, mb_y, qp, lv);
 }
 
@@ -1626,7 +1886,7 @@ fn code_luma_i16(
         let origin = pic
             .y
             .at(mb_x * 16 + dx as usize * 4, mb_y * 16 + dy as usize * 4);
-        add_residual_4x4(&mut pic.y.data, stride, origin, &resid);
+        add_residual_4x4(&mut pic.y.data, 8, stride, origin, &resid);
     }
 }
 
@@ -1852,7 +2112,7 @@ fn code_chroma(
             let mut resid = [0i32; 16];
             inverse_transform_4x4(&raster, &mut resid);
             let origin = plane.at(mb_x * 8 + (blk & 1) * 4, mb_y * 8 + (blk >> 1) * 4);
-            add_residual_4x4(&mut plane.data, stride, origin, &resid);
+            add_residual_4x4(&mut plane.data, 8, stride, origin, &resid);
         }
     }
 }
@@ -1905,7 +2165,7 @@ fn code_intra_4x4(
             if !allowed[mode as usize] {
                 continue;
             }
-            pred_4x4(mode, &n, &mut p);
+            pred_4x4(mode, 8, &n, &mut p);
             let bits = if mode == predicted { 1 } else { 4 };
             let c = satd4(&e.src.y, e.src.stride, x, y, &p, 4) + motion_rate(e, f64::from(bits));
             ranked[mode as usize] = (c, mode);
@@ -1939,7 +2199,7 @@ fn code_intra_4x4(
                 if c == i32::MAX {
                     break;
                 }
-                pred_4x4(cand, &n, &mut p);
+                pred_4x4(cand, 8, &n, &mut p);
                 let mut d = [0i32; 16];
                 for ry in 0..4 {
                     for rx in 0..4 {
@@ -1975,7 +2235,7 @@ fn code_intra_4x4(
         modes[blk] = mode;
         pic.i4_modes[by * w4 + bx] = mode;
         // Prediction into the plane, then residual and reconstruction.
-        pred_4x4(mode, &n, &mut p);
+        pred_4x4(mode, 8, &n, &mut p);
         let stride = pic.y.stride;
         let origin = pic.y.at(x, y);
         for ry in 0..4 {
@@ -1999,7 +2259,7 @@ fn code_intra_4x4(
             dequant_4x4(&mut raster, &e.ls, qp, false);
             let mut resid = [0i32; 16];
             inverse_transform_4x4(&raster, &mut resid);
-            add_residual_4x4(&mut pic.y.data, stride, origin, &resid);
+            add_residual_4x4(&mut pic.y.data, 8, stride, origin, &resid);
         }
     }
     (modes, pred_modes)
@@ -2074,7 +2334,7 @@ fn code_block_8x8(
         *out = [0; 64];
         return 0;
     }
-    add_residual_8x8(&mut pic.y.data, stride, origin, &resid);
+    add_residual_8x8(&mut pic.y.data, 8, stride, origin, &resid);
     nz
 }
 
@@ -2261,7 +2521,7 @@ fn rough_intra_bits(lv: &Levels, i4: Option<(&[u8], &[u8])>) -> i64 {
 }
 
 fn entropy_bits(w: &EncEntropy, write: impl FnOnce(&mut EncEntropy)) -> i64 {
-    let mut probe = w.clone();
+    let mut probe = w.probe_copy();
     let before = probe.bit_len();
     write(&mut probe);
     (probe.bit_len() - before) as i64
@@ -2356,6 +2616,7 @@ fn write_luma_for_cost(
         }
     }
 }
+#[allow(clippy::too_many_arguments)] // the encoder cost model takes its per-MB state explicitly
 fn cost_chroma_nz_pair(
     pic: &Picture,
     nbr: &MbNeighbors,
@@ -2419,6 +2680,7 @@ fn write_chroma_for_cost(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the encoder cost model takes its per-MB state explicitly
 fn intra_mb_bits(
     pic: &Picture,
     e: &MbEnc<'_>,
@@ -2475,6 +2737,7 @@ fn intra_mb_bits(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // the encoder cost model takes its per-MB state explicitly
 fn inter_mb_bits(
     pic: &Picture,
     e: &MbEnc<'_>,
@@ -2544,12 +2807,15 @@ fn encode_intra_mb(
     let mut pred_modes8 = [2u8; 4];
     let mut use_i4 = false;
     let mut chroma_lv = Levels::default();
-    let chroma_mode = choose_chroma_mode_rd(pic, e, w, &nbr, mb_x, mb_y, qp, &mut chroma_lv);
+    let chroma_mode = mb_timed!(
+        10,
+        choose_chroma_mode_rd(pic, e, w, &nbr, mb_x, mb_y, qp, &mut chroma_lv)
+    );
     let mut use_i8 = false;
 
     if cost.allow_i4 {
         let mut lv4 = chroma_lv.clone();
-        let (m4, p4) = code_intra_4x4(pic, e, mb_x, mb_y, qp, &nbr, &mut lv4);
+        let (m4, p4) = mb_timed!(6, code_intra_4x4(pic, e, mb_x, mb_y, qp, &nbr, &mut lv4));
         let cost4 = if e.t8x8_intra(mb_y) {
             let bits = intra_mb_bits(
                 pic,
@@ -2579,8 +2845,10 @@ fn encode_intra_mb(
         // Intra_8x8 on the same terms, when the PPS allows it.
         let mut lv8 = chroma_lv.clone();
         let mut recon8 = [0u8; 256];
-        let cost8 = if e.t8x8_intra(mb_y) {
-            let (m8, p8) = code_intra_8x8(pic, e, w, mb_x, mb_y, qp, &nbr, &mut lv8);
+        let skip8 = e.preset == Preset::Fast
+            && (e.fast.skip_i8 || (e.fast.p_skip_i8 && e.slice_type == SliceType::P));
+        let cost8 = if e.t8x8_intra(mb_y) && !skip8 {
+            let (m8, p8) = mb_timed!(7, code_intra_8x8(pic, e, w, mb_x, mb_y, qp, &nbr, &mut lv8));
             modes8 = m8;
             pred_modes8 = p8;
             save_luma(pic, mb_x, mb_y, &mut recon8);
@@ -2602,7 +2870,10 @@ fn encode_intra_mb(
         };
 
         let mut lv16 = chroma_lv;
-        code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv16);
+        mb_timed!(
+            11,
+            code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv16)
+        );
         let cost16 = if e.t8x8_intra(mb_y) {
             let bits = intra_mb_bits(
                 pic,
@@ -2650,7 +2921,10 @@ fn encode_intra_mb(
         }
     } else {
         lv = chroma_lv;
-        code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv);
+        mb_timed!(
+            11,
+            code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv)
+        );
     }
 
     // ---- syntax ----
@@ -2835,9 +3109,9 @@ fn ssd_mb_deblocked(
             if s == 0 {
                 continue;
             }
-            let ep = edge_params(qp, 0, 0, s);
+            let ep = edge_params(qp, 0, 0, s, 8);
             for row in seg * 4..seg * 4 + 4 {
-                filter_luma_line(&mut scratch, (A + row) * S + A + x, 1, &ep);
+                filter_luma_line(&mut scratch, 255, (A + row) * S + A + x, 1, &ep);
             }
         }
     }
@@ -2854,7 +3128,7 @@ fn ssd_mb_deblocked(
         ];
         if seg_bs[0] == seg_bs[1] && seg_bs[1] == seg_bs[2] && seg_bs[2] == seg_bs[3] {
             if seg_bs[0] != 0 {
-                let ep = edge_params(qp, 0, 0, seg_bs[0]);
+                let ep = edge_params(qp, 0, 0, seg_bs[0], 8);
                 filter_luma_h_edge16(&mut scratch, (A + y) * S + A, S, &ep);
             }
             continue;
@@ -2863,9 +3137,9 @@ fn ssd_mb_deblocked(
             if seg_bs[seg] == 0 {
                 continue;
             }
-            let ep = edge_params(qp, 0, 0, seg_bs[seg]);
+            let ep = edge_params(qp, 0, 0, seg_bs[seg], 8);
             for col in seg * 4..seg * 4 + 4 {
-                filter_luma_line(&mut scratch, (A + y) * S + A + col, S, &ep);
+                filter_luma_line(&mut scratch, 255, (A + y) * S + A + col, S, &ep);
             }
         }
     }
@@ -2963,7 +3237,17 @@ fn compensate_part(
     };
     let stride = pic.y.stride;
     let origin = pic.y.at(mb_x * 16 + bx * 4, mb_y * 16 + by * 4);
-    mc_luma(&plane, x0, y0, mv, w, h, stride, &mut pic.y.data[origin..], Put::Set);
+    mc_luma(
+        &plane,
+        x0,
+        y0,
+        mv,
+        w,
+        h,
+        stride,
+        &mut pic.y.data[origin..],
+        Put::Set,
+    );
     for comp in 0..2 {
         let src = if comp == 0 {
             &reference.cb
@@ -3024,6 +3308,7 @@ fn encode_inter_mb(
         mb_y,
         slice_id: e.slice_id,
         written: 0,
+        pos: Default::default(),
     };
     let (part_w, part_h) = shape.part_blocks();
     let mut mvd = [[0i16; 2]; 4];
@@ -3075,54 +3360,74 @@ fn encode_inter_mb(
     // bits it saves: on static content a macroblock whose residual is pure
     // quantisation churn costs bits every picture and improves nothing.
     let may_skip = choice.prefer_skip;
-    let ssd_skip = may_skip.then(|| ssd_mb(pic, e, mb_x, mb_y));
-    let mut chroma_lv = Levels::default();
-    code_chroma(pic, e, w, mb_x, mb_y, qp, false, &mut chroma_lv);
-    let mut lv = chroma_lv.clone();
-    if e.t8x8_inter(mb_y) {
-        // Both transform sizes on the same prediction; the cheaper
-        // rate-distortion cost is coded.
-        let mut pred = [0u8; 256];
-        save_luma(pic, mb_x, mb_y, &mut pred);
-        let mut lv4 = chroma_lv.clone();
-        code_luma_4x4(pic, e, w, mb_x, mb_y, qp, false, &mut lv4);
-        let bits4 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv4);
-        let cost4 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits4 as f64;
-        let mut recon4 = [0u8; 256];
-        save_luma(pic, mb_x, mb_y, &mut recon4);
-        restore_luma(pic, mb_x, mb_y, &pred);
-        let mut lv8 = chroma_lv;
-        code_luma_8x8(pic, e, w, mb_x, mb_y, qp, &mut lv8);
-        let bits8 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv8);
-        let cost8 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits8 as f64;
-        if cost8 + e.lambda * e.t8x8_margin_bits < cost4 {
-            lv = lv8;
-        } else {
-            lv = lv4;
-            restore_luma(pic, mb_x, mb_y, &recon4);
-        }
+    let (lv, skip) = if choice.force_skip {
+        (Levels::default(), true)
     } else {
-        code_luma_4x4(pic, e, w, mb_x, mb_y, qp, false, &mut lv);
-    }
-    let empty = lv.cbp_luma == 0 && lv.cbp_chroma == 0;
-    let skip = match ssd_skip {
-        None => false,
-        Some(_) if empty => true,
-        Some(ssd_skip) => {
-            let coded = if e.t8x8_inter(mb_y) {
-                let bits = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv);
-                ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
+        let ssd_skip = may_skip.then(|| ssd_mb(pic, e, mb_x, mb_y));
+        let mut chroma_lv = Levels::default();
+        code_chroma(pic, e, w, mb_x, mb_y, qp, false, &mut chroma_lv);
+        let mut lv = chroma_lv.clone();
+        let tx_mode = if e.preset == Preset::Fast {
+            e.fast.inter_tx
+        } else {
+            0
+        };
+        if e.t8x8_inter(mb_y) && tx_mode == 1 {
+            code_luma_8x8(pic, e, w, mb_x, mb_y, qp, &mut lv);
+        } else if e.t8x8_inter(mb_y) && tx_mode != 2 {
+            // Both transform sizes on the same prediction; the cheaper
+            // rate-distortion cost is coded.
+            let mut pred = [0u8; 256];
+            save_luma(pic, mb_x, mb_y, &mut pred);
+            let mut lv4 = chroma_lv.clone();
+            code_luma_4x4(pic, e, w, mb_x, mb_y, qp, false, &mut lv4);
+            // At Fast the 8x8 trial is only worth its time when the 4x4 coding
+            // left a few levels in a smooth residual: an empty one cannot be
+            // beaten and a dense one rarely is.
+            let nz4: u32 = lv4.luma_nz.iter().map(|&n| u32::from(n)).sum();
+            if tx_mode == 3 && (lv4.cbp_luma == 0 || nz4 > e.fast.tx8_nz_limit) {
+                lv = lv4;
             } else {
-                ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * estimate_bits(&lv) as f64
-            };
-            if ssd_skip as f64 <= coded {
-                // Put the prediction back: the residual has been added to it.
-                compensate_part(pic, reference, mb_x, mb_y, (0, 0), (16, 16), choice.skip_mv);
-                true
-            } else {
-                false
+                let bits4 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv4);
+                let cost4 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits4 as f64;
+                let mut recon4 = [0u8; 256];
+                save_luma(pic, mb_x, mb_y, &mut recon4);
+                restore_luma(pic, mb_x, mb_y, &pred);
+                let mut lv8 = chroma_lv;
+                code_luma_8x8(pic, e, w, mb_x, mb_y, qp, &mut lv8);
+                let bits8 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv8);
+                let cost8 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits8 as f64;
+                if cost8 + e.lambda * e.t8x8_margin_bits < cost4 {
+                    lv = lv8;
+                } else {
+                    lv = lv4;
+                    restore_luma(pic, mb_x, mb_y, &recon4);
+                }
             }
+        } else {
+            code_luma_4x4(pic, e, w, mb_x, mb_y, qp, false, &mut lv);
         }
+        let empty = lv.cbp_luma == 0 && lv.cbp_chroma == 0;
+        let skip = match ssd_skip {
+            None => false,
+            Some(_) if empty => true,
+            Some(ssd_skip) => {
+                let coded = if e.t8x8_inter(mb_y) {
+                    let bits = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv);
+                    ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
+                } else {
+                    ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * estimate_bits(&lv) as f64
+                };
+                if ssd_skip as f64 <= coded {
+                    // Put the prediction back: the residual has been added to it.
+                    compensate_part(pic, reference, mb_x, mb_y, (0, 0), (16, 16), choice.skip_mv);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        (lv, skip)
     };
 
     let w4 = pic.mb_w * 4;
@@ -3145,7 +3450,7 @@ fn encode_inter_mb(
                 pic.nz_c[comp][base..base + 2].fill(0);
             }
         }
-        pic.mb_qp[mb_addr] = e.qp as u8;
+        pic.mb_qp[mb_addr] = e.qp as i8;
         pic.mb_flags[mb_addr] = FLAG_DECODED | FLAG_INTER | FLAG_SKIP;
         pic.mb_cbp[mb_addr] = 0;
         pic.mb_dc_cbf[mb_addr] = 0;
@@ -3238,7 +3543,7 @@ fn finish_mb(
         e.qp_delta_inc = 0;
         e.qp
     };
-    pic.mb_qp[mb_addr] = qp_y as u8;
+    pic.mb_qp[mb_addr] = qp_y as i8;
     pic.mb_flags[mb_addr] = FLAG_DECODED
         | if m.is_i16 { FLAG_I16 } else { 0 }
         | if m.intra { 0 } else { FLAG_INTER }
@@ -3395,7 +3700,7 @@ fn choose_chroma_mode_rd(
                 stride,
                 origin,
             };
-            pred_chroma_8x8(mode, &mut win, nbr.b, nbr.a);
+            pred_chroma_8x8(mode, 8, &mut win, nbr.b, nbr.a);
         }
         let mut lv = Levels::default();
         code_chroma(pic, e, w, mb_x, mb_y, qp, true, &mut lv);
@@ -3495,12 +3800,13 @@ fn i8_mode_by_rd(
     let lambda = lambda_ssd(qp);
     let stride = pic.y.stride;
     let origin = pic.y.at(x, y);
-    let mut best: Option<(f64, u8, [i32; 64], bool, [u8; 64])> = None;
+    type Best = Option<(f64, u8, [i32; 64], bool, [u8; 64])>;
+    let mut best: Best = None;
     for mode in 0..9u8 {
         if !allowed[mode as usize] {
             continue;
         }
-        pred_8x8(mode, n, p);
+        pred_8x8(mode, 8, n, p);
         for ry in 0..8 {
             let row = origin + ry * stride;
             pic.y.data[row..row + 8].copy_from_slice(&p[ry * 8..ry * 8 + 8]);

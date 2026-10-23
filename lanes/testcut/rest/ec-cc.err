@@ -1,0 +1,8 @@
+   Compiling ec-h265-syntax v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-h265-syntax)
+   Compiling ec-h264-syntax v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-h264-syntax)
+   Compiling ec-cc v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-cc)
+    Finished `release` profile [optimized] target(s) in 3.86s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_cc-cb4d96b5b3d930ea)
+     Running tests/captions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/captions-4b890188bea68511)
+     Running tests/streams.rs (/home/user/.cache/tgt-testcut-rest/release/deps/streams-2706c147dd46e048)
+   Doc-tests ec_cc

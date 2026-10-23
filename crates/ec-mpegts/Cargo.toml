@@ -1,0 +1,14 @@
+[package]
+name = "ec-mpegts"
+description = "MPEG-2 Transport Stream demuxer: .ts, BDAV .m2ts/.mts (AVCHD), PAT/PMT, PES, exact seeking."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true
+ec-dvdsub.workspace = true
+ec-h264-syntax.workspace = true
+ec-h265-syntax.workspace = true
+ec-truehd.workspace = true

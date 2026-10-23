@@ -1,0 +1,46 @@
+[package]
+name = "ec-hw-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-hw]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "build_parameters"
+path = "fuzz_targets/build_parameters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h264_build_parameters"
+path = "fuzz_targets/h264_build_parameters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vp9_build_parameters"
+path = "fuzz_targets/vp9_build_parameters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "av1_build_parameters"
+path = "fuzz_targets/av1_build_parameters.rs"
+test = false
+doc = false
+bench = false

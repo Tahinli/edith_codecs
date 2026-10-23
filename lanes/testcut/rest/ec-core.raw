@@ -1,0 +1,92 @@
+{ "type": "suite", "event": "started", "test_count": 44 }
+{ "type": "test", "event": "started", "name": "bitio::tests::exp_golomb_round_trip_including_edges" }
+{ "type": "test", "event": "started", "name": "bitio::tests::lsb_round_trip_and_order" }
+{ "type": "test", "event": "started", "name": "bitio::tests::lsb_truncation_is_need_more" }
+{ "type": "test", "event": "started", "name": "bitio::tests::msb_bit_order_is_most_significant_first" }
+{ "type": "test", "name": "bitio::tests::exp_golomb_round_trip_including_edges", "event": "ok", "exec_time": 0.000003717 }
+{ "type": "test", "event": "started", "name": "bitio::tests::msb_round_trip_mixed_widths" }
+{ "type": "test", "name": "bitio::tests::msb_bit_order_is_most_significant_first", "event": "ok", "exec_time": 0.000000351 }
+{ "type": "test", "event": "started", "name": "bitio::tests::peek_and_skip_do_not_diverge" }
+{ "type": "test", "name": "bitio::tests::lsb_truncation_is_need_more", "event": "ok", "exec_time": 0.000001022 }
+{ "type": "test", "event": "started", "name": "bitio::tests::signed_exp_golomb_round_trip" }
+{ "type": "test", "name": "bitio::tests::msb_round_trip_mixed_widths", "event": "ok", "exec_time": 0.000002855 }
+{ "type": "test", "event": "started", "name": "bitio::tests::signed_fixed_width_and_bytes" }
+{ "type": "test", "name": "bitio::tests::lsb_round_trip_and_order", "event": "ok", "exec_time": 0.000003788 }
+{ "type": "test", "event": "started", "name": "bitio::tests::truncation_is_need_more_never_panic" }
+{ "type": "test", "name": "bitio::tests::peek_and_skip_do_not_diverge", "event": "ok", "exec_time": 0.00000036 }
+{ "type": "test", "event": "started", "name": "color::tests::an_output_declares_the_space_its_height_implies" }
+{ "type": "test", "name": "bitio::tests::signed_exp_golomb_round_trip", "event": "ok", "exec_time": 0.000002084 }
+{ "type": "test", "event": "started", "name": "color::tests::an_unstated_brightness_is_absent_and_not_a_zero" }
+{ "type": "test", "name": "bitio::tests::signed_fixed_width_and_bytes", "event": "ok", "exec_time": 0.000001643 }
+{ "type": "test", "event": "started", "name": "color::tests::av1_sequence_header_reads_its_color_config" }
+{ "type": "test", "name": "bitio::tests::truncation_is_need_more_never_panic", "event": "ok", "exec_time": 0.000000842 }
+{ "type": "test", "event": "started", "name": "color::tests::bit_reader_reads_exp_golomb" }
+{ "type": "test", "name": "color::tests::an_output_declares_the_space_its_height_implies", "event": "ok", "exec_time": 0.00000017 }
+{ "type": "test", "event": "started", "name": "color::tests::color_info_carries_the_same_meaning_both_ways" }
+{ "type": "test", "name": "color::tests::an_unstated_brightness_is_absent_and_not_a_zero", "event": "ok", "exec_time": 0.00000027 }
+{ "type": "test", "event": "started", "name": "color::tests::h264_scaling_lists_are_skipped_before_the_vui" }
+{ "type": "test", "name": "color::tests::av1_sequence_header_reads_its_color_config", "event": "ok", "exec_time": 0.000040226 }
+{ "type": "test", "event": "started", "name": "color::tests::h273_codes_round_trip" }
+{ "type": "test", "name": "color::tests::bit_reader_reads_exp_golomb", "event": "ok", "exec_time": 0.000000822 }
+{ "type": "test", "event": "started", "name": "color::tests::hevc_scaling_list_data_is_skipped_before_the_vui" }
+{ "type": "test", "name": "color::tests::color_info_carries_the_same_meaning_both_ways", "event": "ok", "exec_time": 0.00000011 }
+{ "type": "test", "event": "started", "name": "color::tests::rbsp_drops_emulation_bytes" }
+{ "type": "test", "name": "color::tests::h264_scaling_lists_are_skipped_before_the_vui", "event": "ok", "exec_time": 0.000017282 }
+{ "type": "test", "event": "started", "name": "color::tests::the_peak_is_the_measured_light_before_the_display_it_was_graded_on" }
+{ "type": "test", "name": "color::tests::h273_codes_round_trip", "event": "ok", "exec_time": 0.000000432 }
+{ "type": "test", "event": "started", "name": "color::tests::the_sei_walk_reads_past_an_emulation_prevention_byte" }
+{ "type": "test", "name": "color::tests::hevc_scaling_list_data_is_skipped_before_the_vui", "event": "ok", "exec_time": 0.000009328 }
+{ "type": "test", "event": "started", "name": "color::tests::tiers_resolve_in_order" }
+{ "type": "test", "name": "color::tests::rbsp_drops_emulation_bytes", "event": "ok", "exec_time": 0.000000882 }
+{ "type": "test", "event": "started", "name": "color::tests::unknown_codes_fall_through" }
+{ "type": "test", "name": "color::tests::the_sei_walk_reads_past_an_emulation_prevention_byte", "event": "ok", "exec_time": 0.000002926 }
+{ "type": "test", "event": "started", "name": "frame::tests::audio_frame_validates_planes" }
+{ "type": "test", "name": "color::tests::the_peak_is_the_measured_light_before_the_display_it_was_graded_on", "event": "ok", "exec_time": 0.000000351 }
+{ "type": "test", "event": "started", "name": "frame::tests::channel_layouts_are_named_and_ordered" }
+{ "type": "test", "name": "color::tests::tiers_resolve_in_order", "event": "ok", "exec_time": 0.00000018 }
+{ "type": "test", "event": "started", "name": "frame::tests::frame_pts_passthrough" }
+{ "type": "test", "name": "color::tests::unknown_codes_fall_through", "event": "ok", "exec_time": 0.0000001 }
+{ "type": "test", "event": "started", "name": "frame::tests::plane_geometry_matches_formats" }
+{ "type": "test", "name": "frame::tests::audio_frame_validates_planes", "event": "ok", "exec_time": 0.000012223 }
+{ "type": "test", "event": "started", "name": "frame::tests::video_frame_validates_planes" }
+{ "type": "test", "name": "frame::tests::channel_layouts_are_named_and_ordered", "event": "ok", "exec_time": 0.000000161 }
+{ "type": "test", "event": "started", "name": "packet::tests::buf_slice_rejects_out_of_range" }
+{ "type": "test", "name": "frame::tests::frame_pts_passthrough", "event": "ok", "exec_time": 0.000001553 }
+{ "type": "test", "event": "started", "name": "packet::tests::buf_slices_share_one_allocation" }
+{ "type": "test", "name": "frame::tests::plane_geometry_matches_formats", "event": "ok", "exec_time": 0.000001272 }
+{ "type": "test", "event": "started", "name": "packet::tests::packet_construction" }
+{ "type": "test", "name": "frame::tests::video_frame_validates_planes", "event": "ok", "exec_time": 0.000004047 }
+{ "type": "test", "event": "started", "name": "registry::tests::a_matrix_term_at_i32_min_is_not_a_quarter_turn" }
+{ "type": "test", "name": "packet::tests::buf_slices_share_one_allocation", "event": "ok", "exec_time": 0.000000441 }
+{ "type": "test", "event": "started", "name": "registry::tests::a_matrix_that_is_not_a_quarter_turn_is_kept_not_rounded" }
+{ "type": "test", "name": "packet::tests::buf_slice_rejects_out_of_range", "event": "ok", "exec_time": 0.000059052 }
+{ "type": "test", "event": "started", "name": "registry::tests::every_codec_id_has_a_media_type_and_name" }
+{ "type": "test", "name": "packet::tests::packet_construction", "event": "ok", "exec_time": 0.000000973 }
+{ "type": "test", "event": "started", "name": "registry::tests::parameters_default_per_media_type" }
+{ "type": "test", "name": "registry::tests::a_matrix_term_at_i32_min_is_not_a_quarter_turn", "event": "ok", "exec_time": 0.00000015 }
+{ "type": "test", "event": "started", "name": "registry::tests::quarter_turn_matrices_read_as_typed_rotations" }
+{ "type": "test", "name": "registry::tests::a_matrix_that_is_not_a_quarter_turn_is_kept_not_rounded", "event": "ok", "exec_time": 0.00000018 }
+{ "type": "test", "event": "started", "name": "registry::tests::stream_info_carries_language_and_timing" }
+{ "type": "test", "name": "registry::tests::every_codec_id_has_a_media_type_and_name", "event": "ok", "exec_time": 0.000007514 }
+{ "type": "test", "event": "started", "name": "registry::tests::trait_objects_are_send" }
+{ "type": "test", "name": "registry::tests::parameters_default_per_media_type", "event": "ok", "exec_time": 0.00000035 }
+{ "type": "test", "event": "started", "name": "timebase::tests::ntsc_never_becomes_integer_fps" }
+{ "type": "test", "name": "registry::tests::quarter_turn_matrices_read_as_typed_rotations", "event": "ok", "exec_time": 0.000000181 }
+{ "type": "test", "event": "started", "name": "timebase::tests::ntsc_ten_hours_zero_drift" }
+{ "type": "test", "name": "registry::tests::stream_info_carries_language_and_timing", "event": "ok", "exec_time": 0.00000032 }
+{ "type": "test", "event": "started", "name": "timebase::tests::overflow_is_reported_not_wrapped" }
+{ "type": "test", "name": "registry::tests::trait_objects_are_send", "event": "ok", "exec_time": 0.000000081 }
+{ "type": "test", "event": "started", "name": "timebase::tests::reduces_and_compares_equal" }
+{ "type": "test", "name": "timebase::tests::overflow_is_reported_not_wrapped", "event": "ok", "exec_time": 0.00000023 }
+{ "type": "test", "event": "started", "name": "timebase::tests::rejects_non_positive_parts" }
+{ "type": "test", "name": "timebase::tests::ntsc_never_becomes_integer_fps", "event": "ok", "exec_time": 0.000000421 }
+{ "type": "test", "event": "started", "name": "timebase::tests::rounding_modes" }
+{ "type": "test", "name": "timebase::tests::ntsc_ten_hours_zero_drift", "event": "ok", "exec_time": 0.000000541 }
+{ "type": "test", "event": "started", "name": "timebase::tests::timestamp_math" }
+{ "type": "test", "name": "timebase::tests::reduces_and_compares_equal", "event": "ok", "exec_time": 0.000000361 }
+{ "type": "test", "name": "timebase::tests::rejects_non_positive_parts", "event": "ok", "exec_time": 0.000001553 }
+{ "type": "test", "name": "timebase::tests::rounding_modes", "event": "ok", "exec_time": 0.000000361 }
+{ "type": "test", "name": "timebase::tests::timestamp_math", "event": "ok", "exec_time": 0.000000221 }
+{ "type": "suite", "event": "ok", "passed": 44, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.004071914 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000048702 }

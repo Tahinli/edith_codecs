@@ -7,6 +7,7 @@ use ec_core::{
 
 use crate::bsi::{self, Acmod, Bsi};
 use crate::decode::{Core, Syntax};
+use crate::dependent;
 use crate::eac3;
 use crate::syncinfo;
 use crate::transform::BLOCK_SAMPLES;
@@ -69,7 +70,8 @@ pub struct FrameInfo {
     pub syntax: Syntax,
     /// Sample rate in Hz.
     pub sample_rate: u32,
-    /// Full-bandwidth channels, LFE excluded.
+    /// Full-bandwidth channels of the independent substream, LFE excluded.
+    /// Dependent substreams add to the frame's layout, not to this count.
     pub nfchans: usize,
     /// LFE present.
     pub lfeon: bool,
@@ -94,9 +96,13 @@ pub struct FrameInfo {
 /// An AC-3 / E-AC-3 decoder.
 ///
 /// One packet is one syncframe (plus any E-AC-3 substreams that belong to it),
-/// which is how every container this family reads stores the format.
+/// which is how the containers this family reads usually store the format. A
+/// packet holding several syncframes is walked by [`Ac3Decoder::decode_packet`].
 pub struct Ac3Decoder {
     core: Core,
+    /// One decoder state per dependent substream of the packet, in packet
+    /// order: each carries its own blocks' history from frame to frame.
+    dependents: Vec<Core>,
     params: CodecParameters,
     options: Options,
     pending: Option<Frame>,
@@ -122,6 +128,7 @@ impl Ac3Decoder {
     pub fn with_options(options: Options) -> Ac3Decoder {
         Ac3Decoder {
             core: Core::new(),
+            dependents: Vec::new(),
             params: CodecParameters::new(CodecId::Ac3),
             options,
             pending: None,
@@ -147,21 +154,94 @@ impl Ac3Decoder {
     /// not implement [`Error::Unsupported`] with the reason named — never a
     /// panic, on any input.
     ///
-    /// After the frame, `data` may hold only padding that is not itself a
-    /// syncframe: container slack is ignored. A tail that *begins* another
-    /// syncframe is stream this decoder would otherwise drop in silence — a
-    /// dependent substream whose channels extend the frame, or a second frame
-    /// altogether — and that is [`Error::Unsupported`] naming what it is;
-    /// containers hand frames over one at a time.
+    /// The independent substream's channels come first, then the channels of
+    /// each E-AC-3 dependent substream that follows it, in packet order. A
+    /// dependent substream whose channel map names a speaker this build has no
+    /// position for is refused by name (see [`dependent`]). After the
+    /// frame, `data` may hold only padding that is not itself a syncframe:
+    /// container slack is ignored. A second syncframe after this one is
+    /// [`Error::Unsupported`] naming what it is: this call takes one syncframe,
+    /// and [`Ac3Decoder::decode_packet`] takes a packet of several.
     pub fn decode_frame(&mut self, data: &[u8]) -> Result<AudioFrame> {
+        let syncframe = self.decode_syncframe(data)?;
+        reject_tail(&data[syncframe.consumed..])?;
+        self.audio_frame(syncframe.info, syncframe.layout, syncframe.interleaved)
+    }
+
+    /// Decode a packet holding one or more syncframes into one audio frame.
+    ///
+    /// Each syncframe (with its E-AC-3 dependent substreams) is decoded in
+    /// packet order against the same decoder state, so the output is the
+    /// frames' samples back to back, exactly as decoding them one packet at a
+    /// time would give. Bytes after the last syncframe that do not begin a
+    /// header are padding and ignored. A following syncframe must share the
+    /// first one's channel layout, and an E-AC-3 independent substream of
+    /// another program (substream id 1 and up) is refused by name: it would be
+    /// stream this decoder does not produce.
+    pub fn decode_packet(&mut self, data: &[u8]) -> Result<AudioFrame> {
+        let mut first = self.decode_syncframe(data)?;
+        let mut pos = first.consumed;
+        while begins_syncframe(&data[pos..]) {
+            let tail = &data[pos..];
+            if tail[5] >> 3 > 10 {
+                let hdr = eac3::parse_from(&mut ec_core::BitReader::new(tail))?;
+                if hdr.substreamid != 0 {
+                    return Err(Error::unsupported(
+                        "E-AC-3 independent substream of another program in the packet",
+                        "programs 2 and up are not decoded; the packet's first \
+                         program is the one this decoder produces",
+                    ));
+                }
+            }
+            let next = self.decode_syncframe(tail).map_err(|e| match e {
+                Error::NeedMore => Error::corrupt("syncframe in the packet tail is truncated"),
+                other => other,
+            })?;
+            if next.layout != first.layout {
+                return Err(Error::unsupported(
+                    "syncframes with different channel layouts in one packet",
+                    "a packet's frames are concatenated into one frame of one layout",
+                ));
+            }
+            first.interleaved.extend(next.interleaved);
+            first.info = next.info;
+            pos += next.consumed;
+        }
+        self.audio_frame(first.info, first.layout, first.interleaved)
+    }
+
+    /// Decode the syncframe that starts `data`: its independent substream and
+    /// the dependent substreams after it, as interleaved samples in the layout
+    /// the options ask for. Bytes after it are the caller's to judge.
+    fn decode_syncframe(&mut self, data: &[u8]) -> Result<Syncframe> {
         let mut samples = Vec::new();
         let (info, consumed) = self.decode_substream(data, &mut samples)?;
-        reject_tail(&data[consumed..])?;
-        let layout = self.layout(&info);
-        let interleaved = self.fold(samples, &info);
+        let (dependents, consumed) = self.decode_dependents(data, consumed, info.samples)?;
+        let mut frame = dependent::split(&samples, &self.core_positions(&info));
+        for d in dependents {
+            frame = dependent::merge(frame, d);
+        }
+        let positions: Vec<ChannelPosition> = frame.iter().map(|c| c.position).collect();
+        let layout = self.layout(&positions);
+        let interleaved = self.fold(dependent::interleave(&frame), &info, &positions);
+        Ok(Syncframe {
+            info,
+            layout,
+            interleaved,
+            consumed,
+        })
+    }
+
+    /// The audio frame for decoded interleaved samples, and the decoder's
+    /// stream parameters updated to match.
+    fn audio_frame(
+        &mut self,
+        info: FrameInfo,
+        layout: ChannelLayout,
+        interleaved: Vec<f32>,
+    ) -> Result<AudioFrame> {
         let channels = layout.channel_count();
         let count = interleaved.len().checked_div(channels).unwrap_or(0);
-        self.info = Some(info.clone());
         self.params.media = MediaParameters::Audio(AudioParameters {
             sample_rate: info.sample_rate,
             layout: layout.clone(),
@@ -176,6 +256,7 @@ impl Ac3Decoder {
         for v in &interleaved {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
+        self.info = Some(info.clone());
         AudioFrame::try_new(
             SampleFormat::F32,
             false,
@@ -238,6 +319,48 @@ impl Ac3Decoder {
         }
     }
 
+    /// Decode the dependent substreams that follow the independent one
+    /// (Annex E, E.3.8), starting at `pos`. Returns what each one adds and the
+    /// offset after the last of them.
+    fn decode_dependents(
+        &mut self,
+        data: &[u8],
+        mut pos: usize,
+        frames: usize,
+    ) -> Result<(Vec<Vec<dependent::Channel>>, usize)> {
+        let mut found = Vec::new();
+        let mut slot = 0;
+        while let Some(hdr) = dependent::peek(&data[pos..]) {
+            let body = data
+                .get(pos..pos + hdr.frame_size)
+                .ok_or_else(|| Error::corrupt("E-AC-3 dependent substream: truncated"))?;
+            if hdr.nblocks * BLOCK_SAMPLES != frames {
+                return Err(Error::corrupt(format!(
+                    "E-AC-3 dependent substream: {} blocks, the independent substream has {}",
+                    hdr.nblocks,
+                    frames / BLOCK_SAMPLES
+                )));
+            }
+            let channels = hdr.nfchans + usize::from(hdr.bsi.lfeon);
+            let positions = dependent::positions(hdr.chanmap, channels)?;
+            if self.dependents.len() <= slot {
+                self.dependents.push(Core::new());
+            }
+            let (drc_scale, dither) = (self.options.drc_scale, self.options.dither);
+            let core = &mut self.dependents[slot];
+            core.drc_scale = drc_scale;
+            core.dither_on = dither;
+            let mut r = ec_core::BitReader::new(body);
+            let own = eac3::parse_from(&mut r)?;
+            let mut samples = Vec::new();
+            eac3::decode_frame(core, &mut r, &own, &mut samples)?;
+            found.push(dependent::split(&samples, &positions));
+            slot += 1;
+            pos += hdr.frame_size;
+        }
+        Ok((found, pos))
+    }
+
     fn info_from(&self, syntax: Syntax, sample_rate: u32, bsi: &Bsi, nblocks: usize) -> FrameInfo {
         FrameInfo {
             syntax,
@@ -254,8 +377,9 @@ impl Ac3Decoder {
         }
     }
 
-    /// The channel layout the coded channels are handed out in.
-    fn native_layout(&self, info: &FrameInfo) -> ChannelLayout {
+    /// The positions the independent substream's channels fill, in the order
+    /// its samples come out.
+    fn core_positions(&self, info: &FrameInfo) -> Vec<ChannelPosition> {
         use ChannelPosition::*;
         let mut positions: Vec<ChannelPosition> = match info.acmod {
             Acmod::DualMono => vec![FrontLeft, FrontRight],
@@ -265,7 +389,8 @@ impl Ac3Decoder {
             Acmod::Surround2_1 => vec![FrontLeft, FrontRight, BackCenter],
             Acmod::Surround3_1 => vec![FrontLeft, FrontRight, FrontCenter, BackCenter],
             Acmod::Surround2_2 => vec![FrontLeft, FrontRight, BackLeft, BackRight],
-            Acmod::Surround3_2 => vec![FrontLeft, FrontRight, FrontCenter, BackLeft, BackRight],
+            // ffmpeg places AC-3's Ls/Rs at the side positions ("5.1(side)").
+            Acmod::Surround3_2 => vec![FrontLeft, FrontRight, FrontCenter, SideLeft, SideRight],
         };
         if info.lfeon {
             let fronts = match info.acmod {
@@ -275,29 +400,23 @@ impl Ac3Decoder {
             };
             positions.insert(fronts.min(positions.len()), Lfe);
         }
-        match positions.len() {
-            1 => ChannelLayout::Mono,
-            2 => ChannelLayout::Stereo,
-            _ if positions == ChannelLayout::Surround5_1.positions() => ChannelLayout::Surround5_1,
-            _ => ChannelLayout::Custom(positions),
-        }
+        positions
     }
 
-    fn layout(&self, info: &FrameInfo) -> ChannelLayout {
+    /// The layout of a frame whose channels sit at `positions` (canonical order).
+    fn layout(&self, positions: &[ChannelPosition]) -> ChannelLayout {
         match self.options.downmix {
-            Downmix::Native => self.native_layout(info),
+            Downmix::Native => layout_of(positions),
             Downmix::Stereo => ChannelLayout::Stereo,
             Downmix::Mono => ChannelLayout::Mono,
         }
     }
 
     /// Apply the requested downmix, if any (§7.8.2).
-    fn fold(&self, samples: Vec<f32>, info: &FrameInfo) -> Vec<f32> {
+    fn fold(&self, samples: Vec<f32>, info: &FrameInfo, positions: &[ChannelPosition]) -> Vec<f32> {
         if self.options.downmix == Downmix::Native {
             return samples;
         }
-        let layout = self.native_layout(info);
-        let positions = layout.positions().to_vec();
         let channels = positions.len();
         if channels == 0 {
             return samples;
@@ -308,11 +427,15 @@ impl Ac3Decoder {
         // full-scale input cannot overflow the downmix — the standard's fixed
         // -7.65 dB would quieten every stereo listener instead.
         let (mut left, mut right) = (Vec::new(), Vec::new());
-        for &p in &positions {
+        for &p in positions {
             let (l, r) = match p {
                 ChannelPosition::FrontLeft => (1.0, 0.0),
                 ChannelPosition::FrontRight => (0.0, 1.0),
                 ChannelPosition::FrontCenter => (clev, clev),
+                // Lc/Rc from a dependent substream sit at the -3 dB point that
+                // the standard's centre coefficient stands for.
+                ChannelPosition::FrontLeftOfCenter => (0.707, 0.0),
+                ChannelPosition::FrontRightOfCenter => (0.0, 0.707),
                 ChannelPosition::BackLeft | ChannelPosition::SideLeft => (slev, 0.0),
                 ChannelPosition::BackRight | ChannelPosition::SideRight => (0.0, slev),
                 // A single surround channel feeds both sides at 0.7 × slev.
@@ -366,7 +489,7 @@ impl Decoder for Ac3Decoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let mut frame = self.decode_frame(&packet.data)?;
+        let mut frame = self.decode_packet(&packet.data)?;
         frame.pts = packet.pts.map(|ts| Timestamp::new(ts, packet.time_base));
         self.pending = Some(Frame::Audio(frame));
         Ok(())
@@ -390,52 +513,66 @@ impl Decoder for Ac3Decoder {
 
     fn reset(&mut self) {
         self.core.reset();
+        for d in &mut self.dependents {
+            d.reset();
+        }
         self.pending = None;
         self.flushed = false;
     }
 }
 
-/// What the bytes after a decoded frame may say. Nothing, or padding that is
-/// not itself a syncframe — the slack a container's block may carry around a
-/// frame. A tail that *begins* a syncframe is stream the caller handed over in
-/// one packet that this decoder decodes only the first of: a dependent
-/// substream whose channels extend the frame, or a second frame altogether.
-/// Dropping either loses audio in silence, so both are named refusals; a
-/// `0x0B77` coincidence that does not parse as a header is junk, and junk is
-/// the spec's own allowance.
-fn reject_tail(tail: &[u8]) -> Result<()> {
+/// The layout of canonically ordered `positions`: the named layouts where they
+/// match, a custom one otherwise.
+fn layout_of(positions: &[ChannelPosition]) -> ChannelLayout {
+    match positions {
+        [ChannelPosition::FrontCenter] => ChannelLayout::Mono,
+        [ChannelPosition::FrontLeft, ChannelPosition::FrontRight] => ChannelLayout::Stereo,
+        _ if positions == ChannelLayout::Surround5_1.positions() => ChannelLayout::Surround5_1,
+        _ if positions == ChannelLayout::Surround7_1.positions() => ChannelLayout::Surround7_1,
+        _ => ChannelLayout::Custom(positions.to_vec()),
+    }
+}
+
+/// One syncframe as decoded: its interleaved samples in the requested layout,
+/// the header summary, and the bytes its independent and dependent substreams
+/// took.
+struct Syncframe {
+    info: FrameInfo,
+    layout: ChannelLayout,
+    interleaved: Vec<f32>,
+    consumed: usize,
+}
+
+/// Whether `tail` begins a syncframe header: the sync word, then a header that
+/// parses as AC-3 or E-AC-3 (the syntax picked by bsid). A `0x0B77`
+/// coincidence that does not parse as a header is junk, which is the spec's
+/// own allowance, so it does not count.
+fn begins_syncframe(tail: &[u8]) -> bool {
     // Both syntaxes announce a frame with 0x0B77, and no header is shorter
     // than six bytes.
     if tail.len() < 6 || u16::from_be_bytes([tail[0], tail[1]]) != syncinfo::SYNCWORD {
-        return Ok(());
+        return false;
     }
-    let named = if tail[5] >> 3 > 10 {
-        match eac3::parse_from(&mut ec_core::BitReader::new(tail)) {
-            // The 7.1-as-5.1-plus-dependents shape: the first substream is
-            // exactly what decoded, the tail is the extension channels this
-            // build does not assemble.
-            Ok(hdr) if hdr.strmtyp == eac3::StreamType::Dependent => Some((
-                "E-AC-3 dependent substream in the tail of the packet",
-                "a dependent substream carries channel extensions for an \
-                 independent one that has to be decoded first",
-            )),
-            Ok(_) => Some((
-                "a second syncframe in the tail of the packet",
-                "one packet is one syncframe and the substreams that belong \
-                 to it; hand frames to the decoder one at a time",
-            )),
-            // A syncword coincidence that is no header is padding, not stream.
-            Err(_) => None,
-        }
+    if tail[5] >> 3 > 10 {
+        eac3::parse_from(&mut ec_core::BitReader::new(tail)).is_ok()
     } else {
-        syncinfo::parse(tail).is_ok().then_some((
-            "a second syncframe in the tail of the packet",
-            "one packet is one syncframe and the substreams that belong \
-                 to it; hand frames to the decoder one at a time",
-        ))
-    };
-    match named {
-        Some((what, why)) => Err(Error::unsupported(what, why)),
-        None => Ok(()),
+        syncinfo::parse(tail).is_ok()
     }
+}
+
+/// What the bytes after a frame and its dependent substreams may say. Nothing,
+/// or padding that is not itself a syncframe — the slack a container's block
+/// may carry around a frame. A tail that *begins* a syncframe is a second
+/// independent substream or a second frame: [`Ac3Decoder::decode_frame`] takes
+/// one syncframe, so that is a named refusal, and [`Ac3Decoder::decode_packet`]
+/// is the call that walks them.
+fn reject_tail(tail: &[u8]) -> Result<()> {
+    if begins_syncframe(tail) {
+        return Err(Error::unsupported(
+            "a second syncframe in the tail of the packet",
+            "decode_frame takes one syncframe; decode_packet (and send_packet) \
+             walks a packet holding several",
+        ));
+    }
+    Ok(())
 }

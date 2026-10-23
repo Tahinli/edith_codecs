@@ -1,0 +1,70 @@
+[package]
+name = "ec-matroska-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-core]
+path = "../../ec-core"
+
+[dependencies.ec-matroska]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "open_tracks"
+path = "fuzz_targets/open_tracks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "demux_packets"
+path = "fuzz_targets/demux_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seek"
+path = "fuzz_targets/seek.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ebml_walk"
+path = "fuzz_targets/ebml_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lacing"
+path = "fuzz_targets/lacing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracks"
+path = "fuzz_targets/tracks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index"
+path = "fuzz_targets/index.rs"
+test = false
+doc = false
+bench = false

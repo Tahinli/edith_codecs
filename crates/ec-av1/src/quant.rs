@@ -348,7 +348,7 @@ mod tests {
     /// every denominator band.
     #[test]
     fn buffered_dequant_matches_the_per_coefficient_form() {
-        let levels: Vec<i32> = (0..64).map(|i| (i as i32 - 32) * 37).collect();
+        let levels: Vec<i32> = (0..64).map(|i| (i - 32) * 37).collect();
         let mut out = Vec::new();
         for (w, h) in [(4, 4), (16, 16), (32, 32), (64, 64), (8, 32), (16, 4)] {
             for bit_depth in [8u8, 10, 12] {

@@ -1,0 +1,12 @@
+   Compiling ec-riff v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-riff)
+    Finished `release` profile [optimized] target(s) in 6.49s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_riff-e3fb4a6522df619c)
+     Running tests/avi_fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/avi_fuzz_regressions-966303a688ad356a)
+     Running tests/avi_raw_dv.rs (/home/user/.cache/tgt-testcut-rest/release/deps/avi_raw_dv-c690cc0b8c134d52)
+     Running tests/avi_video.rs (/home/user/.cache/tgt-testcut-rest/release/deps/avi_video-2bf6fcd5f51b7554)
+[avi @ 0x5649944ea900] monow rawvideo cannot be written to avi, output file will be unreadable
+     Running tests/dts.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dts-c3f2f0c494d7653d)
+     Running tests/mov_raw.rs (/home/user/.cache/tgt-testcut-rest/release/deps/mov_raw-c6eb8f370ed71e0d)
+     Running tests/rf64.rs (/home/user/.cache/tgt-testcut-rest/release/deps/rf64-174d57687f1ea8a5)
+     Running tests/wav.rs (/home/user/.cache/tgt-testcut-rest/release/deps/wav-0babed3be06e3d5d)
+   Doc-tests ec_riff

@@ -11,12 +11,12 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ec_hw::{
-    Codec, Decoder, EncCodec, Encoder, EncoderConfig, Frame, FrameMetadata, I420, I420_16,
-    RateControlMode,
+    Codec, Decoder, EncCodec, Encoder, EncoderConfig, Frame, FrameMetadata, H264Profile, I420,
+    I420_16, RateControlMode,
 };
 use ec_va::Display;
 
@@ -28,8 +28,8 @@ fn bitstreams() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/bitstreams")
 }
 
-fn display() -> Option<Arc<Display>> {
-    match Display::open() {
+fn display() -> Option<Rc<Display>> {
+    match ec_va::open() {
         Ok(display) => Some(display),
         Err(e) => {
             eprintln!("skipped: no VA display ({e})");
@@ -110,8 +110,10 @@ impl Reference {
         if self.ten_bit {
             let read = |slice: &[u8]| -> Vec<u16> {
                 slice
-                    .chunks_exact(2)
-                    .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| u16::from_le_bytes(*p))
                     .collect()
             };
             Some(Planes {
@@ -557,7 +559,7 @@ fn source_frame(width: u32, height: u32, t: u32) -> I420 {
 
 /// Encode `frames` synthetic pictures and return the bitstream.
 fn encode_stream(
-    display: &Arc<Display>,
+    display: &Rc<Display>,
     codec: EncCodec,
     width: u32,
     height: u32,
@@ -658,6 +660,96 @@ fn round_trip(codec: EncCodec, width: u32, height: u32, min_db: f64) {
 #[test]
 fn h264_encode_round_trips_through_ffmpeg() {
     round_trip(EncCodec::H264, 640, 480, 30.0);
+}
+
+/// Each selectable H.264 profile: the driver encodes it, ffprobe reports the
+/// profile the SPS signals, and ffmpeg decodes the stream with no error output
+/// and the picture matches the source.
+fn h264_profile_round_trip(profile: H264Profile, ffprobe_name: &str) {
+    let Some(display) = display() else { return };
+    let (width, height, frames) = (640u32, 480u32, 12u32);
+    let mut config = EncoderConfig::new(EncCodec::H264, width, height).h264_profile(profile);
+    config.gop_size = 30;
+    config.rate_control = RateControlMode::ConstantQp { qp: 26 };
+    let mut encoder = Encoder::new(&display, config).expect("encoder");
+    let mut stream = Vec::new();
+    for t in 0..frames {
+        let coded = encoder
+            .encode(
+                &source_frame(width, height, t),
+                FrameMetadata {
+                    timestamp: i64::from(t),
+                    force_keyframe: false,
+                },
+            )
+            .expect("encode");
+        stream.extend_from_slice(&coded.data);
+    }
+
+    let dir = std::env::temp_dir().join(format!("ec-hw-h264-{profile:?}"));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("out.264");
+    std::fs::write(&path, &stream).expect("write bitstream");
+
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=profile",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&path)
+        .output()
+        .expect("ffprobe runs");
+    let got = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    assert_eq!(
+        got, ffprobe_name,
+        "{profile:?}: ffprobe reads the SPS profile"
+    );
+
+    // Strict decode: any warning or error on stderr fails the test.
+    let decode = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "warning", "-i"])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        decode.status.success() && decode.stderr.is_empty(),
+        "{profile:?}: ffmpeg reports {}",
+        String::from_utf8_lossy(&decode.stderr)
+    );
+
+    let mut reference = Reference::open(&path, width, height, false).expect("ffmpeg runs");
+    let mut worst = f64::INFINITY;
+    for t in 0..frames {
+        let got = reference.next(width, height).expect("decoded picture");
+        worst = worst.min(psnr(
+            &got,
+            &Planes::from_8bit(&source_frame(width, height, t)),
+        ));
+    }
+    println!("{profile:?}: {} bytes, worst {worst:.1} dB", stream.len());
+    assert!(worst >= 30.0, "{profile:?}: worst frame {worst:.1} dB");
+}
+
+#[test]
+fn h264_constrained_baseline_encodes_and_decodes() {
+    h264_profile_round_trip(H264Profile::ConstrainedBaseline, "Constrained Baseline");
+}
+
+#[test]
+fn h264_main_profile_has_no_high_syntax_and_decodes() {
+    h264_profile_round_trip(H264Profile::Main, "Main");
+}
+
+#[test]
+fn h264_high_profile_still_decodes() {
+    h264_profile_round_trip(H264Profile::High, "High");
 }
 
 #[test]
@@ -971,7 +1063,14 @@ fn ten_bit_film_clip() -> Option<(PathBuf, String, u32, u32, u32, u32)> {
         }
         let (nw, nh): (u32, u32) = (f[3].parse().ok()?, f[4].parse().ok()?);
         let (cw, ch) = (nw.min(1920) / 128 * 128, nh.min(1024) / 128 * 128);
-        return Some((path, "00:40:00".into(), cw, ch, (nw - cw) / 2 & !1, (nh - ch) / 2 & !1));
+        return Some((
+            path,
+            "00:40:00".into(),
+            cw,
+            ch,
+            ((nw - cw) / 2) & !1,
+            ((nh - ch) / 2) & !1,
+        ));
     }
     None
 }
@@ -1018,7 +1117,14 @@ fn write_y4m_16(path: &Path, frames: &[I420_16], fps: (u32, u32)) -> bool {
     };
     let mut out = std::io::BufWriter::new(file);
     let (w, h) = (frames[0].width, frames[0].height);
-    if write!(out, "YUV4MPEG2 W{w} H{h} F{}:{} Ip A1:1 C420p10\n", fps.0, fps.1).is_err() {
+    if write!(
+        out,
+        "YUV4MPEG2 W{w} H{h} F{}:{} Ip A1:1 C420p10",
+        fps.0, fps.1
+    )
+    .and_then(|()| out.write_all(b"\n"))
+    .is_err()
+    {
         return false;
     }
     for f in frames {
@@ -1067,7 +1173,11 @@ fn ten_bit_source(dir: &Path, frames: u32) -> Option<(String, PathBuf, Vec<I420_
     }
     let (w, h) = (1920u32, 1024u32);
     let planes: Vec<I420_16> = (0..frames).map(|t| source_frame_16(w, h, t)).collect();
-    write_y4m_16(&y4m, &planes, (24, 1)).then_some(("synthetic 10-bit gradient".into(), y4m, planes))
+    write_y4m_16(&y4m, &planes, (24, 1)).then_some((
+        "synthetic 10-bit gradient".into(),
+        y4m,
+        planes,
+    ))
 }
 
 /// The same pictures as 10-bit planes, for the hardware encoder's own input.
@@ -1083,7 +1193,11 @@ fn raw_frames_16(y4m: &Path, width: u32, height: u32, frames: u32) -> Option<Vec
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let frame_len = (w * h + 2 * cw * ch) * 2;
     let read = |s: &[u8]| -> Vec<u16> {
-        s.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect()
+        s.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes(*p))
+            .collect()
     };
     let mut pictures = Vec::new();
     for chunk in out.stdout.chunks_exact(frame_len).take(frames as usize) {
@@ -1107,8 +1221,16 @@ fn raw_frames_16(y4m: &Path, width: u32, height: u32, frames: u32) -> Option<Vec
 fn ffprobe_pix_fmt(path: &Path) -> Option<String> {
     let out = Command::new("ffprobe")
         .args([
-            "-v", "error", "-select_streams", "v:0", "-show_entries",
-            "stream=pix_fmt", "-of", "default=nw=1:nk=1", "-f", "obu",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=pix_fmt",
+            "-of",
+            "default=nw=1:nk=1",
+            "-f",
+            "obu",
         ])
         .arg(path)
         .output()
@@ -1118,7 +1240,7 @@ fn ffprobe_pix_fmt(path: &Path) -> Option<String> {
 
 /// Encode 10-bit planes and return the bitstream.
 fn encode_stream_16(
-    display: &Arc<Display>,
+    display: &Rc<Display>,
     planes: &[I420_16],
     qp: u32,
     rate_control: RateControlMode,
@@ -1136,7 +1258,10 @@ fn encode_stream_16(
     for (t, frame) in planes.iter().enumerate() {
         let coded = encoder.encode_16(
             frame,
-            FrameMetadata { timestamp: t as i64, force_keyframe: false },
+            FrameMetadata {
+                timestamp: t as i64,
+                force_keyframe: false,
+            },
         )?;
         out.extend_from_slice(&coded.data);
     }
@@ -1195,15 +1320,29 @@ fn av1_10bit_encode_agrees_between_two_decoders() {
     config.rate_control = RateControlMode::ConstantQp { qp: 90 };
     let mut ten = Encoder::new(&display, config).expect("a 10-bit AV1 encoder");
     assert!(
-        ten.encode(&source_frame(width, height, 0), FrameMetadata::default()).is_err(),
+        ten.encode(&source_frame(width, height, 0), FrameMetadata::default())
+            .is_err(),
         "8-bit pixels went into a 10-bit encoder"
     );
 
     let ours = ec_av1::stream::decode_stream(&data)
         .unwrap_or_else(|e| panic!("ec-av1 decodes the 10-bit hardware stream: {e}"));
-    assert_eq!(ours.len(), planes.len(), "ec-av1 decoded {} of {frames} frames", ours.len());
-    let peak = ours.iter().flat_map(|p| p.y.iter()).copied().max().unwrap_or(0);
-    assert!(peak > 255, "every decoded luma sample fits in 8 bits (peak {peak})");
+    assert_eq!(
+        ours.len(),
+        planes.len(),
+        "ec-av1 decoded {} of {frames} frames",
+        ours.len()
+    );
+    let peak = ours
+        .iter()
+        .flat_map(|p| p.y.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    assert!(
+        peak > 255,
+        "every decoded luma sample fits in 8 bits (peak {peak})"
+    );
 
     let mut reference =
         Reference::open(&path, width, height, true).expect("ffmpeg opens the stream");
@@ -1219,10 +1358,16 @@ fn av1_10bit_encode_agrees_between_two_decoders() {
             peak: 1023.0,
         };
         let db = psnr(&mine, &theirs);
-        assert!(db.is_infinite(), "frame {i}: the two decoders disagree ({db:.2} dB)");
+        assert!(
+            db.is_infinite(),
+            "frame {i}: the two decoders disagree ({db:.2} dB)"
+        );
         let source = Planes::from_16bit(&planes[i]);
         let fidelity = psnr(&mine, &source);
-        assert!(fidelity > 30.0, "frame {i}: coded {fidelity:.2} dB from the 10-bit source");
+        assert!(
+            fidelity > 30.0,
+            "frame {i}: coded {fidelity:.2} dB from the 10-bit source"
+        );
         worst = worst.min(fidelity);
     }
     println!(
@@ -1263,7 +1408,10 @@ fn av1_encode_rate_control_lands() {
         return;
     };
 
-    println!("AV1 rate control on {label}, {width}x{height} yuv420p, {} frames at {fps} fps:", planes.len());
+    println!(
+        "AV1 rate control on {label}, {width}x{height} yuv420p, {} frames at {fps} fps:",
+        planes.len()
+    );
     // QVBR is quality-defined: `bitrate` is a ceiling it may not exceed, not
     // a target it must reach, so asking it to land on the number would be
     // asking for the wrong thing.
@@ -1296,7 +1444,10 @@ fn av1_encode_rate_control_lands() {
             for (i, frame) in planes.iter().enumerate() {
                 match encoder.encode(
                     frame,
-                    FrameMetadata { timestamp: i as i64, force_keyframe: false },
+                    FrameMetadata {
+                        timestamp: i as i64,
+                        force_keyframe: false,
+                    },
                 ) {
                     Ok(coded) => bytes.extend_from_slice(&coded.data),
                     Err(e) => panic!("{mode_name} at {target} bps: encode failed ({e})"),
@@ -1366,7 +1517,12 @@ fn ffmpeg_psnr_at(coded: &Path, source: &Path, fps: u32) -> Option<f64> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stderr);
     let field = text.split("average:").nth(1)?;
-    field.split_whitespace().next()?.parse::<f64>().ok().filter(|v| v.is_finite())
+    field
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
 }
 
 /// What the GPU's 10-bit AV1 costs against 10-bit software, on his own film.
@@ -1395,12 +1551,8 @@ fn av1_10bit_bd_row_vs_software() {
 
     let mut ours = Vec::new();
     for qp in [180u32, 140, 100, 60] {
-        let data = match encode_stream_16(
-            &display,
-            &planes,
-            qp,
-            RateControlMode::ConstantQp { qp },
-        ) {
+        let data = match encode_stream_16(&display, &planes, qp, RateControlMode::ConstantQp { qp })
+        {
             Ok(data) => data,
             Err(e) => {
                 eprintln!("skipped: 10-bit AV1 encode unavailable ({e})");
@@ -1422,9 +1574,12 @@ fn av1_10bit_bd_row_vs_software() {
                 "film-B-10bit",
                 "librav1e",
                 &[
-                    "-pix_fmt", "yuv420p10le",
-                    "-rav1e-params", &format!("speed=6:quantizer={q}"),
-                    "-g", "60",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-rav1e-params",
+                    &format!("speed=6:quantizer={q}"),
+                    "-g",
+                    "60",
                 ],
                 *q,
                 coded,
@@ -1440,8 +1595,16 @@ fn av1_10bit_bd_row_vs_software() {
                 "film-B-10bit",
                 "libaom-av1",
                 &[
-                    "-pix_fmt", "yuv420p10le",
-                    "-cpu-used", "6", "-crf", &crf.to_string(), "-b:v", "0", "-g", "60",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-cpu-used",
+                    "6",
+                    "-crf",
+                    &crf.to_string(),
+                    "-b:v",
+                    "0",
+                    "-g",
+                    "60",
                 ],
                 *crf,
                 coded,
@@ -1495,7 +1658,10 @@ fn av1_encode_bd_row_vs_software() {
     }
     // A ladder compared with itself saves nothing: the check on the metric.
     let same = [(100.0, 30.0), (200.0, 35.0), (400.0, 40.0)];
-    assert!(bd_rate(&same, &same).abs() < 1e-9, "bd_rate is not self-zero");
+    assert!(
+        bd_rate(&same, &same).abs() < 1e-9,
+        "bd_rate is not self-zero"
+    );
 
     let dir = std::env::temp_dir().join("ec-hw-av1-bd");
     let _ = std::fs::create_dir_all(&dir);
@@ -1555,7 +1721,12 @@ fn av1_encode_bd_row_vs_software() {
                     &y4m,
                     label,
                     "librav1e",
-                    &["-rav1e-params", &format!("speed=6:quantizer={q}"), "-g", "60"],
+                    &[
+                        "-rav1e-params",
+                        &format!("speed=6:quantizer={q}"),
+                        "-g",
+                        "60",
+                    ],
                     *q,
                     frames,
                 )
@@ -1570,7 +1741,14 @@ fn av1_encode_bd_row_vs_software() {
                     label,
                     "libaom-av1",
                     &[
-                        "-cpu-used", "6", "-crf", &crf.to_string(), "-b:v", "0", "-g", "60",
+                        "-cpu-used",
+                        "6",
+                        "-crf",
+                        &crf.to_string(),
+                        "-b:v",
+                        "0",
+                        "-g",
+                        "60",
                     ],
                     *crf,
                     frames,
@@ -1748,7 +1926,7 @@ fn real_clips() -> Vec<(&'static str, PathBuf)> {
 fn bd_rate(reference: &[(f64, f64)], test: &[(f64, f64)]) -> f64 {
     let low = reference[0].1.max(test[0].1);
     let high = reference[reference.len() - 1].1.min(test[test.len() - 1].1);
-    if !(high > low) {
+    if high <= low {
         return f64::NAN;
     }
     // log-rate at a PSNR, linearly interpolated inside the ladder.
@@ -1810,7 +1988,12 @@ fn av1_encode_speed() {
     // actually stored at, so the fps that matters for a real export.
     let planes: Vec<I420_16> = (0..30).map(|t| source_frame_16(3840, 1608, t)).collect();
     let start = Instant::now();
-    match encode_stream_16(&display, &planes, 90, RateControlMode::ConstantQp { qp: 90 }) {
+    match encode_stream_16(
+        &display,
+        &planes,
+        90,
+        RateControlMode::ConstantQp { qp: 90 },
+    ) {
         Ok(data) => {
             let secs = start.elapsed().as_secs_f64();
             println!(
@@ -1995,7 +2178,7 @@ fn frames_export_as_dma_buf() {
     let mut exported = 0usize;
     decode_stream(&mut decoder, Codec::H264, &data, 2, |frame| {
         let prime = frame.export_prime().expect("export");
-        assert_eq!(prime.fourcc, ec_va::sys::VA_FOURCC_NV12);
+        assert_eq!(prime.fourcc, ec_va::va::VA_FOURCC_NV12);
         assert_eq!((prime.width, prime.height), frame.coded_size);
         assert!(!prime.objects.is_empty(), "no DRM objects exported");
         assert!(!prime.layers.is_empty(), "no layers exported");
@@ -2559,9 +2742,17 @@ fn encode_frame_accepts_p010_via_vpp() {
             worst_y = worst_y.min(y_db);
             worst_uv = worst_uv.min(uv_db);
         }
-        println!("{target:?} encode_frame (P010 via VPP) vs CPU path: worst Y {worst_y:.1} dB, worst UV {worst_uv:.1} dB");
-        assert!(worst_y >= 40.0, "{target:?}: worst Y {worst_y:.1} dB vs the CPU path");
-        assert!(worst_uv >= 40.0, "{target:?}: worst UV {worst_uv:.1} dB vs the CPU path");
+        println!(
+            "{target:?} encode_frame (P010 via VPP) vs CPU path: worst Y {worst_y:.1} dB, worst UV {worst_uv:.1} dB"
+        );
+        assert!(
+            worst_y >= 40.0,
+            "{target:?}: worst Y {worst_y:.1} dB vs the CPU path"
+        );
+        assert!(
+            worst_uv >= 40.0,
+            "{target:?}: worst UV {worst_uv:.1} dB vs the CPU path"
+        );
 
         // The size-mismatch route (HEVC: 2160 visible vs 2176 coded) places
         // the picture by VPP region rather than encoder cropping alone, so
@@ -2617,15 +2808,24 @@ fn p010_zero_copy_encode_is_realtime() {
         return;
     };
     let units = split_access_units(&data, Codec::H265);
-    assert!(units.len() > limit, "film clip too short for {limit} frames");
+    assert!(
+        units.len() > limit,
+        "film clip too short for {limit} frames"
+    );
 
-    println!("{:<28} {:>10} {:>10} {:>10}", "stage", "median ms", "min ms", "max ms");
+    println!(
+        "{:<28} {:>10} {:>10} {:>10}",
+        "stage", "median ms", "min ms", "max ms"
+    );
     // (target, zero-copy median ms, CPU-path median ms) rows, filled in order.
     let mut rows: Vec<(EncCodec, f64, f64)> = Vec::new();
     let run_target = |target: EncCodec| -> (f64, f64) {
         let mut zc_median = None;
         let mut cpu_median = None;
-        for (label, zero_copy) in [("decode+encode_frame", true), ("decode+to_i420+encode", false)] {
+        for (label, zero_copy) in [
+            ("decode+encode_frame", true),
+            ("decode+to_i420+encode", false),
+        ] {
             let name = format!("{target:?} {label}");
             let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
             let mut encoder: Option<Encoder> = None;
@@ -2825,7 +3025,9 @@ fn h264_seek_matches_linear_open_gop() {
     // caller to: decode the leading IDR (its picture is thrown away) and
     // reset picture state before feeding the seek target.
     let mut seek_decoder = Decoder::new(&display, Codec::H264).expect("decoder opens");
-    seek_decoder.decode(units[0], 0).expect("prime parameter sets");
+    seek_decoder
+        .decode(units[0], 0)
+        .expect("prime parameter sets");
     seek_decoder.reset();
     let mut seeked_frame = None;
     for (i, unit) in units[open_gop_at..].iter().enumerate() {
@@ -2919,8 +3121,15 @@ fn trace_headers(path: &Path, codec: &str) -> Vec<(String, i64)> {
 /// fields, so a stream whose every slice says 0/0 judders there even though
 /// desktop decoders (which re-derive from decode order) play it cleanly.
 /// Encode a long P-run and read the fields back the way such a decoder does.
-fn slice_counters(codec: EncCodec, width: u32, height: u32, frames: u32) -> (PathBuf, Vec<(String, i64)>) {
-    let Some(display) = display() else { return (PathBuf::new(), Vec::new()) };
+fn slice_counters(
+    codec: EncCodec,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> (PathBuf, Vec<(String, i64)>) {
+    let Some(display) = display() else {
+        return (PathBuf::new(), Vec::new());
+    };
     let mut config = EncoderConfig::new(codec, width, height);
     config.gop_size = frames * 2;
     config.framerate = (30, 1);
@@ -2929,7 +3138,13 @@ fn slice_counters(codec: EncCodec, width: u32, height: u32, frames: u32) -> (Pat
     let mut out = Vec::new();
     for t in 0..frames {
         let coded = encoder
-            .encode(&source_frame(width, height, t), FrameMetadata { timestamp: i64::from(t), force_keyframe: false })
+            .encode(
+                &source_frame(width, height, t),
+                FrameMetadata {
+                    timestamp: i64::from(t),
+                    force_keyframe: false,
+                },
+            )
             .expect("encode");
         assert_eq!(coded.is_keyframe, t == 0, "one IDR then P-frames at {t}");
         out.extend_from_slice(&coded.data);
@@ -2947,8 +3162,12 @@ fn slice_counters(codec: EncCodec, width: u32, height: u32, frames: u32) -> (Pat
     (path, fields)
 }
 
-fn values<'a>(fields: &'a [(String, i64)], name: &str) -> Vec<i64> {
-    fields.iter().filter(|(n, _)| n == name).map(|(_, v)| *v).collect()
+fn values(fields: &[(String, i64)], name: &str) -> Vec<i64> {
+    fields
+        .iter()
+        .filter(|(n, _)| n == name)
+        .map(|(_, v)| *v)
+        .collect()
 }
 
 #[test]
@@ -2959,17 +3178,34 @@ fn h264_slice_headers_count_frames_for_stateful_decoders() {
         return;
     }
     let frame_num = values(&fields, "frame_num");
-    assert_eq!(frame_num.len(), frames as usize, "one slice per picture in {}", path.display());
+    assert_eq!(
+        frame_num.len(),
+        frames as usize,
+        "one slice per picture in {}",
+        path.display()
+    );
     let log2_max = values(&fields, "log2_max_frame_num_minus4")[0] + 4;
     let max_frame_num = 1i64 << log2_max;
     let expected: Vec<i64> = (0..frames as i64).map(|n| n % max_frame_num).collect();
-    assert_eq!(frame_num, expected, "frame_num steps +1 mod {max_frame_num}");
+    assert_eq!(
+        frame_num, expected,
+        "frame_num steps +1 mod {max_frame_num}"
+    );
     // pic_order_cnt_type 2: POC = 2 * FrameNumOffset-adjusted frame_num, no lsb is
     // written — the decoder's output order is the decode order by construction.
     let poc_type = values(&fields, "pic_order_cnt_type");
-    assert!(!poc_type.is_empty() && poc_type.iter().all(|&t| t == 2), "POC type 2 in the SPS: {poc_type:?}");
-    assert!(values(&fields, "pic_order_cnt_lsb").is_empty(), "no POC lsb under type 2");
-    assert!(values(&fields, "level_idc").iter().all(|&l| l == 30), "640x360@30 is level 3.0");
+    assert!(
+        !poc_type.is_empty() && poc_type.iter().all(|&t| t == 2),
+        "POC type 2 in the SPS: {poc_type:?}"
+    );
+    assert!(
+        values(&fields, "pic_order_cnt_lsb").is_empty(),
+        "no POC lsb under type 2"
+    );
+    assert!(
+        values(&fields, "level_idc").iter().all(|&l| l == 30),
+        "640x360@30 is level 3.0"
+    );
 }
 
 #[test]
@@ -2980,9 +3216,386 @@ fn hevc_slice_headers_count_pocs_for_stateful_decoders() {
         return;
     }
     let lsb = values(&fields, "slice_pic_order_cnt_lsb");
-    assert_eq!(lsb.len(), frames as usize - 1, "every non-IDR slice carries a POC lsb in {}", path.display());
+    assert_eq!(
+        lsb.len(),
+        frames as usize - 1,
+        "every non-IDR slice carries a POC lsb in {}",
+        path.display()
+    );
     let log2_max = values(&fields, "log2_max_pic_order_cnt_lsb_minus4")[0] + 4;
     let max_lsb = 1i64 << log2_max;
     let expected: Vec<i64> = (1..frames as i64).map(|n| n % max_lsb).collect();
     assert_eq!(lsb, expected, "POC lsb steps +1 mod {max_lsb}");
+}
+
+// ---------------------------------------------------------------------------
+// Rate control: achieved bitrate against the request, and PSNR at that rate
+// ---------------------------------------------------------------------------
+
+/// Write 8-bit 4:2:0 frames as a y4m file, the reference ffmpeg compares with.
+fn write_y4m_8(path: &Path, frames: &[I420], fps: u32) -> bool {
+    use std::io::Write;
+    let Some(first) = frames.first() else {
+        return false;
+    };
+    let Ok(file) = std::fs::File::create(path) else {
+        return false;
+    };
+    let mut out = std::io::BufWriter::new(file);
+    let header = format!(
+        "YUV4MPEG2 W{} H{} F{fps}:1 Ip A1:1 C420jpeg\n",
+        first.width, first.height
+    );
+    if out.write_all(header.as_bytes()).is_err() {
+        return false;
+    }
+    for f in frames {
+        if out.write_all(b"FRAME\n").is_err()
+            || out.write_all(&f.y).is_err()
+            || out.write_all(&f.u).is_err()
+            || out.write_all(&f.v).is_err()
+        {
+            return false;
+        }
+    }
+    out.flush().is_ok()
+}
+
+/// Average PSNR (dB) of a raw elementary stream against its source y4m.
+fn psnr_of_elementary(coded: &Path, format: &str, source: &Path, fps: u32) -> Option<f64> {
+    let rate = fps.to_string();
+    let out = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "info", "-f", format, "-r", &rate, "-i"])
+        .arg(coded)
+        .args(["-r", &rate, "-i"])
+        .arg(source)
+        .args(["-lavfi", "psnr", "-f", "null", "-"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    let field = text.split("average:").nth(1)?;
+    field
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+}
+
+/// One CBR encode of `frames` at `bitrate`: the stream, and the bits per second
+/// it actually spent over the clip.
+fn cbr_encode(
+    display: &Rc<Display>,
+    codec: EncCodec,
+    (width, height, fps): (u32, u32, u32),
+    bitrate: u32,
+    frames: &[I420],
+) -> Result<(Vec<u8>, f64), ec_hw::Error> {
+    let mut config = EncoderConfig::new(codec, width, height);
+    config.framerate = (fps, 1);
+    config.gop_size = 30;
+    config.bitrate = bitrate;
+    config.rate_control = RateControlMode::ConstantBitrate;
+    let mut encoder = Encoder::new(display, config)?;
+    let mut out = Vec::new();
+    for (t, frame) in frames.iter().enumerate() {
+        let coded = encoder.encode(
+            frame,
+            FrameMetadata {
+                timestamp: t as i64,
+                force_keyframe: false,
+            },
+        )?;
+        out.extend_from_slice(&coded.data);
+    }
+    let delivered = out.len() as f64 * 8.0 * f64::from(fps) / frames.len() as f64;
+    Ok((out, delivered))
+}
+
+/// CBR must land within +/-5% of the request on every codec, clip and rate,
+/// and the PSNR it reaches at that rate is printed for the report.
+#[test]
+fn cbr_lands_within_five_percent_of_the_request() {
+    let Some(display) = display() else { return };
+    // 8 s: a 2 s clip also carries the start-up of the rate controller, which
+    // is measured apart from the steady-state rate the request is about.
+    let (width, height, fps, frames) = (1280u32, 720u32, 30u32, 240u32);
+    let dir = std::env::temp_dir().join("ec-hw-rc-measure");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    // Two clips: a synthetic moving box, and ffmpeg's testsrc2 (the content the
+    // edith measurements used), both generated here so nothing depends on a
+    // personal library.
+    let synthetic: Vec<I420> = (0..frames)
+        .map(|t| source_frame(width, height, t))
+        .collect();
+    let synthetic_y4m = dir.join("cbr-synthetic.y4m");
+    assert!(write_y4m_8(&synthetic_y4m, &synthetic, fps), "write source");
+    let testsrc_y4m = dir.join("cbr-testsrc2.y4m");
+    let generated = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("testsrc2=size={width}x{height}:rate={fps}"))
+        .args(["-frames:v", &frames.to_string(), "-pix_fmt", "yuv420p"])
+        .arg(&testsrc_y4m)
+        .status()
+        .is_ok_and(|s| s.success());
+    let Some(testsrc) = generated
+        .then(|| raw_frames(&testsrc_y4m, width, height, frames))
+        .flatten()
+    else {
+        eprintln!("skipped: ffmpeg cannot generate testsrc2");
+        return;
+    };
+    let clips: [(&str, Vec<I420>, PathBuf); 2] = [
+        ("moving box", synthetic, synthetic_y4m),
+        ("testsrc2", testsrc, testsrc_y4m),
+    ];
+    let mut failures = Vec::new();
+    println!("CBR, {width}x{height} {fps} fps, {frames} frames:");
+    for (codec, name, format) in [
+        (EncCodec::H264, "H.264", "h264"),
+        (EncCodec::H265, "HEVC", "hevc"),
+        (EncCodec::Av1, "AV1", "obu"),
+    ] {
+        for (clip_name, pictures, source) in &clips {
+            for target in [1_000_000u32, 3_000_000, 8_000_000] {
+                let (stream, delivered) =
+                    match cbr_encode(&display, codec, (width, height, fps), target, pictures) {
+                        Ok(encoded) => encoded,
+                        Err(e) => panic!("{name} {clip_name} at {target} bps: encode failed ({e})"),
+                    };
+                let coded = dir.join(format!(
+                    "{name}-{}-{target}.{format}",
+                    clip_name.replace(' ', "-")
+                ));
+                std::fs::write(&coded, &stream).expect("write stream");
+                let db = psnr_of_elementary(&coded, format, source, fps).unwrap_or(f64::NAN);
+                let error = delivered / f64::from(target) - 1.0;
+                println!(
+                    "  {name:<6} {clip_name:<12} target {:>5} kbps -> {:>6.0} kbps ({:+5.1}%), {db:.2} dB",
+                    target / 1000,
+                    delivered / 1000.0,
+                    error * 100.0
+                );
+                if error.abs() > 0.05 {
+                    failures.push(format!(
+                        "{name} {clip_name} at {target} bps: {:+.1}%",
+                        error * 100.0
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "outside +/-5%: {failures:?}");
+}
+
+/// An NV12 surface holding `frame`, imported from DMA-BUFs: the surface is made
+/// by the driver, exported, and imported back, as a foreign allocator's buffer
+/// would arrive.
+fn imported_nv12(
+    display: &Rc<Display>,
+    frame: &I420,
+) -> Rc<ec_va::va::Surface<ec_va::surface::PrimeImport>> {
+    use ec_va::SurfaceExt;
+
+    let (w, h) = (frame.width, frame.height);
+    let mut pool =
+        ec_va::create_pool(display, &ec_va::SurfaceSpec::nv12(w, h), 1).expect("surface");
+    let surface = pool.pop().expect("one surface");
+    {
+        let format =
+            ec_va::surface::image_format(display, ec_va::va::VA_FOURCC_NV12).expect("format");
+        let mut image =
+            ec_va::surface::create_image(&surface, format, (w, h), (w, h)).expect("image");
+        let layout = *image.image();
+        let data = AsMut::<[u8]>::as_mut(&mut image);
+        let (wu, hu) = (w as usize, h as usize);
+        let (cw, ch) = (wu.div_ceil(2), hu.div_ceil(2));
+        for row in 0..hu {
+            let d = layout.offsets[0] as usize + row * layout.pitches[0] as usize;
+            data[d..d + wu].copy_from_slice(&frame.y[row * wu..row * wu + wu]);
+        }
+        for row in 0..ch {
+            let d = layout.offsets[1] as usize + row * layout.pitches[1] as usize;
+            for col in 0..cw {
+                data[d + col * 2] = frame.u[row * cw + col];
+                data[d + col * 2 + 1] = frame.v[row * cw + col];
+            }
+        }
+    }
+    let prime = surface.export().expect("export");
+    Rc::new(ec_va::surface::import_prime(display, &prime).expect("import"))
+}
+
+/// Encoding an imported DMA-BUF must give the bytes the CPU path gives for the
+/// same pixels: the import is only a different way of handing over the source.
+#[test]
+fn encode_surface_of_an_imported_dma_buf_matches_the_cpu_path() {
+    let Some(display) = display() else { return };
+    let (w, h) = (640u32, 480u32);
+    for codec in [EncCodec::H264, EncCodec::H265] {
+        let mut config = EncoderConfig::new(codec, w, h);
+        config.gop_size = 3;
+        config.rate_control = RateControlMode::ConstantQp { qp: 30 };
+        let mut cpu = Encoder::new(&display, config).expect("cpu encoder");
+        let mut dma = Encoder::new(&display, config).expect("dma encoder");
+        for t in 0..4u32 {
+            let frame = source_frame(w, h, t);
+            let meta = FrameMetadata {
+                timestamp: i64::from(t),
+                force_keyframe: false,
+            };
+            let want = cpu.encode(&frame, meta).expect("cpu encode");
+            let surface = imported_nv12(&display, &frame);
+            let got = dma
+                .encode_surface(&surface, (w, h), meta)
+                .expect("encode_surface");
+            assert_eq!(got.is_keyframe, want.is_keyframe, "{codec:?} frame {t}");
+            assert_eq!(
+                got.data.len(),
+                want.data.len(),
+                "{codec:?} frame {t}: imported source coded to a different size"
+            );
+            assert!(got.data == want.data, "{codec:?} frame {t}: bytes differ");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broken streams: an inter picture whose references were never decoded
+// ---------------------------------------------------------------------------
+
+/// The OBUs of an AV1 temporal unit, as whole byte slices (each with its header).
+fn av1_obus(tu: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < tu.len() {
+        let header = tu[i];
+        let ext = usize::from((header >> 2) & 1);
+        if (header >> 1) & 1 == 0 {
+            break; // no obu_size: the rest of the unit is one OBU
+        }
+        let mut size = 0usize;
+        let mut pos = i + 1 + ext;
+        for shift in (0..64).step_by(7) {
+            let Some(&byte) = tu.get(pos) else { return out };
+            pos += 1;
+            size |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        let end = (pos + size).min(tu.len());
+        out.push(&tu[i..end]);
+        i = end;
+    }
+    out
+}
+
+/// The Annex B NAL units of an access unit, without their start codes.
+fn annexb_nals(au: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(n, &start)| {
+            let end = starts.get(n + 1).map_or(au.len(), |&next| next - 3);
+            let mut nal = &au[start..end];
+            while let [rest @ .., 0] = nal {
+                nal = rest; // trailing zeros belong to the next start code
+            }
+            nal
+        })
+        .collect()
+}
+
+/// A stream that starts at an inter picture: the parameter sets of the first
+/// access unit, then the access unit that follows it, with the picture that
+/// would have filled its references (the first access unit) left out.
+fn broken_gop(codec: Codec, data: &[u8]) -> Option<Vec<u8>> {
+    let mut stream = Vec::new();
+    match codec {
+        Codec::Av1 => {
+            let units = split_ivf(data);
+            // The sequence header OBU, which the first temporal unit carries.
+            let seq = av1_obus(units.first()?)
+                .into_iter()
+                .find(|obu| (obu[0] >> 3) & 0xf == 1)?;
+            stream.extend_from_slice(seq);
+            stream.extend_from_slice(units.get(1)?);
+        }
+        Codec::Vp9 => {
+            // VP9 carries its parameters in the frame header: the inter frame
+            // alone is the broken stream.
+            stream.extend_from_slice(split_ivf(data).get(1)?);
+        }
+        Codec::H264 | Codec::H265 => {
+            let units = split_access_units(data, codec);
+            let is_parameter_set = |nal: &[u8]| {
+                let t = match codec {
+                    Codec::H264 => nal[0] & 0x1f,
+                    _ => (nal[0] >> 1) & 0x3f,
+                };
+                match codec {
+                    Codec::H264 => t == 7 || t == 8,
+                    _ => (32..=34).contains(&t),
+                }
+            };
+            for nal in annexb_nals(units.first()?) {
+                if is_parameter_set(nal) {
+                    stream.extend_from_slice(&[0, 0, 0, 1]);
+                    stream.extend_from_slice(nal);
+                }
+            }
+            stream.extend_from_slice(units.get(1)?);
+        }
+    }
+    Some(stream)
+}
+
+/// Each codec's broken GOP is refused with an error at the first access unit
+/// that needs the missing picture, and never produces a picture. Refusing an
+/// inter frame whose references were never filled is what the software
+/// decoders do (ec-av1: "no saved CDF state").
+#[test]
+fn a_broken_gop_is_refused_on_every_codec() {
+    let Some(display) = display() else { return };
+    let cases = [
+        (Codec::Av1, "av1-1080p-23.976-8bit.ivf"),
+        (Codec::Vp9, "vp9-1080p-23.976-8bit.ivf"),
+        (Codec::H264, "h264-bframes-320.264"),
+        (Codec::H265, "hevc-bframes-320.265"),
+    ];
+    for (codec, name) in cases {
+        let path = bitstreams().join(name);
+        let Ok(data) = std::fs::read(&path) else {
+            eprintln!("skipped {name}: no fixture");
+            continue;
+        };
+        let stream = broken_gop(codec, &data).expect("the fixture has a second access unit");
+        let mut decoder = Decoder::new(&display, codec).expect("decoder");
+        let refusal = decoder.decode(&stream, 0).err().map(|e| e.to_string());
+        let mut pictures = 0usize;
+        while decoder.next_frame().is_some() {
+            pictures += 1;
+        }
+        assert!(
+            refusal.is_some(),
+            "{codec:?} {name}: the broken GOP decoded without an error ({pictures} pictures)"
+        );
+        assert_eq!(
+            pictures, 0,
+            "{codec:?} {name}: a picture came out of a broken GOP"
+        );
+        println!("{codec:?} {name}: refused: {}", refusal.unwrap_or_default());
+    }
 }

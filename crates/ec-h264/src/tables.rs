@@ -223,6 +223,40 @@ pub const COEFF_TOKEN_CHROMA_DC: &[CoeffTokenEntry] = &[
     (8, 0b00000010, 4, 2),
 ];
 
+/// Table 9-5, column nC == -2 (chroma DC, 4:2:2).
+pub const COEFF_TOKEN_CHROMA_DC_422: &[CoeffTokenEntry] = &[
+    (1, 0b1, 0, 0),
+    (2, 0b01, 1, 1),
+    (3, 0b001, 2, 2),
+    (5, 0b00001, 3, 3),
+    (6, 0b000001, 4, 3),
+    (7, 0b0001000, 6, 3),
+    (7, 0b0001001, 5, 3),
+    (7, 0b0001010, 4, 2),
+    (7, 0b0001011, 3, 2),
+    (7, 0b0001100, 3, 1),
+    (7, 0b0001101, 2, 1),
+    (7, 0b0001110, 2, 0),
+    (7, 0b0001111, 1, 0),
+    (9, 0b000000100, 5, 2),
+    (9, 0b000000101, 4, 1),
+    (9, 0b000000110, 4, 0),
+    (9, 0b000000111, 3, 0),
+    (10, 0b0000000100, 7, 3),
+    (10, 0b0000000101, 6, 2),
+    (10, 0b0000000110, 5, 1),
+    (10, 0b0000000111, 5, 0),
+    (11, 0b00000000100, 8, 3),
+    (11, 0b00000000101, 7, 2),
+    (11, 0b00000000110, 6, 1),
+    (11, 0b00000000111, 6, 0),
+    (12, 0b000000000100, 8, 2),
+    (12, 0b000000000101, 8, 1),
+    (12, 0b000000000110, 7, 1),
+    (12, 0b000000000111, 7, 0),
+    (13, 0b0000000000111, 8, 0),
+];
+
 /// One total_zeros / run_before entry: (code length, code, value).
 pub type VlcEntry = (u8, u16, u8);
 
@@ -406,6 +440,47 @@ pub const TOTAL_ZEROS_CHROMA_DC: [&[VlcEntry]; 3] = [
     &[(1, 0b1, 0), (1, 0b0, 1)],
 ];
 
+/// Table 9-9 (b): total_zeros for chroma DC 2x4 (4:2:2), by tzVlcIndex 1..=7.
+pub const TOTAL_ZEROS_CHROMA_DC_422: [&[VlcEntry]; 7] = [
+    &[
+        (1, 0b1, 0),
+        (3, 0b010, 1),
+        (3, 0b011, 2),
+        (4, 0b0010, 3),
+        (4, 0b0011, 4),
+        (4, 0b0001, 5),
+        (5, 0b00001, 6),
+        (5, 0b00000, 7),
+    ],
+    &[
+        (3, 0b000, 0),
+        (2, 0b01, 1),
+        (3, 0b001, 2),
+        (3, 0b100, 3),
+        (3, 0b101, 4),
+        (3, 0b110, 5),
+        (3, 0b111, 6),
+    ],
+    &[
+        (3, 0b000, 0),
+        (3, 0b001, 1),
+        (2, 0b01, 2),
+        (2, 0b10, 3),
+        (3, 0b110, 4),
+        (3, 0b111, 5),
+    ],
+    &[
+        (3, 0b110, 0),
+        (2, 0b00, 1),
+        (2, 0b01, 2),
+        (2, 0b10, 3),
+        (3, 0b111, 4),
+    ],
+    &[(2, 0b00, 0), (2, 0b01, 1), (2, 0b10, 2), (2, 0b11, 3)],
+    &[(2, 0b00, 0), (2, 0b01, 1), (1, 0b1, 2)],
+    &[(1, 0b0, 0), (1, 0b1, 1)],
+];
+
 /// Table 9-10: run_before, indexed by min(zerosLeft, 7) - 1.
 pub const RUN_BEFORE: [&[VlcEntry]; 7] = [
     // zerosLeft 1
@@ -476,10 +551,12 @@ pub const CBP_INTER_420: [u8; 48] = [
 ];
 
 /// Table 9-4 (b), Intra column: codeNum -> coded_block_pattern for
-/// ChromaArrayType 0 or 3. Unused until monochrome / 4:4:4 decode lands;
-/// kept beside its sibling so the spec table lives in one place.
-#[allow(dead_code)]
+/// ChromaArrayType 0 or 3.
 pub const CBP_INTRA_MONO: [u8; 16] = [15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9];
+
+/// Table 9-4 (b), Inter column: codeNum -> coded_block_pattern for
+/// ChromaArrayType 0 or 3.
+pub const CBP_INTER_MONO: [u8; 16] = [0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9];
 
 /// Table 8-15: QPC as a function of qPI (identity below 30).
 pub const CHROMA_QP: [u8; 52] = [
@@ -551,6 +628,16 @@ pub const TC0: [[u8; 52]; 3] = [
 /// 4x4 zig-zag scan: scan position -> raster index (Table 8-13, frame scan).
 pub const ZIGZAG_4X4: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
+/// 4x4 field scan: scan position -> raster index (Table 8-13, field scan).
+pub const FIELD_4X4: [u8; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+
+/// 8x8 field scan: scan position -> raster index (Table 8-14, field scan).
+pub const FIELD_8X8: [u8; 64] = [
+    0, 8, 16, 1, 9, 24, 32, 17, 2, 25, 40, 48, 56, 33, 10, 3, 18, 41, 49, 57, 26, 11, 4, 19, 34,
+    42, 50, 58, 27, 12, 5, 20, 35, 43, 51, 59, 28, 13, 6, 21, 36, 44, 52, 60, 29, 14, 22, 37, 45,
+    53, 61, 30, 7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
+];
+
 /// 8x8 zig-zag scan: scan position -> raster index (Table 8-14, frame scan).
 /// Shared with the scaling-list parser, which reads the same scan.
 pub use ec_h264_syntax::sps::ZIGZAG_8X8;
@@ -615,10 +702,18 @@ mod tests {
             ("nc2", COEFF_TOKEN_NC2),
             ("nc4", COEFF_TOKEN_NC4),
             ("chroma-dc", COEFF_TOKEN_CHROMA_DC),
+            ("chroma-dc-422", COEFF_TOKEN_CHROMA_DC_422),
         ] {
             let codes: Vec<(u8, u16)> = table.iter().map(|&(l, c, _, _)| (l, c)).collect();
             assert_prefix_free(name, &codes);
-            assert_eq!(table.len(), if name == "chroma-dc" { 14 } else { 62 });
+            assert_eq!(
+                table.len(),
+                match name {
+                    "chroma-dc" => 14,
+                    "chroma-dc-422" => 30,
+                    _ => 62,
+                }
+            );
             // All (tc, t1) pairs distinct.
             let mut pairs: Vec<(u8, u8)> = table.iter().map(|&(_, _, tc, t1)| (tc, t1)).collect();
             pairs.sort_unstable();
@@ -640,7 +735,10 @@ mod tests {
             assert_eq!(vals, (0..=(15 - i) as u8).collect::<Vec<_>>());
             assert_kraft("total_zeros", &codes);
         }
-        for table in &TOTAL_ZEROS_CHROMA_DC {
+        for table in TOTAL_ZEROS_CHROMA_DC
+            .iter()
+            .chain(&TOTAL_ZEROS_CHROMA_DC_422)
+        {
             let codes: Vec<(u8, u16)> = table.iter().map(|&(l, c, _)| (l, c)).collect();
             assert_prefix_free("total_zeros_chroma", &codes);
             assert_kraft("total_zeros_chroma", &codes);
@@ -661,6 +759,9 @@ mod tests {
         v.sort_unstable();
         assert_eq!(v, (0..48).collect::<Vec<u8>>());
         let mut v = CBP_INTRA_MONO.to_vec();
+        v.sort_unstable();
+        assert_eq!(v, (0..16).collect::<Vec<u8>>());
+        let mut v = CBP_INTER_MONO.to_vec();
         v.sort_unstable();
         assert_eq!(v, (0..16).collect::<Vec<u8>>());
     }

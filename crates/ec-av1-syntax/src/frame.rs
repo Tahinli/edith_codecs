@@ -1906,6 +1906,7 @@ fn read_film_grain_params(
         fg.point_y_value[i] = r.read_bits(8)? as u8;
         fg.point_y_scaling[i] = r.read_bits(8)? as u8;
     }
+    require_increasing(&fg.point_y_value[..fg.num_y_points as usize], "luma")?;
     fg.chroma_scaling_from_luma = if color.mono_chrome {
         false
     } else {
@@ -1926,6 +1927,7 @@ fn read_film_grain_params(
             fg.point_cb_value[i] = r.read_bits(8)? as u8;
             fg.point_cb_scaling[i] = r.read_bits(8)? as u8;
         }
+        require_increasing(&fg.point_cb_value[..fg.num_cb_points as usize], "cb")?;
         fg.num_cr_points = r.read_bits(4)? as u8;
         if fg.num_cr_points as usize > fg.point_cr_value.len() {
             return Err(Error::corrupt("AV1 film grain: num_cr_points exceeds 10"));
@@ -1935,6 +1937,7 @@ fn read_film_grain_params(
             fg.point_cr_scaling[i] = r.read_bits(8)? as u8;
         }
     }
+    require_increasing(&fg.point_cr_value[..fg.num_cr_points as usize], "cr")?;
     fg.grain_scaling_minus_8 = r.read_bits(2)? as u8;
     fg.ar_coeff_lag = r.read_bits(2)? as u8;
     let num_pos_luma = 2 * fg.ar_coeff_lag as usize * (fg.ar_coeff_lag as usize + 1);
@@ -2097,6 +2100,17 @@ pub(crate) fn apply_show_existing_refresh(state: &mut FrameState, h: &FrameHeade
             state.ref_order_hint[i] = slot.order_hint;
         }
     }
+}
+
+/// 6.8.20: the scaling points of each plane have strictly increasing values. A
+/// repeated value is a zero-width segment, which the scaling LUT divides by.
+fn require_increasing(values: &[u8], plane: &str) -> Result<()> {
+    if values.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(Error::corrupt(format!(
+            "AV1 film grain: {plane} scaling point values are not increasing"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

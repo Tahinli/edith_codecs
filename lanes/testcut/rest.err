@@ -1,0 +1,83 @@
+remote-run: host=c
+=== PKG ec-aac
+=== EXIT ec-aac 0
+=== PKG ec-ac3
+=== EXIT ec-ac3 101
+=== PKG ec-alac
+=== EXIT ec-alac 0
+=== PKG ec-amr
+=== EXIT ec-amr 0
+=== PKG ec-ass
+=== EXIT ec-ass 0
+=== PKG ec-av1-syntax
+=== EXIT ec-av1-syntax 0
+=== PKG ec-cc
+=== EXIT ec-cc 0
+=== PKG ec-core
+=== EXIT ec-core 0
+=== PKG ec-dnxhd
+=== EXIT ec-dnxhd 0
+=== PKG ec-dsp
+=== EXIT ec-dsp 0
+=== PKG ec-dts
+=== EXIT ec-dts 0
+=== PKG ec-dv
+=== EXIT ec-dv 0
+=== PKG ec-dvbsub
+=== EXIT ec-dvbsub 0
+=== PKG ec-dvdsub
+=== EXIT ec-dvdsub 0
+=== PKG ec-flac
+=== EXIT ec-flac 0
+=== PKG ec-h264
+=== EXIT ec-h264 101
+=== PKG ec-h264-syntax
+=== EXIT ec-h264-syntax 0
+=== PKG ec-h265
+=== EXIT ec-h265 0
+=== PKG ec-h265-syntax
+=== EXIT ec-h265-syntax 0
+=== PKG ec-image
+=== EXIT ec-image 0
+=== PKG ec-inflate
+=== EXIT ec-inflate 0
+=== PKG ec-matroska
+=== EXIT ec-matroska 0
+=== PKG ec-mjpeg
+=== EXIT ec-mjpeg 0
+=== PKG ec-mp3
+=== EXIT ec-mp3 0
+=== PKG ec-mp4
+=== EXIT ec-mp4 0
+=== PKG ec-mpeg2
+=== EXIT ec-mpeg2 0
+=== PKG ec-mpeg4
+=== EXIT ec-mpeg4 0
+=== PKG ec-mpegts
+=== EXIT ec-mpegts 0
+=== PKG ec-ogg
+=== EXIT ec-ogg 0
+=== PKG ec-opus
+=== EXIT ec-opus 0
+=== PKG ec-pcm-ext
+=== EXIT ec-pcm-ext 0
+=== PKG ec-pgs
+=== EXIT ec-pgs 0
+=== PKG ec-probe
+=== EXIT ec-probe 0
+=== PKG ec-prores
+=== EXIT ec-prores 0
+=== PKG ec-riff
+=== EXIT ec-riff 0
+=== PKG ec-subs
+=== EXIT ec-subs 101
+=== PKG ec-truehd
+=== EXIT ec-truehd 101
+=== PKG ec-vorbis
+=== EXIT ec-vorbis 0
+=== PKG ec-vp8
+=== EXIT ec-vp8 0
+=== PKG ec-vp9
+=== EXIT ec-vp9 0
+=== PKG ec-vp9-syntax
+=== EXIT ec-vp9-syntax 0

@@ -15,6 +15,8 @@
 //! stdout is TSV (every line `type<TAB>...`), stderr is the human summary.
 //! Exit code: 0 = PASS, 1 = FAIL, 2 = usage/IO error.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 

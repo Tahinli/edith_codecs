@@ -1,0 +1,18 @@
+[Script Info]
+Title: Format lines with reordered fields
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Alignment, Name, Fontsize, Fontname, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, MarginL, MarginR, MarginV, Encoding
+Style: 8,Reordered Top,44,Verdana,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,10,10,10,1
+Style: 2,Reordered Bottom,36,Verdana,&H0000FFFF,&H000000FF,&H00000000,&H00000000,0,-1,0,0,100,100,0,0,1,2,0,10,10,10,1
+
+[Events]
+Format: Start, End, Style, Layer, Name, Effect, MarginL, MarginR, MarginV, Text
+Dialogue: 0:00:01.00,0:00:02.50,Reordered Top,0,speaker,,0,0,0,first row in reordered columns
+Dialogue: 0:00:02.50,0:00:04.00,Reordered Bottom,1,,,0,0,0,second row, comma kept in text
+Dialogue: 0:00:03.00,0:00:05.00,Reordered Top,0,,,0,0,0,{\an5}overlapping third row
+Dialogue: 0:00:05.00,0:00:06.00,Reordered Bottom,0,,,0,0,0,{\pos(10,20)}{\b1}bold last

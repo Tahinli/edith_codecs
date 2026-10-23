@@ -1,0 +1,13 @@
+   Compiling ec-mpegts v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-mpegts)
+    Finished `release` profile [optimized] target(s) in 14.49s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_mpegts-ca6ffb540be2f8ce)
+     Running tests/committed.rs (/home/user/.cache/tgt-testcut-rest/release/deps/committed-7b25b6eaf3353772)
+     Running tests/committed_ps.rs (/home/user/.cache/tgt-testcut-rest/release/deps/committed_ps-ba9333acb3e7a9ff)
+     Running tests/dts.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dts-2a5c78aa26216790)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-064d2917fbae7f3f)
+     Running tests/mpeg2.rs (/home/user/.cache/tgt-testcut-rest/release/deps/mpeg2-a883faf33a091d20)
+     Running tests/ps.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ps-1186a82a7e565f75)
+     Running tests/robust.rs (/home/user/.cache/tgt-testcut-rest/release/deps/robust-2244ceb1ba440f61)
+     Running tests/synthetic.rs (/home/user/.cache/tgt-testcut-rest/release/deps/synthetic-48d9c6451130af5e)
+     Running tests/truehd.rs (/home/user/.cache/tgt-testcut-rest/release/deps/truehd-914bbac4866041b0)
+   Doc-tests ec_mpegts

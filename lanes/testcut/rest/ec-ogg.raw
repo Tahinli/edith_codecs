@@ -1,0 +1,46 @@
+{ "type": "suite", "event": "started", "test_count": 7 }
+{ "type": "test", "event": "started", "name": "crc::tests::matches_known_vectors" }
+{ "type": "test", "event": "started", "name": "mapping::tests::identifies_the_three_mappings" }
+{ "type": "test", "event": "started", "name": "mapping::tests::opus_durations_follow_the_toc" }
+{ "type": "test", "event": "started", "name": "page::tests::lacing_terminates_multiples_of_255" }
+{ "type": "test", "name": "crc::tests::matches_known_vectors", "event": "ok", "exec_time": 0.000000481 }
+{ "type": "test", "event": "started", "name": "page::tests::page_round_trips_through_its_own_checksum" }
+{ "type": "test", "name": "mapping::tests::identifies_the_three_mappings", "event": "ok", "exec_time": 0.000002084 }
+{ "type": "test", "event": "started", "name": "page::tests::xiph_lacing_round_trips" }
+{ "type": "test", "name": "mapping::tests::opus_durations_follow_the_toc", "event": "ok", "exec_time": 0.000000111 }
+{ "type": "test", "event": "started", "name": "tests::granule_side_data_round_trips" }
+{ "type": "test", "name": "page::tests::lacing_terminates_multiples_of_255", "event": "ok", "exec_time": 0.000001362 }
+{ "type": "test", "name": "page::tests::page_round_trips_through_its_own_checksum", "event": "ok", "exec_time": 0.000008607 }
+{ "type": "test", "name": "page::tests::xiph_lacing_round_trips", "event": "ok", "exec_time": 0.000037331 }
+{ "type": "test", "name": "tests::granule_side_data_round_trips", "event": "ok", "exec_time": 0.000001754 }
+{ "type": "suite", "event": "ok", "passed": 7, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000650369 }
+{ "type": "suite", "event": "started", "test_count": 11 }
+{ "type": "test", "event": "started", "name": "caller_supplied_headers_win_over_extradata" }
+{ "type": "test", "event": "started", "name": "damage_costs_one_page_and_no_more" }
+{ "type": "test", "event": "started", "name": "demuxes_every_fixture_to_eof" }
+{ "type": "test", "event": "started", "name": "granule_at_i64_floor_does_not_overflow_the_duration" }
+{ "type": "test", "name": "granule_at_i64_floor_does_not_overflow_the_duration", "event": "ok", "exec_time": 0.00002094 }
+{ "type": "test", "event": "started", "name": "packet_position_near_i64_max_saturates_instead_of_overflowing" }
+{ "type": "test", "name": "packet_position_near_i64_max_saturates_instead_of_overflowing", "event": "ok", "exec_time": 0.000016421 }
+{ "type": "test", "event": "started", "name": "page_size_does_not_change_the_audio" }
+{ "type": "test", "name": "caller_supplied_headers_win_over_extradata", "event": "ok", "exec_time": 0.000018966 }
+{ "type": "test", "event": "started", "name": "reads_flac_in_ogg" }
+{ "type": "test", "name": "damage_costs_one_page_and_no_more", "event": "ok", "exec_time": 0.001294789 }
+{ "type": "test", "event": "started", "name": "remuxes_every_fixture_bit_identically" }
+{ "type": "test", "name": "reads_flac_in_ogg", "event": "ok", "exec_time": 0.542433033 }
+{ "type": "test", "event": "started", "name": "round_trips_awkward_packet_sizes_through_memory" }
+{ "type": "test", "name": "round_trips_awkward_packet_sizes_through_memory", "event": "ok", "exec_time": 0.004650113 }
+{ "type": "test", "event": "started", "name": "seek_to_first_data_granule_replays_the_first_packet" }
+{ "type": "test", "name": "seek_to_first_data_granule_replays_the_first_packet", "event": "ok", "exec_time": 0.000053792 }
+{ "type": "test", "event": "started", "name": "seeks_land_at_or_before_the_target" }
+{ "type": "test", "name": "seeks_land_at_or_before_the_target", "event": "ok", "exec_time": 0.082085672 }
+{ "type": "test", "name": "page_size_does_not_change_the_audio", "event": "ok", "exec_time": 2.393513849 }
+{ "type": "test", "name": "demuxes_every_fixture_to_eof", "event": "ok", "exec_time": 3.407672724 }
+{ "type": "test", "name": "remuxes_every_fixture_bit_identically", "event": "ok", "exec_time": 9.038834524 }
+{ "type": "suite", "event": "ok", "passed": 11, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 9.04185131 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "real_library_ogg_streams_match_ffmpeg" }
+{ "type": "test", "name": "real_library_ogg_streams_match_ffmpeg", "event": "ignored", "message": "sweeps the PERSONAL media library (fixtures/real-library-manifest.tsv, ogg rows) through ffmpeg; local only: run with --ignored." }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.000068389 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000045425 }

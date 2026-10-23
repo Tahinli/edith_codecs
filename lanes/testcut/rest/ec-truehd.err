@@ -1,0 +1,13 @@
+   Compiling ec-truehd v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-truehd)
+    Finished `release` profile [optimized] target(s) in 4.45s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_truehd-ff31727e8920856a)
+     Running tests/atmos_synth.rs (/home/user/.cache/tgt-testcut-rest/release/deps/atmos_synth-1a96ff50a42da718)
+error: test failed, to rerun pass `-p ec-truehd --test atmos_synth`
+     Running tests/fixture_exact.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fixture_exact-59be2e3b1e02f773)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-2d3e167fe70195bb)
+     Running tests/library.rs (/home/user/.cache/tgt-testcut-rest/release/deps/library-282b3d53b91210be)
+     Running tests/oracle.rs (/home/user/.cache/tgt-testcut-rest/release/deps/oracle-2e50eb5e123fad1b)
+     Running tests/refused_au_recovery.rs (/home/user/.cache/tgt-testcut-rest/release/deps/refused_au_recovery-097fdfd34eb83241)
+   Doc-tests ec_truehd
+error: 1 target failed:
+    `-p ec-truehd --test atmos_synth`

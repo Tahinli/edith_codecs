@@ -175,6 +175,48 @@ impl CabacEnc {
         self.w.bit_len() + u64::from(self.outstanding)
     }
 
+    /// Take over `trial`, a [`CabacEnc::probe_copy`] of this coder, and the
+    /// bits its writes made; see [`EncEntropy::adopt`]. The destructuring is
+    /// exhaustive, so a new field cannot be left out of the hand-over.
+    pub(crate) fn adopt(&mut self, trial: CabacEnc) {
+        let CabacEnc {
+            w,
+            low,
+            range,
+            outstanding,
+            first,
+            state,
+            ctx,
+            cbp_luma_bins,
+            cur_intra,
+        } = trial;
+        let from = self.w.bit_len() % 8;
+        super::entropy::append_bits(&mut self.w, &w, from);
+        self.low = low;
+        self.range = range;
+        self.outstanding = outstanding;
+        self.first = first;
+        self.state = state;
+        self.ctx = ctx;
+        self.cbp_luma_bins = cbp_luma_bins;
+        self.cur_intra = cur_intra;
+    }
+
+    /// The coder state without the output buffer; see `EncEntropy::probe_copy`.
+    pub(crate) fn probe_copy(&self) -> CabacEnc {
+        CabacEnc {
+            w: super::entropy::aligned_empty(&self.w),
+            low: self.low,
+            range: self.range,
+            outstanding: self.outstanding,
+            first: self.first,
+            state: self.state,
+            ctx: self.ctx,
+            cbp_luma_bins: self.cbp_luma_bins,
+            cur_intra: self.cur_intra,
+        }
+    }
+
     /// `end_of_slice_flag` = 0: another macroblock follows.
     pub(crate) fn not_end_of_slice(&mut self) {
         self.terminate(false);
@@ -749,6 +791,8 @@ mod tests {
                 a: [None, Some(nbr(false)), Some(nbr(true))][rand(3) as usize],
                 b: [None, Some(nbr(false)), Some(nbr(true))][rand(3) as usize],
                 qp_delta_inc: 0,
+                field: false,
+                mbaff_a: None,
             };
             let mut c = [0i32; 64];
             let density = [1, 3, 8, 20, 64][rand(5) as usize];
@@ -779,7 +823,7 @@ mod tests {
                 "flag {i}"
             );
             let mut got = [0i32; 64];
-            dec.residual_block_8x8(&mut got).expect("block");
+            dec.residual_block_8x8(&mut got, 0, None).expect("block");
             assert_eq!(&got[..], &c[..], "block {i}");
             assert!(dec.more_macroblocks().expect("terminate"), "block {i} end");
         }

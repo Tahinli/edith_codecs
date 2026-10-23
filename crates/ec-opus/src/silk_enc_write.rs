@@ -80,6 +80,8 @@ pub struct SilkEncoder {
     voiced_frames: usize,
     mirror_out: Vec<i16>,
     target_bps: Option<u32>,
+    /// Byte budget for one packet (D2b): the rate loop coarsens until it fits.
+    max_bytes: Option<usize>,
     /// Bits the rate loop owes (+) or banked (-) against the target.
     reservoir: f32,
     /// Last frame's gain-step operating point (libopus carries its gain
@@ -120,7 +122,12 @@ const MIN_TARGET_RATE_BPS: f32 = 5000.0;
 /// forever). Below, libopus's absolute x0.25 bound holds: a near-silent
 /// stereo side channel spending up to its share walked the gain down 30
 /// steps and drowned the mid (stereo 16k oracle corr .07).
+/// Extra gain trials a packet may spend to fit its byte budget (D2b).
+const MAX_BUDGET_TRIALS: usize = 12;
 const MAX_RATE_STEP: i32 = 30;
+/// How far past the rate loop's own step the budget clamp may coarsen one packet.
+const BUDGET_FILL: f32 = 0.9;
+const MAX_BUDGET_STEP: i32 = 120;
 /// Start each frame's rate loop at the previous frame's operating point.
 const CARRY_RATE_STEP: bool = true;
 /// Operating-point smoothing: the loop starts each frame at the slow
@@ -161,6 +168,7 @@ impl SilkEncoder {
             prev_pitch_lag: 0,
             mirror_out: vec![0; 20 * 16],
             target_bps: None,
+            max_bytes: None,
             reservoir: 0.0,
             rate_step: 0,
             rate_ema: 0.0,
@@ -192,6 +200,12 @@ impl SilkEncoder {
     /// at unit excitation RMS with no rate loop.
     pub fn set_bitrate(&mut self, bps: u32) {
         self.target_bps = Some(bps);
+    }
+
+    /// Byte budget for the next packet (D2b). `None` (the default) leaves the
+    /// packet size to the rate loop alone.
+    pub fn set_max_bytes(&mut self, max: Option<usize>) {
+        self.max_bytes = max;
     }
 
     fn reset_state(&mut self) {
@@ -564,6 +578,9 @@ impl SilkEncoder {
             (_, 10, 16) => 1.45,
             _ => PULSE_LAMBDA,
         };
+        // Budget fallback: scales the pulse penalty when gain coarsening alone
+        // cannot fit the packet (the gain range saturates on onsets).
+        let lam_mul = std::cell::Cell::new(1.0f32);
         let run = |per: usize, gains_q16: &[i32; MAX_NB_SUBFR]| -> Run {
             let cbk = codebook(per);
             let mut r = r.clone();
@@ -625,13 +642,13 @@ impl SilkEncoder {
                         let lvl = p as f32 - LEVEL_ADJUST * (p.signum() as f32);
                         lvl + offset
                     };
-                    let c0 = (target.round() as i32).clamp(-MAX_PULSE, MAX_PULSE);
+                    let c0 = ((target.round() / lam_mul.get()).round() as i32).clamp(-MAX_PULSE, MAX_PULSE);
                     let pl = [c0 - 1, c0, c0 + 1]
                         .into_iter()
                         .filter(|p| p.abs() <= MAX_PULSE)
                         .min_by(|&a, &b| {
                             let cost = |p: i32| {
-                                (recon(p) - target).powi(2) + pulse_lambda * p.abs() as f32
+                                (recon(p) - target).powi(2) + pulse_lambda * lam_mul.get() * p.abs() as f32
                             };
                             cost(a).partial_cmp(&cost(b)).unwrap()
                         })
@@ -718,7 +735,12 @@ impl SilkEncoder {
         // magnitudes together; the reservoir carries each packet's miss.
         let mut best = trial(if CARRY_RATE_STEP { self.rate_step } else { 0 });
         if let Some(bps) = self.target_bps {
-            let frame_bits = bps as f32 * frame_ms as f32 / 1000.0;
+            let mut frame_bits = bps as f32 * frame_ms as f32 / 1000.0;
+            // A packet cap is a promise to fill it: the CBR packet is padded to
+            // the cap anyway, so aim the rate loop just under it.
+            if let Some(max) = self.max_bytes {
+                frame_bits = frame_bits.max(BUDGET_FILL * max as f32 * 8.0);
+            }
             // libopus (enc_API.c): only overspend is remembered
             // (`nBitsExceeded`, clamped 0..10000 bits) and it is repaid at
             // `frame_ms / BITRESERVOIR_DECAY_TIME_MS` per frame, never all
@@ -738,6 +760,7 @@ impl SilkEncoder {
             let bits_of = |t: &Trial| t.bytes.len() as f32 * 8.0;
             let start = if CARRY_RATE_STEP { self.rate_step } else { 0 };
             let (mut s0, mut b0) = (start, bits_of(&best));
+            let mut best_step = start;
             // Each quantiser step is ~0.227 bit per sample; a second trial
             // corrects the slope from the first measurement.
             let mut slope = 0.227 * n as f32;
@@ -757,13 +780,69 @@ impl SilkEncoder {
                         slope = ((b1 - b0) / (step - s0) as f32).abs().max(1.0);
                     }
                     best = t;
+            best_step = step;
                     s0 = step;
                     b0 = b1;
                 } else {
                     break;
                 }
             }
-            self.rate_ema += (s0 as f32 - self.rate_ema) * CARRY_EMA;
+                // D2b: a packet may not exceed its byte budget. Coarsen the gain until
+            // it fits; a larger step spends fewer bits (the slope above).
+            // The nominal slope, not the measured one: a noisy measured slope
+            // can be tiny and send the step far out. Steps stay within the
+            // gain range the loop above allows.
+            // The rate loop's own step feeds the carry; budget coarsening is a
+            // per-packet clamp and must not drag later frames coarser.
+            let s_ctl = s0;
+            if let Some(max) = self.max_bytes {
+                let nominal = 0.227 * n as f32;
+                // `floor_step`: the finest step known not to fit.
+                let mut floor_step = best_step;
+                let mut trials = 0;
+                while best.bytes.len() > max && trials < MAX_BUDGET_TRIALS {
+                    let excess = (best.bytes.len() - max) as f32 * 8.0;
+                    let step = (best_step + ((excess / nominal).ceil() as i32).max(1))
+                        .min(start + MAX_BUDGET_STEP);
+                    if step == best_step {
+                        break;
+                    }
+                    floor_step = best_step;
+                    let before = best.bytes.len();
+                    best = trial(step);
+                    best_step = step;
+                    trials += 1;
+                    if best.bytes.len() == before {
+                        // Plateau: more gain does not shrink this frame.
+                        break;
+                    }
+                }
+                // Gain coarsening saturates on onsets: penalise pulses instead.
+                let mut mul = 1.0f32;
+                while best.bytes.len() > max && mul < 64.0 {
+                    mul *= if mul < 4.0 { 1.15 } else { 2.0 };
+                    lam_mul.set(mul);
+                    best = trial(best_step);
+                }
+                lam_mul.set(1.0);
+                // The ceil step can overshoot a whole step's worth of bytes;
+                // walk back toward the last step that did not fit while the
+                // packet still fits.
+                while best.bytes.len() <= max
+                    && best_step - 1 > floor_step
+                    && trials < MAX_BUDGET_TRIALS
+                {
+                    let finer = trial(best_step - 1);
+                    trials += 1;
+                    if finer.bytes.len() > max {
+                        break;
+                    }
+                    best = finer;
+                    best_step -= 1;
+                }
+                b0 = bits_of(&best);
+            }
+            self.rate_ema += (s_ctl as f32 - self.rate_ema) * CARRY_EMA;
             self.rate_step = (self.rate_ema.round() as i32).clamp(-MAX_RATE_STEP, MAX_RATE_STEP);
             self.reservoir = if LIBOPUS_RESERVOIR {
                 // Debt only (bits over the frame's share), as `nBitsExceeded`.
@@ -809,6 +888,9 @@ impl SilkEncoder {
 #[derive(Clone, Debug)]
 pub struct SilkStereoEncoder {
     fs_khz: usize,
+    /// Byte budget for one stereo packet (D2b), split between mid and side.
+    max_bytes: Option<usize>,
+    packet_room: Option<usize>,
     mid: SilkEncoder,
     side: SilkEncoder,
     range: RangeEncoder,
@@ -840,6 +922,8 @@ impl SilkStereoEncoder {
     fn with_fs_khz(fs_khz: usize) -> SilkStereoEncoder {
         SilkStereoEncoder {
             fs_khz,
+            max_bytes: None,
+            packet_room: None,
             mid: SilkEncoder::with_fs_khz(fs_khz),
             side: SilkEncoder::with_fs_khz(fs_khz),
             range: RangeEncoder::new(),
@@ -870,6 +954,43 @@ impl SilkStereoEncoder {
     /// libopus `silk_stereo_LR_to_MS`.
     pub fn set_bitrate(&mut self, bps: u32) {
         self.target_bps = Some(bps);
+    }
+
+    /// Byte budget for one stereo packet (D2b). `None` (the default) leaves the
+    /// packet size to the rate loops.
+    pub fn set_max_bytes(&mut self, max: Option<usize>) {
+        self.max_bytes = max;
+    }
+
+    /// Hands each channel its share of the packet budget, split as the bits
+    /// are (`mid_bps : side_bps`), less a two-byte margin for the shared header.
+    /// A side channel that is not coded takes no share.
+    fn set_sub_budgets(&mut self, mid_bps: u32, side_bps: u32, mid_only: bool) {
+        let Some(max) = self.max_bytes.map(|m| m.saturating_sub(2)) else {
+            self.mid.set_max_bytes(None);
+            self.side.set_max_bytes(None);
+            self.packet_room = None;
+            return;
+        };
+        let mid = if mid_only {
+            max
+        } else {
+            max * mid_bps as usize / (mid_bps as usize + side_bps as usize).max(1)
+        };
+        // The mid channel is coded first and may take half of the side share
+        // on top of its own; the side then gets whatever the mid left (see
+        // `side_budget_after_mid`).
+        let mid = mid + (max - mid) / 4;
+        self.mid.set_max_bytes(Some(mid));
+        self.side.set_max_bytes(Some(max - mid));
+        self.packet_room = Some(max);
+    }
+
+    /// Hands the side channel the room the coded mid channel left.
+    fn side_budget_after_mid(&mut self, mid_bytes: usize) {
+        if let Some(max) = self.packet_room {
+            self.side.set_max_bytes(Some(max.saturating_sub(mid_bytes).max(1)));
+        }
     }
 
     /// libopus `silk_stereo_LR_to_MS` rate split and panned-mono rule.
@@ -959,7 +1080,7 @@ impl SilkStereoEncoder {
         let mut side = Vec::with_capacity(samples);
         let mut mid_energy = 0.0f32;
         let mut side_energy = 0.0f32;
-        for lr in pcm48.chunks_exact(2) {
+        for lr in pcm48.as_chunks::<2>().0 {
             let m = 0.5 * (lr[0] + lr[1]);
             let s = 0.5 * (lr[0] - lr[1]);
             mid.push(m);
@@ -978,6 +1099,7 @@ impl SilkStereoEncoder {
             if !mid_only {
                 self.side.set_bitrate(side_bps.max(500));
             }
+            self.set_sub_budgets(mid_bps, side_bps, mid_only);
             mid_only
         } else {
             side_energy < 1.0e-10
@@ -988,6 +1110,7 @@ impl SilkStereoEncoder {
         let side_trial = if mid_only {
             None
         } else {
+            self.side_budget_after_mid(mid_trial.bytes.len());
             Some(
                 self.side
                     .encode_inner(&side, frame_ms, None, false, 0, true)?,
@@ -1038,7 +1161,7 @@ impl SilkStereoEncoder {
         let mut side = Vec::with_capacity(samples);
         let mut mid_energy = 0.0f32;
         let mut side_energy = 0.0f32;
-        for lr in pcm48.chunks_exact(2) {
+        for lr in pcm48.as_chunks::<2>().0 {
             let m = 0.5 * (lr[0] + lr[1]);
             let s = 0.5 * (lr[0] - lr[1]);
             mid.push(m);
@@ -1057,6 +1180,7 @@ impl SilkStereoEncoder {
             if !mid_only {
                 self.side.set_bitrate(side_bps.max(500));
             }
+            self.set_sub_budgets(mid_bps, side_bps, mid_only);
             mid_only
         } else {
             side_energy < 1.0e-10
@@ -1067,6 +1191,7 @@ impl SilkStereoEncoder {
         let side_trial = if mid_only {
             None
         } else {
+            self.side_budget_after_mid(mid_trial.bytes.len());
             Some(
                 self.side
                     .encode_inner(&side, frame_ms, None, false, 0, true)?,

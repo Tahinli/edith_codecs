@@ -490,6 +490,8 @@ fn filter_intra_edge(buf: &mut [i32], strength: i32) {
     let sz = buf.len() as i32;
     let mut edge = [0i32; 129];
     edge[..buf.len()].copy_from_slice(buf);
+    // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+    #[allow(clippy::needless_range_loop)]
     for i in 1..buf.len() {
         let mut s = 0;
         for (j, &tap) in KERNEL[filt].iter().enumerate() {
@@ -703,45 +705,20 @@ fn dc(above: Option<&[u16]>, left: Option<&[u16]>, bw: usize, bh: usize, fctx: &
         (None, None) => 1i32 << (crate::decode::bit_depth(fctx) - 1),
         (Some(a), None) => average(a, bw as u32),
         (None, Some(l)) => average(l, bh as u32),
-        (Some(a), Some(l)) if bw == bh => {
-            // `dc_predictor` (libaom `intrapred.c`): exact division, the
-            // square path this whole lane must leave bit-identical.
+        (Some(a), Some(l)) => {
+            // Spec 7.11.2.5: `avg = (sum + ((w + h) >> 1)) / (w + h)`, exact
+            // integer division for every rect shape too. libaom's
+            // `dc_predictor_rect` approximates that with a multiply-shift
+            // (`0x5556` / `0x3334`). The approximation is exact only while the
+            // edge sum stays below 2^16: for a 1:4 block (4x16, 16x4, 8x32,
+            // 16x64) it is already off by one from sum 65526, which 12-bit
+            // edges reach, which is what made the 12-bit 4:4:4 V plane one
+            // high against libdav1d.
             let sum: u32 = a + l;
             let count = (bw + bh) as u32;
             ((sum + (count >> 1)) / count) as i32
         }
-        (Some(a), Some(l)) => {
-            // `dc_predictor_rect`: AV1 never divides by `bw + bh` exactly for
-            // a rect block -- it approximates with a multiply-shift whose
-            // constants are derived from `bw + bh`'s odd factor (`d == 3` for
-            // every 1:2 ratio, `d == 5` for every 1:4 one; libaom comments
-            // this exact derivation in `intrapred.c` rather than tabulating
-            // it, so this ports the derivation, not a lookup).
-            let sum: u32 = a + l;
-            let (shift1, multiplier) = dc_rect_multiplier(bw, bh);
-            let num = u64::from(sum + ((bw + bh) as u32 >> 1));
-            (((num >> shift1) * multiplier) >> 16) as i32
-        }
     }
-}
-
-/// `dc_predictor_rect`'s per-call `(shift1, multiplier)` (libaom
-/// `intrapred.c`, `DC_MULTIPLIER_1X2`/`DC_MULTIPLIER_1X4`): shift `bw + bh`
-/// right until it is odd; AV1's only rect ratios (1:2, 1:4) leave that odd
-/// remainder at exactly 3 or 5.
-fn dc_rect_multiplier(bw: usize, bh: usize) -> (u32, u64) {
-    let mut d = (bw + bh) as u32;
-    let mut shift1 = 0;
-    while d & 1 == 0 {
-        d >>= 1;
-        shift1 += 1;
-    }
-    let multiplier = match d {
-        3 => 0x5556,
-        5 => 0x3334,
-        _ => panic!("AV1 rect blocks are only 1:2 or 1:4 (bw={bw} bh={bh})"),
-    };
-    (shift1, multiplier)
 }
 
 /// `Intra_Filter_Taps` (spec 7.11.2.3 / libaom `av1_filter_intra_taps`,
@@ -830,6 +807,8 @@ const FILTER_INTRA_SCALE_BITS: u32 = 4;
 /// Panics when `dst` is not `bw * bh` long, or `bw` is not a multiple of 4
 /// or `bh` not a multiple of 2 (spec `av1_filter_intra_allowed_bsize` never
 /// offers this mode past 32x32).
+// Signature mirrors the spec's per-call inputs; a parameter struct would only move them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_filter_intra(
     mode: usize,
     above: Option<&[u16]>,
@@ -867,6 +846,8 @@ pub(crate) fn predict_filter_intra(
             let p5 = at(&buffer, r, c - 1);
             let p6 = at(&buffer, r + 1, c - 1);
             let p = [p0, p1, p2, p3, p4, p5, p6];
+            // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+            #[allow(clippy::needless_range_loop)]
             for k in 0..8 {
                 let (r_off, c_off) = (k >> 2, k & 3);
                 let pr: i32 = taps[k].iter().zip(&p).map(|(t, s)| t * s).sum();
@@ -1116,6 +1097,33 @@ mod tests {
         }
         crate::decode::set_bit_depth(8, fctx);
         assert_eq!(compared, 2 * 14 * 5 * 3, "every shape/mode/seed was compared");
+    }
+
+    /// Spec 7.11.2.5 divides the rect DC average exactly. A 4x16 block (a 1:4
+    /// shape, `w + h = 20`) with an edge sum of 65526 (reachable only at 12
+    /// bit) must average to 3276. The libaom multiply-shift approximation gave
+    /// 3277 here, one high against libdav1d on the 12-bit 4:4:4 V plane.
+    #[test]
+    fn rect_dc_divides_exactly_for_12bit_edge_sums() {
+        let fctx = &crate::decode::FrameCtx::new();
+        crate::decode::set_bit_depth(12, fctx);
+        let above = [4095u16; 4];
+        let left: Vec<u16> = (0..16).map(|i| if i < 10 { 3072 } else { 3071 }).collect();
+        let mut dst = vec![0u16; 4 * 16];
+        predict(
+            DC_PRED,
+            0,
+            Some(&above),
+            Some(&left),
+            Some(4095),
+            4,
+            16,
+            false,
+            false,
+            &mut dst,
+            fctx,
+        );
+        assert!(dst.iter().all(|&v| v == 3276), "got {:?}", &dst[..4]);
     }
 
     /// lane-intrarect r1: checksum-verify DC/SMOOTH/PAETH and a directional

@@ -1,0 +1,2 @@
+crate	binary	test	status	exec_time_s
+ec-image	tests/fuzz.rs	single_seed_sweeps_survive_mutation	ok	100

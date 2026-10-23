@@ -1,3 +1,4 @@
+> SUPERSEDED 2026-10-15 by lanes/vp9f72.report.md (1080p frames identical to libvpx 1.15.0).
 # lane-vp9inter report — inter-frame SYNTAX, slice 1 (`ec-vp9`)
 
 Worktree `/home/user/Documents/Code/Rust/edith_codecs-inter` (detached `43c9c913`).

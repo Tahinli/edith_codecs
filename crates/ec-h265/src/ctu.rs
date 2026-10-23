@@ -27,10 +27,17 @@ use crate::encoder::TransformSkip;
 use crate::intra::{self, Availability, Refs};
 use crate::residual::{self, encode_residual};
 use crate::transform::{
-    chroma_qp, dequantize, forward_transform, forward_transform_skip, inverse_transform,
-    inverse_transform_skip, quantize, quantize_offset, uses_dst,
+    chroma_qp_bd, dequantize_bd, forward_transform, forward_transform_skip, inverse_transform_bd,
+    inverse_transform_skip_bd, quant_qp, quantize, quantize_offset, scale_forward_bd, uses_dst,
 };
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+
+#[cfg(target_arch = "x86_64")]
+use archmage::{SimdToken, X64V1Token, arcane};
+
+/// A picture sample as the encoder stores it: `u16` at every bit depth, the
+/// values 0..=255 for 8-bit pictures.
+pub type Pel = u16;
 
 /// The rounding the rate-distortion level search starts from, as a divisor of
 /// the quantiser step: 2 is round-to-nearest, against the 3 the plain path
@@ -66,11 +73,11 @@ pub fn lambda_for(qp: i32) -> f64 {
 /// publishes a line per CTB and nothing else.
 pub struct RowBoundary {
     /// Bottom luma line, one entry per column.
-    pub y: Vec<AtomicU8>,
+    pub y: Vec<AtomicU16>,
     /// Bottom Cb line.
-    pub cb: Vec<AtomicU8>,
+    pub cb: Vec<AtomicU16>,
     /// Bottom Cr line.
-    pub cr: Vec<AtomicU8>,
+    pub cr: Vec<AtomicU16>,
     /// `CtDepth` along the bottom, one entry per four columns.
     pub depth: Vec<AtomicU8>,
 }
@@ -78,12 +85,13 @@ pub struct RowBoundary {
 impl RowBoundary {
     /// Storage for a picture `width` luma samples wide.
     pub fn new(width: usize) -> RowBoundary {
-        let make = |n: usize| (0..n).map(|_| AtomicU8::new(0)).collect();
+        let make = |n: usize| (0..n).map(|_| AtomicU16::new(0)).collect();
+        let make8 = |n: usize| (0..n).map(|_| AtomicU8::new(0)).collect();
         RowBoundary {
             y: make(width),
             cb: make(width / 2),
             cr: make(width / 2),
-            depth: make(width / 4),
+            depth: make8(width / 4),
         }
     }
 }
@@ -91,21 +99,21 @@ impl RowBoundary {
 /// Source planes for one picture, already padded to the coded size.
 pub struct SourcePlanes<'a> {
     /// Luma plane, `width * height`.
-    pub y: &'a [u8],
+    pub y: &'a [Pel],
     /// Cb plane, `width / 2 * height / 2`.
-    pub cb: &'a [u8],
+    pub cb: &'a [Pel],
     /// Cr plane.
-    pub cr: &'a [u8],
+    pub cr: &'a [Pel],
 }
 
 /// The mutable state one wavefront worker owns while coding one CTB row.
 pub struct RowState<'a> {
     /// Reconstructed luma for this row band.
-    pub rec_y: &'a mut [u8],
+    pub rec_y: &'a mut [Pel],
     /// Reconstructed Cb for this row band.
-    pub rec_cb: &'a mut [u8],
+    pub rec_cb: &'a mut [Pel],
     /// Reconstructed Cr for this row band.
-    pub rec_cr: &'a mut [u8],
+    pub rec_cr: &'a mut [Pel],
     /// The boundary this row publishes for the row below.
     pub publish: &'a RowBoundary,
     /// The boundary the row above published; absent for the first row.
@@ -114,15 +122,17 @@ pub struct RowState<'a> {
 
 /// Scratch buffers, allocated once per row rather than per block.
 struct Scratch {
-    pred: Vec<u8>,
+    pred: Vec<Pel>,
     residual: Vec<i32>,
     coeffs: Vec<i32>,
     scaled: Vec<i32>,
-    recon: Vec<u8>,
-    best_recon: Vec<u8>,
+    recon: Vec<Pel>,
+    best_recon: Vec<Pel>,
     levels: Vec<i32>,
     best_levels: Vec<i32>,
-    source: Vec<u8>,
+    /// Smoothed copy of the current luma reference samples (see `luma_refs`).
+    filt: Option<Refs<Pel>>,
+    source: Vec<Pel>,
     luma_levels: Vec<i32>,
     cb_levels: Vec<i32>,
     cr_levels: Vec<i32>,
@@ -139,6 +149,7 @@ impl Scratch {
             best_recon: vec![0; 32 * 32],
             levels: vec![0; 32 * 32],
             best_levels: vec![0; 32 * 32],
+            filt: None,
             source: vec![0; 32 * 32],
             luma_levels: vec![0; 32 * 32],
             cb_levels: vec![0; 16 * 16],
@@ -153,6 +164,12 @@ pub struct CtuEncoder<'a> {
     row: RowState<'a>,
     width: usize,
     height: usize,
+    /// Luma and chroma bit depth (8 or 10).
+    bit_depth: u32,
+    /// The largest sample value, `(1 << bit_depth) - 1`.
+    max: i32,
+    /// The mid-grey sample a row with no row above predicts from.
+    half: Pel,
     ctb_size: usize,
     band_y0: usize,
     band_rows: usize,
@@ -225,20 +242,27 @@ impl<'a> CtuEncoder<'a> {
         rqt: bool,
         cu64: bool,
         min_cb_log2: u32,
+        bit_depth: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
+        // qP is QpY + QpBdOffset (8.6.1). The quantiser, the dequantiser and the
+        // lambda all work on qP; the QpY argument only feeds the CABAC contexts.
+        let qp_bd = qp + 6 * (bit_depth as i32 - 8);
         CtuEncoder {
             src,
             row,
             width,
             height,
+            bit_depth,
+            max: (1 << bit_depth) - 1,
+            half: 1 << (bit_depth - 1),
             ctb_size,
             band_y0,
             band_rows,
-            qp,
-            qp_c: chroma_qp(qp, 0),
-            lambda: lambda_for(qp),
-            lambda_satd: lambda_for(qp).sqrt(),
+            qp: qp_bd,
+            qp_c: chroma_qp_bd(qp, 0, bit_depth) + 6 * (bit_depth as i32 - 8),
+            lambda: lambda_for(qp_bd),
+            lambda_satd: lambda_for(qp_bd).sqrt(),
             strong_smoothing,
             candidates: candidates.clamp(1, 35),
             chroma_rd,
@@ -252,7 +276,7 @@ impl<'a> CtuEncoder<'a> {
             rqt,
             cu64,
             rdoq_enc: {
-                let mut enc = CabacEncoder::counter(Contexts::new(qp));
+                let mut enc = CabacEncoder::counter(Contexts::new(qp.clamp(0, 51)));
                 enc.set_estimating(rdoq_estimate);
                 enc
             },
@@ -301,21 +325,21 @@ impl<'a> CtuEncoder<'a> {
         }
     }
 
-    fn rec_y(&self, x: usize, y: usize) -> u8 {
+    fn rec_y(&self, x: usize, y: usize) -> Pel {
         if y < self.band_y0 {
             self.row
                 .above
-                .map_or(128, |above| above.y[x].load(Ordering::Relaxed))
+                .map_or(self.half, |above| above.y[x].load(Ordering::Relaxed))
         } else {
             self.row.rec_y[(y - self.band_y0) * self.width + x]
         }
     }
 
     /// Reconstructed chroma sample, in chroma coordinates.
-    fn rec_c(&self, x: usize, y: usize, plane: usize) -> u8 {
+    fn rec_c(&self, x: usize, y: usize, plane: usize) -> Pel {
         let band_c0 = self.band_y0 / 2;
         if y < band_c0 {
-            self.row.above.map_or(128, |above| {
+            self.row.above.map_or(self.half, |above| {
                 let line = if plane == 1 { &above.cb } else { &above.cr };
                 line[x].load(Ordering::Relaxed)
             })
@@ -468,7 +492,7 @@ impl<'a> CtuEncoder<'a> {
     }
 
     /// Reconstructed samples of a square luma region and its chroma, packed.
-    fn save_region(&self, x: usize, y: usize, size: usize) -> Vec<u8> {
+    fn save_region(&self, x: usize, y: usize, size: usize) -> Vec<Pel> {
         let mut out = Vec::with_capacity(size * size * 3 / 2);
         for yy in y..y + size {
             for xx in x..x + size {
@@ -485,7 +509,7 @@ impl<'a> CtuEncoder<'a> {
         out
     }
 
-    fn load_region(&mut self, x: usize, y: usize, size: usize, data: &[u8]) {
+    fn load_region(&mut self, x: usize, y: usize, size: usize, data: &[Pel]) {
         let mut i = 0;
         for yy in y..y + size {
             for xx in x..x + size {
@@ -531,12 +555,12 @@ impl<'a> CtuEncoder<'a> {
         }
     }
 
-    fn write_rec_y(&mut self, x: usize, y: usize, value: u8) {
+    fn write_rec_y(&mut self, x: usize, y: usize, value: Pel) {
         let stride = self.width;
         self.row.rec_y[(y - self.band_y0) * stride + x] = value;
     }
 
-    fn write_rec_c(&mut self, x: usize, y: usize, plane: usize, value: u8) {
+    fn write_rec_c(&mut self, x: usize, y: usize, plane: usize, value: Pel) {
         let stride = self.width / 2;
         let band_c0 = self.band_y0 / 2;
         let data = if plane == 1 {
@@ -1376,12 +1400,14 @@ impl<'a> CtuEncoder<'a> {
         // the SATD surface over the angles is smooth by construction.
         let mut scored: Vec<(f64, u8)> = Vec::with_capacity(24);
         let score = |this: &mut Self, mode: u8, scored: &mut Vec<(f64, u8)>| {
-            intra::predict(
+            intra::predict_cached(
                 &refs,
+                &mut this.scratch.filt,
                 mode,
                 n,
                 true,
                 this.strong_smoothing,
+                this.bit_depth,
                 &mut this.scratch.pred,
             );
             let satd = satd(&source, &this.scratch.pred[..n * n], n) as f64;
@@ -1483,8 +1509,8 @@ impl<'a> CtuEncoder<'a> {
         &mut self,
         n: usize,
         mode: u8,
-        source: &[u8],
-        refs: &Refs,
+        source: &[Pel],
+        refs: &Refs<Pel>,
         refine: bool,
     ) -> (f64, bool) {
         if self.ts_rd {
@@ -1506,9 +1532,9 @@ impl<'a> CtuEncoder<'a> {
 
     /// Code the 4x4 luma block both ways and keep the cheaper one, leaving its
     /// levels and reconstruction in the scratch and its flag in `ts_luma`.
-    fn transform_luma_ts_rd(&mut self, mode: u8, source: &[u8], refs: &Refs) -> (f64, bool) {
+    fn transform_luma_ts_rd(&mut self, mode: u8, source: &[Pel], refs: &Refs<Pel>) -> (f64, bool) {
         let scan = intra::scan_index(mode, 2, true);
-        let (mut best_cost, mut best) = (f64::MAX, (0.0, false, false, [0i32; 16], [0u8; 16]));
+        let (mut best_cost, mut best) = (f64::MAX, (0.0, false, false, [0i32; 16], [0 as Pel; 16]));
         for skip in [false, true] {
             self.ts_luma = skip;
             let (ssd, cbf) = self.transform_luma_at(4, mode, source, refs, true);
@@ -1520,7 +1546,7 @@ impl<'a> CtuEncoder<'a> {
             }
             let cost = ssd + self.lambda * bits;
             if cost < best_cost {
-                let (mut levels, mut recon) = ([0i32; 16], [0u8; 16]);
+                let (mut levels, mut recon) = ([0i32; 16], [0 as Pel; 16]);
                 levels.copy_from_slice(&self.scratch.levels[..16]);
                 recon.copy_from_slice(&self.scratch.recon[..16]);
                 best_cost = cost;
@@ -1538,16 +1564,18 @@ impl<'a> CtuEncoder<'a> {
         &mut self,
         n: usize,
         mode: u8,
-        source: &[u8],
-        refs: &Refs,
+        source: &[Pel],
+        refs: &Refs<Pel>,
         refine: bool,
     ) -> (f64, bool) {
-        intra::predict(
+        intra::predict_cached(
             refs,
+            &mut self.scratch.filt,
             mode,
             n,
             true,
             self.strong_smoothing,
+            self.bit_depth,
             &mut self.scratch.pred,
         );
         for (i, &sample) in source[..n * n].iter().enumerate() {
@@ -1565,16 +1593,22 @@ impl<'a> CtuEncoder<'a> {
         } else {
             forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, n, dst);
         }
+        scale_forward_bd(&mut self.scratch.coeffs, n, self.bit_depth);
         let mut nonzero = if self.rdoq {
             quantize_offset(
                 &self.scratch.coeffs,
                 &mut self.scratch.levels,
                 n,
-                self.qp,
+                quant_qp(self.qp, self.bit_depth),
                 RDOQ_DEAD_ZONE,
             )
         } else {
-            quantize(&self.scratch.coeffs, &mut self.scratch.levels, n, self.qp)
+            quantize(
+                &self.scratch.coeffs,
+                &mut self.scratch.levels,
+                n,
+                quant_qp(self.qp, self.bit_depth),
+            )
         };
         let ts = self.ts_flag(skip);
         if self.rdoq && refine && nonzero > 0 {
@@ -1583,10 +1617,15 @@ impl<'a> CtuEncoder<'a> {
                 &mut self.scratch.levels,
                 n,
                 self.qp,
+                self.bit_depth,
                 0,
                 intra::scan_index(mode, n.trailing_zeros(), true),
                 ctx::CBF_LUMA + 1,
-                self.lambda,
+                if self.bit_depth > 8 {
+                    self.lambda / 16.0
+                } else {
+                    self.lambda
+                },
                 ts,
                 &mut self.rdoq_enc,
             );
@@ -1596,25 +1635,42 @@ impl<'a> CtuEncoder<'a> {
                 &self.scratch.coeffs,
                 &mut self.scratch.levels,
                 n,
-                self.qp,
+                quant_qp(self.qp, self.bit_depth),
                 intra::scan_index(mode, n.trailing_zeros(), true),
             );
         }
         let cbf = nonzero > 0;
         if cbf {
-            dequantize(&self.scratch.levels, &mut self.scratch.scaled, n, self.qp);
+            dequantize_bd(
+                &self.scratch.levels,
+                &mut self.scratch.scaled,
+                n,
+                self.qp,
+                self.bit_depth,
+            );
             if skip {
-                inverse_transform_skip(&self.scratch.scaled, &mut self.scratch.residual, n);
+                inverse_transform_skip_bd(
+                    &self.scratch.scaled,
+                    &mut self.scratch.residual,
+                    n,
+                    self.bit_depth,
+                );
             } else {
-                inverse_transform(&self.scratch.scaled, &mut self.scratch.residual, n, dst);
+                inverse_transform_bd(
+                    &self.scratch.scaled,
+                    &mut self.scratch.residual,
+                    n,
+                    dst,
+                    self.bit_depth,
+                );
             }
         } else {
             self.scratch.residual[..n * n].fill(0);
         }
         let mut ssd = 0i64;
         for (i, &sample) in source[..n * n].iter().enumerate() {
-            let value =
-                (i32::from(self.scratch.pred[i]) + self.scratch.residual[i]).clamp(0, 255) as u8;
+            let value = (i32::from(self.scratch.pred[i]) + self.scratch.residual[i])
+                .clamp(0, self.max) as Pel;
             self.scratch.recon[i] = value;
             let d = i64::from(sample) - i64::from(value);
             ssd += d * d;
@@ -1644,6 +1700,7 @@ impl<'a> CtuEncoder<'a> {
             cn,
             false,
             self.strong_smoothing,
+            self.bit_depth,
             &mut self.scratch.pred,
         );
         for row in 0..cn {
@@ -1658,12 +1715,13 @@ impl<'a> CtuEncoder<'a> {
         } else {
             forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, cn, false);
         }
+        scale_forward_bd(&mut self.scratch.coeffs, cn, self.bit_depth);
         let mut nonzero = if self.rdoq {
             quantize_offset(
                 &self.scratch.coeffs,
                 &mut self.scratch.levels,
                 cn,
-                self.qp_c,
+                quant_qp(self.qp_c, self.bit_depth),
                 RDOQ_DEAD_ZONE_C,
             )
         } else {
@@ -1671,7 +1729,7 @@ impl<'a> CtuEncoder<'a> {
                 &self.scratch.coeffs,
                 &mut self.scratch.levels,
                 cn,
-                self.qp_c,
+                quant_qp(self.qp_c, self.bit_depth),
             )
         };
         let ts = self.ts_flag(skip && cn == 4);
@@ -1681,10 +1739,15 @@ impl<'a> CtuEncoder<'a> {
                 &mut self.scratch.levels,
                 cn,
                 self.qp_c,
+                self.bit_depth,
                 plane,
                 intra::scan_index(pred_mode, cn.trailing_zeros(), false),
                 ctx::CBF_CHROMA,
-                self.lambda,
+                if self.bit_depth > 8 {
+                    self.lambda / 16.0
+                } else {
+                    self.lambda
+                },
                 ts,
                 &mut self.rdoq_enc,
             );
@@ -1694,22 +1757,34 @@ impl<'a> CtuEncoder<'a> {
                 &self.scratch.coeffs,
                 &mut self.scratch.levels,
                 cn,
-                self.qp_c,
+                quant_qp(self.qp_c, self.bit_depth),
                 intra::scan_index(pred_mode, cn.trailing_zeros(), false),
             );
         }
         let cbf = nonzero > 0;
         if cbf {
-            dequantize(
+            dequantize_bd(
                 &self.scratch.levels,
                 &mut self.scratch.scaled,
                 cn,
                 self.qp_c,
+                self.bit_depth,
             );
             if skip && cn == 4 {
-                inverse_transform_skip(&self.scratch.scaled, &mut self.scratch.residual, cn);
+                inverse_transform_skip_bd(
+                    &self.scratch.scaled,
+                    &mut self.scratch.residual,
+                    cn,
+                    self.bit_depth,
+                );
             } else {
-                inverse_transform(&self.scratch.scaled, &mut self.scratch.residual, cn, false);
+                inverse_transform_bd(
+                    &self.scratch.scaled,
+                    &mut self.scratch.residual,
+                    cn,
+                    false,
+                    self.bit_depth,
+                );
             }
         } else {
             self.scratch.residual[..cn * cn].fill(0);
@@ -1719,7 +1794,7 @@ impl<'a> CtuEncoder<'a> {
             for col in 0..cn {
                 let value = (i32::from(self.scratch.pred[row * cn + col])
                     + self.scratch.residual[row * cn + col])
-                    .clamp(0, 255) as u8;
+                    .clamp(0, self.max) as Pel;
                 let d = i64::from(src[(cy + row) * cw + cx + col]) - i64::from(value);
                 ssd += d * d;
                 self.write_rec_c(cx + col, cy + row, plane, value);
@@ -1829,7 +1904,8 @@ impl<'a> CtuEncoder<'a> {
 
     // ---- reference samples -----------------------------------------------
 
-    fn luma_refs(&self, x: usize, y: usize, n: usize) -> Refs {
+    fn luma_refs(&mut self, x: usize, y: usize, n: usize) -> Refs<Pel> {
+        self.scratch.filt = None;
         let mut refs = Refs::default();
         let mut avail = Availability::default();
         let span = 2 * n;
@@ -1847,11 +1923,11 @@ impl<'a> CtuEncoder<'a> {
                 refs.left[i] = self.rec_y(x - 1, y + i);
             }
         }
-        intra::substitute(&mut refs, &avail, n, 8);
+        intra::substitute(&mut refs, &avail, n, self.bit_depth);
         refs
     }
 
-    fn chroma_refs(&self, cx: usize, cy: usize, cn: usize, plane: usize) -> Refs {
+    fn chroma_refs(&self, cx: usize, cy: usize, cn: usize, plane: usize) -> Refs<Pel> {
         let mut refs = Refs::default();
         let mut avail = Availability::default();
         let span = 2 * cn;
@@ -1869,13 +1945,83 @@ impl<'a> CtuEncoder<'a> {
                 refs.left[i] = self.rec_c(cx - 1, cy + i, plane);
             }
         }
-        intra::substitute(&mut refs, &avail, cn, 8);
+        intra::substitute(&mut refs, &avail, cn, self.bit_depth);
         refs
     }
 }
 
 /// Sum of absolute transformed differences, 4x4 Hadamard per sub-block.
-fn satd(source: &[u8], pred: &[u8], n: usize) -> u32 {
+fn satd(source: &[Pel], pred: &[Pel], n: usize) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if n >= 4
+        && n.is_multiple_of(4)
+        && (n == 4 || n.is_multiple_of(8))
+        && source.len() >= n * n
+        && pred.len() >= n * n
+    {
+        // The SSE2 token (SSE2 is part of the x86_64 baseline, so this is always Some); the
+        // check above puts every load (`n` samples per row, `n` rows) inside both slices.
+        if let Some(t) = X64V1Token::summon() {
+            return satd_sse2(t, source, pred, n);
+        }
+    }
+    satd_scalar(source, pred, n)
+}
+
+/// [`satd`] on 16-bit lanes: the differences of 10-bit samples are within +-1023, so the
+/// sixteen Hadamard sums of a 4x4 block stay within +-16368. The vertical butterfly runs
+/// across whole rows, the horizontal one inside each group of four lanes.
+#[cfg(target_arch = "x86_64")]
+#[arcane]
+fn satd_sse2(_t: X64V1Token, source: &[Pel], pred: &[Pel], n: usize) -> u32 {
+    use std::arch::x86_64::*;
+    let sg1 = _mm_set_epi16(-1, -1, 1, 1, -1, -1, 1, 1);
+    let sg2 = _mm_set_epi16(-1, 1, -1, 1, -1, 1, -1, 1);
+    let ones = _mm_set1_epi16(1);
+    let mut total = _mm_setzero_si128();
+    // `n` (4) or 8 samples at `i`, the upper lanes zero for the 4-wide case.
+    let load = |v: &[Pel], i: usize| -> __m128i {
+        if n == 4 {
+            // Four samples in the low 64 bits, upper lanes zero.
+            let lo: u64 = bytemuck::cast(<[Pel; 4]>::try_from(&v[i..i + 4]).unwrap());
+            _mm_cvtsi64_si128(lo as i64)
+        } else {
+            bytemuck::cast(<[Pel; 8]>::try_from(&v[i..i + 8]).unwrap())
+        }
+    };
+    let step = if n == 4 { 4 } else { 8 };
+    for by in (0..n).step_by(4) {
+        for bx in (0..n).step_by(step) {
+            let i = by * n + bx;
+            let d0 = _mm_sub_epi16(load(source, i), load(pred, i));
+            let d1 = _mm_sub_epi16(load(source, i + n), load(pred, i + n));
+            let d2 = _mm_sub_epi16(load(source, i + 2 * n), load(pred, i + 2 * n));
+            let d3 = _mm_sub_epi16(load(source, i + 3 * n), load(pred, i + 3 * n));
+            let (s0, s1) = (_mm_add_epi16(d0, d2), _mm_add_epi16(d1, d3));
+            let (s2, s3) = (_mm_sub_epi16(d0, d2), _mm_sub_epi16(d1, d3));
+            for v in [
+                _mm_add_epi16(s0, s1),
+                _mm_sub_epi16(s0, s1),
+                _mm_add_epi16(s2, s3),
+                _mm_sub_epi16(s2, s3),
+            ] {
+                // lanes [a0 a1 a2 a3] -> [a0+a2, a1+a3, a0-a2, a1-a3]
+                let t = _mm_shufflehi_epi16(_mm_shufflelo_epi16(v, 0x4E), 0x4E);
+                let h1 = _mm_add_epi16(_mm_mullo_epi16(v, sg1), t);
+                // -> [h0+h1, h0-h1, h2+h3, h2-h3]
+                let t = _mm_shufflehi_epi16(_mm_shufflelo_epi16(h1, 0xB1), 0xB1);
+                let h2 = _mm_add_epi16(_mm_mullo_epi16(h1, sg2), t);
+                let abs = _mm_max_epi16(h2, _mm_sub_epi16(_mm_setzero_si128(), h2));
+                total = _mm_add_epi32(total, _mm_madd_epi16(abs, ones));
+            }
+        }
+    }
+    let t = _mm_add_epi32(total, _mm_srli_si128(total, 8));
+    let t = _mm_add_epi32(t, _mm_srli_si128(t, 4));
+    (_mm_cvtsi128_si32(t) as u32).div_ceil(2)
+}
+
+fn satd_scalar(source: &[Pel], pred: &[Pel], n: usize) -> u32 {
     let mut total = 0u32;
     for by in (0..n).step_by(4) {
         for bx in (0..n).step_by(4) {
@@ -1916,14 +2062,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn satd_vector_path_matches_the_scalar_one() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = |max: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % (max + 1)
+        };
+        for n in [4usize, 8, 16, 32] {
+            for max in [255u32, 1023] {
+                for round in 0..40 {
+                    let (a, b): (Vec<Pel>, Vec<Pel>) = (0..n * n)
+                        .map(|_| {
+                            if round % 4 == 0 {
+                                // Extremes: the largest possible sums.
+                                (
+                                    if next(1) == 0 { 0 } else { max as Pel },
+                                    if next(1) == 0 { 0 } else { max as Pel },
+                                )
+                            } else {
+                                (next(max) as Pel, next(max) as Pel)
+                            }
+                        })
+                        .unzip();
+                    assert_eq!(satd(&a, &b, n), satd_scalar(&a, &b, n), "n={n} max={max}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn satd_is_zero_for_an_exact_prediction_and_grows_with_error() {
-        let source: Vec<u8> = (0..64).map(|i| (i * 3 % 251) as u8).collect();
+        let source: Vec<Pel> = (0..64).map(|i| (i * 3 % 251) as Pel).collect();
         assert_eq!(satd(&source, &source, 8), 0);
         let mut worse = source.clone();
         worse[9] = worse[9].wrapping_add(40);
         assert!(satd(&source, &worse, 8) > 0);
         // A constant offset shows up entirely in the DC term.
-        let shifted: Vec<u8> = source.iter().map(|v| v.saturating_sub(10)).collect();
+        let shifted: Vec<Pel> = source.iter().map(|v| v.saturating_sub(10)).collect();
         assert!(satd(&source, &shifted, 8) >= 8 * 8 * 10 / 2);
     }
 

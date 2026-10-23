@@ -1,0 +1,7 @@
+   Compiling ec-subs v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-subs)
+   Compiling ec-ass v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-ass)
+    Finished `release` profile [optimized] target(s) in 3.55s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_ass-f63eac62614b35ca)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-4bc1f77c736e6273)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-ed2faa9fee713ab5)
+   Doc-tests ec_ass

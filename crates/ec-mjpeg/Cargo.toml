@@ -1,0 +1,15 @@
+[package]
+name = "ec-mjpeg"
+description = "Motion JPEG video decoder: JPEG packets straight to planar YUV (4:2:0, 4:2:2, 4:4:4, gray), default Huffman tables, two-field packets, progressive."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+ec-image = { workspace = true }
+
+[dev-dependencies]
+ec-mp4 = { workspace = true }
+ec-matroska = { workspace = true }

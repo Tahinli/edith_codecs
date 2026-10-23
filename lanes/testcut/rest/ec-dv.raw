@@ -1,0 +1,63 @@
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "idct::const_tests::constants_follow_formula" }
+{ "type": "test", "event": "started", "name": "video::tests::short_and_unknown_frames_are_refused" }
+{ "type": "test", "event": "started", "name": "video::tests::vlc_table_is_a_complete_prefix_code" }
+{ "type": "test", "event": "started", "name": "video::tests::work_chunks_stay_inside_the_frame_and_the_picture" }
+{ "type": "test", "name": "idct::const_tests::constants_follow_formula", "event": "ok", "exec_time": 0.000000411 }
+{ "type": "test", "event": "started", "name": "video::tests::zigzag_is_standard" }
+{ "type": "test", "name": "video::tests::zigzag_is_standard", "event": "ok", "exec_time": 0.000003577 }
+{ "type": "test", "name": "video::tests::vlc_table_is_a_complete_prefix_code", "event": "ok", "exec_time": 0.000445186 }
+{ "type": "test", "name": "video::tests::work_chunks_stay_inside_the_frame_and_the_picture", "event": "ok", "exec_time": 0.000482236 }
+{ "type": "test", "name": "video::tests::short_and_unknown_frames_are_refused", "event": "ok", "exec_time": 0.003429383 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.003890601 }
+{ "type": "suite", "event": "started", "test_count": 5 }
+{ "type": "test", "event": "started", "name": "audio_rates_and_12bit_match_ffmpeg" }
+{ "type": "test", "event": "started", "name": "avi_and_mov_carry_dv" }
+{ "type": "test", "event": "started", "name": "decoder_trait_output_formats" }
+{ "type": "test", "event": "started", "name": "field_order_matches_ffprobe_view" }
+{ "type": "test", "name": "field_order_matches_ffprobe_view", "event": "ok", "exec_time": 0.744663199 }
+{ "type": "test", "event": "started", "name": "raw_demuxer_sniff_seek_and_junk" }
+{ "type": "test", "name": "raw_demuxer_sniff_seek_and_junk", "event": "ok", "exec_time": 0.378103173 }
+{ "type": "test", "name": "decoder_trait_output_formats", "event": "ok", "exec_time": 1.4258154410000001 }
+{ "type": "test", "name": "audio_rates_and_12bit_match_ffmpeg", "event": "ok", "exec_time": 1.511945205 }
+{ "type": "test", "name": "avi_and_mov_carry_dv", "event": "ok", "exec_time": 3.697661984 }
+{ "type": "suite", "event": "ok", "passed": 5, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 3.698525427 }
+{ "type": "suite", "event": "started", "test_count": 11 }
+{ "type": "test", "event": "started", "name": "hd_1080i50" }
+{ "type": "test", "event": "started", "name": "hd_1080i60" }
+{ "type": "test", "event": "started", "name": "hd_720p50" }
+{ "type": "test", "event": "started", "name": "hd_720p60" }
+{ "type": "test", "name": "hd_720p50", "event": "ok", "exec_time": 2.27242033 }
+{ "type": "test", "event": "started", "name": "mutated_streams_match_ffmpeg" }
+{ "type": "test", "name": "hd_720p60", "event": "ok", "exec_time": 2.318158133 }
+{ "type": "test", "event": "started", "name": "native_formats" }
+{ "type": "test", "name": "native_formats", "event": "ok", "exec_time": 1.288337078 }
+{ "type": "test", "event": "started", "name": "ntsc_411" }
+{ "type": "test", "name": "hd_1080i60", "event": "ok", "exec_time": 5.501579858 }
+{ "type": "test", "event": "started", "name": "ntsc_422_dvcpro50" }
+{ "type": "test", "name": "hd_1080i50", "event": "ok", "exec_time": 5.553758422 }
+{ "type": "test", "event": "started", "name": "pal_411" }
+{ "type": "test", "name": "ntsc_411", "event": "ok", "exec_time": 2.5629603579999998 }
+{ "type": "test", "event": "started", "name": "pal_420" }
+{ "type": "test", "name": "pal_411", "event": "ok", "exec_time": 2.44345994 }
+{ "type": "test", "event": "started", "name": "pal_422_dvcpro50" }
+{ "type": "test", "name": "pal_420", "event": "ok", "exec_time": 2.543419065 }
+{ "type": "test", "name": "ntsc_422_dvcpro50", "event": "ok", "exec_time": 3.457732064 }
+{ "type": "test", "name": "pal_422_dvcpro50", "event": "ok", "exec_time": 3.070084627 }
+{ "type": "test", "event": "timeout", "name": "mutated_streams_match_ffmpeg" }
+{ "type": "test", "name": "mutated_streams_match_ffmpeg", "event": "ok", "exec_time": 60.422008086 }
+{ "type": "suite", "event": "ok", "passed": 11, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 62.696572482 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "decode_speed" }
+{ "type": "test", "name": "decode_speed", "event": "ok", "exec_time": 11.116690062 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 11.117347726 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "all_headers_with_hostile_audio_packs" }
+{ "type": "test", "event": "started", "name": "bit_flips_and_truncations_do_not_panic" }
+{ "type": "test", "event": "started", "name": "random_frames_of_every_profile_do_not_panic" }
+{ "type": "test", "name": "random_frames_of_every_profile_do_not_panic", "event": "ok", "exec_time": 0.53082396 }
+{ "type": "test", "name": "bit_flips_and_truncations_do_not_panic", "event": "ok", "exec_time": 0.852072318 }
+{ "type": "test", "name": "all_headers_with_hostile_audio_packs", "event": "ok", "exec_time": 1.296607993 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 1.297013325 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000065523 }

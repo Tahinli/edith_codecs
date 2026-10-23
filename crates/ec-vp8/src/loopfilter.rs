@@ -17,13 +17,14 @@
 //!
 //! C signed right-shifts are arithmetic (floor); Rust `i32 >>` has the same
 //! semantics, so every `>>` below reproduces the C rounding exactly. No
-//! allocation, no `unsafe`.
+//! allocation.
 //!
 //! Frame-type note: §15.4 (and libvpx `lf_init_lut`) makes `hev_threshold`
 //! depend on whether the current frame is a key frame. [`filter_frame`]
 //! keeps the crate-contract signature and applies the *inter-frame* table;
 //! call [`filter_frame_ex`] with the decoded `is_keyframe` flag for fully
 //! type-exact decoding (the two differ only for levels ≥ 15).
+use crate::{Error, Result};
 
 /// Per-macroblock filter inputs the decoder derives from the frame header,
 /// segmentation map and per-MB prediction info.
@@ -186,7 +187,7 @@ pub fn filter_frame(
     sharpness: u8,
     simple_filter_type: bool,
     mb_info: &[MbFilterInfo],
-) {
+) -> Result<()> {
     filter_frame_ex(
         y,
         u,
@@ -199,7 +200,7 @@ pub fn filter_frame(
         simple_filter_type,
         mb_info,
         false,
-    );
+    )
 }
 
 /// [`filter_frame`] with an explicit frame type: `is_keyframe` selects the
@@ -219,13 +220,43 @@ pub fn filter_frame_ex(
     simple_filter_type: bool,
     mb_info: &[MbFilterInfo],
     is_keyframe: bool,
-) {
-    debug_assert_eq!(mb_info.len(), mb_cols * mb_rows);
-    debug_assert!(y.len() >= stride * (mb_rows * 16 - 1) + mb_cols * 16);
-    debug_assert!(u.len() >= uv_stride * (mb_rows * 8 - 1) + mb_cols * 8);
-    debug_assert!(v.len() >= uv_stride * (mb_rows * 8 - 1) + mb_cols * 8);
-    debug_assert!(stride >= mb_cols * 16);
-    debug_assert!(uv_stride >= mb_cols * 8);
+) -> Result<()> {
+    // Geometry is validated here, once per frame, and not per pixel. Every
+    // tap the edge helpers read lies inside `(rows*block - 1) * stride +
+    // cols*block` samples of the plane: the highest edge is a subblock edge
+    // in the last MB, and its 4-tap or 3-row reach ends exactly there. The
+    // helpers only read MB edges with a neighbour on the far side (col > 0,
+    // row > 0), so the lowest tap is never before the plane start. A caller
+    // with short planes or a mismatched `mb_info` gets an error, not a panic.
+    if mb_cols == 0 || mb_rows == 0 {
+        return Ok(());
+    }
+    let span = |stride: usize, block: usize| -> Option<usize> {
+        (mb_rows * block)
+            .checked_sub(1)?
+            .checked_mul(stride)?
+            .checked_add(mb_cols.checked_mul(block)?)
+    };
+    let geometry_ok = match (span(stride, 16), span(uv_stride, 8)) {
+        (Some(need_y), Some(need_uv)) => {
+            y.len() >= need_y
+                && u.len() >= need_uv
+                && v.len() >= need_uv
+                && stride >= mb_cols * 16
+                && uv_stride >= mb_cols * 8
+                && mb_info.len() == mb_cols * mb_rows
+        }
+        _ => false,
+    };
+    if !geometry_ok {
+        return Err(Error::corrupt(format!(
+            "loop filter geometry: {mb_cols}x{mb_rows} MBs, planes {}/{}/{}, strides {stride}/{uv_stride}, {} MB infos",
+            y.len(),
+            u.len(),
+            v.len(),
+            mb_info.len()
+        )));
+    }
 
     let tables = LoopFilterTables::update_sharpness(sharpness);
 
@@ -293,6 +324,7 @@ pub fn filter_frame_ex(
             }
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +437,7 @@ fn filter_mb_v_edge(
     // most pixels fail the threshold, so stores stay conditional.
     for row in 0..8 * size {
         let a = anchor + row * stride;
-        debug_assert!(a >= 4 && a + 3 < plane.len());
+        // Taps a-4..a+4: inside the plane, see filter_frame_ex.
         let mut px = [0u8; 8];
         px.copy_from_slice(&plane[a - 4..a + 4]);
         let c = [
@@ -454,8 +486,9 @@ fn filter_subblock_v_edge(
 ) {
     for row in 0..8 * size {
         let a = anchor + row * stride;
-        debug_assert!(a >= 4 && a + 3 < plane.len());
-        let px: [u8; 8] = plane[a - 4..a + 4].try_into().unwrap();
+        // Taps a-4..a+4: inside the plane, see filter_frame_ex.
+        let mut px = [0u8; 8];
+        px.copy_from_slice(&plane[a - 4..a + 4]);
         let c = [
             i32::from(px[0]),
             i32::from(px[1]),
@@ -493,7 +526,7 @@ fn filter_mb_h_edge(
     // per-column).
     let n = 8 * size;
     let mut px = [[0u8; 64]; 8];
-    debug_assert!(anchor >= 4 * stride && anchor + 3 * stride + n <= plane.len());
+    // Rows anchor-4*stride ..= anchor+3*stride+n: see filter_frame_ex.
     for (k, r) in px.iter_mut().enumerate() {
         // Add the row offset before backing up 4 rows: `anchor` is only
         // guaranteed to sit >= 4 rows into the plane, and the subtracted
@@ -546,7 +579,7 @@ fn filter_subblock_h_edge(
 ) {
     let n = 8 * size;
     let mut px = [[0u8; 64]; 8];
-    debug_assert!(anchor >= 4 * stride && anchor + 3 * stride + n <= plane.len());
+    // Rows anchor-4*stride ..= anchor+3*stride+n: see filter_frame_ex.
     for (k, r) in px.iter_mut().enumerate() {
         // Same add-first form as [`filter_mb_h_edge`]: the subtracted
         // expression underflows for k > 4.
@@ -580,8 +613,9 @@ fn filter_subblock_h_edge(
 fn filter_v_edge_simple(plane: &mut [u8], stride: usize, anchor: usize, limit: i32) {
     for row in 0..16 {
         let a = anchor + row * stride;
-        debug_assert!(a >= 2 && a + 1 < plane.len());
-        let px: [u8; 4] = plane[a - 2..a + 2].try_into().unwrap();
+        // Taps a-2..a+2: see filter_frame_ex.
+        let mut px = [0u8; 4];
+        px.copy_from_slice(&plane[a - 2..a + 2]);
         let p1 = i32::from(px[0]);
         let p0 = i32::from(px[1]);
         let q0 = i32::from(px[2]);
@@ -598,7 +632,7 @@ fn filter_v_edge_simple(plane: &mut [u8], stride: usize, anchor: usize, limit: i
 fn filter_h_edge_simple(plane: &mut [u8], stride: usize, anchor: usize, limit: i32) {
     // Contiguous columns, strided taps: chunked loads, conditional stores.
     let mut px = [[0u8; 16]; 4];
-    debug_assert!(anchor >= 2 * stride && anchor + stride + 16 <= plane.len());
+    // Rows anchor-2*stride ..= anchor+stride+15: see filter_frame_ex.
     for (k, r) in px.iter_mut().enumerate() {
         // Add-first form (see [`filter_mb_h_edge`]): the subtracted
         // expression underflows for k > 2.
@@ -851,7 +885,7 @@ abaca5bfb68881959894edeff6f0c9c9d4dcd52e2738310d00041d166f607972b8bfb6ada49b9287
                 level: 0,
                 inner_edges: true,
             }; 4],
-        );
+        ).unwrap();
         assert_eq!(y, y0);
         assert_eq!(u, u0);
         assert_eq!(v, v0);
@@ -886,7 +920,7 @@ abaca5bfb68881959894edeff6f0c9c9d4dcd52e2738310d00041d166f607972b8bfb6ada49b9287
                 level: 30,
                 inner_edges: false,
             }; 2],
-        );
+        ).unwrap();
         for r in 0..16 {
             assert_eq!(
                 &y[r * 32 + 12..r * 32 + 20],
@@ -981,7 +1015,7 @@ abaca5bfb68881959894edeff6f0c9c9d4dcd52e2738310d00041d166f607972b8bfb6ada49b9287
                 level: 30,
                 inner_edges: true,
             }; 2],
-        );
+        ).unwrap();
         // a = 3*20 - 20 = 40 -> f1 = 44>>3 = 5, f2 = 43>>3 = 5.
         for r in 0..16 {
             assert_eq!(
@@ -1020,7 +1054,7 @@ abaca5bfb68881959894edeff6f0c9c9d4dcd52e2738310d00041d166f607972b8bfb6ada49b9287
                 inner_edges: true,
             }; 4],
             false,
-        );
+        ).unwrap();
         assert_eq!(y, unhex(NORMAL_Y));
         assert_eq!(u, unhex(NORMAL_U));
         assert_eq!(v, unhex(NORMAL_V));
@@ -1048,7 +1082,7 @@ abaca5bfb68881959894edeff6f0c9c9d4dcd52e2738310d00041d166f607972b8bfb6ada49b9287
                 level: 25,
                 inner_edges: true,
             }; 4],
-        );
+        ).unwrap();
         assert_eq!(y, unhex(SIMPLE_Y));
         assert_eq!(u, u0);
         assert_eq!(v, v0);
@@ -1087,10 +1121,10 @@ abaca5bfb68881959894edeff6f0c9c9d4dcd52e2738310d00041d166f607972b8bfb6ada49b9287
         let mut inter = build();
         filter_frame_ex(
             &mut inter, &mut uy, &mut vy, 32, 16, 2, 1, 1, false, &info, false,
-        );
+        ).unwrap();
         filter_frame_ex(
             &mut ky, &mut uk, &mut vk, 32, 16, 2, 1, 1, false, &info, true,
-        );
+        ).unwrap();
         assert_eq!(&inter[12..20], &[110, 111, 113, 112, 111, 112, 112, 113]);
         assert_eq!(&ky[12..20], &[110, 110, 112, 111, 112, 113, 113, 113]);
     }

@@ -11,19 +11,17 @@
 //!
 //! # Unsafe
 //!
-//! This crate is `deny(unsafe_code)` rather than `forbid`: the two motion
-//! compensation inner loops are the largest single share of a decode's time
-//! and are hand-vectorised with `std::arch::x86_64` intrinsics, which are
-//! unsafe by signature. The exception is confined to [`mc`]'s `simd` module
-//! (plus its dispatch and its tests, each carrying its own
-//! `#[allow(unsafe_code)]`); every kernel there is checked lane-for-lane
-//! against the scalar function it replaces, which stays the reference
-//! implementation and is what every other architecture runs.
+//! This crate is `forbid(unsafe_code)`: it contains no `unsafe` block, fn or
+//! impl, and the motion compensation kernels are safe Rust. The scalar
+//! function each kernel replaces stays the reference implementation.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Codec signatures are tuples of slices and iterator adaptors; one alias per signature would add indirection without clarity.
+#![allow(clippy::type_complexity)]
 
 pub mod bits;
+mod autothreads;
 pub mod cdf;
 mod cdf_state;
 pub mod census;
@@ -32,6 +30,8 @@ pub mod decode;
 pub mod encode;
 mod dumpio;
 pub mod encoder;
+#[doc(hidden)]
+pub mod fault;
 mod envflags;
 mod film_grain;
 mod filter_search;
@@ -60,6 +60,10 @@ pub mod speed;
 mod stack_budget;
 pub mod stream;
 mod superres;
+#[cfg(test)]
+mod test_source;
+#[cfg(test)]
+pub(crate) mod tool_cache;
 pub mod tile;
 mod timeline;
 pub mod transform;

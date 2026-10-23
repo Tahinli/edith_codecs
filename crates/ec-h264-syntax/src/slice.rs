@@ -249,9 +249,9 @@ impl SliceHeader {
         if matches!(slice_type, SliceType::P | SliceType::Sp | SliceType::B) {
             if r.read_bit()? {
                 // num_ref_idx_active_override_flag
-                num_ref_idx_l0_active = r.read_ue()? + 1;
+                num_ref_idx_l0_active = r.read_ue()?.saturating_add(1);
                 if slice_type == SliceType::B {
-                    num_ref_idx_l1_active = r.read_ue()? + 1;
+                    num_ref_idx_l1_active = r.read_ue()?.saturating_add(1);
                 }
             }
             if num_ref_idx_l0_active > 32 || num_ref_idx_l1_active > 32 {
@@ -331,7 +331,7 @@ impl SliceHeader {
         };
 
         let slice_qp_delta = r.read_se()?;
-        let slice_qp = pps.pic_init_qp + slice_qp_delta;
+        let slice_qp = pps.pic_init_qp.saturating_add(slice_qp_delta);
         if !(-(sps.bit_depth_luma as i32 - 8) * 6..=51).contains(&slice_qp) {
             return Err(Error::corrupt("SliceQPY out of range"));
         }

@@ -1,5 +1,5 @@
 //! MP3 — MPEG-1/2/2.5 Layer III — decoding and encoding for the edith_codecs
-//! family.
+//! family, plus Layer I and II (MP1/MP2) decoding.
 //!
 //! Three ways in, smallest first:
 //!
@@ -28,6 +28,14 @@
 //! coupling, the block windows, the psychoacoustic model — is written from the
 //! standards (ISO/IEC 11172-3 and 13818-3).
 //!
+//! **Layers I and II.** The same [`Mp3Reader`], [`Mp3Decode`] and [`Mp3Decoder`]
+//! decode MPEG-1/2/2.5 Layer I and II frames (selected by the header, so a
+//! stream may even mix them), through the same polyphase bank run in f64 with the
+//! exact `D[i]` window. Layer II's allocation tables were measured from an oracle
+//! like the Layer III ones (`scripts/mp2-tables/`). Joint-stereo intensity bound
+//! and CRC are honoured; the MPEG-2 multichannel extension is ignored (the
+//! stereo base is decoded). There is no Layer I/II encoder.
+//!
 //! Free-format streams are refused by name rather than guessed at, since their
 //! frame length is only knowable by scanning to the next sync word.
 
@@ -41,6 +49,7 @@ pub mod header;
 mod filterbank;
 mod huffman;
 mod huffman_tables;
+mod layer12;
 mod tables;
 mod window;
 
@@ -149,7 +158,16 @@ impl Decoder for Mp3Decoder {
 
 /// Codec parameters for a Layer III stream of this shape.
 pub fn codec_parameters(sample_rate: u32, channels: usize) -> CodecParameters {
-    let mut params = CodecParameters::new(CodecId::Mp3);
+    layer_codec_parameters(3, sample_rate, channels)
+}
+
+/// Codec parameters for a Layer I (`1`), II (`2`) or III (anything else) stream.
+pub fn layer_codec_parameters(layer: u8, sample_rate: u32, channels: usize) -> CodecParameters {
+    let mut params = CodecParameters::new(match layer {
+        1 => CodecId::Mp1,
+        2 => CodecId::Mp2,
+        _ => CodecId::Mp3,
+    });
     params.media = MediaParameters::Audio(AudioParameters {
         sample_rate,
         layout: ChannelLayout::from_count(channels),

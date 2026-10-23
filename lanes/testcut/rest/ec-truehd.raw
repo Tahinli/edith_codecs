@@ -1,0 +1,72 @@
+{ "type": "suite", "event": "started", "test_count": 18 }
+{ "type": "test", "event": "started", "name": "decode::tests::codebooks_are_prefix_free" }
+{ "type": "test", "event": "started", "name": "decode::tests::every_codebook_entry_decodes_to_its_index" }
+{ "type": "test", "event": "started", "name": "decode::tests::out_of_range_filter_order_is_refused_and_not_stored" }
+{ "type": "test", "event": "started", "name": "decode::tests::quant_step_above_huff_lsbs_does_not_shift_negatively" }
+{ "type": "test", "name": "decode::tests::every_codebook_entry_decodes_to_its_index", "event": "ok", "exec_time": 0.000031219 }
+{ "type": "test", "event": "started", "name": "decode::tests::stale_huff_lsbs_above_24_is_corrupt_not_an_overflow" }
+{ "type": "test", "name": "decode::tests::quant_step_above_huff_lsbs_does_not_shift_negatively", "event": "ok", "exec_time": 0.000003917 }
+{ "type": "test", "event": "started", "name": "encode::tests::compression_ratio_gates" }
+{ "type": "test", "name": "decode::tests::out_of_range_filter_order_is_refused_and_not_stored", "event": "ok", "exec_time": 0.000001273 }
+{ "type": "test", "event": "started", "name": "encode::tests::encoder_round_trips_through_our_own_decoder" }
+{ "type": "test", "name": "decode::tests::codebooks_are_prefix_free", "event": "ok", "exec_time": 0.000006783 }
+{ "type": "test", "event": "started", "name": "sync::tests::a_corrupted_major_sync_word_does_not_panic" }
+{ "type": "test", "name": "decode::tests::stale_huff_lsbs_above_24_is_corrupt_not_an_overflow", "event": "ok", "exec_time": 0.0000107 }
+{ "type": "test", "event": "started", "name": "sync::tests::a_directory_past_four_entries_is_corrupt" }
+{ "type": "test", "name": "sync::tests::a_corrupted_major_sync_word_does_not_panic", "event": "ok", "exec_time": 0.000004288 }
+{ "type": "test", "event": "started", "name": "sync::tests::a_truncated_access_unit_is_need_more" }
+{ "type": "test", "name": "sync::tests::a_directory_past_four_entries_is_corrupt", "event": "ok", "exec_time": 0.000003066 }
+{ "type": "test", "event": "started", "name": "sync::tests::a_well_formed_3_entry_directory_still_parses" }
+{ "type": "test", "name": "encode::tests::encoder_round_trips_through_our_own_decoder", "event": "ok", "exec_time": 0.000788703 }
+{ "type": "test", "event": "started", "name": "sync::tests::a_well_formed_4_entry_directory_parses_with_7_1_on_top" }
+{ "type": "test", "name": "sync::tests::a_truncated_access_unit_is_need_more", "event": "ok", "exec_time": 0.000004228 }
+{ "type": "test", "event": "started", "name": "sync::tests::decoder_yields_nothing_before_a_major_sync" }
+{ "type": "test", "name": "sync::tests::a_well_formed_3_entry_directory_still_parses", "event": "ok", "exec_time": 0.000012804 }
+{ "type": "test", "event": "started", "name": "sync::tests::frame_length_needs_two_bytes" }
+{ "type": "test", "name": "sync::tests::decoder_yields_nothing_before_a_major_sync", "event": "ok", "exec_time": 0.000044223 }
+{ "type": "test", "event": "started", "name": "sync::tests::frame_length_reads_the_16_bit_word" }
+{ "type": "test", "name": "sync::tests::a_well_formed_4_entry_directory_parses_with_7_1_on_top", "event": "ok", "exec_time": 0.000002656 }
+{ "type": "test", "event": "started", "name": "sync::tests::parses_a_5_1_access_unit_with_a_major_sync" }
+{ "type": "test", "name": "sync::tests::frame_length_needs_two_bytes", "event": "ok", "exec_time": 0.000000812 }
+{ "type": "test", "event": "started", "name": "sync::tests::parses_a_stereo_access_unit_with_no_major_sync" }
+{ "type": "test", "name": "sync::tests::frame_length_reads_the_16_bit_word", "event": "ok", "exec_time": 0.000003357 }
+{ "type": "test", "event": "started", "name": "sync::tests::substream_spans_follow_the_directory" }
+{ "type": "test", "name": "sync::tests::parses_a_5_1_access_unit_with_a_major_sync", "event": "ok", "exec_time": 0.000003927 }
+{ "type": "test", "name": "sync::tests::parses_a_stereo_access_unit_with_no_major_sync", "event": "ok", "exec_time": 0.000001423 }
+{ "type": "test", "name": "sync::tests::substream_spans_follow_the_directory", "event": "ok", "exec_time": 0.000002455 }
+{ "type": "test", "name": "encode::tests::compression_ratio_gates", "event": "ok", "exec_time": 0.089715811 }
+{ "type": "suite", "event": "ok", "passed": 18, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.091147602 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "object_substream_contents_do_not_change_the_pcm_output" }
+{ "type": "test", "event": "started", "name": "synthetic_atmos_decodes_bit_exact_to_the_original_7_1" }
+{ "type": "test", "name": "object_substream_contents_do_not_change_the_pcm_output", "event": "failed", "exec_time": 0.000093355, "stdout": "\nthread 'object_substream_contents_do_not_change_the_pcm_output' (4032872) panicked at crates/ec-truehd/tests/atmos_synth.rs:85:9:\nEC_REQUIRE_FIXTURES=1 but the 7.1 TrueHD remux is absent under ~/Downloads\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n" }
+{ "type": "test", "name": "synthetic_atmos_decodes_bit_exact_to_the_original_7_1", "event": "failed", "exec_time": 0.000081844, "stdout": "\nthread 'synthetic_atmos_decodes_bit_exact_to_the_original_7_1' (4032873) panicked at crates/ec-truehd/tests/atmos_synth.rs:85:9:\nEC_REQUIRE_FIXTURES=1 but the 7.1 TrueHD remux is absent under ~/Downloads\n" }
+{ "type": "suite", "event": "failed", "passed": 0, "failed": 2, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000367851 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "fixtures_are_bit_exact_against_ffmpeg" }
+{ "type": "test", "event": "started", "name": "remux_71_is_bit_exact_against_ffmpeg" }
+{ "type": "test", "name": "remux_71_is_bit_exact_against_ffmpeg", "event": "ok", "exec_time": 0.000021229 }
+{ "type": "test", "name": "fixtures_are_bit_exact_against_ffmpeg", "event": "ok", "exec_time": 0.925698798 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.926293757 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "stale_huff_lsbs_overflow_is_corrupt_not_a_panic" }
+{ "type": "test", "name": "stale_huff_lsbs_overflow_is_corrupt_not_a_panic", "event": "ok", "exec_time": 0.00293173 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.003383128 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "walks_every_truehd_access_unit_of_a_real_7_1_remux" }
+{ "type": "test", "name": "walks_every_truehd_access_unit_of_a_real_7_1_remux", "event": "ok", "exec_time": 0.000044233 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000338476 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "externally_encoded_mlp_round_trips_bit_exact" }
+{ "type": "test", "event": "started", "name": "ffmpeg_decodes_our_encoder_bit_exact" }
+{ "type": "test", "event": "started", "name": "first_60_seconds_of_a_real_7_1_remux_are_bit_exact" }
+{ "type": "test", "name": "first_60_seconds_of_a_real_7_1_remux_are_bit_exact", "event": "ok", "exec_time": 0.000050344 }
+{ "type": "test", "name": "ffmpeg_decodes_our_encoder_bit_exact", "event": "ok", "exec_time": 0.687163695 }
+{ "type": "test", "name": "externally_encoded_mlp_round_trips_bit_exact", "event": "ok", "exec_time": 3.194338469 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 3.194776773 }
+{ "type": "suite", "event": "started", "test_count": 1 }
+{ "type": "test", "event": "started", "name": "refused_access_unit_does_not_poison_later_units" }
+{ "type": "test", "name": "refused_access_unit_does_not_poison_later_units", "event": "ok", "exec_time": 3.047645393 }
+{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 3.048137117 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000061446 }

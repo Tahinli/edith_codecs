@@ -1,0 +1,64 @@
+{ "type": "suite", "event": "started", "test_count": 14 }
+{ "type": "test", "event": "started", "name": "bits::tests::float32_round_trips_through_the_spec_format" }
+{ "type": "test", "event": "started", "name": "codebook::tests::a_designed_book_decodes_back_through_the_parsed_tree" }
+{ "type": "test", "event": "started", "name": "codebook::tests::a_lookup_table_past_the_header_budget_is_refused" }
+{ "type": "test", "event": "started", "name": "codebook::tests::lookup1_values_matches_the_definition" }
+{ "type": "test", "name": "codebook::tests::a_lookup_table_past_the_header_budget_is_refused", "event": "ok", "exec_time": 0.000076784 }
+{ "type": "test", "event": "started", "name": "encode::tests::a_stationary_signal_uses_only_long_blocks" }
+{ "type": "test", "name": "bits::tests::float32_round_trips_through_the_spec_format", "event": "ok", "exec_time": 0.000003707 }
+{ "type": "test", "event": "started", "name": "encode::tests::an_onset_after_silence_uses_short_blocks" }
+{ "type": "test", "name": "codebook::tests::lookup1_values_matches_the_definition", "event": "ok", "exec_time": 0.000000401 }
+{ "type": "test", "event": "started", "name": "encode::tests::coupling_round_trips_every_sign_case" }
+{ "type": "test", "name": "codebook::tests::a_designed_book_decodes_back_through_the_parsed_tree", "event": "ok", "exec_time": 0.000019247 }
+{ "type": "test", "event": "started", "name": "encode::tests::folding_is_the_exact_inverse_of_the_decoder" }
+{ "type": "test", "name": "encode::tests::coupling_round_trips_every_sign_case", "event": "ok", "exec_time": 0.000001733 }
+{ "type": "test", "event": "started", "name": "encode::tests::tail_granule_44100_mono" }
+{ "type": "test", "name": "encode::tests::folding_is_the_exact_inverse_of_the_decoder", "event": "ok", "exec_time": 0.000006752 }
+{ "type": "test", "event": "started", "name": "encode::tests::vector_residue_books_address_exact_values" }
+{ "type": "test", "name": "encode::tests::vector_residue_books_address_exact_values", "event": "ok", "exec_time": 0.000279824 }
+{ "type": "test", "event": "started", "name": "floor::tests::inverse_db_table_matches_the_spec_endpoints" }
+{ "type": "test", "name": "floor::tests::inverse_db_table_matches_the_spec_endpoints", "event": "ok", "exec_time": 0.000000802 }
+{ "type": "test", "event": "started", "name": "floor::tests::render_line_draws_the_spec_slope" }
+{ "type": "test", "name": "floor::tests::render_line_draws_the_spec_slope", "event": "ok", "exec_time": 0.000000721 }
+{ "type": "test", "event": "started", "name": "setup::tests::identification_refuses_what_it_cannot_decode" }
+{ "type": "test", "name": "setup::tests::identification_refuses_what_it_cannot_decode", "event": "ok", "exec_time": 0.000003366 }
+{ "type": "test", "event": "started", "name": "window::tests::overlapping_windows_add_to_one" }
+{ "type": "test", "name": "window::tests::overlapping_windows_add_to_one", "event": "ok", "exec_time": 0.000108714 }
+{ "type": "test", "name": "encode::tests::tail_granule_44100_mono", "event": "ok", "exec_time": 0.006971347 }
+{ "type": "test", "name": "encode::tests::a_stationary_signal_uses_only_long_blocks", "event": "ok", "exec_time": 0.017907965 }
+{ "type": "test", "name": "encode::tests::an_onset_after_silence_uses_short_blocks", "event": "ok", "exec_time": 0.017562106 }
+{ "type": "suite", "event": "ok", "passed": 14, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.019627438 }
+{ "type": "suite", "event": "started", "test_count": 11 }
+{ "type": "test", "event": "started", "name": "a_short_input_keeps_its_own_length" }
+{ "type": "test", "event": "started", "name": "band_error_vs_reference" }
+{ "type": "test", "event": "started", "name": "encoded_streams_decode_cleanly_at_the_stated_length" }
+{ "type": "test", "event": "started", "name": "flush_delivers_the_terminal_hop" }
+{ "type": "test", "name": "band_error_vs_reference", "event": "ignored", "message": "slow: encodes 7 full sources × 2 rates, needs ffmpeg/libvorbis" }
+{ "type": "test", "event": "started", "name": "onset_after_silence_has_no_pre_echo" }
+{ "type": "test", "name": "flush_delivers_the_terminal_hop", "event": "ok", "exec_time": 0.031016986 }
+{ "type": "test", "event": "started", "name": "quiet_content_reaches_the_target_or_is_transparent" }
+{ "type": "test", "name": "a_short_input_keeps_its_own_length", "event": "ok", "exec_time": 0.951066994 }
+{ "type": "test", "event": "started", "name": "real_library_sweep_vs_reference" }
+{ "type": "test", "name": "real_library_sweep_vs_reference", "event": "ignored", "message": "slow: encodes 7 full sources × 2 rates, needs ffmpeg/libvorbis" }
+{ "type": "test", "event": "started", "name": "repo_fixtures_decode_like_ffmpeg_including_surround" }
+{ "type": "test", "name": "quiet_content_reaches_the_target_or_is_transparent", "event": "ok", "exec_time": 0.998791222 }
+{ "type": "test", "event": "started", "name": "residue_histogram_vs_reference" }
+{ "type": "test", "name": "residue_histogram_vs_reference", "event": "ignored", "message": "slow: encodes 7 sources × 128k, needs ffmpeg/libvorbis" }
+{ "type": "test", "event": "started", "name": "the_rate_loop_tracks_the_target_bitrate" }
+{ "type": "test", "name": "the_rate_loop_tracks_the_target_bitrate", "event": "ok", "exec_time": 0.076831515 }
+{ "type": "test", "event": "started", "name": "xiph_vectors_decode_like_ffmpeg" }
+{ "type": "test", "name": "repo_fixtures_decode_like_ffmpeg_including_surround", "event": "ok", "exec_time": 3.882369801 }
+{ "type": "test", "name": "encoded_streams_decode_cleanly_at_the_stated_length", "event": "ok", "exec_time": 6.5737554849999995 }
+{ "type": "test", "name": "xiph_vectors_decode_like_ffmpeg", "event": "ok", "exec_time": 35.491274804 }
+{ "type": "test", "name": "onset_after_silence_has_no_pre_echo", "event": "ok", "exec_time": 40.442053255 }
+{ "type": "suite", "event": "ok", "passed": 8, "failed": 0, "ignored": 3, "measured": 0, "filtered_out": 0, "exec_time": 40.442956009 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "granule_behind_the_first_output_trims_the_head" }
+{ "type": "test", "event": "started", "name": "single_page_file_ends_at_its_granule" }
+{ "type": "test", "event": "started", "name": "whole_file_length_and_samples_match_ffmpeg" }
+{ "type": "test", "name": "granule_behind_the_first_output_trims_the_head", "event": "ok", "exec_time": 0.22437549 }
+{ "type": "test", "name": "single_page_file_ends_at_its_granule", "event": "ok", "exec_time": 0.664803641 }
+{ "type": "test", "name": "whole_file_length_and_samples_match_ffmpeg", "event": "ok", "exec_time": 2.2589646 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 2.25949089 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.0000374 }

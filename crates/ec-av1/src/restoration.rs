@@ -4,6 +4,7 @@
 //! two pixel filters (Wiener, self-guided/SGR). See `lanes/lr.report.md` for
 //! the full derivation (libaom `decodeframe.c`/`restoration.c` line refs).
 use crate::hits::hit;
+use multiversion::target::match_target;
 
 use crate::msac::SymbolDecoder;
 use ec_av1_syntax::obu::floor_log2;
@@ -504,6 +505,8 @@ pub(crate) fn read_lr(
     if !lr.uses_lr {
         return;
     }
+    // Index loop mirrors the spec's per-position form over several offsets; an iterator would obscure it.
+    #[allow(clippy::needless_range_loop)]
     for plane in 0..3 {
         let ftype = lr.frame_restoration_type[plane];
         if ftype == RestorationType::None {
@@ -800,6 +803,7 @@ fn lr_src_row<'a>(
 #[allow(clippy::too_many_arguments)]
 fn apply_wiener_stripe(
     out: &mut [u16],
+    row0: usize,
     cdef: &[u16],
     deblocked: &[u16],
     stride: usize,
@@ -917,7 +921,7 @@ fn apply_wiener_stripe(
     acc.resize(w, 0i32);
     for r in 0..h {
         crate::mc::vpass_row(&inter[r * w..], w, w, 1, &taps, &mut acc);
-        let dst = &mut out[(v_start + r) * stride + h_start..][..w];
+        let dst = &mut out[(v_start + r - row0) * stride + h_start..][..w];
         for (o, &a) in dst.iter_mut().zip(acc.iter()) {
             *o = round2(i64::from(a), round1).clamp(0, smax) as u16;
         }
@@ -1020,7 +1024,7 @@ fn compute_ab(
     let gh = h + 2;
     ab.clear();
     ab.resize(gw * gh, (0i32, 0i64));
-    let n = ((2 * r + 1) * (2 * r + 1)) as i32;
+    let n = (2 * r + 1) * (2 * r + 1);
     // lane-perf6: the box sums are separable. Summing every grid point's own
     // (2r+1)^2 window called `lr_sample` -- whose stripe-boundary test is the
     // expensive part -- (2r+1) times more often than needed; one column-sum
@@ -1161,6 +1165,8 @@ fn ab_point(a: i32, b: i32, n: i32, s: i32, bd_shift: u32, one_by_x: i64) -> (i3
 
 /// One grid row's `(A, B)` pairs: [`ab_point`] per element, eight at a time
 /// under AVX2 (the kernel is that arithmetic lane-wise, same widths).
+#[multiversion::multiversion(targets("x86_64+avx2"))]
+#[allow(clippy::too_many_arguments)]
 fn ab_row(
     a_row: &[i32],
     b_row: &[i32],
@@ -1170,19 +1176,10 @@ fn ab_row(
     one_by_x: i64,
     out: &mut [(i32, i64)],
 ) {
-    let mut done = 0usize;
-    #[cfg(target_arch = "x86_64")]
-    #[allow(unsafe_code)]
-    {
-        if matches!(crate::mc::simd_level(), crate::mc::SimdLevel::Avx2) {
-            // SAFETY: the arm is reached only when the CPU reports avx2, and
-            // the kernel touches `8 * (out.len() / 8)` elements of each of
-            // the three equally long slices.
-            done = unsafe {
-                sgr_simd::ab_row_avx2(a_row, b_row, n, s, bd_shift, one_by_x as i32, out)
-            };
-        }
-    }
+    let done = match_target! {
+        "x86_64+avx2" => sgr_simd::ab_row_avx2(a_row, b_row, n, s, bd_shift, one_by_x as i32, out),
+        _ => 0usize,
+    };
     for gj in done..out.len() {
         out[gj] = ab_point(a_row[gj], b_row[gj], n, s, bd_shift, one_by_x);
     }
@@ -1190,8 +1187,6 @@ fn ab_row(
 
 /// [`ab_row`]'s AVX2 kernel.
 #[cfg(target_arch = "x86_64")]
-#[allow(unsafe_code)]
-#[allow(unsafe_op_in_unsafe_fn)] // each kernel's whole body is its contract
 mod sgr_simd {
     use super::{SGRPROJ_MTABLE_BITS, SGRPROJ_RECIP_BITS, SGR_X_BY_XPLUS1};
     use std::arch::x86_64::*;
@@ -1199,15 +1194,14 @@ mod sgr_simd {
     /// Eight grid points of `super::ab_point` per iteration, returning how
     /// many points were written (a multiple of 8; the tail stays scalar).
     ///
-    /// # Safety
-    /// Requires AVX2. Every lane repeats the scalar arithmetic at the widths
+    /// Every lane repeats the scalar arithmetic at the widths
     /// `compute_ab` proves: `a, b >= 0` and `s > 0`, `p < 2^26`,
     /// `p * s < 2^38`, `(256 - A) * one_by_x < 2^21` and that times
     /// `b < 2^17` is `< 2^38` -- so the two 64-bit products below lose no
     /// bit, and the unsigned `mul_epu32` sees no negative operand.
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn ab_row_avx2(
+    pub fn ab_row_avx2(
         a_row: &[i32],
         b_row: &[i32],
         n: i32,
@@ -1239,12 +1233,10 @@ mod sgr_simd {
         } else {
             1 << (bd_shift - 1)
         });
-        let mut av = [0i32; 8];
-        let mut bv = [0i32; 8];
         let mut gj = 0usize;
         while gj + 8 <= len {
-            let a = _mm256_loadu_si256(a_row.as_ptr().add(gj).cast());
-            let b = _mm256_loadu_si256(b_row.as_ptr().add(gj).cast());
+            let a = bytemuck::cast::<[i32; 8], __m256i>(a_row[gj..gj + 8].try_into().unwrap());
+            let b = bytemuck::cast::<[i32; 8], __m256i>(b_row[gj..gj + 8].try_into().unwrap());
             let a_s = _mm256_srl_epi32(_mm256_add_epi32(a, rnd_a), sh_a);
             let b_s = _mm256_srl_epi32(_mm256_add_epi32(b, rnd_bd), sh_bd);
             let p = _mm256_max_epi32(
@@ -1252,11 +1244,12 @@ mod sgr_simd {
                 zero,
             );
             let z = _mm256_min_epi32(mul_shift(p, sv, rnd_z, sh_z), c255);
-            let a_val = _mm256_i32gather_epi32(SGR_X_BY_XPLUS1.as_ptr(), z, 4);
+            let zv: [i32; 8] = bytemuck::cast(z);
+            let a_val: __m256i = bytemuck::cast(zv.map(|i| SGR_X_BY_XPLUS1[i as usize]));
             let t = _mm256_mullo_epi32(_mm256_sub_epi32(c256, a_val), obx);
             let b_val = mul_shift(t, b, rnd_b, sh_b);
-            _mm256_storeu_si256(av.as_mut_ptr().cast(), a_val);
-            _mm256_storeu_si256(bv.as_mut_ptr().cast(), b_val);
+            let av: [i32; 8] = bytemuck::cast(a_val);
+            let bv: [i32; 8] = bytemuck::cast(b_val);
             for k in 0..8 {
                 out[gj + k] = (av[k], i64::from(bv[k]));
             }
@@ -1269,7 +1262,7 @@ mod sgr_simd {
     /// with the product formed in 64 bits (even and odd lanes separately,
     /// `mul_epu32`) and packed back once the shift makes it fit again.
     #[target_feature(enable = "avx2")]
-    unsafe fn mul_shift(x: __m256i, y: __m256i, rnd: __m256i, shift: __m128i) -> __m256i {
+    fn mul_shift(x: __m256i, y: __m256i, rnd: __m256i, shift: __m128i) -> __m256i {
         let ev = _mm256_mul_epu32(x, y);
         let od = _mm256_mul_epu32(_mm256_srli_epi64(x, 32), _mm256_srli_epi64(y, 32));
         let ev = _mm256_srl_epi64(_mm256_add_epi64(ev, rnd), shift);
@@ -1312,6 +1305,7 @@ fn fill_clamped_row(src: &[u16], plane_w: usize, base_col: i64, out: &mut [u16])
 #[allow(clippy::too_many_arguments)]
 fn apply_sgrproj_stripe(
     out: &mut [u16],
+    row0: usize,
     cdef: &[u16],
     deblocked: &[u16],
     stride: usize,
@@ -1472,7 +1466,8 @@ fn apply_sgrproj_stripe(
                 }
             }
             let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS).clamp(0, smax) as u16;
-            out[(v_start as i64 + i) as usize * stride + (h_start as i64 + j) as usize] = out_v;
+            out[(v_start as i64 + i - row0 as i64) as usize * stride + (h_start as i64 + j) as usize] =
+                out_v;
         }
     }
     SGR_AB_SCRATCH.with(|c| *c.borrow_mut() = (buf0, buf1));
@@ -1488,6 +1483,7 @@ fn apply_sgrproj_stripe(
 #[allow(clippy::too_many_arguments)]
 fn filter_restoration_unit(
     out: &mut [u16],
+    row0: usize,
     cdef: &[u16],
     deblocked: &[u16],
     stride: usize,
@@ -1522,6 +1518,7 @@ fn filter_restoration_unit(
         match filter {
             UnitFilter::Wiener(info) => apply_wiener_stripe(
                 out,
+                row0,
                 cdef,
                 deblocked,
                 stride,
@@ -1536,6 +1533,7 @@ fn filter_restoration_unit(
             ),
             UnitFilter::Sgrproj(info) => apply_sgrproj_stripe(
                 out,
+                row0,
                 cdef,
                 deblocked,
                 stride,
@@ -1582,10 +1580,8 @@ pub(crate) fn apply_loop_restoration_plane(
     // to be a fresh `cdef.to_vec()` per plane per frame -- a multi-megabyte
     // allocation whose every page then faulted in on first touch.
     out: &mut Vec<u16>,
-    // lane-pipefilt2: `Some((r_lo, r_hi))` restricts the call to those RU
-    // ROWS, for the pipeline, which runs loop restoration band by band
-    // behind CDEF. `out` is then the caller's, already sized, and only this
-    // range's rows are refilled from `cdef` (the rows below `plane_h` are
+    // `Some((r_lo, r_hi))` restricts the call to those RU ROWS. `out` is then
+    // the caller's, already sized, and only this range's rows are refilled from `cdef` (the rows below `plane_h` are
     // the caller's own tail copy). `None` is the whole-plane form.
     rrows: Option<(usize, usize)>,
     fctx: &crate::decode::FrameCtx,
@@ -1597,16 +1593,19 @@ pub(crate) fn apply_loop_restoration_plane(
         if rows.is_empty() {
             return;
         }
-        let so = crate::par::Shared::new(out);
-        let rbands = crate::par::bands(rows.len(), crate::par::filter_threads());
-        crate::par::run_bands(&rbands, fctx, |r_lo, r_hi, fctx| {
-            // SAFETY: this band writes only the `out` rows its own RU rows cover.
-            #[allow(unsafe_code)]
-            let out = unsafe { so.get() };
+        // Each band's RU rows write one contiguous run of `out` rows (the
+        // rows run `v_start..v_end` back to back), so a band owns its own slice.
+        let pbands: Vec<(usize, usize)> = crate::par::bands(rows.len(), crate::par::filter_threads())
+            .into_iter()
+            .map(|(a, b)| (rows[a].0 as usize, rows[b - 1].1 as usize))
+            .collect();
+        crate::par::run_bands_mut(&pbands, stride, fctx, out.as_mut_slice(), |lo, hi, mine, fctx| {
+            let r_lo = rows.partition_point(|r| (r.0 as usize) < lo);
+            let r_hi = rows.partition_point(|r| (r.0 as usize) < hi);
             for rrow in r_lo..r_hi {
                 lr_unit_row(
-                    out, cdef, deblocked, stride, plane_w, plane_h, ss_y, unit_size, grid, plane,
-                    rrow, &rows, fctx,
+                    mine, lo, cdef, deblocked, stride, plane_w, plane_h, ss_y, unit_size, grid,
+                    plane, rrow, &rows, fctx,
                 );
             }
         });
@@ -1622,8 +1621,8 @@ pub(crate) fn apply_loop_restoration_plane(
         let (a, b) = (v_start as usize * stride, v_end as usize * stride);
         out[a..b].copy_from_slice(&cdef[a..b]);
         lr_unit_row(
-            out, cdef, deblocked, stride, plane_w, plane_h, ss_y, unit_size, grid, plane, rrow,
-            &rows, fctx,
+            out, 0, cdef, deblocked, stride, plane_w, plane_h, ss_y, unit_size, grid, plane,
+            rrow, &rows, fctx,
         );
     }
 }
@@ -1670,6 +1669,7 @@ pub(crate) fn lr_unit_rows(
 #[allow(clippy::too_many_arguments)]
 fn lr_unit_row(
     out: &mut [u16],
+    row0: usize,
     cdef: &[u16],
     deblocked: &[u16],
     stride: usize,
@@ -1698,6 +1698,7 @@ fn lr_unit_row(
         if filter != UnitFilter::None {
             filter_restoration_unit(
                 out,
+                row0,
                 cdef,
                 deblocked,
                 stride,
@@ -1725,8 +1726,7 @@ mod tests {
     /// The write side these roundtrips exercise now lives beside the
     /// readers (`write_ns`/`write_subexp`/`write_unsigned_subexp_with_ref`,
     /// used by the encoder's per-unit LR syntax) instead of being a
-    /// test-only transcription of it -- one implementation, pinned here.
-
+    /// test-only transcription of it -- one implementation, pinned here.    ///
     /// `decode_subexp_msac`/`ns_msac` roundtrip every value in a handful of
     /// `(num_syms, k)` alphabets -- the shapes LR's tap ranges (`k` 1..=4,
     /// `num_syms` up to 96) actually hit, per `WIENER_TAP_MAXV`-`MINV`+1 /
@@ -1816,11 +1816,7 @@ mod tests {
                 wiener_from_taps([0, 4, 12], [0, 0, -8]),
                 wiener_from_taps([0, 0, 0], [0, 0, 0]),
             ];
-            let units: Vec<WienerInfo> = if chroma {
-                units.iter().copied().collect()
-            } else {
-                units.to_vec()
-            };
+            let units: Vec<WienerInfo> = units.to_vec();
             let mut enc = SymbolEncoder::new();
             let mut wref = WienerInfo::default();
             for u in &units {

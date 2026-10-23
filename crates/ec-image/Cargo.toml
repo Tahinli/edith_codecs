@@ -15,3 +15,4 @@ ec-inflate = { workspace = true }
 # bytes both ways and compares pixels. Running it is the point; nothing is
 # copied from it.
 image = "0.25.10"
+tracking-allocator = "0.4.0"

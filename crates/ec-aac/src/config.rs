@@ -42,6 +42,9 @@ pub struct AudioSpecificConfig {
     pub ps_present: bool,
     /// The rate SBR would output at, when signalled.
     pub extension_sample_rate: Option<u32>,
+    /// The program config element the config carries when `channel_config` is 0. Raw
+    /// blocks may then omit it, so their speaker layout comes from here.
+    pub pce: Vec<PceElement>,
 }
 
 /// Channels implied by `channelConfiguration` (ISO 14496-3 tbl 1.19).
@@ -108,6 +111,7 @@ pub fn parse_audio_specific_config(data: &[u8]) -> Result<AudioSpecificConfig> {
                 sbr_present: false,
                 ps_present: false,
                 extension_sample_rate: None,
+                pce: pce.elements,
             });
         }
         // A backward-compatible SBR signal rides in a sync extension at the end.
@@ -132,6 +136,7 @@ pub fn parse_audio_specific_config(data: &[u8]) -> Result<AudioSpecificConfig> {
         sbr_present: sbr,
         ps_present: ps,
         extension_sample_rate: ext_rate,
+        pce: Vec::new(),
     })
 }
 
@@ -174,6 +179,7 @@ pub fn audio_specific_config_bytes(sample_rate: u32, channels: u16) -> Vec<u8> {
         sbr_present: false,
         ps_present: false,
         extension_sample_rate: None,
+        pce: Vec::new(),
     })
 }
 
@@ -186,22 +192,113 @@ pub fn config_for_channels(channels: u16) -> u8 {
     }
 }
 
+/// A loudspeaker position, named as FFmpeg's channel masks name it. The derived
+/// order is the mask bit order, which is the order FFmpeg writes its output in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(clippy::upper_case_acronyms)] // FFmpeg's and ISO's own speaker names.
+pub enum Speaker {
+    FL,
+    FR,
+    FC,
+    LFE,
+    BL,
+    BR,
+    FLC,
+    FRC,
+    BC,
+    SL,
+    SR,
+}
+
+/// One element a program_config_element lists: its syntactic kind (`0` SCE, `1` CPE,
+/// `3` LFE, as in the raw data block's `id_syn_ele`), its instance tag, and the
+/// speaker of each of its channels. `speakers` is empty when the PCE's layout is
+/// one this crate does not name, and the decoder then keeps the bitstream order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PceElement {
+    pub kind: u8,
+    pub tag: u8,
+    pub speakers: Vec<Speaker>,
+}
+
 /// What a program_config_element says about the stream.
 #[derive(Clone, Debug, Default)]
 pub struct ProgramConfig {
     pub sf_index: u8,
     pub channels: u16,
+    /// The listed elements, in PCE order (front, side, back, LFE).
+    pub elements: Vec<PceElement>,
 }
 
-/// Parses a program_config_element far enough to count its channels.
+/// Names the speakers of a PCE's elements from the list each sits in.
+///
+/// Front elements run from the centre outwards: a centre SCE is FC, the outermost
+/// front pair is FL/FR, and an inner pair is FLC/FRC. Side and back pairs are SL/SR
+/// and BL/BR, a back SCE is BC, and each LFE is LFE. A layout outside those shapes
+/// (two centres, a third front pair, two side pairs, ...) names nothing, which the
+/// caller treats as an unknown layout.
+fn name_speakers(
+    front: &[(u8, u8)],
+    side: &[(u8, u8)],
+    back: &[(u8, u8)],
+    lfe: &[u8],
+) -> Option<Vec<Vec<Speaker>>> {
+    use Speaker::*;
+    let mut names: Vec<Vec<Speaker>> = Vec::new();
+    // Front, from the centre outwards: walk the list backwards so the last pair is outermost.
+    let mut front_names = vec![Vec::new(); front.len()];
+    let (mut pairs, mut centres) = (0usize, 0usize);
+    for (i, &(kind, _)) in front.iter().enumerate().rev() {
+        if kind == 1 {
+            front_names[i] = match pairs {
+                0 => vec![FL, FR],
+                1 => vec![FLC, FRC],
+                _ => return None,
+            };
+            pairs += 1;
+        } else {
+            if centres == 1 {
+                return None;
+            }
+            centres += 1;
+            front_names[i] = vec![FC];
+        }
+    }
+    names.extend(front_names);
+    let mut side_names = Vec::new();
+    for &(kind, _) in side {
+        if kind != 1 || !side_names.is_empty() {
+            return None;
+        }
+        side_names.push(vec![SL, SR]);
+    }
+    names.extend(side_names);
+    let mut back_names = Vec::new();
+    for &(kind, _) in back {
+        let next = match (kind, back_names.is_empty()) {
+            (1, true) => vec![BL, BR],
+            (0, true) => vec![BC],
+            _ => return None,
+        };
+        back_names.push(next);
+    }
+    names.extend(back_names);
+    if lfe.len() > 1 {
+        return None;
+    }
+    names.extend(lfe.iter().map(|_| vec![LFE]));
+    Some(names)
+}
+
+/// Parses a program_config_element, the channel layout a `channelConfiguration` of 0 carries.
 pub fn parse_program_config(r: &mut BitReader<'_>) -> Result<ProgramConfig> {
     let _tag = r.read_bits(4)?;
     let _object_type = r.read_bits(2)?;
     let sf_index = r.read_bits(4)? as u8;
-    let front = r.read_bits(4)? as usize;
-    let side = r.read_bits(4)? as usize;
-    let back = r.read_bits(4)? as usize;
-    let lfe = r.read_bits(2)? as usize;
+    let front_n = r.read_bits(4)? as usize;
+    let side_n = r.read_bits(4)? as usize;
+    let back_n = r.read_bits(4)? as usize;
+    let lfe_n = r.read_bits(2)? as usize;
     let assoc = r.read_bits(3)? as usize;
     let cc = r.read_bits(4)? as usize;
     if r.read_bit()? {
@@ -214,12 +311,28 @@ pub fn parse_program_config(r: &mut BitReader<'_>) -> Result<ProgramConfig> {
         let _matrix_mixdown = r.read_bits(3)?;
     }
     let mut channels = 0u16;
-    for _ in 0..front + side + back {
-        channels += if r.read_bit()? { 2 } else { 1 };
-        let _tag = r.read_bits(4)?;
+    let read_cpe_tag = |r: &mut BitReader<'_>| -> Result<(u8, u8)> {
+        let cpe = r.read_bit()?;
+        let tag = r.read_bits(4)? as u8;
+        Ok((u8::from(cpe), tag))
+    };
+    let mut front = Vec::with_capacity(front_n);
+    for _ in 0..front_n {
+        front.push(read_cpe_tag(r)?);
     }
-    channels += lfe as u16;
-    for _ in 0..lfe + assoc {
+    let mut side = Vec::with_capacity(side_n);
+    for _ in 0..side_n {
+        side.push(read_cpe_tag(r)?);
+    }
+    let mut back = Vec::with_capacity(back_n);
+    for _ in 0..back_n {
+        back.push(read_cpe_tag(r)?);
+    }
+    let mut lfe = Vec::with_capacity(lfe_n);
+    for _ in 0..lfe_n {
+        lfe.push(r.read_bits(4)? as u8);
+    }
+    for _ in 0..assoc {
         let _tag = r.read_bits(4)?;
     }
     for _ in 0..cc {
@@ -229,11 +342,31 @@ pub fn parse_program_config(r: &mut BitReader<'_>) -> Result<ProgramConfig> {
     r.align_to_byte();
     let comment = r.read_bits(8)? as u64;
     r.skip_bits(comment * 8)?;
-    Ok(ProgramConfig { sf_index, channels })
-}
 
-pub(crate) fn skip_program_config(r: &mut BitReader<'_>) -> Result<()> {
-    parse_program_config(r).map(|_| ())
+    for &(kind, _) in front.iter().chain(&side).chain(&back) {
+        channels += if kind == 1 { 2 } else { 1 };
+    }
+    channels += lfe.len() as u16;
+
+    // Speakers come back in the listing order (front, side, back, LFE), one entry per element.
+    let named = name_speakers(&front, &side, &back, &lfe).unwrap_or_default();
+    let listed = front
+        .iter()
+        .chain(&side)
+        .chain(&back)
+        .map(|&(kind, tag)| (kind, tag))
+        .chain(lfe.iter().map(|&tag| (3, tag)));
+    let mut elements = Vec::new();
+    for (i, (kind, tag)) in listed.enumerate() {
+        // An unnamed layout leaves `named` short, so every element then reads as unknown.
+        let speakers = named.get(i).cloned().unwrap_or_default();
+        elements.push(PceElement { kind, tag, speakers });
+    }
+    Ok(ProgramConfig {
+        sf_index,
+        channels,
+        elements,
+    })
 }
 
 /// An ADTS frame header (§1.A.2.2).
@@ -343,6 +476,7 @@ mod tests {
             sbr_present: true,
             ps_present: false,
             extension_sample_rate: Some(44100),
+            pce: Vec::new(),
         };
         let bytes = write_audio_specific_config(&cfg);
         let parsed = parse_audio_specific_config(&bytes).expect("parses");

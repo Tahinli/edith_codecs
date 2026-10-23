@@ -1,0 +1,31 @@
+[package]
+name = "ec-vp8-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-vp8]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_ivf"
+path = "fuzz_targets/decode_ivf.rs"
+test = false
+doc = false
+bench = false

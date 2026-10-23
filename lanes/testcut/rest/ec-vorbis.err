@@ -1,0 +1,6 @@
+   Compiling ec-vorbis v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-vorbis)
+    Finished `release` profile [optimized] target(s) in 5.28s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_vorbis-f3a8b2e262bf6ff5)
+     Running tests/oracle.rs (/home/user/.cache/tgt-testcut-rest/release/deps/oracle-3cf7928a5eb91553)
+     Running tests/trim.rs (/home/user/.cache/tgt-testcut-rest/release/deps/trim-d5e1b7522d1e7ea1)
+   Doc-tests ec_vorbis

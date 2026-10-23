@@ -1,0 +1,7 @@
+   Compiling ec-mp3 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-mp3)
+    Finished `release` profile [optimized] target(s) in 8.22s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_mp3-f28222f10edddfe8)
+     Running tests/decode_matrix.rs (/home/user/.cache/tgt-testcut-rest/release/deps/decode_matrix-5398c67bbaedbfbf)
+     Running tests/encode_matrix.rs (/home/user/.cache/tgt-testcut-rest/release/deps/encode_matrix-25f355178d6da4ab)
+     Running tests/mp2_matrix.rs (/home/user/.cache/tgt-testcut-rest/release/deps/mp2_matrix-ad7a18b2be4b52dd)
+   Doc-tests ec_mp3

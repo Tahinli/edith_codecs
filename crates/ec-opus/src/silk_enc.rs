@@ -619,22 +619,20 @@ pub(crate) fn estimate_pitch(
     // lane opus-silkq r1); kept off.
     const ENABLE_PITCH_CONTINUITY: bool = false;
     let mut best_lag = best_lag;
-    if ENABLE_PITCH_CONTINUITY {
-        if let Some(pl) = prior_lag {
-            let pl = pl as usize;
-            if pl >= min_lag && pl <= max_lag && best_lag.abs_diff(pl) > dec {
-                let p_lo = pl.saturating_sub(dec).max(min_lag);
-                let p_hi = (pl + dec).min(max_lag);
-                let p_scores: Vec<f32> = (p_lo..=p_hi).map(|lag| ncc(frame, lag)).collect();
-                let p_best = p_scores.iter().cloned().fold(f32::MIN, f32::max);
-                if p_best >= 0.85 * best_score {
-                    best_lag = (p_lo..=p_hi)
-                        .zip(p_scores.iter())
-                        .find(|&(_, &s)| s >= 0.85 * p_best)
-                        .map(|(lag, _)| lag)
-                        .unwrap_or(pl);
-                    best_score = p_best;
-                }
+    if ENABLE_PITCH_CONTINUITY && let Some(pl) = prior_lag {
+        let pl = pl as usize;
+        if pl >= min_lag && pl <= max_lag && best_lag.abs_diff(pl) > dec {
+            let p_lo = pl.saturating_sub(dec).max(min_lag);
+            let p_hi = (pl + dec).min(max_lag);
+            let p_scores: Vec<f32> = (p_lo..=p_hi).map(|lag| ncc(frame, lag)).collect();
+            let p_best = p_scores.iter().cloned().fold(f32::MIN, f32::max);
+            if p_best >= 0.85 * best_score {
+                best_lag = (p_lo..=p_hi)
+                    .zip(p_scores.iter())
+                    .find(|&(_, &s)| s >= 0.85 * p_best)
+                    .map(|(lag, _)| lag)
+                    .unwrap_or(pl);
+                best_score = p_best;
             }
         }
     }

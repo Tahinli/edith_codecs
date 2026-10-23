@@ -1,0 +1,35 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling rustversion v1.0.23
+   Compiling safe_unaligned_simd v0.2.5
+   Compiling syn v3.0.9
+   Compiling archmage-macros v0.9.31-beta.1
+   Compiling multiversion-macros v0.9.1
+   Compiling multiversion v0.9.1
+   Compiling archmage v0.9.31-beta.1
+   Compiling ec-h265 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-h265)
+    Finished `release` profile [optimized] target(s) in 37.33s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_h265-a695a68e94ba6440)
+     Running tests/conformance.rs (/home/user/.cache/tgt-testcut-rest/release/deps/conformance-0523abbc708642b8)
+     Running tests/conformance_intra.rs (/home/user/.cache/tgt-testcut-rest/release/deps/conformance_intra-a556a69aaf063c9d)
+     Running tests/conformance_rext.rs (/home/user/.cache/tgt-testcut-rest/release/deps/conformance_rext-21e16586a23ac8c3)
+     Running tests/conformance_rext422.rs (/home/user/.cache/tgt-testcut-rest/release/deps/conformance_rext422-1e5fa6fbe2dcbc54)
+     Running tests/cu_syntax.rs (/home/user/.cache/tgt-testcut-rest/release/deps/cu_syntax-799a762252660d20)
+     Running tests/dec_meta.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dec_meta-6d35c30b17bbbaa2)
+     Running tests/dec_shell.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dec_shell-945f9d77ec633806)
+     Running tests/decode.rs (/home/user/.cache/tgt-testcut-rest/release/deps/decode-e46f9000f9a11426)
+     Running tests/dolby_vision_p8.rs (/home/user/.cache/tgt-testcut-rest/release/deps/dolby_vision_p8-08f4ccb46264fa73)
+     Running tests/enc8_bitstream_hash.rs (/home/user/.cache/tgt-testcut-rest/release/deps/enc8_bitstream_hash-453fd0e1a9b9028b)
+     Running tests/encode.rs (/home/user/.cache/tgt-testcut-rest/release/deps/encode-556edc6cbca28fc9)
+     Running tests/encode_threads.rs (/home/user/.cache/tgt-testcut-rest/release/deps/encode_threads-f84e6f979282f34e)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-ff5992d0bd552e33)
+     Running tests/main10.rs (/home/user/.cache/tgt-testcut-rest/release/deps/main10-8bf887fe62347489)
+     Running tests/perf.rs (/home/user/.cache/tgt-testcut-rest/release/deps/perf-2c0648b245df39f5)
+     Running tests/rate_control.rs (/home/user/.cache/tgt-testcut-rest/release/deps/rate_control-2542e39492f12d31)
+     Running tests/rdoq_cache_hash.rs (/home/user/.cache/tgt-testcut-rest/release/deps/rdoq_cache_hash-a1d5429607f36760)
+     Running tests/real_library.rs (/home/user/.cache/tgt-testcut-rest/release/deps/real_library-e8879efba116c05c)
+     Running tests/refusals.rs (/home/user/.cache/tgt-testcut-rest/release/deps/refusals-39d5894555e0e670)
+     Running tests/rext_generated.rs (/home/user/.cache/tgt-testcut-rest/release/deps/rext_generated-26a8689f9acb2f19)
+     Running tests/scaling_lists.rs (/home/user/.cache/tgt-testcut-rest/release/deps/scaling_lists-e7d6307c993f5331)
+   Doc-tests ec_h265

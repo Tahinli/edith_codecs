@@ -36,6 +36,9 @@ impl Rng {
 
 fn reference_sps() -> Sps {
     Sps {
+        max_latency_increase_plus1: 0,
+        extension_flags: 0,
+        range: Default::default(),
         vps_id: 0,
         id: 0,
         chroma_format_idc: 1,
@@ -60,6 +63,7 @@ fn reference_sps() -> Sps {
         max_transform_hierarchy_depth_inter: 0,
         max_transform_hierarchy_depth_intra: 0,
         scaling_list_enabled: false,
+        scaling_list: None,
         amp_enabled: false,
         sao_enabled: true,
         pcm_enabled: false,

@@ -545,7 +545,7 @@ mod tests {
     /// CALL is what a helper-delegating gate needs: its flags live in the
     /// helper it calls, and it is invisible to a spelling-only filter.
     fn gate_bodies() -> Vec<&'static str> {
-        let src = include_str!("stream.rs");
+        let src = crate::test_source::module_source("stream");
         let enc = encoder_fns(src);
         let gates: Vec<&str> = src
             .split("\n    #[")
@@ -644,13 +644,11 @@ mod tests {
                     break;
                 };
                 let literal = &t[start..start + end];
-                if literal.len() == 1 {
-                    if let Some(c) = literal.chars().next() {
-                        if c.is_ascii_digit() {
+                if literal.len() == 1
+                    && let Some(c) = literal.chars().next()
+                        && c.is_ascii_digit() {
                             out.insert(c);
                         }
-                    }
-                }
                 at = start + end + 1;
             }
             out
@@ -694,7 +692,7 @@ mod tests {
         };
         // Split a comma-separated list at TOP level only, so `("1", 8u8)`
         // stays one element.
-        fn split_top<'a>(t: &'a str) -> Vec<&'a str> {
+        fn split_top(t: &str) -> Vec<&str> {
             let mut out = Vec::new();
             let (mut depth, mut start) = (0i32, 0usize);
             for (i, c) in t.char_indices() {
@@ -853,11 +851,10 @@ mod tests {
             let head = &body[at..];
             if let Some(close) = head.find(')') {
                 let pattern = &head["for (".len()..close];
-                if let Some(pos) = pattern.split(',').position(|p| p.trim() == var) {
-                    if let Some(set) = named_column(pos) {
+                if let Some(pos) = pattern.split(',').position(|p| p.trim() == var)
+                    && let Some(set) = named_column(pos) {
                         merge(set);
                     }
-                }
             }
         }
         // (4) `u8::from(<a>.<field>)` over a struct-literal arm table.
@@ -900,11 +897,10 @@ mod tests {
         for (i, _) in gate.match_indices(&literal) {
             let rest = &gate[i + literal.len()..];
             let Some(end) = rest.find('"') else { continue };
-            if let Some(c) = rest[..end].chars().next() {
-                if c.is_ascii_digit() {
+            if let Some(c) = rest[..end].chars().next()
+                && c.is_ascii_digit() {
                     out.insert(c);
                 }
-            }
         }
         // A template `format!("--<spelling>={<var>}")`: the placeholder name
         // is the part between the braces, and its VALUE is whatever the
@@ -1073,7 +1069,7 @@ mod tests {
     /// old spelling-only filter.
     #[test]
     fn the_detector_sees_the_gates_the_spelling_filter_missed() {
-        let src = include_str!("stream.rs");
+        let src = crate::test_source::module_source("stream");
         let gates = gate_bodies();
         // The helper-delegation half: each of these builds its stream through
         // `inter_sb_none_gate` and spells none of `legacy_gate_tokens`, so the
@@ -1395,7 +1391,12 @@ mod tests {
                 } else {
                     ""
                 };
-                let helper = if gate.contains(&format!("format!(\"--{TOOL}=")) && values.is_empty()
+                // A segment that does not open at a `#[test]` is glued non-test helper
+                // text from a split module (the support helpers have no attribute between
+                // them), so its `format!` parameter is not a gate's own value.
+                let helper = if gate.starts_with("test]")
+                    && gate.contains(&format!("format!(\"--{TOOL}="))
+                    && values.is_empty()
                 {
                     " [UNRESOLVED: variable is a shared helper's parameter]"
                 } else {
@@ -1551,8 +1552,8 @@ mod tests {
     ///      is where the assert-last and the env escape live, and
     ///   2. inside an `assert!` (the deliberate hard-failure form), or
     ///   3. in a comment, which cannot execute.
-    /// Anything else is a skip with no env escape, and the test fails naming
-    /// the exact `file:line`.
+    ///      Anything else is a skip with no env escape, and the test fails naming
+    ///      the exact `file:line`.
     ///
     /// THE FLOOR. A source scan that matches nothing is the false-pass shape
     /// this crate has been bitten by twice (a `format!` brace escape, and
@@ -1581,9 +1582,9 @@ mod tests {
             "affine_aomenc_path().is_file()",
         ];
         let files: [(&str, &str); 3] = [
-            ("stream.rs", include_str!("stream.rs")),
-            ("decode.rs", include_str!("decode.rs")),
-            ("encode.rs", include_str!("encode.rs")),
+            ("stream.rs", crate::test_source::module_source("stream")),
+            ("decode.rs", crate::test_source::module_source("decode")),
+            ("encode.rs", crate::test_source::module_source("encode")),
         ];
 
         // The line range each probe body owns: from its opener to the first
@@ -1731,17 +1732,15 @@ mod pin_inventory {
         let mut cur: Option<(String, usize)> = None;
         for (i, line) in src.lines().enumerate() {
             let t = line.trim_start();
-            if let Some(rest) = t.strip_prefix("fn ") {
-                if let Some(name) = rest.split('(').next() {
-                    if !name.contains(' ') {
+            if let Some(rest) = t.strip_prefix("fn ")
+                && let Some(name) = rest.split('(').next()
+                    && !name.contains(' ') {
                         cur = Some((name.to_string(), i));
                     }
-                }
-            }
             // A `#[test]`/`#[ignore]` line is never a closing brace, so the fn
             // ends at the first line that is exactly four-space `}`.
-            if let Some((name, start)) = &cur {
-                if i > *start && line == "    }" {
+            if let Some((name, start)) = &cur
+                && i > *start && line == "    }" {
                     let body = src
                         .lines()
                         .skip(*start)
@@ -1751,7 +1750,6 @@ mod pin_inventory {
                     out.push((name.clone(), &*Box::leak(body.into_boxed_str())));
                     cur = None;
                 }
-            }
         }
         out
     }
@@ -1990,7 +1988,7 @@ mod pin_inventory_tests {
     /// the check the r3 manifest could not express.
     #[test]
     fn every_pin_a_gate_reads_is_committed_under_the_crate() {
-        let src = include_str!("stream.rs");
+        let src = crate::test_source::module_source("stream");
         let reads = pins_read(src);
         assert!(
             reads.len() >= 20,
@@ -2100,8 +2098,7 @@ mod count_vacuity {
     /// the scan does not have (class: unexercised matcher in a source
     /// scanner). [`count_vacuity_tests::every_scanner_matcher_fires_on_a_known_site`]
     /// iterates THESE arrays, so a matcher cannot be added here without a
-    /// positive control that has to pass.
-
+    /// positive control that has to pass.    ///
     /// Oracle call spellings whose LAST argument is a locally derived count.
     /// `ffmpeg_decode_sequence_444(` fires on five real `stream.rs` gates
     /// (stream.rs:7030/7545/7735/8439/11643) but yields no count-vacuity SITE,
@@ -2285,14 +2282,12 @@ mod count_vacuity {
         let mut fn_start = 0usize;
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim_start();
-            if let Some(rest) = t.strip_prefix("fn ") {
-                if let Some(n) = rest.split('(').next() {
-                    if !n.contains(' ') {
+            if let Some(rest) = t.strip_prefix("fn ")
+                && let Some(n) = rest.split('(').next()
+                    && !n.contains(' ') {
                         gate = n.to_string();
                         fn_start = offsets[i];
                     }
-                }
-            }
             // A DOC COMMENT is prose about code, not code. One row in the ledger
             // was a `///` line quoting a gate's pre-fix body (`stream.rs:30924`,
             // inside `pinned_lr_sgr_stream_call_unique_dump`) and the sweep
@@ -2485,7 +2480,7 @@ mod count_vacuity {
     /// "fires" means fires on the slice the guard actually reads.
     #[test]
     fn every_scanner_matcher_fires_on_a_known_site() {
-        let src = include_str!("stream.rs");
+        let src = crate::test_source::module_source("stream");
         let lines: Vec<&str> = src.lines().collect();
         let fns = fn_slices(src);
 
@@ -2580,7 +2575,7 @@ mod count_vacuity_tests {
     /// silently stop finding sites. Measured count is well above this.
     #[test]
     fn the_count_vacuity_sweep_finds_the_known_sites() {
-        let src = include_str!("stream.rs");
+        let src = crate::test_source::module_source("stream");
         let s = sites(src);
         assert!(
             s.len() >= 40,
@@ -2641,8 +2636,11 @@ mod count_vacuity_tests {
         // reds with "1 unpinned count site(s), ceiling is 0".
         const UNPINNED_CEILING: usize = 0;
         let unpinned = s.iter().filter(|x| x.pinned_by.is_none()).count();
+        // The ceiling is deliberately 0 today; it stays a ceiling so a site can be grandfathered by raising it.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        let within_ceiling = unpinned <= UNPINNED_CEILING;
         assert!(
-            unpinned <= UNPINNED_CEILING,
+            within_ceiling,
             "{unpinned} unpinned count site(s), ceiling is {UNPINNED_CEILING} -- a new one \
              was added (lower the ceiling only when a site is actually fixed)"
         );
@@ -2660,7 +2658,7 @@ mod count_vacuity_tests {
     /// change dressed as a fix.
     #[test]
     fn every_locally_derived_oracle_count_is_reported() {
-        let src = include_str!("stream.rs");
+        let src = crate::test_source::module_source("stream");
         let s = sites(src);
         let unpinned: Vec<String> = s
             .iter()

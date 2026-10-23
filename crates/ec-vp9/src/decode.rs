@@ -13,6 +13,7 @@
 //! pretending to decode. Odd coded extents are supported: chroma stores and
 //! crops at `(w + ss_x) >> ss_x` (`uv_crop_width`), matching libvpx.
 
+use crate::adapt::{adapt_coef_probs, adapt_mode_probs, adapt_mv_probs, COEF_MAX_UPDATE_FACTOR, COEF_MAX_UPDATE_FACTOR_AFTER_KEY};
 use crate::header::{FrameContext, read_compressed_header};
 use crate::intra::build_intra_predictors;
 use crate::loopfilter::LfGrids;
@@ -21,10 +22,22 @@ use crate::modes::{MiInfo, MiState, read_intra_frame_mode_info};
 use crate::tables::*;
 use crate::tokens::{PlaneContexts, decode_coefs, scan_for};
 use crate::transform::inverse_transform_add;
+use crate::tables::{ensure, corrupt};
 use crate::{Error, Result, Sample};
 use ec_vp9_syntax::{FrameHeader, FrameType, Vp9Parser, superframe};
 
 const SB_MI: usize = 8; // a 64x64 superblock in mi (8x8) units
+
+/// The compressed-header bytes of `frame`. Both sizes come from the input, so
+/// a header that names bytes past the end of the frame is a corrupt-stream
+/// error, not a slice panic.
+fn compressed_header_slice<'a>(frame: &'a [u8], hdr: &FrameHeader) -> Result<&'a [u8]> {
+    let start = hdr.uncompressed_header_size as usize;
+    let end = start + hdr.header_size_in_bytes as usize;
+    frame
+        .get(start..end)
+        .ok_or_else(|| corrupt("compressed header runs past the frame"))
+}
 
 /// A decoded, displayable frame: cropped contiguous planes.
 #[derive(Clone, Debug)]
@@ -73,6 +86,10 @@ struct Planes {
     ss_y: usize,
 }
 
+/// VP9 level 6.2 caps a picture at 8192x4352 luma samples. Larger frame headers are refused
+/// before any picture or mode-info buffer is sized from them (fuzz regression: a 24580-wide key frame).
+const MAX_LUMA_SAMPLES: u64 = 8192 * 4352;
+
 impl Planes {
     /// A frame scratch at the 64-multiple ALIGNED extent, filled with the
     /// neutral grey `1 << (bd - 1)` (`128` at 8-bit, `512` at 10-bit). The
@@ -95,6 +112,20 @@ impl Planes {
             ss_x,
             ss_y,
         }
+    }
+
+    /// Whether this buffer has the geometry and depth a frame of this size needs.
+    fn fits(&self, aw: usize, ah: usize, bd: u8, ss_x: usize, ss_y: usize) -> bool {
+        self.aw == aw && self.ah == ah && self.bd == bd && self.ss_x == ss_x && self.ss_y == ss_y
+    }
+
+    /// Set every sample back to the neutral grey `new` starts from, so a recycled
+    /// buffer is indistinguishable from a fresh one.
+    fn refill(&mut self) {
+        let fill = 1u16 << (self.bd - 1);
+        self.y.fill(fill);
+        self.u.fill(fill);
+        self.v.fill(fill);
     }
 
     /// Immutable plane + stride (the predictor reads references).
@@ -135,6 +166,9 @@ pub struct Decoder {
     refs: [Option<RefFrame>; 8],
     /// Frame scratch, live only inside `decode_keyframe`.
     planes: Option<Planes>,
+    /// Frame buffers no longer referenced, kept for reuse so a frame does not
+    /// allocate (and page-fault) its planes afresh.
+    spare: Vec<Planes>,
     /// The four stored frame contexts (spec 6.2 `frame_context_idx`).
     ///
     /// Boxed because a `FrameContext` is 2039 bytes and four of them inline
@@ -162,6 +196,17 @@ pub struct Decoder {
     /// The `vpx_convolve8` stride-64 intermediate plus the second scratch its
     /// averaging variant needs.
     mc_temp: Vec<Sample>,
+    /// Tile-column workers per frame. Set by `EC_VP9_THREADS` when that is a
+    /// positive integer (clamped to 1..=64); otherwise `default_threads()`.
+    threads: usize,
+}
+
+/// Default tile-column worker count when `EC_VP9_THREADS` is unset or invalid:
+/// the host's available parallelism, capped at 6 (the measured knee for 1080p
+/// tile streams; see `lanes/vp9speed.report.md`). Falls back to 1 if the
+/// parallelism cannot be determined.
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).min(6)
 }
 
 /// One DPB slot: a decoded frame buffer at its ALIGNED (64-multiple) extent
@@ -216,6 +261,7 @@ impl Decoder {
             ctx: Box::new(FrameContext::new(true)),
             refs: [const { None }; 8],
             planes: None,
+            spare: Vec::new(),
             frame_ctxs: {
                 let d = FrameContext::new(false);
                 Box::new([d.clone(), d.clone(), d.clone(), d])
@@ -229,6 +275,11 @@ impl Decoder {
             syntax_blocks: 0,
             mc_scratch: Vec::new(),
             mc_temp: vec![0; 64 * 135 + 64 * 64],
+            threads: std::env::var("EC_VP9_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .map_or_else(default_threads, |n| n.clamp(1, 64)),
         }
     }
 
@@ -265,10 +316,19 @@ impl Decoder {
                 "this lane decodes 8-, 10- and 12-bit only",
             ));
         }
+        if u64::from(hdr.width) * u64::from(hdr.height) > MAX_LUMA_SAMPLES {
+            return Err(Error::unsupported(
+                format!("vp9 frame {}x{}", hdr.width, hdr.height),
+                "this lane decodes up to VP9 level 6.2 (8192x4352 luma samples)",
+            ));
+        }
         // One index per decoded frame (the dumps' `frame=` field), so this
         // path and `decode_syntax` label the same frame the same way.
         let index = self.decode_index;
         self.decode_index += 1;
+        if crate::trace_enabled() {
+            eprintln!("B FRAME x FRAME x");
+        }
         if hdr.frame_type == FrameType::Key {
             return self.decode_key_frame(&hdr, frame);
         }
@@ -287,8 +347,8 @@ impl Decoder {
         // (libvpx `get_partition_probs`), which our `new(true)` models on the
         // active copy only.
         let d = FrameContext::new(false);
-        self.frame_ctxs = Box::new([d.clone(), d.clone(), d.clone(), d]);
-        self.ctx = Box::new(FrameContext::new(true));
+        *self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
+        *self.ctx = FrameContext::new(true);
         self.prev_mvs.clear();
         self.prev_seg.clear();
         self.last = LastFrameFacts {
@@ -310,9 +370,8 @@ impl Decoder {
             }
             h
         };
-        let hdr_start = hdr.uncompressed_header_size as usize;
         let ch = read_compressed_header(
-            &frame[hdr_start..hdr_start + hdr.header_size_in_bytes as usize],
+            compressed_header_slice(frame, &hdr)?,
             &mut self.ctx,
             &hdr,
         )?;
@@ -359,7 +418,7 @@ impl Decoder {
         let hdr = hdr.clone();
         if hdr.error_resilient_mode || hdr.reset_frame_context == 3 {
             let d = FrameContext::new(false);
-            self.frame_ctxs = Box::new([d.clone(), d.clone(), d.clone(), d]);
+            *self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
         } else if hdr.reset_frame_context == 2 {
             self.frame_ctxs[0] = FrameContext::new(false);
         }
@@ -367,7 +426,7 @@ impl Decoder {
         let mut ctx = self.frame_ctxs[0].clone();
         let stored_partition = ctx.partition;
         ctx.use_key_partition();
-        self.ctx = Box::new(ctx);
+        *self.ctx = ctx;
         self.prev_seg.clear();
         self.prev_mvs.clear();
         self.last = LastFrameFacts {
@@ -377,9 +436,8 @@ impl Decoder {
             show_frame: hdr.show_frame,
             key: false,
         };
-        let hdr_start = hdr.uncompressed_header_size as usize;
         let ch = read_compressed_header(
-            &frame[hdr_start..hdr_start + hdr.header_size_in_bytes as usize],
+            compressed_header_slice(frame, &hdr)?,
             &mut self.ctx,
             &hdr,
         )?;
@@ -398,7 +456,8 @@ impl Decoder {
         };
         for slot in 0..8 {
             if hdr.refresh_frame_flags & (1 << slot) != 0 {
-                self.refs[slot] = Some(frame.clone());
+                let old = self.refs[slot].replace(frame.clone());
+                self.recycle(old);
             }
         }
         Ok(if hdr.show_frame { Some(pic) } else { None })
@@ -419,6 +478,12 @@ impl Decoder {
                 return Err(Error::unsupported(
                     format!("vp9 bit depth {}", hdr.bit_depth),
                     "this lane decodes 8-, 10- and 12-bit only",
+                ));
+            }
+            if u64::from(hdr.width) * u64::from(hdr.height) > MAX_LUMA_SAMPLES {
+                return Err(Error::unsupported(
+                    format!("vp9 frame {}x{}", hdr.width, hdr.height),
+                    "this lane decodes up to VP9 level 6.2 (8192x4352 luma samples)",
                 ));
             }
             if hdr.frame_type == FrameType::Key {
@@ -458,11 +523,11 @@ impl Decoder {
         // "reset after this frame" and takes no action at frame start.
         if hdr.reset_frame_context == 3 {
             let d = FrameContext::new(false);
-            self.frame_ctxs = Box::new([d.clone(), d.clone(), d.clone(), d]);
+            *self.frame_ctxs = [d.clone(), d.clone(), d.clone(), d];
         } else if hdr.reset_frame_context == 2 {
             self.frame_ctxs[hdr.frame_context_idx as usize] = FrameContext::new(false);
         }
-        self.ctx = Box::new(self.frame_ctxs[hdr.frame_context_idx as usize].clone());
+        *self.ctx = self.frame_ctxs[hdr.frame_context_idx as usize].clone();
 
         // Reference slots (spec 7.2): `ref_frame_idx[i]` names the slot LAST,
         // GOLDEN and ALTREF use. libvpx validates every named reference's
@@ -485,7 +550,7 @@ impl Decoder {
             let height = hdr.height as usize;
             let aw = width.div_ceil(64) * 64;
             let ah = height.div_ceil(64) * 64;
-            self.planes = Some(Planes::new(aw, ah, hdr.bit_depth, ss_x, ss_y));
+            self.planes = Some(self.frame_planes(aw, ah, hdr.bit_depth, ss_x, ss_y));
         }
 
         let hdr_start = hdr.uncompressed_header_size as usize;
@@ -493,7 +558,7 @@ impl Decoder {
             eprintln!("CHSTART frame={index}");
         }
         let ch = read_compressed_header(
-            &frame[hdr_start..hdr_start + hdr.header_size_in_bytes as usize],
+            compressed_header_slice(frame, hdr)?,
             &mut self.ctx,
             hdr,
         )?;
@@ -532,11 +597,16 @@ impl Decoder {
 
         let mi_cols = hdr.mi_cols() as usize;
         let mi_rows = hdr.mi_rows() as usize;
-        let sb64_cols = mi_cols.div_ceil(SB_MI);
-        let sb64_rows = mi_rows.div_ceil(SB_MI);
         let tile_cols = 1usize << hdr.tile_info.cols_log2;
         let tile_rows = 1usize << hdr.tile_info.rows_log2;
 
+        // The previous frame's segment map only predicts from a frame of the same
+        // mode-info size; a resized frame reads it as all zeros (libvpx
+        // reallocates the map zeroed when the size changes).
+        // `vp9_setup_past_independence` (error-resilient frames) also zeroes it.
+        if hdr.error_resilient_mode || self.prev_seg.len() != mi_cols * mi_rows {
+            self.prev_seg.clear();
+        }
         self.iw = Some(InterWalk {
             ifs,
             sign_bias,
@@ -550,92 +620,44 @@ impl Decoder {
             blocks: 0,
         });
 
-        let mut data: &[u8] = &frame[hdr_start + hdr.header_size_in_bytes as usize..];
-        let mut tiles: Vec<&[u8]> = Vec::with_capacity(tile_cols * tile_rows);
-        for tr in 0..tile_rows {
-            for tc in 0..tile_cols {
-                let last = tr == tile_rows - 1 && tc == tile_cols - 1;
-                if last {
-                    tiles.push(data);
-                } else {
-                    ensure(data.len() >= 4, "truncated tile size")?;
-                    let sz = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
-                    data = &data[4..];
-                    ensure(data.len() >= sz, "truncated tile data")?;
-                    tiles.push(&data[..sz]);
-                    data = &data[sz..];
-                }
-            }
-        }
-
+        let data: &[u8] = frame
+            .get(hdr_start + hdr.header_size_in_bytes as usize..)
+            .ok_or_else(|| corrupt("tile data starts past the frame"))?;
+        let tiles = split_tiles(data, tile_cols, tile_rows)?;
+        let job = TileJob {
+            hdr,
+            tx_mode: ch.tx_mode,
+            pixels,
+            level_of_seg: [[0u8; 2]; 8],
+            tiles: &tiles,
+        };
         // The loop-filter grids are only written when pixels are built, but
         // the walk's signature carries them.
-        let mut grids = LfGrids {
-            level8: vec![0; mi_cols * mi_rows],
-            blk: vec![(0u8, 0u32, 0u32); mi_cols * mi_rows],
-            otx: vec![0; mi_cols * mi_rows],
-            skip_inter: vec![false; mi_cols * mi_rows],
-            mi_cols,
-            mi_rows,
-        };
-        // `above_context` / `above_seg_context` and the mi grid are
-        // FRAME-scoped in libvpx (memset once per frame before the tile loop,
-        // `vp9_decodeframe.c:2079-2083`; indexed by absolute mi_row/mi_col by
-        // `set_skip_context`). Tile rows are disjoint in COLUMN only, so a
-        // tile row k > 0 reads above state written by tile row k - 1 — the
-        // same invariant the keyframe path documents. `above_context` is
-        // sized by `mi_cols_aligned_to_sb`: a TX_32X32 block indexes up to 8
-        // 4x4 units past the last mi col.
-        let aligned_cols = mi_cols.div_ceil(SB_MI) * SB_MI;
-        let mut ectx = [
-            PlaneContexts::new(aligned_cols * 2),
-            PlaneContexts::new(aligned_cols * 2),
-            PlaneContexts::new(aligned_cols * 2),
-        ];
-        ectx.iter_mut().for_each(|p| p.above.fill(0));
-        let mut mi = MiState::new(mi_cols, mi_rows);
-        mi.above_seg.fill(0);
-        let mut ti = 0usize;
-        for tr in 0..tile_rows {
-            let row_lo = ((sb64_rows * tr) >> hdr.tile_info.rows_log2) * SB_MI;
-            let row_hi = (((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2) * SB_MI).min(mi_rows);
-            for tc in 0..tile_cols {
-                let col_lo = ((sb64_cols * tc) >> hdr.tile_info.cols_log2) * SB_MI;
-                let col_hi =
-                    (((sb64_cols * (tc + 1)) >> hdr.tile_info.cols_log2) * SB_MI).min(mi_cols);
-                if let Some(w) = self.iw.as_mut() {
-                    w.tile_col_end = col_hi;
-                }
-                if crate::trace_enabled() {
-                    eprintln!("TILE {} bytes frame={index}", tiles[ti].len());
-                }
-                let mut r = crate::bool::BoolDecoder::new(tiles[ti])?;
-                ti += 1;
-                for sb_row in (row_lo..row_hi).step_by(SB_MI) {
-                    // Left entropy/partition contexts are zeroed at the start
-                    // of every superblock row (the SB row's left edge has no
-                    // neighbours); the above contexts stay frame-scoped.
-                    ectx.iter_mut().for_each(|p| p.left = [0; 32]);
-                    mi.left_seg = [0; 32];
-                    for sb_col in (col_lo..col_hi).step_by(SB_MI) {
-                        self.decode_partition(
-                            &mut r,
-                            &mut mi,
-                            &mut ectx,
-                            &mut grids,
-                            &[[0u8; 2]; 8],
-                            hdr,
-                            sb_row,
-                            sb_col,
-                            4,
-                            col_lo,
-                            ch.tx_mode,
-                            pixels,
-                        )?;
-                    }
-                }
-                ensure(r.overreads() == 0, "tile bool decoder desync")?;
-            }
+        let mut grids = new_grids(mi_cols, mi_rows);
+        let mut counts = crate::adapt::Counts::default();
+        let t_walk = crate::prof::start();
+        self.walk_frame(&job, &mut grids, &mut counts)?;
+        crate::prof::stop(crate::prof::Phase::Walk, t_walk);
+
+        // Backward adaptation (libvpx vp9_decode_frame): counts from this frame
+        // adapt the stored context the frame started from. Skipped for
+        // error-resilient and frame-parallel frames, which count nothing.
+        if !hdr.error_resilient_mode && !hdr.frame_parallel_decoding_mode {
+            let pre = self.frame_ctxs[hdr.frame_context_idx as usize].clone();
+            let factor = if self.last.key {
+                COEF_MAX_UPDATE_FACTOR_AFTER_KEY
+            } else {
+                COEF_MAX_UPDATE_FACTOR
+            };
+            adapt_coef_probs(&mut self.ctx, &pre, &counts, factor);
+            adapt_mode_probs(
+                &mut self.ctx,
+                &pre,
+                &counts,
+                ch.tx_mode == TX_MODE_SELECT,
+                interp_filter_of(hdr) == crate::inter::SWITCHABLE,
+            );
+            adapt_mv_probs(&mut self.ctx, &pre, &counts, hdr.allow_high_precision_mv);
         }
 
         // The walk state is consumed below, so the block count the harness pins
@@ -643,7 +665,11 @@ impl Decoder {
         self.syntax_blocks = self.iw.as_ref().map_or(0, |w| w.blocks);
         let w = self.iw.take().expect("inter walk state");
         self.prev_mvs = w.mvs;
-        self.prev_seg = w.seg_map;
+        if hdr.segmentation.enabled {
+            self.prev_seg = w.seg_map;
+        } else {
+            self.prev_seg = w.prev_seg;
+        }
         self.last = LastFrameFacts {
             width: hdr.width,
             height: hdr.height,
@@ -676,7 +702,8 @@ impl Decoder {
         // Loop filter post-pass: same extents as the keyframe path, but the
         // per-cell level comes from the block's own reference and mode class
         // (`get_filter_level`, vp9_loopfilter.c:249).
-        if hdr.loop_filter.level > 0 && std::env::var_os("EC_VP9_SKIP_LF").is_none() {
+        if hdr.loop_filter.level > 0 && !crate::knobs::skip_lf() {
+            let t_lf = crate::prof::start();
             let p = self.planes.as_mut().expect("frame scratch");
             let (vw, vh) = (mi_cols * 8, mi_rows * 8);
             grids.filter_frame(
@@ -694,6 +721,7 @@ impl Decoder {
                 hdr.loop_filter.sharpness,
                 hdr.bit_depth,
             );
+            crate::prof::stop(crate::prof::Phase::LoopFilter, t_lf);
         }
 
         let pic = self.take_picture(hdr);
@@ -709,7 +737,8 @@ impl Decoder {
         // reads.
         for slot in 0..8 {
             if hdr.refresh_frame_flags & (1 << slot) != 0 {
-                self.refs[slot] = Some(frame.clone());
+                let old = self.refs[slot].replace(frame.clone());
+                self.recycle(old);
             }
         }
         Ok(if hdr.show_frame { Some(pic) } else { None })
@@ -739,6 +768,7 @@ impl Decoder {
         y_mis: usize,
         tile_col_start: usize,
         tx_mode: u8,
+        counts: &mut crate::adapt::Counts,
     ) -> Result<MiInfo> {
         // BLOCK_4X4/4X8/8X4 are the SPLIT/VERT/HORZ partitions of an 8x8.
         let partition = match sb_type {
@@ -775,7 +805,7 @@ impl Decoder {
             x_mis,
             y_mis,
             partition,
-            &mut w.seg_map,
+            &mut w.seg_map, counts,
         );
         if let Ok(info) = &info {
             w.blocks += 1;
@@ -829,7 +859,8 @@ impl Decoder {
         sb_type: usize,
         bw: usize,
         bh: usize,
-    ) -> Result<()> {
+        counts: &mut crate::adapt::Counts,
+    ) -> Result<usize> {
         let (ss_x, ss_y) = plane_ss(hdr, 1);
         let n4w = [
             plane_n4_w(bw, 0),
@@ -844,10 +875,11 @@ impl Decoder {
         if info.skip {
             // dec_reset_skip_context
             reset_skip_context(ectx, row, col, sb_type, n4w, n4h, ss_x, ss_y);
-            return Ok(());
+            return Ok(0);
         }
         let mb_to_right = ((mi.mi_cols as isize - bw as isize - col as isize) * 64) as i32;
         let mb_to_bottom = ((mi.mi_rows as isize - bh as isize - row as isize) * 64) as i32;
+        let mut eobtotal = 0usize;
         for plane in 0..3usize {
             let (ss_x, ss_y) = plane_ss(hdr, plane);
             let tx_size = if plane == 0 {
@@ -862,7 +894,7 @@ impl Decoder {
                 (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
             for brow in (0..max_blocks_high).step_by(step) {
                 for bcol in (0..max_blocks_wide).step_by(step) {
-                    let _ = decode_inter_tx_tokens(
+                    eobtotal += decode_inter_tx_tokens(
                         r,
                         ectx,
                         hdr,
@@ -878,12 +910,13 @@ impl Decoder {
                         bw,
                         bh,
                         mb_to_right,
-                        mb_to_bottom,
-                    );
+                        mb_to_bottom, counts,
+                    )
+                    .eob;
                 }
             }
         }
-        Ok(())
+        Ok(eobtotal)
     }
 
     /// `decode_block`'s inter arm with pixels (`vp9_decodeframe.c:990-1044`):
@@ -905,7 +938,8 @@ impl Decoder {
         bh: usize,
         mi: &mut MiState,
         tile_col_start: usize,
-    ) -> Result<()> {
+        counts: &mut crate::adapt::Counts,
+    ) -> Result<bool> {
         let (ss_x, ss_y) = plane_ss(hdr, 1);
         let x_mis = bw.min(mi.mi_cols - col);
         let y_mis = bh.min(mi.mi_rows - row);
@@ -995,17 +1029,18 @@ impl Decoder {
                             // Intra prediction's left availability is
                             // tile-scoped (`tile->mi_col_start`), which the
                             // inter walk passes as the tile's first mi col.
-                            tile_col_start,
+                            tile_col_start, counts,
                         )?;
                     }
                 }
             }
-            return Ok(());
+            return Ok(false);
         }
 
         // Prediction: `dec_build_inter_predictors_sb`, every reference, every
         // plane, before any token is read.
         {
+            let t_mc = crate::prof::start();
             let planes = self.planes.as_mut().expect("frame scratch");
             let refs = &self.refs;
             let scratch = &mut self.mc_scratch;
@@ -1028,10 +1063,11 @@ impl Decoder {
                     sb_type,
                 )?;
             }
+            crate::prof::stop(crate::prof::Phase::Mc, t_mc);
         }
 
         if info.skip {
-            return Ok(());
+            return Ok(false);
         }
 
         // Reconstruction: `reconstruct_inter_block` per transform block.
@@ -1050,6 +1086,7 @@ impl Decoder {
                 (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
             for brow in (0..max_blocks_high).step_by(step) {
                 for bcol in (0..max_blocks_wide).step_by(step) {
+                    let t_tok = crate::prof::start();
                     let coef = decode_inter_tx_tokens(
                         r,
                         ectx,
@@ -1066,8 +1103,9 @@ impl Decoder {
                         bw,
                         bh,
                         mb_to_right,
-                        mb_to_bottom,
+                        mb_to_bottom, counts,
                     );
+                    crate::prof::stop(crate::prof::Phase::Tokens, t_tok);
                     eobtotal += coef.eob;
                     if coef.eob == 0 {
                         continue;
@@ -1082,6 +1120,7 @@ impl Decoder {
                     let y0 = ((row * 8) >> ss_y) + brow * 4;
                     let dst_off = y0 * stride + x0;
                     let (data, _) = planes.plane(plane);
+                    let t_idct = crate::prof::start();
                     inverse_transform_add(
                         tx_size,
                         DCT_DCT,
@@ -1092,6 +1131,7 @@ impl Decoder {
                         hdr.quantization.lossless(),
                         bd,
                     );
+                    crate::prof::stop(crate::prof::Phase::Idct, t_idct);
                 }
             }
         }
@@ -1104,8 +1144,11 @@ impl Decoder {
                     grids.skip_inter[(row + dy) * mi.mi_cols + col + dx] = true;
                 }
             }
+            // The same assignment is visible to later blocks' skip and tx
+            // contexts through the mode-info grid.
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn decode_keyframe(&mut self, hdr: &FrameHeader, frame: &[u8], tx_mode: u8) -> Result<Picture> {
@@ -1121,10 +1164,8 @@ impl Decoder {
         // mi_row 132 writes 8 rows past a 1080-row buffer).
         let aw = width.div_ceil(64) * 64;
         let ah = height.div_ceil(64) * 64;
-        self.planes = Some(Planes::new(aw, ah, hdr.bit_depth, ss_x, ss_y));
-        let tail_start = std::env::var("EC_VP9_FORCE_TAIL")
-            .ok()
-            .and_then(|s| s.parse().ok())
+        self.planes = Some(self.frame_planes(aw, ah, hdr.bit_depth, ss_x, ss_y));
+        let tail_start = crate::knobs::force_tail()
             .unwrap_or_else(|| {
                 hdr.uncompressed_header_size as usize + hdr.header_size_in_bytes as usize
             });
@@ -1142,31 +1183,10 @@ impl Decoder {
         let ss_y = hdr.subsampling_y as usize;
         let mi_cols = hdr.mi_cols() as usize;
         let mi_rows = hdr.mi_rows() as usize;
-        let sb64_cols = mi_cols.div_ceil(SB_MI);
-        let sb64_rows = mi_rows.div_ceil(SB_MI);
         let tile_cols = 1usize << hdr.tile_info.cols_log2;
         let tile_rows = 1usize << hdr.tile_info.rows_log2;
 
-        // Tile data: every tile except the overall last carries a
-        // 32-bit BIG-endian size prefix (spec 6.4; libvpx `get_tile_buffer`
-        // reads it with `mem_get_be32`, vp9_decodeframe.c:1688/1690).
-        let mut data: &[u8] = tail;
-        let mut tiles: Vec<&[u8]> = Vec::with_capacity(tile_cols * tile_rows);
-        for tr in 0..tile_rows {
-            for tc in 0..tile_cols {
-                let last = tr == tile_rows - 1 && tc == tile_cols - 1;
-                if last {
-                    tiles.push(data);
-                } else {
-                    ensure(data.len() >= 4, "truncated tile size")?;
-                    let sz = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
-                    data = &data[4..];
-                    ensure(data.len() >= sz, "truncated tile data")?;
-                    tiles.push(&data[..sz]);
-                    data = &data[sz..];
-                }
-            }
-        }
+        let tiles = split_tiles(tail, tile_cols, tile_rows)?;
 
         // Keyframe loop filter levels: intra ref, no mode class, per
         // segment (spec 8.8.1).
@@ -1174,101 +1194,30 @@ impl Decoder {
         for (seg, slot) in level_of_seg.iter_mut().enumerate() {
             *slot = hdr.loop_filter_levels(seg)[0];
         }
-
-        let mut grids = LfGrids {
-            level8: vec![0; mi_cols * mi_rows],
-            blk: vec![(0u8, 0u32, 0u32); mi_cols * mi_rows],
-            otx: vec![0; mi_cols * mi_rows],
-            skip_inter: vec![false; mi_cols * mi_rows],
-            mi_cols,
-            mi_rows,
+        let job = TileJob {
+            hdr,
+            tx_mode,
+            pixels: true,
+            level_of_seg,
+            tiles: &tiles,
         };
-        let mut ti = 0usize;
-        // `above_context` / `above_seg_context` and the mi grid are
-        // FRAME-scoped in libvpx: `cm->above_context` is memset once per
-        // frame BEFORE the tile loop (vp9_decodeframe.c:2079-2080 / :2082-2083,
-        // inside the :2077-2083 block), the
-        // shared `cm->mi_grid_visible` accumulates every tile's records, and
-        // the buffers are indexed by ABSOLUTE mi_row/mi_col
-        // (`set_skip_context`, vp9_onyxc_int.h:405-413). A tile row k > 0
-        // therefore reads above state written by tile row k - 1 — tiles are
-        // disjoint in COLUMN only. Allocating these per tile would discard
-        // that above state and mis-gate `xd->above_mi`, so they live here and
-        // are zeroed exactly once per frame.
-        // libvpx sizes `cm->above_context` by `mi_cols_aligned_to_sb` and the
-        // mi grid stride by `mi_cols`; the above arrays are written/indexed up
-        // to a whole TX_32X32 (8 4x4 units) past the last mi col, so a
-        // non-multiple-of-8 width would otherwise index out of bounds.
-        let aligned_cols = mi_cols.div_ceil(SB_MI) * SB_MI;
-        let mut ectx = [
-            PlaneContexts::new(aligned_cols * 2),
-            PlaneContexts::new(aligned_cols * 2),
-            PlaneContexts::new(aligned_cols * 2),
-        ];
-        ectx.iter_mut().for_each(|p| p.above.fill(0));
-        let mut mi = MiState::new(mi_cols, mi_rows);
-        mi.above_seg.fill(0);
-        for tr in 0..tile_rows {
-            let row_lo = ((sb64_rows * tr) >> hdr.tile_info.rows_log2) * SB_MI;
-            let row_hi = (((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2) * SB_MI).min(mi_rows);
-            for tc in 0..tile_cols {
-                let col_lo = ((sb64_cols * tc) >> hdr.tile_info.cols_log2) * SB_MI;
-                let col_hi =
-                    (((sb64_cols * (tc + 1)) >> hdr.tile_info.cols_log2) * SB_MI).min(mi_cols);
-                if crate::trace_enabled() {
-                    eprintln!(
-                        "TILE {} bytes first={:02x?}",
-                        tiles[ti].len(),
-                        &tiles[ti][..8.min(tiles[ti].len())]
-                    );
-                }
-                let mut r = crate::bool::BoolDecoder::new(tiles[ti])?;
-                ti += 1;
-                for sb_row in (row_lo..row_hi).step_by(SB_MI) {
-                    // libvpx zeroes the left ENTROPY and PARTITION contexts at
-                    // the start of EVERY superblock row, not just the tile's
-                    // first one (vp9_decodeframe.c:2260-2261 plain
-                    // `decode_tiles`; the row-mt twin is :2117-2118 and the
-                    // per-tile-row twins :1828-1829 / :1901-1902): the left
-                    // edge of an SB row has no pixels to its left. Our luma
-                    // left index wraps at mi_row 16, so a stale value from two
-                    // SB rows earlier would otherwise be read here.
-                    // `above_context`/`above_seg_context` are frame-scoped
-                    // (memset once per frame at :2079-2083, before the tile
-                    // loop) and indexed by ABSOLUTE mi_col, so they persist
-                    // across tile rows and are NOT reset here.
-                    ectx.iter_mut().for_each(|p| p.left = [0; 32]);
-                    mi.left_seg = [0; 32];
-                    for sb_col in (col_lo..col_hi).step_by(SB_MI) {
-                        self.decode_partition(
-                            &mut r,
-                            &mut mi,
-                            &mut ectx,
-                            &mut grids,
-                            &level_of_seg,
-                            hdr,
-                            sb_row,
-                            sb_col,
-                            4,
-                            col_lo,
-                            tx_mode,
-                            true,
-                        )?;
-                    }
-                }
-                if r.overreads() != 0 {
-                    return Err(corrupt(format!(
-                        "tile bool decoder desync (tile tr={tr} tc={tc} overreads={})",
-                        r.overreads()
-                    )));
-                }
-            }
+        let mut grids = new_grids(mi_cols, mi_rows);
+        let mut counts = crate::adapt::Counts::default();
+        self.walk_frame(&job, &mut grids, &mut counts)?;
+
+        // Intra frames adapt the coefficient tables only (libvpx: mode, skip and
+        // MV tables are adapted for inter frames alone), from the context the
+        // frame started from: slot 0, which a key or intra-only frame resets.
+        if !hdr.error_resilient_mode && !hdr.frame_parallel_decoding_mode {
+            let pre = self.frame_ctxs[0].clone();
+            adapt_coef_probs(&mut self.ctx, &pre, &counts, COEF_MAX_UPDATE_FACTOR);
         }
 
         // Loop filter post-pass (level 0 disables it for the frame).
         // The extents are the MI-aligned VISIBLE plane (libvpx's masks clear
         // everything past `mi_cols`/`mi_rows`), not the padded buffer size.
-        if hdr.loop_filter.level > 0 && std::env::var_os("EC_VP9_SKIP_LF").is_none() {
+        if hdr.loop_filter.level > 0 && !crate::knobs::skip_lf() {
+            let t_lf = crate::prof::start();
             let p = self.planes.as_mut().expect("frame scratch");
             let (vw, vh) = (mi_cols * 8, mi_rows * 8);
             grids.filter_frame(
@@ -1286,6 +1235,13 @@ impl Decoder {
                 hdr.loop_filter.sharpness,
                 hdr.bit_depth,
             );
+            crate::prof::stop(crate::prof::Phase::LoopFilter, t_lf);
+        }
+
+        // `vp9_swap_current_and_last_seg_map` runs only when segmentation is
+        // enabled: this frame's map becomes the next frame's prediction map.
+        if hdr.segmentation.enabled {
+            self.prev_seg = std::mem::take(&mut grids.seg);
         }
 
         Ok(self.take_picture(hdr))
@@ -1310,6 +1266,7 @@ impl Decoder {
         // branch only: a keyframe always reconstructs its intra blocks, and
         // the syntax-only inter walk parses tokens without predicting.
         pixels: bool,
+        counts: &mut crate::adapt::Counts,
     ) -> Result<()> {
         if row >= mi.mi_rows || col >= mi.mi_cols {
             return Ok(());
@@ -1326,7 +1283,7 @@ impl Decoder {
         let partition = {
             let ctx = mi.partition_ctx(row, col, n8 as u32);
             let probs = &self.ctx.partition[ctx];
-            if has_rows && has_cols {
+            let p = if has_rows && has_cols {
                 r.read_tree(&PARTITION_TREE, probs)
             } else if !has_rows && has_cols {
                 if r.read_bool(probs[1]) { 3 } else { 1 }
@@ -1334,7 +1291,10 @@ impl Decoder {
                 if r.read_bool(probs[2]) { 3 } else { 2 }
             } else {
                 3
-            }
+            };
+            // libvpx counts the implied SPLIT too (`++counts->partition[ctx][p]`).
+            counts.partition[ctx][p as usize] += 1;
+            p
         };
         let bsize = bsize_of_n4(n4);
         let subsize = SUBSIZE_LOOKUP[partition as usize * 13 + bsize] as usize;
@@ -1353,7 +1313,7 @@ impl Decoder {
                 1,
                 tile_col_start,
                 tx_mode,
-                pixels,
+                pixels, counts,
             )?;
         } else {
             match partition {
@@ -1371,7 +1331,7 @@ impl Decoder {
                     n4,
                     tile_col_start,
                     tx_mode,
-                    pixels,
+                    pixels, counts,
                 )?,
                 1 => {
                     self.decode_block(
@@ -1388,7 +1348,7 @@ impl Decoder {
                         n8,
                         tile_col_start,
                         tx_mode,
-                        pixels,
+                        pixels, counts,
                     )?;
                     if has_rows {
                         self.decode_block(
@@ -1405,7 +1365,7 @@ impl Decoder {
                             n8,
                             tile_col_start,
                             tx_mode,
-                            pixels,
+                            pixels, counts,
                         )?;
                     }
                 }
@@ -1424,7 +1384,7 @@ impl Decoder {
                         n4,
                         tile_col_start,
                         tx_mode,
-                        pixels,
+                        pixels, counts,
                     )?;
                     if has_cols {
                         self.decode_block(
@@ -1441,7 +1401,7 @@ impl Decoder {
                             n4,
                             tile_col_start,
                             tx_mode,
-                            pixels,
+                            pixels, counts,
                         )?;
                     }
                 }
@@ -1464,7 +1424,7 @@ impl Decoder {
                             n8,
                             tile_col_start,
                             tx_mode,
-                            pixels,
+                            pixels, counts,
                         )?;
                     }
                 }
@@ -1494,6 +1454,7 @@ impl Decoder {
         tile_col_start: usize,
         tx_mode: u8,
         pixels: bool,
+        counts: &mut crate::adapt::Counts,
     ) -> Result<()> {
         let bw = 1 << (bwl - 1);
         let bh = 1 << (bhl - 1);
@@ -1518,17 +1479,14 @@ impl Decoder {
         // `frame_is_intra_only` (onyxc_int.h:363): a keyframe OR an
         // intra-only frame walks the intra mode-info path.
         let intra_frame = hdr.frame_type == FrameType::Key || hdr.intra_only;
-        let info = if intra_frame {
+        let mut info = if intra_frame {
             read_intra_frame_mode_info(
                 r,
                 mi,
                 &hdr.segmentation,
-                &self.ctx.partition,
                 row,
                 col,
                 sb_type,
-                x_mis,
-                y_mis,
                 tile_col_start,
                 tx_mode,
                 &self.ctx,
@@ -1544,7 +1502,7 @@ impl Decoder {
                 x_mis,
                 y_mis,
                 tile_col_start,
-                tx_mode,
+                tx_mode, counts,
             )?
         };
         if !intra_frame {
@@ -1553,7 +1511,7 @@ impl Decoder {
                 // per-cell loop-filter level is the block's own reference and
                 // mode class (`get_filter_level`), so the grids are written
                 // inside the reconstruction rather than from `level_of_seg`.
-                self.reconstruct_inter_pixels(
+                let became_skip = self.reconstruct_inter_pixels(
                     r,
                     ectx,
                     grids,
@@ -1565,12 +1523,22 @@ impl Decoder {
                     bw,
                     bh,
                     mi,
-                    tile_col_start,
+                    tile_col_start, counts,
                 )?;
+                if became_skip {
+                    info.skip = true;
+                }
             } else {
                 // Inter syntax only: tokens keep the entropy stream aligned,
                 // the block lands in the mode grid, and no pixel is touched.
-                self.decode_inter_block_tokens(r, mi, ectx, hdr, &info, row, col, sb_type, bw, bh)?;
+                let eobtotal =
+                    self.decode_inter_block_tokens(r, mi, ectx, hdr, &info, row, col, sb_type, bw, bh, counts)?;
+                // libvpx decode_block: an inter block of 8x8 or larger with no
+                // coefficients becomes skip (`mi->skip = 1`), which the skip
+                // and tx contexts of later blocks then read.
+                if sb_type >= 3 && !info.skip && eobtotal == 0 {
+                    info.skip = true;
+                }
             }
             for dy in 0..y_mis {
                 for dx in 0..x_mis {
@@ -1614,6 +1582,7 @@ impl Decoder {
             for dx in 0..x_mis {
                 let cell = (row + dy) * mi.mi_cols + col + dx;
                 grids.level8[cell] = level;
+                grids.seg[cell] = info.segment;
                 grids.blk[cell] = (sb_type as u8, row as u32, col as u32);
                 grids.otx[cell] = if sb_type < 3 {
                     TX_4X4 as u8
@@ -1668,7 +1637,7 @@ impl Decoder {
                         bh,
                         mb_to_right,
                         mb_to_bottom,
-                        tile_col_start,
+                        tile_col_start, counts,
                     )?;
                 }
             }
@@ -1705,6 +1674,7 @@ impl Decoder {
         mb_to_right: i32,
         mb_to_bottom: i32,
         tile_col_start: usize,
+        counts: &mut crate::adapt::Counts,
     ) -> Result<()> {
         let (ss_x, ss_y) = plane_ss(hdr, plane);
         let mode = if plane == 0 {
@@ -1733,7 +1703,7 @@ impl Decoder {
         // last tx column of ITS OWN block (pd->n4_w units) — above-right
         // past the block's right edge belongs to a not-yet-decoded
         // neighbour, so it must stage as unavailable.
-        let rgt = tx_col + (1usize << tx_size) < bw * 2 >> ss_x;
+        let rgt = tx_col + (1usize << tx_size) < ((bw * 2) >> ss_x);
 
         // `xd->cur_buf->y_width/y_height` (vp9_reconintra.c:288-292) are the
         // MI-ALIGNED (8-multiple) buffer extent, not the visible coded size:
@@ -1829,12 +1799,12 @@ impl Decoder {
             false,
             bd,
             (x0, y0),
-            plane,
+            plane, counts,
         );
 
         // 3. Context write-back (vp9_decode_block_tokens, v1.15 shifts).
-        let n4w = bw * 2 >> ss_x;
-        let n4h = bh * 2 >> ss_y;
+        let n4w = (bw * 2) >> ss_x;
+        let n4h = (bh * 2) >> ss_y;
         let maxw = (n4w as i32 + (mb_to_right.min(0) >> (5 + ss_x))).max(0) as usize;
         let maxh = (n4h as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
         let nblocks = 1usize << tx_size;
@@ -2090,7 +2060,8 @@ fn decode_inter_tx_tokens(
     bh: usize,
     mb_to_right: i32,
     mb_to_bottom: i32,
-) -> crate::tokens::CoeffBlock {
+        counts: &mut crate::adapt::Counts,
+    ) -> crate::tokens::CoeffBlock {
     let (ss_x, ss_y) = plane_ss(hdr, plane);
     // `predict_and_reconstruct_intra_block` (decodeframe.c:320-345): the luma
     // mode of a sub-8x8 block is the SUB-BLOCK's, and an intra block inside an
@@ -2141,11 +2112,11 @@ fn decode_inter_tx_tokens(
         info.is_inter,
         hdr.bit_depth,
         (0, 0),
-        plane,
+        plane, counts,
     );
     // vp9_decode_block_tokens context write-back (v1.15 edge shifts).
-    let n4w_s = bw * 2 >> ss_x;
-    let n4h_s = bh * 2 >> ss_y;
+    let n4w_s = (bw * 2) >> ss_x;
+    let n4h_s = (bh * 2) >> ss_y;
     let maxw = (n4w_s as i32 + (mb_to_right.min(0) >> (5 + ss_x))).max(0) as usize;
     let maxh = (n4h_s as i32 + (mb_to_bottom.min(0) >> (5 + ss_y))).max(0) as usize;
     let shift_a = if maxw > 0 && nblocks + bcol > maxw {
@@ -2265,6 +2236,8 @@ fn inter_predict_plane(
                         y * 4,
                         4,
                         4,
+                        pw,
+                        ph,
                         mv,
                         mb_left,
                         mb_to_right,
@@ -2291,6 +2264,8 @@ fn inter_predict_plane(
                 row,
                 0,
                 0,
+                pw,
+                ph,
                 pw,
                 ph,
                 info.mv[rf],
@@ -2325,5 +2300,327 @@ fn interp_filter_of(hdr: &FrameHeader) -> u8 {
         v
     } else {
         LITERAL_TO_FILTER[v as usize]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tile-column threading.
+//
+// VP9 tile columns are independent within a frame: a block never reads mode
+// info, entropy contexts or pixels across a tile-column boundary (left
+// availability stops at `tile_col_start`, MV candidates are bounded by the
+// tile's column range, and above-right samples stay inside the block). Tile
+// ROWS of one column depend on each other, so a worker walks every tile row
+// of the columns it owns, in order. Each worker decodes into a private copy of
+// the frame; the columns are then copied into the frame in column order. The
+// counts are sums, so the result does not depend on the worker count.
+
+/// Everything a tile walk reads that is fixed for the whole frame.
+struct TileJob<'a> {
+    hdr: &'a FrameHeader,
+    tx_mode: u8,
+    /// Whether the walk reconstructs pixels (see `decode_partition`).
+    pixels: bool,
+    /// Loop-filter level per segment (keyframes; inter walks pass zeros).
+    level_of_seg: [[u8; 2]; 8],
+    /// Tile payloads in bitstream order: `tiles[tile_row * tile_cols + tile_col]`.
+    tiles: &'a [&'a [u8]],
+}
+
+/// Split the tile payloads (spec 6.4). Every tile but the last carries a
+/// 32-bit big-endian size (libvpx `get_tile_buffer`).
+fn split_tiles(mut data: &[u8], tile_cols: usize, tile_rows: usize) -> Result<Vec<&[u8]>> {
+    let mut tiles = Vec::with_capacity(tile_cols * tile_rows);
+    for tr in 0..tile_rows {
+        for tc in 0..tile_cols {
+            let last = tr == tile_rows - 1 && tc == tile_cols - 1;
+            if last {
+                tiles.push(data);
+            } else {
+                ensure(data.len() >= 4, "truncated tile size")?;
+                let sz = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                data = &data[4..];
+                ensure(data.len() >= sz, "truncated tile data")?;
+                tiles.push(&data[..sz]);
+                data = &data[sz..];
+            }
+        }
+    }
+    Ok(tiles)
+}
+
+fn new_grids(mi_cols: usize, mi_rows: usize) -> LfGrids {
+    LfGrids {
+        level8: vec![0; mi_cols * mi_rows],
+        blk: vec![(0u8, 0u32, 0u32); mi_cols * mi_rows],
+        otx: vec![0; mi_cols * mi_rows],
+        skip_inter: vec![false; mi_cols * mi_rows],
+        seg: vec![0; mi_cols * mi_rows],
+        mi_cols,
+        mi_rows,
+    }
+}
+
+/// Mode-info column span `[lo, hi)` of tile column `tc` (spec 6.4).
+fn tile_col_span(hdr: &FrameHeader, tc: usize) -> (usize, usize) {
+    let mi_cols = hdr.mi_cols() as usize;
+    let sb64_cols = mi_cols.div_ceil(SB_MI);
+    let log2 = hdr.tile_info.cols_log2;
+    let lo = (((sb64_cols * tc) >> log2) * SB_MI).min(mi_cols);
+    let hi = (((sb64_cols * (tc + 1)) >> log2) * SB_MI).min(mi_cols);
+    (lo, hi)
+}
+
+/// Copy columns `[lo, hi)` of every row of a mode-info array.
+fn copy_mi_cols<T: Copy>(dst: &mut [T], src: &[T], mi_cols: usize, mi_rows: usize, lo: usize, hi: usize) {
+    for r in 0..mi_rows {
+        let b = r * mi_cols;
+        dst[b + lo..b + hi].copy_from_slice(&src[b + lo..b + hi]);
+    }
+}
+
+/// Copy the pixel columns of one tile column. The last tile column also owns
+/// the padding past `mi_cols` (a block at the frame edge writes its full size).
+/// Padded (64-multiple) luma width of a frame.
+fn frame_aw(hdr: &FrameHeader) -> usize {
+    (hdr.width as usize).div_ceil(64) * 64
+}
+
+/// Padded (64-multiple) luma height of a frame.
+fn frame_ah(hdr: &FrameHeader) -> usize {
+    (hdr.height as usize).div_ceil(64) * 64
+}
+
+fn copy_plane_cols(dst: &mut Planes, src: &Planes, lo_mi: usize, hi_mi: usize, last: bool) {
+    fn rows<T: Copy>(dst: &mut [T], src: &[T], stride: usize, rows: usize, x0: usize, x1: usize) {
+        for r in 0..rows {
+            let b = r * stride;
+            dst[b + x0..b + x1].copy_from_slice(&src[b + x0..b + x1]);
+        }
+    }
+    let x0 = lo_mi * 8;
+    let x1 = if last { dst.ys } else { hi_mi * 8 };
+    rows(&mut dst.y, &src.y, dst.ys, dst.ah, x0, x1);
+    let (cx0, cx1) = (x0 >> dst.ss_x, if last { dst.uvs } else { x1 >> dst.ss_x });
+    let ch = dst.ah >> dst.ss_y;
+    rows(&mut dst.u, &src.u, dst.uvs, ch, cx0, cx1);
+    rows(&mut dst.v, &src.v, dst.uvs, ch, cx0, cx1);
+}
+
+impl Decoder {
+    /// A frame buffer of this geometry, reusing a spare when one fits.
+    fn frame_planes(&mut self, aw: usize, ah: usize, bd: u8, ss_x: usize, ss_y: usize) -> Planes {
+        match self.spare.iter().position(|p| p.fits(aw, ah, bd, ss_x, ss_y)) {
+            Some(i) => {
+                let mut p = self.spare.swap_remove(i);
+                p.refill();
+                p
+            }
+            None => Planes::new(aw, ah, bd, ss_x, ss_y),
+        }
+    }
+
+    /// Keep the buffer of a reference slot that was just replaced, if nothing else
+    /// holds it. Only a few spares are kept; the rest are dropped.
+    fn recycle(&mut self, old: Option<RefFrame>) {
+        if let Some(rf) = old {
+            if let Ok(p) = std::sync::Arc::try_unwrap(rf.planes) {
+                self.recycle_planes(p);
+            }
+        }
+    }
+
+    fn recycle_planes(&mut self, p: Planes) {
+        if self.spare.len() < 8 {
+            self.spare.push(p);
+        }
+    }
+
+    /// Set how many tile-column workers decode each frame. `1` is
+    /// single-threaded; the output is identical for every value.
+    pub fn set_threads(&mut self, n: usize) {
+        self.threads = n.clamp(1, 64);
+    }
+
+    /// Walk every tile of the frame into `self.planes` / `self.iw`, with the
+    /// loop-filter grids and counts merged in.
+    fn walk_frame(&mut self, job: &TileJob<'_>, grids: &mut LfGrids, counts: &mut crate::adapt::Counts) -> Result<()> {
+        let hdr = job.hdr;
+        let tile_cols = 1usize << hdr.tile_info.cols_log2;
+        let workers = self.threads.clamp(1, tile_cols);
+        if workers == 1 {
+            let cols: Vec<usize> = (0..tile_cols).collect();
+            return self.walk_columns(job, &cols, grids, counts);
+        }
+        let mi_cols = hdr.mi_cols() as usize;
+        let mi_rows = hdr.mi_rows() as usize;
+        let owned: Vec<Vec<usize>> = (0..workers).map(|w| (w..tile_cols).step_by(workers).collect()).collect();
+        let worker_planes: Vec<Planes> = (0..workers)
+            .map(|_| self.frame_planes(frame_aw(hdr), frame_ah(hdr), hdr.bit_depth, hdr.subsampling_x as usize, hdr.subsampling_y as usize))
+            .collect();
+        let parent: &Decoder = self;
+        let results: Vec<Result<(Decoder, LfGrids, crate::adapt::Counts)>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = owned
+                .iter()
+                .zip(worker_planes)
+                .map(|(cols, planes)| {
+                    scope.spawn(move || -> Result<(Decoder, LfGrids, crate::adapt::Counts)> {
+                        let t_fork = crate::prof::start();
+                        let mut wk = parent.fork(hdr, planes);
+                        let mut g = new_grids(mi_cols, mi_rows);
+                        let mut c = crate::adapt::Counts::default();
+                        crate::prof::stop(crate::prof::Phase::Threads, t_fork);
+                        wk.walk_columns(job, cols, &mut g, &mut c)?;
+                        Ok((wk, g, c))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(corrupt("tile worker panicked"))))
+                .collect()
+        });
+        let mut parts = Vec::with_capacity(workers);
+        for res in results {
+            parts.push(res?);
+        }
+        let t_merge = crate::prof::start();
+        for (w, (mut wk, g, c)) in parts.into_iter().enumerate() {
+            counts.add(&c);
+            for &tc in &owned[w] {
+                let (lo, hi) = tile_col_span(hdr, tc);
+                if lo >= hi {
+                    continue;
+                }
+                copy_mi_cols(&mut grids.level8, &g.level8, mi_cols, mi_rows, lo, hi);
+                copy_mi_cols(&mut grids.blk, &g.blk, mi_cols, mi_rows, lo, hi);
+                copy_mi_cols(&mut grids.otx, &g.otx, mi_cols, mi_rows, lo, hi);
+                copy_mi_cols(&mut grids.skip_inter, &g.skip_inter, mi_cols, mi_rows, lo, hi);
+                copy_mi_cols(&mut grids.seg, &g.seg, mi_cols, mi_rows, lo, hi);
+                if let (Some(dst), Some(src)) = (self.iw.as_mut(), wk.iw.as_ref()) {
+                    copy_mi_cols(&mut dst.mvs, &src.mvs, mi_cols, mi_rows, lo, hi);
+                    copy_mi_cols(&mut dst.seg_map, &src.seg_map, mi_cols, mi_rows, lo, hi);
+                }
+                if let (Some(dst), Some(src)) = (self.planes.as_mut(), wk.planes.as_ref()) {
+                    copy_plane_cols(dst, src, lo, hi, hi == mi_cols);
+                }
+            }
+            if let (Some(dst), Some(src)) = (self.iw.as_mut(), wk.iw.as_ref()) {
+                dst.blocks += src.blocks;
+            }
+            if let Some(p) = wk.planes.take() {
+                self.recycle_planes(p);
+            }
+        }
+        crate::prof::stop(crate::prof::Phase::Threads, t_merge);
+        Ok(())
+    }
+
+    /// Walk the tile columns `cols`, every tile row of each, in order.
+    fn walk_columns(
+        &mut self,
+        job: &TileJob<'_>,
+        cols: &[usize],
+        grids: &mut LfGrids,
+        counts: &mut crate::adapt::Counts,
+    ) -> Result<()> {
+        let hdr = job.hdr;
+        let mi_cols = hdr.mi_cols() as usize;
+        let mi_rows = hdr.mi_rows() as usize;
+        let tile_cols = 1usize << hdr.tile_info.cols_log2;
+        let tile_rows = 1usize << hdr.tile_info.rows_log2;
+        // `above_context` / `above_seg_context` are FRAME-scoped in libvpx
+        // (zeroed once per frame, indexed by ABSOLUTE mi_col), so a walk
+        // zeroes them once; columns never read another column's entries. They
+        // are sized by `mi_cols_aligned_to_sb`: a TX_32X32 block indexes up to
+        // 8 4x4 units past the last mi col.
+        let aligned_cols = mi_cols.div_ceil(SB_MI) * SB_MI;
+        let mut ectx = [
+            PlaneContexts::new(aligned_cols * 2),
+            PlaneContexts::new(aligned_cols * 2),
+            PlaneContexts::new(aligned_cols * 2),
+        ];
+        let mut mi = MiState::new(mi_cols, mi_rows);
+        mi.above_seg.fill(0);
+        for &tc in cols {
+            let (col_lo, col_hi) = tile_col_span(hdr, tc);
+            if let Some(w) = self.iw.as_mut() {
+                w.tile_col_end = col_hi;
+            }
+            for tr in 0..tile_rows {
+                let sb64_rows = mi_rows.div_ceil(SB_MI);
+                let row_lo = ((sb64_rows * tr) >> hdr.tile_info.rows_log2) * SB_MI;
+                let row_hi = (((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2) * SB_MI).min(mi_rows);
+                let data = job.tiles[tr * tile_cols + tc];
+                if crate::trace_enabled() {
+                    eprintln!("TILE {} bytes tr={tr} tc={tc}", data.len());
+                }
+                let mut r = crate::bool::BoolDecoder::new(data)?;
+                for sb_row in (row_lo..row_hi).step_by(SB_MI) {
+                    // Left entropy/partition contexts are zeroed at the start
+                    // of every superblock row (the SB row's left edge has no
+                    // neighbours, libvpx vp9_decodeframe.c decode_tiles).
+                    ectx.iter_mut().for_each(|p| p.left = [0; 32]);
+                    mi.left_seg = [0; 32];
+                    for sb_col in (col_lo..col_hi).step_by(SB_MI) {
+                        self.decode_partition(
+                            &mut r,
+                            &mut mi,
+                            &mut ectx,
+                            grids,
+                            &job.level_of_seg,
+                            hdr,
+                            sb_row,
+                            sb_col,
+                            4,
+                            col_lo,
+                            job.tx_mode,
+                            job.pixels,
+                            counts,
+                        )?;
+                    }
+                }
+                ensure(
+                    r.overreads() == 0,
+                    &format!("tile bool decoder desync (tile tr={tr} tc={tc})"),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A worker decoder for a set of tile columns: the same frame state, with
+    /// its own frame buffer and walk state. The parent is not modified.
+    fn fork(&self, hdr: &FrameHeader, planes: Planes) -> Decoder {
+        let n = (hdr.mi_cols() * hdr.mi_rows()) as usize;
+        Decoder {
+            parser: Vp9Parser::new(),
+            ctx: self.ctx.clone(),
+            refs: self.refs.clone(),
+            planes: Some(planes),
+            spare: Vec::new(),
+            frame_ctxs: self.frame_ctxs.clone(),
+            prev_mvs: Vec::new(),
+            prev_seg: Vec::new(),
+            last: self.last,
+            iw: self.iw.as_ref().map(|w| InterWalk {
+                ifs: w.ifs,
+                sign_bias: w.sign_bias,
+                use_prev: w.use_prev,
+                seg_map: vec![0; n],
+                mvs: vec![crate::inter::MvRef::default(); n],
+                prev_seg: w.prev_seg.clone(),
+                prev_mvs: w.prev_mvs.clone(),
+                tile_col_end: w.tile_col_end,
+                frame_index: w.frame_index,
+                blocks: 0,
+            }),
+            frames_seen: self.frames_seen,
+            decode_index: self.decode_index,
+            syntax_blocks: 0,
+            mc_scratch: Vec::new(),
+            mc_temp: vec![0; 64 * 135 + 64 * 64],
+            threads: 1,
+        }
     }
 }

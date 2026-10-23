@@ -8,6 +8,7 @@
 //! approximately.
 
 use crate::dpb::{BLK_DIRECT, BLK_INTRA, BLK_SKIP, Picture};
+use crate::sample::Sample;
 
 /// Prediction mode of a macroblock or sub-macroblock partition (Table 7-13,
 /// 7-14, 7-17, 7-18).
@@ -176,12 +177,93 @@ pub(crate) struct MvCtx {
     pub slice_id: u16,
     /// Bit `y * 4 + x` set once block (x, y) of this macroblock is derived.
     pub written: u16,
+    /// The macroblock's place in an MBAFF frame (inert otherwise).
+    pub pos: crate::mbaff::MbPos,
 }
 
 impl MvCtx {
-    /// Motion data of the 4x4 block at picture block coordinates `(bx, by)`,
-    /// for list `list`.
-    pub(crate) fn at(&self, pic: &Picture, bx: i32, by: i32, list: usize) -> Nb {
+    /// Resolve the 4x4 block at picture block coordinates `(bx, by)` — the
+    /// raster neighbour of a block of the current macroblock — to its index
+    /// in the per-block arrays, or `None` when it is unavailable (outside the
+    /// picture, in another slice, not yet decoded, or not a neighbour Table
+    /// 6-4 allows). In an MBAFF frame the coordinates only say *which*
+    /// neighbour (left, above, above-right, above-left) and row; the block
+    /// actually read is the one 6.4.12.2 derives. The flag is the neighbouring
+    /// macroblock's field mode (the current macroblock's for blocks inside it).
+    #[inline]
+    fn resolve<S: Sample>(
+        &self,
+        pic: &Picture<S>,
+        bx: i32,
+        by: i32,
+        diag: bool,
+    ) -> Option<(usize, bool)> {
+        let w4 = (pic.mb_w * 4) as i32;
+        if self.pos.active {
+            return self.resolve_mbaff(pic, bx, by, diag);
+        }
+        let h4 = (pic.mb_h * 4) as i32;
+        if bx < 0 || by < 0 || bx >= w4 || by >= h4 {
+            return None;
+        }
+        let (mbx, mby) = (bx as usize / 4, by as usize / 4);
+        let addr = mby * pic.mb_w + mbx;
+        if mbx == self.mb_x && mby == self.mb_y {
+            let within = (by as usize % 4) * 4 + bx as usize % 4;
+            if self.written & (1 << within) == 0 {
+                return None;
+            }
+        } else if pic.mb_slice[addr] != self.slice_id {
+            return None;
+        }
+        Some((by as usize * pic.mb_w * 4 + bx as usize, false))
+    }
+
+    /// [`MvCtx::resolve`] for an MBAFF frame (Table 6-4).
+    #[inline(never)]
+    fn resolve_mbaff<S: Sample>(
+        &self,
+        pic: &Picture<S>,
+        bx: i32,
+        by: i32,
+        diag: bool,
+    ) -> Option<(usize, bool)> {
+        let w4 = (pic.mb_w * 4) as i32;
+        {
+            let (rx, ry) = (bx - 4 * self.mb_x as i32, by - 4 * self.mb_y as i32);
+            if (0..4).contains(&rx) && (0..4).contains(&ry) {
+                if self.written & (1 << (ry * 4 + rx)) == 0 {
+                    return None;
+                }
+                return Some((by as usize * w4 as usize + bx as usize, self.pos.field));
+            }
+            let xn = if rx < 0 {
+                -1
+            } else if rx >= 4 {
+                16
+            } else {
+                rx * 4
+            };
+            // Neighbour D of a block below the top row sits at luma row
+            // `y - 1`, the last row of the block above; the others at the
+            // block's own first row.
+            let yn = if ry < 0 {
+                -1
+            } else if diag {
+                ry * 4 + 3
+            } else {
+                ry * 4
+            };
+            let l = crate::mbaff::locate(pic, &self.pos, xn, yn, 16, 16)?;
+            let gbx = (l.slot % pic.mb_w) * 4 + (l.xw as usize >> 2);
+            let gby = (l.slot / pic.mb_w) * 4 + (l.yw as usize >> 2);
+            Some((gby * w4 as usize + gbx, l.field))
+        }
+    }
+
+    /// [`MvCtx::at`] outside MBAFF frames: raster addressing.
+    #[inline]
+    fn at_plain<S: Sample>(&self, pic: &Picture<S>, bx: i32, by: i32, list: usize) -> Nb {
         let w4 = (pic.mb_w * 4) as i32;
         let h4 = (pic.mb_h * 4) as i32;
         if bx < 0 || by < 0 || bx >= w4 || by >= h4 {
@@ -213,12 +295,62 @@ impl MvCtx {
         }
     }
 
+    /// Motion data of the 4x4 block at picture block coordinates `(bx, by)`,
+    /// for list `list`.
+    #[inline]
+    pub(crate) fn at<S: Sample>(&self, pic: &Picture<S>, bx: i32, by: i32, list: usize) -> Nb {
+        self.at_d(pic, bx, by, list, false)
+    }
+
+    /// [`MvCtx::at`] for neighbour D when `diag` (the block diagonally above
+    /// and left, `(bx - 1, by - 1)`).
+    #[inline]
+    fn at_d<S: Sample>(&self, pic: &Picture<S>, bx: i32, by: i32, list: usize, diag: bool) -> Nb {
+        let Some((idx, nfield)) = self.resolve(pic, bx, by, diag) else {
+            return Nb::default();
+        };
+        if pic.blk[idx] & BLK_INTRA != 0 {
+            // Available as a partition, but contributes no motion (8.4.1.3.2).
+            return Nb {
+                avail: true,
+                mv: [0; 2],
+                ref_idx: -1,
+            };
+        }
+        let mut nb = Nb {
+            avail: true,
+            mv: pic.mv[idx][list],
+            ref_idx: pic.ref_idx[idx][list],
+        };
+        if self.pos.active && nfield != self.pos.field && nb.ref_idx >= 0 {
+            nb = self.rescale(nb);
+        }
+        nb
+    }
+
+    #[inline(never)]
+    fn rescale(&self, mut nb: Nb) -> Nb {
+        {
+            // 8.4.1.3.2: motion of a neighbour of the other mode is converted
+            // to the current macroblock's units.
+            if self.pos.field {
+                nb.mv[1] /= 2;
+                nb.ref_idx *= 2;
+            } else {
+                nb.mv[1] = nb.mv[1].wrapping_mul(2);
+                nb.ref_idx >>= 1;
+            }
+        }
+        nb
+    }
+
     /// Neighbours A, B and C of a partition whose top-left 4x4 block is at
     /// macroblock-relative `(px, py)` and whose `predPartWidth` is `pw` blocks
     /// (clause 6.4.11.7, with the C-to-D substitution of 8-214).
-    pub(crate) fn neighbours(
+    #[inline]
+    pub(crate) fn neighbours<S: Sample>(
         &self,
-        pic: &Picture,
+        pic: &Picture<S>,
         px: usize,
         py: usize,
         pw: usize,
@@ -226,11 +358,32 @@ impl MvCtx {
     ) -> [Nb; 3] {
         let bx = (self.mb_x * 4 + px) as i32;
         let by = (self.mb_y * 4 + py) as i32;
-        let a = self.at(pic, bx - 1, by, list);
-        let b = self.at(pic, bx, by - 1, list);
-        let mut c = self.at(pic, bx + pw as i32, by - 1, list);
+        if self.pos.active {
+            return self.neighbours_mbaff(pic, bx, by, pw, list);
+        }
+        let a = self.at_plain(pic, bx - 1, by, list);
+        let b = self.at_plain(pic, bx, by - 1, list);
+        let mut c = self.at_plain(pic, bx + pw as i32, by - 1, list);
         if !c.avail {
-            c = self.at(pic, bx - 1, by - 1, list);
+            c = self.at_plain(pic, bx - 1, by - 1, list);
+        }
+        [a, b, c]
+    }
+
+    #[inline(never)]
+    fn neighbours_mbaff<S: Sample>(
+        &self,
+        pic: &Picture<S>,
+        bx: i32,
+        by: i32,
+        pw: usize,
+        list: usize,
+    ) -> [Nb; 3] {
+        let a = self.at_d(pic, bx - 1, by, list, false);
+        let b = self.at_d(pic, bx, by - 1, list, false);
+        let mut c = self.at_d(pic, bx + pw as i32, by - 1, list, false);
+        if !c.avail {
+            c = self.at_d(pic, bx - 1, by - 1, list, true);
         }
         [a, b, c]
     }
@@ -292,8 +445,8 @@ pub(crate) fn min_positive(x: i8, y: i8) -> i8 {
 
 /// Record one 4x4 block's motion data into the picture arrays.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_block(
-    pic: &mut Picture,
+pub(crate) fn write_block<S: Sample>(
+    pic: &mut Picture<S>,
     ctx: &mut MvCtx,
     px: usize,
     py: usize,
@@ -314,7 +467,7 @@ pub(crate) fn write_block(
 
 /// Mark every 4x4 block of the current macroblock as intra, clearing the motion
 /// data an inter neighbour would otherwise read (8.4.1.3.2, 9.3.3.1.1.7).
-pub(crate) fn write_intra_mb(pic: &mut Picture, mb_x: usize, mb_y: usize) {
+pub(crate) fn write_intra_mb<S: Sample>(pic: &mut Picture<S>, mb_x: usize, mb_y: usize) {
     let w4 = pic.mb_w * 4;
     for py in 0..4 {
         let base = (mb_y * 4 + py) * w4 + mb_x * 4;
@@ -331,8 +484,8 @@ pub(crate) fn write_intra_mb(pic: &mut Picture, mb_x: usize, mb_y: usize) {
 /// Record `Abs( mvd )` for one 4x4 block, saturated at the largest value the
 /// context thresholds of 9.3.3.1.1.7 can distinguish.
 #[inline]
-pub(crate) fn write_mvd(
-    pic: &mut Picture,
+pub(crate) fn write_mvd<S: Sample>(
+    pic: &mut Picture<S>,
     mb_x: usize,
     mb_y: usize,
     px: usize,
@@ -349,50 +502,56 @@ pub(crate) fn write_mvd(
 /// `absMvdCompN` of the neighbouring partition at picture block coordinates
 /// `(bx, by)` (9.3.3.1.1.7): zero when the neighbour is unavailable, skipped,
 /// intra or direct coded.
-pub(crate) fn neighbour_mvd(pic: &Picture, ctx: &MvCtx, bx: i32, by: i32, list: usize) -> [u32; 2] {
-    let w4 = (pic.mb_w * 4) as i32;
-    let h4 = (pic.mb_h * 4) as i32;
-    if bx < 0 || by < 0 || bx >= w4 || by >= h4 {
+pub(crate) fn neighbour_mvd<S: Sample>(
+    pic: &Picture<S>,
+    ctx: &MvCtx,
+    bx: i32,
+    by: i32,
+    list: usize,
+) -> [u32; 2] {
+    let Some((idx, nfield)) = ctx.resolve(pic, bx, by, false) else {
         return [0; 2];
-    }
-    let (mbx, mby) = (bx as usize / 4, by as usize / 4);
-    if mbx == ctx.mb_x && mby == ctx.mb_y {
-        let within = (by as usize % 4) * 4 + bx as usize % 4;
-        if ctx.written & (1 << within) == 0 {
-            return [0; 2];
-        }
-    } else if pic.mb_slice[mby * pic.mb_w + mbx] != ctx.slice_id {
-        return [0; 2];
-    }
-    let idx = by as usize * pic.mb_w * 4 + bx as usize;
+    };
     if pic.blk[idx] & (BLK_INTRA | BLK_SKIP | BLK_DIRECT) != 0 || pic.ref_idx[idx][list] < 0 {
         return [0; 2];
     }
     let e = pic.mvd_abs[idx];
-    [u32::from(e[list * 2]), u32::from(e[list * 2 + 1])]
+    let mut out = [u32::from(e[list * 2]), u32::from(e[list * 2 + 1])];
+    if ctx.pos.active && nfield != ctx.pos.field {
+        // The vertical component is compared in the current macroblock's
+        // units (9.3.3.1.1.7).
+        if ctx.pos.field {
+            out[1] /= 2;
+        } else {
+            out[1] *= 2;
+        }
+    }
+    out
 }
 
 /// `condTermFlagN` for ref_idx_lX (9.3.3.1.1.6).
-pub(crate) fn ref_idx_cond(pic: &Picture, ctx: &MvCtx, bx: i32, by: i32, list: usize) -> usize {
-    let w4 = (pic.mb_w * 4) as i32;
-    let h4 = (pic.mb_h * 4) as i32;
-    if bx < 0 || by < 0 || bx >= w4 || by >= h4 {
+pub(crate) fn ref_idx_cond<S: Sample>(
+    pic: &Picture<S>,
+    ctx: &MvCtx,
+    bx: i32,
+    by: i32,
+    list: usize,
+) -> usize {
+    let Some((idx, nfield)) = ctx.resolve(pic, bx, by, false) else {
         return 0;
-    }
-    let (mbx, mby) = (bx as usize / 4, by as usize / 4);
-    if mbx == ctx.mb_x && mby == ctx.mb_y {
-        let within = (by as usize % 4) * 4 + bx as usize % 4;
-        if ctx.written & (1 << within) == 0 {
-            return 0;
-        }
-    } else if pic.mb_slice[mby * pic.mb_w + mbx] != ctx.slice_id {
-        return 0;
-    }
-    let idx = by as usize * pic.mb_w * 4 + bx as usize;
+    };
     if pic.blk[idx] & (BLK_INTRA | BLK_SKIP | BLK_DIRECT) != 0 {
         return 0;
     }
-    usize::from(pic.ref_idx[idx][list] > 0)
+    // refIdxZeroFlagN: a frame macroblock reading a field neighbour in an
+    // MBAFF frame compares against 1, because field reference indices count
+    // fields.
+    let limit = if ctx.pos.active && !ctx.pos.field && nfield {
+        1
+    } else {
+        0
+    };
+    usize::from(pic.ref_idx[idx][list] > limit)
 }
 
 #[cfg(test)]

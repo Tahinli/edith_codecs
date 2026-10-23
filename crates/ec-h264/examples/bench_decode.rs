@@ -109,7 +109,9 @@ fn decode(src: &Source, hash: bool) -> (usize, u64, u32, u32) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let path = args.first().expect("usage: bench_decode <file.mp4|.264> [reps] [--hash]");
+    let path = args
+        .first()
+        .expect("usage: bench_decode <file.mp4|.264> [reps] [--hash]");
     let reps: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let hash = args.iter().any(|a| a == "--hash");
 

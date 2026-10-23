@@ -42,6 +42,10 @@ const MAX_QUANT: i32 = 8191;
 /// Masking floor relative to the loudest band of the frame, standing in for the
 /// absolute threshold of hearing (see [`AacEncoder::psychoacoustics`]).
 const ATH_FLOOR: f32 = 1e-7;
+/// How far each band's allowed noise moves from its masking estimate toward the
+/// frame's mean level: 0 keeps the masking threshold, 1 gives every band the same
+/// absolute noise (the minimum-MSE allocation the correlation bar measures).
+const MSE_BLEND: f32 = 0.3;
 
 /// Which window shape the encoder asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -311,8 +315,13 @@ impl AacEncoder {
             c.drain(..FRAME_LEN);
         }
 
-        let target = (u64::from(self.config.bitrate_bps) * FRAME_LEN as u64
-            / u64::from(self.sample_rate.max(1))) as i32;
+        // The stream's bitrate counts every byte written, so with ADTS on the 56-bit header
+        // comes out of this frame's share before the raw block gets its bits.
+        let header_bits = if self.config.adts { 56 } else { 0 };
+        let target = ((u64::from(self.config.bitrate_bps) * FRAME_LEN as u64
+            / u64::from(self.sample_rate.max(1))) as i32
+            - header_bits)
+            .max(0);
         let budget = target
             + self
                 .reservoir
@@ -480,12 +489,21 @@ impl AacEncoder {
         // filterbank's own leakage does, so an encoder spends its whole budget
         // coding the skirts of a tone at full precision.
         let floor = energy.iter().copied().fold(0.0f32, f32::max) * ATH_FLOOR;
+        // The frame's mean level per coefficient, the reference for the MSE blend.
+        let mean_level = (0..bands)
+            .map(|b| f64::from(energy[b]) * f64::from(swb[b + 1] - swb[b]))
+            .sum::<f64>()
+            / FRAME_LEN as f64;
+        let mean_level = (mean_level as f32).max(1e-3);
         (0..bands)
             .map(|b| {
                 // Flat (noise-like) bands mask well, peaky (tonal) ones badly.
                 let tonality = (1.0 - flatness[b]).clamp(0.0, 1.0);
                 let smr = 10f32.powf((6.0 + 18.0 * tonality) / 10.0);
-                (spread[b] / smr).max(floor).max(1e-3)
+                let mask = (spread[b] / smr).max(1e-3);
+                // Geometric blend of the mask and the frame's mean level.
+                let blended = mask.powf(1.0 - MSE_BLEND) * mean_level.powf(MSE_BLEND);
+                blended.max(floor).max(1e-3)
             })
             .collect()
     }
@@ -650,14 +668,18 @@ impl AacEncoder {
 
         let mut w = BitWriter::new();
         let mut at = 0usize;
+        // element_instance_tag numbers the elements of each type in order (ISO/IEC
+        // 14496-3 4.5.2.1), so a layout with two CPEs or two SCEs carries distinct tags.
+        let mut tags = [0u32; 3];
         for plan in &elements {
-            let id = match plan.element {
-                Element::Sce => 0u32,
-                Element::Cpe => 1,
-                Element::Lfe => 3,
+            let (id, kind) = match plan.element {
+                Element::Sce => (0u32, 0usize),
+                Element::Cpe => (1, 1),
+                Element::Lfe => (3, 2),
             };
             w.write_bits(id, 3);
-            w.write_bits(0, 4); // element_instance_tag
+            w.write_bits(tags[kind], 4); // element_instance_tag
+            tags[kind] += 1;
             if plan.element == Element::Cpe {
                 w.write_bit(true); // common_window
                 write_ics_info(&mut w, &coded[at]);
@@ -687,6 +709,7 @@ impl AacEncoder {
     /// bitstream cannot carry would come back at the wrong gain, and chaining
     /// the constraint through *silent* bands is what drags a fine scalefactor
     /// into the empty top of the spectrum and spends the frame on leakage.
+    #[allow(clippy::too_many_arguments)] // the encoder passes its per-frame inputs flat; a bundling struct only moves them
     fn quantise(
         &self,
         frame: &ChannelFrame,

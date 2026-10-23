@@ -9,11 +9,18 @@
 //! field below therefore has to agree with the `VAEnc*ParameterBuffer` the
 //! driver was given, or the header describes a picture other than the one the
 //! hardware coded.
+#![allow(dead_code)] // parked with the encoder: the writers return when it is ported
+
+/// `VAEncPackedHeaderSequence`: packed sequence-level header bits.
+pub const PACKED_HEADER_SEQUENCE: u32 = 1;
+/// `VAEncPackedHeaderPicture`: packed picture-level header bits.
+pub const PACKED_HEADER_PICTURE: u32 = 2;
+/// `VAEncPackedHeaderSlice`: packed slice-level header bits.
+pub const PACKED_HEADER_SLICE: u32 = 3;
 
 use ec_core::BitWriter;
 
 use super::Colour;
-use crate::params::enc::{PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PACKED_HEADER_SLICE};
 
 /// A header ready to submit: escaped bytes plus its exact length in bits.
 ///
@@ -51,24 +58,36 @@ pub(super) struct H264Params {
     pub(super) time_scale: u32,
     pub(super) pic_init_qp: u8,
     pub(super) colour: Option<Colour>,
+    pub(super) profile: super::H264Profile,
 }
 
 /// `log2_max_frame_num`, matching `seq_fields.log2_max_frame_num_minus4 = 0`.
 pub(super) const H264_LOG2_MAX_FRAME_NUM: u32 = 4;
 
-/// The sequence parameter set (7.3.2.1), High profile.
+/// The sequence parameter set (7.3.2.1) for the profile in `p`.
+///
+/// Only High (`profile_idc` 100) carries the chroma/bit-depth/scaling tail; Main
+/// (77) and Constrained Baseline (66) end the profile-specific part after
+/// `seq_parameter_set_id`, and Constrained Baseline sets `constraint_set1_flag`.
 pub(super) fn h264_sps(p: &H264Params) -> Packed {
     let mut w = BitWriter::with_capacity(64);
-    w.write_bits(100, 8); // profile_idc: High
-    w.write_bits(0, 8); // constraint_set flags + reserved_zero_2bits
+    let (profile_idc, constraints) = match p.profile {
+        super::H264Profile::ConstrainedBaseline => (66, 0x40), // constraint_set1_flag
+        super::H264Profile::Main => (77, 0),
+        super::H264Profile::High => (100, 0),
+    };
+    w.write_bits(profile_idc, 8);
+    w.write_bits(constraints, 8); // constraint_set flags + reserved_zero_2bits
     w.write_bits(u32::from(p.level_idc), 8);
     w.write_ue(0); // seq_parameter_set_id
-    // High profile tail.
-    w.write_ue(1); // chroma_format_idc: 4:2:0
-    w.write_ue(0); // bit_depth_luma_minus8
-    w.write_ue(0); // bit_depth_chroma_minus8
-    w.write_bit(false); // qpprime_y_zero_transform_bypass_flag
-    w.write_bit(false); // seq_scaling_matrix_present_flag
+    if p.profile == super::H264Profile::High {
+        // High profile tail.
+        w.write_ue(1); // chroma_format_idc: 4:2:0
+        w.write_ue(0); // bit_depth_luma_minus8
+        w.write_ue(0); // bit_depth_chroma_minus8
+        w.write_bit(false); // qpprime_y_zero_transform_bypass_flag
+        w.write_bit(false); // seq_scaling_matrix_present_flag
+    }
     w.write_ue(H264_LOG2_MAX_FRAME_NUM - 4);
     w.write_ue(2); // pic_order_cnt_type 2: output order is decode order
     w.write_ue(1); // max_num_ref_frames
@@ -116,7 +135,7 @@ pub(super) fn h264_pps(p: &H264Params) -> Packed {
     let mut w = BitWriter::with_capacity(16);
     w.write_ue(0); // pic_parameter_set_id
     w.write_ue(0); // seq_parameter_set_id
-    w.write_bit(true); // entropy_coding_mode_flag: CABAC
+    w.write_bit(p.profile.cabac()); // entropy_coding_mode_flag
     w.write_bit(false); // bottom_field_pic_order_in_frame_present_flag
     w.write_ue(0); // num_slice_groups_minus1
     w.write_ue(0); // num_ref_idx_l0_default_active_minus1
@@ -190,13 +209,14 @@ fn trailing(w: &mut BitWriter) {
 /// The syntax crate writes all four structures, so the encoder and the software
 /// HEVC path in this family share one definition of what a parameter set is.
 pub(super) mod hevc {
+    #[allow(unused_imports)]
+    use super::{PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PACKED_HEADER_SLICE};
     use ec_h265_syntax::{
         ConformanceWindow, NalHeader, NalUnitType, Pps, ProfileTierLevel, ShortTermRefPicSet,
         SliceHeader, SliceType, Sps, Vps,
     };
 
     use super::{Colour, Packed, nal};
-    use crate::params::enc::{PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PACKED_HEADER_SLICE};
 
     /// Geometry and timing for the parameter sets.
     pub(in crate::enc) struct Params {
@@ -240,6 +260,9 @@ pub(super) mod hevc {
             log2_max_poc_lsb_minus4: 8,
             max_dec_pic_buffering_minus1: 1,
             max_num_reorder_pics: 0,
+            max_latency_increase_plus1: 0,
+            extension_flags: 0,
+            range: Default::default(),
             log2_min_cb_size_minus3: 0,
             log2_diff_max_min_cb_size: 3,
             log2_min_tb_size_minus2: 0,
@@ -247,6 +270,7 @@ pub(super) mod hevc {
             max_transform_hierarchy_depth_inter: 1,
             max_transform_hierarchy_depth_intra: 1,
             scaling_list_enabled: false,
+            scaling_list: None,
             amp_enabled: true,
             sao_enabled: true,
             pcm_enabled: false,
@@ -381,10 +405,11 @@ pub(super) mod hevc {
 /// syntax: a field written here that disagrees with the parameter buffer is a
 /// picture described two ways, and the driver believes this one.
 pub(super) mod av1 {
+    #[allow(unused_imports)]
+    use super::{PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PACKED_HEADER_SLICE};
     use ec_core::BitWriter;
 
     use super::{Colour, Packed};
-    use crate::params::enc::{PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE};
 
     /// `OrderHintBits`, and the width of `order_hint` in a frame header.
     pub(in crate::enc) const ORDER_HINT_BITS: u32 = 8;
@@ -622,5 +647,66 @@ pub(super) mod av1 {
             k += 1;
         }
         k
+    }
+}
+
+#[cfg(test)]
+mod h264_profile_tests {
+    use super::*;
+
+    fn params(profile: super::super::H264Profile) -> H264Params {
+        H264Params {
+            level_idc: 40,
+            mb_width: 40,
+            mb_height: 30,
+            crop_right: 0,
+            crop_bottom: 0,
+            num_units_in_tick: 1,
+            time_scale: 60,
+            pic_init_qp: 26,
+            colour: None,
+            profile,
+        }
+    }
+
+    /// The SPS NAL payload after the one-byte NAL header: `profile_idc`,
+    /// constraint byte, level, then the RBSP.
+    fn sps_profile(profile: super::super::H264Profile) -> (u8, u8, usize) {
+        let packed = h264_sps(&params(profile));
+        // Start code (4 bytes) then the NAL header (0x67).
+        (packed.bytes[5], packed.bytes[6], packed.bits as usize)
+    }
+
+    #[test]
+    fn each_profile_writes_its_profile_idc_and_constraints() {
+        use super::super::H264Profile::*;
+        assert_eq!(sps_profile(ConstrainedBaseline).0, 66);
+        assert_eq!(sps_profile(ConstrainedBaseline).1, 0x40);
+        assert_eq!(sps_profile(Main).0, 77);
+        assert_eq!(sps_profile(Main).1, 0);
+        assert_eq!(sps_profile(High).0, 100);
+    }
+
+    #[test]
+    fn main_and_baseline_omit_the_high_only_tail() {
+        use super::super::H264Profile::*;
+        // The High tail is chroma_format_idc, two bit depths, the bypass flag
+        // and the scaling-list flag. Main and Baseline must not carry them, so
+        // their SPS is shorter than High's for the same picture.
+        let high = sps_profile(High).2;
+        assert!(sps_profile(Main).2 < high);
+        assert_eq!(sps_profile(Main).2, sps_profile(ConstrainedBaseline).2);
+        // ue(1) chroma_format_idc is 3 bits, two ue(0) depths are 1 bit each,
+        // then the two flags: 3 + 1 + 1 + 1 + 1 = 7 bits. The rbsp_trailing_bits
+        // alignment can move the count by one more.
+        assert!((7..=8).contains(&(high - sps_profile(Main).2)));
+    }
+
+    #[test]
+    fn profile_selects_cabac_only_above_baseline() {
+        use super::super::H264Profile::*;
+        assert!(!ConstrainedBaseline.cabac());
+        assert!(Main.cabac());
+        assert!(High.cabac());
     }
 }

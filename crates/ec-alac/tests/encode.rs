@@ -266,7 +266,7 @@ fn muxed_stream_is_alac_at_the_right_rate_and_ffmpeg_agrees() {
     let Some(stdout) = ffmpeg_decode(&out_path, "s16le") else { return };
     let want: Vec<i16> = samples.iter().map(|&s| s as i16).collect();
     let got: Vec<i16> = stdout
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     assert_eq!(got, want, "ffmpeg decode of the muxed file vs source PCM");

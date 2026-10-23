@@ -1,0 +1,10 @@
+   Compiling ec-vp8 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-vp8)
+    Finished `release` profile [optimized] target(s) in 3.96s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_vp8-e1d61f635f54cd88)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-99cd28bb80c4552c)
+     Running tests/header_parse.rs (/home/user/.cache/tgt-testcut-rest/release/deps/header_parse-feffe67e7b50ddf7)
+     Running tests/ivf.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ivf-bb4c6696c13c0a22)
+     Running tests/keyframe_exact.rs (/home/user/.cache/tgt-testcut-rest/release/deps/keyframe_exact-636f806ce9e3a6df)
+     Running tests/malformed_no_panic.rs (/home/user/.cache/tgt-testcut-rest/release/deps/malformed_no_panic-a831a609b3b03bfb)
+     Running tests/stream_exact.rs (/home/user/.cache/tgt-testcut-rest/release/deps/stream_exact-eaf6d17588def551)
+   Doc-tests ec_vp8

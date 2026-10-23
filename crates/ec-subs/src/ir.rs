@@ -7,6 +7,19 @@
 //! ASS `\pos` and `\an` — rides beside the runs instead of inside them, because
 //! it applies to the cue as a whole.
 
+/// How a karaoke syllable is highlighted, after libass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KaraokeMode {
+    /// `\k`: the syllable is secondary-coloured until `start_cs`, then switches at once to primary.
+    #[default]
+    Fill,
+    /// `\kf` / `\K`: a left-to-right sweep from secondary to primary across the syllable.
+    Sweep,
+    /// `\ko`: like `Fill`, but the switch is of the outline only (the outline stays hidden until the
+    /// syllable starts).
+    Outline,
+}
+
 /// One inline run of a cue body.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Segment {
@@ -52,10 +65,20 @@ pub enum Segment {
         /// What the class applies to.
         children: Vec<Segment>,
     },
-    /// ASS `{\k<cs>}`: the run is highlighted for `cs` centiseconds.
+    /// ASS karaoke syllable (`\k`, `\K`, `\kf`, `\ko`, `\kt`).
+    ///
+    /// The syllable is highlighted from `start_cs` to `start_cs + cs`, both in
+    /// centiseconds from the cue start. A run split by a style block inside one
+    /// syllable repeats the same `start_cs` and `cs`; a renderer groups by that pair.
     Karaoke {
         /// Beat length in centiseconds.
         cs: u32,
+        /// Syllable start, centiseconds from the cue start (`\kt` sets it absolutely).
+        start_cs: u32,
+        /// How the highlight is drawn.
+        mode: KaraokeMode,
+        /// `\2c` override of the not-yet-sung colour; `None` is the style's secondary.
+        secondary: Option<(u8, u8, u8)>,
         /// The syllable under the beat.
         children: Vec<Segment>,
     },
@@ -114,6 +137,8 @@ pub struct SubtitleStyle {
     pub font_size: Option<f32>,
     /// Fill colour, RGBA.
     pub primary_color: Option<(u8, u8, u8, u8)>,
+    /// Secondary (karaoke, not yet sung) colour, RGBA.
+    pub secondary_color: Option<(u8, u8, u8, u8)>,
     /// Outline colour, RGBA.
     pub outline_color: Option<(u8, u8, u8, u8)>,
     /// Box/shadow colour, RGBA.
@@ -262,6 +287,9 @@ mod tests {
             Segment::Timestamp { offset_us: 5 },
             Segment::Karaoke {
                 cs: 42,
+                start_cs: 0,
+                mode: KaraokeMode::Fill,
+                secondary: None,
                 children: vec![Segment::Text("ka".into())],
             },
         ];

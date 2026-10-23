@@ -1,4 +1,5 @@
-//! MD5 (IETF RFC 1321), for the decoded picture hash SEI and nothing else.
+//! MD5 (IETF RFC 1321), for the decoded picture hash SEI and the whole-output digests
+//! that conformance packages ship alongside a bitstream.
 //!
 //! Not a security primitive and not offered as one: the spec names MD5 as the
 //! picture hash, so this exists to reproduce that one number.
@@ -116,6 +117,8 @@ impl Md5 {
                 return;
             }
         }
+        // The remainder is handled below; as_chunks needs a newer MSRV than this crate targets.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let mut chunks = data.chunks_exact(64);
         for block in &mut chunks {
             let mut b = [0u8; 64];

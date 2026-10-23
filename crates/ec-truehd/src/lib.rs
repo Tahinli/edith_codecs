@@ -20,11 +20,21 @@
 //!   predictor filters, Huffman/LSB residual entropy and the channel
 //!   matrixing that turns decorrelated substream channels back into PCM,
 //!   plus the stream's own lossless check.
-//! - **Out of scope, refused by name via [`Error::Unsupported`]**: the 4th
-//!   substream (16-channel object/Atmos audio) — a different, unrelated
-//!   payload riding the same container, not a bigger version of the 3 PCM
-//!   presentations above — and any metadata semantics beyond parsing the
-//!   bytes (dialogue normalisation curves, downmix hints and the like stay
+//! - **Atmos streams are decoded as their PCM presentations**: a TrueHD
+//!   stream may carry a 4th substream (Dolby Atmos object audio, a 16-channel
+//!   extension). It is backward compatible: substreams 0..2 are the ordinary
+//!   2-ch, 6-ch and 8-ch PCM presentations, and the decoder reconstructs the
+//!   highest of them (8-ch, 7.1) exactly as it does for a 3-substream stream.
+//!   The 4th substream is located through its directory end pointer and
+//!   skipped, not decoded, the way legacy decoders (ffmpeg's included) do. Its
+//!   bytes are never read, so its parity is not checked. A directory with more
+//!   than 4 entries is [`Error::Corrupt`].
+//! - **Out of scope, refused by name via [`Error::Unsupported`]**: decoding the
+//!   Atmos object audio itself (the 16-channel presentation carried by the 4th
+//!   substream), a different payload riding the same access unit and not a
+//!   bigger version of the 3 PCM presentations above; a PCM substream asking
+//!   for more than 8 matrix channels; and any metadata semantics beyond parsing
+//!   the bytes (dialogue normalisation curves, downmix hints and the like stay
 //!   unopinionated data on the parsed structs, same as this family treats
 //!   AC-3's `dialnorm`).
 //!

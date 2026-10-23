@@ -36,6 +36,7 @@ fn main() {
             sbr_present: true,
             ps_present: false,
             extension_sample_rate: Some(44100),
+            pce: Vec::new(),
         });
         ec_aac::AacDecoder::with_config_bytes(&asc).expect("asc parses")
     } else {

@@ -1,0 +1,22 @@
+[Script Info]
+Title: Centisecond timing edges
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:00.01,Default,,0,0,0,,first centisecond
+Dialogue: 0,0:00:00.99,0:00:01.00,Default,,0,0,0,,ninety nine
+Dialogue: 0,0:00:01.00,0:00:01.00,Default,,0,0,0,,zero duration at one second
+Dialogue: 0,0:00:09.99,0:00:10.00,Default,,0,0,0,,just under ten
+Dialogue: 0,0:00:59.99,0:01:00.00,Default,,0,0,0,,minute boundary
+Dialogue: 0,0:59:59.99,1:00:00.00,Default,,0,0,0,,hour boundary
+Dialogue: 0,9:59:59.99,9:59:59.99,Default,,0,0,0,,last instant before ten hours
+Dialogue: 0,0:00:12.34,0:00:12.56,Default,,0,0,0,,fractional centiseconds 34 to 56
+Dialogue: 0,0:00:13.10,0:00:13.20,Default,,0,0,0,,tenths of a second

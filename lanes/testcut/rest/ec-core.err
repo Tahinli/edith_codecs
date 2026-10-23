@@ -1,0 +1,4 @@
+   Compiling ec-core v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-core)
+    Finished `release` profile [optimized] target(s) in 1.52s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_core-65f263608b2978ea)
+   Doc-tests ec_core

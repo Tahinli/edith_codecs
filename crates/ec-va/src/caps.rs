@@ -1,18 +1,16 @@
 //! Capability probing: what this GPU can actually decode and encode.
 //!
 //! [`Profile`] and [`Entrypoint`] are safe mirrors of the C enums, each with an
-//! `Unknown(i32)` arm. That arm is not defensive decoration: `vaQueryConfigProfiles`
-//! writes driver-chosen `int`s into our array, and a newer libva can name a
-//! profile this build has never heard of. Decoding that into a `#[repr(i32)]`
-//! Rust enum would be undefined behaviour — which is exactly how header drift
-//! turns into a soundness bug.
+//! `Unknown(i32)` arm: a newer libva can name a profile this build has never
+//! heard of, and that must survive as data rather than become an invalid enum.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
-use crate::config::{Config, SurfaceCaps};
+use cros_libva::{VAConfigAttrib, VAConfigAttribType};
+
+use crate::config::{Config, SurfaceCaps, caps_of};
 use crate::display::Display;
-use crate::error::{Result, check};
-use crate::sys;
+use crate::error::{Result, va_ok};
 
 /// Generates a safe enum mirroring a C enum, plus its raw conversions.
 ///
@@ -31,7 +29,7 @@ macro_rules! va_enum {
         pub enum $name {
             $( #[allow(missing_docs)] $variant, )*
             /// A value this build does not know. Carried, never guessed at.
-            Unknown(i32),
+            Unknown($raw),
         }
 
         impl $name {
@@ -64,7 +62,7 @@ macro_rules! va_enum {
 
 va_enum! {
     /// `VAProfile`, transcribed from `va.h:502-547` (libva 1.23).
-    Profile: sys::VAProfile {
+    Profile: i32 {
         None = -1,
         MPEG2Simple = 0,
         MPEG2Main = 1,
@@ -112,7 +110,7 @@ va_enum! {
 
 va_enum! {
     /// `VAEntrypoint`, transcribed from `va.h:552-616` (libva 1.23).
-    Entrypoint: sys::VAEntrypoint {
+    Entrypoint: u32 {
         VLD = 1,
         IZZ = 2,
         IDCT = 3,
@@ -149,22 +147,20 @@ impl Profile {
 }
 
 /// What one (profile, entrypoint) pair supports.
+/// One supported (profile, entrypoint) pair and what the driver says about it.
 #[derive(Debug, Clone)]
 pub struct CapEntry {
     /// The profile.
     pub profile: Profile,
     /// The entrypoint.
     pub entrypoint: Entrypoint,
-    /// `VAConfigAttribRTFormat` bitmask (`VA_RT_FORMAT_*`).
+    /// `VAConfigAttribRTFormat`: the `VA_RT_FORMAT_*` mask.
     pub rt_formats: u32,
-    /// `VAConfigAttribEncPackedHeaders` bitmask (`VA_ENC_PACKED_HEADER_*`);
-    /// zero for a decode entrypoint. An encoder has to ask for these in its
-    /// config before the driver will use the headers it writes.
+    /// `VAConfigAttribEncPackedHeaders`.
     pub packed_headers: u32,
-    /// `VAConfigAttribRateControl` bitmask (`VA_RC_*`); zero for decode.
+    /// `VAConfigAttribRateControl`.
     pub rate_control: u32,
-    /// Surface geometry and pixel formats this config accepts, when the driver
-    /// reports them. `None` if `vaQuerySurfaceAttributes` refused the config.
+    /// Surface constraints, when the config could be created to ask.
     pub surfaces: Option<SurfaceCaps>,
 }
 
@@ -180,8 +176,6 @@ impl CapEntry {
 pub struct CapReport {
     /// `vaQueryVendorString`.
     pub vendor: String,
-    /// Runtime libva version.
-    pub version: (i32, i32),
     /// One entry per supported (profile, entrypoint) pair, in driver order.
     pub entries: Vec<CapEntry>,
     /// FourCCs from `vaQueryImageFormats` — the formats `vaGetImage` can produce.
@@ -192,11 +186,10 @@ impl CapReport {
     /// Probe a display. One `vaCreateConfig`/`vaDestroyConfig` round trip per
     /// supported pair; ~15 pairs on a typical GPU, so this is cheap enough to
     /// do once at startup and cache.
-    pub fn probe(display: &Arc<Display>) -> Result<CapReport> {
+    pub fn probe(display: &Rc<Display>) -> Result<CapReport> {
         let entries = probe_entries(display)?;
         Ok(CapReport {
-            vendor: display.vendor()?,
-            version: display.version(),
+            vendor: crate::display::vendor(display)?,
             entries,
             image_formats: query_image_formats(display)?,
         })
@@ -226,7 +219,7 @@ impl CapReport {
     }
 }
 
-fn probe_entries(display: &Arc<Display>) -> Result<Vec<CapEntry>> {
+fn probe_entries(display: &Rc<Display>) -> Result<Vec<CapEntry>> {
     let mut entries = Vec::new();
     for profile in query_profiles(display)? {
         for entrypoint in query_entrypoints(display, profile)? {
@@ -235,10 +228,10 @@ fn probe_entries(display: &Arc<Display>) -> Result<Vec<CapEntry>> {
             // Creating the config is also how the legal surface sizes are
             // discovered: `vaQuerySurfaceAttributes` needs a config id. A
             // driver may refuse a pair it just advertised (radeonsi does this
-            // for some encode entrypoints) — that is data, not an error, so it
+            // for some encode entrypoints), which is data, not an error, so it
             // lands as `surfaces: None` instead of failing the whole probe.
             let surfaces = match Config::new(display, profile, entrypoint, &[]) {
-                Ok(config) => config.surface_caps().ok(),
+                Ok(mut config) => caps_of(&mut config).ok(),
                 Err(_) => None,
             };
             entries.push(CapEntry {
@@ -254,99 +247,54 @@ fn probe_entries(display: &Arc<Display>) -> Result<Vec<CapEntry>> {
     Ok(entries)
 }
 
-fn query_profiles(display: &Arc<Display>) -> Result<Vec<Profile>> {
-    // SAFETY: valid display; vaMaxNumProfiles only reads driver constants.
-    let max = unsafe { sys::vaMaxNumProfiles(display.handle()) };
-    let max = max.max(0) as usize;
-    let mut raw = vec![0 as sys::VAProfile; max];
-    let mut count: i32 = 0;
-    // SAFETY: `raw` has `max` elements, which is the capacity libva promises
-    // never to exceed (va.h:1524). `count` is a valid out-parameter. On return
-    // only the first `count` entries are initialized, and only those are read.
-    let status =
-        unsafe { sys::vaQueryConfigProfiles(display.handle(), raw.as_mut_ptr(), &mut count) };
-    check("vaQueryConfigProfiles", status)?;
-    raw.truncate(count.clamp(0, max as i32) as usize);
+fn query_profiles(display: &Rc<Display>) -> Result<Vec<Profile>> {
+    let raw = va_ok("vaQueryConfigProfiles", display.query_config_profiles())?;
     Ok(raw.into_iter().map(Profile::from_raw).collect())
 }
 
-fn query_entrypoints(display: &Arc<Display>, profile: Profile) -> Result<Vec<Entrypoint>> {
-    // SAFETY: valid display; reads driver constants only.
-    let max = unsafe { sys::vaMaxNumEntrypoints(display.handle()) };
-    let max = max.max(0) as usize;
-    let mut raw = vec![0 as sys::VAEntrypoint; max];
-    let mut count: i32 = 0;
-    // SAFETY: as in `query_profiles` — buffer sized by vaMaxNumEntrypoints,
-    // valid out-parameter, only the reported prefix is read.
-    let status = unsafe {
-        sys::vaQueryConfigEntrypoints(
-            display.handle(),
-            profile.as_raw(),
-            raw.as_mut_ptr(),
-            &mut count,
-        )
-    };
-    check("vaQueryConfigEntrypoints", status)?;
-    raw.truncate(count.clamp(0, max as i32) as usize);
+fn query_entrypoints(display: &Rc<Display>, profile: Profile) -> Result<Vec<Entrypoint>> {
+    let raw = va_ok(
+        "vaQueryConfigEntrypoints",
+        display.query_config_entrypoints(profile.as_raw()),
+    )?;
     Ok(raw.into_iter().map(Entrypoint::from_raw).collect())
 }
 
-/// The three config attributes this family reads, in one round trip:
-/// RT format, packed headers, rate control modes.
 fn query_attribs(
-    display: &Arc<Display>,
+    display: &Rc<Display>,
     profile: Profile,
     entrypoint: Entrypoint,
 ) -> Result<[u32; 3]> {
     let mut attrs = [
-        sys::VAConfigAttrib {
-            type_: sys::VAConfigAttribRTFormat,
+        VAConfigAttrib {
+            type_: VAConfigAttribType::VAConfigAttribRTFormat,
             value: 0,
         },
-        sys::VAConfigAttrib {
-            type_: sys::VAConfigAttribEncPackedHeaders,
+        VAConfigAttrib {
+            type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
             value: 0,
         },
-        sys::VAConfigAttrib {
-            type_: sys::VAConfigAttribRateControl,
+        VAConfigAttrib {
+            type_: VAConfigAttribType::VAConfigAttribRateControl,
             value: 0,
         },
     ];
-    // SAFETY: `attrs` is a valid, initialized array of 1 VAConfigAttrib and the
-    // length passed matches. vaGetConfigAttributes writes only `value`.
-    let status = unsafe {
-        sys::vaGetConfigAttributes(
-            display.handle(),
-            profile.as_raw(),
-            entrypoint.as_raw(),
-            attrs.as_mut_ptr(),
-            attrs.len() as i32,
-        )
-    };
-    check("vaGetConfigAttributes", status)?;
+    va_ok(
+        "vaGetConfigAttributes",
+        display.get_config_attributes(profile.as_raw(), entrypoint.as_raw(), &mut attrs),
+    )?;
     // VA_ATTRIB_NOT_SUPPORTED is 0xffffffff; a decode entrypoint answers that
     // for the encode-only attributes, and "all bits set" is not a capability.
-    let value = |a: &sys::VAConfigAttrib| if a.value == u32::MAX { 0 } else { a.value };
+    let value = |a: &VAConfigAttrib| if a.value == u32::MAX { 0 } else { a.value };
     Ok([value(&attrs[0]), value(&attrs[1]), value(&attrs[2])])
 }
 
-fn query_image_formats(display: &Arc<Display>) -> Result<Vec<u32>> {
-    // SAFETY: valid display; reads driver constants only.
-    let max = unsafe { sys::vaMaxNumImageFormats(display.handle()) };
-    let max = max.max(0) as usize;
-    let mut formats = vec![sys::VAImageFormat::default(); max];
-    let mut count: i32 = 0;
-    // SAFETY: buffer sized by vaMaxNumImageFormats as the header requires
-    // (va.h:4773); `count` is a valid out-parameter; only the reported prefix
-    // is read afterwards.
-    let status =
-        unsafe { sys::vaQueryImageFormats(display.handle(), formats.as_mut_ptr(), &mut count) };
-    check("vaQueryImageFormats", status)?;
-    formats.truncate(count.clamp(0, max as i32) as usize);
+fn query_image_formats(display: &Rc<Display>) -> Result<Vec<u32>> {
+    let formats = va_ok("vaQueryImageFormats", display.query_image_formats())?;
     Ok(formats.into_iter().map(|f| f.fourcc).collect())
 }
 
-/// A FourCC as its four ASCII characters, for logs and reports.
+/// Render a FourCC as its four characters, `?` for non-printable bytes.
 pub fn fourcc_str(fourcc: u32) -> String {
     fourcc
         .to_le_bytes()
@@ -385,8 +333,8 @@ mod tests {
 
     #[test]
     fn fourcc_rendering() {
-        assert_eq!(fourcc_str(sys::VA_FOURCC_NV12), "NV12");
-        assert_eq!(fourcc_str(sys::VA_FOURCC_P010), "P010");
+        assert_eq!(fourcc_str(cros_libva::VA_FOURCC_NV12), "NV12");
+        assert_eq!(fourcc_str(cros_libva::VA_FOURCC_P010), "P010");
         assert_eq!(fourcc_str(0), "????");
     }
 }

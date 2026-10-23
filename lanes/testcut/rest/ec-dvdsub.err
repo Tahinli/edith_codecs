@@ -1,0 +1,5 @@
+   Compiling ec-dvdsub v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dvdsub)
+    Finished `release` profile [optimized] target(s) in 2.49s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_dvdsub-94307b118a06e51a)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-8a8035389518dc2f)
+   Doc-tests ec_dvdsub

@@ -6,6 +6,7 @@
 //! `allow_high_precision_mv && use_mv_hp(predictor)`, so the candidate scan
 //! runs even though no motion compensation happens.
 
+use crate::adapt::{inc_mv, Counts};
 use crate::bool::BoolDecoder;
 use crate::header::FrameContext;
 use crate::modes::{MiInfo, MiState};
@@ -166,6 +167,7 @@ pub(crate) fn read_inter_frame_mode_info(
     y_mis: usize,
     partition: u8,
     cur_seg: &mut [u8],
+    counts: &mut Counts,
 ) -> crate::Result<MiInfo> {
     let above = st.above_mi(row, col).cloned();
     let left = st.left_mi(row, col, c.tile_col_start).cloned();
@@ -176,9 +178,9 @@ pub(crate) fn read_inter_frame_mode_info(
 
     let mut seg_id_predicted = false;
     let segment = read_inter_segment_id(r, c, nb, row, col, x_mis, y_mis, cur_seg, &mut seg_id_predicted);
-    let skip = read_skip(r, c, fc, segment, nb);
-    let inter_block = read_is_inter_block(r, c, fc, segment, nb);
-    let tx_size = read_tx_size(r, c, fc, sb_type, nb, !skip || !inter_block);
+    let skip = read_skip(r, c, fc, segment, nb, counts);
+    let inter_block = read_is_inter_block(r, c, fc, segment, nb, counts);
+    let tx_size = read_tx_size(r, c, fc, sb_type, nb, !skip || !inter_block, counts);
 
     let mut info = MiInfo {
         sb_type,
@@ -197,9 +199,9 @@ pub(crate) fn read_inter_frame_mode_info(
         interp_filter: SWITCHABLE_FILTERS,
     };
     if inter_block {
-        read_inter_block_mode_info(r, st, c, fc, &mut info, nb, row, col, partition)?;
+        read_inter_block_mode_info(r, st, c, fc, &mut info, nb, row, col, partition, counts)?;
     } else {
-        read_intra_block_mode_info(r, fc, &mut info);
+        read_intra_block_mode_info(r, fc, &mut info, counts);
     }
     Ok(info)
 }
@@ -292,13 +294,16 @@ fn read_skip(
     fc: &FrameContext,
     segment_id: u8,
     nb: Nb<'_>,
+    counts: &mut Counts,
 ) -> bool {
     if seg_feature(c.seg, segment_id, SEG_LVL_SKIP) {
         true
     } else {
         let ctx = usize::from(nb.above.is_some_and(|m| m.skip))
             + usize::from(nb.left.is_some_and(|m| m.skip));
-        r.read_bool(fc.skip[ctx])
+        let skip = r.read_bool(fc.skip[ctx]);
+        counts.skip[ctx][usize::from(skip)] += 1;
+        skip
     }
 }
 
@@ -326,11 +331,15 @@ fn read_is_inter_block(
     fc: &FrameContext,
     segment_id: u8,
     nb: Nb<'_>,
+    counts: &mut Counts,
 ) -> bool {
     if seg_feature(c.seg, segment_id, SEG_LVL_REF_FRAME) {
         c.seg.feature_data[segment_id as usize][SEG_LVL_REF_FRAME] != INTRA_FRAME as i16
     } else {
-        r.read_bool(fc.intra_inter[intra_inter_context(nb)])
+        let ctx = intra_inter_context(nb);
+        let bit = r.read_bool(fc.intra_inter[ctx]);
+        counts.intra_inter[ctx][usize::from(bit)] += 1;
+        bit
     }
 }
 
@@ -342,6 +351,7 @@ fn read_tx_size(
     sb_type: usize,
     nb: Nb<'_>,
     allow_select: bool,
+    counts: &mut Counts,
 ) -> usize {
     let max_tx = MAX_TXSIZE_LOOKUP[sb_type] as usize;
     if allow_select && c.tx_mode == TX_MODE_SELECT && sb_type >= 3 {
@@ -374,6 +384,11 @@ fn read_tx_size(
                 tx += r.read_bool(probs[2]) as usize;
             }
         }
+        match max_tx {
+            1 => counts.tx8[ctx][tx] += 1,
+            2 => counts.tx16[ctx][tx] += 1,
+            _ => counts.tx32[ctx][tx] += 1,
+        }
         tx
     } else {
         max_tx.min(TX_MODE_TO_BIGGEST_TX_SIZE[c.tx_mode as usize])
@@ -381,8 +396,10 @@ fn read_tx_size(
 }
 
 /// `read_inter_mode`.
-fn read_inter_mode(r: &mut BoolDecoder, fc: &FrameContext, ctx: usize) -> u8 {
-    NEARESTMV + r.read_tree(&INTER_MODE_TREE, &fc.inter_mode[ctx])
+fn read_inter_mode(r: &mut BoolDecoder, fc: &FrameContext, ctx: usize, counts: &mut Counts) -> u8 {
+    let offset = r.read_tree(&INTER_MODE_TREE, &fc.inter_mode[ctx]);
+    counts.inter_mode[ctx][offset as usize] += 1;
+    NEARESTMV + offset
 }
 
 /// `get_mode_context` (`vp9_decodemv.c:681`): the two nearest candidates'
@@ -416,38 +433,51 @@ fn switchable_interp_ctx(nb: Nb<'_>) -> usize {
 }
 
 /// `read_intra_block_mode_info` (the intra fallback inside an inter frame).
-fn read_intra_block_mode_info(r: &mut BoolDecoder, fc: &FrameContext, info: &mut MiInfo) {
+fn read_intra_block_mode_info(
+    r: &mut BoolDecoder,
+    fc: &FrameContext,
+    info: &mut MiInfo,
+    counts: &mut Counts,
+) {
     let bsize = info.sb_type;
+    // Every y-mode read counts into `y_mode[group]` (libvpx `read_intra_mode_y`).
+    let mut y = |r: &mut BoolDecoder, group: usize| -> u8 {
+        let m = r.read_tree(&INTRA_MODE_TREE, &fc.y_mode[group]);
+        counts.y_mode[group][m as usize] += 1;
+        m
+    };
     match bsize {
         0 => {
             for i in 0..4 {
-                info.bmi[i] = r.read_tree(&INTRA_MODE_TREE, &fc.y_mode[0]);
+                info.bmi[i] = y(r, 0);
             }
             info.mode = info.bmi[3];
         }
         1 => {
-            let m0 = r.read_tree(&INTRA_MODE_TREE, &fc.y_mode[0]);
+            let m0 = y(r, 0);
             info.bmi[0] = m0;
             info.bmi[2] = m0;
-            let m1 = r.read_tree(&INTRA_MODE_TREE, &fc.y_mode[0]);
+            let m1 = y(r, 0);
             info.bmi[1] = m1;
             info.bmi[3] = m1;
             info.mode = m1;
         }
         2 => {
-            let m0 = r.read_tree(&INTRA_MODE_TREE, &fc.y_mode[0]);
+            let m0 = y(r, 0);
             info.bmi[0] = m0;
             info.bmi[1] = m0;
-            let m2 = r.read_tree(&INTRA_MODE_TREE, &fc.y_mode[0]);
+            let m2 = y(r, 0);
             info.bmi[2] = m2;
             info.bmi[3] = m2;
             info.mode = m2;
         }
         _ => {
-            info.mode = r.read_tree(&INTRA_MODE_TREE, &fc.y_mode[SIZE_GROUP_LOOKUP[bsize] as usize]);
+            info.mode = y(r, SIZE_GROUP_LOOKUP[bsize] as usize);
         }
     }
-    info.uv_mode = r.read_tree(&INTRA_MODE_TREE, &fc.uv_mode[info.mode as usize]);
+    let uv = r.read_tree(&INTRA_MODE_TREE, &fc.uv_mode[info.mode as usize]);
+    counts.uv_mode[info.mode as usize][uv as usize] += 1;
+    info.uv_mode = uv;
     info.interp_filter = SWITCHABLE_FILTERS;
     info.ref_frame = [INTRA_FRAME, NO_REF_FRAME];
 }
@@ -863,6 +893,7 @@ fn read_mv(
     pred: (i32, i32),
     fc: &FrameContext,
     allow_hp: bool,
+    counts: &mut Counts,
 ) -> ((i32, i32), (i32, i32)) {
     let joint = r.read_tree(&MV_JOINT_TREE, &fc.nmv_joints);
     let use_hp = allow_hp && use_mv_hp(pred);
@@ -877,6 +908,7 @@ fn read_mv(
     if joint & 1 != 0 {
         diff.1 = read_mv_component(r, fc, 1, use_hp);
     }
+    inc_mv(counts, diff);
     ((pred.0 + diff.0, pred.1 + diff.1), diff)
 }
 
@@ -889,13 +921,14 @@ fn assign_mv(
     near_nearest: &[(i32, i32); 2],
     is_compound: usize,
     allow_hp: bool,
+    counts: &mut Counts,
 ) -> crate::Result<([(i32, i32); 2], [(i32, i32); 2])> {
     let mut mv = [(0, 0); 2];
     let mut diff = [(0, 0); 2];
     match mode {
         NEWMV => {
             for i in 0..1 + is_compound {
-                let (m, d) = read_mv(r, ref_mv[i], fc, allow_hp);
+                let (m, d) = read_mv(r, ref_mv[i], fc, allow_hp, counts);
                 mv[i] = m;
                 diff[i] = d;
             }
@@ -917,10 +950,13 @@ fn read_block_reference_mode(
     c: &InterBlockCtx<'_>,
     fc: &FrameContext,
     nb: Nb<'_>,
+    counts: &mut Counts,
 ) -> u8 {
     if c.ifs.reference_mode == REFERENCE_MODE_SELECT {
         let ctx = reference_mode_context(c, nb);
-        u8::from(r.read_bool(fc.comp_inter[ctx]))
+        let bit = r.read_bool(fc.comp_inter[ctx]);
+        counts.comp_inter[ctx][usize::from(bit)] += 1;
+        u8::from(bit)
     } else {
         c.ifs.reference_mode
     }
@@ -1156,25 +1192,29 @@ fn read_ref_frames(
     nb: Nb<'_>,
     segment_id: u8,
     out: &mut [i8; 2],
+    counts: &mut Counts,
 ) {
     if seg_feature(c.seg, segment_id, SEG_LVL_REF_FRAME) {
         out[0] = c.seg.feature_data[segment_id as usize][SEG_LVL_REF_FRAME] as i8;
         out[1] = NO_REF_FRAME;
         return;
     }
-    let mode = read_block_reference_mode(r, c, fc, nb);
+    let mode = read_block_reference_mode(r, c, fc, nb, counts);
     if mode == COMPOUND_REFERENCE {
         let idx = usize::from(c.sign_bias[c.ifs.comp_fixed_ref as usize]);
         let ctx = pred_context_comp_ref_p(c, nb);
         let bit = usize::from(r.read_bool(fc.comp_ref[ctx]));
+        counts.comp_ref[ctx][bit] += 1;
         out[idx] = c.ifs.comp_fixed_ref;
         out[1 - idx] = c.ifs.comp_var_ref[bit];
     } else {
         let ctx0 = pred_context_single_ref_p1(nb);
         let bit0 = r.read_bool(fc.single_ref[ctx0][0]);
+        counts.single_ref[ctx0][0][usize::from(bit0)] += 1;
         if bit0 {
             let ctx1 = pred_context_single_ref_p2(nb);
             let bit1 = r.read_bool(fc.single_ref[ctx1][1]);
+            counts.single_ref[ctx1][1][usize::from(bit1)] += 1;
             out[0] = if bit1 { ALTREF_FRAME } else { GOLDEN_FRAME };
         } else {
             out[0] = LAST_FRAME;
@@ -1195,10 +1235,11 @@ fn read_inter_block_mode_info(
     row: usize,
     col: usize,
     partition: u8,
+    counts: &mut Counts,
 ) -> crate::Result<()> {
     let bsize = info.sb_type;
     let mut best_ref_mvs = [(0, 0); 2];
-    read_ref_frames(r, c, fc, nb, info.segment, &mut info.ref_frame);
+    read_ref_frames(r, c, fc, nb, info.segment, &mut info.ref_frame, counts);
     let is_compound = usize::from(info.ref_frame[1] > INTRA_FRAME);
     let inter_mode_ctx = get_mode_context(st, c, bsize, row, col);
 
@@ -1210,7 +1251,7 @@ fn read_inter_block_mode_info(
             ));
         }
     } else if bsize >= 3 {
-        info.mode = read_inter_mode(r, fc, inter_mode_ctx);
+        info.mode = read_inter_mode(r, fc, inter_mode_ctx, counts);
     }
 
     info.interp_filter = if c.frame_interp == SWITCHABLE {
@@ -1222,6 +1263,7 @@ fn read_inter_block_mode_info(
             );
         }
         let t = r.read_tree(&SWITCHABLE_INTERP_TREE, &fc.switchable_interp[ictx]);
+        counts.switchable_interp[ictx][t as usize] += 1;
         if crate::interdump_enabled() {
             eprintln!("SWItype {t}");
         }
@@ -1255,7 +1297,7 @@ fn read_inter_block_mode_info(
             let mut idx = 0usize;
             while idx < 2 {
                 let j = idy * 2 + idx;
-                b_mode = read_inter_mode(r, fc, inter_mode_ctx);
+                b_mode = read_inter_mode(r, fc, inter_mode_ctx, counts);
                 info.bmi[j] = b_mode;
                 if b_mode == NEARESTMV || b_mode == NEARMV {
                     for rf in 0..1 + is_compound {
@@ -1282,6 +1324,7 @@ fn read_inter_block_mode_info(
                     &best_sub8x8,
                     is_compound,
                     c.allow_hp,
+                    counts,
                 )?;
                 info.bmi_mv[j] = mv;
                 info.mv_diff = diff;
@@ -1315,6 +1358,7 @@ fn read_inter_block_mode_info(
             &best_ref_mvs,
             is_compound,
             c.allow_hp,
+            counts,
         )?;
         info.mv = mv;
         info.mv_diff = diff;

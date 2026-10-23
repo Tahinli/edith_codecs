@@ -90,7 +90,11 @@ impl TimeBase {
     ///
     /// Exact: the whole computation runs in [`i128`] and rounds exactly once.
     pub fn checked_rescale(&self, ticks: i64, to: TimeBase, rounding: Rounding) -> Option<i64> {
-        let n = ticks as i128 * self.num as i128 * to.den as i128;
+        // Checked: a fuzzed TimestampScale makes `num` large, and a tick count times
+        // two such factors overflows i128 (found by the ec-matroska seek fuzz target).
+        let n = (ticks as i128)
+            .checked_mul(self.num as i128)?
+            .checked_mul(to.den as i128)?;
         let d = self.den as i128 * to.num as i128;
         i64::try_from(rounding.div(n, d)).ok()
     }

@@ -648,12 +648,10 @@ pub(crate) mod tests {
     fn bulk_bit_reads_match_the_per_bit_form() {
         let data: Vec<u8> = (0..40u32).map(|i| (i * 37 + 11) as u8).collect();
         let per_bit = |start: usize, n: u32| -> u32 {
-            let mut bit = start;
             let mut v = 0u32;
-            for _ in 0..n {
+            for bit in (start..).take(n as usize) {
                 let byte = data.get(bit >> 3).copied().unwrap_or(0);
                 v = (v << 1) | u32::from((byte >> (7 - (bit & 7))) & 1);
-                bit += 1;
             }
             v
         };
@@ -1003,7 +1001,7 @@ pub(crate) mod symtrace {
 
     thread_local! {
         static BUF: RefCell<(String, usize)> = const { RefCell::new((String::new(), 0)) };
-        static ECD: RefCell<VecDeque<(u32, u32, u32, u32)>> = RefCell::new(VecDeque::new());
+        static ECD: RefCell<VecDeque<(u32, u32, u32, u32)>> = const { RefCell::new(VecDeque::new()) };
         // lane-av1dumploud: the file's PATH travels with it, so a short write
         // can name the file it truncated instead of reconstructing a name.
         static ECD_READER: RefCell<Option<(std::fs::File, String)>> = const { RefCell::new(None) };

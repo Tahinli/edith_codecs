@@ -1,7 +1,8 @@
 //! Inverse transforms and scaling (spec 8.5.9 - 8.5.13).
 
 use crate::tables::{
-    NORM_ADJUST_4X4, NORM_ADJUST_8X8, NORM_ADJUST_CLASS_4X4, ZIGZAG_4X4, ZIGZAG_8X8,
+    FIELD_4X4, FIELD_8X8, NORM_ADJUST_4X4, NORM_ADJUST_8X8, NORM_ADJUST_CLASS_4X4, ZIGZAG_4X4,
+    ZIGZAG_8X8,
 };
 
 /// Per-QP scaling factors for one 4x4 weight list: `LevelScale4x4(m, i, j) =
@@ -41,13 +42,13 @@ pub fn dequant_4x4(block: &mut [i32; 16], ls: &LevelScale4x4, qp: i32, skip_dc: 
     if shift >= 4 {
         let sh = (shift - 4) as u32;
         for i in start..16 {
-            block[i] = (block[i] * scale[i]) << sh;
+            block[i] = block[i].wrapping_mul(scale[i]) << sh;
         }
     } else {
         let sh = (4 - shift) as u32;
         let round = 1i32 << (3 - shift);
         for i in start..16 {
-            block[i] = (block[i] * scale[i] + round) >> sh;
+            block[i] = block[i].wrapping_mul(scale[i]).wrapping_add(round) >> sh;
         }
     }
 }
@@ -102,13 +103,13 @@ pub fn dequant_8x8(block: &mut [i32; 64], ls: &LevelScale8x8, qp: i32) {
     if qp >= 36 {
         let sh = (qp / 6 - 6) as u32;
         for i in 0..64 {
-            block[i] = (block[i] * scale[i]) << sh;
+            block[i] = block[i].wrapping_mul(scale[i]) << sh;
         }
     } else {
         let sh = (6 - qp / 6) as u32;
         let round = 1i32 << (5 - qp / 6);
         for i in 0..64 {
-            block[i] = (block[i] * scale[i] + round) >> sh;
+            block[i] = block[i].wrapping_mul(scale[i]).wrapping_add(round) >> sh;
         }
     }
 }
@@ -118,6 +119,14 @@ pub fn dequant_8x8(block: &mut [i32; 64], ls: &LevelScale8x8, qp: i32) {
 #[inline]
 pub fn unzigzag_8x8(scan: &[i32; 64], out: &mut [i32; 64]) {
     for (s, &raster) in ZIGZAG_8X8.iter().enumerate() {
+        out[raster as usize] = scan[s];
+    }
+}
+
+/// The same with the 8x8 field scan (Table 8-14), for field macroblocks.
+#[inline]
+pub fn unfield_8x8(scan: &[i32; 64], out: &mut [i32; 64]) {
+    for (s, &raster) in FIELD_8X8.iter().enumerate() {
         out[raster as usize] = scan[s];
     }
 }
@@ -193,6 +202,23 @@ pub fn unzigzag(scan: &[i32; 16], out: &mut [i32; 16]) {
     }
 }
 
+/// The same with the 4x4 field scan (Table 8-13), for field macroblocks.
+#[inline]
+pub fn unfield(scan: &[i32; 16], out: &mut [i32; 16]) {
+    for (s, &raster) in FIELD_4X4.iter().enumerate() {
+        out[raster as usize] = scan[s];
+    }
+}
+
+/// Field-scan counterpart of [`unzigzag_ac15`].
+#[inline]
+pub fn unfield_ac15(scan: &[i32; 16], out: &mut [i32; 16]) {
+    out[0] = 0;
+    for k in 0..15 {
+        out[FIELD_4X4[k + 1] as usize] = scan[k];
+    }
+}
+
 /// Un-zigzag a 15-coefficient AC block (Intra_16x16 luma AC / chroma AC):
 /// scan position `k` maps to zig-zag position `k + 1`; the DC slot is
 /// cleared for the caller to fill from the separate DC path.
@@ -245,30 +271,30 @@ pub fn luma_dc_transform(c: &mut [i32; 16], ls: &LevelScale4x4, qp: i32) {
     for i in 0..4 {
         let o = i * 4;
         let (a, b, cc, d) = (c[o], c[o + 1], c[o + 2], c[o + 3]);
-        f[o] = a + b + cc + d;
-        f[o + 1] = a + b - cc - d;
-        f[o + 2] = a - b - cc + d;
-        f[o + 3] = a - b + cc - d;
+        f[o] = a.wrapping_add(b).wrapping_add(cc).wrapping_add(d);
+        f[o + 1] = a.wrapping_add(b).wrapping_sub(cc).wrapping_sub(d);
+        f[o + 2] = a.wrapping_sub(b).wrapping_sub(cc).wrapping_add(d);
+        f[o + 3] = a.wrapping_sub(b).wrapping_add(cc).wrapping_sub(d);
     }
     let mut g = [0i32; 16];
     for j in 0..4 {
         let (a, b, cc, d) = (f[j], f[4 + j], f[8 + j], f[12 + j]);
-        g[j] = a + b + cc + d;
-        g[4 + j] = a + b - cc - d;
-        g[8 + j] = a - b - cc + d;
-        g[12 + j] = a - b + cc - d;
+        g[j] = a.wrapping_add(b).wrapping_add(cc).wrapping_add(d);
+        g[4 + j] = a.wrapping_add(b).wrapping_sub(cc).wrapping_sub(d);
+        g[8 + j] = a.wrapping_sub(b).wrapping_sub(cc).wrapping_add(d);
+        g[12 + j] = a.wrapping_sub(b).wrapping_add(cc).wrapping_sub(d);
     }
     let scale = ls.scale[(qp % 6) as usize][0];
     if qp >= 36 {
         let sh = (qp / 6 - 6) as u32;
         for (o, &v) in c.iter_mut().zip(&g) {
-            *o = (v * scale) << sh;
+            *o = v.wrapping_mul(scale) << sh;
         }
     } else {
         let sh = (6 - qp / 6) as u32;
         let round = 1i32 << (5 - qp / 6);
         for (o, &v) in c.iter_mut().zip(&g) {
-            *o = (v * scale + round) >> sh;
+            *o = v.wrapping_mul(scale).wrapping_add(round) >> sh;
         }
     }
 }
@@ -279,15 +305,59 @@ pub fn luma_dc_transform(c: &mut [i32; 16], ls: &LevelScale4x4, qp: i32) {
 pub fn chroma_dc_transform_420(c: &mut [i32; 4], ls: &LevelScale4x4, qp: i32) {
     let (c00, c01, c10, c11) = (c[0], c[1], c[2], c[3]);
     let f = [
-        c00 + c01 + c10 + c11,
-        c00 - c01 + c10 - c11,
-        c00 + c01 - c10 - c11,
-        c00 - c01 - c10 + c11,
+        c00.wrapping_add(c01).wrapping_add(c10).wrapping_add(c11),
+        c00.wrapping_sub(c01).wrapping_add(c10).wrapping_sub(c11),
+        c00.wrapping_add(c01).wrapping_sub(c10).wrapping_sub(c11),
+        c00.wrapping_sub(c01).wrapping_sub(c10).wrapping_add(c11),
     ];
     let scale = ls.scale[(qp % 6) as usize][0];
     let sh = (qp / 6) as u32;
     for (o, &v) in c.iter_mut().zip(&f) {
-        *o = ((v * scale) << sh) >> 5;
+        *o = (v.wrapping_mul(scale) << sh) >> 5;
+    }
+}
+
+/// Scan position of each raster element of the 4:2:2 chroma DC array (the
+/// 4x2 matrix `c` of Equation 8-330), row by row.
+pub const CHROMA_DC_422_RASTER: [usize; 8] = [0, 2, 1, 5, 3, 6, 4, 7];
+
+/// Chroma DC for 4:2:2 (spec 8.5.11.1, 8.5.11.2): `c` holds the eight DC
+/// levels in scan order; on return it holds the scaled DC values in raster
+/// order of the chroma 4x4 blocks (two per row, four rows). `qp` is `QP'c`;
+/// the transform scales with `QP'c + 3`.
+pub fn chroma_dc_transform_422(c: &mut [i32; 8], ls: &LevelScale4x4, qp: i32) {
+    let mut m = [0i32; 8];
+    for (r, &s) in CHROMA_DC_422_RASTER.iter().enumerate() {
+        m[r] = c[s];
+    }
+    // f = A * c * B: B is the 2-point butterfly on each row ...
+    let mut t = [0i32; 8];
+    for row in 0..4 {
+        t[row * 2] = m[row * 2].wrapping_add(m[row * 2 + 1]);
+        t[row * 2 + 1] = m[row * 2].wrapping_sub(m[row * 2 + 1]);
+    }
+    // ... and A the 4-point transform down each column.
+    let mut f = [0i32; 8];
+    for col in 0..2 {
+        let (r0, r1, r2, r3) = (t[col], t[2 + col], t[4 + col], t[6 + col]);
+        let (z0, z1, z2, z3) = (
+            r0.wrapping_add(r2),
+            r0.wrapping_sub(r2),
+            r1.wrapping_sub(r3),
+            r1.wrapping_add(r3),
+        );
+        f[col] = z0.wrapping_add(z3);
+        f[2 + col] = z1.wrapping_add(z2);
+        f[4 + col] = z1.wrapping_sub(z2);
+        f[6 + col] = z0.wrapping_sub(z3);
+    }
+    let qp_dc = qp + 3;
+    let scale = ls.scale[(qp_dc % 6) as usize][0];
+    let sh = (qp_dc / 6) as u32;
+    // (f * LevelScale << (qP/6 - 6)) for qP >= 36, else the rounded right
+    // shift: both are ((f * LevelScale) << (qP/6) + 32) >> 6.
+    for (o, &v) in c.iter_mut().zip(&f) {
+        *o = (v.wrapping_mul(scale).wrapping_shl(sh).wrapping_add(32)) >> 6;
     }
 }
 
@@ -357,5 +427,25 @@ mod tests {
         chroma_dc_transform_420(&mut c, &ls, 30);
         // f = [4,4,4,4]; scale = LS(0,0,0) = 160; ((4 * 160) << 5) >> 5 = 640.
         assert!(c.iter().all(|&x| x == 640), "{c:?}");
+    }
+
+    #[test]
+    fn chroma_dc_422_hadamard() {
+        let ls = flat_ls();
+        // A lone DC level spreads equally over the eight blocks; the scaling
+        // runs at QP'c + 3: LevelScale(33 % 6 = 3, 0, 0) = 16 * 14, shifted
+        // left by 33 / 6 = 5, then ((.. + 32) >> 6).
+        let mut c = [4, 0, 0, 0, 0, 0, 0, 0];
+        chroma_dc_transform_422(&mut c, &ls, 30);
+        assert!(
+            c.iter().all(|&x| x == (((4 * 224) << 5) + 32) >> 6),
+            "{c:?}"
+        );
+        // Level 1 at scan position 1 is raster row 1, column 0: the sign
+        // pattern of A's second column.
+        let mut c = [0, 1, 0, 0, 0, 0, 0, 0];
+        chroma_dc_transform_422(&mut c, &ls, 30);
+        let u = ((224 << 5) + 32) >> 6;
+        assert_eq!(c, [u, u, u, u, -u, -u, -u, -u]);
     }
 }

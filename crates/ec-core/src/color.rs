@@ -253,6 +253,69 @@ pub struct ContentLight {
     /// The mastering display's black, which is a hundredth of a nit or less on
     /// the displays these grades are approved on.
     pub mastering_min: Option<f32>,
+    /// The mastering display's primaries and white point, where the container
+    /// stated them. [`None`] on every value built before this field existed
+    /// and in every file that does not say: a muxer then writes BT.2020 / D65
+    /// in an mp4 `mdcv` and leaves the chromaticities out of Matroska.
+    pub mastering_primaries: Option<MasteringPrimaries>,
+}
+
+/// A mastering display's colour primaries and white point as an `mdcv` box and
+/// an HEVC mastering display SEI state them: CIE 1931 xy in increments of
+/// 0.00002 (so BT.2020 red x = 0.708 is 35400), in the SEI's order, green,
+/// blue, red. Matroska writes the same chromaticities as floats and divides
+/// by 50000 on the way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasteringPrimaries {
+    /// Green `(x, y)`.
+    pub green: (u16, u16),
+    /// Blue `(x, y)`.
+    pub blue: (u16, u16),
+    /// Red `(x, y)`.
+    pub red: (u16, u16),
+    /// White point `(x, y)`.
+    pub white: (u16, u16),
+}
+
+impl MasteringPrimaries {
+    /// BT.2020 primaries with a D65 white point.
+    pub const BT2020: Self = Self {
+        green: (8500, 39850),
+        blue: (6550, 2300),
+        red: (35400, 14600),
+        white: (15635, 16450),
+    };
+    /// Display P3 primaries with a D65 white point.
+    pub const P3_D65: Self = Self {
+        green: (13250, 34500),
+        blue: (7500, 3000),
+        red: (34000, 16000),
+        white: (15635, 16450),
+    };
+
+    /// The eight values in `mdcv` order: gx gy bx by rx ry wx wy.
+    pub fn to_array(self) -> [u16; 8] {
+        [
+            self.green.0,
+            self.green.1,
+            self.blue.0,
+            self.blue.1,
+            self.red.0,
+            self.red.1,
+            self.white.0,
+            self.white.1,
+        ]
+    }
+
+    /// The inverse of [`MasteringPrimaries::to_array`].
+    pub fn from_array(v: [u16; 8]) -> Self {
+        Self {
+            green: (v[0], v[1]),
+            blue: (v[2], v[3]),
+            red: (v[4], v[5]),
+            white: (v[6], v[7]),
+        }
+    }
 }
 
 impl ContentLight {
@@ -278,6 +341,7 @@ impl ContentLight {
             max_fall: self.max_fall.or(under.max_fall),
             mastering_max: self.mastering_max.or(under.mastering_max),
             mastering_min: self.mastering_min.or(under.mastering_min),
+            mastering_primaries: self.mastering_primaries.or(under.mastering_primaries),
         }
     }
 }
@@ -289,8 +353,8 @@ impl ContentLight {
 /// serves both; Matroska writes the same numbers as EBML floats instead and is
 /// read where it is walked.
 ///
-/// The chromaticities are read past: what a tone map wants is the luminance
-/// pair, and the display's gamut is not something this family acts on. A zero
+/// The chromaticities are kept as [`MasteringPrimaries`] for a remux; a tone map
+/// acts on the luminance pair alone. A zero
 /// luminance is "not stated", which is what the oracle writes when it has nothing —
 /// believing it would tell a tone map the film peaks at black.
 pub fn mdcv(payload: &[u8]) -> ContentLight {
@@ -298,9 +362,19 @@ pub fn mdcv(payload: &[u8]) -> ContentLight {
         let raw = u32::from_be_bytes(payload.get(at..at + 4)?.try_into().ok()?);
         Some(raw as f32 * 1e-4).filter(|v| *v > 0.0)
     };
+    let mut xy = [0u16; 8];
+    let mastering_primaries = payload.get(..16).map(|p| {
+        for (i, v) in xy.iter_mut().enumerate() {
+            *v = u16::from_be_bytes([p[i * 2], p[i * 2 + 1]]);
+        }
+        MasteringPrimaries::from_array(xy)
+    });
+    // All zero is "not stated", like a zero luminance.
+    let mastering_primaries = mastering_primaries.filter(|p| p.to_array() != [0; 8]);
     ContentLight {
         mastering_max: luminance(16),
         mastering_min: luminance(20),
+        mastering_primaries,
         ..ContentLight::default()
     }
 }
@@ -1395,6 +1469,7 @@ mod tests {
         max_fall: Some(400.0),
         mastering_max: Some(1000.0),
         mastering_min: Some(0.005),
+        mastering_primaries: None,
     };
 
     /// Nits, compared the way three different encodings of them allow: Matroska

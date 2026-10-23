@@ -127,49 +127,14 @@ impl MiState {
     }
 }
 
-/// `read_partition` (decodeframe.c:1195).
-fn read_partition(
-    r: &mut BoolDecoder,
-    st: &MiState,
-    partition_probs: &[[u8; 3]; 16],
-    row: usize,
-    col: usize,
-    has_rows: bool,
-    has_cols: bool,
-    bsl: u32,
-) -> crate::Result<u8> {
-    let ctx = st.partition_ctx(row, col, bsl);
-    let probs = &partition_probs[ctx];
-    if has_rows && has_cols {
-        Ok(r.read_tree(&PARTITION_TREE, probs))
-    } else if !has_rows && has_cols {
-        Ok(if r.read_bool(probs[1]) {
-            3 /* SPLIT */
-        } else {
-            1 /* HORZ */
-        })
-    } else if has_rows && !has_cols {
-        Ok(if r.read_bool(probs[2]) {
-            3 /* SPLIT */
-        } else {
-            2 /* VERT */
-        })
-    } else {
-        Ok(3)
-    }
-}
-
 /// `read_intra_mode_kf` + `read_intra_frame_mode_info` (decodemv.c).
 pub(crate) fn read_intra_frame_mode_info(
     r: &mut BoolDecoder,
     st: &mut MiState,
     seg: &ec_vp9_syntax::SegmentationParams,
-    partition_probs: &[[u8; 3]; 16],
     row: usize,
     col: usize,
     sb_type: usize,
-    x_mis: usize,
-    y_mis: usize,
     tile_col_start: usize,
     tx_mode: u8,
     fc: &FrameContext,

@@ -10,6 +10,9 @@ authors.workspace = true
 ec-core.workspace = true
 ec-h265-syntax.workspace = true
 wide.workspace = true
+bytemuck = "1"
+archmage = "=0.9.31-beta.1"
+multiversion = "0.9"
 
 [dev-dependencies]
 ec-h265-syntax.workspace = true

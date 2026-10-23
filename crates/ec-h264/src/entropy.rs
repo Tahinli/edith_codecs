@@ -20,7 +20,7 @@ use ec_core::error::{Error, Result};
 
 use crate::bits::BitCursor;
 use crate::cabac::Cabac;
-use crate::tables::{CBP_INTER_420, CBP_INTRA_420};
+use crate::tables::{CBP_INTER_420, CBP_INTER_MONO, CBP_INTRA_420, CBP_INTRA_MONO};
 
 /// Macroblock state bits (`Picture::mb_flags`, and `MbInfo::flags` for a
 /// neighbour). CABAC context selection reads all of them.
@@ -53,6 +53,9 @@ pub(crate) enum BlockCat {
     Luma4x4,
     /// ChromaDCLevel of component `iCbCr`, `ctxBlockCat` 3.
     ChromaDc(u8),
+    /// ChromaDCLevel of component `iCbCr` for 4:2:2 (2x4 DC, eight levels),
+    /// `ctxBlockCat` 3.
+    ChromaDc422(u8),
     /// ChromaACLevel, `ctxBlockCat` 4.
     ChromaAc,
     /// LumaLevel8x8, `ctxBlockCat` 5: one 64-coefficient block under
@@ -69,6 +72,7 @@ impl BlockCat {
             BlockCat::LumaDc | BlockCat::Luma4x4 => 16,
             BlockCat::LumaAc | BlockCat::ChromaAc => 15,
             BlockCat::ChromaDc(_) => 4,
+            BlockCat::ChromaDc422(_) => 8,
             BlockCat::Luma8x8 => 64,
         }
     }
@@ -79,7 +83,7 @@ impl BlockCat {
             BlockCat::LumaDc => 0,
             BlockCat::LumaAc => 1,
             BlockCat::Luma4x4 => 2,
-            BlockCat::ChromaDc(_) => 3,
+            BlockCat::ChromaDc(_) | BlockCat::ChromaDc422(_) => 3,
             BlockCat::ChromaAc => 4,
             BlockCat::Luma8x8 => 5,
         }
@@ -107,6 +111,23 @@ pub(crate) struct MbCtx {
     /// ctxIdxInc for the first mb_qp_delta bin (clause 9.3.3.1.1.5), derived by
     /// the caller from the previous macroblock in decoding order.
     pub qp_delta_inc: u8,
+    /// The macroblock is a field macroblock (a field picture, or a field
+    /// macroblock of an MBAFF frame): field-coded significance contexts.
+    pub field: bool,
+    /// MBAFF frames only: the left neighbour of the lower 8x8 luma blocks can
+    /// be a different macroblock from the one beside the upper blocks, and the
+    /// 8x8 block of the neighbour that is adjacent differs with it.
+    pub mbaff_a: Option<MbaffA>,
+}
+
+/// See [`MbCtx::mbaff_a`].
+#[derive(Clone, Copy)]
+pub(crate) struct MbaffA {
+    /// The macroblock left of luma row 8.
+    pub lower: Option<MbInfo>,
+    /// The 8x8 block index inside the neighbour that bins 0 (upper) and 2
+    /// (lower) of coded_block_pattern read.
+    pub blk: [u8; 2],
 }
 
 /// The slice-data syntax reader.
@@ -173,6 +194,23 @@ impl<'a> Entropy<'a> {
         match self {
             Entropy::Cavlc(_) => Err(Error::corrupt("mb_skip_flag in a CAVLC slice")),
             Entropy::Cabac(c) => Ok(c.mb_skip_flag(b_slice, inc)),
+        }
+    }
+
+    /// `mb_field_decoding_flag` (7.3.4); `inc` is the CABAC context increment.
+    pub(crate) fn mb_field_flag(&mut self, inc: usize) -> Result<bool> {
+        match self {
+            Entropy::Cavlc(r) => r.read_bit(),
+            Entropy::Cabac(c) => Ok(c.mb_field_decoding_flag(inc)),
+        }
+    }
+
+    /// The next CAVLC bit without consuming it (the field flag of the bottom
+    /// macroblock when the top one is skipped); `false` for CABAC.
+    pub(crate) fn peek_bit(&mut self) -> bool {
+        match self {
+            Entropy::Cavlc(r) => r.peek16() & 0x8000 != 0,
+            Entropy::Cabac(_) => false,
         }
     }
 
@@ -248,16 +286,25 @@ impl<'a> Entropy<'a> {
 
     /// `coded_block_pattern` of an inter macroblock, as
     /// `(CodedBlockPatternLuma, CodedBlockPatternChroma)`.
-    pub(crate) fn coded_block_pattern_inter(&mut self) -> Result<(u8, u8)> {
+    ///
+    /// `has_chroma` is ChromaArrayType 1 or 2: the pattern then has a chroma
+    /// part; for 0 and 3 (Table 9-4 b) it is the luma nibble alone.
+    pub(crate) fn coded_block_pattern_inter(&mut self, has_chroma: bool) -> Result<(u8, u8)> {
         match self {
             Entropy::Cavlc(r) => {
                 let code = r.read_ue()? as usize;
+                if !has_chroma {
+                    let cbp = *CBP_INTER_MONO
+                        .get(code)
+                        .ok_or_else(|| Error::corrupt("coded_block_pattern codeNum > 15"))?;
+                    return Ok((cbp, 0));
+                }
                 let cbp = *CBP_INTER_420
                     .get(code)
                     .ok_or_else(|| Error::corrupt("coded_block_pattern codeNum > 47"))?;
                 Ok((cbp & 15, cbp >> 4))
             }
-            Entropy::Cabac(c) => c.coded_block_pattern(),
+            Entropy::Cabac(c) => c.coded_block_pattern(has_chroma),
         }
     }
 
@@ -323,17 +370,23 @@ impl<'a> Entropy<'a> {
 
     /// `coded_block_pattern` of an Intra_4x4 macroblock, as
     /// `(CodedBlockPatternLuma, CodedBlockPatternChroma)`.
-    pub(crate) fn coded_block_pattern_intra(&mut self) -> Result<(u8, u8)> {
+    pub(crate) fn coded_block_pattern_intra(&mut self, has_chroma: bool) -> Result<(u8, u8)> {
         match self {
             Entropy::Cavlc(r) => {
                 // me(v), clause 9.1.2 Table 9-4.
                 let code = r.read_ue()? as usize;
+                if !has_chroma {
+                    let cbp = *CBP_INTRA_MONO
+                        .get(code)
+                        .ok_or_else(|| Error::corrupt("coded_block_pattern codeNum > 15"))?;
+                    return Ok((cbp, 0));
+                }
                 let cbp = *CBP_INTRA_420
                     .get(code)
                     .ok_or_else(|| Error::corrupt("coded_block_pattern codeNum > 47"))?;
                 Ok((cbp & 15, cbp >> 4))
             }
-            Entropy::Cabac(c) => c.coded_block_pattern(),
+            Entropy::Cabac(c) => c.coded_block_pattern(has_chroma),
         }
     }
 
@@ -343,7 +396,9 @@ impl<'a> Entropy<'a> {
             Entropy::Cavlc(r) => r.read_se()?,
             Entropy::Cabac(c) => c.mb_qp_delta()?,
         };
-        if !(-26..=25).contains(&delta) {
+        // The widest range any supported bit depth allows; the caller narrows it
+        // to the picture's QpBdOffset.
+        if !(-32..=31).contains(&delta) {
             return Err(Error::corrupt("mb_qp_delta outside [-26, 25]"));
         }
         Ok(delta)
@@ -364,10 +419,27 @@ impl<'a> Entropy<'a> {
         na: Option<u8>,
         nb: Option<u8>,
     ) -> Result<u8> {
+        self.residual_block_c(coeff, cat, 0, na, nb)
+    }
+
+    /// [`Entropy::residual_block`] for colour component `comp` of a 4:4:4
+    /// macroblock (0 Y, 1 Cb, 2 Cr): the Cb and Cr residual is coded like luma
+    /// but with context sets of its own.
+    #[inline]
+    pub(crate) fn residual_block_c(
+        &mut self,
+        coeff: &mut [i32; 16],
+        cat: BlockCat,
+        comp: u8,
+        na: Option<u8>,
+        nb: Option<u8>,
+    ) -> Result<u8> {
         match self {
             Entropy::Cavlc(r) => {
                 let nc = if matches!(cat, BlockCat::ChromaDc(_)) {
                     -1
+                } else if matches!(cat, BlockCat::ChromaDc422(_)) {
+                    -2
                 } else {
                     match (na, nb) {
                         (Some(a), Some(b)) => (i32::from(a) + i32::from(b) + 1) >> 1,
@@ -378,7 +450,7 @@ impl<'a> Entropy<'a> {
                 };
                 crate::cavlc::residual_block(r, coeff, cat.max_num_coeff(), nc)
             }
-            Entropy::Cabac(c) => c.residual_block(coeff, cat, na, nb),
+            Entropy::Cabac(c) => c.residual_block(coeff, cat, comp, na, nb),
         }
     }
 
@@ -386,23 +458,34 @@ impl<'a> Entropy<'a> {
     /// returning the number of non-zero coefficients. CABAC only: a CAVLC 8x8
     /// block is coded as four interleaved 4x4 blocks (7.3.5.3.1), which the
     /// caller reads through [`Entropy::residual_block`].
-    pub(crate) fn residual_block_8x8(&mut self, coeff: &mut [i32; 64]) -> Result<u8> {
+    ///
+    /// `comp` is the colour component, and `cbf` the neighbouring blocks' counts
+    /// when coded_block_flag is sent for the 8x8 class (ChromaArrayType 3).
+    pub(crate) fn residual_block_8x8(
+        &mut self,
+        coeff: &mut [i32; 64],
+        comp: u8,
+        cbf: Option<(Option<u8>, Option<u8>)>,
+    ) -> Result<u8> {
         match self {
             Entropy::Cavlc(_) => Err(Error::corrupt("8x8 residual block read from a CAVLC slice")),
-            Entropy::Cabac(c) => c.residual_block_8x8(coeff),
+            Entropy::Cabac(c) => c.residual_block_8x8(coeff, comp, cbf),
         }
     }
 
-    /// The 384 raw bytes of an I_PCM macroblock (256 luma, 2x64 chroma), after
+    /// The raw bytes of an I_PCM macroblock (256 luma plus the chroma samples), after
     /// alignment. A CABAC reader restarts its arithmetic engine afterwards
     /// (clause 9.3.1.2).
-    pub(crate) fn pcm_block(&mut self) -> Result<&'a [u8]> {
+    pub(crate) fn pcm_block(&mut self, bd: u32, samples: usize) -> Result<&'a [u8]> {
+        // `samples` samples of `bd` bits: 256 luma plus the chroma ones (384
+        // for 4:2:0, 256 for monochrome, 768 for 4:4:4).
+        let n = samples / 8 * bd as usize;
         match self {
             Entropy::Cavlc(r) => {
                 r.align_to_byte();
-                r.read_bytes(384)
+                r.read_bytes(n)
             }
-            Entropy::Cabac(c) => c.pcm_block(),
+            Entropy::Cabac(c) => c.pcm_block(bd, samples),
         }
     }
 

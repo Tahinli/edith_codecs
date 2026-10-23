@@ -8,10 +8,7 @@
 //! are never read (band 0 context = sub-block has-coef flags, 0..=2).
 //! BLOCK_INVALID (255) survives in SS_SIZE_LOOKUP where a 4:2:0
 //! subsampled block size does not exist.
-#![allow(dead_code)]
 
-pub(crate) const COEF_CON_TREE: [i8; 16] =
-    [2, 6, -2, 4, -3, -4, 8, 10, -5, -6, 12, 14, -7, -8, -9, -10];
 pub(crate) const CAT1_PROB: [u8; 1] = [159];
 pub(crate) const CAT2_PROB: [u8; 2] = [165, 145];
 pub(crate) const CAT3_PROB: [u8; 3] = [173, 148, 140];
@@ -55,7 +52,6 @@ pub(crate) const COEFBAND_TRANS_8X8PLUS: [u8; 1024] = [
     5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
 ];
 pub(crate) const COEFBAND_TRANS_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
-pub(crate) const PT_ENERGY_CLASS: [u8; 12] = [0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5, 5];
 pub(crate) const PARETO8_FULL: [u8; 2040] = [
     3, 86, 128, 6, 86, 23, 88, 29, 6, 86, 128, 11, 87, 42, 91, 52, 9, 86, 129, 17, 88, 61, 94, 76,
     12, 86, 129, 22, 88, 77, 97, 93, 15, 87, 129, 28, 89, 93, 100, 110, 17, 87, 129, 33, 90, 105,

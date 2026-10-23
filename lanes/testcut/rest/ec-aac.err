@@ -1,0 +1,23 @@
+   Compiling ec-core v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-core)
+   Compiling bytemuck v1.25.2
+   Compiling safe_arch v1.1.0
+   Compiling wide v1.6.1
+   Compiling ec-inflate v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-inflate)
+   Compiling ec-matroska v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-matroska)
+   Compiling ec-mp4 v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-mp4)
+   Compiling ec-dsp v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dsp)
+   Compiling ec-aac v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-aac)
+    Finished `release` profile [optimized] target(s) in 29.45s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_aac-5cd8669ced9d8283)
+     Running tests/he_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/he_parity-a17489c6cff2f1cf)
+     Running tests/implicit_ps.rs (/home/user/.cache/tgt-testcut-rest/release/deps/implicit_ps-31038893eaeec477)
+     Running tests/implicit_sbr.rs (/home/user/.cache/tgt-testcut-rest/release/deps/implicit_sbr-40c693a59b05ea0b)
+     Running tests/reelh_per_frame.rs (/home/user/.cache/tgt-testcut-rest/release/deps/reelh_per_frame-a018826a6d3d21d7)
+     Running tests/multichannel_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/multichannel_parity-00623c9357c94ca2)
+     Running tests/no_panic.rs (/home/user/.cache/tgt-testcut-rest/release/deps/no_panic-85fb6ecf64f7c662)
+     Running tests/obs_real_content.rs (/home/user/.cache/tgt-testcut-rest/release/deps/obs_real_content-1be12552affff4b3)
+     Running tests/oracle.rs (/home/user/.cache/tgt-testcut-rest/release/deps/oracle-8cc07b9a9fd94cb8)
+     Running tests/ps_mp4.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ps_mp4-4915f38d0d928d21)
+     Running tests/ps_oracle.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ps_oracle-7fa893adc1f40e44)
+     Running tests/sbr_real_library/main.rs (/home/user/.cache/tgt-testcut-rest/release/deps/sbr_real_library-6d481c88fedd6d2c)
+   Doc-tests ec_aac

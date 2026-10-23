@@ -74,8 +74,11 @@ impl RateControl {
         // a few frames of debt.
         let (down, up) = if idr { (6.0, 6.0) } else { (4.0, 2.0) };
         qp = qp.clamp(self.last_qp[kind] - down, self.last_qp[kind] + up);
-        // Leaky bucket: 1.5 QP per picture of debt, capped.
-        qp += (self.buffer / (self.base.max(1.0) * 4.0) * 2.0).clamp(-2.0, 2.0);
+        // Leaky bucket: 1 QP per picture-budget of debt. The correction may
+        // reach 6 QP: a model that is biased by a few QP (an IDR that costs
+        // twice its share, every picture of the group under its target) must
+        // be pulled back by the bucket, and a 2 QP cap left a 7 % overshoot.
+        qp += (self.buffer / (self.base.max(1.0) * 4.0) * 4.0).clamp(-6.0, 6.0);
         // The quantiser floor is a measured choice, not a spec limit: below QP 10
         // this encoder spends large numbers of bits on differences a viewer
         // cannot see, and on static content it spends them re-coding pictures
@@ -92,7 +95,10 @@ impl RateControl {
         let kind = usize::from(!idr);
         let bits = bits as f64;
         let c = bits * (f64::from(qp) / 6.0).exp2();
-        self.complexity[kind] = if self.complexity[kind] == 0.0 {
+        // An IDR is taken as measured. Smoothing it made the IDR QP lag several
+        // GOPs behind the picture it was measured on (1080p at 1 Mb/s: the QP
+        // stepped up by the full clamp at every IDR).
+        self.complexity[kind] = if self.complexity[kind] == 0.0 || idr {
             c
         } else {
             // Smoothed: one anomalous picture must not whipsaw the next.
@@ -102,7 +108,7 @@ impl RateControl {
         // The budget a picture of this type was given, not the flat average:
         // an IDR that lands on its (large) target must not push the bucket.
         let target = self.frame_target(idr);
-        self.buffer = (self.buffer + bits - target).clamp(-4.0 * self.base, 8.0 * self.base);
+        self.buffer = (self.buffer + bits - target).clamp(-4.0 * self.base, 16.0 * self.base);
     }
 
     /// Per-macroblock-row correction inside a slice: `spent` and `expected` are

@@ -1,0 +1,164 @@
+{ "type": "suite", "event": "started", "test_count": 57 }
+{ "type": "test", "event": "started", "name": "bool::tests::overreads_are_counted_not_panicked" }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_bools_at_every_extreme" }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_literals" }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_long_random_streams" }
+{ "type": "test", "name": "bool::tests::roundtrips_bools_at_every_extreme", "event": "ok", "exec_time": 0.000006993 }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_prob7" }
+{ "type": "test", "name": "bool::tests::overreads_are_counted_not_panicked", "event": "ok", "exec_time": 0.000000851 }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_signed_literals" }
+{ "type": "test", "name": "bool::tests::roundtrips_prob7", "event": "ok", "exec_time": 0.000020439 }
+{ "type": "test", "event": "started", "name": "bool::tests::roundtrips_tree_values" }
+{ "type": "test", "name": "bool::tests::roundtrips_literals", "event": "ok", "exec_time": 0.00002682 }
+{ "type": "test", "event": "started", "name": "bool::tests::short_partitions_zero_extend" }
+{ "type": "test", "name": "bool::tests::roundtrips_long_random_streams", "event": "ok", "exec_time": 0.000048881 }
+{ "type": "test", "event": "started", "name": "intra::tests::dc16_all_availability_cases" }
+{ "type": "test", "name": "bool::tests::roundtrips_signed_literals", "event": "ok", "exec_time": 0.000005911 }
+{ "type": "test", "event": "started", "name": "intra::tests::dc8_all_availability_cases" }
+{ "type": "test", "name": "bool::tests::roundtrips_tree_values", "event": "ok", "exec_time": 0.000001914 }
+{ "type": "test", "event": "started", "name": "intra::tests::predict16_rejects_invalid_mode" }
+{ "type": "test", "name": "bool::tests::short_partitions_zero_extend", "event": "ok", "exec_time": 0.000000131 }
+{ "type": "test", "event": "started", "name": "intra::tests::predict4_rejects_invalid_mode" }
+{ "type": "test", "name": "intra::tests::dc16_all_availability_cases", "event": "ok", "exec_time": 0.000001001 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_dc_constant" }
+{ "type": "test", "name": "intra::tests::dc8_all_availability_cases", "event": "ok", "exec_time": 0.000001053 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_hd_uses_avg2p_for_svg2p_typo_line" }
+{ "type": "test", "name": "intra::tests::predict16_rejects_invalid_mode", "event": "ok", "exec_time": 0.000001122 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_he_smoothed_column" }
+{ "type": "test", "name": "intra::tests::predict4_rejects_invalid_mode", "event": "ok", "exec_time": 0.000000821 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_hu_up_diagonal" }
+{ "type": "test", "name": "intra::tests::subblock_dc_constant", "event": "ok", "exec_time": 0.000000271 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_ld_downright_diagonal" }
+{ "type": "test", "name": "intra::tests::subblock_hd_uses_avg2p_for_svg2p_typo_line", "event": "ok", "exec_time": 0.000000331 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_rd_downright_diagonal" }
+{ "type": "test", "name": "intra::tests::subblock_he_smoothed_column", "event": "ok", "exec_time": 0.00000038 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_tm_gradient" }
+{ "type": "test", "name": "intra::tests::subblock_hu_up_diagonal", "event": "ok", "exec_time": 0.000000351 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_ve_smoothed_row" }
+{ "type": "test", "name": "intra::tests::subblock_ld_downright_diagonal", "event": "ok", "exec_time": 0.000000321 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_vl_downleft_diagonal" }
+{ "type": "test", "name": "intra::tests::subblock_rd_downright_diagonal", "event": "ok", "exec_time": 0.000000201 }
+{ "type": "test", "event": "started", "name": "intra::tests::subblock_vr_mixed_diagonal" }
+{ "type": "test", "name": "intra::tests::subblock_tm_gradient", "event": "ok", "exec_time": 0.00000019 }
+{ "type": "test", "event": "started", "name": "intra::tests::tm16_clamps_both_directions" }
+{ "type": "test", "name": "intra::tests::subblock_ve_smoothed_row", "event": "ok", "exec_time": 0.000000291 }
+{ "type": "test", "event": "started", "name": "intra::tests::tm4_clamps_via_predict4" }
+{ "type": "test", "name": "intra::tests::subblock_vr_mixed_diagonal", "event": "ok", "exec_time": 0.000000321 }
+{ "type": "test", "event": "started", "name": "intra::tests::v_and_h_copy_edges" }
+{ "type": "test", "name": "intra::tests::tm16_clamps_both_directions", "event": "ok", "exec_time": 0.000000611 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::driver_normal_filter_frame_order" }
+{ "type": "test", "name": "intra::tests::tm4_clamps_via_predict4", "event": "ok", "exec_time": 0.00000053 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::driver_simple_filter_frame" }
+{ "type": "test", "name": "intra::tests::v_and_h_copy_edges", "event": "ok", "exec_time": 0.000000541 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::frame_type_changes_hev_path" }
+{ "type": "test", "name": "loopfilter::tests::driver_normal_filter_frame_order", "event": "ok", "exec_time": 0.000040545 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::hev_edge_takes_short_path" }
+{ "type": "test", "name": "intra::tests::subblock_vl_downleft_diagonal", "event": "ok", "exec_time": 0.00000029 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::hev_threshold_table" }
+{ "type": "test", "name": "loopfilter::tests::driver_simple_filter_frame", "event": "ok", "exec_time": 0.000012984 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::level_zero_disables_filtering" }
+{ "type": "test", "name": "loopfilter::tests::frame_type_changes_hev_path", "event": "ok", "exec_time": 0.000008937 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::mb_v_edge_normal_filter_kernel" }
+{ "type": "test", "name": "loopfilter::tests::hev_edge_takes_short_path", "event": "ok", "exec_time": 0.000000631 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::sharpness_tables_match_libvpx" }
+{ "type": "test", "name": "loopfilter::tests::hev_threshold_table", "event": "ok", "exec_time": 0.00000009 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::simple_filter_leaves_chroma_untouched" }
+{ "type": "test", "name": "loopfilter::tests::level_zero_disables_filtering", "event": "ok", "exec_time": 0.000001884 }
+{ "type": "test", "event": "started", "name": "loopfilter::tests::subblock_edge_takes_full_three_tap_path" }
+{ "type": "test", "name": "loopfilter::tests::mb_v_edge_normal_filter_kernel", "event": "ok", "exec_time": 0.000001393 }
+{ "type": "test", "event": "started", "name": "mc::tests::bilinear_chroma_matches_hand_computed_values" }
+{ "type": "test", "name": "loopfilter::tests::sharpness_tables_match_libvpx", "event": "ok", "exec_time": 0.000002044 }
+{ "type": "test", "event": "started", "name": "mc::tests::dispatched_bilinear_matches_the_scalar_reference_everywhere" }
+{ "type": "test", "name": "loopfilter::tests::simple_filter_leaves_chroma_untouched", "event": "ok", "exec_time": 0.000002214 }
+{ "type": "test", "event": "started", "name": "mc::tests::dispatched_sixtap_matches_the_scalar_reference_everywhere" }
+{ "type": "test", "name": "loopfilter::tests::subblock_edge_takes_full_three_tap_path", "event": "ok", "exec_time": 0.000000561 }
+{ "type": "test", "event": "started", "name": "mc::tests::extend_plane_replicates_edges_and_corners" }
+{ "type": "test", "name": "mc::tests::bilinear_chroma_matches_hand_computed_values", "event": "ok", "exec_time": 0.00002632 }
+{ "type": "test", "event": "started", "name": "mc::tests::integer_mv_predict_is_a_plain_copy" }
+{ "type": "test", "name": "mc::tests::integer_mv_predict_is_a_plain_copy", "event": "ok", "exec_time": 0.000015489 }
+{ "type": "test", "event": "started", "name": "mc::tests::sixtap_combined_phase_16x16_matches_hand_computed_values" }
+{ "type": "test", "name": "mc::tests::extend_plane_replicates_edges_and_corners", "event": "ok", "exec_time": 0.000070461 }
+{ "type": "test", "event": "started", "name": "mc::tests::sixtap_pure_horizontal_matches_hand_computed_values" }
+{ "type": "test", "name": "mc::tests::sixtap_combined_phase_16x16_matches_hand_computed_values", "event": "ok", "exec_time": 0.000023384 }
+{ "type": "test", "event": "started", "name": "mc::tests::umv_border_clamps_match_libvpx_arithmetic" }
+{ "type": "test", "name": "mc::tests::sixtap_pure_horizontal_matches_hand_computed_values", "event": "ok", "exec_time": 0.000009828 }
+{ "type": "test", "event": "started", "name": "transform::tests::dequant_at_qindex_boundaries" }
+{ "type": "test", "name": "mc::tests::umv_border_clamps_match_libvpx_arithmetic", "event": "ok", "exec_time": 0.000023144 }
+{ "type": "test", "event": "started", "name": "transform::tests::dequant_delta_indices_clamp_to_qindex_range" }
+{ "type": "test", "name": "transform::tests::dequant_at_qindex_boundaries", "event": "ok", "exec_time": 0.00000008 }
+{ "type": "test", "event": "started", "name": "transform::tests::dequant_y2_ac_floor_at_eight" }
+{ "type": "test", "name": "transform::tests::dequant_delta_indices_clamp_to_qindex_range", "event": "ok", "exec_time": 0.000000431 }
+{ "type": "test", "event": "started", "name": "transform::tests::dequant_y2_ac_matches_libvpx_fixed_point_over_all_q" }
+{ "type": "test", "name": "transform::tests::dequant_y2_ac_floor_at_eight", "event": "ok", "exec_time": 0.00000026 }
+{ "type": "test", "event": "started", "name": "transform::tests::idct_add_equals_clamped_predict_plus_residual" }
+{ "type": "test", "name": "transform::tests::dequant_y2_ac_matches_libvpx_fixed_point_over_all_q", "event": "ok", "exec_time": 0.000002013 }
+{ "type": "test", "event": "started", "name": "transform::tests::idct_add_updates_existing_recon_buffer" }
+{ "type": "test", "name": "transform::tests::idct_add_equals_clamped_predict_plus_residual", "event": "ok", "exec_time": 0.000001082 }
+{ "type": "test", "event": "started", "name": "transform::tests::idct_dc_only_40_yields_five" }
+{ "type": "test", "name": "transform::tests::idct_add_updates_existing_recon_buffer", "event": "ok", "exec_time": 0.000000271 }
+{ "type": "test", "event": "started", "name": "transform::tests::idct_dc_shortcut_matches_full_transform" }
+{ "type": "test", "name": "transform::tests::idct_dc_only_40_yields_five", "event": "ok", "exec_time": 0.00000015 }
+{ "type": "test", "event": "started", "name": "transform::tests::idct_mixed_block_matches_oracle" }
+{ "type": "test", "name": "transform::tests::idct_dc_shortcut_matches_full_transform", "event": "ok", "exec_time": 0.000000681 }
+{ "type": "test", "event": "started", "name": "transform::tests::iwht_dc_shortcut_matches_full_transform" }
+{ "type": "test", "name": "transform::tests::idct_mixed_block_matches_oracle", "event": "ok", "exec_time": 0.000000151 }
+{ "type": "test", "event": "started", "name": "transform::tests::iwht_impulse_at_row1_col1_yields_hadamard_pattern" }
+{ "type": "test", "name": "transform::tests::iwht_dc_shortcut_matches_full_transform", "event": "ok", "exec_time": 0.000000641 }
+{ "type": "test", "event": "started", "name": "transform::tests::iwht_mixed_block_matches_oracle" }
+{ "type": "test", "name": "transform::tests::iwht_impulse_at_row1_col1_yields_hadamard_pattern", "event": "ok", "exec_time": 0.00000012 }
+{ "type": "test", "event": "started", "name": "transform::tests::iwht_unit_impulse_yields_all_ones" }
+{ "type": "test", "name": "mc::tests::dispatched_bilinear_matches_the_scalar_reference_everywhere", "event": "ok", "exec_time": 0.001583175 }
+{ "type": "test", "event": "started", "name": "transform::tests::quant_lookup_tables_match_libvpx" }
+{ "type": "test", "name": "transform::tests::iwht_mixed_block_matches_oracle", "event": "ok", "exec_time": 0.00000024 }
+{ "type": "test", "name": "transform::tests::iwht_unit_impulse_yields_all_ones", "event": "ok", "exec_time": 0.000000291 }
+{ "type": "test", "name": "transform::tests::quant_lookup_tables_match_libvpx", "event": "ok", "exec_time": 0.000000111 }
+{ "type": "test", "name": "mc::tests::dispatched_sixtap_matches_the_scalar_reference_everywhere", "event": "ok", "exec_time": 0.003159829 }
+{ "type": "suite", "event": "ok", "passed": 57, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.006221633 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "inter_frame_before_key_frame_is_rejected" }
+{ "type": "test", "event": "started", "name": "inter_frame_with_reference_of_another_size_is_refused" }
+{ "type": "test", "event": "started", "name": "zero_height_key_frame_is_rejected" }
+{ "type": "test", "event": "started", "name": "zero_width_key_frame_is_rejected" }
+{ "type": "test", "name": "inter_frame_before_key_frame_is_rejected", "event": "ok", "exec_time": 0.000004028 }
+{ "type": "test", "name": "zero_height_key_frame_is_rejected", "event": "ok", "exec_time": 0.000006392 }
+{ "type": "test", "name": "zero_width_key_frame_is_rejected", "event": "ok", "exec_time": 0.000005811 }
+{ "type": "test", "name": "inter_frame_with_reference_of_another_size_is_refused", "event": "ok", "exec_time": 0.000908288 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.001437342 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "gop_key_frame_parses_and_coexists_with_inter" }
+{ "type": "test", "event": "started", "name": "parses_multi_partition_header" }
+{ "type": "test", "event": "started", "name": "parses_real_key_frame_headers" }
+{ "type": "test", "event": "started", "name": "parses_vp8_in_webp_still" }
+{ "type": "test", "name": "parses_vp8_in_webp_still", "event": "ok", "exec_time": 0.000112862 }
+{ "type": "test", "name": "parses_multi_partition_header", "event": "ok", "exec_time": 0.000128493 }
+{ "type": "test", "name": "gop_key_frame_parses_and_coexists_with_inter", "event": "ok", "exec_time": 0.000183333 }
+{ "type": "test", "name": "parses_real_key_frame_headers", "event": "ok", "exec_time": 0.000424549 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.001104084 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000039264 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "interframe_streams_match_ffmpeg" }
+{ "type": "test", "event": "started", "name": "keyframes_match_ffmpeg" }
+{ "type": "test", "event": "started", "name": "multi_partition_keyframe_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "vp8_in_webp_still_matches_ffmpeg" }
+{ "type": "test", "name": "vp8_in_webp_still_matches_ffmpeg", "event": "ok", "exec_time": 0.221374748 }
+{ "type": "test", "name": "multi_partition_keyframe_matches_ffmpeg", "event": "ok", "exec_time": 0.234077482 }
+{ "type": "test", "name": "interframe_streams_match_ffmpeg", "event": "ok", "exec_time": 0.738251359 }
+{ "type": "test", "name": "keyframes_match_ffmpeg", "event": "ok", "exec_time": 0.943433502 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.944114083 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "decode_must_not_panic_helper_accepts_errors" }
+{ "type": "test", "event": "started", "name": "truncated_and_corrupted_fixtures_never_panic" }
+{ "type": "test", "name": "decode_must_not_panic_helper_accepts_errors", "event": "ok", "exec_time": 0.000003577 }
+{ "type": "test", "name": "truncated_and_corrupted_fixtures_never_panic", "event": "ok", "exec_time": 11.696895347 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 11.697461521 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "decode_stream_is_error_not_panic_on_bad_containers" }
+{ "type": "test", "event": "started", "name": "decode_stream_matches_ffmpeg_on_every_fixture" }
+{ "type": "test", "event": "started", "name": "hidden_frames_update_references_and_produce_no_picture" }
+{ "type": "test", "name": "decode_stream_is_error_not_panic_on_bad_containers", "event": "ok", "exec_time": 0.000277552 }
+{ "type": "test", "name": "hidden_frames_update_references_and_produce_no_picture", "event": "ok", "exec_time": 0.263697494 }
+{ "type": "test", "name": "decode_stream_matches_ffmpeg_on_every_fixture", "event": "ok", "exec_time": 2.120610782 }
+{ "type": "suite", "event": "ok", "passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 2.121385138 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000033052 }

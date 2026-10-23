@@ -8,6 +8,8 @@
 //!
 //! Run: `cargo run -p ec-bench --release`
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -108,12 +110,9 @@ fn real_video(codec: &str) -> Option<PathBuf> {
         }
     }
     found.sort();
-    for p in found {
-        if ffprobe_field(&p, "v:0", "codec_name").as_deref() == Some(codec) {
-            return Some(p);
-        }
-    }
-    None
+    found
+        .into_iter()
+        .find(|p| ffprobe_field(p, "v:0", "codec_name").as_deref() == Some(codec))
 }
 
 fn ffprobe_field(path: &Path, stream: &str, key: &str) -> Option<String> {
@@ -342,7 +341,7 @@ fn bench_hw_av1_encode(rows: &mut Vec<Row>) {
         rows.push(missing("ec-hw av1", "encode"));
         return;
     };
-    let display = match ec_va::Display::open() {
+    let display = match ec_va::open() {
         Ok(display) => display,
         Err(e) => {
             rows.push(missing_direction("ec-hw av1", "encode", &format!("no VA display ({e})")));
@@ -410,7 +409,7 @@ fn bench_hw_av1_encode_10bit(rows: &mut Vec<Row>) {
         rows.push(missing("ec-hw av1 10-bit", "encode"));
         return;
     };
-    let display = match ec_va::Display::open() {
+    let display = match ec_va::open() {
         Ok(display) => display,
         Err(e) => {
             rows.push(missing_direction("ec-hw av1 10-bit", "encode", &format!("no VA display ({e})")));
@@ -436,7 +435,7 @@ fn bench_hw_av1_encode_10bit(rows: &mut Vec<Row>) {
         }
     };
     let read = |s: &[u8]| -> Vec<u16> {
-        s.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect()
+        s.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes([p[0], p[1]])).collect()
     };
     let start = Instant::now();
     let mut coded = 0usize;
@@ -647,22 +646,22 @@ fn bench_audio_decode(rows: &mut Vec<Row>) {
             candidates.push(p);
         }
     }
-    if let Some(src) = real_video("h264") {
-        if ffprobe_field(&src, "a:0", "codec_name").as_deref() == Some("ac3") {
-            let out = Command::new("ffmpeg")
-                .args(["-v", "error", "-t", "10", "-i"])
-                .arg(&src)
-                .args(["-vn", "-c:a", "copy", "-f", "ac3"])
-                .arg(
-                    Path::new(&std::env::var("HOME").unwrap())
-                        .join(".cache/bench-media/sample.ac3"),
-                )
-                .output();
-            if let Ok(o) = out {
-                if o.status.success() {
-                    candidates.push(home().join(".cache/bench-media/sample.ac3"));
-                }
-            }
+    if let Some(src) = real_video("h264")
+        && ffprobe_field(&src, "a:0", "codec_name").as_deref() == Some("ac3")
+    {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-t", "10", "-i"])
+            .arg(&src)
+            .args(["-vn", "-c:a", "copy", "-f", "ac3"])
+            .arg(
+                Path::new(&std::env::var("HOME").unwrap())
+                    .join(".cache/bench-media/sample.ac3"),
+            )
+            .output();
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            candidates.push(home().join(".cache/bench-media/sample.ac3"));
         }
     }
     candidates.sort();
@@ -1066,11 +1065,8 @@ fn bench_container_demux(rows: &mut Vec<Row>) {
         .unwrap_or(0.0);
         let mut packets = 0u64;
         let start = Instant::now();
-        loop {
-            match reader.next_packet() {
-                Ok(_) => packets += 1,
-                Err(_) => break,
-            }
+        while reader.next_packet().is_ok() {
+            packets += 1;
         }
         let wall = start.elapsed().as_secs_f64();
         let name = src.file_name().unwrap().to_string_lossy().into_owned();

@@ -2,6 +2,9 @@
 //! PNS/M/S decorrelation the consumer sweep found in that encoder's output
 //! (see repo ledger). Real files, read-only, absent directory skips loudly.
 
+mod common;
+
+use common::have_ffmpeg;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -14,14 +17,6 @@ use std::io::BufReader;
 const MAX_SAMPLES: usize = 480_000; // 10s @ 48kHz
 const LAG_MAX: usize = 4_000;
 const WINDOW: usize = 200_000;
-
-fn have_ffmpeg() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 fn ffmpeg_decode(path: &Path, channels: usize) -> Vec<Vec<f32>> {
     let out = Command::new("ffmpeg")
@@ -47,7 +42,7 @@ fn ffmpeg_decode(path: &Path, channels: usize) -> Vec<Vec<f32>> {
     );
     let samples: Vec<f32> = out
         .stdout
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let mut planes = vec![Vec::with_capacity(samples.len() / channels.max(1)); channels];
@@ -203,9 +198,7 @@ fn obs_content_table() {
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("mp4"))
         .collect();
     files.sort();
-    unsafe {
-        std::env::set_var("EC_AAC_TOOL_SIDEINFO_DEBUG", "1");
-    }
+    let _knob = ec_aac::knobs::set_tool_sideinfo_debug(Some(true));
     for path in files {
         eprintln!("== {}", path.display());
         let before = ec_aac::tool_sideinfo_log().len();

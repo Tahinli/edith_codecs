@@ -165,18 +165,6 @@ stamp!(filters_done, filters_done);
 stamp!(slot_fulfil, slot_fulfil);
 stamp!(grain_done, grain_done);
 
-/// Whether this frame's filters ran pipelined per superblock row.
-#[cold]
-pub(crate) fn note_pipe(pipe: bool) {
-    if !on() {
-        return;
-    }
-    let idx = CUR.with(std::cell::Cell::get);
-    if idx != usize::MAX {
-        rec(idx, |r| r.pipe = pipe);
-    }
-}
-
 /// The picture reached the sink. Only a frame that finished on a worker
 /// (`grain_done`) and has not been emitted yet takes the stamp -- a
 /// `show_existing_frame` re-output reports a decode index that is not its

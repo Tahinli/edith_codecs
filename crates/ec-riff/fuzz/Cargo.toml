@@ -1,0 +1,49 @@
+[package]
+name = "ec-riff-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-core]
+path = "../../ec-core"
+
+[dependencies.ec-riff]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "wav_read"
+path = "fuzz_targets/wav_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avi_read"
+path = "fuzz_targets/avi_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avi_seek"
+path = "fuzz_targets/avi_seek.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avi_demux"
+path = "fuzz_targets/avi_demux.rs"
+test = false
+doc = false
+bench = false

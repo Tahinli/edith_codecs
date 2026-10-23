@@ -235,7 +235,7 @@ pub(crate) const BY_VALUE_TYPES: &[(&str, Option<usize>, bool, &str)] = &[
     // -- silk_enc_write.rs ------------------------------------------------
     (
         "SilkEncoder",
-        Some(6648),
+        Some(6664),
         false,
         "silk_enc_write::SilkEncoder::new -> Self. `pub`, `pub use`d at the \
          crate root, and returned by value -- but every field that holds one \
@@ -243,10 +243,10 @@ pub(crate) const BY_VALUE_TYPES: &[(&str, Option<usize>, bool, &str)] = &[
     ),
     (
         "SilkStereoEncoder",
-        Some(19744),
+        Some(19808),
         false,
         "silk_enc_write::SilkStereoEncoder::new -> Self. The largest single \
-         type in the crate at 2.41x the budget, and the reason three of the \
+         type in the crate at 2.42x the budget, and the reason three of the \
          six Encoder slots are boxed rather than one",
     ),
     (
@@ -545,7 +545,7 @@ mod tests {
             rows.len(),
             STACK_BUDGET / 1024
         );
-        eprintln!("{:>8}  {:>7}  {}", "BYTES", "%BUDGET", "TYPE");
+        eprintln!("{:>8}  {:>7}  TYPE", "BYTES", "%BUDGET");
         for (name, size) in &rows {
             eprintln!(
                 "{size:>8}  {:>6.1}%  {name}",
@@ -625,8 +625,8 @@ mod tests {
 
     /// The SILK encoders and the SILK packet buffer stay BEHIND A BOX.
     ///
-    /// The budget does not apply to `SilkEncoder` (6,648 B),
-    /// `SilkStereoEncoder` (19,744 B) or the 3,831-byte `silk_buf`, because
+    /// The budget does not apply to `SilkEncoder` (6,664 B),
+    /// `SilkStereoEncoder` (19,792 B) or the 3,831-byte `silk_buf`, because
     /// every field holding one is a `Box` and no caller can reach them by
     /// value any more. What keeps them off the stack is those exact `Box`
     /// spellings, and THIS is the pin for that -- a source scan over the
@@ -729,10 +729,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("no source pinned for {file}"));
             assert!(
                 !src.contains(spelling),
-                "{} is declared unboxed as `{spelling}`. The box pin is \
+                "{file}::{field} is declared unboxed as `{spelling}`. The box pin is \
                  matching a spelling that is not the live declaration, and \
-                 {field}'s bytes are back on every caller's stack.",
-                format!("{file}::{field}")
+                 {field}'s bytes are back on every caller's stack."
             );
         }
     }

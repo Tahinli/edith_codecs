@@ -17,8 +17,11 @@
 //! B pictures comes out in the order a player has to present it, not the order
 //! it was coded in.
 
+use crate::sample::Sample;
 use ec_core::error::{Error, Result};
 use ec_h264_syntax::{DecRefPicMarking, RefPicListMod, SliceType, Sps};
+
+mod interlaced;
 
 /// Luma plane padding on every side, sized for inter-prediction filter
 /// overreach: a 16-wide partition plus the two/three sample reach of the 6-tap
@@ -30,6 +33,20 @@ pub(crate) const PAD_C: usize = 16;
 pub(crate) const NO_SLICE: u16 = u16::MAX;
 /// Hard cap on stored pictures: 16 reference frames (Annex A) plus the current.
 const MAX_STORED: usize = 17;
+
+/// `Picture::structure` of a frame (or of a complementary field pair seen as one).
+pub(crate) const FRAME: u8 = 0;
+/// `Picture::structure` of a top field.
+pub(crate) const TOP: u8 = 1;
+/// `Picture::structure` of a bottom field.
+pub(crate) const BOTTOM: u8 = 2;
+/// `Picture::coding` (`PicCodingStruct`, Table 8-7): coded as a frame without
+/// macroblock-adaptive frame/field switching (FRM).
+pub(crate) const CODED_FRM: u8 = 0;
+/// Coded as a frame with macroblock-adaptive frame/field macroblock pairs (AFRM).
+pub(crate) const CODED_AFRM: u8 = 1;
+/// Coded as two field pictures (FLD).
+pub(crate) const CODED_FLD: u8 = 2;
 
 /// Per-4x4-block flags recorded for inter neighbour derivation.
 /// The block belongs to an intra macroblock.
@@ -52,10 +69,10 @@ pub(crate) enum Mark {
     Long,
 }
 
-/// A padded 8-bit plane.
+/// A padded sample plane (`u8` at 8 bits, `u16` above).
 #[derive(Debug, Default)]
-pub(crate) struct Plane8 {
-    pub data: Vec<u8>,
+pub(crate) struct PicPlane<S: Sample = u8> {
+    pub data: Vec<S>,
     pub stride: usize,
     /// Index of sample (0, 0) of the picture.
     pub origin: usize,
@@ -64,7 +81,10 @@ pub(crate) struct Plane8 {
     pub pad: usize,
 }
 
-impl Plane8 {
+/// The 8-bit plane.
+pub(crate) type Plane8 = PicPlane<u8>;
+
+impl<S: Sample> PicPlane<S> {
     fn resize(&mut self, width: usize, height: usize, pad: usize) {
         self.stride = width + 2 * pad;
         self.origin = pad * self.stride + pad;
@@ -72,7 +92,8 @@ impl Plane8 {
         self.height = height;
         self.pad = pad;
         self.data.clear();
-        self.data.resize(self.stride * (height + 2 * pad), 0);
+        self.data
+            .resize(self.stride * (height + 2 * pad), S::default());
     }
 
     #[inline]
@@ -104,6 +125,16 @@ impl Plane8 {
     }
 }
 
+/// Chroma macroblock width, height and plane padding for a `ChromaArrayType`.
+/// A monochrome picture keeps 4:2:0-sized neutral planes.
+pub(crate) fn chroma_geometry(cat: u8) -> (usize, usize, usize) {
+    match cat {
+        2 => (8, 16, PAD_C),
+        3 => (16, 16, PAD_Y),
+        _ => (8, 8, PAD_C),
+    }
+}
+
 /// Per-slice values the deblocking filter needs after slice decode ends.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SliceParams {
@@ -120,21 +151,35 @@ pub(crate) struct SliceParams {
 /// by macroblock address or 4x4-block coordinate: no per-macroblock heap
 /// objects anywhere, and the whole picture is one reusable allocation set.
 #[derive(Debug, Default)]
-pub(crate) struct Picture {
+pub(crate) struct Picture<S: Sample = u8> {
+    /// Sample bit depth (luma and chroma agree; mixed depths are refused).
+    pub bd: u32,
+    /// Chroma rows per macroblock: 8 for 4:2:0 and monochrome (whose planes
+    /// are neutral filler), 16 for 4:2:2 and 4:4:4.
+    pub cmb_h: usize,
+    /// Chroma columns per macroblock: 8, or 16 for 4:4:4.
+    pub cw: usize,
+    /// `ChromaArrayType`: 0 monochrome (or a separately coded colour plane),
+    /// 1 4:2:0, 2 4:2:2, 3 4:4:4.
+    pub cat: u8,
+    /// `qpprime_y_zero_transform_bypass_flag` of the SPS.
+    pub bypass_enabled: bool,
     pub sps_id: u8,
     pub mb_w: usize,
     pub mb_h: usize,
-    pub y: Plane8,
-    pub cb: Plane8,
-    pub cr: Plane8,
+    pub y: PicPlane<S>,
+    pub cb: PicPlane<S>,
+    pub cr: PicPlane<S>,
     /// TotalCoeff per luma 4x4 block, `(mb_w * 4) x (mb_h * 4)`.
     pub nz_y: Vec<u8>,
-    /// TotalCoeff per chroma 4x4 block, `(mb_w * 2) x (mb_h * 2)`, Cb and Cr.
+    /// TotalCoeff per chroma 4x4 block, `(mb_w * 2) x (mb_h * cmb_h / 4)`, Cb and
+    /// Cr; for 4:4:4 (whose chroma blocks are laid out like luma ones) the
+    /// grids are as large as `nz_y`.
     pub nz_c: [Vec<u8>; 2],
     /// Intra4x4PredMode per luma 4x4 block (2 = DC for non-I4x4 MBs).
     pub i4_modes: Vec<u8>,
     /// QPY per macroblock (the prediction-chain value; PCM keeps the chain).
-    pub mb_qp: Vec<u8>,
+    pub mb_qp: Vec<i8>,
     /// `FLAG_*` bits per macroblock.
     pub mb_flags: Vec<u8>,
     /// `CodedBlockPatternLuma | CodedBlockPatternChroma << 4` per macroblock.
@@ -143,6 +188,9 @@ pub(crate) struct Picture {
     pub mb_dc_cbf: Vec<u8>,
     /// Owning slice index per macroblock, `NO_SLICE` when undecoded.
     pub mb_slice: Vec<u16>,
+    /// 1 for a macroblock of a field macroblock pair, per macroblock (MBAFF
+    /// frames only; both macroblocks of a pair carry the pair's flag).
+    pub mb_field: Vec<u8>,
     /// `MvLX[..][..]` per luma 4x4 block, `[list][component]`, quarter samples.
     pub mv: Vec<[[i16; 2]; 2]>,
     /// `RefIdxLX` per luma 4x4 block, -1 when the list is not used.
@@ -195,25 +243,101 @@ pub(crate) struct Picture {
     pub crop: (u32, u32),
     /// Colour description carried from the VUI.
     pub color: ec_core::frame::ColorInfo,
+
+    // ---- interlaced pictures (frame_mbs_only_flag 0) ----
+    /// What this object is: [`FRAME`], [`TOP`] or [`BOTTOM`]. A field picture
+    /// is decoded into a half-height `Picture` of its own, so every per-macroblock
+    /// array below describes that one field.
+    pub structure: u8,
+    /// `PicCodingStruct` of a frame store ([`CODED_FRM`], [`CODED_AFRM`],
+    /// [`CODED_FLD`]).
+    pub coding: u8,
+    /// An MBAFF frame (`coding == CODED_AFRM`). Its per-macroblock and
+    /// per-block arrays are in *slot* order: macroblock `2 * pair + b` of
+    /// pair (px, pr) lives at slot row `2 * pr + b` whether the pair is a
+    /// frame or a field pair.
+    pub mbaff: bool,
+    /// The two fields `[top, bottom]` of a frame store of an interlaced
+    /// stream: their own padded half-height planes (so a field reference reads
+    /// edge-replicated samples of the field, not of the frame) and, for a
+    /// frame coded as field pictures, their motion data.
+    pub fields: Vec<Picture<S>>,
+    /// Marking of each field of a frame store (`mark` is the aggregate).
+    pub fmark: [Mark; 2],
+    /// `TopFieldOrderCnt` and `BottomFieldOrderCnt`.
+    pub fpoc: [i32; 2],
+    /// Which fields have been decoded.
+    pub have: [bool; 2],
+    /// The first field is stored and the second has not arrived (yet).
+    pub awaiting_second: bool,
 }
 
-impl Picture {
+impl<S: Sample> Picture<S> {
     /// Reset for a new picture of `sps`'s geometry, reallocating only when the
     /// geometry actually changed.
     pub(crate) fn start(&mut self, sps: &Sps) {
+        self.start_as(sps, FRAME);
+    }
+
+    /// [`Picture::start`] for a picture of the given structure: a field is
+    /// half the frame's height.
+    pub(crate) fn start_as(&mut self, sps: &Sps, structure: u8) {
+        self.bd = u32::from(sps.bit_depth_luma);
+        let cat = sps.chroma_array_type();
+        let (cw, cmb_h, cpad) = chroma_geometry(cat);
+        self.cat = cat;
+        self.cw = cw;
+        self.bypass_enabled = sps.transform_bypass;
+        self.structure = structure;
+        self.coding = if structure != FRAME {
+            CODED_FLD
+        } else {
+            CODED_FRM
+        };
+        self.fmark = [Mark::Unused; 2];
+        self.have = [false; 2];
+        self.awaiting_second = false;
+        self.mbaff = false;
         let mb_w = sps.mb_width as usize;
-        let mb_h = sps.mb_height as usize;
-        if self.mb_w != mb_w || self.mb_h != mb_h || self.sps_id != sps.id {
+        let mb_h = if structure == FRAME {
+            sps.mb_height as usize
+        } else {
+            sps.mb_height as usize / 2
+        };
+        if self.mb_w != mb_w
+            || self.cmb_h != cmb_h
+            || self.cw != cw
+            || (cat == 0 && self.cb.data.first() != Some(&S::from_i32(1 << (self.bd - 1))))
+            || self.mb_h != mb_h
+            || self.sps_id != sps.id
+            || self.mv.len() != mb_w * mb_h * 16
+        {
             self.mb_w = mb_w;
             self.mb_h = mb_h;
+            self.cmb_h = cmb_h;
             self.sps_id = sps.id;
             self.y.resize(mb_w * 16, mb_h * 16, PAD_Y);
-            self.cb.resize(mb_w * 8, mb_h * 8, PAD_C);
-            self.cr.resize(mb_w * 8, mb_h * 8, PAD_C);
+            self.cb.resize(mb_w * cw, mb_h * cmb_h, cpad);
+            self.cr.resize(mb_w * cw, mb_h * cmb_h, cpad);
+            if cat == 0 {
+                // A monochrome picture leaves its chroma planes neutral: they
+                // are never written, and come out as the grey chroma of a
+                // 4:2:0 frame.
+                let neutral = S::from_i32(1 << (self.bd - 1));
+                self.cb.data.fill(neutral);
+                self.cr.data.fill(neutral);
+            }
             let blocks = mb_w * mb_h * 16;
             self.nz_y.resize(blocks, 0);
             for c in &mut self.nz_c {
-                c.resize(mb_w * mb_h * 4, 0);
+                c.resize(
+                    if cat == 3 {
+                        blocks
+                    } else {
+                        mb_w * mb_h * (cmb_h / 2)
+                    },
+                    0,
+                );
             }
             self.i4_modes.resize(blocks, 2);
             self.mb_qp.resize(mb_w * mb_h, 0);
@@ -221,6 +345,7 @@ impl Picture {
             self.mb_cbp.resize(mb_w * mb_h, 0);
             self.mb_dc_cbf.resize(mb_w * mb_h, 0);
             self.mb_slice.resize(mb_w * mb_h, NO_SLICE);
+            self.mb_field.resize(mb_w * mb_h, 0);
             self.mv.resize(blocks, [[0; 2]; 2]);
             self.ref_idx.resize(blocks, [-1; 2]);
             self.ref_id.resize(blocks, [-1; 2]);
@@ -231,6 +356,7 @@ impl Picture {
         // "who is decoded" state must be wiped between pictures.
         self.mb_slice.fill(NO_SLICE);
         self.mb_flags.fill(0);
+        self.mb_field.fill(0);
         self.slices.clear();
         self.decoded_mbs = 0;
         self.complete = false;
@@ -262,12 +388,13 @@ impl Picture {
 
     /// Fill the picture with mid-grey, for a frame the stream never sent.
     fn fill_grey(&mut self) {
-        self.y.data.fill(128);
-        self.cb.data.fill(128);
-        self.cr.data.fill(128);
+        let grey = S::from_i32(1 << (self.bd - 1));
+        self.y.data.fill(grey);
+        self.cb.data.fill(grey);
+        self.cr.data.fill(grey);
     }
 
-    fn copy_samples_from(&mut self, src: &Picture) {
+    fn copy_samples_from(&mut self, src: &Picture<S>) {
         self.y.data.copy_from_slice(&src.y.data);
         self.cb.data.copy_from_slice(&src.cb.data);
         self.cr.data.copy_from_slice(&src.cr.data);
@@ -275,7 +402,7 @@ impl Picture {
 
     /// True while the picture occupies a decoded picture buffer slot.
     fn stored(&self) -> bool {
-        self.mark != Mark::Unused || self.output
+        self.mark != Mark::Unused || self.output || self.awaiting_second
     }
 }
 
@@ -304,27 +431,50 @@ impl RefList {
     }
 
     /// The DPB index of `RefPicListX[idx]`, `None` past the end.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn get(&self, idx: usize) -> Option<usize> {
-        (idx < self.len).then(|| usize::from(self.entries[idx]))
+        (idx < self.len).then(|| usize::from(self.entries[idx] & 31))
+    }
+
+    /// The DPB index and structure ([`FRAME`], [`TOP`] or [`BOTTOM`]) of
+    /// `RefPicListX[idx]`. A field entry names one field of a stored frame.
+    #[inline]
+    pub(crate) fn get_ref(&self, idx: usize) -> Option<(usize, u8)> {
+        (idx < self.len).then(|| {
+            let e = self.entries[idx];
+            (usize::from(e & 31), e >> 5)
+        })
     }
 
     /// Append one DPB index; also the constructor decoder tests need to name
     /// a non-empty reference list.
     pub(crate) fn push(&mut self, idx: usize) {
+        self.push_ref(idx, FRAME);
+    }
+
+    /// Append one field (or frame) of DPB entry `idx`.
+    pub(crate) fn push_ref(&mut self, idx: usize, structure: u8) {
         if self.len < self.entries.len() {
-            self.entries[self.len] = idx as u8;
+            self.entries[self.len] = idx as u8 | (structure << 5);
             self.len += 1;
         }
     }
 }
 
 /// The decoded picture buffer and the clause 8.2 state that spans pictures.
-pub(crate) struct Dpb {
+pub(crate) struct Dpb<S: Sample = u8> {
     /// Stored pictures, in no particular order.
-    pub frames: Vec<Picture>,
+    pub frames: Vec<Picture<S>>,
     /// Recycled picture buffers.
-    free: Vec<Picture>,
+    free: Vec<Picture<S>>,
+    /// Recycled half-height buffers (field pictures and the field views of
+    /// frames).
+    field_free: Vec<Picture<S>>,
+    /// The stream has frame_mbs_only_flag 0: reference marking, list
+    /// construction and storage go through the field-aware paths in
+    /// [`interlaced`].
+    pub(crate) interlaced: bool,
     next_id: i32,
     /// `max_dec_frame_buffering`.
     max_frames: usize,
@@ -348,11 +498,13 @@ pub(crate) struct Dpb {
     last_id: i32,
 }
 
-impl Default for Dpb {
-    fn default() -> Dpb {
+impl<S: Sample> Default for Dpb<S> {
+    fn default() -> Dpb<S> {
         Dpb {
             frames: Vec::new(),
             free: Vec::new(),
+            field_free: Vec::new(),
+            interlaced: false,
             next_id: 0,
             max_frames: 16,
             max_reorder: 16,
@@ -373,8 +525,13 @@ impl Default for Dpb {
 /// Output of the picture order count derivation (clause 8.2.1).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Poc {
-    /// `PicOrderCnt( )` of the frame.
+    /// `PicOrderCnt( )` of the picture (8-1): the frame's minimum, or the
+    /// field's own count.
     pub value: i32,
+    /// `TopFieldOrderCnt` and `BottomFieldOrderCnt` (only the field being
+    /// decoded is meaningful for a field picture).
+    pub top: i32,
+    pub bottom: i32,
     /// `FrameNumOffset`, predicted from by the next picture.
     pub frame_num_offset: i32,
     /// `PicOrderCntMsb` (POC type 0 only).
@@ -387,6 +544,10 @@ pub(crate) struct Poc {
 /// slice header of that picture.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PicInfo {
+    /// [`FRAME`], [`TOP`] or [`BOTTOM`].
+    pub structure: u8,
+    /// For a second field: the frame store its first field created.
+    pub second_of: Option<usize>,
     pub is_idr: bool,
     pub is_reference: bool,
     pub frame_num: u32,
@@ -395,7 +556,18 @@ pub(crate) struct PicInfo {
     pub delta_pic_order_cnt: [i32; 2],
 }
 
-impl Dpb {
+impl PicInfo {
+    /// `PicOrderCnt( )` (8-1) from the two field counts.
+    fn value_of(&self, top: i32, bottom: i32) -> i32 {
+        match self.structure {
+            TOP => top,
+            BOTTOM => bottom,
+            _ => top.min(bottom),
+        }
+    }
+}
+
+impl<S: Sample> Dpb<S> {
     /// Adopt the buffer limits of `sps` (Annex A / VUI), keeping whatever is
     /// already stored.
     pub(crate) fn configure(&mut self, sps: &Sps) {
@@ -410,20 +582,45 @@ impl Dpb {
             // order: pictures still leave smallest-POC-first.
             None => (level_frames, level_frames),
         };
+        self.interlaced = !sps.frame_mbs_only;
         self.max_frames = buffering.max(sps.max_num_ref_frames as usize).max(1);
         self.max_reorder = reorder.min(self.max_frames);
     }
 
     /// A picture buffer to decode into, off the free list when possible.
-    pub(crate) fn take_picture(&mut self) -> Picture {
+    pub(crate) fn take_picture(&mut self) -> Picture<S> {
         let mut pic = self.free.pop().unwrap_or_default();
-        pic.id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        pic.id = self.reserve_id();
         pic
     }
 
+    /// A fresh picture identity. Frames take multiples of four so that the
+    /// fields of a frame can be named `id + 1` (top) and `id + 2` (bottom):
+    /// the reference identity of a field is derived from its frame's.
+    pub(crate) fn reserve_id(&mut self) -> i32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(4);
+        id
+    }
+
+    /// A half-height picture buffer off the field free list.
+    pub(crate) fn take_field_picture(&mut self) -> Picture<S> {
+        self.field_free.pop().unwrap_or_default()
+    }
+
     /// Hand a picture buffer back for reuse.
-    pub(crate) fn recycle(&mut self, pic: Picture) {
+    pub(crate) fn recycle(&mut self, mut pic: Picture<S>) {
+        if pic.structure != FRAME {
+            if self.field_free.len() < 2 * MAX_STORED {
+                self.field_free.push(pic);
+            }
+            return;
+        }
+        for f in pic.fields.drain(..) {
+            if self.field_free.len() < 2 * MAX_STORED {
+                self.field_free.push(f);
+            }
+        }
         if self.free.len() < MAX_STORED {
             self.free.push(pic);
         }
@@ -466,10 +663,17 @@ impl Dpb {
                 } else {
                     prev_msb
                 };
+                // 8-1 / 8-2 for a frame, 8-2' for a bottom field, which has no delta.
                 let top = msb + lsb;
-                let bottom = top + info.delta_pic_order_cnt_bottom;
+                let bottom = if info.structure == FRAME {
+                    top + info.delta_pic_order_cnt_bottom
+                } else {
+                    top
+                };
                 Ok(Poc {
-                    value: top.min(bottom),
+                    value: info.value_of(top, bottom),
+                    top,
+                    bottom,
                     frame_num_offset: 0,
                     msb,
                     lsb,
@@ -501,11 +705,18 @@ impl Dpb {
                     expected = expected.wrapping_add(sps.offset_for_non_ref_pic);
                 }
                 let top = expected.wrapping_add(info.delta_pic_order_cnt[0]);
-                let bottom = top
-                    .wrapping_add(sps.offset_for_top_to_bottom_field)
-                    .wrapping_add(info.delta_pic_order_cnt[1]);
+                let bottom = if info.structure == FRAME {
+                    top.wrapping_add(sps.offset_for_top_to_bottom_field)
+                        .wrapping_add(info.delta_pic_order_cnt[1])
+                } else {
+                    expected
+                        .wrapping_add(sps.offset_for_top_to_bottom_field)
+                        .wrapping_add(info.delta_pic_order_cnt[0])
+                };
                 Ok(Poc {
-                    value: top.min(bottom),
+                    value: info.value_of(top, bottom),
+                    top,
+                    bottom,
                     frame_num_offset: offset,
                     msb: 0,
                     lsb: 0,
@@ -523,6 +734,8 @@ impl Dpb {
                 };
                 Ok(Poc {
                     value: poc,
+                    top: poc,
+                    bottom: poc,
                     frame_num_offset: offset,
                     msb: 0,
                     lsb: 0,
@@ -584,6 +797,8 @@ impl Dpb {
             pic.output = false;
             pic.complete = true;
             let info = PicInfo {
+                structure: FRAME,
+                second_of: None,
                 is_idr: false,
                 is_reference: true,
                 frame_num: unused,
@@ -842,7 +1057,7 @@ impl Dpb {
     /// bookkeeping, but the bumping process must never hand it to a caller.
     pub(crate) fn store(
         &mut self,
-        mut pic: Picture,
+        mut pic: Picture<S>,
         sps: &Sps,
         info: &PicInfo,
         marking: Option<&DecRefPicMarking>,
@@ -872,7 +1087,14 @@ impl Dpb {
                 self.max_long_term_idx = None;
             }
         } else if info.is_reference {
-            let m = marking.expect("a reference picture carries dec_ref_pic_marking");
+            // nal_ref_idc says reference, but the marking the slices carried
+            // is absent (the flag is per-slice, so a corrupt picture can mix
+            // them): malformed input, not a reason to panic.
+            let Some(m) = marking else {
+                return Err(Error::corrupt(
+                    "a reference picture carries no dec_ref_pic_marking",
+                ));
+            };
             pic.mark = Mark::Short;
             if m.adaptive {
                 self.apply_mmco(&mut pic, m, info)?;
@@ -958,7 +1180,7 @@ impl Dpb {
     /// Adaptive marking (clause 8.2.5.4).
     fn apply_mmco(
         &mut self,
-        pic: &mut Picture,
+        pic: &mut Picture<S>,
         m: &DecRefPicMarking,
         info: &PicInfo,
     ) -> Result<()> {
@@ -1051,7 +1273,7 @@ impl Dpb {
                 .frames
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.output && p.id != last)
+                .filter(|(_, p)| p.output && !p.awaiting_second && p.id != last)
                 .min_by_key(|(_, p)| p.poc)
                 .map(|(i, _)| i);
             if best.is_some() {
@@ -1059,14 +1281,18 @@ impl Dpb {
             }
             self.pending_flush = false;
         }
-        let pending = self.frames.iter().filter(|p| p.output).count();
+        let pending = self
+            .frames
+            .iter()
+            .filter(|p| p.output && !p.awaiting_second)
+            .count();
         let stored = self.frames.iter().filter(|p| p.stored()).count();
         if !flush && pending <= self.max_reorder && stored <= self.max_frames {
             return None;
         }
         let mut best: Option<usize> = None;
         for (i, pic) in self.frames.iter().enumerate() {
-            if !pic.output {
+            if !pic.output || pic.awaiting_second {
                 continue;
             }
             if best.is_none_or(|b| pic.poc < self.frames[b].poc) {
@@ -1074,6 +1300,16 @@ impl Dpb {
             }
         }
         best
+    }
+
+    /// Identity of the frame store the most recently stored picture went into.
+    pub(crate) fn last_stored_id(&self) -> i32 {
+        self.last_id
+    }
+
+    /// True when the most recently stored picture is a first field.
+    pub(crate) fn awaiting_second_field(&self) -> bool {
+        self.frames.iter().any(|f| f.awaiting_second)
     }
 
     /// Mark picture `idx` as output and reclaim every slot that is now free.
@@ -1183,6 +1419,8 @@ mod tests {
 
     fn info(frame_num: u32, lsb: u32, is_ref: bool, is_idr: bool) -> PicInfo {
         PicInfo {
+            structure: FRAME,
+            second_of: None,
             is_idr,
             is_reference: is_ref,
             frame_num,
@@ -1192,11 +1430,24 @@ mod tests {
         }
     }
 
+    /// A reference picture stored without its dec_ref_pic_marking is malformed
+    /// input: `store` must return `Corrupt`, not panic.
+    #[test]
+    fn reference_picture_without_marking_is_corrupt_not_a_panic() {
+        let sps = sps_for(0);
+        let mut dpb = Dpb::<u8>::default();
+        let pic = dpb.take_picture();
+        let err = dpb
+            .store(pic, &sps, &info(0, 0, true, false), None, true)
+            .expect_err("a reference picture without marking must be refused");
+        assert!(matches!(err, Error::Corrupt { .. }), "{err:?}");
+    }
+
     /// Picture order count type 0 wraps when pic_order_cnt_lsb rolls over.
     #[test]
     fn poc_type_0_tracks_the_msb_across_a_wrap() {
         let sps = sps_for(0);
-        let mut dpb = Dpb::default();
+        let mut dpb = Dpb::<u8>::default();
         let mut expect = |i: PicInfo, want: i32| {
             let poc = dpb.picture_order_count(&sps, &i).unwrap();
             assert_eq!(poc.value, want, "{i:?}");
@@ -1221,7 +1472,7 @@ mod tests {
     #[test]
     fn poc_type_2_is_twice_the_frame_number() {
         let sps = sps_for(2);
-        let dpb = Dpb::default();
+        let dpb = Dpb::<u8>::default();
         assert_eq!(
             dpb.picture_order_count(&sps, &info(0, 0, true, true))
                 .unwrap()
@@ -1246,7 +1497,7 @@ mod tests {
     #[test]
     fn poc_type_1_follows_the_offset_cycle() {
         let sps = sps_for(1);
-        let dpb = Dpb::default();
+        let dpb = Dpb::<u8>::default();
         // One-entry cycle of +2: frame n has expectedPicOrderCnt 2n.
         assert_eq!(
             dpb.picture_order_count(&sps, &info(0, 0, true, true))
@@ -1268,7 +1519,7 @@ mod tests {
         );
     }
 
-    fn push_ref(dpb: &mut Dpb, frame_num: u32, poc: i32, mark: Mark) {
+    fn push_ref(dpb: &mut Dpb<u8>, frame_num: u32, poc: i32, mark: Mark) {
         let mut pic = dpb.take_picture();
         pic.frame_num = frame_num;
         pic.frame_num_wrap = frame_num as i32;
@@ -1281,7 +1532,7 @@ mod tests {
     /// P list 0 is short-term by descending PicNum then long-term ascending.
     #[test]
     fn p_list_initialisation_orders_by_pic_num() {
-        let mut dpb = Dpb::default();
+        let mut dpb = Dpb::<u8>::default();
         push_ref(&mut dpb, 2, 4, Mark::Short);
         push_ref(&mut dpb, 5, 10, Mark::Short);
         push_ref(&mut dpb, 3, 6, Mark::Short);
@@ -1302,7 +1553,7 @@ mod tests {
     /// B lists split around the current POC and mirror each other.
     #[test]
     fn b_list_initialisation_splits_around_the_current_poc() {
-        let mut dpb = Dpb::default();
+        let mut dpb = Dpb::<u8>::default();
         push_ref(&mut dpb, 0, 0, Mark::Short);
         push_ref(&mut dpb, 1, 8, Mark::Short);
         push_ref(&mut dpb, 2, 4, Mark::Short);
@@ -1323,7 +1574,7 @@ mod tests {
     /// entries swapped (8.2.4.2.3 step 3 only fires above one entry).
     #[test]
     fn identical_b_lists_swap_the_first_two_entries() {
-        let mut dpb = Dpb::default();
+        let mut dpb = Dpb::<u8>::default();
         push_ref(&mut dpb, 0, 0, Mark::Short);
         push_ref(&mut dpb, 1, 2, Mark::Short);
         // Both references precede the current picture, so initialisation gives
@@ -1344,7 +1595,7 @@ mod tests {
     /// A short-term modification moves the named picture to the front.
     #[test]
     fn short_term_modification_reorders_the_list() {
-        let mut dpb = Dpb::default();
+        let mut dpb = Dpb::<u8>::default();
         push_ref(&mut dpb, 5, 10, Mark::Short);
         push_ref(&mut dpb, 4, 8, Mark::Short);
         push_ref(&mut dpb, 3, 6, Mark::Short);

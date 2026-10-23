@@ -1,0 +1,9 @@
+   Compiling ec-subs v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-subs)
+    Finished `release` profile [optimized] target(s) in 1.85s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_subs-5d2a06041e3425a1)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-9b601b635ac42bda)
+     Running tests/real_library.rs (/home/user/.cache/tgt-testcut-rest/release/deps/real_library-0da15d5a3a07b4d2)
+error: test failed, to rerun pass `-p ec-subs --test real_library`
+   Doc-tests ec_subs
+error: 1 target failed:
+    `-p ec-subs --test real_library`

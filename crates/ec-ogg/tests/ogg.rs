@@ -771,3 +771,61 @@ fn seek_to_first_data_granule_replays_the_first_packet() {
         assert_eq!(after_seek.pts, first.pts, "{codec:?}: first packet pts");
     }
 }
+
+/// Fuzzing regression: a granule position at the bottom of `i64` on the last page of an Opus
+/// stream made `granule - pre_skip` overflow when the demuxer measured the duration.
+#[test]
+fn granule_at_i64_floor_does_not_overflow_the_duration() {
+    let time_base = TimeBase::from_rate(48_000);
+    let mut head = Vec::from(*b"OpusHead");
+    head.extend_from_slice(&[1, 2]);
+    head.extend_from_slice(&312u16.to_le_bytes()); // pre-skip, so start_time is non-zero
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.resize(19, 0);
+    let mut params = CodecParameters::new(CodecId::Opus);
+    params.extradata = Some(Buf::from_vec(head));
+
+    let mut muxer = OggMuxer::new(Cursor::new(Vec::new()));
+    muxer.add_stream(StreamInfo::new(0, time_base, params)).unwrap();
+    let mut packet = Packet::new(0, time_base, vec![0xf8, 0, 0]); // config 31, one frame
+    packet.side_data.push(granule_side_data(i64::MIN));
+    muxer.write_packet(&packet).unwrap();
+    muxer.finish().unwrap();
+    let bytes = muxer.into_inner().into_inner();
+
+    let demuxer = OggDemuxer::open(Cursor::new(bytes)).unwrap();
+    assert_eq!(demuxer.streams()[0].duration, None, "no duration can be stated");
+}
+
+/// Fuzzing regression: a page whose granule sits near `i64::MAX` made the running packet
+/// position overflow when the next packet (which has no granule of its own) advanced it.
+#[test]
+fn packet_position_near_i64_max_saturates_instead_of_overflowing() {
+    let time_base = TimeBase::from_rate(48_000);
+    let mut head = Vec::from(*b"OpusHead");
+    head.extend_from_slice(&[1, 2]);
+    head.extend_from_slice(&0u16.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.resize(19, 0);
+    let mut params = CodecParameters::new(CodecId::Opus);
+    params.extradata = Some(Buf::from_vec(head));
+
+    let mut muxer = OggMuxer::new(Cursor::new(Vec::new()));
+    muxer.add_stream(StreamInfo::new(0, time_base, params)).unwrap();
+    // One packet per page, so the second packet sits on a page with no granule of its own.
+    muxer.set_page_target_bytes(Some(1));
+    let mut first = Packet::new(0, time_base, vec![0xf8, 0, 0]);
+    first.side_data.push(granule_side_data(i64::MAX - 100));
+    muxer.write_packet(&first).unwrap();
+    muxer.write_packet(&Packet::new(0, time_base, vec![0xf8, 1, 1])).unwrap();
+    muxer.finish().unwrap();
+    let bytes = muxer.into_inner().into_inner();
+
+    let mut demuxer = OggDemuxer::open(Cursor::new(bytes)).unwrap();
+    let mut read = Vec::new();
+    while let Ok(packet) = demuxer.next_packet() {
+        read.push(packet);
+    }
+    assert_eq!(read.len(), 2, "both packets are still delivered");
+    assert_eq!(read[1].pts, Some(i64::MAX - 100), "the packet that overflowed keeps its start");
+}

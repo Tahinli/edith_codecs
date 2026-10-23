@@ -47,9 +47,10 @@ not worse by 0.3, wall ≤+15%. Sign: BD-rate, lower better.
 ## 2. Witnesses FIRST (before any BD gate)
 
 Add witnesses in the standing pattern (see
+`superblock_size_global_suite` (the folded cases, incl.
 `a_128_root_block_with_a_real_residual_decodes_exact_through_both_decoders`
-and `a_128_root_residual_block_under_a_per_unit_cdef_list_decodes_exact`,
-both `--ignored`, fixture q=60 after lane-b128res re-vitalization):
+and `a_128_root_residual_block_under_a_per_unit_cdef_list_decodes_exact`),
+`--ignored`, fixture q=60 after lane-b128res re-vitalization):
 
 - a Rect128 half with a real residual decodes sample-exact through
   ffmpeg AND `decode_stream`, with a `coded > 0` assert as the guard.

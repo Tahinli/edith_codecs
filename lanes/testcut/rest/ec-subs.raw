@@ -1,0 +1,48 @@
+{ "type": "suite", "event": "started", "test_count": 13 }
+{ "type": "test", "event": "started", "name": "ir::tests::plain_text_walks_the_tree_and_drops_what_cannot_be_said" }
+{ "type": "test", "event": "started", "name": "markup::tests::clocks_are_read_in_every_shape_a_file_writes_them" }
+{ "type": "test", "event": "started", "name": "markup::tests::decode_takes_the_bom_and_folds_the_line_endings" }
+{ "type": "test", "event": "started", "name": "markup::tests::font_colour_is_read_by_hex_and_by_name" }
+{ "type": "test", "name": "markup::tests::clocks_are_read_in_every_shape_a_file_writes_them", "event": "ok", "exec_time": 0.00000516 }
+{ "type": "test", "event": "started", "name": "markup::tests::markup_nests_and_forgives" }
+{ "type": "test", "name": "markup::tests::decode_takes_the_bom_and_folds_the_line_endings", "event": "ok", "exec_time": 0.000006222 }
+{ "type": "test", "event": "started", "name": "markup::tests::webvtt_only_tags_are_off_for_srt" }
+{ "type": "test", "name": "markup::tests::font_colour_is_read_by_hex_and_by_name", "event": "ok", "exec_time": 0.000130967 }
+{ "type": "test", "event": "started", "name": "srt::tests::a_backwards_pair_is_clamped_not_negative" }
+{ "type": "test", "name": "ir::tests::plain_text_walks_the_tree_and_drops_what_cannot_be_said", "event": "ok", "exec_time": 0.000002414 }
+{ "type": "test", "event": "started", "name": "srt::tests::an_ordinary_file_parses" }
+{ "type": "test", "name": "markup::tests::markup_nests_and_forgives", "event": "ok", "exec_time": 0.000010991 }
+{ "type": "test", "event": "started", "name": "srt::tests::text_that_is_not_a_subtitle_file_is_refused_but_empty_is_not" }
+{ "type": "test", "name": "markup::tests::webvtt_only_tags_are_off_for_srt", "event": "ok", "exec_time": 0.000006502 }
+{ "type": "test", "event": "started", "name": "srt::tests::the_tolerances_a_real_file_needs" }
+{ "type": "test", "name": "srt::tests::a_backwards_pair_is_clamped_not_negative", "event": "ok", "exec_time": 0.000008095 }
+{ "type": "test", "event": "started", "name": "webvtt::tests::a_file_without_the_signature_still_parses_and_prose_does_not" }
+{ "type": "test", "name": "srt::tests::an_ordinary_file_parses", "event": "ok", "exec_time": 0.00005338 }
+{ "type": "test", "event": "started", "name": "webvtt::tests::header_identifiers_notes_and_settings" }
+{ "type": "test", "name": "srt::tests::text_that_is_not_a_subtitle_file_is_refused_but_empty_is_not", "event": "ok", "exec_time": 0.000002816 }
+{ "type": "test", "event": "started", "name": "webvtt::tests::inline_timestamps_and_classes_are_runs_not_words" }
+{ "type": "test", "name": "webvtt::tests::a_file_without_the_signature_still_parses_and_prose_does_not", "event": "ok", "exec_time": 0.000013296 }
+{ "type": "test", "name": "webvtt::tests::header_identifiers_notes_and_settings", "event": "ok", "exec_time": 0.000022762 }
+{ "type": "test", "name": "webvtt::tests::inline_timestamps_and_classes_are_runs_not_words", "event": "ok", "exec_time": 0.000011832 }
+{ "type": "test", "name": "srt::tests::the_tolerances_a_real_file_needs", "event": "ok", "exec_time": 0.000013275 }
+{ "type": "suite", "event": "ok", "passed": 13, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.001661102 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "a_clock_too_large_for_microseconds_is_refused_not_overflowed" }
+{ "type": "test", "event": "started", "name": "a_cue_with_an_overflowing_clock_is_skipped_and_counted" }
+{ "type": "test", "event": "started", "name": "a_run_of_bare_ampersands_is_linear_and_unchanged" }
+{ "type": "test", "event": "started", "name": "deep_nesting_is_capped_and_the_text_survives" }
+{ "type": "test", "name": "a_clock_too_large_for_microseconds_is_refused_not_overflowed", "event": "ok", "exec_time": 0.00000493 }
+{ "type": "test", "name": "a_cue_with_an_overflowing_clock_is_skipped_and_counted", "event": "ok", "exec_time": 0.000012534 }
+{ "type": "test", "name": "a_run_of_bare_ampersands_is_linear_and_unchanged", "event": "ok", "exec_time": 0.00502204 }
+{ "type": "test", "name": "deep_nesting_is_capped_and_the_text_survives", "event": "ok", "exec_time": 0.069362083 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.070368527 }
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "a_real_ass_script_parses_whole" }
+{ "type": "test", "event": "started", "name": "a_real_pgs_stream_decodes_to_plausible_bitmaps" }
+{ "type": "test", "event": "started", "name": "a_real_subrip_track_parses_whole" }
+{ "type": "test", "name": "a_real_ass_script_parses_whole", "event": "ok", "exec_time": 0.00242053 }
+{ "type": "test", "name": "a_real_subrip_track_parses_whole", "event": "ok", "exec_time": 0.017372534 }
+{ "type": "test", "name": "a_real_pgs_stream_decodes_to_plausible_bitmaps", "event": "failed", "exec_time": 0.06214101, "stdout": "\nthread 'a_real_pgs_stream_decodes_to_plausible_bitmaps' (4032665) panicked at crates/ec-subs/tests/real_library.rs:139:5:\n9 display sets\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n" }
+{ "type": "suite", "event": "failed", "passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.062631272 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000046958 }

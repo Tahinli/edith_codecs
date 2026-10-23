@@ -22,9 +22,8 @@
 //! - The inverse WHT rounds with `(x + 3) >> 3` (§14.3); the DC-only
 //!   shortcut uses the same constant on `input[0]` alone.
 //!
-//! All functions are pure, allocation-free, and free of `unsafe`.
+//! All functions are pure, allocation-free, and carry no SIMD code.
 
-#![deny(unsafe_code)]
 
 /// 16-bit fixed-point `sqrt(2) * cos(pi/8) - 1` (RFC 6386 §14.4). The
 /// product `x * sqrt(2) * cos(pi/8)` is computed as `x + ((x * K) >> 16)`

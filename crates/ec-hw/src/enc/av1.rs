@@ -11,19 +11,21 @@
 //! parameter buffer below. Both therefore describe one picture, or the coded
 //! frame is not the frame that was submitted.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
-use ec_va::Buffer;
+use ec_va::va::{
+    AV1EncLoopFilterFlags, AV1EncLoopRestorationFlags, AV1EncModeControlFlags,
+    AV1EncPictureFlags, AV1EncQMatrixFlags, AV1EncSeqFields, AV1EncTileGroupObuHdrInfo,
+    BufferType, EncPictureParameter, EncPictureParameterBufferAV1, EncSegParamAV1,
+    EncSegParamFlagsAV1, EncSequenceParameter, EncSequenceParameterBufferAV1, EncSliceParameter,
+    EncTileGroupBufferAV1, EncWarpedMotionParamsAV1, RefFrameCtrlAV1, VABufferID,
+};
 
 use super::headers::av1 as av1_headers;
 use super::{Encoder, RateControlMode};
 use crate::error::Result;
-use crate::params::enc::{
-    EncPictureParameterBufferAV1, EncSequenceParameterBufferAV1, EncTileGroupBufferAV1,
-};
-use crate::params::param_buffer;
-use crate::pool::PooledSurface;
 use crate::params::INVALID_SURFACE;
+use crate::pool::PooledSurface;
 
 /// `KEY_FRAME` and `INTER_FRAME` (spec 6.8.2).
 const KEY_FRAME: u32 = 0;
@@ -40,39 +42,54 @@ const LOOP_FILTER_LEVEL: u8 = 1;
 
 pub(super) fn parameters(
     encoder: &Encoder,
-    recon: &Arc<PooledSurface>,
-    coded_buf: u32,
+    recon: &Rc<PooledSurface>,
+    coded_buf: VABufferID,
     keyframe: bool,
-    out: &mut Vec<Buffer>,
+    out: &mut Vec<BufferType>,
 ) -> Result<()> {
     let config = *encoder.config();
-    let context = encoder.context();
     let (coded_w, coded_h) = encoder.coded_size();
     let (width, height) = (config.width.max(1), config.height.max(1));
     let cqp = config.rate_control.is_cqp();
     let ten_bit = config.bit_depth == 10;
     let level_idx = seq_level_idx(coded_w, coded_h, config.framerate);
 
-    let mut seq = EncSequenceParameterBufferAV1 {
-        seq_profile: 0,
-        seq_level_idx: level_idx,
-        seq_tier: 0,
-        intra_period: config.gop_size.max(1),
-        ip_period: 1,
-        bits_per_second: match config.rate_control {
+    // enable_order_hint, the bit depth and 4:2:0 subsampling; everything else off.
+    let seq_fields = AV1EncSeqFields::new(
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        if ten_bit { 2 } else { 0 },
+        true,
+        true,
+        false,
+    );
+    let seq = EncSequenceParameterBufferAV1::new(
+        0,
+        level_idx,
+        0,
+        0,
+        config.gop_size.max(1),
+        1,
+        match config.rate_control {
             RateControlMode::ConstantQp { .. } => 0,
             _ => config.bitrate,
         },
-        order_hint_bits_minus_1: (av1_headers::ORDER_HINT_BITS - 1) as u8,
-        ..EncSequenceParameterBufferAV1::default()
-    };
-    seq.seq_fields = seq
-        .seq_fields
-        .enable_order_hint(1)
-        .bit_depth_minus8(if ten_bit { 2 } else { 0 })
-        .subsampling_x(1)
-        .subsampling_y(1);
-    out.push(param_buffer(context, &seq)?);
+        &seq_fields,
+        (av1_headers::ORDER_HINT_BITS - 1) as u8,
+    );
+    out.push(BufferType::EncSequenceParameter(EncSequenceParameter::AV1(seq)));
 
     // Superblocks are 64x64: use_128x128_superblock is off in the sequence
     // header, and this driver advertises no support for the larger one.
@@ -89,53 +106,153 @@ pub(super) fn parameters(
     };
     // One reference, refreshed every picture: slot 0 holds the previous
     // reconstruction and every ref_frame_idx points at it.
-    let refresh_frame_flags = if keyframe { 0xff } else { 0x01 };
+    let refresh_frame_flags: u8 = if keyframe { 0xff } else { 0x01 };
 
-    let mut pic = EncPictureParameterBufferAV1 {
-        frame_width_minus_1: (width - 1) as u16,
-        frame_height_minus_1: (height - 1) as u16,
-        reconstructed_frame: recon.id(),
+    let mut reference_frames = [INVALID_SURFACE; 8];
+    let mut ref_ctrl_l0 = RefFrameCtrlAV1::default();
+    if let Some(reference) = encoder.reference().filter(|_| !keyframe) {
+        reference_frames[0] = reference.id();
+        // ref_frame_ctrl_l0 = LAST_FRAME in search_idx0 (bits 0..2).
+        ref_ctrl_l0 = RefFrameCtrlAV1::new(1, 0, 0, 0, 0, 0, 0);
+    }
+
+    // A shown key frame is error resilient by inference (5.9.2). The driver
+    // writes the frame header and the tile group as separate OBUs, which is
+    // what the header packed below describes.
+    let picture_flags = AV1EncPictureFlags::new(
+        if keyframe { KEY_FRAME } else { INTER_FRAME },
+        keyframe,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    );
+    let loop_filter_flags = AV1EncLoopFilterFlags::new(0, false, false);
+    // Single reference prediction: compound needs a second reference.
+    let mode_control = AV1EncModeControlFlags::new(
+        false,
+        0,
+        false,
+        0,
+        false,
+        TX_MODE_SELECT,
+        0,
+        false,
+    );
+    let tile_group_hdr = AV1EncTileGroupObuHdrInfo::new(false, true, 0, 0);
+    let segments = EncSegParamAV1::new(
+        &EncSegParamFlagsAV1::new(false, false, false),
+        0,
+        [[0; 8]; 8],
+        [0; 8],
+    );
+    let loop_restoration = AV1EncLoopRestorationFlags::new(0, 0, 0, 0, false);
+    let wm = [EncWarpedMotionParamsAV1::default(); 7];
+    let mut width_in_sbs_minus_1 = [0u16; 63];
+    let mut height_in_sbs_minus_1 = [0u16; 63];
+    width_in_sbs_minus_1[0] = (sb_cols - 1) as u16;
+    height_in_sbs_minus_1[0] = (sb_rows - 1) as u16;
+
+    let (packed, offsets) = av1_headers::frame_header(&av1_headers::FrameParams {
+        keyframe,
+        order_hint,
+        primary_ref_frame: 0,
+        refresh_frame_flags,
+        ref_frame_idx: [0; 7],
+        base_q_idx: base_qindex,
+        loop_filter_level: [LOOP_FILTER_LEVEL; 4],
+        tx_mode_select: true,
+        max_tile_cols_log2: av1_headers::tile_log2(sb_cols.min(64)),
+        max_tile_rows_log2: av1_headers::tile_log2(sb_rows.min(64)),
+    });
+    // Outside CQP the driver picks the quantiser and the deblocking levels
+    // itself and back-annotates them into the header it writes, which is what
+    // these offsets are for (ffmpeg sets them on the same condition). In CQP
+    // it has nothing to write back, so they stay zero.
+    let back_annotate = !cqp;
+    let (bit_offset_qindex, bit_offset_segmentation, bit_offset_loopfilter_params) = if back_annotate {
+        (offsets.qindex, offsets.segmentation, offsets.loop_filter)
+    } else {
+        (0, 0, 0)
+    };
+    let (bit_offset_cdef_params, size_in_bits_cdef_params) = if back_annotate {
+        (offsets.cdef, offsets.cdef_size)
+    } else {
+        (0, 0)
+    };
+    let (size_in_bits_frame_hdr_obu, byte_offset_frame_hdr_obu_size) = if back_annotate {
+        (offsets.total_bits, offsets.obu_size_byte)
+    } else {
+        (0, 0)
+    };
+
+    let pic = EncPictureParameterBufferAV1::new(
+        (width - 1) as u16,
+        (height - 1) as u16,
+        recon.id(),
         coded_buf,
-        primary_ref_frame: if keyframe { PRIMARY_REF_NONE } else { 0 },
+        reference_frames,
+        [0; 7],
+        0,
+        if keyframe { PRIMARY_REF_NONE } else { 0 },
         order_hint,
         refresh_frame_flags,
+        &ref_ctrl_l0,
+        &RefFrameCtrlAV1::default(),
+        &picture_flags,
+        0,
+        0,
+        0,
+        [LOOP_FILTER_LEVEL; 2],
+        LOOP_FILTER_LEVEL,
+        LOOP_FILTER_LEVEL,
+        &loop_filter_flags,
+        8,
+        INTERP_SWITCHABLE,
+        [0; 8],
+        [0; 2],
         base_qindex,
-        min_base_qindex: if cqp { 0 } else { 1 },
-        max_base_qindex: if cqp { 0 } else { 255 },
-        filter_level: [LOOP_FILTER_LEVEL; 2],
-        filter_level_u: LOOP_FILTER_LEVEL,
-        filter_level_v: LOOP_FILTER_LEVEL,
-        interpolation_filter: INTERP_SWITCHABLE,
-        tile_cols: 1,
-        tile_rows: 1,
-        superres_scale_denominator: 8,
-        ..EncPictureParameterBufferAV1::default()
-    };
-    pic.width_in_sbs_minus_1[0] = (sb_cols - 1) as u16;
-    pic.height_in_sbs_minus_1[0] = (sb_rows - 1) as u16;
-    if let Some(reference) = encoder.reference().filter(|_| !keyframe) {
-        pic.reference_frames[0] = reference.id();
-        // ref_frame_ctrl_l0 = LAST_FRAME in search_idx0 (bits 0..2).
-        pic.ref_frame_ctrl_l0 = 1;
-    }
-    pic.picture_flags = pic
-        .picture_flags
-        .frame_type(if keyframe { KEY_FRAME } else { INTER_FRAME })
-        // A shown key frame is error resilient by inference (5.9.2).
-        .error_resilient_mode(u32::from(keyframe))
-        // The driver writes the frame header and the tile group as separate
-        // OBUs, which is what the header packed below describes.
-        .enable_frame_obu(0);
-    pic.mode_control_flags = pic
-        .mode_control_flags
-        .tx_mode(TX_MODE_SELECT)
-        // Single reference prediction: compound needs a second reference.
-        .reference_mode(0);
-    pic.tile_group_obu_hdr_info = pic.tile_group_obu_hdr_info.obu_has_size_field(1);
-    for slot in pic.reference_frames.iter_mut().skip(1) {
-        *slot = INVALID_SURFACE;
-    }
-
+        0,
+        0,
+        0,
+        0,
+        0,
+        if cqp { 0 } else { 1 },
+        if cqp { 0 } else { 255 },
+        &AV1EncQMatrixFlags::new(false, 0, 0, 0),
+        &mode_control,
+        &segments,
+        1,
+        1,
+        width_in_sbs_minus_1,
+        height_in_sbs_minus_1,
+        0,
+        0,
+        0,
+        [0; 8],
+        [0; 8],
+        &loop_restoration,
+        wm,
+        bit_offset_qindex,
+        bit_offset_segmentation,
+        bit_offset_loopfilter_params,
+        bit_offset_cdef_params,
+        size_in_bits_cdef_params,
+        byte_offset_frame_hdr_obu_size,
+        size_in_bits_frame_hdr_obu,
+        &tile_group_hdr,
+        0,
+        0,
+    );
     if keyframe {
         encoder.push_packed(
             &av1_headers::sequence_header(&av1_headers::SeqParams {
@@ -149,40 +266,12 @@ pub(super) fn parameters(
             out,
         )?;
     }
-    let (packed, offsets) = av1_headers::frame_header(&av1_headers::FrameParams {
-        keyframe,
-        order_hint,
-        primary_ref_frame: 0,
-        refresh_frame_flags,
-        ref_frame_idx: [0; 7],
-        base_q_idx: base_qindex,
-        loop_filter_level: [LOOP_FILTER_LEVEL; 4],
-        tx_mode_select: true,
-        max_tile_cols_log2: av1_headers::tile_log2(sb_cols.min(64)),
-        max_tile_rows_log2: av1_headers::tile_log2(sb_rows.min(64)),
-    });
-    if !cqp {
-        // Outside CQP the driver picks the quantiser and the deblocking
-        // levels itself and back-annotates them into the header it writes,
-        // which is what these offsets are for (ffmpeg sets them on the same
-        // condition). In CQP it has nothing to write back.
-        pic.bit_offset_qindex = offsets.qindex;
-        pic.bit_offset_segmentation = offsets.segmentation;
-        pic.bit_offset_loopfilter_params = offsets.loop_filter;
-        pic.bit_offset_cdef_params = offsets.cdef;
-        pic.size_in_bits_cdef_params = offsets.cdef_size;
-        pic.size_in_bits_frame_hdr_obu = offsets.total_bits;
-        pic.byte_offset_frame_hdr_obu_size = offsets.obu_size_byte;
-    }
-    out.push(param_buffer(context, &pic)?);
+    out.push(BufferType::EncPictureParameter(EncPictureParameter::AV1(pic)));
     encoder.push_packed(&packed, out)?;
 
-    let tile_group = EncTileGroupBufferAV1 {
-        tg_start: 0,
-        tg_end: 0,
-        ..EncTileGroupBufferAV1::default()
-    };
-    out.push(param_buffer(context, &tile_group)?);
+    out.push(BufferType::EncSliceParameter(EncSliceParameter::AV1(
+        EncTileGroupBufferAV1::new(0, 0),
+    )));
     Ok(())
 }
 

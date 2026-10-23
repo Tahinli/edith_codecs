@@ -1,0 +1,5 @@
+   Compiling ec-pgs v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-pgs)
+    Finished `release` profile [optimized] target(s) in 1.43s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_pgs-06c656ab74086485)
+     Running tests/fuzz_regressions.rs (/home/user/.cache/tgt-testcut-rest/release/deps/fuzz_regressions-23ff617eebd5ea6a)
+   Doc-tests ec_pgs

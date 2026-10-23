@@ -192,7 +192,7 @@ pub(crate) const BY_VALUE_TYPES: &[(&str, Option<usize>, bool, &str)] = &[
     // -- encoder.rs -------------------------------------------------------
     (
         "Av1Encoder",
-        Some(2944),
+        Some(2704),
         true,
         "Av1Encoder::new / with_speed / with_pyramid / with_rate_target / \
          with_pyramid_and_rate_target, all `Result<Self>`, nesting three deep",
@@ -259,7 +259,7 @@ pub(crate) const BY_VALUE_TYPES: &[(&str, Option<usize>, bool, &str)] = &[
     // -- decode.rs --------------------------------------------------------
     (
         "FrameCtx",
-        Some(1296),
+        Some(1056),
         false,
         "FrameCtx::for_encoder() -> Self, pub(crate); one inline per Av1Encoder",
     ),
@@ -441,16 +441,17 @@ mod tests {
     /// a `pub fn` returning a named type; a new module added to `lib.rs` needs
     /// adding here, and
     /// [`every_by_value_module_is_scanned`] is what keeps that honest.
-    const FILES: &[(&str, &str)] = &[
+    fn files() -> Vec<(&'static str, &'static str)> {
+        vec![
         ("bits.rs", include_str!("bits.rs")),
-        ("cdf.rs", include_str!("cdf.rs")),
+        ("cdf.rs", crate::test_source::module_source("cdf")),
         ("cdf_state.rs", include_str!("cdf_state.rs")),
         ("census.rs", include_str!("census.rs")),
         ("compound.rs", include_str!("compound.rs")),
-        ("decode.rs", include_str!("decode.rs")),
+        ("decode.rs", crate::test_source::module_source("decode")),
         ("dumpio.rs", include_str!("dumpio.rs")),
-        ("encode.rs", include_str!("encode.rs")),
-        ("encoder.rs", include_str!("encoder.rs")),
+        ("encode.rs", crate::test_source::module_source("encode")),
+        ("encoder.rs", crate::test_source::module_source("encoder")),
         ("envflags.rs", include_str!("envflags.rs")),
         ("film_grain.rs", include_str!("film_grain.rs")),
         ("filter_search.rs", include_str!("filter_search.rs")),
@@ -466,22 +467,26 @@ mod tests {
         ("mvstack.rs", include_str!("mvstack.rs")),
         ("obu.rs", include_str!("obu.rs")),
         ("par.rs", include_str!("par.rs")),
+        ("autothreads.rs", include_str!("autothreads.rs")),
         ("probe.rs", include_str!("probe.rs")),
-        ("qm.rs", include_str!("qm.rs")),
+        ("qm.rs", crate::test_source::module_source("qm")),
         ("quant.rs", include_str!("quant.rs")),
         ("refusal_inventory.rs", include_str!("refusal_inventory.rs")),
         ("restoration.rs", include_str!("restoration.rs")),
         ("sequence.rs", include_str!("sequence.rs")),
         ("speed.rs", include_str!("speed.rs")),
-        ("stream.rs", include_str!("stream.rs")),
+        ("stream.rs", crate::test_source::module_source("stream")),
         ("superres.rs", include_str!("superres.rs")),
-        ("tile.rs", include_str!("tile.rs")),
+        ("test_source.rs", include_str!("test_source.rs")),
+        ("tile.rs", crate::test_source::module_source("tile")),
         ("timeline.rs", include_str!("timeline.rs")),
         ("transform.rs", include_str!("transform.rs")),
         ("warp.rs", include_str!("warp.rs")),
         ("wedge.rs", include_str!("wedge.rs")),
         ("stack_budget.rs", include_str!("stack_budget.rs")),
-    ];
+        ("fault.rs", include_str!("fault.rs")),
+        ]
+    }
 
     /// Every module `lib.rs` declares, so the scan's file list cannot silently
     /// fall behind a new module. A new `mod foo;` with a by-value `pub fn`
@@ -511,7 +516,7 @@ mod tests {
              derived file list is broken rather than small",
             declared.len()
         );
-        let scanned: Vec<&str> = FILES.iter().map(|(n, _)| *n).collect();
+        let scanned: Vec<&str> = files().iter().map(|(n, _)| *n).collect();
         let mut missing: Vec<String> = declared
             .iter()
             .filter(|d| !scanned.iter().any(|s| *s == format!("{d}.rs")))
@@ -521,7 +526,7 @@ mod tests {
         assert!(
             missing.is_empty(),
             "lib.rs declares modules the by-value scan never reads: {:?}. Add \
-             them to FILES, or the sweep cannot see a new by-value return that \
+             them to files(), or the sweep cannot see a new by-value return that \
              lands in one of them.",
             missing
         );
@@ -558,7 +563,7 @@ mod tests {
             rows.len(),
             STACK_BUDGET / 1024
         );
-        eprintln!("{:>8}  {:>7}  {}", "BYTES", "%BUDGET", "TYPE");
+        eprintln!("{:>8}  {:>7}  TYPE", "BYTES", "%BUDGET");
         for (name, size) in &rows {
             eprintln!(
                 "{size:>8}  {:>6.1}%  {name}",
@@ -673,12 +678,12 @@ mod tests {
                 "next_cdfs: Box<CdfSnapshot>",
             ),
         ];
-        const FILES: &[(&str, &str)] = &[
-            ("encoder.rs", include_str!("encoder.rs")),
-            ("encode.rs", include_str!("encode.rs")),
+        let files: [(&str, &str); 2] = [
+            ("encoder.rs", crate::test_source::module_source("encoder")),
+            ("encode.rs", crate::test_source::module_source("encode")),
         ];
         for (file, field, spelling) in PINS {
-            let src = FILES
+            let src = files
                 .iter()
                 .find(|(name, _)| name == file)
                 .map(|(_, src)| *src)
@@ -695,7 +700,7 @@ mod tests {
         }
         // And the negative control: the unboxed spellings must NOT all still
         // be present, or the scan above would be matching a comment.
-        let encoder = FILES[0].1;
+        let encoder = files[0].1;
         assert!(
             !encoder.contains("cdfs: crate::encode::CdfSnapshot,"),
             "the box pin is matching a spelling that is not the live \
@@ -794,7 +799,7 @@ mod tests {
     #[test]
     fn every_by_value_public_return_is_in_the_inventory() {
         let mut found: Vec<(String, String)> = Vec::new();
-        for (file, src) in FILES {
+        for (file, src) in files() {
             for (n, line) in src.lines().enumerate() {
                 if let Some(name) = by_value_return_name(line) {
                     found.push((name, format!("{file}:{}", n + 1)));
@@ -808,7 +813,7 @@ mod tests {
             "the by-value return scan found {} names across {} files, which is \
              too few to be a real sweep -- the matcher, not the crate, is broken",
             found.len(),
-            FILES.len()
+            files().len()
         );
 
         let mut missing = Vec::new();
@@ -890,17 +895,24 @@ mod tests {
     /// A lower bound is what the budget's reasoning needs: the claim is "no
     /// caller gets less than 2 MiB", and `size >= 2 MiB` is exactly that,
     /// whether the region is one mapping or three.
-    fn stack_region(tid: u32, addr: usize) -> Option<(usize, usize)> {
+    ///
+    /// The third field is whether the mapping is writable. Merging only joins
+    /// VMAs whose protections match, so a merged thread stack is still
+    /// writable. Its size can grow without bound, which is why the tests check
+    /// this flag and never an upper bound on the size.
+    fn stack_region(tid: u32, addr: usize) -> Option<(usize, usize, bool)> {
         let maps = std::fs::read_to_string(format!("/proc/self/task/{tid}/maps")).ok()?;
         for line in maps.lines() {
-            let (range, _) = line.split_once(' ')?;
+            let (range, perms) = line.split_once(' ')?;
             let (lo, hi) = range.split_once('-')?;
             let (lo, hi) = (
                 usize::from_str_radix(lo, 16).ok()?,
                 usize::from_str_radix(hi, 16).ok()?,
             );
             if addr >= lo && addr < hi {
-                return Some((lo, hi));
+                // `perms` is `rwxp`-style: the second character is write.
+                let writable = perms.as_bytes().get(1) == Some(&b'w');
+                return Some((lo, hi, writable));
             }
         }
         None
@@ -935,12 +947,12 @@ mod tests {
                 let tid = std::process::id();
                 let marker = 0u8;
                 let here = &marker as *const u8 as usize;
-                let (lo, hi) =
+                let (lo, hi, rw) =
                     stack_region(tid, here).expect("this thread's own stack is in its maps");
-                (tid, lo, hi)
+                (lo, hi, rw)
             })
             .expect("spawn");
-        let (_tid, lo, hi) = handle.join().expect("the probe thread returned");
+        let (lo, hi, rw) = handle.join().expect("the probe thread returned");
         let size = hi - lo;
         assert!(
             size >= EXPLICIT,
@@ -949,16 +961,23 @@ mod tests {
              the maps parse is finding the wrong region"
         );
         assert!(
-            size <= 512 * 1024 * 1024,
-            "the mapping holding an explicitly-1-MiB thread's frame is {size} \
-             bytes, which is not a stack -- the maps parse found the wrong region"
+            rw,
+            "the mapping holding an explicitly-1-MiB thread's frame is not \
+             writable -- a thread stack is read-write, so the maps parse found \
+             the wrong region"
         );
 
         let tid = std::process::id();
         let marker = 0u8;
         let here = &marker as *const u8 as usize;
-        let (lo, hi) = stack_region(tid, here).expect("this test thread's stack is in its maps");
+        let (lo, hi, rw) =
+            stack_region(tid, here).expect("this test thread's stack is in its maps");
         let size = hi - lo;
+        assert!(
+            rw,
+            "a default test thread's stack mapping is not writable -- the maps \
+             parse found the wrong region"
+        );
         assert!(
             size >= 2 * 1024 * 1024,
             "a default test thread's stack measured {size} bytes, under the \

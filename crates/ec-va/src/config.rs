@@ -1,19 +1,19 @@
-//! [`Config`] — a `VAConfigID` for one (profile, entrypoint) pair, plus the
-//! surface geometry the driver will accept for it.
+//! VA configs: one `(profile, entrypoint)` pair plus driver attributes.
 
-use std::sync::Arc;
+use std::rc::Rc;
+
+use cros_libva::{GenericValue, QuerySurfaceAttributesError, VAConfigAttrib, VASurfaceAttribType};
 
 use crate::caps::{Entrypoint, Profile};
 use crate::display::Display;
-use crate::error::{Error, Result, check};
-use crate::sys;
+use crate::error::{Error, Result, va_ok};
 
-/// A configuration attribute, e.g. `RTFormat = VA_RT_FORMAT_YUV420`.
+/// One `VAConfigAttrib`: a type and its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigAttrib {
-    /// `VAConfigAttrib*` type constant from [`crate::sys`].
-    pub type_: sys::VAConfigAttribType,
-    /// Attribute value; meaning depends on `type_`.
+    /// The `VAConfigAttribType` this value answers.
+    pub type_: u32,
+    /// The value, interpreted per attribute type.
     pub value: u32,
 }
 
@@ -21,7 +21,7 @@ impl ConfigAttrib {
     /// `VAConfigAttribRTFormat` with the given `VA_RT_FORMAT_*` mask.
     pub fn rt_format(mask: u32) -> Self {
         ConfigAttrib {
-            type_: sys::VAConfigAttribRTFormat,
+            type_: cros_libva::VAConfigAttribType::VAConfigAttribRTFormat,
             value: mask,
         }
     }
@@ -64,136 +64,40 @@ impl SurfaceCaps {
     }
 }
 
-/// A live `VAConfigID`.
-///
-/// Held by `Arc` because a [`crate::Context`] must not outlive its config.
+/// A live `VAConfigID`, remembering the profile and entrypoint it was made for.
 pub struct Config {
-    display: Arc<Display>,
-    id: sys::VAConfigID,
+    inner: cros_libva::Config,
     profile: Profile,
     entrypoint: Entrypoint,
 }
 
 impl Config {
-    /// Create a config for `(profile, entrypoint)` with the given attributes.
-    ///
-    /// Pass `&[]` for the driver defaults — enough for capability probing;
-    /// decode contexts want at least an explicit `RTFormat` so that a 10-bit
-    /// stream gets a 10-bit config instead of silently getting an 8-bit one.
+    /// `vaCreateConfig` for `profile` and `entrypoint` with the given attributes.
     pub fn new(
-        display: &Arc<Display>,
+        display: &Rc<Display>,
         profile: Profile,
         entrypoint: Entrypoint,
         attribs: &[ConfigAttrib],
-    ) -> Result<Arc<Config>> {
-        let mut raw: Vec<sys::VAConfigAttrib> = attribs
+    ) -> Result<Config> {
+        let attrs = attribs
             .iter()
-            .map(|a| sys::VAConfigAttrib {
+            .map(|a| VAConfigAttrib {
                 type_: a.type_,
                 value: a.value,
             })
             .collect();
-        let mut id: sys::VAConfigID = sys::VA_INVALID_ID;
-        // SAFETY: `raw` is a valid array of `raw.len()` VAConfigAttrib (a null
-        // pointer with len 0 is also accepted by libva, and `as_mut_ptr` on an
-        // empty Vec is a dangling-but-aligned pointer, which libva never
-        // dereferences because the count is 0). `id` is a valid out-parameter.
-        let status = unsafe {
-            sys::vaCreateConfig(
-                display.handle(),
-                profile.as_raw(),
-                entrypoint.as_raw(),
-                raw.as_mut_ptr(),
-                raw.len() as i32,
-                &mut id,
-            )
-        };
-        check("vaCreateConfig", status)?;
-        if id == sys::VA_INVALID_ID {
-            return Err(Error::Protocol(
-                "vaCreateConfig succeeded but returned VA_INVALID_ID".to_string(),
-            ));
-        }
-        Ok(Arc::new(Config {
-            display: Arc::clone(display),
-            id,
+        let inner = va_ok(
+            "vaCreateConfig",
+            display.create_config(attrs, profile.as_raw(), entrypoint.as_raw()),
+        )?;
+        Ok(Config {
+            inner,
             profile,
             entrypoint,
-        }))
+        })
     }
 
-    /// Surface constraints for this config (`vaQuerySurfaceAttributes`).
-    pub fn surface_caps(&self) -> Result<SurfaceCaps> {
-        // Two-pass query: NULL first to learn the count, as documented at
-        // va.h:1855 ("it is perfectly valid to pass NULL to attrib_list").
-        let mut count: u32 = 0;
-        // SAFETY: valid display and config id; NULL attrib_list with a valid
-        // count out-parameter is the documented "how many?" form.
-        let status = unsafe {
-            sys::vaQuerySurfaceAttributes(
-                self.display.handle(),
-                self.id,
-                std::ptr::null_mut(),
-                &mut count,
-            )
-        };
-        check("vaQuerySurfaceAttributes", status)?;
-
-        let mut attrs = vec![
-            sys::VASurfaceAttrib {
-                type_: sys::VASurfaceAttribNone,
-                flags: 0,
-                value: sys::VAGenericValue {
-                    type_: sys::VAGenericValueTypeInteger,
-                    value: sys::VAGenericValueUnion { i: 0 },
-                },
-            };
-            count as usize
-        ];
-        // SAFETY: `attrs` holds exactly `count` initialized elements, and
-        // `count` is what the driver just asked for. It is passed by pointer
-        // together with its length; libva rewrites `count` to the number
-        // actually written, which cannot exceed the input.
-        let status = unsafe {
-            sys::vaQuerySurfaceAttributes(
-                self.display.handle(),
-                self.id,
-                attrs.as_mut_ptr(),
-                &mut count,
-            )
-        };
-        check("vaQuerySurfaceAttributes", status)?;
-        attrs.truncate(count as usize);
-
-        let mut caps = SurfaceCaps::default();
-        for attr in &attrs {
-            if attr.flags & sys::VA_SURFACE_ATTRIB_GETTABLE == 0 {
-                continue;
-            }
-            // Every attribute read below is documented as an integer
-            // (va.h:1691-1730). A driver contradicting that is a protocol
-            // error, not something to reinterpret: reading the wrong union arm
-            // is precisely the class of bug this crate exists to avoid.
-            if attr.value.type_ != sys::VAGenericValueTypeInteger {
-                continue;
-            }
-            // SAFETY: the discriminant was just checked to be Integer, so the
-            // `i` arm of the union is the initialized one.
-            let value = unsafe { attr.value.value.i };
-            match attr.type_ {
-                sys::VASurfaceAttribPixelFormat => caps.pixel_formats.push(value as u32),
-                sys::VASurfaceAttribMinWidth => caps.min_width = Some(value.max(0) as u32),
-                sys::VASurfaceAttribMaxWidth => caps.max_width = Some(value.max(0) as u32),
-                sys::VASurfaceAttribMinHeight => caps.min_height = Some(value.max(0) as u32),
-                sys::VASurfaceAttribMaxHeight => caps.max_height = Some(value.max(0) as u32),
-                sys::VASurfaceAttribMemoryType => caps.memory_types = value as u32,
-                _ => {}
-            }
-        }
-        Ok(caps)
-    }
-
-    /// The profile this config was created for.
+    /// The profile this config decodes or encodes.
     pub fn profile(&self) -> Profile {
         self.profile
     }
@@ -203,31 +107,60 @@ impl Config {
         self.entrypoint
     }
 
-    /// The display this config belongs to.
-    pub fn display(&self) -> &Arc<Display> {
-        &self.display
+    /// The cros-libva handle, for the calls that take one.
+    pub fn raw(&self) -> &cros_libva::Config {
+        &self.inner
     }
 
-    pub(crate) fn id(&self) -> sys::VAConfigID {
-        self.id
+    /// Mutable cros-libva handle; surface attribute queries need one.
+    pub fn raw_mut(&mut self) -> &mut cros_libva::Config {
+        &mut self.inner
     }
 }
 
-impl std::fmt::Debug for Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Config")
-            .field("id", &self.id)
-            .field("profile", &self.profile)
-            .field("entrypoint", &self.entrypoint)
-            .finish()
-    }
+/// Query the surface constraints of `config` (`vaQuerySurfaceAttributes`).
+///
+/// A config's surfaces are described by attributes the driver may or may not
+/// report; each one that is missing stays `None`.
+pub fn caps_of(config: &mut Config) -> Result<SurfaceCaps> {
+    let first = |v: Vec<u32>| v.first().copied();
+    Ok(SurfaceCaps {
+        min_width: first(attribute_ints(
+            config,
+            VASurfaceAttribType::VASurfaceAttribMinWidth,
+        )?),
+        max_width: first(attribute_ints(
+            config,
+            VASurfaceAttribType::VASurfaceAttribMaxWidth,
+        )?),
+        min_height: first(attribute_ints(
+            config,
+            VASurfaceAttribType::VASurfaceAttribMinHeight,
+        )?),
+        max_height: first(attribute_ints(
+            config,
+            VASurfaceAttribType::VASurfaceAttribMaxHeight,
+        )?),
+        pixel_formats: attribute_ints(config, VASurfaceAttribType::VASurfaceAttribPixelFormat)?,
+        memory_types: attribute_ints(config, VASurfaceAttribType::VASurfaceAttribMemoryType)?
+            .into_iter()
+            .fold(0, |acc, m| acc | m),
+    })
 }
 
-impl Drop for Config {
-    fn drop(&mut self) {
-        // SAFETY: `self.id` was returned by vaCreateConfig on `self.display`
-        // and has not been destroyed. Contexts hold an `Arc<Config>`, so no
-        // context can still reference it here.
-        unsafe { sys::vaDestroyConfig(self.display.handle(), self.id) };
-    }
+fn attribute_ints(config: &mut Config, ty: VASurfaceAttribType::Type) -> Result<Vec<u32>> {
+    let values = config
+        .raw_mut()
+        .query_surface_attributes_by_type(ty)
+        .map_err(|e| match e {
+            QuerySurfaceAttributesError::VaError(v) => Error::va("vaQuerySurfaceAttributes", &v),
+            other => Error::Protocol(other.to_string()),
+        })?;
+    Ok(values
+        .into_iter()
+        .filter_map(|v| match v {
+            GenericValue::Integer(i) => Some(i as u32),
+            _ => None,
+        })
+        .collect())
 }

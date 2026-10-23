@@ -1,5 +1,6 @@
 //! VUI parameters — the part of an SPS that says what the samples *mean*.
 
+use crate::ps::check_range;
 use ec_core::bitio::{BitReader, BitWriter};
 use ec_core::color::ColorDescription;
 use ec_core::error::Result;
@@ -66,6 +67,9 @@ pub struct VuiParameters {
     pub sample_aspect_ratio: Option<(u16, u16)>,
     /// What the samples mean.
     pub video_signal_type: Option<VideoSignalType>,
+    /// `(chroma_sample_loc_type_top_field, chroma_sample_loc_type_bottom_field)`,
+    /// each 0..=5. 4:2:0 BT.2020 material is normally type 2 (top-left).
+    pub chroma_sample_loc: Option<(u8, u8)>,
     /// `(num_units_in_tick, time_scale)`: a rational frame rate, exact.
     pub timing: Option<(u32, u32)>,
 }
@@ -100,7 +104,14 @@ impl VuiParameters {
             }
             None => w.write_bit(false),
         }
-        w.write_bit(false); // chroma_loc_info_present_flag
+        match self.chroma_sample_loc {
+            Some((top, bottom)) => {
+                w.write_bit(true);
+                w.write_ue(u32::from(top));
+                w.write_ue(u32::from(bottom));
+            }
+            None => w.write_bit(false),
+        }
         w.write_bit(false); // neutral_chroma_indication_flag
         w.write_bit(false); // field_seq_flag
         w.write_bit(false); // frame_field_info_present_flag
@@ -151,8 +162,9 @@ impl VuiParameters {
             });
         }
         if r.read_bit()? {
-            r.read_ue()?;
-            r.read_ue()?;
+            let top = r.read_ue()?;
+            let bottom = r.read_ue()?;
+            vui.chroma_sample_loc = Some((top as u8, bottom as u8));
         }
         r.read_bit()?; // neutral_chroma_indication_flag
         r.read_bit()?; // field_seq_flag
@@ -229,7 +241,16 @@ fn skip_hrd_parameters(
         }
         let mut cpb_cnt = 1u32;
         if !low_delay {
-            cpb_cnt = r.read_ue()? + 1;
+            // E.2.2: cpb_cnt_minus1 is 0 to 31. Widened before the +1 so it cannot wrap.
+            let cpb_cnt_minus1 = r.read_ue()?;
+            check_range(
+                "HEVC VUI",
+                "cpb_cnt_minus1",
+                i64::from(cpb_cnt_minus1),
+                0,
+                31,
+            )?;
+            cpb_cnt = cpb_cnt_minus1 + 1;
         }
         for present in [nal_hrd, vcl_hrd] {
             if !present {
@@ -253,6 +274,55 @@ fn skip_hrd_parameters(
 mod tests {
     use super::*;
 
+    /// A VUI with only the HRD block set: one sub-layer, NAL HRD, no sub-picture
+    /// parameters, and the given `cpb_cnt_minus1`.
+    fn vui_with_cpb_cnt(cpb_cnt_minus1: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        for _ in 0..8 {
+            w.write_bit(false); // aspect ratio .. default display window, all absent
+        }
+        w.write_bit(true); // vui_timing_info_present_flag
+        w.write_bits(1001, 32);
+        w.write_bits(60_000, 32);
+        w.write_bit(false); // vui_poc_proportional_to_timing_flag
+        w.write_bit(true); // vui_hrd_parameters_present_flag
+        w.write_bit(true); // nal_hrd_parameters_present_flag
+        w.write_bit(false); // vcl_hrd_parameters_present_flag
+        w.write_bit(false); // sub_pic_hrd_params_present_flag
+        w.write_bits(0, 4); // bit_rate_scale
+        w.write_bits(0, 4); // cpb_size_scale
+        w.write_bits(0, 15); // initial, au and dpb delay lengths
+        w.write_bit(false); // fixed_pic_rate_general_flag
+        w.write_bit(false); // fixed_pic_rate_within_cvs_flag
+        w.write_bit(false); // low_delay_hrd_flag
+        w.write_ue(cpb_cnt_minus1);
+        // One NAL entry per CPB (the refused count never gets this far): bit rate,
+        // CPB size, CBR flag. Then bitstream_restriction_flag, so the parse ends cleanly.
+        for _ in 0..=cpb_cnt_minus1.min(31) {
+            w.write_ue(0);
+            w.write_ue(0);
+            w.write_bit(false);
+        }
+        w.write_bit(false); // bitstream_restriction_flag
+        w.align_to_byte();
+        w.into_bytes()
+    }
+
+    #[test]
+    fn cpb_count_past_31_is_refused_and_31_is_not() {
+        let bytes = vui_with_cpb_cnt(31);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            VuiParameters::parse(&mut r, 0).unwrap().timing,
+            Some((1001, 60_000))
+        );
+
+        let bytes = vui_with_cpb_cnt(32);
+        let mut r = BitReader::new(&bytes);
+        let err = VuiParameters::parse(&mut r, 0).unwrap_err();
+        assert!(err.to_string().contains("cpb_cnt_minus1"), "{err}");
+    }
+
     #[test]
     fn vui_round_trips() {
         let vui = VuiParameters {
@@ -266,6 +336,7 @@ mod tests {
                     matrix_coeffs: 1,
                 }),
             }),
+            chroma_sample_loc: Some((2, 2)),
             timing: Some((1001, 60_000)),
         };
         let mut w = BitWriter::new();

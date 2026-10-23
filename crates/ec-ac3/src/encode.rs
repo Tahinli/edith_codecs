@@ -207,7 +207,7 @@ fn smooth_exps(exps: &mut [u8]) {
 fn write_exp_groups(w: &mut BitWriter, sent: &[u8]) {
     w.write_bits(u32::from(sent[0]), 4);
     let mut prev = i32::from(sent[0]);
-    for grp in sent[1..].chunks_exact(3) {
+    for grp in sent[1..].as_chunks::<3>().0 {
         let mut code = 0u32;
         for &v in grp {
             let diff = i32::from(v) - prev;
@@ -902,7 +902,9 @@ fn scale(exponent: u8) -> f32 {
 /// Little-endian floats out of a plane.
 fn floats(plane: &Buf, count: usize) -> Vec<f32> {
     plane
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take(count)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()

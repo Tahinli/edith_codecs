@@ -34,12 +34,12 @@ pub mod timebase;
 
 pub use bitio::{BitReader, BitReaderLsb, BitWriter, BitWriterLsb};
 pub use color::{
-    ColorDescription, ContentLight, Matrix, Primaries, Tags, Transfer, bitstream_tags,
+    ColorDescription, ContentLight, MasteringPrimaries, Matrix, Primaries, Tags, Transfer, bitstream_tags,
     hevc_sei_light,
 };
 pub use error::{Error, Result};
 pub use frame::{
-    AudioFrame, ChannelLayout, ChannelPosition, ColorInfo, Frame, PixelFormat, Plane, SampleFormat,
+    AudioFrame, ChannelLayout, ChannelPosition, ColorInfo, Frame, Interlace, PixelFormat, Plane, SampleFormat,
     VideoFrame,
 };
 pub use packet::{Buf, Packet, PacketFlags, SideData};

@@ -1,0 +1,22 @@
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "tests::a_small_unit_decodes_to_its_pixels" }
+{ "type": "test", "event": "started", "name": "tests::idx_text_is_read" }
+{ "type": "test", "event": "started", "name": "tests::rubbish_never_panics" }
+{ "type": "test", "event": "started", "name": "tests::units_split_across_and_packed_within_pes_are_cut_by_size" }
+{ "type": "test", "name": "tests::idx_text_is_read", "event": "ok", "exec_time": 0.00000569 }
+{ "type": "test", "name": "tests::units_split_across_and_packed_within_pes_are_cut_by_size", "event": "ok", "exec_time": 0.000004158 }
+{ "type": "test", "name": "tests::a_small_unit_decodes_to_its_pixels", "event": "ok", "exec_time": 0.00001003 }
+{ "type": "test", "name": "tests::rubbish_never_panics", "event": "ok", "exec_time": 0.008465584 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.009433502 }
+{ "type": "suite", "event": "started", "test_count": 4 }
+{ "type": "test", "event": "started", "name": "idx_sub_pair_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "mkv_vobsub_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "mp4s_esds_matches_ffmpeg" }
+{ "type": "test", "event": "started", "name": "vob_private_stream_1_matches_ffmpeg" }
+{ "type": "test", "name": "mkv_vobsub_matches_ffmpeg", "event": "ok", "exec_time": 0.204423597 }
+{ "type": "test", "name": "vob_private_stream_1_matches_ffmpeg", "event": "ok", "exec_time": 0.216142054 }
+{ "type": "test", "name": "idx_sub_pair_matches_ffmpeg", "event": "ok", "exec_time": 0.222931646 }
+{ "type": "test", "name": "mp4s_esds_matches_ffmpeg", "event": "ok", "exec_time": 0.226231369 }
+{ "type": "suite", "event": "ok", "passed": 4, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.22674213 }
+{ "type": "suite", "event": "started", "test_count": 0 }
+{ "type": "suite", "event": "ok", "passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.000034946 }

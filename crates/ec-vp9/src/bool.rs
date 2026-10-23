@@ -390,9 +390,9 @@ mod tests {
         // An empty partition is legal (a degenerate tile); init reads
         // zeros and the shortfall shows in overreads.
         let mut d = BoolDecoder::new(&[]).unwrap();
-        assert_eq!(d.read_bool(128), false);
+        assert!(!d.read_bool(128));
         let mut d = BoolDecoder::new(&[0]).unwrap();
-        assert_eq!(d.read_bool(128), false);
+        assert!(!d.read_bool(128));
     }
 
     #[test]

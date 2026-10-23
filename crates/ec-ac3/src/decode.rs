@@ -204,7 +204,7 @@ impl Core {
         }
         self.cplinu = false;
         self.dynrng = [1.0; 2];
-        self.exps = Box::new([[0; COEFFS]; CHANNELS]);
+        *self.exps = [[0; COEFFS]; CHANNELS];
     }
 
     /// Adopt a frame header: channel configuration for the blocks that follow.
@@ -587,8 +587,16 @@ impl Core {
                     self.aht_channel(r, CPL, (start, end), blk)?;
                 } else {
                     for bin in start..end {
-                        let value = m.read(r, self.bap[CPL][bin])?;
-                        self.coeffs[CPL][bin] = value * scale(self.exps[CPL][bin]);
+                        let bap = self.bap[CPL][bin];
+                        let value = m.read(r, bap)?;
+                        // The coupling channel always draws dither for its zero-bit
+                        // mantissas, whatever the coupled channels' dithflag says:
+                        // each coupled channel decides later whether to keep it.
+                        self.coeffs[CPL][bin] = if bap == 0 && self.dither_on {
+                            self.dither.value() * scale(self.exps[CPL][bin])
+                        } else {
+                            value * scale(self.exps[CPL][bin])
+                        };
                     }
                 }
                 got_cplchan = true;
@@ -660,8 +668,10 @@ impl Core {
                 }
                 let from = start + sbnd * 12;
                 for bin in from..(from + 12).min(end) {
-                    let cpl = if self.bap[CPL][bin] == 0 && self.dithflag[ch] && self.dither_on {
-                        self.dither.value() * scale(self.exps[CPL][bin])
+                    // §7.3.4: a coupled channel without dithflag gets silence where
+                    // the coupling channel's mantissa was zero-bit.
+                    let cpl = if self.bap[CPL][bin] == 0 && !self.dithflag[ch] {
+                        0.0
                     } else {
                         self.coeffs[CPL][bin]
                     };

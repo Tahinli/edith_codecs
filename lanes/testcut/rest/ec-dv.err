@@ -1,0 +1,8 @@
+   Compiling ec-dv v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-dv)
+    Finished `release` profile [optimized] target(s) in 3.43s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_dv-34c712792e8ee477)
+     Running tests/containers.rs (/home/user/.cache/tgt-testcut-rest/release/deps/containers-eca3fe9c896abfeb)
+     Running tests/ffmpeg_parity.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ffmpeg_parity-b4369b84a78014bc)
+     Running tests/perf.rs (/home/user/.cache/tgt-testcut-rest/release/deps/perf-dbbf0fe1d2003661)
+     Running tests/robust.rs (/home/user/.cache/tgt-testcut-rest/release/deps/robust-c7b1728bdd348689)
+   Doc-tests ec_dv

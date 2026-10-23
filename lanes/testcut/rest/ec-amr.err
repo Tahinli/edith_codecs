@@ -1,0 +1,7 @@
+   Compiling ec-amr v0.1.0 (/home/user/lanes/testcut-rest/edith_codecs/crates/ec-amr)
+    Finished `release` profile [optimized] target(s) in 4.97s
+     Running unittests src/lib.rs (/home/user/.cache/tgt-testcut-rest/release/deps/ec_amr-668648efe623523a)
+     Running tests/container_roundtrip.rs (/home/user/.cache/tgt-testcut-rest/release/deps/container_roundtrip-c23571b7aecbc44c)
+     Running tests/oracle.rs (/home/user/.cache/tgt-testcut-rest/release/deps/oracle-2444b547013a6fda)
+     Running tests/wb_oracle.rs (/home/user/.cache/tgt-testcut-rest/release/deps/wb_oracle-9d78c054570ca75e)
+   Doc-tests ec_amr

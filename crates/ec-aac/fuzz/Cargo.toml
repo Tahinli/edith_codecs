@@ -1,0 +1,39 @@
+[package]
+name = "ec-aac-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ec-aac]
+path = ".."
+
+# Keeps this crate out of the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_adts"
+path = "fuzz_targets/decode_adts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_raw"
+path = "fuzz_targets/decode_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_he"
+path = "fuzz_targets/decode_he.rs"
+test = false
+doc = false
+bench = false
