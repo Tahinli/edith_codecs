@@ -1,0 +1,1 @@
+mutant 1: crates/ec-av1/src/fault.rs:39:8 '!' -> ''

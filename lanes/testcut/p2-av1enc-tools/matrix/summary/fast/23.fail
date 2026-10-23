@@ -1,0 +1,17 @@
+        FAIL [   0.295s] (388/683) ec-av1 stream::tests::t02::a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg
+        FAIL [   0.379s] (367/683) ec-av1 stream::tests::t02::a_doubly_cut_superblock_root_round_trips_in_every_plane
+        FAIL [   0.572s] (112/683) ec-av1 encode::tests::key_frame_and_inter_frame_both_encode_at_half_straddle_size
+        FAIL [   0.611s] (124/683) ec-av1 encode::tests::the_filter_search_picks_real_filters
+        FAIL [   0.937s] ( 93/683) ec-av1 encode::more_tests::low_motion_makes_an_inter_frame_smaller_than_the_key_frame
+        FAIL [   0.961s] ( 94/683) ec-av1 encode::more_tests::pricer_error_census_by_block_class
+        FAIL [   1.104s] (140/683) ec-av1 encoder::tests::a_leaf_predicts_off_last2_when_the_picture_two_back_matches
+        FAIL [  11.433s] (105/683) ec-av1 encode::more_tests::real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size
+        FAIL [   1.213s] ( 90/683) ec-av1 encode::more_tests::every_frame_of_a_sequence_decodes_through_our_own_decoder
+        FAIL [   1.285s] ( 96/683) ec-av1 encode::more_tests::predicted_coeff_bits_track_the_tile_the_writer_wrote
+        FAIL [  13.379s] (134/683) ec-av1 encode::tests::a_sequence_round_trips_at_the_exactly_half_straddle_size
+        FAIL [   1.471s] ( 91/683) ec-av1 encode::more_tests::a_high_precision_frame_codes_eighth_pel_motion_vectors_both_decoders_read
+        FAIL [   1.577s] ( 92/683) ec-av1 encode::more_tests::each_frame_interpolation_filter_codes_its_own_stream_ffmpeg_decodes_exactly
+        FAIL [   1.700s] (139/683) ec-av1 encoder::tests::a_dc_stepped_clip_codes_a_64x64_residual_and_decodes_sample_exact
+        FAIL [   2.415s] (141/683) ec-av1 encoder::tests::a_high_frequency_clip_splits_the_64x64_roots_luma_and_decodes_sample_exact
+        FAIL [   3.595s] (143/683) ec-av1 encoder::tests::a_four_level_pyramid_stream_decodes_in_display_order
+        FAIL [   4.405s] (137/683) ec-av1 encoder::tests::a_1080p_shaped_clip_straddles_at_every_block_size_and_decodes_sample_exact

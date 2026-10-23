@@ -1,0 +1,1 @@
+mutant 21: crates/ec-av1/src/encode/coef.rs:2362:39 '==' -> '!='

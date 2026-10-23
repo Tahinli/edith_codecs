@@ -1,0 +1,2 @@
+mutant	file	line	replacement	killing_heavy_tests
+6	crates/ec-av1/src/speed.rs	196	1	encode::more_tests::the_encoders_own_streams_are_byte_identical_to_their_pins ; encoder::tests::the_arf_leaf_offer_set_fires_moves_the_stream_and_decodes_sample_exact

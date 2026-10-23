@@ -1,0 +1,20 @@
+        FAIL [  10.139s] (10/36) ec-av1 encode::tests::a_frame_round_trips_at_its_own_size
+        FAIL [  11.738s] (20/36) ec-av1 encoder::tests::filter_replay_codes_the_same_stream_as_a_full_decode
+        FAIL [  11.746s] (14/36) ec-av1 encoder::tests::an_inter_clip_codes_both_inter_set_tx_types_both_decoders_read_exactly
+        FAIL [   1.563s] (19/36) ec-av1 encoder::tests::filter_replay_final_matches_the_capture_decode
+        FAIL [   1.570s] (27/36) ec-av1 encoder::tests::the_future_tpl_window_still_codes_every_picture_and_moves_the_stream
+        FAIL [   1.587s] (29/36) ec-av1 encoder::tests::the_lookahead_holds_one_group_and_still_codes_every_picture
+        FAIL [   1.755s] ( 4/36) ec-av1 encode::tests::a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames
+        FAIL [  18.708s] ( 1/36) ec-av1 decode::tests::odd_sizes_round_trip_bit_exact_against_the_encoder_reconstruction
+        FAIL [  20.326s] ( 3/36) ec-av1 encode::more_tests::the_encoders_own_streams_are_byte_identical_to_their_pins
+        FAIL [  21.726s] ( 7/36) ec-av1 encode::more_tests::real_clip_encodes_within_its_quality_and_size_budget
+        FAIL [  24.356s] (34/36) ec-av1::yuv422_dav1d yuv422_matches_dav1d_byte_exact
+        FAIL [   2.663s] (11/36) ec-av1 encoder::tests::a_static_clip_codes_64x64_roots_and_decodes_sample_exact
+        FAIL [  27.664s] (18/36) ec-av1 encoder::tests::every_tile_layout_decodes_sample_exact_through_both_decoders
+        FAIL [  27.704s] (15/36) ec-av1 encoder::tests::a_moving_detail_clip_codes_two_delta_q_levels_both_decoders_read_exactly
+        FAIL [   2.933s] ( 9/36) ec-av1 encoder::tests::a_non_superblock_aligned_clip_codes_edge_64x64_roots_and_decodes_sample_exact
+        FAIL [  31.388s] (16/36) ec-av1 encoder::tests::a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders
+        FAIL [   4.683s] (13/36) ec-av1 encoder::tests::a_three_level_pyramid_stream_decodes_in_display_order
+        FAIL [   4.961s] (12/36) ec-av1 encoder::tests::a_pyramid_stream_decodes_in_display_order_through_both_decoders
+        FAIL [   6.990s] ( 8/36) ec-av1 encode::tests::a_640x360_half_straddle_sequence_round_trips_through_ffmpeg
+        FAIL [   8.822s] (24/36) ec-av1 encoder::tests::the_arf_leaf_offer_set_fires_moves_the_stream_and_decodes_sample_exact

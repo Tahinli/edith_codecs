@@ -1,0 +1,5 @@
+        FAIL [  14.898s] (124/683) ec-av1 encode::tests::a_sequence_round_trips_at_the_exactly_half_straddle_size
+        FAIL [  22.945s] (127/683) ec-av1 encode::more_tests::real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size
+        FAIL [   2.798s] (111/683) ec-av1 encode::tests::every_mode_decodes_to_what_the_encoder_predicted
+        FAIL [   8.683s] (137/683) ec-av1 encode::tests::the_final_filter_replay_matches_the_capture_decode_at_odd_sizes
+        FAIL [   9.152s] (139/683) ec-av1 encoder::tests::a_1080p_shaped_clip_straddles_at_every_block_size_and_decodes_sample_exact
