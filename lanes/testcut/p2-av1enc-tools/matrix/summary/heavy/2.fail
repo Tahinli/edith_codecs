@@ -1,0 +1,13 @@
+        FAIL [  10.642s] (24/31) ec-av1 encoder::tests::the_lookahead_holds_one_group_and_still_codes_every_picture
+        FAIL [  13.327s] (23/31) ec-av1 encoder::tests::the_future_tpl_window_still_codes_every_picture_and_moves_the_stream
+        FAIL [  16.621s] (22/31) ec-av1 encoder::tests::the_arf_leaf_offer_set_fires_moves_the_stream_and_decodes_sample_exact
+        FAIL [  29.411s] ( 2/31) ec-av1 encode::more_tests::the_encoders_own_streams_are_byte_identical_to_their_pins
+        FAIL [  35.642s] ( 4/31) ec-av1 encode::more_tests::real_clip_encodes_within_its_quality_and_size_budget
+        FAIL [  43.676s] (28/31) ec-av1::yuv422_dav1d yuv422_matches_dav1d_byte_exact
+        FAIL [  53.918s] (13/31) ec-av1 encoder::tests::every_tile_layout_decodes_sample_exact_through_both_decoders
+        FAIL [  54.249s] (12/31) ec-av1 encoder::tests::a_moving_detail_clip_codes_two_delta_q_levels_both_decoders_read_exactly
+        FAIL [  57.500s] (11/31) ec-av1 encoder::tests::a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders
+        FAIL [   6.794s] ( 1/31) ec-av1 encode::tests::a_640x360_half_straddle_sequence_round_trips_through_ffmpeg
+        FAIL [   7.909s] (20/31) ec-av1 encoder::tests::quality_target_is_monotone_in_bytes_and_psnr
+        FAIL [   8.887s] ( 9/31) ec-av1 encoder::tests::a_three_level_pyramid_stream_decodes_in_display_order
+        FAIL [   9.475s] ( 6/31) ec-av1 encoder::tests::a_pyramid_stream_decodes_in_display_order_through_both_decoders

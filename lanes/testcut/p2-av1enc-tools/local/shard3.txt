@@ -1,0 +1,11 @@
+encoder::tests::geometry_mismatch_is_refused
+encoder::tests::gop_cadence_is_honored
+encoder::tests::bytes_per_frame_target_settles_within_20_percent
+encoder::tests::a_static_clip_codes_64x64_roots_and_decodes_sample_exact
+encoder::tests::tile_bytes_do_not_depend_on_the_thread_count
+encoder::tests::filter_replay_final_matches_the_capture_decode
+encode::tests::a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames
+encode::tests::a_640x360_half_straddle_sequence_round_trips_through_ffmpeg
+decode::tests::odd_sizes_round_trip_bit_exact_against_the_encoder_reconstruction
+encode::more_tests::real_clip_encodes_within_its_quality_and_size_budget
+encoder::tests::an_inter_clip_codes_both_inter_set_tx_types_both_decoders_read_exactly

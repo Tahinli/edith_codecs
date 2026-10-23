@@ -1,0 +1,21 @@
+        FAIL [  11.801s] (27/28) ec-av1 encoder::tests::tile_bytes_do_not_depend_on_the_thread_count
+        FAIL [   1.211s] (21/28) ec-av1 encoder::tests::the_arf_leaf_offer_set_fires_moves_the_stream_and_decodes_sample_exact
+        FAIL [  12.171s] (20/28) ec-av1 encoder::tests::filter_replay_final_matches_the_capture_decode
+        FAIL [  12.344s] (19/28) ec-av1 encoder::tests::every_tile_layout_decodes_sample_exact_through_both_decoders
+        FAIL [  13.174s] (10/28) ec-av1 encoder::tests::a_moving_detail_clip_codes_two_delta_q_levels_both_decoders_read_exactly
+        FAIL [   1.360s] ( 5/28) ec-av1 encoder::tests::a_non_superblock_aligned_clip_codes_edge_64x64_roots_and_decodes_sample_exact
+        FAIL [   1.387s] (18/28) ec-av1 encoder::tests::quality_target_is_monotone_in_bytes_and_psnr
+        FAIL [  16.086s] (11/28) ec-av1 encoder::tests::a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders
+        FAIL [   1.681s] ( 1/28) ec-av1 encode::more_tests::the_probe_arms_the_gates_source
+        FAIL [  17.859s] (26/28) ec-av1 encoder::tests::filter_replay_codes_the_same_stream_as_a_full_decode
+        FAIL [   2.185s] ( 6/28) ec-av1 encoder::tests::a_pyramid_stream_decodes_in_display_order_through_both_decoders
+        FAIL [   2.582s] ( 9/28) ec-av1 encoder::tests::bitrate_target_lands_within_5_percent_over_48_frames
+        FAIL [   2.766s] ( 2/28) ec-av1 encode::tests::a_640x360_half_straddle_sequence_round_trips_through_ffmpeg
+        FAIL [   2.914s] (25/28) ec-av1 encoder::tests::the_lookahead_holds_one_group_and_still_codes_every_picture
+        FAIL [   3.017s] (13/28) ec-av1 encoder::tests::bytes_per_frame_target_settles_within_20_percent
+        FAIL [   3.085s] (12/28) ec-av1 encoder::tests::bytes_per_frame_controller_never_oscillates_past_its_clamp
+        FAIL [   3.462s] (23/28) ec-av1 encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence
+        FAIL [   3.646s] ( 3/28) ec-av1 encode::more_tests::the_encoders_own_streams_are_byte_identical_to_their_pins
+        FAIL [   4.376s] (24/28) ec-av1 encoder::tests::the_future_tpl_window_still_codes_every_picture_and_moves_the_stream
+        FAIL [   5.061s] ( 4/28) ec-av1 encode::more_tests::real_clip_encodes_within_its_quality_and_size_budget
+        FAIL [   5.821s] (15/28) ec-av1 encoder::tests::filter_stage_bytes_do_not_depend_on_the_thread_count

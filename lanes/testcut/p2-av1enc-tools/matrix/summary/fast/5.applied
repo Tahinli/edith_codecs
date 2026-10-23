@@ -1,0 +1,1 @@
+mutant 5: crates/ec-av1/src/restoration.rs:1416:81 '+' -> '*'

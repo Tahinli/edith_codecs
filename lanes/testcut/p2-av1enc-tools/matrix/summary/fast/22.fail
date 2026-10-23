@@ -1,0 +1,28 @@
+        FAIL [   0.190s] (336/683) ec-av1 stream::tests::t01::streaming_decode_matches_the_collecting_one
+        FAIL [   0.206s] ( 34/683) ec-av1 decode::tests::a_gop_round_trips_bit_exact_against_the_encoder_reconstruction
+        FAIL [   0.259s] ( 51/683) ec-av1 decode::tests::an_odd_size_gop_round_trips_bit_exact_against_the_encoder_reconstruction
+        FAIL [   0.273s] (333/683) ec-av1 stream::tests::t01::decode_stream_round_trips_a_gop
+        FAIL [   0.319s] (334/683) ec-av1 stream::tests::t01::decode_stream_round_trips_an_odd_size_gop
+        FAIL [   0.423s] (125/683) ec-av1 encode::tests::the_filter_search_picks_real_filters
+        FAIL [   0.457s] ( 63/683) ec-av1 decode::tests::ffmpeg_and_this_decoder_agree_on_a_gop
+        FAIL [   0.546s] (367/683) ec-av1 stream::tests::t02::a_doubly_cut_superblock_root_round_trips_in_every_plane
+        FAIL [   0.584s] (387/683) ec-av1 stream::tests::t02::a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg
+        FAIL [   0.587s] ( 94/683) ec-av1 encode::more_tests::predicted_coeff_bits_track_the_tile_the_writer_wrote
+        FAIL [   0.588s] (123/683) ec-av1 encode::tests::sequence_round_trips_at_a_non_multiple_size
+        FAIL [   0.607s] ( 93/683) ec-av1 encode::more_tests::low_motion_makes_an_inter_frame_smaller_than_the_key_frame
+        FAIL [   0.649s] (392/683) ec-av1 stream::tests::t02::decode_stream_agrees_with_ffmpeg_on_a_gop
+        FAIL [   0.702s] ( 90/683) ec-av1 encode::more_tests::every_frame_of_a_sequence_decodes_through_our_own_decoder
+        FAIL [   0.762s] ( 98/683) ec-av1 encode::more_tests::pricer_error_census_by_block_class
+        FAIL [   0.770s] (107/683) ec-av1 encode::tests::every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed
+        FAIL [   0.790s] ( 91/683) ec-av1 encode::more_tests::a_high_precision_frame_codes_eighth_pel_motion_vectors_both_decoders_read
+        FAIL [   1.181s] ( 92/683) ec-av1 encode::more_tests::each_frame_interpolation_filter_codes_its_own_stream_ffmpeg_decodes_exactly
+        FAIL [   1.232s] (138/683) ec-av1 encoder::tests::a_four_level_pyramid_stream_decodes_in_display_order
+        FAIL [  12.890s] (113/683) ec-av1 encode::tests::a_sequence_round_trips_at_the_exactly_half_straddle_size
+        FAIL [   1.300s] (140/683) ec-av1 encoder::tests::a_leaf_predicts_off_last2_when_the_picture_two_back_matches
+        FAIL [   1.629s] (101/683) ec-av1 encode::tests::a_screen_content_picture_codes_palette_blocks_ffmpeg_decodes_exactly
+        FAIL [   1.870s] (139/683) ec-av1 encoder::tests::a_dc_stepped_clip_codes_a_64x64_residual_and_decodes_sample_exact
+        FAIL [   2.052s] (141/683) ec-av1 encoder::tests::a_high_frequency_clip_splits_the_64x64_roots_luma_and_decodes_sample_exact
+        FAIL [   2.285s] (137/683) ec-av1 encoder::tests::a_crossfade_clip_codes_a_compound_64x64_root_and_decodes_sample_exact
+        FAIL [   2.879s] (168/683) ec-av1 encoder::tests::an_edge_clip_codes_every_reduced_set_tx_type_both_decoders_read_exactly
+        FAIL [   4.163s] (136/683) ec-av1 encoder::tests::a_1080p_shaped_clip_straddles_at_every_block_size_and_decodes_sample_exact
+        FAIL [   7.567s] (102/683) ec-av1 encode::more_tests::real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size

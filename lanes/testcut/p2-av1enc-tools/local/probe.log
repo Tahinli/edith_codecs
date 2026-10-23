@@ -1,0 +1,15 @@
+remote-run: auto order: c a b
+remote-run: host=c
+fedora-8gb-nbg1-4
+cargo-mutants 27.1.0
+cargo-llvm-cov 0.9.1
+error: no such command: `nextest`
+
+help: a command with a similar name exists: `test`
+
+help: view all installed commands with `cargo --list`
+help: find a package to install `nextest` with `cargo search cargo-nextest`
+4
+               total        used        free      shared  buff/cache   available
+Mem:               7           0           2           0           5           7
+tmpfs           3.8G   12M  3.8G   1% /tmp

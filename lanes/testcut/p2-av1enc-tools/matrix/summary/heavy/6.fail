@@ -1,0 +1,2 @@
+        FAIL [  12.302s] (26/35) ec-av1 encoder::tests::the_arf_leaf_offer_set_fires_moves_the_stream_and_decodes_sample_exact
+        FAIL [  12.340s] ( 1/35) ec-av1 encode::more_tests::the_encoders_own_streams_are_byte_identical_to_their_pins
