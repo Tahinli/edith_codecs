@@ -1,0 +1,3 @@
+crates/ec-h265/src/residual.rs:609:42: replace + with - in residual_header	KILLED	rc=-1 ran=0 timeout=True 
+crates/ec-h265/src/ctu.rs:429:13: replace + with - in CtuEncoder<'a>::code_quadtree	KILLED	rc=-1 ran=0 timeout=True 
+crates/ec-h265/src/residual.rs:430:64: replace >> with << in rdoq	KILLED	rc=-1 ran=0 timeout=True 

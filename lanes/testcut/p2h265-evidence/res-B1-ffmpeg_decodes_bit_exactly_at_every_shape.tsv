@@ -1,0 +1,10 @@
+crates/ec-h265/src/ctu.rs:1536:9: replace CtuEncoder<'a>::transform_luma_ts_rd -> (f64, bool) with (1.0, true)	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/deblock.rs:138:25: replace >> with << in luma_segment	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/intra.rs:400:43: replace + with * in predict_dc	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/intra.rs:437:30: replace * with / in predict_angular	KILLED	rc=100 ran=1 timeout=False 
+crates/ec-h265/src/residual.rs:609:42: replace + with - in residual_header	KILLED	rc=-1 ran=0 timeout=True 
+crates/ec-h265/src/ctu.rs:1429:23: delete - in CtuEncoder<'a>::choose_luma_mode	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/ctu.rs:429:13: replace + with - in CtuEncoder<'a>::code_quadtree	KILLED	rc=-1 ran=0 timeout=True 
+crates/ec-h265/src/residual.rs:270:43: replace + with * in estimate_residual_bits	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/residual.rs:430:64: replace >> with << in rdoq	KILLED	rc=-1 ran=0 timeout=True 
+crates/ec-h265/src/intra.rs:73:66: replace == with != in Availability::is_empty	KILLED	rc=100 ran=1 timeout=False 

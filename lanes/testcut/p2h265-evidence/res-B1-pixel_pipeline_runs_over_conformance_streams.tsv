@@ -1,0 +1,10 @@
+crates/ec-h265/src/dec/cu_syntax.rs:424:62: replace != with == in parse_slice_into	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/deblock.rs:224:49: replace + with - in luma_segment	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/deblock.rs:376:25: replace - with / in chroma_pass	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/deblock.rs:394:84: replace >> with << in chroma_pass	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/sao.rs:166:56: replace << with >> in filter_ctb_rows	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/cu_syntax.rs:412:28: replace || with && in parse_slice_into	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/cu_syntax/wpp.rs:627:39: replace << with >> in parse_segment	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/picjob.rs:163:35: replace + with * in PicJob::run_slice	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/sao.rs:125:25: replace + with - in filter_ctb_rows	SURVIVED	rc=0 ran=1 timeout=False 
+crates/ec-h265/src/dec/merge.rs:38:32: replace > with == in derive_merge	SURVIVED	rc=0 ran=1 timeout=False 
