@@ -1,0 +1,107 @@
+| crate | test | seconds | class | |U(T)| vs fast | |U(T)| vs fast+kept | |K'| | decision |
+|---|---|---|---|---|---|---|---|
+| ec-av1 | stream::tests::t05::a_real_aomenc_square_only_inter_sequence_with_a_64x64_intra_superblock_decodes_pixel_exact | 264.9 | candidate | 14499 | 14499 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_temporal_mv_candidates_decodes_pixel_exact | 260.4 | candidate | 20515 | 20515 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_superblock_level_ab_partitions_decodes_pixel_exact | 258.8 | candidate | 22374 | 22374 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact | 218.6 | candidate | 33335 | 33335 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_a_coded_rectangular_residual_decodes_pixel_exact | 175.9 | candidate | 23890 | 23890 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_interintra_wedge_decodes_pixel_exact | 166.3 | candidate | 17454 | 17454 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_a_16_level_rect_leaf_decodes_pixel_exact | 157.2 | candidate | 25424 | 25424 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_10bit_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact | 148.9 | candidate | 19327 | 19327 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact | 145.6 | candidate | 13784 | 13784 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_a_sub8x8_inter_split_decodes_pixel_exact | 144.8 | candidate | 28972 | 28972 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_warped_motion_refuses_or_matches | 129.1 | candidate | 16766 | 16766 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_superres_key_frame_sequence_decodes_pixel_exact | 128.2 | candidate | 9431 | 9431 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact | 126.4 | candidate | 19309 | 19309 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal | 124.7 | candidate | 30169 | 30169 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_16x16_level_ab_partitions_decodes_pixel_exact | 121.3 | candidate | 25282 | 25282 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_pinned_444_inter_stream_chroma_units_inherit_their_own_quadrants_tx_type | 116.6 | protected | 19756 | 19756 | 0 | keep (protected) |
+| ec-av1 | stream::tests::t05::a_pinned_444_rect_inter_stream_resolves_each_chroma_unit_from_its_own_luma_leaf | 116.1 | protected | 29810 | 29810 | 0 | keep (protected) |
+| ec-av1 | stream::tests::t05::a_pinned_rect_stream_with_a_64x64_intra_block_in_an_inter_frame_decodes_pixel_exact | 115.8 | protected | 13038 | 13038 | 0 | keep (protected) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact | 109.2 | candidate | 16824 | 16824 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_a_diffwtd_compound_64x64_block_decodes_pixel_exact | 104.1 | candidate | 16023 | 16023 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_a_coded_rect_strip_below_16x16_decodes_pixel_exact | 98.5 | candidate | 12728 | 12728 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_a_rectangular_compound_wedge_decodes_pixel_exact | 95.8 | candidate | 21178 | 21178 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_inter_sequence_with_a_superblock_level_rect_partition_decodes_pixel_exact | 95.2 | candidate | 19849 | 19849 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact | 92.7 | candidate | 20641 | 20641 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_free_partitions_decodes_pixel_exact | 92.0 | candidate | 20339 | 20339 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_filter_intra_on_a_sub16_horz_vert_strip_decodes_pixel_exact | 91.1 | candidate | 14645 | 14645 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t07::a_real_aomenc_stream_with_delta_q_and_delta_lf_decodes_pixel_exact | 89.8 | candidate | 16960 | 16960 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact | 86.6 | candidate | 14510 | 14510 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_stream_with_filter_intra_on_a_32_level_1to4_strip_decodes_pixel_exact | 84.9 | candidate | 14094 | 14094 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_stream_with_compound_references_decodes_pixel_exact | 83.3 | candidate | 14277 | 14277 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_inter_sequence_with_32x32_level_1to4_strips_codes_their_rect_residual | 77.5 | candidate | 21686 | 21686 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_filter_intra_on_a_horz_vert_strip_decodes_pixel_exact | 71.3 | candidate | 12860 | 12860 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t07::a_real_aomenc_tiny_frame_size_sweep_decodes_pixel_exact | 69.5 | candidate | 14933 | 14933 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact | 68.8 | candidate | 11951 | 11951 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact | 66.5 | candidate | 14352 | 14352 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact | 62.3 | candidate | 26260 | 26260 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_stream_with_rect_screen_content_decodes_pixel_exact | 61.8 | candidate | 16889 | 16889 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_10bit_decodes_pixel_exact | 61.5 | candidate | 14068 | 14068 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_128x128_none_inter_blocks_coded_chroma_per_mu_chunk_decodes_pixel_exact | 59.5 | candidate | 11160 | 11160 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_stream_with_a_32x32_level_1to4_partition_decodes_pixel_exact | 58.8 | candidate | 16326 | 16326 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact | 57.7 | candidate | 14705 | 14705 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_frame_edge_straddling_band_decodes_pixel_exact | 57.2 | candidate | 30148 | 30148 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag | 57.1 | protected | 13961 | 13961 | 0 | keep (protected) |
+| ec-av1 | stream::tests::t05::a_real_aomenc_inter_sequence_with_forward_keyframes_and_temporal_mvs_decodes_pixel_exact | 54.9 | candidate | 22287 | 22287 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_inter_sequence_with_an_intra_rect_strip_decodes_pixel_exact_10bit | 54.8 | candidate | 17912 | 17912 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_a_superblock_level_ab_partition_decodes_pixel_exact | 54.6 | candidate | 10982 | 10982 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_inter_sequence_with_an_intra_rect_strip_decodes_pixel_exact | 53.9 | candidate | 17735 | 17735 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t03::a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact | 53.5 | candidate | 15247 | 15247 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_mandelbrot_fires_the_vert_b_partition_arm | 53.5 | candidate | 30286 | 30286 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_interintra_decodes_pixel_exact | 52.8 | candidate | 20494 | 20494 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact | 52.0 | candidate | 10970 | 10970 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_stream_with_rect_palette_decodes_pixel_exact | 49.6 | candidate | 16872 | 16872 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_128x128_superblocks_decodes_pixel_exact | 47.8 | candidate | 14872 | 14872 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_band_stream_seed46_decodes_pixel_exact | 47.3 | candidate | 14488 | 14488 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_sb128_intra_rect_block_decodes_pixel_exact | 46.7 | candidate | 14172 | 14172 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_32x32_frame_edge_rect_partition_with_a_flat_band_decodes_pixel_exact | 46.0 | candidate | 25900 | 25900 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact | 45.3 | candidate | 12145 | 12145 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_compound_global_warp_12bit_stream_decodes_pixel_exact | 45.0 | candidate | 17449 | 17449 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_compound_global_warp_stream_decodes_pixel_exact | 44.8 | candidate | 17657 | 17657 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_decodes_pixel_exact | 44.5 | candidate | 13674 | 13674 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_10bit_partial_bottom_stripe_restoration_decodes_pixel_exact | 44.5 | candidate | 11831 | 11831 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_stream_with_a_16_level_1to4_partition_decodes_pixel_exact | 44.3 | candidate | 16581 | 16581 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t07::a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly | 43.6 | candidate | 12489 | 12489 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_sb128_gathered_edge_horz_partition_decodes_pixel_exact | 42.3 | candidate | 22421 | 22421 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_a_32x32_frame_edge_rect_partition_decodes_pixel_exact | 41.6 | candidate | 27190 | 27190 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact | 40.8 | candidate | 12463 | 12463 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_compound_global_warp_10bit_stream_decodes_pixel_exact | 38.8 | candidate | 17692 | 17692 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_force_integer_mv_warp_10bit_stream_decodes_pixel_exact | 38.6 | candidate | 11798 | 11798 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_sb128_ab_partition_at_the_128_root_decodes_pixel_exact | 37.0 | candidate | 24088 | 24088 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_superres_all_tools_sb128_stream_decodes_pixel_exact | 36.7 | candidate | 28561 | 28561 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_stream_reconstructs_identically_with_one_and_four_recon_threads | 36.5 | kept(cover) | 34706 | 0 | 0 | keep |
+| ec-av1 | stream::tests::t06::a_real_compound_global_warp_12bit_8x8_leaf_stream_decodes_pixel_exact | 36.0 | candidate | 21641 | 3363 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t07::a_real_aomenc_stream_with_variance_aq_segmentation_decodes_pixel_exact | 35.9 | candidate | 17054 | 1771 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_inter_frame_with_a_64x64_intra_block_reads_the_no_cfl_uv_alphabet | 35.4 | candidate | 21905 | 2365 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_422_muchunk_compound_128root_pinned_stream_reaches_its_unit_walk | 33.2 | protected | 15194 | 1385 | 0 | keep (protected) |
+| ec-av1 | stream::tests::t07::a_real_aomenc_stream_with_cdef_decodes_pixel_exact | 32.4 | candidate | 16856 | 1495 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::the_frame_the_caller_receives_carries_no_unwritten_plane_sample | 31.5 | candidate | 40658 | 9272 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_10bit_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips | 31.1 | candidate | 32140 | 4751 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_stream_filters_identically_with_one_and_four_filter_threads | 30.4 | candidate | 37947 | 8681 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t10::a_real_aomenc_inter_sequence_with_intra_sub8x8_leaves_decodes_pixel_exact | 29.3 | candidate | 24816 | 6622 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact | 27.7 | candidate | 13276 | 1455 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_422_muchunk_iis_128root_grad128_comp_stream_is_exact_and_reaches_its_unit_walk | 27.4 | candidate | 14673 | 1464 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_stream_whose_frame_edge_partition_bit_is_horz_decodes_pixel_exact | 27.3 | candidate | 19098 | 3036 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit | 26.3 | candidate | 21961 | 3078 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t04::a_real_aomenc_10bit_obmc_over_1to4_strip_neighbours_decodes_pixel_exact | 26.0 | candidate | 16356 | 2595 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::the_two_10bit_film_pins_match_aomdec_on_every_decode_order_frame | 26.0 | protected | 39467 | 9378 | 0 | keep (protected) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_multi_tile_inter_10bit_stream_decodes_pixel_exact | 25.5 | candidate | 22314 | 1923 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_inter_128x128_none_root_decodes_pixel_exact | 25.0 | candidate | 21567 | 2223 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t07::a_real_aomenc_both_axes_cut_corner_inter_frames_decode_pixel_exact | 24.5 | candidate | 17501 | 2056 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact | 24.1 | candidate | 10230 | 859 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t07::a_real_aomenc_compound_mv_stack_across_two_tile_columns_decodes_pixel_exact | 23.8 | candidate | 14889 | 1088 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_inter_sequence_with_a_split_transform_intra_strip_decodes_pixel_exact | 23.1 | candidate | 19800 | 1831 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_force_integer_mv_warp_stream_decodes_pixel_exact | 22.8 | candidate | 11773 | 686 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t08::a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact | 22.5 | candidate | 11664 | 836 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact | 22.5 | candidate | 21952 | 3039 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t10::a_420_lossless_rect_chroma_walk_is_bounded_by_the_chroma_plane | 22.4 | candidate | 13348 | 3686 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_stream_with_ab_partitions_decodes_pixel_exact | 21.5 | candidate | 20308 | 2245 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t01::a_real_aomenc_128x128_superblock_stream_decodes_pixel_exact | 21.5 | candidate | 15900 | 1685 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t01::a_real_aomenc_mixed_lossless_segment_frame_decodes_sample_exact | 21.5 | candidate | 26585 | 7999 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t09::the_grained_picture_the_caller_receives_carries_no_unwritten_plane_sample | 21.3 | candidate | 42474 | 10691 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t01::a_real_obmc_stream_reads_a_recorded_switchable_filter_for_every_neighbour | 21.1 | candidate | 28943 | 4480 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t03::a_real_aomenc_10bit_stream_with_a_rect_transform_decodes_pixel_exact | 20.7 | candidate | 25770 | 4701 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t01::a_real_aomenc_inter_frame_edge_half_strip_decodes_pixel_exact | 20.5 | candidate | 22802 | 3197 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t07::a_real_aomenc_compound_mv_stack_with_global_motion_decodes_pixel_exact | 20.4 | candidate | 14827 | 945 | 0 | keep (unique coverage) |
+| ec-av1 | stream::tests::t06::a_real_aomenc_10bit_stream_with_onesided_compound_decodes_pixel_exact | 20.3 | candidate | 16485 | 1672 | 0 | keep (unique coverage) |

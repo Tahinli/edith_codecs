@@ -1,0 +1,2 @@
+mutant	file	line	replacement	killing_heavy_tests
+48	crates/ec-av1/src/decode/wave.rs	650	+	stream::tests::t04::a_real_stream_reconstructs_identically_with_one_and_four_recon_threads

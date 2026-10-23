@@ -18,3 +18,7 @@ lanes/wedge_dump
 
 # testcut p2 av1s per-test coverage (214 MB, local only)
 lanes/testcut/p2-av1stream.cov/
+lanes/testcut/p2-av1stream.heavy-results/
+lanes/testcut/p2-av1stream.fast-results/
+lanes/testcut/p2-av1stream.decide/fast.json
+lanes/testcut/p2-av1stream.decide/heavy/
