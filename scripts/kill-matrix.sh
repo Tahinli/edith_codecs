@@ -86,12 +86,14 @@ heavy_one() {
 
 # Fast mode: apply one mutant, run the fast profile (fail-fast is fine: any failure is a kill).
 # Status: fail (a test failed, timed out or the test run was killed), pass, unviable (no test run).
+# Baseline-failing test (unmutated fast run fails it), excluded so fail-fast cannot make every mutant "killed".
+FAST_EXCL='not test(/aom_vectors_match_per_frame_md5$/)'
 fast_one() {
     local json=$1 idx=$2 out=$3 rc
     rm -f "$out/$idx.status" "$out/$idx.fail"
     python3 scripts/mutate.py apply "$json" "$idx" "$ROOT" > "$out/$idx.apply.txt" 2>&1
     set +e
-    timeout 3600 cargo nextest run -p "$CRATE" --profile fast -j "$NEXTEST_J" > "$out/$idx.log" 2>&1
+    timeout 7200 cargo nextest run -p "$CRATE" --profile fast -j "$NEXTEST_J" -E "$FAST_EXCL" > "$out/$idx.log" 2>&1
     rc=$?
     set -e
     python3 scripts/mutate.py revert "$ROOT"
@@ -101,6 +103,16 @@ fast_one() {
 }
 
 case $sub in
+fastbase)
+    # Unmutated fast profile, no fail-fast: the baseline. Failing tests are listed in OUT/failing.txt.
+    out=$1; mkdir -p "$out"
+    set +e
+    timeout 7200 cargo nextest run -p "$CRATE" --profile fast --no-fail-fast -j "$NEXTEST_J" > "$out/fast.log" 2>&1
+    echo "rc=$?" > "$out/rc.txt"
+    set -e
+    grep -E '^\s*(FAIL|TIMEOUT|SIG[A-Z]+)\b' "$out/fast.log" | sed 's/\x1b\[[0-9;]*m//g' | sort -u > "$out/failing.txt" || true
+    grep Summary "$out/fast.log" | tail -n 1 > "$out/summary.txt" || true
+    ;;
 list)
     out=$1; mkdir -p "$out"
     (cd "crates/$CRATE" && cargo mutants -p "$CRATE" --list --json) > "$out/mutants.json"
