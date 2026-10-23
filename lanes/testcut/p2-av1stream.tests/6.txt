@@ -1,0 +1,1 @@
+stream::tests::t09::the_grained_picture_the_caller_receives_carries_no_unwritten_plane_sample

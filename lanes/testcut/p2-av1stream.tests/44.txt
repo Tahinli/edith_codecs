@@ -1,0 +1,10 @@
+stream::tests::t05::a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact
+stream::tests::t06::a_real_aomenc_stream_with_mandelbrot_fires_the_vert_b_partition_arm
+stream::tests::t09::a_real_aomenc_stream_with_a_16_level_1to4_partition_decodes_pixel_exact
+stream::tests::t04::a_superres_all_tools_sb128_stream_decodes_pixel_exact
+stream::tests::t09::the_frame_the_caller_receives_carries_no_unwritten_plane_sample
+stream::tests::t04::a_real_stream_filters_identically_with_one_and_four_filter_threads
+stream::tests::t09::the_two_10bit_film_pins_match_aomdec_on_every_decode_order_frame
+stream::tests::t10::a_420_lossless_rect_chroma_walk_is_bounded_by_the_chroma_plane
+stream::tests::t01::a_real_aomenc_mixed_lossless_segment_frame_decodes_sample_exact
+stream::tests::t09::the_grained_picture_the_caller_receives_carries_no_unwritten_plane_sample

@@ -1,0 +1,4 @@
+stream::tests::t06::a_real_aomenc_superres_key_frame_sequence_decodes_pixel_exact
+stream::tests::t06::a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact
+stream::tests::t04::a_superres_all_tools_sb128_stream_decodes_pixel_exact
+stream::tests::t04::a_real_stream_filters_identically_with_one_and_four_filter_threads
