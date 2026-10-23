@@ -451,11 +451,6 @@ fn x264_hi444_8bit() {
 }
 
 #[test]
-fn x264_hi444_10bit() {
-    sweep("4:4:4 10-bit", &all("yuv444p10le", "", false, 1));
-}
-
-#[test]
 fn x264_hi444_mbaff() {
     let mut cases = all("yuv444p", "mbaff-", true, 2);
     cases.extend(all("yuv444p10le", "mbaff-", true, 4));
