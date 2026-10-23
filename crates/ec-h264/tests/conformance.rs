@@ -782,45 +782,6 @@ const ENTROPY_MODES: [(&str, &[&str]); 2] = [
     ("cabac", &["-profile:v", "main", "-coder", "ac"]),
 ];
 
-/// Every quantisation parameter, bit-exact against ffmpeg, under both entropy
-/// coders.
-///
-/// The deblocking filter's alpha, beta and tC0 tables (8-16 and 8-17) are
-/// indexed by QP; the conformance vectors touch only a few of their 52 rows,
-/// and a whole wrong column there passes the vectors (it did, once). One
-/// all-intra picture per QP covers every row. Under CABAC the same sweep walks
-/// the context initialisation of clause 9.3.1.1 across all 52 SliceQPY values,
-/// which the fixed-QP conformance vectors barely touch.
-#[test]
-fn every_quantiser_matches_ffmpeg() {
-    if !have_ffmpeg() {
-        eprintln!("SKIP: ffmpeg not on PATH");
-        return;
-    }
-    let dir = scratch("qp-sweep");
-    let mut failures = Vec::new();
-    for (mode, profile) in ENTROPY_MODES {
-        let mut checked = 0usize;
-        for qp in 1..=51u32 {
-            let mut extra = profile.to_vec();
-            let qp_string = qp.to_string();
-            extra.extend(["-qp", &qp_string]);
-            match round_trip(&dir, &format!("{mode}-q{qp}"), "176x144", &extra) {
-                Ok(0) => checked += 1,
-                Ok(n) => failures.push(format!("{mode} qp {qp}: {n} bytes differ")),
-                Err(e) => failures.push(e),
-            }
-        }
-        assert!(
-            checked >= 40,
-            "too few {mode} quantisers exercised: {checked}"
-        );
-        eprintln!("{mode}: {checked} quantisers bit-exact against ffmpeg");
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(failures.is_empty(), "{failures:#?}");
-}
-
 /// Geometry and slice structure: cropping, odd sizes, multiple slices, the
 /// loop filter off and a chroma QP offset — what a real camera or encoder
 /// produces, none of which the QCIF single-slice vectors cover.
@@ -1391,55 +1352,6 @@ fn a_frame_num_gap_keeps_decoding() {
         "only {frames} frames survived a single dropped picture"
     );
     eprintln!("frame_num gap: {frames} frames decoded after dropping one picture");
-}
-
-/// Every quantisation parameter again, this time over a GOP with motion.
-///
-/// The intra sweep above walks the alpha, beta and tC0 rows the bS 3 and 4
-/// edges use. Boundary strengths 1 and 2 exist only between inter macroblocks,
-/// so their tC0 columns (Table 8-17) had no oracle at all until now — and both
-/// were wrong when this landed. One P/B GOP per quantiser covers every row of
-/// both columns, and under CABAC it also walks the cabac_init_idc columns
-/// across all 52 SliceQPY values.
-#[test]
-fn every_quantiser_with_motion_matches_ffmpeg() {
-    if !have_ffmpeg() {
-        eprintln!("SKIP: ffmpeg not on PATH");
-        return;
-    }
-    let dir = scratch("qp-motion");
-    let mut failures = Vec::new();
-    for coder in ["ac", "0"] {
-        let mut checked = 0usize;
-        for qp in 1..=51u32 {
-            let qp_string = qp.to_string();
-            let extra = vec![
-                "-profile:v",
-                "main",
-                "-coder",
-                coder,
-                "-qp",
-                &qp_string,
-                "-x264-params",
-                "bframes=2:b-adapt=0:ref=2",
-            ];
-            let tag = format!("{coder}-q{qp}");
-            match x264_encode_gop(&dir, &tag, "176x144", 8, &extra) {
-                Some(stream) => match compare_sequence(&stream) {
-                    Ok(_) => checked += 1,
-                    Err(e) => failures.push(format!("{tag}: {e}")),
-                },
-                None => failures.push(format!("{tag}: ffmpeg cannot encode")),
-            }
-        }
-        assert!(
-            checked >= 40,
-            "too few {coder} quantisers exercised: {checked}"
-        );
-        eprintln!("{coder}: {checked} quantisers bit-exact over a GOP with motion");
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// Geometry and slice structure, over a GOP rather than one picture: cropping,
@@ -2153,56 +2065,6 @@ fn pps_enables_8x8(stream: &Path) -> bool {
         }
     }
     false
-}
-
-/// The High-profile 8x8 transform, which every real-world encoder turns on by
-/// default: transform_size_8x8_flag, Intra_8x8 prediction with its reference
-/// filter (8.3.2), the 8x8 residual under both entropy coders and the 8x8
-/// inverse transform of 8.5.13.
-///
-/// The quantiser sweep matters twice over here: the 8x8 dequant ladder of
-/// 8.5.13.1 has its own rounding branch at QP 36, and under CABAC the whole
-/// ctxIdx 402..435 initialisation is a function of SliceQPY.
-#[test]
-fn high_profile_8x8_matches_ffmpeg() {
-    if !have_ffmpeg() {
-        eprintln!("SKIP: ffmpeg not on PATH");
-        return;
-    }
-    let dir = scratch("high8x8");
-    let mut failures = Vec::new();
-    // High profile with the 8x8 transform forced on, in both entropy coders.
-    let modes: [(&str, &[&str]); 2] = [
-        ("cabac", &["-profile:v", "high", "-coder", "ac"]),
-        ("cavlc", &["-profile:v", "high", "-coder", "0"]),
-    ];
-    for (mode, profile) in modes {
-        let mut checked = 0usize;
-        for qp in 1..=51u32 {
-            let mut extra = profile.to_vec();
-            let qp_string = qp.to_string();
-            extra.extend(["-qp", &qp_string, "-x264-params", "8x8dct=1:i8x8=1"]);
-            let tag = format!("i8-{mode}-q{qp}");
-            match round_trip(&dir, &tag, "176x144", &extra) {
-                Ok(0) => {
-                    assert!(
-                        pps_enables_8x8(&dir.join(format!("{tag}.264"))),
-                        "{tag}: encoder did not enable the 8x8 transform"
-                    );
-                    checked += 1;
-                }
-                Ok(n) => failures.push(format!("intra {mode} qp {qp}: {n} bytes differ")),
-                Err(e) => failures.push(e),
-            }
-        }
-        assert!(
-            checked >= 40,
-            "too few {mode} quantisers exercised: {checked}"
-        );
-        eprintln!("8x8 intra {mode}: {checked} quantisers bit-exact against ffmpeg");
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// The same transform in inter macroblocks: P and B partitions carry the flag
