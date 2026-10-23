@@ -68,7 +68,7 @@ heavy_one() {
     fi
     python3 scripts/mutate.py apply "$json" "$idx" "$ROOT" > "$out/$idx.apply.txt" 2>&1
     set +e
-    timeout 3600 cargo nextest run -p "$CRATE" --no-fail-fast -j "$NEXTEST_J" -E "$expr" > "$out/$idx.log" 2>&1
+    timeout 7200 cargo nextest run -p "$CRATE" --profile mut --no-fail-fast -j "$NEXTEST_J" -E "$expr" > "$out/$idx.log" 2>&1
     rc=$?
     set -e
     python3 scripts/mutate.py revert "$ROOT"
@@ -82,6 +82,22 @@ heavy_one() {
     fi
     python3 scripts/kill-matrix-analyze.py failing "$out/$idx.log" "$tests" "$out/$idx.fail"
     if [ -s "$out/$idx.fail" ]; then echo fail > "$out/$idx.status"; else echo pass > "$out/$idx.status"; fi
+}
+
+# Fast mode: apply one mutant, run the fast profile (fail-fast is fine: any failure is a kill).
+# Status: fail (a test failed, timed out or the test run was killed), pass, unviable (no test run).
+fast_one() {
+    local json=$1 idx=$2 out=$3 rc
+    rm -f "$out/$idx.status" "$out/$idx.fail"
+    python3 scripts/mutate.py apply "$json" "$idx" "$ROOT" > "$out/$idx.apply.txt" 2>&1
+    set +e
+    timeout 3600 cargo nextest run -p "$CRATE" --profile fast -j "$NEXTEST_J" > "$out/$idx.log" 2>&1
+    rc=$?
+    set -e
+    python3 scripts/mutate.py revert "$ROOT"
+    if [ "$rc" -eq 124 ]; then echo fail > "$out/$idx.status"; return 0; fi
+    if ! grep -q 'Summary' "$out/$idx.log"; then echo unviable > "$out/$idx.status"; return 0; fi
+    if grep -qE '^\s*(FAIL|TIMEOUT|SIG[A-Z]+|LEAK|ABORT)\b' "$out/$idx.log"; then echo fail > "$out/$idx.status"; else echo pass > "$out/$idx.status"; fi
 }
 
 case $sub in
@@ -129,37 +145,18 @@ fastcov)
     rm -f "$TMP/fast-cov.json"
     ;;
 mutrun)
-    # Fast mode: cargo-mutants applies, builds and runs each sampled mutant itself. Each one is selected
-    # by its exact name (-F/--re over the names `--list` shows), so no span is applied by this script.
+    # json: the sample; idxfile lines: "<index>" (fast) or "<index><TAB><tests file>" (heavy).
+    # Each run applies exactly one mutant (mutate.py, exact span) and runs the tests. cargo-mutants'
+    # --re/-F does not filter by name in this version (it tests the first N mutants of the list), so
+    # it is not used for selection here.
     json=$1; idxfile=$2; out=$3; mode=$4
     mkdir -p "$out"
-    # idxfile lines: "<index>" (fast) or "<index><TAB><tests file>" (heavy, one list per mutant).
     while IFS=$'\t' read -r idx tests; do
         [ -n "$idx" ] || continue
         if [ "$mode" = heavy ]; then
             heavy_one "$json" "$idx" "$tests" "$out"
-            echo "mutrun: heavy mutant $idx status=$(cat "$out/$idx.status")" >&2
-            continue
-        fi
-        re=$(python3 scripts/kill-matrix-analyze.py regex "$json" "$idx")
-        sel=(--cargo-test-arg=--profile --cargo-test-arg=fast)
-        rm -rf "$out/$idx.d"
-        set +e
-        cargo mutants -p "$CRATE" --test-tool nextest --baseline skip --timeout-multiplier 3 \
-            --re "$re" "${sel[@]}" --output "$out/$idx.d" > "$out/$idx.log" 2>&1
-        rc=$?
-        set -e
-        mo="$out/$idx.d/mutants.out"
-        if [ -f "$mo/caught.txt" ] && grep -qF "$(python3 scripts/kill-matrix-analyze.py name "$json" "$idx")" "$mo/caught.txt"; then
-            echo fail > "$out/$idx.status"          # killed by the selected tests
-        elif [ -f "$mo/timeout.txt" ] && grep -qF "$(python3 scripts/kill-matrix-analyze.py name "$json" "$idx")" "$mo/timeout.txt"; then
-            echo fail > "$out/$idx.status"
-        elif [ -f "$mo/unviable.txt" ] && grep -qF "$(python3 scripts/kill-matrix-analyze.py name "$json" "$idx")" "$mo/unviable.txt"; then
-            echo unviable > "$out/$idx.status"
-        elif [ -f "$mo/missed.txt" ] && grep -qF "$(python3 scripts/kill-matrix-analyze.py name "$json" "$idx")" "$mo/missed.txt"; then
-            echo pass > "$out/$idx.status"          # survived the selected tests
         else
-            echo "error rc=$rc" > "$out/$idx.status"
+            fast_one "$json" "$idx" "$out"
         fi
         echo "mutrun: $mode mutant $idx status=$(cat "$out/$idx.status")" >&2
     done < "$idxfile"

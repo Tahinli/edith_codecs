@@ -42,3 +42,9 @@ not ((package(ec-av1) & (test(=decode::tests::odd_sizes_round_trip_bit_exact_aga
   (package(ec-vorbis) & (test(/(^|::)xiph_vectors_decode_like_ffmpeg$/) | test(/(^|::)onset_after_silence_has_no_pre_echo$/))) |
   (package(ec-vp9) & (test(/(^|::)libvpx_vectors_match_per_frame_md5$/))))
 '''
+
+# [profile.mut]: kill-matrix runs (scripts/kill-matrix.sh heavy mode). A test that hangs under a
+# mutant is terminated after 7 x 60 s = 420 s (about 1.6x the slowest heavy test, ~265 s) and nextest
+# reports it as TIMEOUT, which the matrix counts as a kill (caught).
+[profile.mut]
+slow-timeout = { period = "60s", terminate-after = 7 }
